@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -113,8 +114,10 @@ class CredentialVault:
         "_cipher",
         "_clock",
         "_lease_issuer",
+        "_lease_invalidators",
         "_lease_lock",
         "_leases",
+        "_active_leases",
         "_process_id",
         "_state",
         "__weakref__",
@@ -183,6 +186,8 @@ class CredentialVault:
         self._lease_issuer = object()
         self._lease_lock = threading.Lock()
         self._leases: dict[str, _LeaseState] = {}
+        self._active_leases: set[str] = set()
+        self._lease_invalidators: dict[str, Callable[[], None]] = {}
         self._process_id = os.getpid()
         _VAULT_INSTANCES.add(self)
 
@@ -266,16 +271,21 @@ class CredentialVault:
         record = self._encrypt_record(account_ref, generation, _STATE_ACTIVE, plaintext)
         relative = self._relative(account_ref)
 
+        invalidators: tuple[Callable[[], None], ...] = ()
         try:
             with self._state.locked():
                 current = self._read_or_migrate_locked(account_ref)
                 if current is not None and generation <= current[1]:
                     raise CredentialVaultError("credential.generation_conflict")
                 self._state.replace_private_bytes(relative, record)
+                invalidators = self._invalidate_account_leases_locked(
+                    account_ref, active_only=True
+                )
         except CredentialVaultError:
             raise
         except HiveStateError:
             raise CredentialVaultError("credential.source_unavailable") from None
+        self._invoke_invalidators(invalidators)
 
     def lease(
         self,
@@ -320,6 +330,8 @@ class CredentialVault:
         ):
             raise CredentialVaultError("credential.vault_request_invalid")
         with self._lease_lock:
+            if lease._token in self._active_leases:
+                raise CredentialVaultError("credential.lease_consumed")
             state = self._leases.pop(lease._token, None)
         if state is None:
             raise CredentialVaultError("credential.lease_consumed")
@@ -333,11 +345,126 @@ class CredentialVault:
             raise CredentialVaultError("credential.generation_conflict")
         return plaintext
 
+    @contextmanager
+    def materialization_lease(
+        self,
+        account_ref: str,
+        *,
+        expected_generation: int,
+        ttl_seconds: int,
+        invalidator: Callable[[], None],
+    ) -> Iterator[tuple[CredentialLease, bytes]]:
+        """Issue one already-active lease with exactly one projection read."""
+
+        self._ensure_current_process()
+        account_ref = self._validated_account_ref(account_ref)
+        expected_generation = self._validated_generation(expected_generation)
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, int)
+            or not 1 <= ttl_seconds <= MAX_LEASE_SECONDS
+            or not callable(invalidator)
+        ):
+            raise CredentialVaultError("credential.vault_request_invalid")
+        now = self._now()
+        with self._state.locked():
+            with self._lease_lock:
+                if len(self._leases) >= MAX_ACTIVE_LEASES:
+                    raise CredentialVaultError("credential.lease_limit")
+                if any(
+                    token in self._active_leases and state.account_ref == account_ref
+                    for token, state in self._leases.items()
+                ):
+                    raise CredentialVaultError("credential.lease_limit")
+                current = self._read_or_migrate_locked(account_ref)
+                if current is None or current[0] != _STATE_ACTIVE:
+                    raise CredentialVaultError("credential.source_unavailable")
+                if current[1] != expected_generation:
+                    raise CredentialVaultError("credential.generation_conflict")
+                token = self._new_lease_token_locked()
+                self._leases[token] = _LeaseState(
+                    account_ref=account_ref,
+                    generation=expected_generation,
+                    expires_at=now + ttl_seconds,
+                    process_id=self._process_id,
+                )
+                self._active_leases.add(token)
+                self._lease_invalidators[token] = invalidator
+                plaintext = current[2]
+        active = CredentialLease(token, self._lease_issuer)
+        try:
+            yield active, plaintext
+        finally:
+            with self._lease_lock:
+                self._remove_leases_locked((token,))
+
+    def publish_active(
+        self,
+        lease: CredentialLease,
+        effect: Callable[[], tuple[int, tuple[int, ...]]],
+    ) -> tuple[int, tuple[int, ...]]:
+        """Linearize one runtime publish before revoke/replace can commit."""
+
+        self._ensure_current_process()
+        if (
+            not isinstance(lease, CredentialLease)
+            or lease._issuer is not self._lease_issuer
+            or not callable(effect)
+        ):
+            raise CredentialVaultError("credential.vault_request_invalid")
+        with self._state.locked():
+            with self._lease_lock:
+                state = self._leases.get(lease._token)
+                if state is None or lease._token not in self._active_leases:
+                    raise CredentialVaultError("credential.lease_consumed")
+                if self._now() >= state.expires_at:
+                    raise CredentialVaultError("credential.lease_expired")
+                return effect()
+
+    def reconcile_active_leases(self) -> None:
+        """Expire or invalidate live effects after cross-process vault mutation."""
+
+        self._ensure_current_process()
+        invalidators: tuple[Callable[[], None], ...] = ()
+        try:
+            with self._state.locked():
+                with self._lease_lock:
+                    invalid = {
+                        token
+                        for token, state in self._leases.items()
+                        if self._now() >= state.expires_at
+                    }
+                    accounts: dict[str, tuple[int, int, bytes] | None] = {}
+                    for token in self._active_leases - invalid:
+                        state = self._leases.get(token)
+                        if state is None:
+                            invalid.add(token)
+                            continue
+                        if state.account_ref not in accounts:
+                            try:
+                                accounts[state.account_ref] = (
+                                    self._read_or_migrate_locked(state.account_ref)
+                                )
+                            except CredentialVaultError:
+                                accounts[state.account_ref] = None
+                        current = accounts[state.account_ref]
+                        if (
+                            current is None
+                            or current[0] != _STATE_ACTIVE
+                            or current[1] != state.generation
+                        ):
+                            invalid.add(token)
+                    invalidators = self._remove_leases_locked(tuple(invalid))
+        except HiveStateError:
+            raise CredentialVaultError("credential.source_unavailable") from None
+        self._invoke_invalidators(invalidators)
+
     def revoke_account(self, account_ref: str, *, expected_generation: int) -> bool:
         self._ensure_current_process()
         account_ref = self._validated_account_ref(account_ref)
         expected_generation = self._validated_generation(expected_generation)
         relative = self._relative(account_ref)
+        invalidators: tuple[Callable[[], None], ...] = ()
         try:
             with self._state.locked():
                 current = self._read_or_migrate_locked(account_ref)
@@ -349,16 +476,14 @@ class CredentialVault:
                     account_ref, expected_generation, _STATE_REVOKED, b""
                 )
                 self._state.replace_private_bytes(relative, tombstone)
+                invalidators = self._invalidate_account_leases_locked(
+                    account_ref, active_only=False
+                )
         except CredentialVaultError:
             raise
         except HiveStateError:
             raise CredentialVaultError("credential.source_unavailable") from None
-        with self._lease_lock:
-            self._leases = {
-                token: state
-                for token, state in self._leases.items()
-                if state.account_ref != account_ref
-            }
+        self._invoke_invalidators(invalidators)
         return True
 
     def _read_projection(self, account_ref: str) -> tuple[int, bytes]:
@@ -653,14 +778,50 @@ class CredentialVault:
     def _invalidate_after_fork(self) -> None:
         self._lease_lock = threading.Lock()
         self._leases = {}
+        self._active_leases = set()
+        self._lease_invalidators = {}
         self._lease_issuer = object()
 
-    def _prune_expired_locked(self, now: float) -> None:
-        self._leases = {
-            token: state
-            for token, state in self._leases.items()
-            if now < state.expires_at
-        }
+    def _prune_expired_locked(self, now: float) -> tuple[Callable[[], None], ...]:
+        expired = tuple(
+            token for token, state in self._leases.items() if now >= state.expires_at
+        )
+        return self._remove_leases_locked(expired)
+
+    def _invalidate_account_leases_locked(
+        self, account_ref: str, *, active_only: bool
+    ) -> tuple[Callable[[], None], ...]:
+        with self._lease_lock:
+            tokens = tuple(
+                token
+                for token, state in self._leases.items()
+                if state.account_ref == account_ref
+                and (not active_only or token in self._active_leases)
+            )
+            return self._remove_leases_locked(tokens)
+
+    def _remove_leases_locked(
+        self, tokens: tuple[str, ...]
+    ) -> tuple[Callable[[], None], ...]:
+        invalidators: list[Callable[[], None]] = []
+        for token in tokens:
+            self._leases.pop(token, None)
+            self._active_leases.discard(token)
+            invalidator = self._lease_invalidators.pop(token, None)
+            if invalidator is not None:
+                invalidators.append(invalidator)
+        return tuple(invalidators)
+
+    @staticmethod
+    def _invoke_invalidators(invalidators: tuple[Callable[[], None], ...]) -> None:
+        failed = False
+        for invalidator in invalidators:
+            try:
+                invalidator()
+            except BaseException:
+                failed = True
+        if failed:
+            raise CredentialVaultError("credential.source_unavailable")
 
     def _new_lease_token_locked(self) -> str:
         while True:

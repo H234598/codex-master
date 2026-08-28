@@ -171,11 +171,13 @@ def _auth_text(value: object, *, maximum: int) -> str:
     return value
 
 
-def validate_openai_auth_json(value: bytes, *, expected_account_id: str) -> bytes:
+def validate_openai_auth_json(
+    value: bytes | bytearray, *, expected_account_id: str
+) -> bytes:
     """Validate account identity and return bounded canonical credential JSON."""
 
     if (
-        type(value) is not bytes
+        type(value) not in {bytes, bytearray}
         or not 1 <= len(value) <= MAX_AUTH_BYTES
         or type(expected_account_id) is not str
         or _ACCOUNT_ID_RE.fullmatch(expected_account_id) is None

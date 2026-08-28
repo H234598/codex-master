@@ -10,12 +10,14 @@ import hmac
 import json
 import math
 import os
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 import stat
+import sys
 import threading
 import time
-from typing import Final
+from typing import Final, cast
+import weakref
 
 from .codex_usage_credential_authority import (
     CredentialAuthorityError,
@@ -23,6 +25,7 @@ from .codex_usage_credential_authority import (
     validate_openai_auth_json,
 )
 from .credential_vault import CredentialVault, CredentialVaultError
+from .hive.state import HiveStateError, HiveStateStore
 
 
 MAX_AUTH_SYNC_PLAN_SECONDS: Final[int] = 5 * 60
@@ -37,6 +40,8 @@ _FINAL_NAME: Final[str] = "auth.json"
 _ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         "control.plan_stale",
+        "control.idempotency_conflict",
+        "control.operation_ambiguous",
         "control.request_invalid",
         "credential.generation_conflict",
         "credential.source_unavailable",
@@ -44,6 +49,12 @@ _ERROR_CODES: Final[frozenset[str]] = frozenset(
         "oauth.identity_mismatch",
     }
 )
+_IDEMPOTENCY_KEY: Final[re.Pattern[str]] = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII
+)
+_RECEIPT_DOCUMENT: Final[PurePosixPath] = PurePosixPath("openai-auth-sync.json")
+_MAX_RECEIPT_BYTES: Final[int] = 2 * 1024 * 1024
+_MAX_RECEIPTS: Final[int] = 4096
 
 
 class OpenAICredentialError(ValueError):
@@ -58,12 +69,13 @@ class OpenAICredentialError(ValueError):
         super().__init__(code)
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(frozen=True, slots=True, weakref_slot=True, repr=False)
 class AuthSyncPlanV1:
     account_ref: str
     expected_generation: int
     expires_at: float
     nonce: str
+    idempotency_key: str
     plan_digest: str
     _issuer: object
 
@@ -82,12 +94,261 @@ class AuthSyncReceiptV1:
         return "AuthSyncReceiptV1(<redacted>)"
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class OpenAIAccountIdentity:
+    enabled: bool
+    backend_account_id: str
+    generation: int
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise OpenAICredentialError("control.request_invalid")
+        _backend_account(self.backend_account_id)
+        _generation(self.generation)
+
+    def __repr__(self) -> str:
+        return "OpenAIAccountIdentity(<redacted>)"
+
+
+class OpenAIIdentitySource:
+    """Authoritative account identities exposed only under one shared guard."""
+
+    __slots__ = ("_identities", "_lock")
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._identities: dict[str, OpenAIAccountIdentity] = {}
+        raise TypeError("OpenAIIdentitySource requires an authoritative adapter")
+
+    @classmethod
+    def for_test(
+        cls, identities: Mapping[str, OpenAIAccountIdentity]
+    ) -> OpenAIIdentitySource:
+        if not isinstance(identities, Mapping) or not 1 <= len(identities) <= 4096:
+            raise OpenAICredentialError("control.request_invalid")
+        source = cls.__new__(cls)
+        source._lock = threading.RLock()
+        source._identities = {}
+        for account_ref, identity in identities.items():
+            if not isinstance(identity, OpenAIAccountIdentity):
+                raise OpenAICredentialError("control.request_invalid")
+            source._identities[_account_ref(account_ref)] = identity
+        return source
+
+    @contextmanager
+    def guard(self, account_ref: str) -> Iterator[OpenAIAccountIdentity]:
+        account_ref = _account_ref(account_ref)
+        with self._lock:
+            identity = self._identities.get(account_ref)
+            if identity is None:
+                raise OpenAICredentialError("control.request_invalid")
+            yield identity
+
+    def set_identity(self, account_ref: str, identity: OpenAIAccountIdentity) -> None:
+        account_ref = _account_ref(account_ref)
+        if not isinstance(identity, OpenAIAccountIdentity):
+            raise OpenAICredentialError("control.request_invalid")
+        with self._lock:
+            self._identities[account_ref] = identity
+
+
+class OpenAIAuthReceiptStore:
+    """Durable shared intent/receipt CAS for auth-sync idempotency."""
+
+    __slots__ = ("_state",)
+
+    def __init__(self, state_root: Path) -> None:
+        if not isinstance(state_root, Path) or not state_root.is_absolute():
+            raise OpenAICredentialError("credential.source_unavailable")
+        try:
+            self._state = HiveStateStore(state_root)
+        except (HiveStateError, OSError, ValueError):
+            raise OpenAICredentialError("credential.source_unavailable") from None
+
+    def plan(self, candidate: Mapping[str, object]) -> dict[str, object]:
+        with self._locked_records() as records:
+            key = candidate["idempotency_key"]
+            for record in records:
+                if record["idempotency_key"] != key:
+                    continue
+                if (
+                    record["account_ref"] != candidate["account_ref"]
+                    or record["expected_generation"] != candidate["expected_generation"]
+                ):
+                    raise OpenAICredentialError("control.idempotency_conflict")
+                return dict(record)
+            if len(records) >= _MAX_RECEIPTS:
+                raise OpenAICredentialError("credential.source_unavailable")
+            record = dict(candidate)
+            record["state"] = "planned"
+            records.append(record)
+            self._write_locked(records)
+            return dict(record)
+
+    def begin(self, plan: AuthSyncPlanV1) -> str:
+        with self._locked_records() as records:
+            record = self._matching_record(records, plan)
+            state = record["state"]
+            if state == "succeeded":
+                return "succeeded"
+            if state == "running":
+                raise OpenAICredentialError("control.operation_ambiguous")
+            if state == "expired":
+                raise OpenAICredentialError("control.plan_stale")
+            record["state"] = "running"
+            self._write_locked(records)
+            return "running"
+
+    def status(self, plan: AuthSyncPlanV1) -> str:
+        with self._locked_records() as records:
+            return str(self._matching_record(records, plan)["state"])
+
+    def succeed(self, plan: AuthSyncPlanV1) -> None:
+        with self._locked_records() as records:
+            record = self._matching_record(records, plan)
+            if record["state"] != "running":
+                raise OpenAICredentialError("control.operation_ambiguous")
+            record["state"] = "succeeded"
+            self._write_locked(records)
+
+    def expire(self, plan: AuthSyncPlanV1) -> None:
+        with self._locked_records() as records:
+            record = self._matching_record(records, plan)
+            if record["state"] != "running":
+                raise OpenAICredentialError("control.operation_ambiguous")
+            record["state"] = "expired"
+            self._write_locked(records)
+
+    @contextmanager
+    def _locked_records(self) -> Iterator[list[dict[str, object]]]:
+        try:
+            with self._state.locked():
+                yield self._read_locked()
+        except OpenAICredentialError:
+            raise
+        except (HiveStateError, OSError, TypeError, ValueError):
+            raise OpenAICredentialError("credential.source_unavailable") from None
+
+    def _read_locked(self) -> list[dict[str, object]]:
+        try:
+            raw = self._state.read_private_bytes(
+                _RECEIPT_DOCUMENT, max_bytes=_MAX_RECEIPT_BYTES
+            )
+        except HiveStateError as exc:
+            if exc.args == ("state_not_found",):
+                return []
+            raise
+        try:
+            document = json.loads(raw.decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            raise OpenAICredentialError("credential.source_unavailable") from None
+        if (
+            not isinstance(document, Mapping)
+            or set(document) != {"schema_version", "records"}
+            or document.get("schema_version") != 1
+            or type(document.get("records")) is not list
+            or len(document["records"]) > _MAX_RECEIPTS
+        ):
+            raise OpenAICredentialError("credential.source_unavailable")
+        records = [self._validated_record(value) for value in document["records"]]
+        keys = [record["idempotency_key"] for record in records]
+        if len(set(keys)) != len(keys):
+            raise OpenAICredentialError("credential.source_unavailable")
+        return records
+
+    def _write_locked(self, records: list[dict[str, object]]) -> None:
+        try:
+            raw = (
+                json.dumps(
+                    {"schema_version": 1, "records": records},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("ascii")
+            if len(raw) > _MAX_RECEIPT_BYTES:
+                raise OpenAICredentialError("credential.source_unavailable")
+            self._state.replace_private_bytes(_RECEIPT_DOCUMENT, raw)
+        except OpenAICredentialError:
+            raise
+        except (HiveStateError, OSError, TypeError, ValueError, RecursionError):
+            raise OpenAICredentialError("credential.source_unavailable") from None
+
+    @staticmethod
+    def _validated_record(value: object) -> dict[str, object]:
+        fields = {
+            "account_ref",
+            "expected_generation",
+            "expires_at",
+            "idempotency_key",
+            "nonce",
+            "plan_digest",
+            "state",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise OpenAICredentialError("credential.source_unavailable")
+        record = dict(value)
+        try:
+            _account_ref(record["account_ref"])
+            _generation(record["expected_generation"])
+            _idempotency_key(record["idempotency_key"])
+            expires = record["expires_at"]
+            if (
+                isinstance(expires, bool)
+                or not isinstance(expires, (int, float))
+                or not math.isfinite(expires)
+                or type(record["nonce"]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", record["nonce"], re.ASCII) is None
+                or type(record["plan_digest"]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", record["plan_digest"], re.ASCII)
+                is None
+                or record["state"] not in {"planned", "running", "succeeded", "expired"}
+            ):
+                raise OpenAICredentialError("credential.source_unavailable")
+            digest = _plan_digest(
+                str(record["account_ref"]),
+                int(record["expected_generation"]),
+                float(expires),
+                str(record["nonce"]),
+                str(record["idempotency_key"]),
+            )
+        except OpenAICredentialError:
+            raise OpenAICredentialError("credential.source_unavailable") from None
+        if not hmac.compare_digest(digest, str(record["plan_digest"])):
+            raise OpenAICredentialError("credential.source_unavailable")
+        record["expires_at"] = float(expires)
+        return record
+
+    @staticmethod
+    def _matching_record(
+        records: list[dict[str, object]], plan: AuthSyncPlanV1
+    ) -> dict[str, object]:
+        for record in records:
+            if record["idempotency_key"] != plan.idempotency_key:
+                continue
+            if any(
+                record[field] != getattr(plan, field)
+                for field in (
+                    "account_ref",
+                    "expected_generation",
+                    "expires_at",
+                    "nonce",
+                    "plan_digest",
+                )
+            ):
+                raise OpenAICredentialError("control.idempotency_conflict")
+            return record
+        raise OpenAICredentialError("control.plan_stale")
+
+
 class AuthorizedAuthIngress:
     """Capability-bound one-shot container for authorized raw auth bytes."""
 
     __slots__ = (
         "_account_ref",
         "_authority",
+        "_closed",
         "_consumed",
         "_generation",
         "_lock",
@@ -100,6 +361,7 @@ class AuthorizedAuthIngress:
 
     _account_ref: str
     _authority: object
+    _closed: bool
     _consumed: bool
     _generation: int
     _lock: threading.Lock
@@ -135,6 +397,7 @@ class AuthorizedAuthIngress:
         ingress._plan_digest = plan.plan_digest
         ingress._payload = bytearray(payload)
         ingress._consumed = False
+        ingress._closed = False
         ingress._process_id = os.getpid()
         ingress._lock = threading.Lock()
         return ingress
@@ -144,7 +407,7 @@ class AuthorizedAuthIngress:
         authority: object,
         plan: AuthSyncPlanV1,
         process_id: int,
-    ) -> bytes:
+    ) -> bytearray:
         if (
             self._authority is not authority
             or self._plan_issuer is not plan._issuer
@@ -157,37 +420,152 @@ class AuthorizedAuthIngress:
         ):
             raise OpenAICredentialError("credential.upload_expired")
         with self._lock:
-            if self._consumed:
+            if self._consumed or self._closed:
                 raise OpenAICredentialError("credential.upload_expired")
             self._consumed = True
-            try:
-                return bytes(self._payload)
-            finally:
-                _zero(self._payload)
+            payload = self._payload
+            self._payload = bytearray(len(payload))
+            return payload
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def close(self) -> None:
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            _zero(self._payload)
+            self._closed = True
+
+    def __enter__(self) -> AuthorizedAuthIngress:
+        if self.closed:
+            raise OpenAICredentialError("credential.upload_expired")
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     def __repr__(self) -> str:
         return "AuthorizedAuthIngress(<redacted>)"
+
+
+class _MaterializedAuth:
+    __slots__ = (
+        "_account_ref",
+        "_descriptor",
+        "_file_metadata",
+        "_invalidated",
+        "_lock",
+        "_published",
+        "_runtime_fd",
+        "_runtime_metadata",
+    )
+
+    def __init__(
+        self,
+        account_ref: str,
+        runtime_fd: int,
+        runtime_metadata: tuple[int, ...],
+    ) -> None:
+        self._account_ref = account_ref
+        self._runtime_fd = runtime_fd
+        self._runtime_metadata = runtime_metadata
+        self._descriptor: int | None = None
+        self._file_metadata: tuple[int, ...] | None = None
+        self._published = False
+        self._invalidated = False
+        self._lock = threading.RLock()
+
+    @property
+    def published(self) -> bool:
+        with self._lock:
+            return self._published
+
+    @property
+    def invalidated(self) -> bool:
+        with self._lock:
+            return self._invalidated
+
+    def publish(self, payload: bytearray) -> tuple[int, tuple[int, ...]]:
+        with self._lock:
+            if self._invalidated:
+                raise OpenAICredentialError("credential.source_unavailable")
+            descriptor, metadata = _publish_auth(
+                self._runtime_fd, self._runtime_metadata, payload
+            )
+            self._descriptor = descriptor
+            self._file_metadata = metadata
+            self._published = True
+            return descriptor, metadata
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._invalidated = True
+            self._remove_locked()
+
+    def close(self) -> None:
+        with self._lock:
+            self._invalidated = True
+            self._remove_locked()
+
+    def _remove_locked(self) -> None:
+        if not self._published:
+            return
+        if self._descriptor is None or self._file_metadata is None:
+            raise OpenAICredentialError("credential.source_unavailable")
+        try:
+            _remove_auth(
+                self._runtime_fd,
+                self._runtime_metadata,
+                self._descriptor,
+                self._file_metadata,
+            )
+        except OpenAICredentialError:
+            if _auth_name_absent(self._runtime_fd):
+                self._published = False
+            raise
+        else:
+            self._published = False
+
+    def release_fds(self) -> None:
+        with self._lock:
+            _close(self._descriptor)
+            self._descriptor = None
 
 
 class OpenAICredentialService:
     """Synchronize authorized auth uploads and materialize one vault lease."""
 
     __slots__ = (
-        "_applied",
         "_clock",
-        "_identities",
+        "_identity_source",
         "_ingress_authority",
+        "_janitor_started",
+        "_janitor_stop",
         "_lock",
+        "_materializations",
+        "_materializing_accounts",
         "_nonce_factory",
         "_plan_issuer",
+        "_plan_refs",
         "_process_id",
+        "_receipts",
+        "_receipt_cache",
         "_vault",
+        "__weakref__",
     )
 
     def __init__(
         self,
         vault: CredentialVault,
-        account_identities: Mapping[str, str],
+        identity_source: OpenAIIdentitySource,
+        receipt_store: OpenAIAuthReceiptStore,
         *,
         ingress_authority: object,
         clock: Callable[[], float] | None = None,
@@ -195,23 +573,26 @@ class OpenAICredentialService:
     ) -> None:
         if (
             not isinstance(vault, CredentialVault)
-            or not isinstance(account_identities, Mapping)
-            or not 1 <= len(account_identities) <= 4096
+            or not isinstance(identity_source, OpenAIIdentitySource)
+            or not isinstance(receipt_store, OpenAIAuthReceiptStore)
             or ingress_authority is None
             or (clock is not None and not callable(clock))
             or (nonce_factory is not None and not callable(nonce_factory))
         ):
             raise OpenAICredentialError("control.request_invalid")
-        identities: dict[str, str] = {}
-        for account_ref, backend_account_id in account_identities.items():
-            identities[_account_ref(account_ref)] = _backend_account(backend_account_id)
         self._vault = vault
-        self._identities = identities
+        self._identity_source = identity_source
+        self._receipts = receipt_store
+        self._receipt_cache: dict[str, AuthSyncReceiptV1] = {}
         self._ingress_authority = ingress_authority
-        self._clock = clock or time.monotonic
+        self._clock = clock or time.time
         self._nonce_factory = nonce_factory or (lambda: os.urandom(32))
         self._plan_issuer = object()
-        self._applied: dict[str, AuthSyncReceiptV1] = {}
+        self._plan_refs: dict[int, weakref.ReferenceType[AuthSyncPlanV1]] = {}
+        self._materializations: set[_MaterializedAuth] = set()
+        self._materializing_accounts: set[str] = set()
+        self._janitor_stop = threading.Event()
+        self._janitor_started = False
         self._lock = threading.RLock()
         self._process_id = os.getpid()
 
@@ -223,34 +604,53 @@ class OpenAICredentialService:
         account_ref: str,
         *,
         expected_generation: int,
+        idempotency_key: str,
         ttl_seconds: int = MAX_AUTH_SYNC_PLAN_SECONDS,
     ) -> AuthSyncPlanV1:
         self._ensure_current_process()
-        account_ref = self._registered_account(account_ref)
+        account_ref = _account_ref(account_ref)
         expected_generation = _generation(expected_generation)
+        idempotency_key = _idempotency_key(idempotency_key)
         if (
             isinstance(ttl_seconds, bool)
             or not isinstance(ttl_seconds, int)
             or not 1 <= ttl_seconds <= MAX_AUTH_SYNC_PLAN_SECONDS
         ):
             raise OpenAICredentialError("control.request_invalid")
-        now = self._now()
-        nonce = self._new_nonce()
-        expires_at = now + ttl_seconds
-        plan_digest = _plan_digest(
-            account_ref,
-            expected_generation,
-            expires_at,
-            nonce,
-        )
-        return AuthSyncPlanV1(
-            account_ref,
-            expected_generation,
-            expires_at,
-            nonce,
-            plan_digest,
+        with self._identity_source.guard(account_ref) as identity:
+            if not identity.enabled or identity.generation != expected_generation:
+                raise OpenAICredentialError("control.request_invalid")
+            now = self._now()
+            nonce = self._new_nonce()
+            expires_at = now + ttl_seconds
+            plan_digest = _plan_digest(
+                account_ref,
+                expected_generation,
+                expires_at,
+                nonce,
+                idempotency_key,
+            )
+            record = self._receipts.plan(
+                {
+                    "account_ref": account_ref,
+                    "expected_generation": expected_generation,
+                    "expires_at": expires_at,
+                    "idempotency_key": idempotency_key,
+                    "nonce": nonce,
+                    "plan_digest": plan_digest,
+                }
+            )
+        plan = AuthSyncPlanV1(
+            str(record["account_ref"]),
+            cast(int, record["expected_generation"]),
+            cast(float, record["expires_at"]),
+            str(record["nonce"]),
+            str(record["idempotency_key"]),
+            str(record["plan_digest"]),
             self._plan_issuer,
         )
+        self._register_plan(plan)
+        return plan
 
     def apply_auth_sync(
         self,
@@ -258,45 +658,73 @@ class OpenAICredentialService:
         upload: AuthorizedAuthIngress,
     ) -> AuthSyncReceiptV1:
         self._ensure_current_process()
-        with self._lock:
-            plan = self._validated_plan(plan)
-            applied = self._applied.get(plan.plan_digest)
-            if applied is not None:
-                return applied
-            if self._now() >= plan.expires_at:
-                raise OpenAICredentialError("control.plan_stale")
-            if not isinstance(upload, AuthorizedAuthIngress):
-                raise OpenAICredentialError("credential.upload_expired")
-            raw = upload._consume(self._ingress_authority, plan, self._process_id)
-            expected_backend_account = self._identities[plan.account_ref]
-            try:
-                canonical = validate_openai_auth_json(
-                    raw,
-                    expected_account_id=expected_backend_account,
-                )
-            except CredentialAuthorityError as exc:
-                if exc.code == "credential_identity_mismatch":
-                    raise OpenAICredentialError("oauth.identity_mismatch") from None
-                raise OpenAICredentialError("credential.source_unavailable") from None
-            try:
-                self._vault.store_projection(
-                    plan.account_ref,
-                    plan.expected_generation,
-                    canonical,
-                )
-            except CredentialVaultError as exc:
-                if exc.code == "credential.generation_conflict":
+        raw = bytearray()
+        if not isinstance(upload, AuthorizedAuthIngress):
+            raise OpenAICredentialError("credential.upload_expired")
+        try:
+            with self._lock:
+                plan = self._validated_plan(plan)
+                status = self._receipts.status(plan)
+                if status == "succeeded":
+                    return self._receipt(plan)
+                if status == "running":
+                    raise OpenAICredentialError("control.operation_ambiguous")
+                if status == "expired":
+                    raise OpenAICredentialError("control.plan_stale")
+                if self._now() >= plan.expires_at:
+                    raise OpenAICredentialError("control.plan_stale")
+                raw = upload._consume(self._ingress_authority, plan, self._process_id)
+                with self._identity_source.guard(plan.account_ref) as initial_identity:
+                    if (
+                        not initial_identity.enabled
+                        or initial_identity.generation != plan.expected_generation
+                    ):
+                        raise OpenAICredentialError("control.plan_stale")
+                    expected_backend_account = initial_identity.backend_account_id
+                try:
+                    canonical = validate_openai_auth_json(
+                        raw,
+                        expected_account_id=expected_backend_account,
+                    )
+                except CredentialAuthorityError as exc:
+                    if exc.code == "credential_identity_mismatch":
+                        raise OpenAICredentialError("oauth.identity_mismatch") from None
                     raise OpenAICredentialError(
-                        "credential.generation_conflict"
+                        "credential.source_unavailable"
                     ) from None
-                raise OpenAICredentialError("credential.source_unavailable") from None
-            receipt = AuthSyncReceiptV1(
-                plan.account_ref,
-                plan.expected_generation,
-                plan.plan_digest,
-            )
-            self._applied[plan.plan_digest] = receipt
-            return receipt
+                with self._identity_source.guard(plan.account_ref) as current_identity:
+                    if (
+                        not current_identity.enabled
+                        or current_identity.generation != plan.expected_generation
+                        or current_identity != initial_identity
+                        or self._now() >= plan.expires_at
+                    ):
+                        raise OpenAICredentialError("control.plan_stale")
+                    begin_state = self._receipts.begin(plan)
+                    if begin_state == "succeeded":
+                        return self._receipt(plan)
+                    if self._now() >= plan.expires_at:
+                        self._receipts.expire(plan)
+                        raise OpenAICredentialError("control.plan_stale")
+                    try:
+                        self._vault.store_projection(
+                            plan.account_ref,
+                            plan.expected_generation,
+                            canonical,
+                        )
+                    except CredentialVaultError as exc:
+                        if exc.code == "credential.generation_conflict":
+                            raise OpenAICredentialError(
+                                "credential.generation_conflict"
+                            ) from None
+                        raise OpenAICredentialError(
+                            "credential.source_unavailable"
+                        ) from None
+                    self._receipts.succeed(plan)
+                return self._receipt(plan)
+        finally:
+            _zero(raw)
+            upload.close()
 
     @contextmanager
     def materialize_auth_lease(
@@ -310,86 +738,111 @@ class OpenAICredentialService:
         account_ref = self._registered_account(account_ref)
         expected_generation = _generation(expected_generation)
         runtime_fd, runtime_metadata = _duplicate_runtime_dir(runtime_dir_fd)
-        materialized_fd: int | None = None
-        materialized_metadata: tuple[int, ...] | None = None
+        entry = _MaterializedAuth(account_ref, runtime_fd, runtime_metadata)
         payload = bytearray()
         owner_pid = self._process_id
-        published = False
+        registered = False
         try:
+            with self._lock:
+                if account_ref in self._materializing_accounts:
+                    raise OpenAICredentialError("credential.source_unavailable")
+                self._materializing_accounts.add(account_ref)
+                self._materializations.add(entry)
+                registered = True
+                self._ensure_janitor_locked()
             try:
-                lease = self._vault.lease(
+                with self._vault.materialization_lease(
                     account_ref,
                     expected_generation=expected_generation,
                     ttl_seconds=MAX_AUTH_SYNC_PLAN_SECONDS,
-                )
-                payload = bytearray(self._vault.consume_lease(lease))
+                    invalidator=entry.invalidate,
+                ) as (active, plaintext):
+                    payload = bytearray(plaintext)
+                    self._vault.publish_active(
+                        active,
+                        lambda: entry.publish(payload),
+                    )
+                    yield PurePosixPath(_FINAL_NAME)
             except CredentialVaultError as exc:
                 if exc.code == "credential.generation_conflict":
                     raise OpenAICredentialError(
                         "credential.generation_conflict"
                     ) from None
                 raise OpenAICredentialError("credential.source_unavailable") from None
-            materialized_fd, materialized_metadata = _publish_auth(
-                runtime_fd,
-                runtime_metadata,
-                payload,
-            )
-            published = True
-            try:
-                yield PurePosixPath(_FINAL_NAME)
-            except BaseException:
-                if os.getpid() == owner_pid:
-                    try:
-                        _remove_auth(
-                            runtime_fd,
-                            runtime_metadata,
-                            materialized_fd,
-                            materialized_metadata,
-                        )
-                    except OpenAICredentialError:
-                        pass
-                    published = False
-                raise
-            else:
-                if os.getpid() == owner_pid:
-                    _remove_auth(
-                        runtime_fd,
-                        runtime_metadata,
-                        materialized_fd,
-                        materialized_metadata,
-                    )
-                    published = False
         finally:
             _zero(payload)
-            if (
-                published
-                and materialized_fd is not None
-                and materialized_metadata is not None
-                and os.getpid() == owner_pid
-            ):
+            cleanup_error: OpenAICredentialError | None = None
+            if os.getpid() == owner_pid:
+                active_error = sys.exc_info()[0] is not None
+                attempts = 2 if active_error else 1
+                for _attempt in range(attempts):
+                    try:
+                        entry.close()
+                    except OpenAICredentialError:
+                        if not active_error and _attempt + 1 == attempts:
+                            cleanup_error = OpenAICredentialError(
+                                "credential.source_unavailable"
+                            )
+                    if not entry.published:
+                        break
+            with self._lock:
+                if registered and not entry.published:
+                    self._materializing_accounts.discard(account_ref)
+                    self._materializations.discard(entry)
+            if not entry.published:
+                entry.release_fds()
+                _close(runtime_fd)
+            if cleanup_error is not None:
+                raise cleanup_error
+
+    def reap_materializations(self) -> None:
+        self._ensure_current_process()
+        try:
+            self._vault.reconcile_active_leases()
+        except CredentialVaultError:
+            pass
+        with self._lock:
+            entries = tuple(self._materializations)
+        for entry in entries:
+            if entry.invalidated and entry.published:
                 try:
-                    _remove_auth(
-                        runtime_fd,
-                        runtime_metadata,
-                        materialized_fd,
-                        materialized_metadata,
-                    )
+                    entry.close()
                 except OpenAICredentialError:
-                    pass
-            if materialized_fd is not None:
-                _close(materialized_fd)
-            _close(runtime_fd)
+                    continue
+            if not entry.published:
+                with self._lock:
+                    self._materializing_accounts.discard(entry._account_ref)  # noqa: SLF001
+                    self._materializations.discard(entry)
+                entry.release_fds()
+                _close(entry._runtime_fd)  # noqa: SLF001 - registry owns duplicate
+
+    def _ensure_janitor_locked(self) -> None:
+        if self._janitor_started:
+            return
+        self._janitor_started = True
+        thread = threading.Thread(
+            target=_materialization_janitor,
+            args=(weakref.ref(self), self._janitor_stop),
+            name="openai-auth-materialization-janitor",
+            daemon=True,
+        )
+        thread.start()
 
     def _validated_plan(self, plan: object) -> AuthSyncPlanV1:
+        reference = (
+            self._plan_refs.get(id(plan)) if isinstance(plan, AuthSyncPlanV1) else None
+        )
         if (
             not isinstance(plan, AuthSyncPlanV1)
             or plan._issuer is not self._plan_issuer
-            or plan.account_ref not in self._identities
+            or reference is None
+            or reference() is not plan
             or _plan_digest(
                 plan.account_ref,
                 plan.expected_generation,
                 plan.expires_at,
                 plan.nonce,
+                plan.idempotency_key,
             )
             != plan.plan_digest
         ):
@@ -398,9 +851,34 @@ class OpenAICredentialService:
 
     def _registered_account(self, value: object) -> str:
         account_ref = _account_ref(value)
-        if account_ref not in self._identities:
-            raise OpenAICredentialError("control.request_invalid")
+        with self._identity_source.guard(account_ref) as identity:
+            if not identity.enabled:
+                raise OpenAICredentialError("control.request_invalid")
         return account_ref
+
+    def _register_plan(self, plan: AuthSyncPlanV1) -> None:
+        plan_id = id(plan)
+        service_ref = weakref.ref(self)
+
+        def forgotten(reference: weakref.ReferenceType[AuthSyncPlanV1]) -> None:
+            service = service_ref()
+            if service is None:
+                return
+            with service._lock:
+                if service._plan_refs.get(plan_id) is reference:
+                    service._plan_refs.pop(plan_id, None)
+
+        with self._lock:
+            self._plan_refs[plan_id] = weakref.ref(plan, forgotten)
+
+    def _receipt(self, plan: AuthSyncPlanV1) -> AuthSyncReceiptV1:
+        receipt = self._receipt_cache.get(plan.plan_digest)
+        if receipt is None:
+            receipt = AuthSyncReceiptV1(
+                plan.account_ref, plan.expected_generation, plan.plan_digest
+            )
+            self._receipt_cache[plan.plan_digest] = receipt
+        return receipt
 
     def _new_nonce(self) -> str:
         try:
@@ -451,11 +929,18 @@ def _generation(value: object) -> int:
     return value
 
 
+def _idempotency_key(value: object) -> str:
+    if type(value) is not str or _IDEMPOTENCY_KEY.fullmatch(value) is None:
+        raise OpenAICredentialError("control.request_invalid")
+    return value
+
+
 def _plan_digest(
     account_ref: str,
     generation: int,
     expires_at: float,
     nonce: str,
+    idempotency_key: str,
 ) -> str:
     if (
         _ACCOUNT_REF.fullmatch(account_ref) is None
@@ -467,6 +952,7 @@ def _plan_digest(
         or not math.isfinite(expires_at)
         or type(nonce) is not str
         or re.fullmatch(r"[0-9a-f]{64}", nonce, re.ASCII) is None
+        or _IDEMPOTENCY_KEY.fullmatch(idempotency_key) is None
     ):
         raise OpenAICredentialError("control.plan_stale")
     document = json.dumps(
@@ -474,6 +960,7 @@ def _plan_digest(
             "account_ref": account_ref,
             "expected_generation": generation,
             "expires_at": float(expires_at).hex(),
+            "idempotency_key": idempotency_key,
             "nonce": nonce,
             "schema_version": 1,
         },
@@ -683,6 +1170,32 @@ def _remove_auth(
         raise OpenAICredentialError("credential.source_unavailable") from None
 
 
+def _auth_name_absent(runtime_fd: int) -> bool:
+    try:
+        os.stat(_FINAL_NAME, dir_fd=runtime_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _materialization_janitor(
+    service_ref: weakref.ReferenceType[OpenAICredentialService],
+    stop: threading.Event,
+) -> None:
+    while not stop.wait(0.1):
+        service = service_ref()
+        if service is None:
+            return
+        try:
+            service.reap_materializations()
+        except BaseException:
+            pass
+        finally:
+            del service
+
+
 def _zero(value: bytearray) -> None:
     for index in range(len(value)):
         value[index] = 0
@@ -702,6 +1215,9 @@ __all__ = (
     "AuthSyncPlanV1",
     "AuthSyncReceiptV1",
     "MAX_AUTH_SYNC_PLAN_SECONDS",
+    "OpenAIAccountIdentity",
+    "OpenAIAuthReceiptStore",
     "OpenAICredentialError",
     "OpenAICredentialService",
+    "OpenAIIdentitySource",
 )
