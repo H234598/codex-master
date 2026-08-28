@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import stat
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,7 +33,8 @@ def vault_at(tmp_path: Path, *, clock: Clock | None = None) -> CredentialVault:
 
 
 def vault_path(tmp_path: Path, account_ref: str = "openai-one") -> Path:
-    return tmp_path / f"{account_ref}.vault"
+    storage_id = hashlib.sha256(account_ref.encode("ascii")).hexdigest()
+    return tmp_path / f"{storage_id}.vault"
 
 
 def test_vault_file_does_not_contain_auth_json(tmp_path: Path) -> None:
@@ -375,3 +378,375 @@ def test_consume_rejects_forged_handle(tmp_path: Path) -> None:
 
     with pytest.raises(CredentialVaultError, match="credential.vault_request_invalid"):
         vault.consume_lease(object())  # type: ignore[arg-type]
+
+
+def test_revoke_persists_generation_floor_across_restart(tmp_path: Path) -> None:
+    vault = vault_at(tmp_path)
+    vault.store_projection("openai-one", 7, b"revoked-marker")
+    assert vault.revoke_account("openai-one", expected_generation=7) is True
+
+    restarted = vault_at(tmp_path)
+    for generation in (6, 7):
+        with pytest.raises(
+            CredentialVaultError, match="credential.generation_conflict"
+        ):
+            restarted.store_projection("openai-one", generation, b"replay-marker")
+
+    restarted.store_projection("openai-one", 8, b"fresh")
+    lease = restarted.lease("openai-one", expected_generation=8, ttl_seconds=30)
+    assert restarted.consume_lease(lease) == b"fresh"
+
+
+def test_revoke_writes_private_secret_free_authenticated_tombstone(
+    tmp_path: Path,
+) -> None:
+    vault = vault_at(tmp_path)
+    vault.store_projection("openai-one", 7, b"revoked-marker")
+    assert vault.revoke_account("openai-one", expected_generation=7) is True
+
+    records = list(tmp_path.glob("*.vault"))
+    assert len(records) == 1
+    raw = records[0].read_bytes()
+    assert b"revoked-marker" not in raw
+    assert b"openai-one" not in raw
+    assert stat.S_IMODE(records[0].stat().st_mode) == 0o600
+    with pytest.raises(CredentialVaultError, match="credential.source_unavailable"):
+        vault.lease("openai-one", expected_generation=7, ttl_seconds=30)
+
+
+def test_revoke_floor_serializes_concurrent_same_generation_store(
+    tmp_path: Path,
+) -> None:
+    vault = vault_at(tmp_path)
+    vault.store_projection("openai-one", 7, b"old")
+    vault.revoke_account("openai-one", expected_generation=7)
+    contenders = (vault_at(tmp_path), vault_at(tmp_path))
+    barrier = threading.Barrier(3)
+    outcomes: list[tuple[str, bytes]] = []
+
+    def store(candidate: CredentialVault, plaintext: bytes) -> None:
+        barrier.wait()
+        try:
+            candidate.store_projection("openai-one", 8, plaintext)
+        except CredentialVaultError as exc:
+            outcomes.append((exc.code, b""))
+        else:
+            outcomes.append(("ok", plaintext))
+
+    threads = [
+        threading.Thread(target=store, args=(contenders[0], b"first")),
+        threading.Thread(target=store, args=(contenders[1], b"second")),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert [code for code, _value in outcomes].count("ok") == 1
+    assert [code for code, _value in outcomes].count(
+        "credential.generation_conflict"
+    ) == 1
+    winner = next(value for code, value in outcomes if code == "ok")
+    restarted = vault_at(tmp_path)
+    lease = restarted.lease("openai-one", expected_generation=8, ttl_seconds=30)
+    assert restarted.consume_lease(lease) == winner
+
+
+def test_revoke_cas_is_concurrent_and_restart_safe(tmp_path: Path) -> None:
+    original = vault_at(tmp_path)
+    original.store_projection("openai-one", 7, b"old")
+    contenders = (vault_at(tmp_path), vault_at(tmp_path))
+    barrier = threading.Barrier(3)
+    outcomes: list[str] = []
+
+    def revoke(candidate: CredentialVault) -> None:
+        barrier.wait()
+        try:
+            candidate.revoke_account("openai-one", expected_generation=7)
+        except CredentialVaultError as exc:
+            outcomes.append(exc.code)
+        else:
+            outcomes.append("ok")
+
+    threads = [
+        threading.Thread(target=revoke, args=(candidate,)) for candidate in contenders
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert outcomes.count("ok") == 1
+    assert outcomes.count("credential.generation_conflict") == 1
+    restarted = vault_at(tmp_path)
+    with pytest.raises(CredentialVaultError, match="credential.generation_conflict"):
+        restarted.store_projection("openai-one", 7, b"replay")
+
+
+def test_failed_tombstone_replace_preserves_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import codex_master.hive.state as state_module
+
+    vault = vault_at(tmp_path)
+    vault.store_projection("openai-one", 7, b"still-active")
+
+    def fail_replace(*_args: object, **_kwargs: object) -> None:
+        raise OSError("private failure text")
+
+    with monkeypatch.context() as context:
+        context.setattr(state_module.os, "replace", fail_replace)
+        with pytest.raises(CredentialVaultError, match="credential.source_unavailable"):
+            vault.revoke_account("openai-one", expected_generation=7)
+
+    lease = vault.lease("openai-one", expected_generation=7, ttl_seconds=30)
+    assert vault.consume_lease(lease) == b"still-active"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is POSIX-only")
+def test_parent_lease_cannot_be_consumed_in_forked_child(tmp_path: Path) -> None:
+    vault = vault_at(tmp_path)
+    vault.store_projection("openai-one", 1, b"fork-private-marker")
+    lease = vault.lease("openai-one", expected_generation=1, ttl_seconds=30)
+    read_fd, write_fd = os.pipe()
+
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        try:
+            vault.consume_lease(lease)
+        except CredentialVaultError as exc:
+            outcome = f"denied:{exc.code}".encode("ascii")
+        except BaseException:
+            outcome = b"raw-error"
+        else:
+            outcome = b"consumed"
+        os.write(write_fd, outcome)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    outcome = os.read(read_fd, 256)
+    os.close(read_fd)
+    _, status = os.waitpid(child, 0)
+    parent_plaintext = vault.consume_lease(lease)
+
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert outcome.startswith(b"denied:credential.")
+    assert b"fork-private-marker" not in outcome
+    assert parent_plaintext == b"fork-private-marker"
+
+
+@pytest.mark.parametrize("length", [122, 123, 128])
+def test_maximum_account_refs_round_trip_after_restart(
+    tmp_path: Path, length: int
+) -> None:
+    account_ref = "a" * length
+    vault = vault_at(tmp_path)
+    vault.store_projection(account_ref, 1, b"secret")
+
+    records = list(tmp_path.glob("*.vault"))
+    assert len(records) == 1
+    assert (
+        records[0].name
+        == hashlib.sha256(account_ref.encode("ascii")).hexdigest() + ".vault"
+    )
+    assert len(records[0].name) == 70
+
+    restarted = vault_at(tmp_path)
+    lease = restarted.lease(account_ref, expected_generation=1, ttl_seconds=30)
+    assert restarted.consume_lease(lease) == b"secret"
+
+
+def test_storage_id_collision_fails_closed_without_clobbering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        CredentialVault,
+        "_storage_name",
+        staticmethod(lambda _account_ref: "f" * 64 + ".vault"),
+        raising=False,
+    )
+    vault = vault_at(tmp_path)
+    vault.store_projection("openai-one", 1, b"first-secret")
+
+    with pytest.raises(
+        CredentialVaultError, match="credential.vault_authentication_failed"
+    ):
+        vault.store_projection("openai-two", 1, b"second-secret")
+
+    restarted = vault_at(tmp_path)
+    lease = restarted.lease("openai-one", expected_generation=1, ttl_seconds=30)
+    assert restarted.consume_lease(lease) == b"first-secret"
+
+
+def _changed_stat(info: os.stat_result, **changes: int) -> SimpleNamespace:
+    values = {
+        "st_mode": info.st_mode,
+        "st_nlink": info.st_nlink,
+        "st_uid": info.st_uid,
+        "st_size": info.st_size,
+        "st_dev": info.st_dev,
+        "st_ino": info.st_ino,
+        "st_mtime_ns": info.st_mtime_ns,
+        "st_ctime_ns": info.st_ctime_ns,
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("st_mode", 0o100644),
+        ("st_mode", stat.S_IFDIR | 0o400),
+        ("st_nlink", 2),
+        ("st_uid", 2**31 - 1),
+    ],
+)
+def test_key_fd_rejects_post_read_metadata_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: int,
+) -> None:
+    import codex_master.credential_vault as vault_module
+
+    key_path = tmp_path / "master-key"
+    key_path.write_bytes(KEY)
+    key_path.chmod(0o400)
+    descriptor = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
+    real_fstat = vault_module.os.fstat
+    calls = 0
+
+    def racing_fstat(fd: int) -> os.stat_result | SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        observed = real_fstat(fd)
+        if calls >= 2:
+            return _changed_stat(observed, **{field: replacement})
+        return observed
+
+    try:
+        monkeypatch.setattr(vault_module.os, "fstat", racing_fstat)
+        with pytest.raises(CredentialVaultError, match="credential.vault_key_invalid"):
+            CredentialVault.from_key_fd(tmp_path / "vault", key_fd=descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_key_fd_rejects_equal_length_content_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import codex_master.credential_vault as vault_module
+
+    key_path = tmp_path / "master-key"
+    key_path.write_bytes(KEY)
+    key_path.chmod(0o400)
+    descriptor = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
+    reads = 0
+
+    def racing_pread(_fd: int, size: int, offset: int) -> bytes:
+        nonlocal reads
+        if offset == 32:
+            return b""
+        assert size == 33 and offset == 0
+        reads += 1
+        return KEY if reads == 1 else b"q" * 32
+
+    try:
+        monkeypatch.setattr(vault_module.os, "pread", racing_pread)
+        with pytest.raises(CredentialVaultError, match="credential.vault_key_invalid"):
+            CredentialVault.from_key_fd(tmp_path / "vault", key_fd=descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_key_fd_rejects_offset_change_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import codex_master.credential_vault as vault_module
+
+    key_path = tmp_path / "master-key"
+    key_path.write_bytes(KEY)
+    key_path.chmod(0o400)
+    descriptor = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
+    offsets = iter((0, 1))
+    try:
+        monkeypatch.setattr(vault_module.os, "lseek", lambda *_args: next(offsets))
+        with pytest.raises(CredentialVaultError, match="credential.vault_key_invalid"):
+            CredentialVault.from_key_fd(tmp_path / "vault", key_fd=descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_key_buffer_is_zeroed_when_post_read_fstat_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import codex_master.credential_vault as vault_module
+
+    key_path = tmp_path / "master-key"
+    key_path.write_bytes(KEY)
+    key_path.chmod(0o400)
+    descriptor = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
+    real_fstat = vault_module.os.fstat
+    real_zero = CredentialVault._zero
+    fstat_calls = 0
+    zeroed: list[bytearray] = []
+
+    def failing_fstat(fd: int) -> os.stat_result:
+        nonlocal fstat_calls
+        fstat_calls += 1
+        if fstat_calls == 2:
+            raise OSError("private failure text")
+        return real_fstat(fd)
+
+    def recording_zero(value: bytearray) -> None:
+        zeroed.append(value)
+        real_zero(value)
+
+    try:
+        monkeypatch.setattr(vault_module.os, "fstat", failing_fstat)
+        monkeypatch.setattr(CredentialVault, "_zero", staticmethod(recording_zero))
+        with pytest.raises(CredentialVaultError, match="credential.vault_key_invalid"):
+            CredentialVault.from_key_fd(tmp_path / "vault", key_fd=descriptor)
+    finally:
+        os.close(descriptor)
+
+    assert zeroed
+    assert all(not any(buffer) for buffer in zeroed)
+
+
+def test_entropy_failures_are_code_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import codex_master.credential_vault as vault_module
+
+    vault = vault_at(tmp_path)
+    monkeypatch.setattr(
+        vault_module.os,
+        "urandom",
+        lambda _size: (_ for _ in ()).throw(OSError("private entropy text")),
+    )
+    with pytest.raises(CredentialVaultError) as store_error:
+        vault.store_projection("openai-one", 1, b"secret-marker")
+    assert store_error.value.code == "credential.source_unavailable"
+    assert "private entropy text" not in str(store_error.value)
+    assert store_error.value.__cause__ is None
+
+    monkeypatch.undo()
+    vault.store_projection("openai-one", 1, b"secret-marker")
+    monkeypatch.setattr(
+        vault_module.secrets,
+        "token_hex",
+        lambda _size: (_ for _ in ()).throw(OSError("private token text")),
+    )
+    with pytest.raises(CredentialVaultError) as lease_error:
+        vault.lease("openai-one", expected_generation=1, ttl_seconds=30)
+    assert lease_error.value.code == "credential.source_unavailable"
+    assert "private token text" not in str(lease_error.value)
+    assert lease_error.value.__cause__ is None

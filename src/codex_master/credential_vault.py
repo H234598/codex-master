@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import hashlib
+import hmac
 import math
 import os
 from pathlib import Path, PurePosixPath
@@ -14,6 +16,7 @@ import struct
 import threading
 import time
 from typing import Final
+import weakref
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -30,9 +33,12 @@ _MAX_ACCOUNT_REF_BYTES: Final[int] = 128
 _NONCE_BYTES: Final[int] = 12
 _TAG_BYTES: Final[int] = 16
 _MAGIC: Final[bytes] = b"CMVAULT\0"
-_SCHEMA_VERSION: Final[int] = 1
-_HEADER: Final[struct.Struct] = struct.Struct(">8sBQ12s")
-_MAX_VAULT_FILE_BYTES: Final[int] = _HEADER.size + MAX_PROJECTION_BYTES + _TAG_BYTES
+_SCHEMA_VERSION: Final[int] = 2
+_STATE_ACTIVE: Final[int] = 1
+_STATE_REVOKED: Final[int] = 2
+_HEADER: Final[struct.Struct] = struct.Struct(">8sBBQ12s")
+_MAX_ENVELOPE_BYTES: Final[int] = 2 + _MAX_ACCOUNT_REF_BYTES + MAX_PROJECTION_BYTES
+_MAX_VAULT_FILE_BYTES: Final[int] = _HEADER.size + _MAX_ENVELOPE_BYTES + _TAG_BYTES
 _ACCOUNT_REF: Final[re.Pattern[str]] = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII
 )
@@ -49,6 +55,16 @@ _ERROR_CODES: Final[frozenset[str]] = frozenset(
         "credential.vault_schema_invalid",
     }
 )
+_VAULT_INSTANCES: weakref.WeakSet[CredentialVault] = weakref.WeakSet()
+
+
+def _invalidate_vaults_after_fork() -> None:
+    for vault in tuple(_VAULT_INSTANCES):
+        vault._invalidate_after_fork()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_invalidate_vaults_after_fork)
 
 
 class CredentialVaultError(ValueError):
@@ -77,11 +93,12 @@ class CredentialLease:
         return "<CredentialLease>"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class _LeaseState:
     account_ref: str
     generation: int
     expires_at: float
+    process_id: int
 
 
 class CredentialVault:
@@ -93,7 +110,9 @@ class CredentialVault:
         "_lease_issuer",
         "_lease_lock",
         "_leases",
+        "_process_id",
         "_state",
+        "__weakref__",
     )
 
     def __init__(
@@ -159,39 +178,77 @@ class CredentialVault:
         self._lease_issuer = object()
         self._lease_lock = threading.Lock()
         self._leases: dict[str, _LeaseState] = {}
+        self._process_id = os.getpid()
+        _VAULT_INSTANCES.add(self)
 
     @staticmethod
     def _read_key_fd(key_fd: int) -> bytearray:
         if isinstance(key_fd, bool) or not isinstance(key_fd, int) or key_fd < 0:
             raise CredentialVaultError("credential.vault_key_invalid")
+        key = bytearray()
+        verification = bytearray()
+        accepted = False
         try:
             before = os.fstat(key_fd)
-            if (
-                not stat.S_ISREG(before.st_mode)
-                or before.st_nlink != 1
-                or before.st_uid not in {0, os.geteuid()}
-                or stat.S_IMODE(before.st_mode) not in {0o400, 0o600}
-                or before.st_size != 32
-            ):
-                raise CredentialVaultError("credential.vault_key_invalid")
-            key = bytearray(os.pread(key_fd, 33, 0))
-            after = os.fstat(key_fd)
-            if (
-                len(key) != 32
-                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
-                or before.st_size != after.st_size
-            ):
-                CredentialVault._zero(key)
-                raise CredentialVaultError("credential.vault_key_invalid")
-            return key
-        except CredentialVaultError:
-            raise
+            if CredentialVault._valid_key_metadata(before):
+                offset_before = os.lseek(key_fd, 0, os.SEEK_CUR)
+                key = bytearray(os.pread(key_fd, 33, 0))
+                eof_after_key = os.pread(key_fd, 1, 32)
+                middle = os.fstat(key_fd)
+                verification = bytearray(os.pread(key_fd, 33, 0))
+                verification_eof = os.pread(key_fd, 1, 32)
+                after = os.fstat(key_fd)
+                offset_after = os.lseek(key_fd, 0, os.SEEK_CUR)
+                accepted = (
+                    CredentialVault._valid_key_metadata(middle)
+                    and CredentialVault._valid_key_metadata(after)
+                    and CredentialVault._key_metadata(before)
+                    == CredentialVault._key_metadata(middle)
+                    == CredentialVault._key_metadata(after)
+                    and len(key) == 32
+                    and len(verification) == 32
+                    and not eof_after_key
+                    and not verification_eof
+                    and offset_before == offset_after
+                    and hmac.compare_digest(key, verification)
+                )
         except OSError:
-            raise CredentialVaultError("credential.vault_key_invalid") from None
+            accepted = False
+        finally:
+            CredentialVault._zero(verification)
+            if not accepted:
+                CredentialVault._zero(key)
+        if not accepted:
+            raise CredentialVaultError("credential.vault_key_invalid")
+        return key
+
+    @staticmethod
+    def _valid_key_metadata(info: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(info.st_mode)
+            and info.st_nlink == 1
+            and info.st_uid in {0, os.geteuid()}
+            and stat.S_IMODE(info.st_mode) in {0o400, 0o600}
+            and info.st_size == 32
+        )
+
+    @staticmethod
+    def _key_metadata(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_size,
+            info.st_uid,
+            info.st_nlink,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
 
     def store_projection(
         self, account_ref: str, generation: int, plaintext: bytes
     ) -> None:
+        self._ensure_current_process()
         account_ref = self._validated_account_ref(account_ref)
         generation = self._validated_generation(generation)
         if (
@@ -201,16 +258,13 @@ class CredentialVault:
         ):
             raise CredentialVaultError("credential.vault_request_invalid")
 
-        nonce = os.urandom(_NONCE_BYTES)
-        aad = self._aad(account_ref, generation)
-        ciphertext = self._cipher.encrypt(nonce, plaintext, aad)
-        record = _HEADER.pack(_MAGIC, _SCHEMA_VERSION, generation, nonce) + ciphertext
+        record = self._encrypt_record(account_ref, generation, _STATE_ACTIVE, plaintext)
         relative = self._relative(account_ref)
 
         try:
             with self._state.locked():
                 current = self._read_optional_locked(relative, account_ref)
-                if current is not None and generation <= current[0]:
+                if current is not None and generation <= current[1]:
                     raise CredentialVaultError("credential.generation_conflict")
                 self._state.replace_private_bytes(relative, record)
         except CredentialVaultError:
@@ -225,6 +279,7 @@ class CredentialVault:
         expected_generation: int,
         ttl_seconds: int,
     ) -> CredentialLease:
+        self._ensure_current_process()
         account_ref = self._validated_account_ref(account_ref)
         expected_generation = self._validated_generation(expected_generation)
         if (
@@ -242,6 +297,7 @@ class CredentialVault:
             account_ref=account_ref,
             generation=generation,
             expires_at=now + ttl_seconds,
+            process_id=self._process_id,
         )
         with self._lease_lock:
             self._prune_expired_locked(now)
@@ -252,6 +308,7 @@ class CredentialVault:
         return CredentialLease(token, self._lease_issuer)
 
     def consume_lease(self, lease: CredentialLease) -> bytes:
+        self._ensure_current_process()
         if (
             not isinstance(lease, CredentialLease)
             or lease._issuer is not self._lease_issuer
@@ -263,6 +320,8 @@ class CredentialVault:
             raise CredentialVaultError("credential.lease_consumed")
         if self._now() >= state.expires_at:
             raise CredentialVaultError("credential.lease_expired")
+        if state.process_id != self._process_id:
+            raise CredentialVaultError("credential.lease_consumed")
 
         generation, plaintext = self._read_projection(state.account_ref)
         if generation != state.generation:
@@ -270,17 +329,21 @@ class CredentialVault:
         return plaintext
 
     def revoke_account(self, account_ref: str, *, expected_generation: int) -> bool:
+        self._ensure_current_process()
         account_ref = self._validated_account_ref(account_ref)
         expected_generation = self._validated_generation(expected_generation)
         relative = self._relative(account_ref)
         try:
             with self._state.locked():
                 current = self._read_optional_locked(relative, account_ref)
-                if current is None:
+                if current is None or current[0] != _STATE_ACTIVE:
                     raise CredentialVaultError("credential.generation_conflict")
-                if current[0] != expected_generation:
+                if current[1] != expected_generation:
                     raise CredentialVaultError("credential.generation_conflict")
-                self._state.remove_private_bytes(relative)
+                tombstone = self._encrypt_record(
+                    account_ref, expected_generation, _STATE_REVOKED, b""
+                )
+                self._state.replace_private_bytes(relative, tombstone)
         except CredentialVaultError:
             raise
         except HiveStateError:
@@ -304,11 +367,14 @@ class CredentialVault:
             raise CredentialVaultError("credential.source_unavailable") from None
         if current is None:
             raise CredentialVaultError("credential.source_unavailable")
-        return current
+        record_state, generation, plaintext = current
+        if record_state != _STATE_ACTIVE:
+            raise CredentialVaultError("credential.source_unavailable")
+        return generation, plaintext
 
     def _read_optional_locked(
         self, relative: PurePosixPath, account_ref: str
-    ) -> tuple[int, bytes] | None:
+    ) -> tuple[int, int, bytes] | None:
         try:
             raw = self._state.read_private_bytes(
                 relative, max_bytes=_MAX_VAULT_FILE_BYTES
@@ -319,40 +385,82 @@ class CredentialVault:
             raise
         return self._decrypt_record(raw, account_ref)
 
-    def _decrypt_record(self, raw: bytes, account_ref: str) -> tuple[int, bytes]:
+    def _decrypt_record(self, raw: bytes, account_ref: str) -> tuple[int, int, bytes]:
         if len(raw) < _HEADER.size + _TAG_BYTES:
             raise CredentialVaultError("credential.vault_schema_invalid")
         try:
-            magic, schema_version, generation, nonce = _HEADER.unpack_from(raw)
+            magic, schema_version, record_state, generation, nonce = (
+                _HEADER.unpack_from(raw)
+            )
         except struct.error:
             raise CredentialVaultError("credential.vault_schema_invalid") from None
         if (
             magic != _MAGIC
             or schema_version != _SCHEMA_VERSION
+            or record_state not in {_STATE_ACTIVE, _STATE_REVOKED}
             or not 1 <= generation <= _MAX_GENERATION
             or len(raw) > _MAX_VAULT_FILE_BYTES
         ):
             raise CredentialVaultError("credential.vault_schema_invalid")
         try:
-            plaintext = self._cipher.decrypt(
+            envelope = self._cipher.decrypt(
                 nonce,
                 raw[_HEADER.size :],
-                self._aad(account_ref, generation),
+                self._aad(account_ref, generation, record_state),
             )
         except InvalidTag:
             raise CredentialVaultError(
                 "credential.vault_authentication_failed"
             ) from None
-        if not plaintext or len(plaintext) > MAX_PROJECTION_BYTES:
+        encoded_ref = account_ref.encode("ascii")
+        if len(envelope) < 2 + len(encoded_ref):
             raise CredentialVaultError("credential.vault_schema_invalid")
-        return generation, plaintext
+        ref_size = int.from_bytes(envelope[:2], "big")
+        stored_ref = envelope[2 : 2 + ref_size]
+        plaintext = envelope[2 + ref_size :]
+        if (
+            ref_size != len(encoded_ref)
+            or not hmac.compare_digest(stored_ref, encoded_ref)
+            or (record_state == _STATE_ACTIVE and not plaintext)
+            or (record_state == _STATE_REVOKED and plaintext)
+            or len(plaintext) > MAX_PROJECTION_BYTES
+        ):
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        return record_state, generation, plaintext
+
+    def _encrypt_record(
+        self,
+        account_ref: str,
+        generation: int,
+        record_state: int,
+        plaintext: bytes,
+    ) -> bytes:
+        nonce: bytes | None
+        try:
+            nonce = os.urandom(_NONCE_BYTES)
+        except OSError:
+            nonce = None
+        if type(nonce) is not bytes or len(nonce) != _NONCE_BYTES:
+            raise CredentialVaultError("credential.source_unavailable")
+        encoded_ref = account_ref.encode("ascii")
+        envelope = len(encoded_ref).to_bytes(2, "big") + encoded_ref + plaintext
+        ciphertext = self._cipher.encrypt(
+            nonce,
+            envelope,
+            self._aad(account_ref, generation, record_state),
+        )
+        return (
+            _HEADER.pack(_MAGIC, _SCHEMA_VERSION, record_state, generation, nonce)
+            + ciphertext
+        )
 
     @staticmethod
-    def _aad(account_ref: str, generation: int) -> bytes:
+    def _aad(account_ref: str, generation: int, record_state: int) -> bytes:
         encoded = account_ref.encode("ascii")
         return (
             b"codex-master-credential-projection\0"
             + bytes([_SCHEMA_VERSION])
+            + bytes([record_state])
             + len(encoded).to_bytes(2, "big")
             + encoded
             + generation.to_bytes(8, "big")
@@ -360,7 +468,12 @@ class CredentialVault:
 
     @staticmethod
     def _relative(account_ref: str) -> PurePosixPath:
-        return PurePosixPath(f"{account_ref}.vault")
+        return PurePosixPath(CredentialVault._storage_name(account_ref))
+
+    @staticmethod
+    def _storage_name(account_ref: str) -> str:
+        digest = hashlib.sha256(account_ref.encode("ascii")).hexdigest()
+        return f"{digest}.vault"
 
     @staticmethod
     def _validated_account_ref(account_ref: str) -> str:
@@ -396,6 +509,16 @@ class CredentialVault:
             raise CredentialVaultError("credential.source_unavailable")
         return float(value)
 
+    def _ensure_current_process(self) -> None:
+        if self._process_id != os.getpid():
+            self._invalidate_after_fork()
+            raise CredentialVaultError("credential.source_unavailable")
+
+    def _invalidate_after_fork(self) -> None:
+        self._lease_lock = threading.Lock()
+        self._leases = {}
+        self._lease_issuer = object()
+
     def _prune_expired_locked(self, now: float) -> None:
         self._leases = {
             token: state
@@ -405,7 +528,13 @@ class CredentialVault:
 
     def _new_lease_token_locked(self) -> str:
         while True:
-            token = secrets.token_hex(32)
+            token: str | None
+            try:
+                token = secrets.token_hex(32)
+            except OSError:
+                token = None
+            if type(token) is not str or len(token) != 64:
+                raise CredentialVaultError("credential.source_unavailable")
             if token not in self._leases:
                 return token
 
