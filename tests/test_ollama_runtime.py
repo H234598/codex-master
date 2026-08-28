@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import fcntl
+import gc
 import os
 from pathlib import Path
 import re
@@ -47,6 +49,7 @@ class FakeRuntime:
         self.process_up = True
         self.cgroup_matches = True
         self.listener_matches = True
+        self.invalidate_scope_after_fetch = False
         self.scope_pid = 4343
         self.scope_control_group = "/user.slice/ollama.scope"
         self.scope_start_ticks = 901
@@ -83,10 +86,13 @@ class FakeRuntime:
         self.cleaned.append(request.unit_name)  # type: ignore[attr-defined]
 
     def fetch_tags(
-        self, port: int, *, timeout_seconds: float, max_bytes: int
+        self, pid: int, port: int, *, timeout_seconds: float, max_bytes: int
     ) -> set[str] | None:
+        assert pid == self.scope_pid
         assert port == 11435
         self.tag_probe_limits = (timeout_seconds, max_bytes)
+        if self.invalidate_scope_after_fetch:
+            self.cgroup_matches = False
         return self.tags
 
     def stop_scope(self, request: object) -> None:
@@ -297,17 +303,25 @@ def test_start_uses_fixed_argv_allowlisted_environment_and_exact_cpu_properties(
     )
     assert request.argv[10:14] == (  # type: ignore[attr-defined]
         f"/proc/{os.getpid()}/exe",
-        "-m",
-        "codex_master.ollama_runtime",
-        "--exec-pinned",
+        "-I",
+        "-P",
+        "-c",
     )
+    assert request.argv[14] == ollama_runtime._EXEC_HELPER_SOURCE  # type: ignore[attr-defined]
     assert request.argv[-2:] != (plan.instance.ollama_executable, "serve")  # type: ignore[attr-defined]
     assert re.fullmatch(r"codex-master-ollama-[a-f0-9]{32}\.scope", result.unit_name)
     assert request.launcher_environment == {  # type: ignore[attr-defined]
         "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.geteuid()}/bus",
-        "PYTHONPATH": str(Path(ollama_runtime.__file__).parent.parent),
         "XDG_RUNTIME_DIR": f"/run/user/{os.geteuid()}",
     }
+
+
+def test_plan_accepts_equivalent_noncanonical_cpu_set(tmp_path: Path) -> None:
+    instance = replace(valid_instance(tmp_path), allowed_cpus="0,1")
+
+    plan = plan_from_registry(instance)
+
+    assert plan.cpu_profile.systemd_properties()["AllowedCPUs"] == "0-1"
 
 
 def test_system_runtime_executes_argv_without_shell_or_ambient_environment(
@@ -342,7 +356,6 @@ def test_system_runtime_executes_argv_without_shell_or_ambient_environment(
             "DBUS_SESSION_BUS_ADDRESS": (
                 f"unix:path=/run/user/{active.plan.host.effective_uid}/bus"
             ),
-            "PYTHONPATH": str(Path(ollama_runtime.__file__).parent.parent),
             "XDG_RUNTIME_DIR": f"/run/user/{active.plan.host.effective_uid}",
         },
         "stdin": subprocess.DEVNULL,
@@ -351,6 +364,75 @@ def test_system_runtime_executes_argv_without_shell_or_ambient_environment(
         "close_fds": True,
         "shell": False,
     }
+
+
+def test_helper_launch_does_not_import_code_from_configured_module_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_root = tmp_path / "attacker"
+    package = fake_root / "codex_master"
+    package.mkdir(parents=True)
+    marker = tmp_path / "imported"
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "ollama_runtime.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('loaded')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        ollama_runtime,
+        "__file__",
+        str(package / "ollama_runtime.py"),
+    )
+    runtime = FakeRuntime()
+    lane = tmp_path / "lane"
+    lane.mkdir()
+    start_local_instance(planned(lane), runtime=runtime)
+    request = runtime.started[0]
+    assert isinstance(request, ollama_runtime.OllamaStartRequest)
+
+    subprocess.run(
+        request.argv[10:],
+        cwd=tmp_path,
+        env=request.launcher_environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5.0,
+        check=False,
+    )
+
+    assert not marker.exists()
+
+
+def test_isolated_helper_executes_pinned_elf_from_sealed_memfd(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    instance = valid_instance(tmp_path, ollama_executable="/usr/bin/yes")
+    plan = plan_from_registry(instance)
+    start_local_instance(plan, runtime=runtime)
+    request = runtime.started[0]
+    assert isinstance(request, ollama_runtime.OllamaStartRequest)
+
+    process = subprocess.Popen(
+        request.argv[10:],
+        env=request.launcher_environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    try:
+        deadline = time.monotonic() + 2.0
+        executable = ""
+        while time.monotonic() < deadline and process.poll() is None:
+            executable = os.readlink(f"/proc/{process.pid}/exe")
+            if "memfd:codex-master-ollama-executable" in executable:
+                break
+            time.sleep(0.01)
+        assert process.poll() is None
+        assert "memfd:codex-master-ollama-executable" in executable
+    finally:
+        process.terminate()
+        process.wait(timeout=5.0)
 
 
 def test_system_runtime_rejects_non_allowlisted_argv_before_process_start(
@@ -561,6 +643,16 @@ def test_plan_provenance_rejects_in_place_field_substitution(tmp_path: Path) -> 
     assert runtime.started == []
 
 
+def test_discarded_plan_releases_provenance_record(tmp_path: Path) -> None:
+    plan = planned(tmp_path)
+    provenance = plan._provenance
+
+    del plan
+    gc.collect()
+
+    assert provenance not in ollama_runtime._PLAN_RECORDS
+
+
 def test_in_place_executable_mutation_after_plan_is_rejected(tmp_path: Path) -> None:
     runtime = FakeRuntime()
     plan = planned(tmp_path)
@@ -572,6 +664,68 @@ def test_in_place_executable_mutation_after_plan_is_rejected(tmp_path: Path) -> 
 
     with pytest.raises(OllamaRuntimeError, match="resource.target_path_changed"):
         start_local_instance(plan, runtime=runtime)
+
+
+def test_executable_digest_has_hard_byte_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = make_executable(tmp_path / "ollama")
+    models = make_models_directory(tmp_path / "models")
+    real_read = os.read
+    served = 0
+
+    def growing_read(descriptor: int, size: int) -> bytes:
+        nonlocal served
+        if os.readlink(f"/proc/self/fd/{descriptor}") == str(executable):
+            if served >= 4096:
+                return b""
+            chunk = b"x" * min(size, 1024)
+            served += len(chunk)
+            return chunk
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(ollama_runtime, "_MAX_EXECUTABLE_BYTES", 2048)
+    monkeypatch.setattr(os, "read", growing_read)
+
+    with pytest.raises(OllamaRuntimeError, match="resource.target_path_invalid"):
+        plan_from_registry(
+            valid_instance(
+                tmp_path,
+                ollama_executable=str(executable),
+                models_directory=str(models),
+            )
+        )
+
+    assert served <= 3072
+
+
+def test_executable_digest_rejects_concurrent_in_place_growth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = make_executable(tmp_path / "ollama")
+    models = make_models_directory(tmp_path / "models")
+    real_read = os.read
+    mutated = False
+
+    def mutating_read(descriptor: int, size: int) -> bytes:
+        nonlocal mutated
+        data = real_read(descriptor, size)
+        if not mutated and os.readlink(f"/proc/self/fd/{descriptor}") == str(executable):
+            mutated = True
+            with executable.open("ab") as stream:
+                stream.write(b"# concurrent mutation\n")
+        return data
+
+    monkeypatch.setattr(os, "read", mutating_read)
+
+    with pytest.raises(OllamaRuntimeError, match="resource.target_path_invalid"):
+        plan_from_registry(
+            valid_instance(
+                tmp_path,
+                ollama_executable=str(executable),
+                models_directory=str(models),
+            )
+        )
 
 
 def test_user_owned_hardlinked_executable_is_rejected(tmp_path: Path) -> None:
@@ -643,6 +797,43 @@ def test_running_identity_uses_scope_leader_not_systemd_run_pid(tmp_path: Path) 
     assert active.process_start_ticks == 901
 
 
+def test_scope_resolution_waits_for_pinned_target_exec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeRuntime()
+    running(tmp_path, fake)
+    request = fake.started[0]
+    assert isinstance(request, ollama_runtime.OllamaStartRequest)
+    runtime = SystemOllamaRuntime()
+    monkeypatch.setattr(
+        runtime,
+        "_scope_observation",
+        lambda _unit_name: (4343, "/user.slice/ollama.scope", 901),
+    )
+    observations = iter((False, True))
+    calls = 0
+
+    def target_exec(_pid: int) -> bool:
+        nonlocal calls
+        calls += 1
+        return next(observations)
+
+    monkeypatch.setattr(
+        ollama_runtime,
+        "_process_executable_is_pinned",
+        target_exec,
+        raising=False,
+    )
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    assert runtime.resolve_scope(request, FakeProcess()) == (
+        4343,
+        "/user.slice/ollama.scope",
+        901,
+    )
+    assert calls == 2
+
+
 def test_system_scope_identity_uses_single_cgroup_procs_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -681,6 +872,17 @@ def test_foreign_listener_cannot_make_instance_ready(tmp_path: Path) -> None:
     assert runtime.tag_probe_limits is None
 
 
+def test_readiness_rechecks_scope_identity_after_connected_tags(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    runtime.invalidate_scope_after_fetch = True
+    active = running(tmp_path, runtime)
+
+    status = probe_instance_readiness(active, runtime=runtime)
+
+    assert status.ready is False
+    assert status.reason_codes == ("resource.scope_membership_invalid",)
+
+
 def test_forged_running_unit_cannot_be_stopped(tmp_path: Path) -> None:
     runtime = FakeRuntime()
     active = running(tmp_path, runtime)
@@ -710,6 +912,17 @@ def test_running_provenance_rejects_in_place_unit_substitution(tmp_path: Path) -
     assert runtime.stopped == []
 
 
+def test_discarded_running_instance_releases_provenance_record(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    active = running(tmp_path, runtime)
+    provenance = active._provenance
+
+    del active
+    gc.collect()
+
+    assert provenance not in ollama_runtime._RUNNING_RECORDS
+
+
 def test_partial_start_is_cleaned_when_process_dies_immediately(tmp_path: Path) -> None:
     runtime = FakeRuntime()
     runtime.process_up = False
@@ -720,18 +933,45 @@ def test_partial_start_is_cleaned_when_process_dies_immediately(tmp_path: Path) 
     assert len(runtime.cleaned) == 1
 
 
+def test_partial_start_is_cleaned_on_baseexception_before_running_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = FakeRuntime()
+    plan = planned(tmp_path)
+    calls = 0
+
+    def interrupt_running_provenance(length: int) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise KeyboardInterrupt
+        return b"s" * length
+
+    monkeypatch.setattr(ollama_runtime.secrets, "token_bytes", interrupt_running_provenance)
+
+    with pytest.raises(KeyboardInterrupt):
+        start_local_instance(plan, runtime=runtime)
+
+    assert len(runtime.cleaned) == 1
+
+
 def test_exec_helper_holds_validated_executable_and_models_fds_until_exec(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plan = planned(tmp_path)
+    executable_path = Path(plan.instance.ollama_executable)
+    original_bytes = executable_path.read_bytes()
     observed: dict[str, object] = {}
 
     def execve(
         executable_fd: int, argv: tuple[str, ...], environment: dict[str, str]
     ) -> None:
         models_fd = int(environment["OLLAMA_MODELS"].rsplit("/", 1)[1])
+        executable_path.write_bytes(b"#!/bin/sh\nexit 99\n")
         observed.update(
             executable_inode=os.fstat(executable_fd).st_ino,
+            executable_bytes=os.pread(executable_fd, len(original_bytes) + 32, 0),
+            executable_seals=fcntl.fcntl(executable_fd, fcntl.F_GET_SEALS),
             models_inode=os.fstat(models_fd).st_ino,
             argv=argv,
             environment=environment,
@@ -749,7 +989,14 @@ def test_exec_helper_holds_validated_executable_and_models_fds_until_exec(
             port=11435,
         )
 
-    assert observed["executable_inode"] == plan.executable.inode
+    assert observed["executable_inode"] != plan.executable.inode
+    assert observed["executable_bytes"] == original_bytes
+    assert observed["executable_seals"] == (
+        fcntl.F_SEAL_SEAL
+        | fcntl.F_SEAL_SHRINK
+        | fcntl.F_SEAL_GROW
+        | fcntl.F_SEAL_WRITE
+    )
     assert observed["models_inode"] == plan.models_directory.inode
     assert observed["argv"] == (plan.instance.ollama_executable, "serve")
     environment = observed["environment"]
@@ -837,7 +1084,7 @@ def test_http_probe_enforces_one_monotonic_total_deadline() -> None:
     started = time.monotonic()
 
     result = SystemOllamaRuntime().fetch_tags(
-        port, timeout_seconds=0.2, max_bytes=64 * 1024
+        os.getpid(), port, timeout_seconds=0.2, max_bytes=64 * 1024
     )
     elapsed = time.monotonic() - started
 
@@ -874,6 +1121,7 @@ def test_http_probe_parses_bounded_content_length_and_chunked_tags(
         try:
             connection.recv(4096)
             connection.sendall(response)
+            time.sleep(0.05)
         finally:
             connection.close()
             listener.close()
@@ -881,5 +1129,35 @@ def test_http_probe_parses_bounded_content_length_and_chunked_tags(
     threading.Thread(target=serve, daemon=True).start()
 
     assert SystemOllamaRuntime().fetch_tags(
-        port, timeout_seconds=0.5, max_bytes=64 * 1024
+        os.getpid(), port, timeout_seconds=0.5, max_bytes=64 * 1024
     ) == {"llama-small"}
+
+
+def test_http_probe_rejects_connected_server_owned_by_foreign_pid() -> None:
+    body = b'{"models":[{"model":"llama-small"}]}'
+    response = (
+        b"HTTP/1.1 200 OK\r\nContent-Length: "
+        + str(len(body)).encode("ascii")
+        + b"\r\nConnection: close\r\n\r\n"
+        + body
+    )
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def serve() -> None:
+        connection, _address = listener.accept()
+        try:
+            connection.recv(4096)
+            connection.sendall(response)
+            time.sleep(0.1)
+        finally:
+            connection.close()
+            listener.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    assert SystemOllamaRuntime().fetch_tags(
+        os.getppid(), port, timeout_seconds=0.5, max_bytes=64 * 1024
+    ) is None
