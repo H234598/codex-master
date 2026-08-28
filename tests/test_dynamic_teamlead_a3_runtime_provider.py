@@ -251,6 +251,16 @@ def test_validate_returns_same_frozen_context_repeatedly() -> None:
         value.release = release()  # type: ignore[misc]
 
 
+def test_rejects_equal_but_distinct_snapshot() -> None:
+    value = valid_value()
+    distinct_snapshot = replace(value.context.snapshot)
+    trusted = replace(value.context, snapshot=distinct_snapshot)
+
+    assert distinct_snapshot == value.request.snapshot
+    assert distinct_snapshot is not value.request.snapshot
+    assert_invalid(replace(value, context=trusted))
+
+
 def test_rejects_mutable_context_impostor() -> None:
     value = valid_value()
 

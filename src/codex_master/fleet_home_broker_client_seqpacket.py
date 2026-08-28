@@ -24,9 +24,17 @@ class BrokerClientExchangeOperations(Protocol):
 
 
 class SeqpacketBrokerClientOperations(BrokerClientOperations):
-    __slots__ = ("_operations",)
+    __slots__ = ("_operations", "_a3_context_identity", "_release_identity")
 
-    def __init__(self, operations: BrokerClientExchangeOperations) -> None:
+    def __init__(
+        self,
+        operations: BrokerClientExchangeOperations,
+        *,
+        a3_context_identity: object,
+        release_identity: object,
+    ) -> None:
+        if a3_context_identity is None or release_identity is None:
+            raise BrokerClientError("identity bindings are required")
         for name in ("exchange", "fstat", "close"):
             try:
                 operation = getattr(operations, name)
@@ -35,6 +43,27 @@ class SeqpacketBrokerClientOperations(BrokerClientOperations):
             if not callable(operation):
                 raise BrokerClientError("exchange operations are incomplete")
         self._operations = operations
+        self._a3_context_identity = a3_context_identity
+        self._release_identity = release_identity
+
+    @property
+    def a3_context_identity(self) -> object:
+        return self._a3_context_identity
+
+    @property
+    def release_identity(self) -> object:
+        return self._release_identity
+
+    def __copy__(self) -> "SeqpacketBrokerClientOperations":
+        raise BrokerClientError("exchange adapter is non-transferable")
+
+    def __deepcopy__(self, memo: object) -> "SeqpacketBrokerClientOperations":
+        del memo
+        raise BrokerClientError("exchange adapter is non-transferable")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise BrokerClientError("exchange adapter is non-transferable")
 
     def receive_frame(self, request: BrokerRequest) -> ScmFrame:
         try:

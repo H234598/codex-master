@@ -1,3 +1,6 @@
+import copy
+import pickle
+
 import pytest
 
 from codex_master.fleet_home_broker_client import BrokerClientError, ScmFrame
@@ -22,6 +25,15 @@ REQUEST = QueryTransactionRequest(
     BindingExpectation("agent_one", 7, 9, 13, "c" * 64, 11),
 )
 STAT = FdStat(17, 31, 0o40700, 0, 0)
+CONTEXT_IDENTITY = object()
+RELEASE_IDENTITY = object()
+
+
+class EqualIdentityMarker:
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, EqualIdentityMarker)
+
+    __hash__ = None
 
 
 class FakeExchangeOperations:
@@ -63,12 +75,20 @@ def response_frame(*, payload: bytes | None = None, fds: object = ()) -> ScmFram
     return ScmFrame(encode_chpb_message(REQUEST) if payload is None else payload, fds)
 
 
+def adapter(operations: FakeExchangeOperations) -> SeqpacketBrokerClientOperations:
+    return SeqpacketBrokerClientOperations(
+        operations,
+        a3_context_identity=CONTEXT_IDENTITY,
+        release_identity=RELEASE_IDENTITY,
+    )
+
+
 def test_receive_frame_exchanges_one_canonical_request_and_preserves_response_fd_ownership():
     response = response_frame(fds=(37,))
     operations = FakeExchangeOperations(response)
-    adapter = SeqpacketBrokerClientOperations(operations)
+    client = adapter(operations)
 
-    received = adapter.receive_frame(REQUEST)
+    received = client.receive_frame(REQUEST)
 
     assert received is response
     assert operations.exchanges == [ScmFrame(encode_chpb_message(REQUEST), ())]
@@ -85,15 +105,60 @@ def test_constructor_rejects_incomplete_exchange_capability():
             raise AssertionError("must not close")
 
     with pytest.raises(BrokerClientError, match="incomplete"):
-        SeqpacketBrokerClientOperations(IncompleteOperations())
+        SeqpacketBrokerClientOperations(
+            IncompleteOperations(),
+            a3_context_identity=CONTEXT_IDENTITY,
+            release_identity=RELEASE_IDENTITY,
+        )
+
+
+def test_constructor_rejects_missing_identity_arguments():
+    with pytest.raises(TypeError):
+        SeqpacketBrokerClientOperations(FakeExchangeOperations(response_frame()))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"a3_context_identity": None, "release_identity": RELEASE_IDENTITY},
+        {"a3_context_identity": CONTEXT_IDENTITY, "release_identity": None},
+    ),
+)
+def test_constructor_rejects_none_identity_arguments(kwargs):
+    with pytest.raises(BrokerClientError, match="identity"):
+        SeqpacketBrokerClientOperations(FakeExchangeOperations(response_frame()), **kwargs)
+
+
+def test_identity_properties_preserve_equal_but_distinct_references():
+    operations = FakeExchangeOperations(response_frame())
+    context_identity = EqualIdentityMarker()
+    release_identity = EqualIdentityMarker()
+    client = SeqpacketBrokerClientOperations(
+        operations,
+        a3_context_identity=context_identity,
+        release_identity=release_identity,
+    )
+
+    assert context_identity == release_identity
+    assert context_identity is not release_identity
+    assert client.a3_context_identity is context_identity
+    assert client.release_identity is release_identity
+    with pytest.raises(AttributeError):
+        client.a3_context_identity = object()
+
+
+@pytest.mark.parametrize("transfer", (copy.copy, copy.deepcopy, pickle.dumps))
+def test_adapter_rejects_copy_and_pickle(transfer):
+    with pytest.raises(BrokerClientError, match="non-transferable"):
+        transfer(adapter(FakeExchangeOperations(response_frame())))
 
 
 def test_receive_frame_rejects_unencodable_request_before_exchange():
     operations = FakeExchangeOperations(response_frame())
-    adapter = SeqpacketBrokerClientOperations(operations)
+    client = adapter(operations)
 
     with pytest.raises(BrokerClientError, match="request encoding"):
-        adapter.receive_frame(object())
+        client.receive_frame(object())
 
     assert operations.exchanges == []
     assert operations.closed == []
@@ -102,10 +167,10 @@ def test_receive_frame_rejects_unencodable_request_before_exchange():
 def test_receive_frame_wraps_exchange_failure_without_fd_cleanup():
     failure = RuntimeError("exchange failed")
     operations = FakeExchangeOperations(response_frame(), exchange_error=failure)
-    adapter = SeqpacketBrokerClientOperations(operations)
+    client = adapter(operations)
 
     with pytest.raises(BrokerClientError, match="frame exchange") as caught:
-        adapter.receive_frame(REQUEST)
+        client.receive_frame(REQUEST)
 
     assert caught.value.__cause__ is failure
     assert operations.exchanges == [ScmFrame(encode_chpb_message(REQUEST), ())]
@@ -114,10 +179,10 @@ def test_receive_frame_wraps_exchange_failure_without_fd_cleanup():
 
 def test_receive_frame_rejects_non_frame_response_without_closing_response_fds():
     operations = FakeExchangeOperations(object())
-    adapter = SeqpacketBrokerClientOperations(operations)
+    client = adapter(operations)
 
     with pytest.raises(BrokerClientError, match="wrong type"):
-        adapter.receive_frame(REQUEST)
+        client.receive_frame(REQUEST)
 
     assert operations.closed == []
 
@@ -131,10 +196,10 @@ def test_receive_frame_rejects_non_frame_response_without_closing_response_fds()
 )
 def test_receive_frame_rejects_malformed_response_frame_without_closing_fds(response):
     operations = FakeExchangeOperations(response)
-    adapter = SeqpacketBrokerClientOperations(operations)
+    client = adapter(operations)
 
     with pytest.raises(BrokerClientError):
-        adapter.receive_frame(REQUEST)
+        client.receive_frame(REQUEST)
 
     assert operations.closed == []
 
@@ -142,29 +207,29 @@ def test_receive_frame_rejects_malformed_response_frame_without_closing_fds(resp
 @pytest.mark.parametrize("fds", ((41, 41), (-1,), (True,)))
 def test_receive_frame_rejects_duplicate_or_noncanonical_response_fds(fds):
     operations = FakeExchangeOperations(response_frame(fds=fds))
-    adapter = SeqpacketBrokerClientOperations(operations)
+    client = adapter(operations)
 
     with pytest.raises(BrokerClientError, match="response fd"):
-        adapter.receive_frame(REQUEST)
+        client.receive_frame(REQUEST)
 
     assert operations.closed == []
 
 
 def test_fstat_delegates_result():
     operations = FakeExchangeOperations(response_frame())
-    adapter = SeqpacketBrokerClientOperations(operations)
+    client = adapter(operations)
 
-    assert adapter.fstat(43) is STAT
+    assert client.fstat(43) is STAT
     assert operations.fstat_calls == [43]
 
 
 def test_fstat_delegation_error_is_not_swallowed():
     failure = RuntimeError("fstat failed")
     operations = FakeExchangeOperations(response_frame(), fstat_error=failure)
-    adapter = SeqpacketBrokerClientOperations(operations)
+    client = adapter(operations)
 
     with pytest.raises(RuntimeError) as caught:
-        adapter.fstat(43)
+        client.fstat(43)
 
     assert caught.value is failure
     assert operations.fstat_calls == [43]
@@ -173,10 +238,10 @@ def test_fstat_delegation_error_is_not_swallowed():
 def test_close_delegates_and_preserves_error():
     failure = RuntimeError("close failed")
     operations = FakeExchangeOperations(response_frame(), close_error=failure)
-    adapter = SeqpacketBrokerClientOperations(operations)
+    client = adapter(operations)
 
     with pytest.raises(RuntimeError) as caught:
-        adapter.close(47)
+        client.close(47)
 
     assert caught.value is failure
     assert operations.closed == [47]

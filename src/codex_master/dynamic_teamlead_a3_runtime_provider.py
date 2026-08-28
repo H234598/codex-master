@@ -104,7 +104,7 @@ def validate_dynamic_teamlead_a3_runtime_context(
     ):
         raise DynamicTeamleadA3RuntimeProviderError(_INVALID_CONTEXT)
     if (
-        context.snapshot != request.snapshot
+        context.snapshot is not request.snapshot
         or context.selection != request.selection
         or context.profile_binding != request.profile_binding
         or context.expected_principal != request.expected_principal
