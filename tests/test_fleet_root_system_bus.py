@@ -90,6 +90,7 @@ from codex_master.fleet_root_system_bus import (
     RootSystemBusError,
     RootSystemBusPeerAttestation,
     TrustedPrincipalGrantConsumer,
+    _RootDynamicTeamleadStartControl,
     _IssuedAttestation,
     _LinuxPeerOperations,
     _ProcObservation,
@@ -3218,6 +3219,382 @@ def test_consumer_issues_ledger_owned_start_composition_without_runtime_effect(
     assert store.commit_calls == 0
     assert exchange.exchange_calls == 0
     assert operations.calls == []
+
+
+def test_root_control_composes_issued_start_and_calls_builder_then_start_once(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_operations = reattest_operations()
+    consumer_operations.alive *= 2
+    consumer_operations.proc *= 2
+    consumer_operations.stats *= 2
+    consumer_operations.units *= 2
+    _host, _resolver, _provider, _operations, _boundary, consumer, service = (
+        _trusted_service(private_bus, operations=consumer_operations)
+    )
+    service._handle_start(":1.1")
+    context, registry, broker, store, exchange = composition_inputs(consumer, service)
+    runner_operations = RecordingRunnerOperations()
+    issued: list[object] = []
+    built: list[object] = []
+    started: list[object] = []
+    real_builder = system_bus.build_root_owned_dynamic_teamlead_start_port
+
+    def record_builder(composition: object) -> object:
+        issued.append(composition)
+        port = real_builder(composition)
+        built.append(port)
+        return port
+
+    def record_start(port: object) -> dict[str, int | str]:
+        started.append(port)
+        return {
+            "schema_version": 1,
+            "status": "started",
+            "raw_output": "not_returned",
+        }
+
+    monkeypatch.setattr(
+        system_bus,
+        "build_root_owned_dynamic_teamlead_start_port",
+        record_builder,
+    )
+    monkeypatch.setattr(system_bus, "dynamic_teamlead_start", record_start)
+    control = _RootDynamicTeamleadStartControl(
+        consumer,
+        context,
+        registry,
+        broker,
+        runner_operations,
+    )
+
+    try:
+        assert control.start_dynamic_teamlead() == {
+            "schema_version": 1,
+            "status": "started",
+            "raw_output": "not_returned",
+        }
+        assert len(issued) == len(built) == len(started) == 1
+        assert started[0] is built[0]
+        assert issued[0] is consumer._runner_records[
+            id(issued[0].executor._permit)
+        ].composition
+        assert store.load_calls == 0
+        assert store.commit_calls == 0
+        assert exchange.exchange_calls == 0
+        assert runner_operations.calls == []
+        assert all(
+            getattr(control, field) is None
+            for field in (
+                "_consumer",
+                "_context",
+                "_registry_operations",
+                "_broker_operations",
+                "_operations",
+            )
+        )
+    finally:
+        service.close()
+
+
+def test_root_control_rejects_transfer_before_and_after_original_burn(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_operations = reattest_operations()
+    consumer_operations.alive *= 2
+    consumer_operations.proc *= 2
+    consumer_operations.stats *= 2
+    consumer_operations.units *= 2
+    _host, _resolver, _provider, _operations, _boundary, consumer, service = (
+        _trusted_service(private_bus, operations=consumer_operations)
+    )
+    service._handle_start(":1.1")
+    context, registry, broker, _store, _exchange = composition_inputs(
+        consumer, service
+    )
+    runner_operations = RecordingRunnerOperations()
+    control = _RootDynamicTeamleadStartControl(
+        consumer,
+        context,
+        registry,
+        broker,
+        runner_operations,
+    )
+    transfers = (
+        copy.copy,
+        copy.deepcopy,
+        pickle.dumps,
+        lambda value: value.__reduce_ex__(4),
+    )
+    expected_started = {
+        "schema_version": 1,
+        "status": "started",
+        "raw_output": "not_returned",
+    }
+    expected_unavailable = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "reason": "dynamic_teamlead_runtime_unavailable",
+        "raw_output": "not_returned",
+    }
+    monkeypatch.setattr(
+        system_bus,
+        "dynamic_teamlead_start",
+        lambda _port: expected_started,
+    )
+
+    try:
+        for transfer in transfers:
+            with pytest.raises(TypeError):
+                transfer(control)
+        assert repr(control) == "<_RootDynamicTeamleadStartControl redacted>"
+        assert str(control) == repr(control)
+        assert control.start_dynamic_teamlead() == expected_started
+        assert all(
+            getattr(control, field) is None
+            for field in (
+                "_consumer",
+                "_context",
+                "_registry_operations",
+                "_broker_operations",
+                "_operations",
+            )
+        )
+        for transfer in transfers:
+            with pytest.raises(TypeError):
+                transfer(control)
+        assert control.start_dynamic_teamlead() == expected_unavailable
+    finally:
+        service.close()
+
+
+def test_root_sparse_normalizer_returns_fresh_canonical_result() -> None:
+    producer_result = {
+        "schema_version": 1,
+        "status": "started",
+        "raw_output": "not_returned",
+    }
+    expected = {
+        "schema_version": 1,
+        "status": "started",
+        "raw_output": "not_returned",
+    }
+
+    first = system_bus._normalize_dynamic_teamlead_result(producer_result)
+    second = system_bus._normalize_dynamic_teamlead_result(producer_result)
+
+    assert first == expected
+    assert second == expected
+    assert first is not second
+    assert first is not producer_result
+    assert second is not producer_result
+    producer_result["raw_output"] = "private detail"
+    assert first == expected
+    assert second == expected
+
+
+@pytest.mark.parametrize("failure", ("issuer", "builder", "start"))
+def test_root_control_failure_is_sparse_terminal_and_drops_inputs(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    consumer_operations = reattest_operations()
+    consumer_operations.alive *= 2
+    consumer_operations.proc *= 2
+    consumer_operations.stats *= 2
+    consumer_operations.units *= 2
+    _host, _resolver, _provider, _operations, _boundary, consumer, service = (
+        _trusted_service(private_bus, operations=consumer_operations)
+    )
+    service._handle_start(":1.1")
+    context, registry, broker, _store, _exchange = composition_inputs(consumer, service)
+    runner_operations = RecordingRunnerOperations()
+    if failure == "issuer":
+        original_issue = TrustedPrincipalGrantConsumer.issue_root_owned_dynamic_teamlead_start_composition
+
+        def issue(
+            bound_consumer: TrustedPrincipalGrantConsumer,
+            *_args: object,
+            **_kwargs: object,
+        ) -> object:
+            if bound_consumer is consumer:
+                raise RuntimeError("issuer detail")
+            return original_issue(bound_consumer, *_args, **_kwargs)
+
+        monkeypatch.setattr(
+            TrustedPrincipalGrantConsumer,
+            "issue_root_owned_dynamic_teamlead_start_composition",
+            issue,
+        )
+    elif failure == "builder":
+
+        def build(_composition: object) -> object:
+            raise RuntimeError("builder detail")
+
+        monkeypatch.setattr(
+            system_bus,
+            "build_root_owned_dynamic_teamlead_start_port",
+            build,
+        )
+    else:
+
+        def start(_port: object) -> object:
+            raise RuntimeError("runner detail")
+
+        monkeypatch.setattr(system_bus, "dynamic_teamlead_start", start)
+    control = _RootDynamicTeamleadStartControl(
+        consumer,
+        context,
+        registry,
+        broker,
+        runner_operations,
+    )
+
+    try:
+        expected = {
+            "schema_version": 1,
+            "status": "unavailable",
+            "reason": "dynamic_teamlead_runtime_unavailable",
+            "raw_output": "not_returned",
+        }
+        assert control.start_dynamic_teamlead() == expected
+        assert control.start_dynamic_teamlead() == expected
+        assert all(
+            getattr(control, field) is None
+            for field in (
+                "_consumer",
+                "_context",
+                "_registry_operations",
+                "_broker_operations",
+                "_operations",
+            )
+        )
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "inactive",
+        "closed",
+        "missing_receipt",
+        "terminal_receipt",
+        "host_generation",
+        "ownership",
+        "cross_release",
+        "broker_release",
+        "occupied_runner",
+        "terminal_runner",
+    ),
+)
+def test_root_control_rejects_lifecycle_and_identity_gates_before_issuance(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    consumer_operations = reattest_operations()
+    consumer_operations.alive *= 2
+    consumer_operations.proc *= 2
+    consumer_operations.stats *= 2
+    consumer_operations.units *= 2
+    _host, _resolver, _provider, _operations, boundary, consumer, service = (
+        _trusted_service(private_bus, operations=consumer_operations)
+    )
+    service._handle_start(":1.1")
+    context, registry, broker, _store, exchange = composition_inputs(consumer, service)
+    runner_operations = RecordingRunnerOperations()
+    issue_calls = 0
+    original_issue = TrustedPrincipalGrantConsumer.issue_root_owned_dynamic_teamlead_start_composition
+
+    def record_issue(
+        bound_consumer: TrustedPrincipalGrantConsumer,
+        *_args: object,
+        **_kwargs: object,
+    ) -> object:
+        nonlocal issue_calls
+        issue_calls += 1
+        return original_issue(bound_consumer, *_args, **_kwargs)
+
+    monkeypatch.setattr(
+        TrustedPrincipalGrantConsumer,
+        "issue_root_owned_dynamic_teamlead_start_composition",
+        record_issue,
+    )
+    active = consumer._active_start
+    assert active is not None
+    receipt_record = boundary._receipts[id(active.receipt)]
+    original_ownership = active.ownership
+    runner_record = None
+    if mutation == "inactive":
+        service._active = False
+    elif mutation == "closed":
+        service._closed = True
+    elif mutation == "missing_receipt":
+        consumer._active_start = None
+    elif mutation == "terminal_receipt":
+        receipt_record.terminal = True
+    elif mutation == "host_generation":
+        service._host._host_generation += 1
+    elif mutation == "ownership":
+        ownership = object.__new__(RootRuntimeActivityOwnership)
+        object.__setattr__(ownership, "host_generation", original_ownership.host_generation)
+        object.__setattr__(ownership, "begin_epoch", original_ownership.begin_epoch)
+        object.__setattr__(active, "ownership", ownership)
+    elif mutation == "cross_release":
+        context = replace(context, release=replace(service._release))
+    elif mutation == "broker_release":
+        broker = SeqpacketBrokerClientOperations(
+            exchange,
+            a3_context_identity=context,
+            release_identity=replace(service._release),
+        )
+    else:
+        _permit, _executor = consumer.issue_dynamic_teamlead_runner(
+            RecordingRunnerOperations()
+        )
+        runner_record = consumer._runner_records[id(_permit)]
+        if mutation == "terminal_runner":
+            runner_record.terminal = True
+
+    monkeypatch.setattr(
+        system_bus,
+        "dynamic_teamlead_start",
+        lambda _port: {
+            "schema_version": 1,
+            "status": "started",
+            "raw_output": "not_returned",
+        },
+    )
+    control = _RootDynamicTeamleadStartControl(
+        consumer,
+        context,
+        registry,
+        broker,
+        runner_operations,
+    )
+
+    try:
+        assert control.start_dynamic_teamlead() == {
+            "schema_version": 1,
+            "status": "unavailable",
+            "reason": "dynamic_teamlead_runtime_unavailable",
+            "raw_output": "not_returned",
+        }
+        assert issue_calls == 0
+        assert runner_operations.calls == []
+    finally:
+        service._closed = False
+        service._active = True
+        consumer._active_start = active
+        object.__setattr__(active, "ownership", original_ownership)
+        receipt_record.terminal = False
+        if mutation == "host_generation":
+            service._host._host_generation -= 1
+        service.close()
 
 
 def test_second_start_composition_issuance_fails_for_same_active_record(

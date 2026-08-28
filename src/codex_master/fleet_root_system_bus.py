@@ -30,8 +30,10 @@ from codex_master.dynamic_teamlead_a3_runner import (
 from codex_master.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
 from codex_master.dynamic_teamlead_a3_runtime_provider import (
     DynamicTeamleadA3RuntimeContext,
+    build_root_owned_dynamic_teamlead_start_port,
     validate_dynamic_teamlead_a3_runtime_context,
 )
+from codex_master.dynamic_teamlead_start import dynamic_teamlead_start
 from codex_master.fleet_home_broker_client import AttestedHome
 from codex_master.fleet_home_broker_client_seqpacket import (
     SeqpacketBrokerClientOperations,
@@ -250,6 +252,175 @@ class _ConsumerDynamicTeamleadRunnerExecutor:
         except AttributeError:
             _fail("dynamic_teamlead_runner_permit_invalid")
 
+
+def _unavailable_dynamic_teamlead_result() -> dict[str, int | str]:
+    return {
+        "schema_version": 1,
+        "status": "unavailable",
+        "reason": "dynamic_teamlead_runtime_unavailable",
+        "raw_output": "not_returned",
+    }
+
+
+def _normalize_dynamic_teamlead_result(value: object) -> dict[str, int | str]:
+    if type(value) is not dict:
+        return _unavailable_dynamic_teamlead_result()
+    if any(type(key) is not str for key in value):
+        return _unavailable_dynamic_teamlead_result()
+    if type(value.get("schema_version")) is not int:
+        return _unavailable_dynamic_teamlead_result()
+    if (
+        value["schema_version"] != 1
+        or type(value.get("status")) is not str
+        or type(value.get("raw_output")) is not str
+    ):
+        return _unavailable_dynamic_teamlead_result()
+    if value["status"] == "started":
+        if set(value) != {"schema_version", "status", "raw_output"}:
+            return _unavailable_dynamic_teamlead_result()
+    elif value["status"] == "unavailable":
+        if set(value) != {
+            "schema_version",
+            "status",
+            "reason",
+            "raw_output",
+        }:
+            return _unavailable_dynamic_teamlead_result()
+        if (
+            type(value.get("reason")) is not str
+            or value.get("reason") != "dynamic_teamlead_runtime_unavailable"
+        ):
+            return _unavailable_dynamic_teamlead_result()
+    else:
+        return _unavailable_dynamic_teamlead_result()
+    if value.get("raw_output") != "not_returned":
+        return _unavailable_dynamic_teamlead_result()
+    if value["status"] == "started":
+        return {
+            "schema_version": 1,
+            "status": "started",
+            "raw_output": "not_returned",
+        }
+    return _unavailable_dynamic_teamlead_result()
+
+
+class _RootDynamicTeamleadStartControl(_NonTransferable):
+    __slots__ = (
+        "_consumer",
+        "_context",
+        "_registry_operations",
+        "_broker_operations",
+        "_operations",
+        "_used",
+        "_lock",
+    )
+
+    def __init__(
+        self,
+        consumer: TrustedPrincipalGrantConsumer,
+        context: DynamicTeamleadA3RuntimeContext,
+        registry_operations: FleetV2RegistryOperations,
+        broker_operations: SeqpacketBrokerClientOperations,
+        operations: DynamicTeamleadRunnerOperations,
+    ) -> None:
+        self._consumer = consumer
+        self._context = context
+        self._registry_operations = registry_operations
+        self._broker_operations = broker_operations
+        self._operations = operations
+        self._used = False
+        self._lock = Lock()
+
+    def start_dynamic_teamlead(self) -> dict[str, int | str]:
+        with self._lock:
+            if self._used:
+                return _unavailable_dynamic_teamlead_result()
+            self._used = True
+            consumer = self._consumer
+            context = self._context
+            registry_operations = self._registry_operations
+            broker_operations = self._broker_operations
+            operations = self._operations
+            self._consumer = None
+            self._context = None
+            self._registry_operations = None
+            self._broker_operations = None
+            self._operations = None
+        try:
+            if type(consumer) is not TrustedPrincipalGrantConsumer:
+                raise ValueError
+            service = consumer._bound_service
+            if (
+                type(service) is not HomeBrokerControlService
+                or consumer._closed is not False
+                or service._active is not True
+                or service._closed is not False
+                or service._consumer is not consumer
+            ):
+                raise ValueError
+            active = consumer._active_start
+            if (
+                type(active) is not _ActiveStart
+                or type(active.receipt) is not BrokerStartReceipt
+                or type(active.ownership) is not RootRuntimeActivityOwnership
+                or active.receipt.ownership is not active.ownership
+                or type(active.attestation) is not RootSystemBusPeerAttestation
+                or active.attestation.service_generation != service._generation
+            ):
+                raise ValueError
+            state = service._host.snapshot()
+            if (
+                state.reconciled is not True
+                or state.participant_generation != service._generation
+                or state.host_generation != active.ownership.host_generation
+                or state.active_principals_or_agents < 1
+            ):
+                raise ValueError
+            with consumer._boundary._lock:
+                receipt_record = consumer._boundary._receipts.get(id(active.receipt))
+                if (
+                    receipt_record is None
+                    or receipt_record.receipt is not active.receipt
+                    or receipt_record.terminal
+                ):
+                    raise ValueError
+            if (
+                active.receipt.release_id != service._release.release_id
+                or active.receipt.socket_unit != service._release.socket_unit
+            ):
+                raise ValueError
+            if type(context) is not DynamicTeamleadA3RuntimeContext:
+                raise ValueError
+            if (
+                validate_dynamic_teamlead_a3_runtime_context(context) is not context
+                or context.context is not consumer._context
+                or context.release is not service._release
+                or type(registry_operations) is not FleetV2RegistryOperations
+                or registry_operations._snapshot is not context.context.snapshot
+                or type(broker_operations) is not SeqpacketBrokerClientOperations
+                or broker_operations.a3_context_identity is not context
+                or broker_operations.release_identity is not service._release
+                or not callable(operations.execute)
+            ):
+                raise ValueError
+            with consumer._runner_lock:
+                if any(
+                    record.active is active
+                    for record in consumer._runner_records.values()
+                ):
+                    raise ValueError
+            composition = (
+                consumer.issue_root_owned_dynamic_teamlead_start_composition(
+                    context,
+                    registry_operations,
+                    broker_operations,
+                    operations,
+                )
+            )
+            port = build_root_owned_dynamic_teamlead_start_port(composition)
+            return _normalize_dynamic_teamlead_result(dynamic_teamlead_start(port))
+        except BaseException:
+            return _unavailable_dynamic_teamlead_result()
 
 class _PeerOperations(Protocol):
     def pidfd_open(self, pid: int) -> int: ...
