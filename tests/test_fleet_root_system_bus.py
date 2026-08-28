@@ -5,6 +5,7 @@ import copy
 import dataclasses
 from dataclasses import replace
 import gc
+import hashlib
 import inspect
 import os
 from pathlib import Path
@@ -3393,6 +3394,110 @@ def test_root_sparse_normalizer_returns_fresh_canonical_result() -> None:
     producer_result["raw_output"] = "private detail"
     assert first == expected
     assert second == expected
+
+
+def test_private_control2_result_constructors_are_zero_argument_and_exact() -> None:
+    started = getattr(system_bus, "_started_dynamic_teamlead_control2_result", None)
+    unavailable = getattr(
+        system_bus, "_unavailable_dynamic_teamlead_control2_result", None
+    )
+    assert callable(started)
+    assert callable(unavailable)
+    assert inspect.signature(started).parameters == {}
+    assert inspect.signature(unavailable).parameters == {}
+    assert started() == (2, "started", "none")
+    result = unavailable()
+    assert type(result) is tuple
+    assert len(result) == 3
+    assert result[0] == 2
+    assert result[1] == "unavailable"
+    assert result[2] == "dynamic_teamlead_runtime_unavailable"
+    assert all(type(value) in (int, str) for value in result)
+
+
+def test_control2_result_codec_has_no_runtime_or_dbus_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def tripwire(*_args: object, **_kwargs: object) -> None:
+        calls.append("side_effect")
+        raise AssertionError("Control2 result codec must be pure")
+
+    for name in (
+        "dynamic_teamlead_start",
+        "build_root_owned_dynamic_teamlead_start_port",
+    ):
+        monkeypatch.setattr(system_bus, name, tripwire)
+    monkeypatch.setattr(system_bus.dbus, "SystemBus", tripwire)
+    monkeypatch.setattr(system_bus.dbus.service, "BusName", tripwire)
+    monkeypatch.setattr(system_bus, "TrustedPrincipalGrantConsumer", tripwire)
+    monkeypatch.setattr(system_bus, "FleetV2RegistryOperations", tripwire)
+    monkeypatch.setattr(system_bus, "SeqpacketBrokerClientOperations", tripwire)
+
+    assert system_bus._started_dynamic_teamlead_control2_result() == (
+        2,
+        "started",
+        "none",
+    )
+    assert system_bus._unavailable_dynamic_teamlead_control2_result() == (
+        2,
+        "unavailable",
+        "dynamic_teamlead_runtime_unavailable",
+    )
+    assert calls == []
+
+
+def test_control1_source_and_registration_surface_remain_p1_identical() -> None:
+    source_path = Path(system_bus.__file__)
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    service = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "HomeBrokerControlService"
+    )
+    service_source = ast.get_source_segment(source, service)
+    assert service_source is not None
+    assert hashlib.sha256((service_source + "\n").encode("utf-8")).hexdigest() == (
+        "049b3e859bc86893275be81b3ae2f922e3750fe1ec24e52539b6c86202ac33bf"
+    )
+    control1_lines = "".join(
+        line
+        for line in source.splitlines(keepends=True)
+        if line.startswith(("BUS_NAME =", "BUS_PATH =", "BUS_INTERFACE =", "BUS_METHOD ="))
+    )
+    assert hashlib.sha256(control1_lines.encode("utf-8")).hexdigest() == (
+        "d0400c6d843724d2abd44ae9f4d9737e038c88795a88044684bc7b0a0625b386"
+    )
+
+    method_decorators = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "dbus"
+        and node.func.value.attr == "service"
+        and node.func.attr == "method"
+    ]
+    bus_name_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "dbus"
+        and node.func.value.attr == "service"
+        and node.func.attr == "BusName"
+    ]
+    assert len(method_decorators) == 1
+    assert len(bus_name_calls) == 1
+    assert "HomeBrokerControl2" not in source
+    assert "serve_mcp" not in source
 
 
 @pytest.mark.parametrize("failure", ("issuer", "builder", "start"))

@@ -304,6 +304,17 @@ def _normalize_dynamic_teamlead_result(value: object) -> dict[str, int | str]:
     return _unavailable_dynamic_teamlead_result()
 
 
+_CONTROL2_UNAVAILABLE_REASON = "dynamic_teamlead_runtime_unavailable"
+
+
+def _started_dynamic_teamlead_control2_result() -> tuple[int, str, str]:
+    return (2, "started", "none")
+
+
+def _unavailable_dynamic_teamlead_control2_result() -> tuple[int, str, str]:
+    return (2, "unavailable", _CONTROL2_UNAVAILABLE_REASON)
+
+
 class _RootDynamicTeamleadStartControl(_NonTransferable):
     __slots__ = (
         "_consumer",
