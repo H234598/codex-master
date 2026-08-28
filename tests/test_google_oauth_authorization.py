@@ -184,6 +184,7 @@ def test_inventory_readonly_policy_exposes_exact_scopes_and_operations() -> None
 
     assert tuple(profile_id.value for profile_id in GoogleOAuthProfileIdV1) == (
         "inventory_readonly",
+        "provisioner",
     )
     assert tuple(operation.value for operation in GoogleOAuthOperationV1) == (
         "projects.search",
@@ -192,6 +193,12 @@ def test_inventory_readonly_policy_exposes_exact_scopes_and_operations() -> None
         "keys.get",
         "keys.list",
         "projects.getBillingInfo",
+        "projects.create",
+        "projects.patch",
+        "services.enable",
+        "keys.create",
+        "keys.patch",
+        "userinfo.get",
     )
     assert type(profile) is GoogleOAuthAuthorizationProfileV1
     assert profile.profile_id is READONLY_PROFILE
@@ -257,6 +264,53 @@ def test_billing_writes_and_project_lifecycle_are_forbidden(
         resolve_google_oauth_profile_v1(READONLY_PROFILE, forbidden_operation)
 
     assert caught.value.code == "credential.oauth_operation_forbidden"
+
+
+def test_provisioner_profile_allows_only_required_mutations() -> None:
+    allowed = (
+        GoogleOAuthOperationV1.PROJECTS_CREATE,
+        GoogleOAuthOperationV1.PROJECTS_PATCH,
+        GoogleOAuthOperationV1.SERVICES_ENABLE,
+        GoogleOAuthOperationV1.KEYS_CREATE,
+        GoogleOAuthOperationV1.KEYS_PATCH,
+        GoogleOAuthOperationV1.KEYS_GET,
+        GoogleOAuthOperationV1.KEYS_LIST,
+        GoogleOAuthOperationV1.PROJECTS_GET,
+        GoogleOAuthOperationV1.PROJECTS_SEARCH,
+        GoogleOAuthOperationV1.USERINFO_GET,
+    )
+    for operation in allowed:
+        profile = resolve_google_oauth_profile_v1(
+            GoogleOAuthProfileIdV1.PROVISIONER, operation
+        )
+        assert profile.profile_id is GoogleOAuthProfileIdV1.PROVISIONER
+        assert operation in profile.allowed_operations
+        assert profile.minimal_scopes == ("cloud-platform", "email", "openid")
+
+    for forbidden in (
+        "resourcemanager.projects.delete",
+        "cloudbilling.projects.updateBillingInfo",
+        "iam.policies.set",
+        "projectquota.requests.create",
+    ):
+        with pytest.raises(
+            GoogleOAuthAuthorizationError,
+            match="credential.oauth_operation_forbidden",
+        ):
+            resolve_google_oauth_profile_v1(
+                GoogleOAuthProfileIdV1.PROVISIONER, forbidden
+            )
+
+
+def test_readonly_profile_still_rejects_provisioner_mutations() -> None:
+    with pytest.raises(
+        GoogleOAuthAuthorizationError,
+        match="credential.oauth_operation_forbidden",
+    ):
+        resolve_google_oauth_profile_v1(
+            GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+            GoogleOAuthOperationV1.PROJECTS_CREATE,
+        )
 
 
 def test_unknown_profile_is_rejected_without_identifier_in_error() -> None:

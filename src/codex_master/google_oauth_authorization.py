@@ -10,6 +10,7 @@ from typing import Final, NoReturn
 
 class GoogleOAuthProfileIdV1(str, Enum):
     INVENTORY_READONLY = "inventory_readonly"
+    PROVISIONER = "provisioner"
 
 
 class GoogleOAuthOperationV1(str, Enum):
@@ -19,6 +20,12 @@ class GoogleOAuthOperationV1(str, Enum):
     KEYS_GET = "keys.get"
     KEYS_LIST = "keys.list"
     PROJECTS_GET_BILLING_INFO = "projects.getBillingInfo"
+    PROJECTS_CREATE = "projects.create"
+    PROJECTS_PATCH = "projects.patch"
+    SERVICES_ENABLE = "services.enable"
+    KEYS_CREATE = "keys.create"
+    KEYS_PATCH = "keys.patch"
+    USERINFO_GET = "userinfo.get"
 
 
 _OAUTH_ERROR_CODES: Final[frozenset[str]] = frozenset(
@@ -74,6 +81,31 @@ _INVENTORY_READONLY_PROFILE_ID: Final[str] = (
 _INVENTORY_READONLY_OPERATION_VALUES: Final[frozenset[str]] = frozenset(
     operation.value for operation in _INVENTORY_READONLY_OPERATIONS
 )
+_PROVISIONER_SCOPES: Final[tuple[str, ...]] = (
+    "cloud-platform",
+    "email",
+    "openid",
+)
+_PROVISIONER_OPERATIONS: Final[tuple[GoogleOAuthOperationV1, ...]] = tuple(
+    sorted(
+        (
+            GoogleOAuthOperationV1.KEYS_CREATE,
+            GoogleOAuthOperationV1.KEYS_GET,
+            GoogleOAuthOperationV1.KEYS_LIST,
+            GoogleOAuthOperationV1.KEYS_PATCH,
+            GoogleOAuthOperationV1.PROJECTS_CREATE,
+            GoogleOAuthOperationV1.PROJECTS_GET,
+            GoogleOAuthOperationV1.PROJECTS_PATCH,
+            GoogleOAuthOperationV1.PROJECTS_SEARCH,
+            GoogleOAuthOperationV1.SERVICES_ENABLE,
+            GoogleOAuthOperationV1.USERINFO_GET,
+        ),
+        key=lambda operation: operation.value,
+    )
+)
+_ALL_OPERATION_VALUES: Final[frozenset[str]] = frozenset(
+    operation.value for operation in GoogleOAuthOperationV1
+)
 _INVENTORY_READONLY_SCOPE_FINGERPRINT: Final[str] = (
     "sha256:"
     + hashlib.sha256("\n".join(_INVENTORY_READONLY_SCOPES).encode("utf-8")).hexdigest()
@@ -107,7 +139,12 @@ class GoogleOAuthAuthorizationProfileV1:
     __str__ = __repr__
 
     def __reduce_ex__(self, protocol: int) -> object:
-        return (_restore_inventory_readonly_profile, ())
+        restore = (
+            _restore_inventory_readonly_profile
+            if self.profile_id is GoogleOAuthProfileIdV1.INVENTORY_READONLY
+            else _restore_provisioner_profile
+        )
+        return (restore, ())
 
 
 def _build_inventory_readonly_profile() -> GoogleOAuthAuthorizationProfileV1:
@@ -151,8 +188,31 @@ _INVENTORY_READONLY_PROFILE: Final[GoogleOAuthAuthorizationProfileV1] = (
 )
 
 
+def _build_provisioner_profile() -> GoogleOAuthAuthorizationProfileV1:
+    profile = object.__new__(GoogleOAuthAuthorizationProfileV1)
+    object.__setattr__(profile, "profile_id", GoogleOAuthProfileIdV1.PROVISIONER)
+    object.__setattr__(profile, "allowed_operations", _PROVISIONER_OPERATIONS)
+    object.__setattr__(profile, "minimal_scopes", _PROVISIONER_SCOPES)
+    object.__setattr__(
+        profile,
+        "scope_fingerprint",
+        "sha256:"
+        + hashlib.sha256("\n".join(_PROVISIONER_SCOPES).encode("utf-8")).hexdigest(),
+    )
+    return profile
+
+
+_PROVISIONER_PROFILE: Final[GoogleOAuthAuthorizationProfileV1] = (
+    _build_provisioner_profile()
+)
+
+
 def _restore_inventory_readonly_profile() -> GoogleOAuthAuthorizationProfileV1:
     return _INVENTORY_READONLY_PROFILE
+
+
+def _restore_provisioner_profile() -> GoogleOAuthAuthorizationProfileV1:
+    return _PROVISIONER_PROFILE
 
 
 def _decode_profile(value: object) -> GoogleOAuthProfileIdV1 | str:
@@ -161,6 +221,8 @@ def _decode_profile(value: object) -> GoogleOAuthProfileIdV1 | str:
     if type(value) is str:
         if value == _INVENTORY_READONLY_PROFILE_ID:
             return GoogleOAuthProfileIdV1.INVENTORY_READONLY
+        if value == GoogleOAuthProfileIdV1.PROVISIONER.value:
+            return GoogleOAuthProfileIdV1.PROVISIONER
         return "credential.oauth_profile_unknown"
     return "credential.oauth_request_invalid"
 
@@ -169,7 +231,7 @@ def _decode_operation(value: object) -> GoogleOAuthOperationV1 | str:
     if type(value) is GoogleOAuthOperationV1:
         return value
     if type(value) is str:
-        if value in _INVENTORY_READONLY_OPERATION_VALUES:
+        if value in _ALL_OPERATION_VALUES:
             return GoogleOAuthOperationV1(value)
         return "credential.oauth_operation_forbidden"
     return "credential.oauth_request_invalid"
@@ -198,5 +260,13 @@ def resolve_google_oauth_profile_v1(
     if type(operation_result) is str:
         del profile_result
         _raise(operation_result)
+    profile = (
+        _INVENTORY_READONLY_PROFILE
+        if profile_result is GoogleOAuthProfileIdV1.INVENTORY_READONLY
+        else _PROVISIONER_PROFILE
+    )
+    if operation_result not in profile.allowed_operations:
+        del profile_result, operation_result, profile
+        _raise("credential.oauth_operation_forbidden")
     del profile_result, operation_result
-    return _INVENTORY_READONLY_PROFILE
+    return profile

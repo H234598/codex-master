@@ -24,14 +24,14 @@ DEFAULT_GOOGLE_ACCOUNT_INVENTORY_PATH = Path(
 )
 MAX_INVENTORY_BYTES = 1_048_576
 MAX_BILLING_ACCOUNTS_PER_ACCOUNT = 4
-MAX_PROJECT_SLOTS_PER_ACCOUNT = 10
+MAX_PROJECT_SLOTS_PER_ACCOUNT = 256
 MAX_YAML_DEPTH = 32
 MAX_YAML_NODES = 4_096
 MAX_YAML_SCALAR_BYTES = 32 * 1024
 MAX_YAML_ALIASES = 0
 MAX_HIVE_SLOT_DIGITS = 9
 
-_ACCOUNT_FIELDS = frozenset(
+_ACCOUNT_FIELDS_V1 = frozenset(
     {
         "ref",
         "login_email",
@@ -42,8 +42,9 @@ _ACCOUNT_FIELDS = frozenset(
         "projects",
     }
 )
+_ACCOUNT_FIELDS_V2 = _ACCOUNT_FIELDS_V1 | frozenset({"auth"})
 _BILLING_FIELDS = frozenset({"ref", "billing_account_id", "label"})
-_PROJECT_FIELDS = frozenset(
+_PROJECT_FIELDS_V1 = frozenset(
     {
         "ref",
         "billing_account_ref",
@@ -55,6 +56,15 @@ _PROJECT_FIELDS = frozenset(
         "secret",
     }
 )
+_PROJECT_FIELDS_V2 = _PROJECT_FIELDS_V1 | frozenset(
+    {"project_name", "purpose", "key_name"}
+)
+_PROJECT_PURPOSES = frozenset({"hive", "oauth_control", "external"})
+_PROJECT_NAME = re.compile(r"[A-Za-z][A-Za-z' !-]{2,28}[A-Za-z]\Z")
+_KEY_NAME = re.compile(r"[A-Za-z][A-Za-z' !-]{2,61}[A-Za-z]\Z")
+_AUTH_FIELDS = frozenset(
+    {"access_token", "refresh_token", "cookies", "client_fingerprint"}
+)
 _PROJECT_STATUSES = frozenset(
     {
         "active",
@@ -62,6 +72,8 @@ _PROJECT_STATUSES = frozenset(
         "delete_planned",
         "delete_requested",
         "restore_pending",
+        "provisioning",
+        "services_enabled",
         "deleted",
     }
 )
@@ -120,6 +132,9 @@ class GoogleProjectV1:
     project_number: str | None
     key_id: str | None
     key_uid: str | None
+    project_name: str | None
+    purpose: str
+    key_name: str | None
 
 
 @dataclass(frozen=True)
@@ -343,7 +358,7 @@ class _StrictInventoryYamlLoader(yaml.SafeLoader):
         return result
 
     def construct_yaml_int(self, node: ScalarNode) -> _YamlIntegerLiteral:
-        if node.value != "1":
+        if node.value not in {"1", "2"}:
             raise _InventoryYamlBoundaryError("integer")
         return _YamlIntegerLiteral(node.value)
 
@@ -394,7 +409,7 @@ def _safe_ancestor(item: os.stat_result) -> bool:
     if not stat.S_ISDIR(item.st_mode) or item.st_uid not in {0, os.geteuid()}:
         return False
     if item.st_uid == os.geteuid():
-        return mode == 0o700
+        return not bool(mode & 0o022)
     return not mode & 0o022 or bool(mode & stat.S_ISVTX)
 
 
@@ -402,7 +417,7 @@ def _safe_private_parent(item: os.stat_result) -> bool:
     return (
         stat.S_ISDIR(item.st_mode)
         and item.st_uid == os.geteuid()
-        and stat.S_IMODE(item.st_mode) == 0o700
+        and not bool(stat.S_IMODE(item.st_mode) & 0o022)
     )
 
 
@@ -592,6 +607,49 @@ def _external_id(value: object) -> str | None:
     return None if value is None else _required_string(value)
 
 
+def _project_name(value: object) -> str | None:
+    if value is None:
+        return None
+    name = _required_string(value)
+    if _PROJECT_NAME.fullmatch(name) is None:
+        _schema_invalid()
+    return name
+
+
+def _key_name(value: object) -> str | None:
+    if value is None:
+        return None
+    name = _required_string(value)
+    if _KEY_NAME.fullmatch(name) is None:
+        _schema_invalid()
+    return name
+
+
+def _validate_private_auth(value: object) -> None:
+    if value is None:
+        return
+    data = _mapping(value, _AUTH_FIELDS, frozenset())
+    for key in ("access_token", "refresh_token", "client_fingerprint"):
+        token = data.get(key)
+        if token is not None:
+            _required_string(token)
+    cookies = data.get("cookies")
+    if cookies is None:
+        return
+    for cookie in _list(cookies, 512):
+        if type(cookie) is not dict or len(cookie) > 24:
+            _schema_invalid()
+        for key, item in cookie.items():
+            if type(key) is not str or not key or type(item) not in {
+                str,
+                int,
+                float,
+                bool,
+                type(None),
+            }:
+                _schema_invalid()
+
+
 def _hive_slot(ref: str) -> int:
     match = _HIVE_REF.fullmatch(ref)
     if match is None or len(match.group(1)) > MAX_HIVE_SLOT_DIGITS:
@@ -609,8 +667,9 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
         frozenset({"schema_version", "google_accounts"}),
     )
     schema_version = top["schema_version"]
-    if type(schema_version) is not _YamlIntegerLiteral or schema_version.value != "1":
+    if type(schema_version) is not _YamlIntegerLiteral:
         _schema_invalid()
+    version = int(schema_version.value)
     accounts: list[GoogleAccountV1] = []
     seen_refs: set[str] = set()
     seen_login_emails: set[str] = set()
@@ -626,7 +685,7 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
     for raw_account in _list(top["google_accounts"], MAX_INVENTORY_BYTES):
         data = _mapping(
             raw_account,
-            _ACCOUNT_FIELDS,
+            _ACCOUNT_FIELDS_V2 if version == 2 else _ACCOUNT_FIELDS_V1,
             frozenset({"ref", "login_email", "billing_accounts", "projects"}),
         )
         account_ref = _required_string(data["ref"])
@@ -642,6 +701,8 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
         seen_login_emails.add(login_email.casefold())
         if subject_id is not None:
             seen_subject_ids.add(subject_id)
+        if version == 2:
+            _validate_private_auth(data.get("auth"))
 
         billings: list[GoogleBillingAccountV1] = []
         billing_refs: set[str] = set()
@@ -669,15 +730,25 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
 
         projects: list[GoogleProjectV1] = []
         for raw_project in _list(data["projects"], MAX_PROJECT_SLOTS_PER_ACCOUNT):
-            project_data = _mapping(raw_project, _PROJECT_FIELDS, _PROJECT_FIELDS)
+            project_fields = (
+                _PROJECT_FIELDS_V2 if version == 2 else _PROJECT_FIELDS_V1
+            )
+            project_data = _mapping(raw_project, project_fields, project_fields)
             project_ref = _required_string(project_data["ref"])
             hive_slot = _hive_slot(project_ref)
             billing_ref = _optional_string(project_data["billing_account_ref"])
+            purpose = (
+                _required_string(project_data["purpose"])
+                if version == 2
+                else "hive"
+            )
+            if purpose not in _PROJECT_PURPOSES:
+                _schema_invalid()
             status = _required_string(project_data["status"])
             if status not in _PROJECT_STATUSES:
                 _schema_invalid()
             secret = project_data["secret"]
-            if status == "active":
+            if status == "active" and purpose == "hive":
                 secret_value = _required_string(secret)
             elif secret is not None:
                 _schema_invalid()
@@ -689,6 +760,14 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
             project_number = _external_id(project_data["project_number"])
             key_id = _external_id(project_data["key_id"])
             key_uid = _external_id(project_data["key_uid"])
+            project_name = (
+                _project_name(project_data["project_name"])
+                if version == 2
+                else None
+            )
+            key_name = _key_name(project_data["key_name"]) if version == 2 else None
+            if version == 2 and project_id is not None and project_name is None:
+                _schema_invalid()
             if (
                 project_ref in seen_refs
                 or hive_slot in seen_slots
@@ -725,6 +804,9 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
                     project_number,
                     key_id,
                     key_uid,
+                    project_name,
+                    purpose,
+                    key_name,
                 )
             )
 
@@ -742,7 +824,7 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
 
     ordered = tuple(sorted(accounts, key=lambda item: item.ref))
     result = GoogleAccountInventoryDocumentV1(
-        schema_version=1,
+        schema_version=version,
         accounts=ordered,
         content_fingerprint=_redacted_fingerprint(ordered),
         by_ref=_frozen_index(
@@ -818,6 +900,9 @@ def _redacted_fingerprint(accounts: tuple[GoogleAccountV1, ...]) -> str:
                     "project_number": project.project_number,
                     "key_id": project.key_id,
                     "key_uid": project.key_uid,
+                    "project_name": project.project_name,
+                    "purpose": project.purpose,
+                    "key_name": project.key_name,
                     "secret": None,
                 }
                 for project in account.projects

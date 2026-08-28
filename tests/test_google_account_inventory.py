@@ -336,7 +336,7 @@ def test_schema_rejects_nonstring_external_ids(tmp_path: Path, field: str) -> No
     )
 
 
-def test_schema_enforces_four_billing_and_ten_project_slots_per_account(
+def test_schema_enforces_four_billing_accounts_without_ten_project_ceiling(
     tmp_path: Path,
 ) -> None:
     within_limit = _inventory_document()
@@ -381,8 +381,8 @@ def test_schema_enforces_four_billing_and_ten_project_slots_per_account(
         == "credential.inventory_schema_invalid"
     )
 
-    over_projects = copy.deepcopy(within_limit)
-    over_projects["google_accounts"][0]["projects"].append(  # type: ignore[index]
+    eleven_projects = copy.deepcopy(within_limit)
+    eleven_projects["google_accounts"][0]["projects"].append(  # type: ignore[index]
         {
             "ref": "the-hive-11",
             "billing_account_ref": None,
@@ -394,12 +394,10 @@ def test_schema_enforces_four_billing_and_ten_project_slots_per_account(
             "secret": None,
         }
     )
-    assert (
-        _assert_inventory_error(
-            _write_document(tmp_path / "over-projects", over_projects)
-        ).code
-        == "credential.inventory_schema_invalid"
+    document = _load_test_document(
+        _write_document(tmp_path / "eleven-projects", eleven_projects)
     )
+    assert len(document.accounts[0].projects) == 11
 
 
 @pytest.mark.parametrize(
@@ -526,10 +524,13 @@ def test_hardlinked_inventory_file_is_rejected(tmp_path: Path) -> None:
     assert _assert_inventory_error(path).code == "credential.inventory_permissions"
 
 
-def test_nonprivate_direct_parent_is_rejected(tmp_path: Path) -> None:
+def test_owner_readonly_direct_parent_matches_production_0755(tmp_path: Path) -> None:
     path = _write_document(tmp_path / "inventory", _inventory_document())
     path.parent.chmod(0o755)
 
+    assert _load_test_document(path).schema_version == 1
+
+    path.parent.chmod(0o775)
     assert _assert_inventory_error(path).code == "credential.inventory_permissions"
 
 
