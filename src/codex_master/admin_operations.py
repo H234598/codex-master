@@ -48,8 +48,10 @@ _RECORD_FIELDS = frozenset(
         "reason_codes",
     }
 )
+_LEGACY_RECORD_FIELDS = _RECORD_FIELDS - {"owner"}
 _STEP_FIELDS = frozenset({"name", "state", "reason_code"})
 _OWNER_FIELDS = frozenset({"boot_id", "pid", "start_ticks"})
+_UNKNOWN_OWNER_FIELDS = frozenset({"status"})
 
 OwnerIdentity = tuple[str, int, int]
 
@@ -358,21 +360,38 @@ class AdminOperationStore:
         if (
             not isinstance(document, Mapping)
             or set(document) != {"schema_version", "operations"}
-            or document.get("schema_version") != 1
+            or type(document.get("schema_version")) is not int
+            or document.get("schema_version") not in {1, 2}
             or type(document.get("operations")) is not list
             or len(document["operations"]) > MAX_OPERATION_RECORDS
         ):
             raise AdminOperationError("control.operation_store_unavailable")
+        legacy = document.get("schema_version") == 1
         records: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         seen_keys: set[str] = set()
         for item in document["operations"]:
+            if legacy:
+                if not isinstance(item, Mapping) or frozenset(item) not in {
+                    _LEGACY_RECORD_FIELDS,
+                    _RECORD_FIELDS,
+                }:
+                    raise AdminOperationError("control.operation_store_unavailable")
+                item = dict(item)
+                if "owner" not in item:
+                    item["owner"] = (
+                        {"status": "unknown"}
+                        if item.get("state") == "running"
+                        else None
+                    )
             record = self._validate_record(item)
             if record["id"] in seen_ids or record["idempotency_key"] in seen_keys:
                 raise AdminOperationError("control.operation_store_unavailable")
             seen_ids.add(record["id"])
             seen_keys.add(record["idempotency_key"])
             records.append(record)
+        if legacy:
+            self._write_locked(records)
         return records
 
     def _write_locked(self, records: list[dict[str, Any]]) -> None:
@@ -381,7 +400,7 @@ class AdminOperationStore:
         try:
             raw = (
                 json.dumps(
-                    {"schema_version": 1, "operations": records},
+                    {"schema_version": 2, "operations": records},
                     ensure_ascii=True,
                     sort_keys=True,
                     separators=(",", ":"),
@@ -403,10 +422,7 @@ class AdminOperationStore:
         record["id"] = self._stored_token(record["id"])
         record["kind"] = self._stored_token(record["kind"])
         record["idempotency_key"] = self._stored_token(record["idempotency_key"])
-        if record["owner"] is not None:
-            record["owner"] = self._owner_document(
-                self._stored_owner(record["owner"])
-            )
+        record["owner"] = self._stored_owner_document(record["owner"])
         record["expected_generation"] = self._stored_generation(
             record["expected_generation"]
         )
@@ -534,6 +550,8 @@ class AdminOperationStore:
             raise AdminOperationError("control.operation_owner_unavailable") from None
 
     def _owner_is_dead(self, value: object) -> bool:
+        if value == {"status": "unknown"}:
+            return False
         owner = self._stored_owner(value)
         try:
             alive = self._owner_probe.is_alive(owner)
@@ -565,6 +583,20 @@ class AdminOperationStore:
             return AdminOperationStore._owner(candidate)
         except AdminOperationError:
             raise AdminOperationError("control.operation_store_unavailable") from None
+
+    @staticmethod
+    def _stored_owner_document(value: object) -> dict[str, object] | None:
+        if value is None:
+            return None
+        if (
+            isinstance(value, Mapping)
+            and set(value) == _UNKNOWN_OWNER_FIELDS
+            and value.get("status") == "unknown"
+        ):
+            return {"status": "unknown"}
+        return AdminOperationStore._owner_document(
+            AdminOperationStore._stored_owner(value)
+        )
 
     @staticmethod
     def _owner_document(owner: OwnerIdentity) -> dict[str, object]:

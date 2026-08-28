@@ -18,6 +18,7 @@ from codex_master.admin_operations import (
 
 
 NOW = datetime(2026, 8, 28, 10, 0, tzinfo=UTC)
+LEGACY_DIGEST = "sha256:b5029f1bcea0a6630628a94cccbed49e025e36551d85fddd6224c7788ca096b5"
 
 
 class Clock:
@@ -61,6 +62,111 @@ def _run_owned_operation(root: str, connection: Any) -> None:
     store.record_step(plan.operation_id, "create", succeeded=True)
     connection.send(plan.operation_id)
     connection.recv()
+
+
+def legacy_v1_record(state: str) -> dict[str, object]:
+    step_state = "succeeded" if state == "succeeded" else "not_attempted"
+    reason_codes = {
+        "planned": ["control.plan_ready"],
+        "running": ["control.operation_running"],
+        "succeeded": ["control.apply_succeeded"],
+    }
+    return {
+        "id": f"op-v1-{state}",
+        "kind": "google.provision",
+        "state": state,
+        "expected_generation": 4,
+        "resulting_generation": 5 if state == "succeeded" else None,
+        "plan_digest": LEGACY_DIGEST,
+        "created_at": "2026-08-28T10:00:00Z",
+        "expires_at": "2026-08-28T10:15:00Z",
+        "idempotency_key": f"legacy-{state}",
+        "steps": [{"name": "one", "state": step_state, "reason_code": None}],
+        "reason_codes": reason_codes[state],
+    }
+
+
+def write_operation_document(tmp_path, payload: dict[str, object]) -> Path:
+    root = tmp_path / "admin-operations"
+    root.mkdir(mode=0o700)
+    document = root / "operations.json"
+    document.write_text(json.dumps(payload), encoding="utf-8")
+    document.chmod(0o600)
+    return document
+
+
+@pytest.mark.parametrize("state", ["planned", "succeeded"])
+def test_v1_stable_record_migrates_without_changing_public_identity(
+    tmp_path, state: str
+) -> None:
+    record = legacy_v1_record(state)
+    document = write_operation_document(
+        tmp_path, {"schema_version": 1, "operations": [record]}
+    )
+
+    store = store_at(tmp_path)
+    migrated = store.get(record["id"])
+    repeated = store.plan(
+        kind="google.provision",
+        generation=4,
+        key=f"legacy-{state}",
+        steps=("one",),
+    )
+
+    assert migrated.id == f"op-v1-{state}"
+    assert migrated.state == state
+    assert migrated.plan_digest == LEGACY_DIGEST
+    assert migrated.expires_at == NOW + timedelta(minutes=15)
+    assert repeated.operation_id == migrated.id
+    assert json.loads(document.read_text(encoding="utf-8"))["schema_version"] == 2
+    assert store_at(tmp_path).get(migrated.id) == migrated
+
+
+def test_v1_running_migrates_to_restart_stable_unknown_owner(tmp_path) -> None:
+    record = legacy_v1_record("running")
+    document = write_operation_document(
+        tmp_path, {"schema_version": 1, "operations": [record]}
+    )
+    dead_probe = OwnerProbe(False)
+
+    migrated = store_at(tmp_path, owner_probe=dead_probe).get(record["id"])
+    persisted = json.loads(document.read_text(encoding="utf-8"))
+
+    assert migrated.state == "running"
+    assert migrated.id == "op-v1-running"
+    assert migrated.plan_digest == LEGACY_DIGEST
+    assert migrated.expires_at == NOW + timedelta(minutes=15)
+    assert persisted["schema_version"] == 2
+    assert persisted["operations"][0]["owner"] == {"status": "unknown"}
+    assert store_at(tmp_path, owner_probe=dead_probe).get(migrated.id).state == "running"
+
+
+def test_unknown_persistence_major_is_rejected(tmp_path) -> None:
+    write_operation_document(
+        tmp_path,
+        {"schema_version": 3, "operations": [legacy_v1_record("planned")]},
+    )
+
+    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+        store_at(tmp_path)
+
+
+def test_owner_aware_v1_running_migrates_without_losing_owner(tmp_path) -> None:
+    store = store_at(tmp_path)
+    plan = store.plan(
+        kind="google.provision", generation=4, key="owner-aware-v1", steps=("one",)
+    )
+    store.begin(plan.operation_id, current_generation=4)
+    document = tmp_path / "admin-operations" / "operations.json"
+    payload = json.loads(document.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    document.write_text(json.dumps(payload), encoding="utf-8")
+    document.chmod(0o600)
+
+    migrated = store_at(tmp_path).get(plan.operation_id)
+
+    assert migrated.state == "running"
+    assert json.loads(document.read_text(encoding="utf-8"))["schema_version"] == 2
 
 
 def test_repeated_idempotency_key_returns_same_operation(tmp_path) -> None:
