@@ -10,6 +10,7 @@ import pytest
 from codex_master.admin_contracts import AdminPrincipalV1, OperationV1
 from codex_master.admin_hosts import ControlHostV1
 from codex_master.admin_operations import AdminOperationPlan, AdminOperationStore
+from codex_master.google_account_inventory import GoogleAccountInventoryError
 from codex_master.google_account_inventory_manager import (
     GoogleAccountInventoryStatusV1,
     InventoryManagerStateV1,
@@ -1018,6 +1019,54 @@ def test_global_inventory_refresh_rejects_stale_generation_before_reload(
         )
 
     assert owners.google_manager.reload_calls == 0
+
+
+def test_global_inventory_refresh_owner_failure_replays_terminal_receipt(
+    tmp_path,
+) -> None:
+    service, owners = service_at()
+    service._operation_store = AdminOperationStore.for_test(tmp_path)
+
+    def fail_reload(*, expected_generation: int) -> GoogleAccountInventoryStatusV1:
+        assert expected_generation == 4
+        owners.google_manager.reload_calls += 1
+        raise GoogleAccountInventoryError("credential.inventory_reload_failed")
+
+    owners.google_manager.reload = fail_reload  # type: ignore[method-assign]
+
+    with pytest.raises(AdminServiceError) as captured:
+        command(
+            service,
+            "google.inventory.refresh",
+            {},
+            "fleet.google.inventory.refresh",
+            idempotency_key="failed-refresh",
+        )
+
+    live_replay = command(
+        service,
+        "google.inventory.refresh",
+        {},
+        "fleet.google.inventory.refresh",
+        idempotency_key="failed-refresh",
+    )
+    restarted, _restarted_owners = service_at()
+    restarted._operation_store = AdminOperationStore.for_test(tmp_path)
+    restarted._google_manager = owners.google_manager
+    restart_replay = command(
+        restarted,
+        "google.inventory.refresh",
+        {},
+        "fleet.google.inventory.refresh",
+        idempotency_key="failed-refresh",
+    )
+
+    assert captured.value.problem.code == "credential.inventory_reload_failed"
+    assert live_replay == restart_replay
+    assert live_replay["state"] == "failed"
+    assert live_replay["failed_count"] == 1
+    assert live_replay["reason_codes"] == ["credential.inventory_reload_failed"]
+    assert owners.google_manager.reload_calls == 1
 
 
 def test_billing_service_forwards_exact_request_owner_binding() -> None:

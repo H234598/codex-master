@@ -486,7 +486,24 @@ class MasterjetControlService:
             operation_plan.operation_id,
             current_generation=current_generation,
         )
-        status = self._google_manager.reload(expected_generation=generation)
+        try:
+            status = self._google_manager.reload(expected_generation=generation)
+        except GoogleAccountInventoryError as error:
+            if type(error) is not GoogleAccountInventoryError:
+                raise
+            reason_code = _owner_service_error(error).problem.code
+            self._operation_store.record_step(
+                operation_plan.operation_id,
+                "inventory.reload",
+                succeeded=False,
+                reason_code=reason_code,
+            )
+            self._operation_store.finish(
+                operation_plan.operation_id,
+                state="failed",
+                reason_codes=(reason_code,),
+            )
+            raise
         self._operation_store.record_step(
             operation_plan.operation_id,
             "inventory.reload",
@@ -678,6 +695,10 @@ def _public_value(value: object, *, field: str | None = None) -> object:
     if value is None or type(value) in {bool, int, float}:
         return value
     if type(value) is str:
+        if field == "reason_codes":
+            if _CODE.fullmatch(value) is None:
+                raise _service_error("control.response_private")
+            return value
         if field == "authorization_url":
             return _public_authorization_url(value)
         try:
@@ -691,7 +712,7 @@ def _public_value(value: object, *, field: str | None = None) -> object:
         raise _service_error("control.response_private")
     if type(value) in {list, tuple}:
         values = cast(list[object] | tuple[object, ...], value)
-        return [_public_value(item) for item in values]
+        return [_public_value(item, field=field) for item in values]
     if type(value) is dict:
         result: dict[str, object] = {}
         items = cast(dict[object, object], value).items()
