@@ -1,376 +1,505 @@
-"""Fail-closed Linux boundary for the offline home broker.
-
-This module deliberately has no live Linux implementation.  Every operation
-is supplied by a narrow adapter so that the broker's identity decisions can
-be tested without root, filesystems, or processes.
-"""
+"""Injected Linux boundary checks for CHPB/2 broker peers and directories."""
 
 from __future__ import annotations
 
-import errno
-import re
 from dataclasses import dataclass
-from enum import Enum
 from typing import Protocol
 
-from .fleet_home_broker_identity import (
-    ObjectIdentity,
-    PeerCgroupEvidence,
-    validate_peer_cgroup_evidence,
-)
-from .fleet_home_broker_protocol import (
-    CANONICAL_AGENT_HOME,
+from codex_master.fleet_home_broker_protocol import (
     MAX_CHPB_DEVICE,
     MAX_CHPB_GENERATION,
     MAX_CHPB_INODE,
+    DirectoryIdentity,
+    PrincipalBinding,
+    _digest,
+    _mcs,
+    validate_principal_binding,
 )
 
 
-# Linux UAPI values.  Keeping these as constants avoids importing or invoking
-# an OS/path API; the injected adapter owns the eventual syscall boundary.
-O_CLOEXEC = 0o2000000
-RESOLVE_NO_XDEV = 0x01
-RESOLVE_NO_MAGICLINKS = 0x02
-RESOLVE_NO_SYMLINKS = 0x04
-RESOLVE_BENEATH = 0x08
-REQUIRED_RESOLVE_FLAGS = (
-    RESOLVE_BENEATH
-    | RESOLVE_NO_SYMLINKS
-    | RESOLVE_NO_MAGICLINKS
-    | RESOLVE_NO_XDEV
-)
-
-_HEX32 = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
-_MCS = re.compile(r"c(0|[1-9][0-9]{0,3}),c(0|[1-9][0-9]{0,3})\Z", re.ASCII)
-_UNIT = re.compile(r"[A-Za-z0-9_.@:-]{1,255}\Z", re.ASCII)
-_TYPE_MASK = 0o170000
-_DIRECTORY_TYPE = 0o040000
-_NO_GROUP_OTHER_WRITE = 0o0022
+SAFE_DIRECTORY_MODE = 0o40700
+_FILE_TYPE_MASK = 0o170000
+_DIRECTORY_FILE_TYPE = 0o040000
+_MAX_FILE_MODE = 0o177777
 
 
-class LinuxBrokerCode(str, Enum):
-    UNSUPPORTED_PLATFORM = "unsupported_platform"
-    UNSAFE_PATH = "unsafe_path"
-    STALE_PEER = "stale_peer"
-    IDENTITY_MISMATCH = "identity_mismatch"
-    CROSS_DEVICE = "cross_device"
-    ALREADY_EXISTS = "already_exists"
-    IO_FAILURE = "io_failure"
-
-
-class LinuxBrokerError(OSError):
-    """Stable error surface for every Linux-boundary rejection."""
-
-    __slots__ = ("code",)
-    code: LinuxBrokerCode
-
-    def __init__(self, code: LinuxBrokerCode):
-        self.code = code
-        super().__init__(code.value)
+class LinuxBoundaryError(ValueError):
+    """Raised when an injected Linux boundary observation is unsafe."""
 
 
 @dataclass(frozen=True, slots=True)
-class LinuxPlatformContract:
-    openat2: bool
-    pidfd: bool
-    cgroup_v2: bool
-    renameat2_noreplace: bool
-
-
-@dataclass(frozen=True, slots=True)
-class OpenHow:
-    flags: int
+class FdStat:
+    dev: int
+    ino: int
     mode: int
-    resolve: int
+    uid: int
+    gid: int
 
 
 @dataclass(frozen=True, slots=True)
-class PinnedFd:
-    fd: int
-    identity: ObjectIdentity
+class PidfdIdentity:
+    pid: int
+    start_time: int
 
 
 @dataclass(frozen=True, slots=True)
-class SystemdUnitEvidence:
-    unit_name: str
+class PeerSnapshot:
+    pid: int
+    cgroup_dev: int
+    cgroup_ino: int
     invocation_id: str
-    cgroup: ObjectIdentity
     unit_generation: int
     mcs_pair: str
 
 
-@dataclass(frozen=True, slots=True)
-class IdmappedMountContract:
-    source: ObjectIdentity
-    target_path: str
-    mcs_pair: str
-    dynamic_user: bool
-    idmapped: bool
+class LinuxOperations(Protocol):
+    def openat2(self, parent_fd: int, child_name: str, flags: int, resolve: int) -> int:
+        ...
+
+    def fstat(self, fd: int) -> FdStat:
+        ...
+
+    def close(self, fd: int) -> None:
+        ...
+
+    def pidfd_open(self, pid: int, flags: int) -> int:
+        ...
+
+    def pidfd_reuse_check(
+        self,
+        pidfd: int,
+        pid: int,
+        proc_fd: int | None,
+        cgroup_fd: int | None,
+        identity: PidfdIdentity | None,
+    ) -> PidfdIdentity:
+        ...
+
+    def open_pinned_proc_pid(
+        self, pidfd: int, pid: int, identity: PidfdIdentity
+    ) -> int:
+        ...
+
+    def open_proc_cgroup(
+        self, pidfd: int, proc_fd: int, identity: PidfdIdentity
+    ) -> int:
+        ...
+
+    def read_proc_control_group(
+        self,
+        pidfd: int,
+        proc_fd: int,
+        cgroup_fd: int,
+        cgroup_dev: int,
+        cgroup_ino: int,
+    ) -> str:
+        ...
+
+    def read_pid1_unit_name(
+        self, pidfd: int, cgroup_fd: int, cgroup_dev: int, cgroup_ino: int
+    ) -> str:
+        ...
+
+    def read_pid1_unit_generation(
+        self, pidfd: int, cgroup_fd: int, cgroup_dev: int, cgroup_ino: int
+    ) -> int:
+        ...
+
+    def read_pid1_invocation_id(
+        self, pidfd: int, cgroup_fd: int, cgroup_dev: int, cgroup_ino: int
+    ) -> str:
+        ...
+
+    def read_pid1_control_group(
+        self, pidfd: int, cgroup_fd: int, cgroup_dev: int, cgroup_ino: int
+    ) -> str:
+        ...
+
+    def read_peer_mcs_pair(
+        self,
+        pidfd: int,
+        proc_fd: int,
+        cgroup_fd: int,
+        cgroup_dev: int,
+        cgroup_ino: int,
+    ) -> str:
+        ...
 
 
-class LinuxBrokerOps(Protocol):
-    """The only operations a Linux adapter may expose to this boundary."""
-
-    def pidfd_open(self, pid: int) -> int: ...
-
-    def pidfd_alive(self, pidfd: int) -> bool: ...
-
-    def open_proc_directory(self, pidfd: int) -> int: ...
-
-    def read_cgroup_v2(self, proc_fd: int) -> str: ...
-
-    def open_cgroup_directory(self, proc_fd: int, name: str) -> int: ...
-
-    def stat_fd(self, fd: int) -> ObjectIdentity: ...
-
-    def openat2(self, parent_fd: int, name: str, how: OpenHow) -> PinnedFd: ...
-
-    def mkdirat(self, parent_fd: int, name: str, mode: int) -> int: ...
-
-    def write_all(self, fd: int, data: bytes) -> None: ...
-
-    def fsync(self, fd: int) -> None: ...
-
-    def renameat2_noreplace(self, parent_fd: int, staging_name: str, final_name: str) -> None: ...
-
-    def unlinkat(self, parent_fd: int, name: str) -> None: ...
-
-    def sha256_fd(self, fd: int) -> str: ...
-
-    def close(self, fd: int) -> None: ...
+_OPENAT2_FLAGS = 0o10000000 | 0o200000 | 0o400000 | 0o2000000
+_OPENAT2_RESOLVE = 0x08 | 0x04 | 0x02
 
 
-def _fail(code: LinuxBrokerCode) -> None:
-    raise LinuxBrokerError(code)
-
-
-def _integer(value: object, low: int, high: int, code: LinuxBrokerCode) -> int:
-    if type(value) is not int:
-        _fail(code)
-    if value < low or value > high:
-        _fail(code)
+def _strict_integer(value: object, field: str, low: int, high: int) -> int:
+    if type(value) is not int or not low <= value <= high:
+        raise LinuxBoundaryError(f"{field} is outside strict integer bounds")
     return value
 
 
-def _fd(value: object) -> int:
-    return _integer(value, 0, MAX_CHPB_INODE, LinuxBrokerCode.IDENTITY_MISMATCH)
-
-
-def _identity(value: object, code: LinuxBrokerCode = LinuxBrokerCode.IDENTITY_MISMATCH) -> ObjectIdentity:
-    if type(value) is not ObjectIdentity:
-        _fail(code)
-    _integer(value.dev, 0, MAX_CHPB_DEVICE, code)
-    _integer(value.ino, 1, MAX_CHPB_INODE, code)
-    _integer(value.mode, 0, 0o177777, code)
-    _integer(value.uid, 0, MAX_CHPB_GENERATION, code)
-    _integer(value.gid, 0, MAX_CHPB_GENERATION, code)
-    _integer(value.nlink, 1, MAX_CHPB_INODE, code)
+def _positive_integer(value: object, field: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise LinuxBoundaryError(f"{field} is not a positive integer")
     return value
 
 
-def _component(value: object) -> str:
-    if type(value) is not str or not value or "\x00" in value:
-        _fail(LinuxBrokerCode.UNSAFE_PATH)
-    if value in (".", "..") or "/" in value:
-        _fail(LinuxBrokerCode.UNSAFE_PATH)
+def _strict_text(value: object, field: str) -> str:
+    if type(value) is not str or not value:
+        raise LinuxBoundaryError(f"{field} is not non-empty text")
     return value
 
 
-def _mcs(value: object) -> str:
-    if type(value) is not str or _MCS.fullmatch(value) is None:
-        _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    left, right = (int(part[1:]) for part in value.split(","))
-    if not 0 <= left < right <= 1023:
-        _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
+def _validate_directory_identity(value: object) -> DirectoryIdentity:
+    if type(value) is not DirectoryIdentity:
+        raise LinuxBoundaryError("expected directory identity is invalid")
+    _strict_integer(value.dev, "directory dev", 0, MAX_CHPB_DEVICE)
+    _strict_integer(value.ino, "directory ino", 1, MAX_CHPB_INODE)
+    _strict_integer(value.mode, "directory mode", SAFE_DIRECTORY_MODE, SAFE_DIRECTORY_MODE)
     return value
 
 
-def _unit_evidence(value: object) -> SystemdUnitEvidence:
-    if type(value) is not SystemdUnitEvidence:
-        _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    if type(value.unit_name) is not str or _UNIT.fullmatch(value.unit_name) is None:
-        _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    if type(value.invocation_id) is not str or _HEX32.fullmatch(value.invocation_id) is None:
-        _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    cgroup = _identity(value.cgroup)
-    if cgroup.mode & _TYPE_MASK != _DIRECTORY_TYPE or cgroup.nlink < 2:
-        _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    if cgroup.uid != 0 or cgroup.gid != 0 or cgroup.mode & _NO_GROUP_OTHER_WRITE:
-        _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    _integer(value.unit_generation, 1, MAX_CHPB_GENERATION, LinuxBrokerCode.IDENTITY_MISMATCH)
-    _mcs(value.mcs_pair)
+def _validate_fd_stat(value: object) -> FdStat:
+    if type(value) is not FdStat:
+        raise LinuxBoundaryError("observed fd stat is invalid")
+    _strict_integer(value.dev, "fd dev", 0, MAX_CHPB_DEVICE)
+    _strict_integer(value.ino, "fd ino", 1, MAX_CHPB_INODE)
+    _strict_integer(value.mode, "fd mode", SAFE_DIRECTORY_MODE, SAFE_DIRECTORY_MODE)
+    if type(value.uid) is not int or value.uid != 0:
+        raise LinuxBoundaryError("fd uid is not exactly root")
+    if type(value.gid) is not int or value.gid != 0:
+        raise LinuxBoundaryError("fd gid is not exactly root")
     return value
 
 
-def _map_operation_error(error: BaseException, *, rename: bool = False) -> None:
-    if isinstance(error, NotImplementedError) or (
-        isinstance(error, OSError)
-        and error.errno in (errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP)
-    ):
-        _fail(LinuxBrokerCode.UNSUPPORTED_PLATFORM)
-    if isinstance(error, OSError) and error.errno == errno.EEXIST:
-        _fail(LinuxBrokerCode.ALREADY_EXISTS)
-    if isinstance(error, OSError) and error.errno == errno.EXDEV:
-        _fail(LinuxBrokerCode.CROSS_DEVICE)
-    if isinstance(error, OSError) and error.errno == errno.ELOOP:
-        _fail(LinuxBrokerCode.UNSAFE_PATH)
-    _fail(LinuxBrokerCode.IO_FAILURE)
+def _validate_cgroup_stat(value: object) -> FdStat:
+    if type(value) is not FdStat:
+        raise LinuxBoundaryError("cgroup stat is invalid")
+    _strict_integer(value.dev, "cgroup dev", 0, MAX_CHPB_DEVICE)
+    _strict_integer(value.ino, "cgroup ino", 1, MAX_CHPB_INODE)
+    _strict_integer(value.mode, "cgroup mode", 0, _MAX_FILE_MODE)
+    if value.mode & _FILE_TYPE_MASK != _DIRECTORY_FILE_TYPE:
+        raise LinuxBoundaryError("cgroup stat is not a directory")
+    return value
 
 
-def _call(function, *args, rename: bool = False):
+def _validate_principal(value: object) -> PrincipalBinding:
+    if type(value) is not PrincipalBinding:
+        raise LinuxBoundaryError("expected principal binding is invalid")
     try:
-        return function(*args)
-    except LinuxBrokerError:
-        raise
-    except (NotImplementedError, OSError) as error:
-        _map_operation_error(error, rename=rename)
-    except Exception as error:
-        _map_operation_error(error, rename=rename)
-    raise AssertionError("unreachable")
+        return validate_principal_binding(value)
+    except Exception as exc:
+        raise LinuxBoundaryError("expected principal binding is invalid") from exc
 
 
-def _validate_pinned(value: object) -> PinnedFd:
-    if type(value) is not PinnedFd:
-        _fail(LinuxBrokerCode.IO_FAILURE)
-    _fd(value.fd)
-    _identity(value.identity, LinuxBrokerCode.IO_FAILURE)
-    return value
-
-
-def require_linux_platform(value: object) -> LinuxPlatformContract:
-    """Require every primitive explicitly; partial platforms are unusable."""
-
-    if type(value) is not LinuxPlatformContract:
-        _fail(LinuxBrokerCode.UNSUPPORTED_PLATFORM)
-    fields = (value.openat2, value.pidfd, value.cgroup_v2, value.renameat2_noreplace)
-    if any(type(field) is not bool for field in fields) or not all(fields):
-        _fail(LinuxBrokerCode.UNSUPPORTED_PLATFORM)
-    return value
-
-
-def open_beneath_no_symlink(
-    ops: LinuxBrokerOps,
-    parent_fd: int,
-    name: str,
-    *,
-    flags: int,
-    mode: int = 0,
-) -> PinnedFd:
-    """Open one safe relative component with one fully constrained openat2."""
-
-    _fd(parent_fd)
-    _component(name)
-    _integer(flags, 0, MAX_CHPB_GENERATION, LinuxBrokerCode.UNSAFE_PATH)
-    _integer(mode, 0, 0o177777, LinuxBrokerCode.UNSAFE_PATH)
-    how = OpenHow(flags | O_CLOEXEC, mode, REQUIRED_RESOLVE_FLAGS)
-    result = _call(ops.openat2, parent_fd, name, how)
-    return _validate_pinned(result)
-
-
-def pin_peer_cgroup(
-    ops: LinuxBrokerOps,
-    peer_pid: int,
-    unit: SystemdUnitEvidence,
-) -> PeerCgroupEvidence:
-    """Pin a peer identity around a cgroup-v2 observation."""
-
-    _integer(peer_pid, 1, MAX_CHPB_GENERATION, LinuxBrokerCode.STALE_PEER)
-    _unit_evidence(unit)
-    pidfd: int | None = None
-    proc_fd: int | None = None
-    cgroup_fd: int | None = None
-    try:
-        pidfd_value = _call(ops.pidfd_open, peer_pid)
-        if type(pidfd_value) is not int or pidfd_value < 0:
-            _fail(LinuxBrokerCode.IO_FAILURE)
-        pidfd = pidfd_value
-
-        alive = _call(ops.pidfd_alive, pidfd)
-        if type(alive) is not bool:
-            _fail(LinuxBrokerCode.IO_FAILURE)
-        if not alive:
-            _fail(LinuxBrokerCode.STALE_PEER)
-
-        proc_value = _call(ops.open_proc_directory, pidfd)
-        if type(proc_value) is not int or proc_value < 0:
-            _fail(LinuxBrokerCode.IO_FAILURE)
-        proc_fd = proc_value
-
-        cgroup_name = _call(ops.read_cgroup_v2, proc_fd)
-        _component(cgroup_name)
-        cgroup_value = _call(ops.open_cgroup_directory, proc_fd, cgroup_name)
-        if type(cgroup_value) is not int or cgroup_value < 0:
-            _fail(LinuxBrokerCode.IO_FAILURE)
-        cgroup_fd = cgroup_value
-
-        observed = _call(ops.stat_fd, cgroup_fd)
-        _identity(observed)
-        if observed.dev != unit.cgroup.dev or observed.ino != unit.cgroup.ino:
-            _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-
-        alive_after = _call(ops.pidfd_alive, pidfd)
-        if type(alive_after) is not bool:
-            _fail(LinuxBrokerCode.IO_FAILURE)
-        if not alive_after:
-            _fail(LinuxBrokerCode.STALE_PEER)
-
-        evidence = PeerCgroupEvidence(
-            peer_pid,
-            observed,
-            unit.invocation_id,
-            unit.unit_name,
-            unit.unit_generation,
-            unit.mcs_pair,
-        )
-        try:
-            validate_peer_cgroup_evidence(evidence)
-        except ValueError:
-            _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-        return evidence
-    finally:
-        for fd in (cgroup_fd, proc_fd, pidfd):
-            if fd is not None:
-                try:
-                    ops.close(fd)
-                except Exception:
-                    # Cleanup must not turn a validated observation into a
-                    # different result, nor may it trigger another adapter
-                    # operation or fallback.
-                    pass
-
-
-def validate_idmapped_mount_contract(value: object) -> IdmappedMountContract:
-    """Validate immutable mount/MCS evidence without performing mount work."""
-
-    if type(value) is not IdmappedMountContract:
-        _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    _identity(value.source)
-    if type(value.target_path) is not str or value.target_path != CANONICAL_AGENT_HOME:
-        _fail(LinuxBrokerCode.UNSAFE_PATH)
-    _mcs(value.mcs_pair)
-    if type(value.dynamic_user) is not bool or type(value.idmapped) is not bool:
-        _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    if value.dynamic_user is not True or value.idmapped is not True:
-        _fail(LinuxBrokerCode.IDENTITY_MISMATCH)
-    return value
-
-
-def rename_noreplace_and_fsync_parent(
-    ops: LinuxBrokerOps,
-    parent_fd: int,
-    staging_name: str,
-    final_name: str,
-) -> None:
-    """Publish exactly once, then durably sync the containing directory."""
-
-    _fd(parent_fd)
-    _component(staging_name)
-    _component(final_name)
-    _call(
-        ops.renameat2_noreplace,
-        parent_fd,
-        staging_name,
-        final_name,
-        rename=True,
+def _validate_pidfd_identity(value: object, expected_pid: int) -> PidfdIdentity:
+    if type(value) is not PidfdIdentity:
+        raise LinuxBoundaryError("pidfd identity is invalid")
+    _positive_integer(value.pid, "pidfd identity pid")
+    _strict_integer(
+        value.start_time,
+        "pidfd identity start time",
+        1,
+        MAX_CHPB_GENERATION,
     )
-    _call(ops.fsync, parent_fd, rename=True)
+    if value.pid != expected_pid:
+        raise LinuxBoundaryError("pidfd identity pid was reused or exited")
+    return value
+
+
+def _pidfd_guard(
+    operations: LinuxOperations,
+    pidfd: int,
+    peer_pid: int,
+    proc_fd: int | None,
+    cgroup_fd: int | None,
+    identity: PidfdIdentity | None,
+) -> PidfdIdentity:
+    observed = _validate_pidfd_identity(
+        operations.pidfd_reuse_check(
+            pidfd,
+            peer_pid,
+            proc_fd,
+            cgroup_fd,
+            identity,
+        ),
+        peer_pid,
+    )
+    if identity is not None and observed != identity:
+        raise LinuxBoundaryError("pidfd identity drifted")
+    return observed
+
+
+def _validate_observed_peer_snapshot(
+    value: object, peer_pid: int
+) -> PeerSnapshot:
+    if type(value) is not PeerSnapshot:
+        raise LinuxBoundaryError("peer snapshot is invalid")
+    _positive_integer(value.pid, "snapshot pid")
+    if value.pid != peer_pid:
+        raise LinuxBoundaryError("snapshot pid was reused or exited")
+    _strict_integer(value.cgroup_dev, "snapshot cgroup dev", 0, MAX_CHPB_DEVICE)
+    _strict_integer(value.cgroup_ino, "snapshot cgroup ino", 1, MAX_CHPB_INODE)
+    _strict_integer(
+        value.unit_generation,
+        "snapshot unit generation",
+        1,
+        MAX_CHPB_GENERATION,
+    )
+    try:
+        _digest(value.invocation_id, 32)
+        _mcs(value.mcs_pair)
+    except Exception as exc:
+        raise LinuxBoundaryError("peer snapshot fields are invalid") from exc
+    return value
+
+
+def _validate_peer_snapshot(
+    value: object, peer_pid: int, expected: PrincipalBinding
+) -> PrincipalBinding:
+    snapshot = _validate_observed_peer_snapshot(value, peer_pid)
+    if (
+        snapshot.cgroup_dev != expected.cgroup_dev
+        or snapshot.cgroup_ino != expected.cgroup_ino
+        or snapshot.unit_generation != expected.unit_generation
+        or snapshot.invocation_id != expected.invocation_id
+        or snapshot.mcs_pair != expected.mcs_pair
+    ):
+        raise LinuxBoundaryError("peer principal does not match")
+    return expected
+
+
+def _close_all(operations: LinuxOperations, fds: tuple[int | None, ...]) -> None:
+    first_error = None
+    for fd in fds:
+        if fd is None:
+            continue
+        try:
+            operations.close(fd)
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise LinuxBoundaryError("fd close failed") from first_error
+
+
+def _fail_with_cleanup(
+    operations: LinuxOperations,
+    fds: tuple[int | None, ...],
+    message: str,
+    cause=None,
+) -> None:
+    try:
+        _close_all(operations, fds)
+    except LinuxBoundaryError as exc:
+        raise LinuxBoundaryError(f"{message}; close failed") from exc
+    error = LinuxBoundaryError(message)
+    if cause is None:
+        raise error
+    raise error from cause
+
+
+def _valid_child_name(child_name: object) -> bool:
+    return (
+        type(child_name) is str
+        and child_name == child_name.strip()
+        and child_name not in {"", ".", ".."}
+        and not child_name.startswith("/")
+        and "/" not in child_name
+        and "\\" not in child_name
+        and "\x00" not in child_name
+    )
+
+
+def open_pinned_child_directory(
+    operations: LinuxOperations,
+    parent_fd: int,
+    child_name: str,
+    expected: DirectoryIdentity,
+) -> int:
+    """Open and verify one pinned child directory using injected operations."""
+
+    if not _valid_child_name(child_name):
+        raise LinuxBoundaryError("child name is not one canonical relative component")
+    _validate_directory_identity(expected)
+
+    try:
+        fd = operations.openat2(parent_fd, child_name, _OPENAT2_FLAGS, _OPENAT2_RESOLVE)
+    except Exception as exc:
+        raise LinuxBoundaryError("openat2 failed") from exc
+
+    try:
+        observed = _validate_fd_stat(operations.fstat(fd))
+        if (
+            observed.dev != expected.dev
+            or observed.ino != expected.ino
+            or observed.mode != expected.mode
+        ):
+            raise LinuxBoundaryError("directory identity drifted")
+    except LinuxBoundaryError as exc:
+        _fail_with_cleanup(operations, (fd,), str(exc), exc)
+    except Exception as exc:
+        _fail_with_cleanup(operations, (fd,), "fstat failed", exc)
+    return fd
+
+
+def _observe_peer_snapshot_with_identity(
+    operations: LinuxOperations,
+    peer_pid: int,
+) -> tuple[PeerSnapshot, PidfdIdentity]:
+    """Private extraction of the existing complete pidfd-bound observation body."""
+
+    _positive_integer(peer_pid, "peer pid")
+    pidfd = None
+    proc_fd = None
+    cgroup_fd = None
+    try:
+        pidfd = operations.pidfd_open(peer_pid, 0)
+        identity = _pidfd_guard(operations, pidfd, peer_pid, None, None, None)
+
+        proc_fd = operations.open_pinned_proc_pid(pidfd, peer_pid, identity)
+        identity = _pidfd_guard(operations, pidfd, peer_pid, proc_fd, None, identity)
+        cgroup_fd = operations.open_proc_cgroup(pidfd, proc_fd, identity)
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        cgroup_stat = _validate_cgroup_stat(operations.fstat(cgroup_fd))
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        cgroup_dev = cgroup_stat.dev
+        cgroup_ino = cgroup_stat.ino
+
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        proc_control_group = _strict_text(
+            operations.read_proc_control_group(
+                pidfd, proc_fd, cgroup_fd, cgroup_dev, cgroup_ino
+            ),
+            "proc control group",
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        unit_name = _strict_text(
+            operations.read_pid1_unit_name(
+                pidfd, cgroup_fd, cgroup_dev, cgroup_ino
+            ),
+            "PID-1 unit name",
+        )
+        if "/" in unit_name:
+            raise LinuxBoundaryError("PID-1 unit name is not canonical")
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        unit_generation = operations.read_pid1_unit_generation(
+            pidfd, cgroup_fd, cgroup_dev, cgroup_ino
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        invocation_id = operations.read_pid1_invocation_id(
+            pidfd, cgroup_fd, cgroup_dev, cgroup_ino
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        pid1_control_group = _strict_text(
+            operations.read_pid1_control_group(
+                pidfd, cgroup_fd, cgroup_dev, cgroup_ino
+            ),
+            "PID-1 control group",
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        mcs_pair = operations.read_peer_mcs_pair(
+            pidfd, proc_fd, cgroup_fd, cgroup_dev, cgroup_ino
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+
+        if proc_control_group != pid1_control_group:
+            raise LinuxBoundaryError("PID-1 control group does not match proc")
+        if not pid1_control_group.endswith(f"/{unit_name}"):
+            raise LinuxBoundaryError("PID-1 unit does not match cgroup")
+        snapshot = PeerSnapshot(
+            identity.pid,
+            cgroup_dev,
+            cgroup_ino,
+            invocation_id,
+            unit_generation,
+            mcs_pair,
+        )
+        _validate_observed_peer_snapshot(snapshot, peer_pid)
+    except LinuxBoundaryError as exc:
+        _fail_with_cleanup(operations, (cgroup_fd, proc_fd, pidfd), str(exc), exc)
+    except Exception as exc:
+        _fail_with_cleanup(
+            operations,
+            (cgroup_fd, proc_fd, pidfd),
+            "peer boundary operation failed",
+            exc,
+        )
+
+    _close_all(operations, (cgroup_fd, proc_fd, pidfd))
+    return snapshot, identity
+
+
+def _attest_peer_principal_with_identity(
+    operations: LinuxOperations,
+    peer_pid: int,
+    expected_principal: PrincipalBinding,
+) -> tuple[PeerSnapshot, PidfdIdentity]:
+    """Attest a peer with explicit PID-FD-bound proc and cgroup reads."""
+
+    _positive_integer(peer_pid, "peer pid")
+    expected = _validate_principal(expected_principal)
+    snapshot, identity = _observe_peer_snapshot_with_identity(operations, peer_pid)
+    _validate_peer_snapshot(snapshot, peer_pid, expected)
+    return snapshot, identity
+
+
+def attest_peer_principal(
+    operations: LinuxOperations,
+    peer_pid: int,
+    expected_principal: PrincipalBinding,
+) -> PeerSnapshot:
+    """Attest a peer with explicit PID-FD-bound proc and cgroup reads."""
+
+    snapshot, _ = _attest_peer_principal_with_identity(
+        operations, peer_pid, expected_principal
+    )
+    return snapshot
+
+
+__all__ = [
+    "FdStat",
+    "LinuxBoundaryError",
+    "LinuxOperations",
+    "PeerSnapshot",
+    "PidfdIdentity",
+    "SAFE_DIRECTORY_MODE",
+    "attest_peer_principal",
+    "open_pinned_child_directory",
+]

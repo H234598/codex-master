@@ -897,7 +897,7 @@ def test_runtime_resolver_uses_task_complexity_after_codex_usage_account_gate() 
     assert no_spark.fallback is True
 
 
-def test_selection_options_offers_exact_teamlead_tuple_for_verified_q_target() -> None:
+def test_selection_options_keeps_q_target_bound_to_requester_authority() -> None:
     inventory = SimpleNamespace(
         agents={"q1": SimpleNamespace(series_prefix="q", skill_profile="teamleiterin")},
         agent_ids=("q1",),
@@ -905,8 +905,8 @@ def test_selection_options_offers_exact_teamlead_tuple_for_verified_q_target() -
     with patch("codex_master.server.canonical_agent_id", return_value="q1"), patch(
         "codex_master.server.current_agent_inventory", return_value=inventory
     ), patch(
-        "codex_master.server.codex_usage_routing_decision",
-        return_value={"decision": "main", "model": "gpt-5.6-luna", "reason": "spark_unavailable"},
+        "codex_master.server.ensure_agent_not_blocked_by_codex_usage",
+        return_value={"blocked": False},
     ):
         offer = agent_selection_options("q1", requester_class="teamleiterin")
         unchanged = agent_selection_options(
@@ -915,19 +915,11 @@ def test_selection_options_offers_exact_teamlead_tuple_for_verified_q_target() -
             known_generation=offer["generation"],
         )
 
-    assert offer["classes"] == ["teamleiterin"]
-    assert offer["lifecycles"] == ["persistent"]
-    assert offer["models"] == ["gpt-5.6-terra"]
-    assert offer["reasoning_levels"] == ["xhigh"]
-    assert offer["options"] == [{
-        "class": "teamleiterin",
-        "lifecycle": "persistent",
-        "model": "gpt-5.6-terra",
-        "reasoning": "xhigh",
-    }]
+    assert "teamleiterin" not in offer["classes"]
+    assert offer["options"]
+    assert all(option["class"] != "teamleiterin" for option in offer["options"])
     assert offer["options_changed"] is True
     assert unchanged["options_changed"] is False
-    assert offer["availability_reason"] == "spark_unavailable"
 
 
 def test_selection_options_hides_teamlead_for_worker_authority() -> None:
@@ -938,8 +930,8 @@ def test_selection_options_hides_teamlead_for_worker_authority() -> None:
     with patch("codex_master.server.canonical_agent_id", return_value="q1"), patch(
         "codex_master.server.current_agent_inventory", return_value=inventory
     ), patch(
-        "codex_master.server.codex_usage_routing_decision",
-        return_value={"decision": "main", "model": "gpt-5.6-luna", "reason": "spark_unavailable"},
+        "codex_master.server.ensure_agent_not_blocked_by_codex_usage",
+        return_value={"blocked": False},
     ):
         offer = agent_selection_options("q1", requester_class="arbeitsbiene")
     assert "teamleiterin" not in offer["classes"]
@@ -969,7 +961,7 @@ def test_skill_profile_cannot_bind_worker_targets_to_leadership() -> None:
         assert resolver_class_for_agent("c1", "arbeitsbiene") == "arbeitsbiene"
 
 
-def test_q_target_binds_leadership_only_for_leadership_authority() -> None:
+def test_q_target_does_not_bind_leadership_from_series_metadata() -> None:
     inventory = type(
         "Inventory",
         (),
@@ -984,14 +976,11 @@ def test_q_target_binds_leadership_only_for_leadership_authority() -> None:
         },
     )()
     with patch("codex_master.server.current_agent_inventory", return_value=inventory):
-        assert (
-            resolver_class_for_agent(
-                "q1",
-                "arbeitsbiene",
-                authority_class="teamleiterin",
-            )
-            == "teamleiterin"
-        )
+        assert resolver_class_for_agent(
+            "q1",
+            "arbeitsbiene",
+            authority_class="teamleiterin",
+        ) == "arbeitsbiene"
         assert resolver_class_for_agent("q1", "arbeitsbiene") == "arbeitsbiene"
 
 

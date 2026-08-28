@@ -26,6 +26,7 @@ EXPECTED_RISKS = {
     "agent_lease_status": Risk.READ_ONLY,
     "agent_claim": Risk.MUTATING,
     "agent_release": Risk.MUTATING,
+    "dynamic_teamlead_start": Risk.MUTATING,
     "agent_wait": Risk.READ_ONLY,
     "fleet_watchdog": Risk.BROAD,
     "usage_watchdog": Risk.BROAD,
@@ -37,7 +38,6 @@ EXPECTED_RISKS = {
     "agent_skill_match": Risk.READ_ONLY,
     "agent_capabilities": Risk.READ_ONLY,
     "agent_scope_check": Risk.READ_ONLY,
-    "agent_routing_decision": Risk.READ_ONLY,
     "agent_selection_options": Risk.READ_ONLY,
     "agent_assign": Risk.MUTATING,
     "agent_assign_readonly": Risk.MUTATING,
@@ -96,13 +96,6 @@ EXPECTED_RISKS = {
     "goddess_report_status": Risk.READ_ONLY,
     "goddess_report_run": Risk.MUTATING,
     "goddess_report_list": Risk.READ_ONLY,
-    "usage_fast_mode": Risk.BROAD,
-    "usage_fast_mode_reconcile": Risk.BROAD,
-    "usage_fast_mode_status": Risk.READ_ONLY,
-    "emergency_queen_status": Risk.READ_ONLY,
-    "emergency_queen_plan_completed": Risk.MUTATING,
-    "emergency_queen_child_started": Risk.MUTATING,
-    "emergency_queen_child_completed": Risk.MUTATING,
 }
 
 

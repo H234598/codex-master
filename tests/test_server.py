@@ -1,7 +1,6 @@
 import ast
 import base64
 import contextlib
-import functools
 import hashlib
 import io
 import json
@@ -45,7 +44,14 @@ from codex_master.resource_monitor import (
     ResourceSnapshotError,
 )
 from codex_master.selection.task_classification import TaskClassificationRequest, TaskClassifier
-from codex_master.usage_snapshot import UsageSnapshot
+from codex_master.usage_snapshot import (
+    AccountUsageEvidenceV2,
+    TrackerEvidenceV2,
+    UsageEvidenceV2,
+    UsageLimitV2,
+    UsageSnapshot,
+    UsageTrendV2,
+)
 
 
 from codex_master.server import (
@@ -62,7 +68,6 @@ from codex_master.server import (
     MAX_ASSIGNMENT_LOG_BYTES,
     MAX_ASSIGNMENT_RECORDS,
     MAX_CAPABILITY_PLUGINS,
-    MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
     MAX_AGENT_SELECTOR_TEXT,
     MAX_APPLET_AGENTS,
     MAX_ERROR_CHARS,
@@ -107,7 +112,6 @@ from codex_master.server import (
     agent_lifecycle_lock,
     agent_identity_guard,
     agent_home_process_summary,
-    agent_spark_routing,
     check_mcp_registration,
     call_tool,
     claim_agent,
@@ -116,16 +120,12 @@ from codex_master.server import (
     classify_tui_context,
     codex_related_process_summary,
     codex_usage_watchdog_status,
-    codex_usage_routing_decision,
-    codex_usage_spark_health_update,
     codex_project_trust_prompt_visible,
     dismiss_codex_update_prompt,
-    validate_codex_usage_routing_decision,
     DEFAULT_AGENT_MODEL,
     DEFAULT_AGENT_MODEL_EFFORT,
     doctor,
     ensure_state,
-    ensure_agent_not_blocked_by_codex_usage,
     ensure_assignment_session_model,
     handle_rpc,
     install,
@@ -156,8 +156,6 @@ from codex_master.server import (
     raw_log_metadata,
     read_message,
     read_meta,
-    remember_agent_routing,
-    remember_agent_usage_account,
     request_agent_report,
     safe_tail,
     same_path_text,
@@ -184,7 +182,6 @@ from codex_master.server import (
     stop_agent,
     strip_ansi,
     skill_match_agent,
-    usage_watchdog_agent,
     sync_plugin_cache_from_repo,
     trim_chars,
     trim_lines,
@@ -1323,7 +1320,7 @@ def _synthetic_alias_snapshot(*, generation: int = 219) -> Any:
         "standard",
         (member,),
     )
-    return server_module.FleetSnapshotV2(2, generation, (account,), (series,))
+    return server_module.FleetSnapshotV2(2, generation, (account,), (series,), ())
 
 
 def _overview_cli_test_snapshot(*, generation: int = 9) -> Any:
@@ -1392,16 +1389,15 @@ class ServerHelpersTest(unittest.TestCase):
                     ),
                 ) as reader:
                     projection = server_module._read_resource_evidence_projection_v2(runtime)
-
-                self.assertEqual(projection.operator_status.state, state)
-                self.assertEqual(projection.operator_status.reason_codes, reasons)
-                self.assertIs(projection.operator_status.measurements, measurements)
-                self.assertIs(projection.gate_facts.measurements, measurements)
-                reader.assert_called_once_with(
-                    runtime.state,
-                    now_utc=RESOURCE_TEST_NOW,
-                    expected_boot_id=RESOURCE_TEST_BOOT_ID,
-                )
+                    self.assertEqual(projection.operator_status.state, state)
+                    self.assertEqual(projection.operator_status.reason_codes, reasons)
+                    self.assertIs(projection.operator_status.measurements, measurements)
+                    self.assertIs(projection.gate_facts.measurements, measurements)
+                    reader.assert_called_once_with(
+                        runtime.state,
+                        now_utc=RESOURCE_TEST_NOW,
+                        expected_boot_id=RESOURCE_TEST_BOOT_ID,
+                    )
 
     def test_v2_warming_offer_is_publicly_retryable_without_numeric_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1421,6 +1417,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["reason_codes"], ["resource_monitor_warming"])
         self.assertEqual(result["errors"][0]["code"], "resource_monitor_warming")
+        self.assertTrue(result["retryable"])
         self.assertNotIn("current", json.dumps(result))
         reader.assert_called_once()
 
@@ -2200,29 +2197,35 @@ class ServerHelpersTest(unittest.TestCase):
         assert result["reason_codes"] == []
 
     def test_p1w1_resource_admission_uses_resource_evidence_with_known_observation(self) -> None:
-        snapshot = {
-            "ok": False,
-            "_g5_facts": True,
-            "load_per_cpu": 2.25,
-            "cpu_busy_percent": 99.0,
-            "io_wait_percent": 99.0,
-            "available_memory_percent": 1.0,
-            "available_memory_mib": 256,
-            "running_agents": 0,
-            "reason_codes": ["cpu_pressure_high"],
-        }
-
         with tempfile.TemporaryDirectory() as directory:
-            approved, adapter, _runner = approved_cgroup_runtime_for_test(Path(directory))
-            with patch.object(
+            root = Path(directory)
+            runtime = resource_runtime_for_test(root)
+            evidence = resource_evidence_v2_for_test(
+                ResourceEvidenceStateV2.READY,
+                measurements=resource_measurements_v2_for_test(
+                    load_per_cpu=2.25,
+                    cpu_busy_percent=99.0,
+                    io_wait_percent=0.0,
+                    available_memory_percent=50.0,
+                    available_memory_mib=8192,
+                ),
+            )
+            with server_module._resource_gate_runtime_scope(runtime), patch.object(
                 server_module,
-                "_typed_g5_cgroup_runtime",
-                return_value=(approved.profile, adapter),
-            ):
+                "read_resource_evidence_v2",
+                create=True,
+                return_value=evidence,
+            ) as reader, patch.object(
+                server_module, "_total_running_agent_count", return_value=0
+            ), patch.object(
+                server_module, "read_hive_io_pressure", return_value=LOW_HIVE_IO_PRESSURE
+            ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
+                snapshot = server_module._resource_gate_snapshot(running_agents_override=0)
                 result = server_module._resource_admission_decision(snapshot=snapshot)
 
         assert result["allowed"] is False
         assert result["reason_codes"] == ["cpu_pressure_high"]
+        reader.assert_called_once()
 
     def test_p1w1_cgroup_preflight_reason_is_not_shadowed_by_observation(self) -> None:
         snapshot = {
@@ -3848,13 +3851,15 @@ class ServerHelpersTest(unittest.TestCase):
             "codex_master.server.tmux_alive", return_value=False
         ), patch("codex_master.server.start_agent", side_effect=fake_start), patch(
             "codex_master.server.agent_lease_status", return_value={"held_by_this_server": False}
-        ), patch("codex_master.server.remember_agent_routing"):
+        ):
             result = server_module._start_agent_with_lease_unlocked("o1")
 
         self.assertEqual(result["status"], "started")
         self.assertEqual(observed, [None])
 
-    def test_ollama_assign_uses_central_spawn_admission_without_context_reuse(self) -> None:
+    def test_ollama_assign_uses_central_spawn_admission_without_context_reuse(
+        self,
+    ) -> None:
         descriptor = SimpleNamespace(
             enabled=True,
             provider=server_module.Provider.OLLAMA_LOCAL,
@@ -3876,21 +3881,34 @@ class ServerHelpersTest(unittest.TestCase):
             observed.append(server_module._RESOURCE_ADMISSION_CONTEXT.get())
             return {"status": "unchanged"}
 
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server.current_agent_inventory", return_value=inventory
-        ), patch("codex_master.server._ollama_descriptor", return_value=descriptor), patch(
-            "codex_master.server._resource_admission_decision",
-            side_effect=AssertionError("assignment must use spawn admission owner"),
-        ), patch(
-            "codex_master.server.spawn_admission_decision", return_value=admission
-        ) as compose, patch("codex_master.server.scope_check", return_value={"allowed": True}), patch(
-            "codex_master.server.resolver_class_for_agent", return_value="arbeitsbiene"
-        ), patch(
-            "codex_master.server.claim_for_agent_mutation", return_value=({"state": "held"}, False)
-        ), patch("codex_master.server.ensure_assignment_session_model", side_effect=fake_ensure), patch(
-            "codex_master.server.send_agent", return_value={"status": "sent"}
-        ), patch("codex_master.server.remember_agent_routing"), patch(
-            "codex_master.server.record_assignment"
+        with (
+            patch("codex_master.server.require_fleet_recovery_ready"),
+            patch(
+                "codex_master.server.current_agent_inventory", return_value=inventory
+            ),
+            patch("codex_master.server._ollama_descriptor", return_value=descriptor),
+            patch(
+                "codex_master.server._resource_admission_decision",
+                side_effect=AssertionError("assignment must use spawn admission owner"),
+            ),
+            patch(
+                "codex_master.server.spawn_admission_decision", return_value=admission
+            ) as compose,
+            patch("codex_master.server.scope_check", return_value={"allowed": True}),
+            patch(
+                "codex_master.server.resolver_class_for_agent",
+                return_value="arbeitsbiene",
+            ),
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=({"state": "held"}, False),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                side_effect=fake_ensure,
+            ),
+            patch("codex_master.server.send_agent", return_value={"status": "sent"}),
+            patch("codex_master.server.record_assignment"),
         ):
             result = server_module._assign_agent_unlocked(
                 "o1",
@@ -5043,42 +5061,6 @@ class ServerHelpersTest(unittest.TestCase):
             )
         )
 
-    def test_server_helpers_state_fixture_isolates_canonical_routing_write_from_sentinel(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            sentinel = Path(tmpdir) / "external-state" / "meta" / "a1.json"
-            sentinel.parent.mkdir(parents=True)
-            sentinel.write_text('{"sentinel": true}\n', encoding="utf-8")
-
-            self.assertEqual(server_module.STATE_ROOT, self._test_state_root)
-            self.assertEqual(server_module.RAW_DIR, self._test_state_root / "raw")
-            self.assertEqual(server_module.META_DIR, self._test_state_root / "meta")
-            self.assertEqual(server_module.LOCK_DIR, self._test_state_root / "locks")
-            self.assertEqual(server_module.LEASE_DIR, self._test_state_root / "leases")
-
-            with patch("codex_master.server.read_meta", return_value={"raw_log": "/tmp/foreign-b1.log"}):
-                remember_agent_routing(
-                    "a",
-                    {
-                        "account": "test-account",
-                        "backend_account_id": "backend-test",
-                        "decision": "spark",
-                        "model": WRITE_AGENT_MODEL,
-                    },
-                )
-
-            self.assertEqual(sentinel.read_text(encoding="utf-8"), '{"sentinel": true}\n')
-            self.assertEqual(
-                json.loads((server_module.META_DIR / "a1.json").read_text(encoding="utf-8")),
-                {
-                    "raw_log": "/tmp/foreign-b1.log",
-                    "routing": {
-                        "account": "test-account",
-                        "backend_account_id": "backend-test",
-                        "decision": "spark",
-                        "model": WRITE_AGENT_MODEL,
-                    },
-                },
-            )
 
     def setUp(self) -> None:
         state_tempdir = tempfile.TemporaryDirectory()
@@ -5101,22 +5083,6 @@ class ServerHelpersTest(unittest.TestCase):
                 "test_pool_home_processes_",
             )
         )
-        routing = patch(
-            "codex_master.server.codex_usage_routing_decision",
-            side_effect=lambda agent, *, role, group_id=None, job_id=None: {
-                "schema_version": 1,
-                "account": "test-account",
-                "backend_account_id": "backend-test",
-                "role": role,
-                "decision": "spark",
-                "model": WRITE_AGENT_MODEL,
-                "reason": "spark_available",
-                "usage_state": "known",
-                "paid_overage_allowed": False,
-                "policy_source": "global",
-                "raw_output": "not_returned",
-            },
-        )
         session_model = patch(
             "codex_master.server.ensure_assignment_session_model",
             return_value={
@@ -5126,9 +5092,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "raw_output": "not_returned",
             },
         )
-        routing.start()
         session_model.start()
-        self.addCleanup(routing.stop)
         self.addCleanup(session_model.stop)
         if not dedicated_scan_test:
             process_summary = patch(
@@ -5218,44 +5182,6 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(result, {"meta_error": "could_not_read"})
             self.assertEqual(original.read_text(encoding="utf-8"), '{"owner":"expected"}\n')
 
-    def test_read_codex_usage_snapshot_rejects_parent_swap_before_open(self) -> None:
-        from codex_master import server as server_module
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            snapshot_dir = root / "snapshots"
-            original_dir = root / "original-snapshots"
-            outside_dir = root / "outside-snapshots"
-            snapshot_dir.mkdir()
-            outside_dir.mkdir()
-            (snapshot_dir / "a1.json").write_text('{"account":"a1","status":"clear"}\n', encoding="utf-8")
-            (outside_dir / "a1.json").write_text(
-                '{"account":"outside","status":"blocked"}\n', encoding="utf-8"
-            )
-            real_open_directory = server_module.open_directory_chain_no_follow_matching
-            swapped = False
-
-            def swap_before_parent_open(path, *args, **kwargs):
-                nonlocal swapped
-                if not swapped and Path(path) == snapshot_dir:
-                    snapshot_dir.rename(original_dir)
-                    snapshot_dir.symlink_to(outside_dir, target_is_directory=True)
-                    swapped = True
-                return real_open_directory(path, *args, **kwargs)
-
-            with patch.dict("os.environ", {"CODEX_USAGE_STATE_ROOT": str(root)}, clear=False), patch.object(
-                server_module,
-                "open_directory_chain_no_follow_matching",
-                side_effect=swap_before_parent_open,
-            ):
-                with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                    server_module.read_codex_usage_snapshot("a1")
-
-            self.assertTrue(swapped)
-            self.assertEqual(
-                (original_dir / "a1.json").read_text(encoding="utf-8"),
-                '{"account":"a1","status":"clear"}\n',
-            )
 
     def test_read_private_regular_text_rejects_regular_file_swap_before_open(self) -> None:
         from codex_master import server as server_module
@@ -6142,7 +6068,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent_skill_match", names)
         self.assertIn("agent_capabilities", names)
         self.assertIn("agent_scope_check", names)
-        self.assertIn("agent_routing_decision", names)
+        self.assertNotIn("agent_routing_decision", names)
         self.assertIn("agent_assign_readonly", names)
         self.assertIn("agent_assign_live_data", names)
         self.assertIn("agent_assign_write", names)
@@ -6383,6 +6309,8 @@ class ServerHelpersTest(unittest.TestCase):
         snapshot = _overview_cli_test_snapshot()
         inventory = object()
         overview = object()
+        evidence = UsageEvidenceV2((), "unavailable", None, None)
+        usage_snapshot = UsageSnapshot((), "unavailable", True, ("usage_unavailable",))
         service = Mock()
 
         def registry_snapshot() -> object:
@@ -6419,9 +6347,22 @@ class ServerHelpersTest(unittest.TestCase):
 
         def enrich(seen_overview: object, usage: object) -> object:
             self.assertIs(seen_overview, overview)
-            self.assertEqual(usage.source, "unavailable")
+            self.assertIs(usage, usage_snapshot)
             events.append("enrich")
             return overview
+
+        def read_usage(*, clock: object) -> UsageEvidenceV2:
+            self.assertTrue(callable(clock))
+            events.append("usage")
+            return evidence
+
+        def display(
+            evidence_arg: UsageEvidenceV2, *, known_account_ids: frozenset[str]
+        ) -> UsageSnapshot:
+            self.assertIs(evidence_arg, evidence)
+            self.assertEqual(known_account_ids, frozenset({"overview-account"}))
+            events.append("display")
+            return usage_snapshot
 
         service.registry_snapshot.side_effect = registry_snapshot
 
@@ -6434,30 +6375,48 @@ class ServerHelpersTest(unittest.TestCase):
                 events.append("lock-exit")
 
         created_at = datetime(2026, 8, 15, tzinfo=timezone.utc)
-        with tempfile.TemporaryDirectory() as temporary, patch.object(
-            server_module, "STATE_ROOT", Path(temporary) / "state"
-        ), patch.object(server_module, "AGENT_POOL_ROOT", Path(temporary) / "pool"), patch.object(
-            server_module, "_fleet_registry_read_lock", fake_lock
-        ), patch.object(server_module, "_readonly_fleet_service", return_value=service), patch.object(
-            server_module,
-            "build_inventory",
-            side_effect=inventory_builder,
-        ), patch.object(
-            server_module,
-            "build_fleet_overview",
-            side_effect=overview_builder,
-        ), patch.object(
-            server_module,
-            "_resolve_codex_usage_state_home",
-            return_value=None,
-        ), patch.object(
-            server_module,
-            "enrich_fleet_overview_usage",
-            side_effect=enrich,
-        ), patch.object(
-            server_module,
-            "render_fleet_overview",
-            side_effect=renderer,
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(server_module, "STATE_ROOT", Path(temporary) / "state"),
+            patch.object(server_module, "AGENT_POOL_ROOT", Path(temporary) / "pool"),
+            patch.object(server_module, "_fleet_registry_read_lock", fake_lock),
+            patch.object(
+                server_module, "_readonly_fleet_service", return_value=service
+            ),
+            patch.object(
+                server_module,
+                "build_inventory",
+                side_effect=inventory_builder,
+            ),
+            patch.object(
+                server_module,
+                "build_fleet_overview",
+                side_effect=overview_builder,
+            ),
+            patch.object(
+                server_module,
+                "read_usage_evidence_v2",
+                side_effect=read_usage,
+            ) as reader,
+            patch.object(
+                server_module,
+                "derive_limit_decisions",
+            ) as tracker,
+            patch.object(
+                server_module,
+                "display_snapshot_from_evidence",
+                side_effect=display,
+            ),
+            patch.object(
+                server_module,
+                "enrich_fleet_overview_usage",
+                side_effect=enrich,
+            ),
+            patch.object(
+                server_module,
+                "render_fleet_overview",
+                side_effect=renderer,
+            ),
         ):
             result = server_module._fleet_overview_local_admin(
                 active_only=True,
@@ -6475,10 +6434,14 @@ class ServerHelpersTest(unittest.TestCase):
                 "inventory",
                 "overview",
                 "lock-exit",
+                "usage",
+                "display",
                 "enrich",
                 "renderer",
             ],
         )
+        reader.assert_called_once()
+        tracker.assert_not_called()
 
     def test_fleet_overview_local_admin_normalizes_inventory_runtime_error(self) -> None:
         marker = "inventory-runtime-marker"
@@ -6517,6 +6480,8 @@ class ServerHelpersTest(unittest.TestCase):
         snapshot = _overview_cli_test_snapshot()
         base_overview = object()
         enriched_overview = object()
+        evidence = UsageEvidenceV2((), "unavailable", None, None)
+        usage_snapshot = UsageSnapshot((), "unavailable", True, ("usage_unavailable",))
         service = Mock()
         service.registry_snapshot.return_value = snapshot
 
@@ -6524,27 +6489,34 @@ class ServerHelpersTest(unittest.TestCase):
         def fake_lock(_path: Path):
             yield
 
-        with patch.object(server_module, "STATE_ROOT", Path("/synthetic-state")), patch.object(
-            server_module, "_fleet_registry_read_lock", fake_lock
-        ), patch.object(
-            server_module, "_readonly_fleet_service", return_value=service
-        ), patch.object(server_module, "build_inventory", return_value=object()), patch.object(
-            server_module, "build_fleet_overview", return_value=base_overview
-        ), patch.object(
-            server_module, "_resolve_codex_usage_state_home", return_value=None
-        ), patch.object(
-            server_module, "load_account_usage_v1"
-        ) as loader, patch.object(
-            server_module, "read_active_launcher_v1"
-        ) as active_reader, patch.object(
-            server_module, "read_account_usage_cache_v1"
-        ) as cache_reader, patch.object(
-            server_module, "default_runner"
-        ) as runner, patch.object(
-            server_module, "enrich_fleet_overview_usage", return_value=enriched_overview
-        ) as enrich, patch.object(
-            server_module, "render_fleet_overview", side_effect=KeyError(marker)
-        ) as renderer:
+        with (
+            patch.object(server_module, "STATE_ROOT", Path("/synthetic-state")),
+            patch.object(server_module, "_fleet_registry_read_lock", fake_lock),
+            patch.object(
+                server_module, "_readonly_fleet_service", return_value=service
+            ),
+            patch.object(server_module, "build_inventory", return_value=object()),
+            patch.object(
+                server_module, "build_fleet_overview", return_value=base_overview
+            ),
+            patch.object(
+                server_module, "read_usage_evidence_v2", return_value=evidence
+            ) as reader,
+            patch.object(server_module, "derive_limit_decisions") as tracker,
+            patch.object(
+                server_module,
+                "display_snapshot_from_evidence",
+                return_value=usage_snapshot,
+            ) as display,
+            patch.object(
+                server_module,
+                "enrich_fleet_overview_usage",
+                return_value=enriched_overview,
+            ) as enrich,
+            patch.object(
+                server_module, "render_fleet_overview", side_effect=KeyError(marker)
+            ) as renderer,
+        ):
             with self.assertRaises(AgentError) as raised:
                 server_module._fleet_overview_local_admin(
                     active_only=True,
@@ -6555,14 +6527,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(str(raised.exception), "fleet_overview_unavailable")
         self.assertIsNone(raised.exception.__cause__)
         self.assertNotIn(marker, str(raised.exception))
-        self.assertEqual(
-            enrich.call_args.args,
-            (base_overview, UsageSnapshot((), "unavailable", True, ("usage_unavailable",))),
+        self.assertEqual(enrich.call_args.args, (base_overview, usage_snapshot))
+        reader.assert_called_once()
+        tracker.assert_not_called()
+        display.assert_called_once_with(
+            evidence,
+            known_account_ids=frozenset({"overview-account"}),
         )
-        loader.assert_not_called()
-        active_reader.assert_not_called()
-        cache_reader.assert_not_called()
-        runner.assert_not_called()
         renderer.assert_called_once_with(enriched_overview, format="compact")
 
     def test_fleet_overview_local_admin_lock_failure_does_not_sample_clock(self) -> None:
@@ -14424,26 +14395,33 @@ google_accounts:
         inventory = server_module._legacy_inventory()
         fleet_service = Mock()
         fleet_service.load.return_value = server_module.FleetSnapshot(1, 7, (), ())
-        with patch.object(
-            server_module,
-            "published_agent_inventory",
-            return_value=(inventory, False),
-        ), patch.object(
-            server_module,
-            "_readonly_fleet_service",
-            return_value=fleet_service,
-        ), patch.object(
-            server_module,
-            "agent_auth_status",
-            return_value={"authenticated": True},
-        ), patch.object(
-            server_module,
-            "agent_lease_status",
-            return_value={"state": "unclaimed"},
-        ), patch.object(
-            server_module,
-            "read_codex_usage_snapshot",
-            return_value={},
+        evidence = UsageEvidenceV2((), "unavailable", None, None)
+        with (
+            patch.object(
+                server_module,
+                "published_agent_inventory",
+                return_value=(inventory, False),
+            ),
+            patch.object(
+                server_module,
+                "_readonly_fleet_service",
+                return_value=fleet_service,
+            ),
+            patch.object(
+                server_module,
+                "agent_auth_status",
+                return_value={"authenticated": True},
+            ),
+            patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ),
+            patch.object(
+                server_module,
+                "read_usage_evidence_v2",
+                return_value=evidence,
+            ) as read_evidence,
         ):
             result = server_module.fleet_selection_preview(
                 series="a",
@@ -14453,6 +14431,7 @@ google_accounts:
                 limit=4,
             )
 
+        read_evidence.assert_called_once()
         self.assertEqual(result["candidate_count"], len(inventory.by_series["a-series"]))
         self.assertEqual(result["selection"]["selected"], {
             "agent": "a1",
@@ -14472,9 +14451,6 @@ google_accounts:
         from codex_master import server as server_module
 
         now = datetime.now(timezone.utc)
-        observed = now.isoformat()
-        reset_5h = (now + timedelta(hours=2)).isoformat()
-        reset_weekly = (now + timedelta(days=3)).isoformat()
         descriptor = server_module.AgentDescriptor(
             "d1", "d", 1, "D 1", server_module.RunnerKind.GEMINI_CLI,
             server_module.Provider.GEMINI_API, "auto", "BW_Work",
@@ -14486,42 +14462,45 @@ google_accounts:
         fleet_service = Mock()
         fleet_service.load.return_value = server_module.FleetSnapshot(1, 25, (), ())
         fleet_service.account_gate.return_value = Mock(allowed=True, reason="ready")
-        snapshot = {
-            "account": "BW_Work",
-            "status": "ok",
-            "captured_at": observed,
-            "backend_used": "app-server",
-            "stale": False,
-            "main": {
-                "exhausted": False,
-                "windows": [
-                    {
-                        "name": "5h", "duration_seconds": 18000, "remaining": 81.0,
-                        "limit": 100.0, "percent": 81.0, "reset_at": reset_5h,
-                    },
-                    {
-                        "name": "weekly", "duration_seconds": 604800, "remaining": 53.0,
-                        "limit": 100.0, "percent": 53.0, "reset_at": reset_weekly,
-                    },
-                ],
-            },
-        }
-        with patch.object(
-            server_module,
-            "published_agent_inventory",
-            return_value=(inventory, True),
-        ), patch.object(
-            server_module,
-            "_readonly_fleet_service",
-            return_value=fleet_service,
-        ), patch.object(
-            server_module,
-            "agent_lease_status",
-            return_value={"state": "unclaimed"},
-        ), patch.object(
-            server_module,
-            "read_codex_usage_snapshot",
-            return_value=snapshot,
+        reset_at = now + timedelta(hours=2)
+        evidence = UsageEvidenceV2(
+            (
+                AccountUsageEvidenceV2(
+                    "BW_Work",
+                    (UsageLimitV2("main", 18000, "reset-1", 19.0, 81.0, reset_at),),
+                    (
+                        UsageTrendV2(
+                            "main", 18000, "reset-1", "complete", now, reset_at
+                        ),
+                    ),
+                    (TrackerEvidenceV2("main", 18000, "reset-1", "complete", now),),
+                ),
+            ),
+            "complete",
+            now,
+            now,
+        )
+        with (
+            patch.object(
+                server_module,
+                "published_agent_inventory",
+                return_value=(inventory, True),
+            ),
+            patch.object(
+                server_module,
+                "_readonly_fleet_service",
+                return_value=fleet_service,
+            ),
+            patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ),
+            patch.object(
+                server_module,
+                "read_usage_evidence_v2",
+                return_value=evidence,
+            ) as read_evidence,
         ):
             result = server_module.fleet_selection_preview(
                 series="d",
@@ -14530,6 +14509,7 @@ google_accounts:
                 sp1a=True,
             )
 
+        read_evidence.assert_called_once()
         self.assertEqual(result["usage"], {
             "account_count": 1,
             "observed_count": 1,
@@ -14546,15 +14526,31 @@ google_accounts:
         inventory = server_module._legacy_inventory()
         fleet_service = Mock()
         fleet_service.load.return_value = server_module.FleetSnapshot(1, 7, (), ())
-        with patch.object(server_module, "published_agent_inventory", return_value=(inventory, False)), patch.object(
-            server_module, "_readonly_fleet_service", return_value=fleet_service
-        ), patch.object(server_module, "agent_auth_status", return_value={"authenticated": True}), patch.object(
-            server_module, "agent_lease_status", return_value={"state": "unclaimed"}
-        ), patch.object(server_module, "read_codex_usage_snapshot", return_value={}):
+        evidence = UsageEvidenceV2((), "unavailable", None, None)
+        with (
+            patch.object(
+                server_module,
+                "published_agent_inventory",
+                return_value=(inventory, False),
+            ),
+            patch.object(
+                server_module, "_readonly_fleet_service", return_value=fleet_service
+            ),
+            patch.object(
+                server_module, "agent_auth_status", return_value={"authenticated": True}
+            ),
+            patch.object(
+                server_module, "agent_lease_status", return_value={"state": "unclaimed"}
+            ),
+            patch.object(
+                server_module, "read_usage_evidence_v2", return_value=evidence
+            ) as read_evidence,
+        ):
             result = server_module.fleet_selection_preview(
                 series="a", task_kind="simple", admission_mode="enforced", sp3=True
             )
 
+        read_evidence.assert_called_once()
         self.assertFalse(result["admission"]["planned"])
         self.assertFalse(result["admission"]["executable"])
         self.assertEqual(result["admission"]["reason"], "admission_gate_blocked")
@@ -17628,11 +17624,7 @@ google_accounts:
                 "unknown argument(s) for agent_selection_options",
             )
 
-    @patch(
-        "codex_master.server.codex_usage_routing_decision",
-        return_value={"decision": "luna", "model": "gpt-5.6-luna"},
-    )
-    def test_unverified_selection_offer_fails_safe_to_arbeitsbiene(self, _mock_routing) -> None:
+    def test_unverified_selection_offer_fails_safe_to_arbeitsbiene(self) -> None:
         result = call_tool("agent_selection_options", {"agent": "a"})
 
         self.assertEqual(result["classes"], ["arbeitsbiene"])
@@ -17640,13 +17632,8 @@ google_accounts:
         self.assertNotIn("koenigin", result["classes"])
         self.assertNotIn("gottbiene", result["classes"])
 
-    @patch(
-        "codex_master.server.codex_usage_routing_decision",
-        return_value={"decision": "luna", "model": "gpt-5.6-luna"},
-    )
     def test_verified_teamleader_offer_contains_only_delegable_resolver_options(
         self,
-        _mock_routing,
     ) -> None:
         result = call_tool(
             "agent_selection_options",
@@ -17672,13 +17659,8 @@ google_accounts:
             {"teamleiterin", "koenigin", "gottbiene"}.isdisjoint(result["classes"])
         )
 
-    @patch(
-        "codex_master.server.codex_usage_routing_decision",
-        return_value={"decision": "luna", "model": "gpt-5.6-luna"},
-    )
     def test_verified_queen_offer_includes_direct_teamleader_for_non_q_target(
         self,
-        _mock_routing,
     ) -> None:
         result = call_tool(
             "agent_selection_options",
@@ -17694,11 +17676,7 @@ google_accounts:
         )
         self.assertTrue({"koenigin", "gottbiene", "goettin"}.isdisjoint(result["classes"]))
 
-    @patch(
-        "codex_master.server.codex_usage_routing_decision",
-        return_value={"decision": "luna", "model": "gpt-5.6-luna"},
-    )
-    def test_direct_tool_call_cannot_supply_selection_offer_authority(self, _mock_routing) -> None:
+    def test_direct_tool_call_cannot_supply_selection_offer_authority(self) -> None:
         for spoofed_class in ("teamleiterin", "koenigin", "gottbiene"):
             with self.subTest(spoofed_class=spoofed_class), self.assertRaisesRegex(
                 AgentError,
@@ -17936,17 +17914,34 @@ google_accounts:
         )
 
     def test_start_without_fix_evidence_never_selects_spark(self) -> None:
-        auth_gate = {"authenticated": True, "provider": "openai", "state": "authenticated"}
+        auth_gate = {
+            "authenticated": True,
+            "provider": "openai",
+            "state": "authenticated",
+        }
         lease = {"state": "held", "holder": "test", "held_by_this_server": True}
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server._headless_descriptor", return_value=None
-        ), patch("codex_master.server._ollama_descriptor", return_value=None), patch(
-            "codex_master.server.require_authenticated_agent_for_mutation", return_value=auth_gate
-        ), patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
-            "codex_master.server.claim_agent", return_value={"status": "existing", "lease": lease}
-        ), patch("codex_master.server.tmux_alive", return_value=False), patch(
-            "codex_master.server.start_agent", return_value={"status": "started"}
-        ) as start, patch("codex_master.server.remember_agent_routing"):
+        evidence = UsageEvidenceV2((), "unavailable", None, None)
+        with (
+            patch("codex_master.server.require_fleet_recovery_ready"),
+            patch("codex_master.server._headless_descriptor", return_value=None),
+            patch("codex_master.server._ollama_descriptor", return_value=None),
+            patch(
+                "codex_master.server.require_authenticated_agent_for_mutation",
+                return_value=auth_gate,
+            ),
+            patch(
+                "codex_master.server.read_usage_evidence_v2", return_value=evidence
+            ) as read_evidence,
+            patch("codex_master.server.derive_limit_decisions") as tracker,
+            patch(
+                "codex_master.server.claim_agent",
+                return_value={"status": "existing", "lease": lease},
+            ),
+            patch("codex_master.server.tmux_alive", return_value=False),
+            patch(
+                "codex_master.server.start_agent", return_value={"status": "started"}
+            ) as start,
+        ):
             result = server_module._start_agent_with_lease_unlocked(
                 "a1",
                 allow_unauthenticated=True,
@@ -17955,26 +17950,87 @@ google_accounts:
 
         self.assertEqual(start.call_args.kwargs["model"], "gpt-5.6-luna")
         self.assertEqual(result["selection"]["model"], "gpt-5.6-luna")
+        read_evidence.assert_called_once()
+        tracker.assert_not_called()
 
     def test_confirmed_assign_write_can_select_spark_and_audit_profile(self) -> None:
-        auth_gate = {"authenticated": True, "provider": "openai", "state": "authenticated"}
+        auth_gate = {
+            "authenticated": True,
+            "provider": "openai",
+            "state": "authenticated",
+        }
         lease = {"state": "held", "holder": "test", "held_by_this_server": True}
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server._headless_descriptor", return_value=None
-        ), patch("codex_master.server._ollama_descriptor", return_value=None), patch(
-            "codex_master.server.require_authenticated_agent_for_mutation", return_value=auth_gate
-        ), patch("codex_master.server.require_ollama_admission"), patch(
-            "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
-        ), patch("codex_master.server.scope_check", return_value={"allowed": True}), patch(
-            "codex_master.server.current_agent_inventory",
-            return_value=SimpleNamespace(
-                agents={"a1": SimpleNamespace(series_prefix="a", skill_profile="arbeitsbiene")}
+        now = datetime.now(timezone.utc)
+        evidence = UsageEvidenceV2(
+            (
+                AccountUsageEvidenceV2(
+                    "account-a1",
+                    (
+                        UsageLimitV2(
+                            "main",
+                            18000,
+                            "reset-1",
+                            100.0,
+                            0.0,
+                            now + timedelta(hours=1),
+                        ),
+                    ),
+                    (
+                        UsageTrendV2(
+                            "main",
+                            18000,
+                            "reset-1",
+                            "complete",
+                            now,
+                            now + timedelta(hours=1),
+                        ),
+                    ),
+                    (TrackerEvidenceV2("main", 18000, "reset-1", "complete", now),),
+                ),
             ),
-        ), patch("codex_master.server.claim_for_agent_mutation", return_value=(lease, False)), patch(
-            "codex_master.server.ensure_assignment_session_model", return_value={"status": "unchanged"}
-        ), patch("codex_master.server.send_agent", return_value={"status": "sent"}), patch(
-            "codex_master.server.remember_agent_routing"
-        ), patch("codex_master.server.record_assignment") as record:
+            "complete",
+            now,
+            now,
+        )
+        with (
+            patch("codex_master.server.require_fleet_recovery_ready"),
+            patch("codex_master.server._headless_descriptor", return_value=None),
+            patch("codex_master.server._ollama_descriptor", return_value=None),
+            patch(
+                "codex_master.server.require_authenticated_agent_for_mutation",
+                return_value=auth_gate,
+            ),
+            patch("codex_master.server.require_ollama_admission"),
+            patch(
+                "codex_master.server.read_usage_evidence_v2", return_value=evidence
+            ) as read_evidence,
+            patch(
+                "codex_master.server.derive_limit_decisions", return_value=()
+            ) as tracker,
+            patch("codex_master.server.scope_check", return_value={"allowed": True}),
+            patch(
+                "codex_master.server.current_agent_inventory",
+                return_value=SimpleNamespace(
+                    agents={
+                        "a1": SimpleNamespace(
+                            account_id="account-a1",
+                            series_prefix="a",
+                            skill_profile="arbeitsbiene",
+                        )
+                    }
+                ),
+            ),
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=(lease, False),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                return_value={"status": "unchanged"},
+            ),
+            patch("codex_master.server.send_agent", return_value={"status": "sent"}),
+            patch("codex_master.server.record_assignment") as record,
+        ):
             result = server_module._assign_agent_unlocked(
                 "a1",
                 role="arbeitsbiene",
@@ -17991,7 +18047,11 @@ google_accounts:
 
         self.assertEqual(result["model"], "gpt-5.3-codex-spark")
         self.assertTrue(result["task_profile"]["spark_eligible"])
-        self.assertEqual(record.call_args.args[0]["task_profile"], result["task_profile"])
+        self.assertEqual(
+            record.call_args.args[0]["task_profile"], result["task_profile"]
+        )
+        read_evidence.assert_called_once()
+        tracker.assert_called_once()
 
     def test_task_evidence_is_write_assignment_only_and_boolean_strict(self) -> None:
         write_properties = server_module.TOOL_SCHEMAS["agent_assign_write"]["properties"]
@@ -18047,7 +18107,7 @@ google_accounts:
         mock_start.assert_not_called()
         mock_send.assert_not_called()
 
-    def test_start_for_explicit_queen_teamlead_uses_exact_terra_xhigh_selection(self) -> None:
+    def test_start_for_explicit_queen_teamlead_rejects_legacy_target(self) -> None:
         inventory = SimpleNamespace(
             agents={"q1": SimpleNamespace(series_prefix="q", skill_profile="teamleiterin")},
             agent_ids=("q1",),
@@ -18077,36 +18137,21 @@ google_accounts:
             "codex_master.server.start_agent",
             return_value={"status": "started"},
         ) as mock_start, patch(
-            "codex_master.server.remember_agent_routing"
-        ), patch(
             "codex_master.server.agent_lease_status",
             return_value={"held_by_this_server": False},
         ):
-            result = server_module._start_agent_with_lease_unlocked(
-                "q1",
-                allow_unauthenticated=True,
-                agent_class="teamleiterin",
-                lifecycle="persistent",
-                model="gpt-5.6-terra",
-                reasoning_effort="xhigh",
-                authority_class="koenigin",
-            )
+            with self.assertRaisesRegex(AgentError, "^dynamic_teamlead_legacy_target_forbidden$"):
+                server_module._start_agent_with_lease_unlocked(
+                    "q1",
+                    allow_unauthenticated=True,
+                    agent_class="teamleiterin",
+                    lifecycle="persistent",
+                    model="gpt-5.6-terra",
+                    reasoning_effort="xhigh",
+                    authority_class="koenigin",
+                )
 
-        self.assertEqual(
-            mock_start.call_args.kwargs["model"],
-            "gpt-5.6-terra",
-        )
-        self.assertEqual(mock_start.call_args.kwargs["model_reasoning_effort"], "xhigh")
-        self.assertEqual(mock_start.call_args.kwargs["agent_class"], "teamleiterin")
-        self.assertEqual(
-            (
-                result["selection"]["class"],
-                result["selection"]["lifecycle"],
-                result["selection"]["model"],
-                result["selection"]["reasoning"],
-            ),
-            ("teamleiterin", "persistent", "gpt-5.6-terra", "xhigh"),
-        )
+        mock_start.assert_not_called()
 
     def test_assignment_class_selection_uses_principal_not_target_series(self) -> None:
         def assign_with(
@@ -18129,26 +18174,31 @@ google_accounts:
                 "held_by_this_server": True,
                 "expires_at_utc": None,
             }
-            with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-                "codex_master.server.require_fleet_recovery_ready"
-            ), patch(
-                "codex_master.server._ollama_descriptor", return_value=None
-            ), patch(
-                "codex_master.server.require_authenticated_agent_for_mutation",
-                return_value={"authenticated": True},
-            ), patch(
-                "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
-            ), patch(
-                "codex_master.server.require_ollama_admission",
-                return_value={"allowed": True},
-            ), patch(
-                "codex_master.server.ensure_assignment_session_model",
-                return_value={"status": "unchanged"},
-            ), patch(
-                "codex_master.server.send_agent",
-                return_value={"agent": descriptor.agent_id, "status": "sent"},
-            ), patch("codex_master.server.remember_agent_routing"), patch(
-                "codex_master.server.record_assignment"
+            with (
+                patch(
+                    "codex_master.server.current_agent_inventory",
+                    return_value=inventory,
+                ),
+                patch("codex_master.server.require_fleet_recovery_ready"),
+                patch("codex_master.server._ollama_descriptor", return_value=None),
+                patch(
+                    "codex_master.server.require_authenticated_agent_for_mutation",
+                    return_value={"authenticated": True},
+                ),
+                patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+                patch(
+                    "codex_master.server.require_ollama_admission",
+                    return_value={"allowed": True},
+                ),
+                patch(
+                    "codex_master.server.ensure_assignment_session_model",
+                    return_value={"status": "unchanged"},
+                ),
+                patch(
+                    "codex_master.server.send_agent",
+                    return_value={"agent": descriptor.agent_id, "status": "sent"},
+                ),
+                patch("codex_master.server.record_assignment"),
             ):
                 return server_module._assign_agent_unlocked(
                     descriptor.agent_id,
@@ -18328,25 +18378,34 @@ google_accounts:
         self.assertEqual(payload["error"], f"timeout_seconds must be <= {MAX_WAIT_SECONDS}")
 
     def test_unauthenticated_assignment_skips_usage_routing(self) -> None:
-        lease = {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"}
-        with patch(
-            "codex_master.server.agent_auth_status",
-            return_value={"authenticated": False, "auth_state": "missing"},
-        ), patch(
-            "codex_master.server.codex_usage_routing_decision",
-            side_effect=AssertionError("unauthenticated assignment must not route"),
-        ) as mock_route, patch(
-            "codex_master.server.claim_for_agent_mutation",
-            return_value=(lease, True),
-        ), patch(
-            "codex_master.server.ensure_assignment_session_model",
-            return_value={"status": "unchanged", "raw_output": "not_returned"},
-        ), patch(
-            "codex_master.server.remember_agent_routing"
-        ), patch(
-            "codex_master.server.send_agent",
-            return_value={"status": "sent", "raw_output": "not_returned"},
-        ), patch("codex_master.server.record_assignment") as record:
+        lease = {
+            "state": "held",
+            "held_by_this_server": True,
+            "raw_output": "not_returned",
+        }
+        with (
+            patch(
+                "codex_master.server.agent_auth_status",
+                return_value={"authenticated": False, "auth_state": "missing"},
+            ),
+            patch(
+                "codex_master.server.read_usage_evidence_v2",
+                return_value=UsageEvidenceV2((), "unavailable", None, None),
+            ) as read_evidence,
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=(lease, True),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                return_value={"status": "unchanged", "raw_output": "not_returned"},
+            ),
+            patch(
+                "codex_master.server.send_agent",
+                return_value={"status": "sent", "raw_output": "not_returned"},
+            ),
+            patch("codex_master.server.record_assignment") as record,
+        ):
             result = assign_agent(
                 "a",
                 role="exploriererin",
@@ -18355,8 +18414,8 @@ google_accounts:
                 allow_unauthenticated=True,
             )
 
-        mock_route.assert_not_called()
-        self.assertIsNone(result["routing"])
+        read_evidence.assert_called_once()
+        self.assertNotIn("routing", result)
         self.assertEqual(record.call_args.args[0]["model"], DEFAULT_AGENT_MODEL)
         self.assertNotIn("routing", record.call_args.args[0])
 
@@ -18548,7 +18607,7 @@ google_accounts:
                     model=DEFAULT_AGENT_MODEL,
                     allow_subagents=False,
                     subagent_admission=None,
-                    agent_class="teamleiterin",
+                    agent_class="spezialistin",
                 )
                 server_module._start_agent_unlocked(
                     "a",
@@ -18556,7 +18615,7 @@ google_accounts:
                     prompt="START_TASK",
                     model="gpt-5.6-terra",
                     model_reasoning_effort="xhigh",
-                    agent_class="teamleiterin",
+                    agent_class="spezialistin",
                     name="Seraphina",
                 )
 
@@ -18565,8 +18624,8 @@ google_accounts:
         self.assertEqual(
             [call.kwargs for call in introduction_policy.call_args_list],
             [
-                {"agent_class": "teamleiterin", "name": "Seraphina"},
-                {"agent_class": "teamleiterin", "name": "Seraphina"},
+                {"agent_class": "spezialistin", "name": "Seraphina"},
+                {"agent_class": "spezialistin", "name": "Seraphina"},
             ],
         )
 
@@ -19063,29 +19122,42 @@ google_accounts:
         self.assertEqual(result, 0)
         self.assertIs(call.call_args.args[1]["confirm_home_refresh"], True)
 
-    def test_subagent_admission_deny_still_sends_and_audits_effective_permission(self) -> None:
+    def test_subagent_admission_deny_still_sends_and_audits_effective_permission(
+        self,
+    ) -> None:
         decision = {
             "allowed": False,
             "reason_codes": ["memory_pressure_high", "private_snapshot=1024"],
             "available_memory_mib": 1024,
         }
-        lease = {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"}
-        with patch(
-            "codex_master.server.agent_auth_status",
-            return_value={"authenticated": False, "auth_state": "missing"},
-        ), patch(
-            "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
-        ), patch(
-            "codex_master.server.spawn_admission_decision", return_value=decision
-        ) as admission, patch(
-            "codex_master.server.claim_for_agent_mutation", return_value=(lease, True)
-        ), patch(
-            "codex_master.server.ensure_assignment_session_model",
-            return_value={"status": "unchanged", "raw_output": "not_returned"},
-        ), patch("codex_master.server.remember_agent_routing"), patch(
-            "codex_master.server.send_agent",
-            return_value={"status": "sent", "raw_output": "not_returned"},
-        ) as send, patch("codex_master.server.record_assignment") as record:
+        lease = {
+            "state": "held",
+            "held_by_this_server": True,
+            "raw_output": "not_returned",
+        }
+        with (
+            patch(
+                "codex_master.server.agent_auth_status",
+                return_value={"authenticated": False, "auth_state": "missing"},
+            ),
+            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch(
+                "codex_master.server.spawn_admission_decision", return_value=decision
+            ) as admission,
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=(lease, True),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                return_value={"status": "unchanged", "raw_output": "not_returned"},
+            ),
+            patch(
+                "codex_master.server.send_agent",
+                return_value={"status": "sent", "raw_output": "not_returned"},
+            ) as send,
+            patch("codex_master.server.record_assignment") as record,
+        ):
             result = assign_agent(
                 "a",
                 role="exploriererin",
@@ -19135,10 +19207,9 @@ google_accounts:
         mock_claim.assert_not_called()
 
     @patch("codex_master.server.record_assignment", side_effect=AgentError("record failed"))
-    @patch("codex_master.server.remember_agent_routing")
     @patch("codex_master.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
     def test_agent_assign_keeps_fresh_lease_when_recording_fails_after_send(
-        self, _mock_send, _mock_routing, _mock_record
+        self, _mock_send, _mock_record
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -19620,7 +19691,6 @@ google_accounts:
         mock_safe_tail.assert_not_called()
 
     @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.update_agent_spark_health")
     @patch("codex_master.server.safe_tail")
     @patch("codex_master.server.status_agent")
     @patch("codex_master.server.agent_lease_status")
@@ -19631,7 +19701,6 @@ google_accounts:
         mock_lease_status,
         mock_status_agent,
         mock_safe_tail,
-        mock_health,
         mock_pane_tail,
     ) -> None:
         mock_pane_tail.return_value = "MCP startup incomplete\n"
@@ -19703,10 +19772,6 @@ google_accounts:
             "output": "assignment finished with result",
             "lease": {"state": "held", "held_by_this_server": True, "lease_id": "f" * 32},
         }
-        mock_health.side_effect = [
-            {"state": "failed", "updated": True, "raw_output": "not_returned"},
-            {"state": "healthy", "updated": True, "raw_output": "not_returned"},
-        ]
         mock_lease_status.return_value = {
             "state": "held",
             "holder": "owner",
@@ -19718,25 +19783,13 @@ google_accounts:
         report_result = assignment_report("a", "assign-recover-a1", lines=3, chars=200, source="log")
 
         self.assertEqual(wait_result["status"], "timeout")
-        self.assertEqual(wait_result["spark_health"]["state"], "failed")
-        self.assertEqual(report_result["spark_health"]["state"], "healthy")
         self.assertEqual(report_result["report_status"], "excerpt_available")
-        self.assertEqual(mock_health.call_count, 2)
-        self.assertEqual(
-            mock_health.call_args_list[0],
-            (( "a1",), {"state": "failed", "reason": "spark_turn_timeout"}),
-        )
-        self.assertEqual(
-            mock_health.call_args_list[1],
-            (("a1",), {"state": "healthy", "reason": "spark_turn_assignment_report_output"}),
-        )
 
     @patch("codex_master.server.safe_tail")
     @patch("codex_master.server.status_agent")
     @patch("codex_master.server.list_assignments")
-    @patch("codex_master.server.update_agent_spark_health")
     def test_superseded_report_does_not_rehabilitate_spark_health(
-        self, mock_health, mock_list_assignments, mock_status_agent, mock_safe_tail
+        self, mock_list_assignments, mock_status_agent, mock_safe_tail
     ) -> None:
         mock_list_assignments.return_value = {
             "records": [
@@ -19782,8 +19835,6 @@ google_accounts:
         result = assignment_report("a", "assign-old-a1", lines=3, chars=200, source="log")
 
         self.assertEqual(result["report_status"], "report_blocked_by_superseded_assignment")
-        self.assertEqual(result["spark_health"]["state"], "not_checked")
-        mock_health.assert_not_called()
 
     @patch("codex_master.server.list_assignments", return_value={"records": []})
     def test_assignment_report_requires_known_assignment(self, _mock_list_assignments) -> None:
@@ -20554,11 +20605,10 @@ google_accounts:
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_called_once()
 
-    @patch("codex_master.server.update_wait_agent_spark_health")
     @patch("codex_master.server.time.sleep")
     @patch("codex_master.server.status_agent")
     def test_wait_agent_reports_activity_for_fresh_running_output(
-        self, mock_status_agent, mock_sleep, mock_health
+        self, mock_status_agent, mock_sleep
     ) -> None:
         initial_status = {
             "agent": "a",
@@ -20594,7 +20644,6 @@ google_accounts:
             return status_sequence.pop(0)
 
         mock_status_agent.side_effect = next_status
-        mock_health.return_value = {"state": "not_checked", "updated": False, "raw_output": "not_returned"}
         with patch("codex_master.server.time.time", return_value=1780826500.0):
             result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
 
@@ -20607,10 +20656,9 @@ google_accounts:
     @patch("codex_master.server.pane_tail")
     @patch("codex_master.server.agent_lifecycle_lock")
     @patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True})
-    @patch("codex_master.server.update_agent_spark_health")
     @patch("codex_master.server.status_agent")
     def test_wait_agent_ignores_preexisting_output_after_assignment(
-        self, mock_status_agent, mock_health, _mock_lease, mock_lifecycle_lock, mock_pane_tail
+        self, mock_status_agent, _mock_lease, mock_lifecycle_lock, mock_pane_tail
     ) -> None:
         mock_lifecycle_lock.return_value.__enter__.return_value = None
         _mock_lease.return_value = {"held_by_this_server": True, "lease_id": "a" * 32}
@@ -20633,7 +20681,6 @@ google_accounts:
         result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
 
         self.assertEqual(result["status"], "timeout")
-        mock_health.assert_called_once_with("a1", state="failed", reason="spark_turn_timeout")
         mock_pane_tail.assert_called_once_with("a1", 24, visible_only=True, verify_identity=True)
 
     @patch("codex_master.server.pane_tail")
@@ -20808,9 +20855,10 @@ google_accounts:
 
         self.assertEqual(wait_terminal_status(current, initial), "identity_unverified")
 
-    @patch("codex_master.server.update_agent_spark_health")
     @patch("codex_master.server.status_agent")
-    def test_wait_agent_prefers_not_running_over_stale_limit(self, mock_status_agent, mock_health) -> None:
+    def test_wait_agent_prefers_not_running_over_stale_limit(
+        self, mock_status_agent
+    ) -> None:
         mock_status_agent.return_value = {
             "agent": "a",
             "running": False,
@@ -20821,7 +20869,6 @@ google_accounts:
 
         self.assertEqual(result["status"], "not_running")
         self.assertEqual(result["poll_count"], 0)
-        mock_health.assert_not_called()
 
     def test_watchdog_effective_idle_prefers_new_assignment_over_stale_raw_log(self) -> None:
         result = watchdog_effective_idle(
@@ -21190,18 +21237,26 @@ google_accounts:
         self.assertIsNone(mock_action.call_args.kwargs.get("release_lease_id"))
         mock_marker.assert_called_once_with("a1", None)
 
-    @patch("codex_master.server.update_agent_spark_health")
-    def test_fleet_watchdog_does_not_update_spark_health_after_lease_expiry(self, mock_health) -> None:
+    def test_fleet_watchdog_does_not_update_spark_health_after_lease_expiry(
+        self,
+    ) -> None:
         status = {
             "agent": "a",
             "running": True,
-            "lease": {"state": "expired", "held_by_this_server": False, "raw_output": "not_returned"},
+            "lease": {
+                "state": "expired",
+                "held_by_this_server": False,
+                "raw_output": "not_returned",
+            },
             "response_state": {"state": "running_idle"},
             "raw_log_idle_seconds": 600,
             "raw_log_bytes": 0,
             "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
             "started_at_utc": "2026-06-07T09:00:00+00:00",
-            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T09:58:00+00:00",
+            },
         }
         lease = {
             "state": "held",
@@ -21220,22 +21275,37 @@ google_accounts:
                 "response_output": "not_returned",
             },
         )
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.claim_agent", return_value={"status": "claimed_expired", "lease": lease}
-        ), patch("codex_master.server.request_agent_report", side_effect=report_error), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "expired", "held_by_this_server": False, "lease_id": lease["lease_id"]},
-        ), patch("codex_master.server.watchdog_action", return_value={"status": "stopped"}), patch(
-            "codex_master.server.update_watchdog_marker"
+        with (
+            patch(
+                "codex_master.server.call_agent_lifecycle",
+                side_effect=lambda _agent, fn: fn(),
+            ),
+            patch("codex_master.server.status_agent", return_value=status),
+            patch("codex_master.server.read_meta", return_value={}),
+            patch(
+                "codex_master.server.claim_agent",
+                return_value={"status": "claimed_expired", "lease": lease},
+            ),
+            patch("codex_master.server.request_agent_report", side_effect=report_error),
+            patch(
+                "codex_master.server.agent_lease_status",
+                return_value={
+                    "state": "expired",
+                    "held_by_this_server": False,
+                    "lease_id": lease["lease_id"],
+                },
+            ),
+            patch(
+                "codex_master.server.watchdog_action",
+                return_value={"status": "stopped"},
+            ),
+            patch("codex_master.server.update_watchdog_marker"),
         ):
             result = fleet_watchdog("a", action="stop", manage_unclaimed=True)
 
         payload = result["results"][0]
-        self.assertEqual(payload["spark_health"]["state"], "not_checked")
-        self.assertEqual(payload["spark_health"]["reason"], "lease_not_held_by_this_server")
-        mock_health.assert_not_called()
+        self.assertEqual(payload["watchdog_state"], "action_sent")
+        self.assertEqual(payload["action_taken"], "stop")
 
     def test_fleet_watchdog_does_not_reuse_release_flag_after_session_restart(self) -> None:
         meta_store: dict[str, object] = {
@@ -21852,1831 +21922,156 @@ google_accounts:
         mock_report.assert_not_called()
         mock_interrupt.assert_not_called()
 
-    def test_legacy_codex_usage_watchdog_status_remains_visible_until_reset(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            snapshot_dir = Path(tmpdir) / "codex-usage" / "snapshots"
-            snapshot_dir.mkdir(parents=True)
-            snapshot_path = snapshot_dir / "a1.json"
-            snapshot_path.write_text(
-                json.dumps(
-                    {
-                        "account": "a1",
-                        "label": "A1",
-                        "captured_at": "2026-06-08T04:20:00+02:00",
-                        "status": "blocked",
-                        "blocked_until": "2099-06-08T06:50:00+02:00",
-                        "blocked_reason": "usage limit reached",
-                    }
+    def test_codex_usage_watchdog_reads_one_attested_v2_dto(self) -> None:
+        from codex_master import server as server_module
+
+        now = datetime.now(timezone.utc)
+        descriptor = server_module.AgentDescriptor(
+            "d1",
+            "d",
+            1,
+            "D 1",
+            server_module.RunnerKind.GEMINI_CLI,
+            server_module.Provider.GEMINI_API,
+            "auto",
+            "BW_Work",
+            Path("/tmp/d1"),
+            "codex_agent_d1_mcp",
+            True,
+        )
+        inventory = server_module.InventorySnapshot(
+            ("d1",), {"d1": descriptor}, {"d-series": ("d1",)}, {"d1": 0}, ("d",)
+        )
+        reset_at = now + timedelta(hours=2)
+        evidence = UsageEvidenceV2(
+            (
+                AccountUsageEvidenceV2(
+                    "BW_Work",
+                    (UsageLimitV2("main", 18000, "reset-1", 100.0, 0.0, reset_at),),
+                    (
+                        UsageTrendV2(
+                            "main", 18000, "reset-1", "complete", now, reset_at
+                        ),
+                    ),
+                    (TrackerEvidenceV2("main", 18000, "reset-1", "complete", now),),
                 ),
-                encoding="utf-8",
-            )
-            with patch.dict(os.environ, {"XDG_DATA_HOME": tmpdir}, clear=False), patch(
-                "codex_master.server.read_meta", return_value={}
-            ), patch("codex_master.server.list_assignments", return_value={"records": []}):
-                status = codex_usage_watchdog_status("a1")
-                self.assertEqual(status["state"], "blocked")
-                self.assertTrue(status["blocked"])
-                self.assertEqual(status["source"], "snapshot")
-
-    def test_codex_usage_reader_prefers_current_snapshot_over_legacy(self) -> None:
-        from codex_master import server as server_module
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir) / "codex-usage"
-            current = root / "current"
-            legacy = root / "snapshots"
-            current.mkdir(parents=True)
-            legacy.mkdir()
-            (current / "a1.json").write_text(
-                json.dumps({"account": "a1", "status": "ok", "captured_at": "2099-01-01T00:00:00+00:00"}),
-                encoding="utf-8",
-            )
-            (legacy / "a1.json").write_text(
-                json.dumps({"account": "a1", "status": "blocked", "blocked_until": "2099-01-02T00:00:00+00:00"}),
-                encoding="utf-8",
-            )
-            with patch.dict(os.environ, {"XDG_DATA_HOME": tmpdir}, clear=False):
-                snapshot = server_module.read_codex_usage_snapshot("a1")
-
-        self.assertEqual(snapshot["status"], "ok")
-
-    def test_codex_usage_reader_does_not_fallback_after_invalid_current_snapshot(self) -> None:
-        from codex_master import server as server_module
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir) / "codex-usage"
-            current = root / "current"
-            legacy = root / "snapshots"
-            current.mkdir(parents=True)
-            legacy.mkdir()
-            (current / "a1.json").write_text("not-json", encoding="utf-8")
-            (legacy / "a1.json").write_text(
-                json.dumps({"account": "a1", "status": "ok"}),
-                encoding="utf-8",
-            )
-            with patch.dict(os.environ, {"XDG_DATA_HOME": tmpdir}, clear=False):
-                with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                    server_module.read_codex_usage_snapshot("a1")
-
-    def test_current_codex_usage_windows_are_normalized_without_private_fields(self) -> None:
-        from codex_master import server as server_module
-
-        snapshot = {
-            "account": "BW_Work",
-            "status": "ok",
-            "captured_at": "2099-01-01T00:00:00+00:00",
-            "backend_used": "app-server",
-            "backend_account_id": "private-account-id",
-            "backend_user_id": "private-user-id",
-            "source_urls": ["https://private.invalid"],
-            "stale": False,
-            "main": {
-                "exhausted": False,
-                "limit_reached": None,
-                "windows": [
-                    {
-                        "name": "5h",
-                        "duration_seconds": 18000,
-                        "remaining": 81.0,
-                        "limit": 100.0,
-                        "percent": 81.0,
-                        "reset_at": "2099-01-01T05:00:00+00:00",
-                    },
-                    {
-                        "name": "weekly",
-                        "duration_seconds": 604800,
-                        "remaining": 53.0,
-                        "limit": 100.0,
-                        "percent": 53.0,
-                        "reset_at": "2099-01-08T00:00:00+00:00",
-                    },
-                ],
-            },
-        }
-
-        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0)
-        usage = state["usage_v2"]
-        self.assertEqual(state["state"], "clear")
-        self.assertEqual(usage["schema_version"], 2)
-        self.assertEqual([item["window_kind"] for item in usage["limit_windows"]], ["rolling_5h", "fixed"])
-        self.assertEqual([item["quantity_value"] for item in usage["limit_windows"]], [81, 53])
-        self.assertTrue(all(isinstance(item["quantity_value"], int) for item in usage["limit_windows"]))
-        serialized_usage = json.dumps(usage)
-        for private_field in ("backend_account_id", "backend_user_id", "source_urls"):
-            self.assertNotIn(private_field, serialized_usage)
-        for private_value in ("private-account-id", "private-user-id", "https://private.invalid"):
-            self.assertNotIn(private_value, serialized_usage)
-
-    def test_current_codex_usage_accepts_absolute_window_counts(self) -> None:
-        from codex_master import server as server_module
-
-        snapshot = {
-            "account": "BW_Absolute",
-            "status": "ok",
-            "captured_at": "2099-01-01T00:00:00+00:00",
-            "backend_used": "app-server",
-            "stale": False,
-            "main": {
-                "windows": [
-                    {
-                        "name": "5h",
-                        "duration_seconds": 18000,
-                        "remaining": 8000,
-                        "limit": 10000,
-                        "reset_at": "2099-01-01T05:00:00+00:00",
-                    }
-                ],
-            },
-        }
-
-        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0)
-        window = state["usage_v2"]["limit_windows"][0]
-        self.assertEqual(window["quantity_value"], 80)
-        self.assertEqual(window["capacity"], 10000)
-        self.assertEqual(window["absolute_remaining"], 8000)
-
-    def test_current_codex_usage_exhausted_window_blocks_until_reset(self) -> None:
-        from codex_master import server as server_module
-
-        snapshot = {
-            "account": "BW_Nufker",
-            "status": "ok",
-            "captured_at": "2099-01-01T00:00:00+00:00",
-            "backend_used": "app-server",
-            "stale": False,
-            "main": {
-                "exhausted": True,
-                "windows": [
-                    {
-                        "name": "weekly",
-                        "duration_seconds": 604800,
-                        "remaining": 0.0,
-                        "limit": 100.0,
-                        "percent": 0.0,
-                        "reset_at": "2099-01-08T00:00:00+00:00",
-                    }
-                ],
-            },
-        }
-
-        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0)
-        self.assertEqual(state["state"], "blocked")
-        self.assertTrue(state["blocked"])
-        self.assertEqual(state["blocked_until_utc"], "2099-01-08T00:00:00+00:00")
-        self.assertEqual(state["reason"], "codex usage window exhausted")
-
-    def test_verified_q_weekly_below_threshold_is_shared_block(self) -> None:
-        from codex_master import server as server_module
-
-        snapshot = {
-            "account": "BW_Q",
-            "status": "ok",
-            "captured_at": "2099-01-01T00:00:00+00:00",
-            "backend_used": "app-server",
-            "stale": False,
-            "main": {
-                "windows": [
-                    {
-                        "name": "weekly",
-                        "duration_seconds": 604800,
-                        "remaining": 9.0,
-                        "limit": 100.0,
-                        "percent": 9.0,
-                        "reset_at": "2099-01-08T00:00:00+00:00",
-                    }
-                ]
-            },
-        }
-
-        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0, series_prefix="q")
-        decision = server_module.codex_usage_eligibility(
-            state["usage_v2"]["limit_windows"], series_prefix="q", now=0
+            ),
+            "complete",
+            now,
+            now,
         )
-        self.assertFalse(decision["eligible"])
-        self.assertEqual(decision["reason_code"], "q_weekly_remaining_below_threshold")
-        self.assertEqual(decision["remaining_percent"], 9.0)
-        self.assertEqual(decision["threshold_percent"], 10.0)
-        self.assertEqual(decision["blocked_until_utc"], "2099-01-08T00:00:00+00:00")
-        self.assertIn("q-series", decision["fallback_hint"])
-        self.assertEqual(state["state"], "blocked")
-        self.assertEqual(state["reason_code"], decision["reason_code"])
+        with (
+            patch.object(
+                server_module, "current_agent_inventory", return_value=inventory
+            ),
+            patch.object(
+                server_module, "read_usage_evidence_v2", return_value=evidence
+            ) as read_evidence,
+        ):
+            status = codex_usage_watchdog_status("d1")
 
-    def test_selection_usage_details_consumes_q_weekly_decision(self) -> None:
-        from codex_master import server as server_module
-
-        snapshot = {
-            "account": "BW_Q",
-            "status": "ok",
-            "captured_at": "2099-01-01T00:00:00+00:00",
-            "backend_used": "app-server",
-            "stale": False,
-            "main": {"windows": [{
-                "name": "weekly", "duration_seconds": 604800,
-                "remaining": 9.0, "limit": 100.0, "percent": 9.0,
-                "reset_at": "2099-01-08T00:00:00+00:00",
-            }]},
-        }
-
-        with patch("codex_master.server.read_codex_usage_snapshot", return_value=snapshot), patch(
-            "codex_master.server.codex_usage_eligibility",
-            wraps=server_module.codex_usage_eligibility,
-        ) as eligibility:
-            details = server_module._selection_usage_details(
-                "BW_Q", "q", {}, now=datetime(2099, 1, 1, tzinfo=timezone.utc)
-            )
-
-        self.assertFalse(details[0])
-        self.assertTrue(details[1])
-        self.assertEqual(eligibility.call_count, 1)
-
-    def test_selection_usage_details_q_weekly_exact_threshold_is_free(self) -> None:
-        from codex_master import server as server_module
-
-        snapshot = {
-            "account": "BW_Q",
-            "status": "ok",
-            "captured_at": "2099-01-01T00:00:00+00:00",
-            "backend_used": "app-server",
-            "stale": False,
-            "main": {"windows": [
-                {"name": "5h", "duration_seconds": 18000, "remaining": 90.0,
-                 "limit": 100.0, "percent": 90.0, "reset_at": "2099-01-01T05:00:00+00:00"},
-                {"name": "weekly", "duration_seconds": 604800, "remaining": 10.0,
-                 "limit": 100.0, "percent": 10.0, "reset_at": "2099-01-08T00:00:00+00:00"},
-            ]},
-        }
-
-        with patch("codex_master.server.read_codex_usage_snapshot", return_value=snapshot):
-            details = server_module._selection_usage_details(
-                "BW_Q", "q", {}, now=datetime(2099, 1, 1, tzinfo=timezone.utc)
-            )
-
-        self.assertTrue(details[0])
-        self.assertFalse(details[1])
-
-    def test_selection_usage_details_non_q_weekly_below_threshold_is_unchanged(self) -> None:
-        from codex_master import server as server_module
-
-        snapshot = {
-            "account": "BW_B",
-            "status": "ok",
-            "captured_at": "2099-01-01T00:00:00+00:00",
-            "backend_used": "app-server",
-            "stale": False,
-            "main": {"windows": [
-                {"name": "5h", "duration_seconds": 18000, "remaining": 90.0,
-                 "limit": 100.0, "percent": 90.0, "reset_at": "2099-01-01T05:00:00+00:00"},
-                {"name": "weekly", "duration_seconds": 604800, "remaining": 9.0,
-                 "limit": 100.0, "percent": 9.0, "reset_at": "2099-01-08T00:00:00+00:00"},
-            ]},
-        }
-
-        with patch("codex_master.server.read_codex_usage_snapshot", return_value=snapshot):
-            details = server_module._selection_usage_details(
-                "BW_B", "b", {}, now=datetime(2099, 1, 1, tzinfo=timezone.utc)
-            )
-
-        self.assertTrue(details[0])
-        self.assertFalse(details[1])
-
-    def test_verified_q_weekly_exact_threshold_is_eligible(self) -> None:
-        from codex_master import server as server_module
-
-        snapshot = {
-            "account": "BW_Q",
-            "status": "ok",
-            "captured_at": "2099-01-01T00:00:00+00:00",
-            "backend_used": "app-server",
-            "stale": False,
-            "main": {
-                "windows": [{
-                    "name": "weekly", "duration_seconds": 604800,
-                    "remaining": 10.0, "limit": 100.0, "percent": 10.0,
-                    "reset_at": "2099-01-08T00:00:00+00:00",
-                }]
-            },
-        }
-
-        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0, series_prefix="q")
-        decision = server_module.codex_usage_eligibility(
-            state["usage_v2"]["limit_windows"], series_prefix="q3", now=0
-        )
-        self.assertTrue(decision["eligible"])
-        self.assertIsNone(decision["reason_code"])
-        self.assertFalse(state["blocked"])
-
-    def test_non_q_weekly_below_threshold_keeps_existing_semantics(self) -> None:
-        from codex_master import server as server_module
-
-        snapshot = {
-            "account": "BW_B",
-            "status": "ok",
-            "captured_at": "2099-01-01T00:00:00+00:00",
-            "backend_used": "app-server",
-            "stale": False,
-            "main": {"windows": [{
-                "name": "weekly", "duration_seconds": 604800,
-                "remaining": 9.0, "limit": 100.0, "percent": 9.0,
-                "reset_at": "2099-01-08T00:00:00+00:00",
-            }]},
-        }
-
-        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0)
-        decision = server_module.codex_usage_eligibility(
-            state["usage_v2"]["limit_windows"], series_prefix="b1", now=0
-        )
-        self.assertTrue(decision["eligible"])
-        self.assertFalse(state["blocked"])
-
-    def test_current_codex_usage_exhausted_past_reset_is_recovered(self) -> None:
-        from codex_master import server as server_module
-
-        snapshot = {
-            "account": "BW_Recovered",
-            "status": "ok",
-            "captured_at": "2099-01-01T00:00:00+00:00",
-            "main": {
-                "exhausted": True,
-                "windows": [
-                    {
-                        "name": "weekly",
-                        "duration_seconds": 604800,
-                        "remaining": 0.0,
-                        "limit": 100.0,
-                        "percent": 0.0,
-                        "reset_at": "2025-12-31T00:00:00+00:00",
-                    }
-                ],
-            },
-        }
-
-        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=1767225600)
-
-        self.assertFalse(state["blocked"])
-        self.assertEqual(state["state"], "clear")
-
-    def test_codex_usage_watchdog_status_reads_snapshot_for_routing_account(self) -> None:
-        blocked = {
-            "account": "BW_Privat",
-            "status": "blocked",
-            "blocked_until": "2099-06-08T06:50:00+00:00",
-            "blocked_reason": "usage limit reached",
-        }
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"routing": {"account": "BW_Privat"}},
-        ), patch("codex_master.server.list_assignments", return_value={"records": []}), patch(
-            "codex_master.server.read_codex_usage_snapshot", return_value=blocked
-        ) as read_snapshot:
-            status = codex_usage_watchdog_status("a1")
-
+        read_evidence.assert_called_once()
+        self.assertEqual(status["account"], "BW_Work")
         self.assertTrue(status["blocked"])
-        read_snapshot.assert_called_once_with("BW_Privat")
-
-    def test_codex_usage_watchdog_prefers_current_session_route_over_old_assignment(self) -> None:
-        blocked = {
-            "account": "BW_Neu",
-            "status": "blocked",
-            "blocked_until": "2099-06-08T06:50:00+00:00",
-            "blocked_reason": "usage limit reached",
-        }
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "started_at_utc": "2026-07-16T10:00:00+00:00",
-                "routing": {"account": "BW_Neu"},
-            },
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2026-07-16T09:00:00+00:00",
-                        "routing": {"account": "BW_Alt"},
-                    }
-                ]
-            },
-        ), patch(
-            "codex_master.server.read_codex_usage_snapshot", return_value=blocked
-        ) as read_snapshot:
-            status = codex_usage_watchdog_status("a1")
-
-        self.assertTrue(status["blocked"])
-        read_snapshot.assert_called_once_with("BW_Neu")
-
-    def test_codex_usage_watchdog_ignores_old_assignment_without_current_route(self) -> None:
-        blocked_old = {
-            "account": "BW_Alt",
-            "status": "blocked",
-            "blocked_until": "2099-06-08T06:50:00+00:00",
-            "blocked_reason": "old account limit",
-        }
-
-        def read_snapshot(account: str) -> dict[str, Any]:
-            return blocked_old if account == "BW_Alt" else {}
-
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"started_at_utc": "2026-07-16T10:00:00+00:00"},
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2026-07-16T09:00:00+00:00",
-                        "routing": {"account": "BW_Alt"},
-                    }
-                ]
-            },
-        ), patch("codex_master.server.read_codex_usage_snapshot", side_effect=read_snapshot) as read:
-            status = codex_usage_watchdog_status("a1")
-
-        self.assertEqual(status["state"], "missing")
-        self.assertEqual(status["account"], "a1")
-        read.assert_called_once_with("a1")
-
-    def test_codex_usage_watchdog_ignores_assignment_with_invalid_timestamp(self) -> None:
-        blocked_old = {
-            "account": "BW_Alt",
-            "status": "blocked",
-            "blocked_until": "2099-06-08T06:50:00+00:00",
-            "blocked_reason": "old account limit",
-        }
-
-        def read_snapshot(account: str) -> dict[str, Any]:
-            return blocked_old if account == "BW_Alt" else {}
-
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"started_at_utc": "2026-07-16T10:00:00+00:00"},
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "not-a-timestamp",
-                        "routing": {"account": "BW_Alt"},
-                    }
-                ]
-            },
-        ), patch("codex_master.server.read_codex_usage_snapshot", side_effect=read_snapshot) as read:
-            status = codex_usage_watchdog_status("a1")
-
-        self.assertEqual(status["state"], "missing")
-        self.assertEqual(status["account"], "a1")
-        read.assert_called_once_with("a1")
-
-    def test_codex_usage_watchdog_ignores_assignment_with_invalid_session_timestamp(self) -> None:
-        blocked_old = {
-            "account": "BW_Alt",
-            "status": "blocked",
-            "blocked_until": "2099-06-08T06:50:00+00:00",
-            "blocked_reason": "old account limit",
-        }
-
-        def read_snapshot(account: str) -> dict[str, Any]:
-            return blocked_old if account == "BW_Alt" else {}
-
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"started_at_utc": "not-a-timestamp"},
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2026-07-16T09:00:00+00:00",
-                        "routing": {"account": "BW_Alt"},
-                    }
-                ]
-            },
-        ), patch("codex_master.server.read_codex_usage_snapshot", side_effect=read_snapshot) as read:
-            status = codex_usage_watchdog_status("a1")
-
-        self.assertEqual(status["state"], "missing")
-        self.assertEqual(status["account"], "a1")
-        read.assert_called_once_with("a1")
-
-    def test_codex_usage_watchdog_ignores_future_assignment(self) -> None:
-        blocked_future = {
-            "account": "BW_Future",
-            "status": "blocked",
-            "blocked_until": "2099-06-08T06:50:00+00:00",
-            "blocked_reason": "future account limit",
-        }
-
-        def read_snapshot(account: str) -> dict[str, Any]:
-            return blocked_future if account == "BW_Future" else {}
-
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"started_at_utc": "2026-07-16T10:00:00+00:00"},
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2099-01-01T00:00:00+00:00",
-                        "routing": {"account": "BW_Future"},
-                    }
-                ]
-            },
-        ), patch("codex_master.server.read_codex_usage_snapshot", side_effect=read_snapshot) as read:
-            status = codex_usage_watchdog_status("a1")
-
-        self.assertEqual(status["state"], "missing")
-        self.assertEqual(status["account"], "a1")
-        read.assert_called_once_with("a1")
-
-    def test_codex_usage_watchdog_ignores_future_assignment_without_session_timestamp(self) -> None:
-        blocked_future = {
-            "account": "BW_Future",
-            "status": "blocked",
-            "blocked_until": "2099-06-08T06:50:00+00:00",
-            "blocked_reason": "future account limit",
-        }
-
-        def read_snapshot(account: str) -> dict[str, Any]:
-            return blocked_future if account == "BW_Future" else {}
-
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2099-01-01T00:00:00+00:00",
-                        "routing": {"account": "BW_Future"},
-                    }
-                ]
-            },
-        ), patch("codex_master.server.read_codex_usage_snapshot", side_effect=read_snapshot) as read:
-            status = codex_usage_watchdog_status("a1")
-
-        self.assertEqual(status["state"], "missing")
-        self.assertEqual(status["account"], "a1")
-        read.assert_called_once_with("a1")
-
-    def test_codex_usage_watchdog_does_not_fallback_to_old_account_snapshot(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "started_at_utc": "2026-07-16T10:00:00+00:00",
-                "routing": {"account": "BW_Neu"},
-            },
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2026-07-16T09:00:00+00:00",
-                        "routing": {"account": "BW_Alt"},
-                    }
-                ]
-            },
-        ), patch(
-            "codex_master.server.read_codex_usage_snapshot", return_value={}
-        ) as read_snapshot:
-            status = codex_usage_watchdog_status("a1")
-
-        self.assertEqual(status["state"], "missing")
-        read_snapshot.assert_called_once_with("BW_Neu")
-
-    def test_codex_usage_watchdog_rejects_snapshot_for_wrong_account(self) -> None:
-        with patch(
-            "codex_master.server.read_meta", return_value={"routing": {"account": "BW_Neu"}}
-        ), patch("codex_master.server.list_assignments", return_value={"records": []}), patch(
-            "codex_master.server.read_codex_usage_snapshot",
-            return_value={"account": "BW_Alt", "status": "blocked", "blocked_until": "2099-06-08T06:50:00+00:00"},
-        ):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                codex_usage_watchdog_status("a1")
-
-    def test_codex_usage_watchdog_rejects_empty_snapshot_account(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.list_assignments", return_value={"records": []}
-        ), patch(
-            "codex_master.server.read_codex_usage_snapshot",
-            return_value={
-                "account": "",
-                "agent": "a1",
-                "status": "blocked",
-                "blocked_until": "2099-06-08T06:50:00+00:00",
-            },
-        ):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                codex_usage_watchdog_status("a1")
-
-    def test_codex_usage_watchdog_rejects_non_string_snapshot_status(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.list_assignments", return_value={"records": []}
-        ), patch(
-            "codex_master.server.read_codex_usage_snapshot",
-            return_value={"account": "a1", "status": False},
-        ):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                codex_usage_watchdog_status("a1")
-
-    def test_codex_usage_watchdog_rejects_empty_assignment_account(self) -> None:
-        with patch(
-            "codex_master.server.read_meta", return_value={"routing": {"account": "BW_Neu"}}
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={"records": [{"routing": {"account": ""}}]},
-        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
-            with self.assertRaisesRegex(AgentError, "codex-usage snapshot account is invalid"):
-                codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    def test_codex_usage_watchdog_rejects_invalid_meta_account_with_current_assignment(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "started_at_utc": "2026-07-17T08:00:00+00:00",
-                "routing": {"account": []},
-            },
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2026-07-17T09:00:00+00:00",
-                        "routing": {"account": "BW_Neu"},
-                    }
-                ]
-            },
-        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
-            with self.assertRaisesRegex(AgentError, "codex-usage snapshot account is invalid"):
-                codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    def test_codex_usage_watchdog_rejects_non_mapping_routing_metadata(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={"routing": []}), patch(
-            "codex_master.server.list_assignments", return_value={"records": []}
-        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
-            with self.assertRaisesRegex(AgentError, "codex-usage routing metadata is invalid"):
-                codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    def test_codex_usage_watchdog_rejects_invalid_metadata_decision(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"routing": {"account": "BW_Neu", "decision": []}},
-        ), patch("codex_master.server.list_assignments", return_value={"records": []}), patch(
-            "codex_master.server.read_codex_usage_snapshot"
-        ) as read_snapshot:
-            with self.assertRaisesRegex(AgentError, "codex-usage routing metadata is invalid"):
-                codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    def test_codex_usage_watchdog_rejects_empty_metadata_account(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"routing": {"account": None}},
-        ), patch("codex_master.server.list_assignments", return_value={"records": []}), patch(
-            "codex_master.server.read_codex_usage_snapshot"
-        ) as read_snapshot:
-            with self.assertRaisesRegex(AgentError, "codex-usage snapshot account is invalid"):
-                codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    def test_codex_usage_watchdog_rejects_non_mapping_assignment_route(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.list_assignments",
-            return_value={"records": [{"routing": []}]},
-        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
-            with self.assertRaisesRegex(AgentError, "codex-usage assignment routing metadata is invalid"):
-                codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    def test_codex_usage_watchdog_rejects_unbound_assignment_route(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.list_assignments",
-            return_value={"records": [{"routing": {"decision": "spark"}}]},
-        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
-            with self.assertRaisesRegex(AgentError, "codex-usage assignment routing metadata is invalid"):
-                codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    def test_codex_usage_watchdog_rejects_invalid_assignment_decision(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.list_assignments",
-            return_value={"records": [{"routing": {"account": "BW_Neu", "decision": []}}]},
-        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
-            with self.assertRaisesRegex(AgentError, "codex-usage assignment routing metadata is invalid"):
-                codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    @patch("codex_master.server.ensure_state")
-    def test_codex_usage_watchdog_rejects_non_mapping_assignment_route_in_log(self, _mock_ensure_state) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            assignment_log = root / "assignments.jsonl"
-            assignment_log.write_text(
-                json.dumps({"agent": "a1", "routing": []}) + "\n",
-                encoding="utf-8",
-            )
-            with patch("codex_master.server.STATE_ROOT", root / "state"), patch(
-                "codex_master.server.LOCK_DIR", root / "locks"
-            ), patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch(
-                "codex_master.server.read_meta", return_value={}
-            ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
-                with self.assertRaisesRegex(AgentError, "codex-usage assignment routing metadata is invalid"):
-                    codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    @patch("codex_master.server.ensure_state")
-    def test_codex_usage_watchdog_rejects_unbound_assignment_route_in_log(self, _mock_ensure_state) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            assignment_log = root / "assignments.jsonl"
-            assignment_log.write_text(
-                json.dumps({"agent": "a1", "routing": {"decision": "spark"}}) + "\n",
-                encoding="utf-8",
-            )
-            with patch("codex_master.server.STATE_ROOT", root / "state"), patch(
-                "codex_master.server.LOCK_DIR", root / "locks"
-            ), patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch(
-                "codex_master.server.read_meta", return_value={}
-            ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
-                with self.assertRaisesRegex(AgentError, "codex-usage assignment routing metadata is invalid"):
-                    codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    @patch("codex_master.server.ensure_state")
-    def test_codex_usage_watchdog_rejects_invalid_assignment_decision_in_log(self, _mock_ensure_state) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            assignment_log = root / "assignments.jsonl"
-            assignment_log.write_text(
-                json.dumps({"agent": "a1", "routing": {"account": "BW_Neu", "decision": "mystery"}}) + "\n",
-                encoding="utf-8",
-            )
-            with patch("codex_master.server.STATE_ROOT", root / "state"), patch(
-                "codex_master.server.LOCK_DIR", root / "locks"
-            ), patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch(
-                "codex_master.server.read_meta", return_value={}
-            ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
-                with self.assertRaisesRegex(AgentError, "codex-usage assignment routing metadata is invalid"):
-                    codex_usage_watchdog_status("a1")
-
-        read_snapshot.assert_not_called()
-
-    def test_codex_usage_watchdog_ignores_marker_for_previous_account(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "routing": {"account": "BW_Neu"},
-                "codex_usage_watchdog": {
-                    "agent": "a1",
-                    "account": "BW_Alt",
-                    "blocked_until_utc": "2099-06-08T06:50:00+00:00",
-                    "reason": "old account limit",
-                },
-            },
-        ), patch("codex_master.server.list_assignments", return_value={"records": []}), patch(
-            "codex_master.server.read_codex_usage_snapshot", return_value={}
-        ) as read_snapshot:
-            status = codex_usage_watchdog_status("a1")
-
-        self.assertEqual(status["state"], "missing")
-        self.assertFalse(status["blocked"])
-        read_snapshot.assert_called_once_with("BW_Neu")
-
-    def test_codex_usage_watchdog_rechecks_legacy_marker_after_account_routing(self) -> None:
-        meta = {
-            "codex_usage_watchdog": {
-                "agent": "a1",
-                "blocked_until_utc": "2099-06-08T06:50:00+00:00",
-                "reason": "old account limit",
-            }
-        }
-        routing = {"account": "BW_Neu", "decision": "main"}
-
-        def remember(_agent: str, account: str) -> None:
-            meta["routing"] = {"account": account}
-
-        with patch("codex_master.server.read_meta", return_value=meta), patch(
-            "codex_master.server.list_assignments", return_value={"records": []}
-        ), patch("codex_master.server.read_codex_usage_snapshot", return_value={}) as read_snapshot, patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
-        ), patch("codex_master.server.codex_usage_routing_decision", return_value=routing) as route, patch(
-            "codex_master.server.remember_agent_usage_account", side_effect=remember
-        ):
-            status = ensure_agent_not_blocked_by_codex_usage("a1")
-
-        self.assertEqual(status["state"], "missing")
-        self.assertEqual(status["account"], "BW_Neu")
-        self.assertFalse(status["blocked"])
-        route.assert_called_once_with("a1", role="arbeitsbiene")
-        read_snapshot.assert_called_once_with("BW_Neu")
-
-    def test_codex_usage_watchdog_rejects_marker_for_wrong_agent(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "routing": {"account": "BW_Neu"},
-                "codex_usage_watchdog": {
-                    "agent": "b1",
-                    "account": "BW_Neu",
-                    "blocked_until_utc": "2099-06-08T06:50:00+00:00",
-                },
-            },
-        ), patch("codex_master.server.list_assignments", return_value={"records": []}):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_marker"):
-                codex_usage_watchdog_status("a1")
-
-    def test_remember_agent_routing_persists_main_usage_account(self) -> None:
-        routing = {
-            "account": "BW_Privat",
-            "backend_account_id": "backend-private",
-            "decision": "main",
-            "model": DEFAULT_AGENT_MODEL,
-        }
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.write_meta"
-        ) as write:
-            remember_agent_routing("a1", routing)
-
-        self.assertEqual(
-            write.call_args.args[1]["routing"],
-            {
-                "account": "BW_Privat",
-                "backend_account_id": "backend-private",
-                "decision": "main",
-                "model": DEFAULT_AGENT_MODEL,
-            },
-        )
-
-    def test_usage_mutation_guard_resolves_unmapped_authenticated_account(self) -> None:
-        missing = {
-            "agent": "a1",
-            "account": "a1",
-            "state": "missing",
-            "blocked": False,
-        }
-        clear = {
-            "agent": "BW_Privat",
-            "account": "BW_Privat",
-            "state": "clear",
-            "blocked": False,
-        }
-        routing = {"account": "BW_Privat", "decision": "unchanged", "model": None}
-        with patch(
-            "codex_master.server.codex_usage_watchdog_status", side_effect=[missing, clear]
-        ), patch(
-            "codex_master.server.agent_auth_status",
-            return_value={"authenticated": True},
-        ), patch(
-            "codex_master.server.codex_usage_routing_decision", return_value=routing
-        ) as route, patch("codex_master.server.remember_agent_usage_account") as remember:
-            status = ensure_agent_not_blocked_by_codex_usage("a1")
-
-        self.assertEqual(status, clear)
-        route.assert_called_once_with("a1", role="arbeitsbiene")
-        remember.assert_called_once_with("a1", "BW_Privat")
-
-    def test_usage_mutation_guard_rechecks_resolved_account_explicitly(self) -> None:
-        fallback = {
-            "agent": "BW_Alt",
-            "account": "BW_Alt",
-            "account_mapping": "fallback",
-            "state": "clear",
-            "blocked": False,
-        }
-        resolved = {
-            "agent": "BW_Neu",
-            "account": "BW_Neu",
-            "account_mapping": "override",
-            "state": "clear",
-            "blocked": False,
-        }
-        routing = {"account": "BW_Neu", "decision": "main", "model": DEFAULT_AGENT_MODEL}
-        with patch(
-            "codex_master.server.codex_usage_watchdog_status", side_effect=[fallback, resolved]
-        ) as status_mock, patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
-        ), patch(
-            "codex_master.server.codex_usage_routing_decision", return_value=routing
-        ) as route, patch("codex_master.server.remember_agent_usage_account") as remember:
-            status = ensure_agent_not_blocked_by_codex_usage("a1")
-
-        self.assertEqual(status, resolved)
-        self.assertEqual(
-            status_mock.call_args_list[1].kwargs,
-            {"snapshot_account": "BW_Neu", "include_assignment_history": True},
-        )
-        route.assert_called_once_with("a1", role="arbeitsbiene")
-        remember.assert_called_once_with("a1", "BW_Neu")
-
-    def test_usage_policy_block_overrides_clear_snapshot_and_reports_reset(self) -> None:
-        status = {
-            "agent": "a1",
-            "account": "BW_Privat",
-            "account_mapping": "routing",
-            "state": "clear",
-            "blocked": False,
-            "blocked_until_utc": None,
-            "source": "snapshot",
-        }
-        routing = {
-            "account": "BW_Privat",
-            "backend_account_id": "backend-private",
-            "decision": "blocked",
-            "model": None,
-            "reason": "main_limit_at_or_below_threshold",
-            "remaining_percent": 1.0,
-            "threshold_percent": 10.0,
-            "blocked_until_utc": "2026-08-15T15:20:23+02:00",
-        }
-        with patch(
-            "codex_master.server.agent_auth_status",
-            return_value={"authenticated": False, "auth_state": "access_token_expired"},
-        ), patch(
-            "codex_master.server.codex_usage_routing_decision", return_value=routing
-        ) as route, patch("codex_master.server.remember_agent_usage_account") as remember:
-            result = server_module.codex_usage_status_with_routing(
-                "a1",
-                status,
-                persist_account=False,
-                include_assignment_history=False,
-                force_policy_check=True,
-            )
-
-        self.assertTrue(result["blocked"])
-        self.assertEqual(result["state"], "blocked")
-        self.assertEqual(result["source"], "routing_policy")
-        self.assertEqual(result["remaining_percent"], 1.0)
-        self.assertEqual(result["threshold_percent"], 10.0)
-        self.assertEqual(result["blocked_until_utc"], "2026-08-15T15:20:23+02:00")
-        route.assert_called_once_with("a1", role="arbeitsbiene")
-        remember.assert_not_called()
-
-    def test_usage_admission_applies_global_policy_to_verified_non_q_usage(self) -> None:
-        from codex_master import server as server_module
-
-        status = _canonical_usage_status()
-        routing = {
-            "account": "BW_B",
-            "decision": "blocked",
-            "reason": "main_limit_at_or_below_threshold",
-            "remaining_percent": 9.0,
-            "threshold_percent": 10.0,
-        }
-        with patch("codex_master.server.codex_usage_watchdog_status", return_value=status), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
-        ), patch("codex_master.server.codex_usage_routing_decision", return_value=routing) as route:
-            with self.assertRaises(AgentError):
-                server_module.ensure_agent_not_blocked_by_codex_usage("b1")
-
-        route.assert_called_once_with("b1", role="arbeitsbiene")
-
-    def test_usage_admission_applies_global_policy_to_verified_q_without_weekly(self) -> None:
-        from codex_master import server as server_module
-
-        status = _canonical_usage_status()
-        status["agent"] = "q1"
-        status["account"] = "BW_Q"
-        status["usage_v2"]["limit_windows"] = [
-            {
-                **status["usage_v2"]["limit_windows"][0],
-                "window_id": "codex_usage_0_five_hour",
-                "budget_key": "codex_usage_five_hour",
-                "window_kind": "rolling_5h",
-            }
-        ]
-        routing = {
-            "account": "BW_Q",
-            "decision": "blocked",
-            "reason": "main_limit_at_or_below_threshold",
-            "remaining_percent": 9.0,
-            "threshold_percent": 10.0,
-        }
-        with patch("codex_master.server.codex_usage_watchdog_status", return_value=status), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
-        ), patch("codex_master.server.codex_usage_routing_decision", return_value=routing) as route, patch(
-            "codex_master.server.remember_agent_usage_account"
-        ):
-            with self.assertRaises(AgentError):
-                server_module.ensure_agent_not_blocked_by_codex_usage("q1")
-
-        route.assert_called_once_with("q1", role="arbeitsbiene")
-
-    def test_unverified_usage_v2_does_not_suppress_fail_closed_routing(self) -> None:
-        routing = {
-            "account": "BW_B",
-            "decision": "blocked",
-            "reason": "main_limit_at_or_below_threshold",
-            "remaining_percent": 9.0,
-            "threshold_percent": 10.0,
-            "blocked_until_utc": "2099-01-08T00:00:00+00:00",
-        }
-        for status in (
-            _canonical_usage_status(confidence="observed"),
-            _canonical_usage_status(windows=[]),
-        ):
-            with self.subTest(status=status["usage_v2"]["limit_windows"]):
-                with patch(
-                    "codex_master.server.agent_auth_status",
-                    return_value={"authenticated": True},
-                ), patch(
-                    "codex_master.server.codex_usage_routing_decision",
-                    return_value=routing,
-                ) as route:
-                    result = server_module.codex_usage_status_with_routing(
-                        "b1", status, force_policy_check=True
-                    )
-
-                self.assertTrue(result["blocked"])
-                self.assertEqual(result["source"], "routing_policy")
-                route.assert_called_once_with("b1", role="arbeitsbiene")
-
-    def test_q_usage_admission_raises_structured_weekly_denial(self) -> None:
-        from codex_master import server as server_module
-
-        status = {
-            "agent": "q1",
-            "account": "BW_Q",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-01-08T00:00:00+00:00",
-            "reason": "verified q-series weekly remaining below threshold",
-            "reason_code": "q_weekly_remaining_below_threshold",
-            "remaining_percent": 9.0,
-            "threshold_percent": 10.0,
-            "fallback_hint": "use a non-q series or wait for the verified q-series weekly reset",
-            "usage_v2": {"limit_windows": []},
-            "usage_eligibility": {"eligible": False},
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"q1": {"label": "Q1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-q1"}},
-            clear=True,
-        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=status), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
-        ), patch("codex_master.server.codex_usage_routing_decision") as route:
-            with self.assertRaises(AgentError) as raised:
-                server_module.ensure_agent_not_blocked_by_codex_usage("q1")
-
-        self.assertEqual(raised.exception.payload, {
-            "error_code": "q_weekly_remaining_below_threshold",
-            "reason_code": "q_weekly_remaining_below_threshold",
-            "reason": status["reason"],
-            "blocked_until": status["blocked_until_utc"],
-            "remaining_percent": 9.0,
-            "threshold_percent": 10.0,
-            "fallback_hint": status["fallback_hint"],
-        })
-        route.assert_not_called()
-
-    def test_usage_watchdog_dry_run_preserves_structured_q_marker_fields(self) -> None:
-        blocked_status = {
-            "agent": "q1",
-            "account": "BW_Q",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-01-08T00:00:00+00:00",
-            "reason": "verified q-series weekly remaining below threshold",
-            "reason_code": "q_weekly_remaining_below_threshold",
-            "remaining_percent": 9.0,
-            "threshold_percent": 10.0,
-            "fallback_hint": "use a non-q series or wait for the verified q-series weekly reset",
-            "source": "snapshot",
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"q1": {"label": "Q1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-q1"}},
-            clear=True,
-        ), patch("codex_master.server.tmux_alive", return_value=False), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
-        ), patch("codex_master.server.codex_usage_status_with_routing", return_value=blocked_status):
-            result = server_module.usage_watchdog_agent("q1", dry_run=True)
-
-        self.assertEqual(result["usage_watchdog_state"], "would_mark")
-        self.assertEqual(
-            {key: result["usage_watchdog"][key] for key in (
-                "reason_code", "remaining_percent", "threshold_percent", "fallback_hint"
-            )},
-            {key: blocked_status[key] for key in (
-                "reason_code", "remaining_percent", "threshold_percent", "fallback_hint"
-            )},
-        )
-
-    def test_usage_background_check_does_not_probe_expired_auth_without_force(self) -> None:
-        status = {
-            "agent": "a2",
-            "account": "BW_Privat",
-            "account_mapping": "fallback",
-            "state": "clear",
-            "blocked": False,
-        }
-        with patch(
-            "codex_master.server.agent_auth_status",
-            return_value={"authenticated": False, "auth_state": "access_token_expired"},
-        ), patch("codex_master.server.codex_usage_routing_decision") as route:
-            result = server_module.codex_usage_status_with_routing("a2", status)
-
-        self.assertIs(result, status)
-        route.assert_not_called()
-
-    def test_remember_agent_usage_account_preserves_same_account_route(self) -> None:
-        meta = {
-            "routing": {
-                "account": "BW_Neu",
-                "backend_account_id": "backend-old",
-                "decision": "spark",
-                "model": WRITE_AGENT_MODEL,
-            }
-        }
-        with patch("codex_master.server.read_meta", return_value=meta), patch(
-            "codex_master.server.write_meta"
-        ) as write:
-            remember_agent_usage_account("a1", "BW_Neu")
-
-        self.assertEqual(
-            write.call_args.args[1]["routing"],
-            {
-                "account": "BW_Neu",
-                "backend_account_id": "backend-old",
-                "decision": "spark",
-                "model": WRITE_AGENT_MODEL,
-            },
-        )
-
-    def test_remember_agent_usage_account_drops_route_bound_to_old_account(self) -> None:
-        meta = {
-            "routing": {
-                "account": "BW_Alt",
-                "backend_account_id": "backend-old",
-                "decision": "spark",
-                "model": WRITE_AGENT_MODEL,
-            }
-        }
-        with patch("codex_master.server.read_meta", return_value=meta), patch(
-            "codex_master.server.write_meta"
-        ) as write:
-            remember_agent_usage_account("a1", "BW_Neu")
-
-        self.assertEqual(write.call_args.args[1]["routing"], {"account": "BW_Neu"})
-
-    def test_agent_spark_routing_recovers_from_account_only_metadata(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"model": WRITE_AGENT_MODEL, "routing": {"account": "BW_Neu"}},
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "routing": {
-                            "account": "BW_Neu",
-                            "decision": "spark",
-                            "backend_account_id": "backend-new",
-                        }
-                    }
-                ]
-            },
-        ):
-            route = agent_spark_routing("a1")
-
-        self.assertEqual(route["backend_account_id"], "backend-new")
-
-    def test_agent_spark_routing_rejects_stale_decisioned_spark_metadata(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "model": WRITE_AGENT_MODEL,
-                "routing": {
-                    "account": "BW_Neu",
-                    "backend_account_id": "backend-stale",
-                    "decision": "spark",
-                },
-            },
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "routing": {
-                            "account": "BW_Alt",
-                            "decision": "spark",
-                            "backend_account_id": "backend-new",
-                        }
-                    }
-                ]
-            },
-        ):
-            route = agent_spark_routing("a1")
-
-        self.assertIsNone(route)
-
-    def test_agent_spark_routing_prefers_current_spark_assignment(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "model": WRITE_AGENT_MODEL,
-                "routing": {
-                    "account": "BW_Neu",
-                    "backend_account_id": "backend-stale",
-                    "decision": "spark",
-                },
-            },
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2026-07-17T00:00:00+00:00",
-                        "routing": {
-                            "account": "BW_Neu",
-                            "decision": "spark",
-                            "backend_account_id": "backend-current",
-                        },
-                    }
-                ]
-            },
-        ):
-            route = agent_spark_routing("a1")
-
-        self.assertEqual(route["backend_account_id"], "backend-current")
-        self.assertEqual(route["decision"], "spark")
-
-    def test_agent_spark_routing_rejects_stale_assignment_account(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"model": WRITE_AGENT_MODEL, "routing": {"account": "BW_Neu"}},
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "routing": {
-                            "account": "BW_Alt",
-                            "decision": "spark",
-                            "backend_account_id": "backend-old",
-                        }
-                    }
-                ]
-            },
-        ):
-            route = agent_spark_routing("a1")
-
-        self.assertIsNone(route)
-
-    def test_agent_spark_routing_rejects_old_matching_assignment(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "model": WRITE_AGENT_MODEL,
-                "started_at_utc": "2026-07-16T10:00:00+00:00",
-                "routing": {"account": "BW_Neu"},
-            },
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2026-07-16T09:00:00+00:00",
-                        "routing": {
-                            "account": "BW_Neu",
-                            "decision": "spark",
-                            "backend_account_id": "backend-old",
-                        },
-                    }
-                ]
-            },
-        ):
-            route = agent_spark_routing("a1")
-
-        self.assertIsNone(route)
-
-    def test_agent_spark_routing_rejects_future_matching_assignment(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "model": WRITE_AGENT_MODEL,
-                "routing": {"account": "BW_Neu"},
-            },
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2099-01-01T00:00:00+00:00",
-                        "routing": {
-                            "account": "BW_Neu",
-                            "decision": "spark",
-                            "backend_account_id": "backend-future",
-                        },
-                    }
-                ]
-            },
-        ):
-            route = agent_spark_routing("a1")
-
-        self.assertIsNone(route)
-
-    def test_agent_spark_routing_rejects_future_assignment_without_metadata_route(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"model": WRITE_AGENT_MODEL},
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "created_at_utc": "2099-01-01T00:00:00+00:00",
-                        "routing": {
-                            "account": "BW_Future",
-                            "decision": "spark",
-                            "backend_account_id": "backend-future",
-                        },
-                    }
-                ]
-            },
-        ):
-            route = agent_spark_routing("a1")
-
-        self.assertIsNone(route)
-
-    def test_agent_spark_routing_does_not_use_assignment_for_empty_metadata(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"model": WRITE_AGENT_MODEL, "routing": {}},
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "routing": {
-                            "account": "BW_Neu",
-                            "decision": "spark",
-                            "backend_account_id": "backend-old",
-                        }
-                    }
-                ]
-            },
-        ) as list_assignments_mock:
-            route = agent_spark_routing("a1")
-
-        self.assertIsNone(route)
-        list_assignments_mock.assert_not_called()
-
-    def test_agent_spark_routing_rejects_unbound_metadata_route(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "model": WRITE_AGENT_MODEL,
-                "routing": {"decision": "spark", "backend_account_id": "backend-unbound"},
-            },
-        ):
-            route = agent_spark_routing("a1")
-
-        self.assertIsNone(route)
-
-    def test_agent_spark_routing_rejects_non_mapping_metadata_route(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"model": WRITE_AGENT_MODEL, "routing": []},
-        ), patch("codex_master.server.list_assignments") as list_assignments_mock:
-            route = agent_spark_routing("a1")
-
-        self.assertIsNone(route)
-        list_assignments_mock.assert_not_called()
-
-    def test_agent_spark_routing_rejects_unbound_assignment_account(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"model": WRITE_AGENT_MODEL, "routing": {"account": "BW_Neu"}},
-        ), patch(
-            "codex_master.server.list_assignments",
-            return_value={
-                "records": [
-                    {
-                        "routing": {
-                            "decision": "spark",
-                            "backend_account_id": "backend-old",
-                        }
-                    }
-                ]
-            },
-        ):
-            route = agent_spark_routing("a1")
-
-        self.assertIsNone(route)
-
-    def test_usage_mutation_guard_rechecks_non_actionable_snapshot_via_routing(self) -> None:
-        status = {
-            "agent": "BW_Privat",
-            "account": "BW_Privat",
-            "state": "clear",
-            "usage_status": "error",
-            "blocked": False,
-        }
-        blocked = {
-            "account": "BW_Privat",
-            "decision": "blocked",
-            "reason": "usage_status_error",
-        }
-        with patch("codex_master.server.codex_usage_watchdog_status", return_value=status), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
-        ), patch(
-            "codex_master.server.codex_usage_routing_decision", return_value=blocked
-        ) as route, patch("codex_master.server.remember_agent_usage_account") as remember:
-            with self.assertRaisesRegex(AgentError, "usage_status_error"):
-                ensure_agent_not_blocked_by_codex_usage("a1")
-
-        route.assert_called_once_with("a1", role="arbeitsbiene")
-        remember.assert_called_once_with("a1", "BW_Privat")
-
-    def test_usage_mutation_guard_rechecks_clear_legacy_agent_snapshot(self) -> None:
+        self.assertEqual(status["source"], "v2")
+
+    def test_server_v2_usage_closure_has_no_legacy_snapshot_exports_or_calls(
+        self,
+    ) -> None:
+        tree = ast.parse(Path(server_module.__file__).read_text(encoding="utf-8"))
         legacy = {
-            "agent": "a1",
-            "account": "a1",
-            "account_mapping": "fallback",
-            "state": "clear",
-            "usage_status": "ok",
-            "blocked": False,
+            "codex_usage_state_root",
+            "codex_usage_snapshot_path",
+            "codex_usage_legacy_snapshot_path",
+            "_read_codex_usage_snapshot_path",
+            "read_codex_usage_snapshot",
+            "codex_usage_snapshot_accounts",
+            "_codex_usage_watchdog_state_from_snapshot",
+            "_codex_usage_v2_from_snapshot",
+            "codex_usage_status_with_routing",
+            "codex_usage_executable",
+            "codex_usage_routing_decision",
+            "codex_usage_spark_health_update",
+            "open_agent_auth_fd",
+            "agent_spark_routing",
+            "remember_agent_routing",
+            "remember_agent_usage_account",
+            "update_agent_spark_health",
+            "update_agent_spark_health_if_lease_current",
+            "update_wait_agent_spark_health",
+            "_spark_health_from_assignment_report",
         }
-        blocked = {
-            "account": "BW_Work",
-            "decision": "blocked",
-            "reason": "main_limit_unknown",
+        consumer_roots = {
+            "agent_selection_options",
+            "_start_agent_with_lease_unlocked",
+            "_assign_agent_unlocked",
+            "codex_usage_watchdog_status",
+            "_fleet_overview_local_admin",
+            "call_tool",
         }
-        with patch(
-            "codex_master.server.codex_usage_watchdog_status", side_effect=[legacy, legacy]
-        ), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
-        ), patch(
-            "codex_master.server.codex_usage_routing_decision", return_value=blocked
-        ) as route, patch("codex_master.server.remember_agent_usage_account") as remember:
-            with self.assertRaisesRegex(AgentError, "main_limit_unknown"):
-                ensure_agent_not_blocked_by_codex_usage("a1")
-
-        route.assert_called_once_with("a1", role="arbeitsbiene")
-        remember.assert_called_once_with("a1", "BW_Work")
-
-    def test_usage_mutation_guard_rechecks_blocked_legacy_agent_snapshot(self) -> None:
-        legacy = {
-            "agent": "a1",
-            "account": "a1",
-            "account_mapping": "fallback",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
-            "reason": "old account limit",
+        exports = {
+            item.name
+            for item in tree.body
+            if isinstance(item, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef))
         }
-        clear = {
-            "agent": "BW_Work",
-            "account": "BW_Work",
-            "account_mapping": "routing",
-            "state": "clear",
-            "blocked": False,
+        calls = {
+            item.func.id
+            for item in ast.walk(tree)
+            if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)
         }
-        routing = {"account": "BW_Work", "decision": "main", "model": DEFAULT_AGENT_MODEL}
-        with patch(
-            "codex_master.server.codex_usage_watchdog_status", side_effect=[legacy, clear]
-        ), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
-        ), patch(
-            "codex_master.server.codex_usage_routing_decision", return_value=routing
-        ) as route, patch("codex_master.server.remember_agent_usage_account") as remember:
-            status = ensure_agent_not_blocked_by_codex_usage("a1")
 
-        self.assertEqual(status, clear)
-        route.assert_called_once_with("a1", role="arbeitsbiene")
-        remember.assert_called_once_with("a1", "BW_Work")
+        self.assertFalse(exports & legacy)
+        self.assertFalse(calls & legacy)
+        self.assertNotIn(
+            "agent_routing_decision", {item["name"] for item in server_module.TOOLS}
+        )
+        self.assertNotIn("CODEX_USAGE_BIN", ast.unparse(tree))
+        self.assertNotIn("CODEX_USAGE_CONFIG", ast.unparse(tree))
+        direct_calls = {
+            item.name: {
+                call.func.id
+                for call in ast.walk(item)
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            }
+            for item in tree.body
+            if isinstance(item, (ast.AsyncFunctionDef, ast.FunctionDef))
+        }
+        reachable = set(consumer_roots)
+        pending = list(consumer_roots)
+        while pending:
+            current = pending.pop()
+            for callee in direct_calls.get(current, ()):
+                if callee in direct_calls and callee not in reachable:
+                    reachable.add(callee)
+                    pending.append(callee)
+        self.assertFalse(reachable & legacy)
 
-    def test_codex_usage_watchdog_reason_is_bounded_and_redacted(self) -> None:
-        secret_reason = "/home/teladi/private-token sk-usage-secret1234567890 " + ("x" * 500)
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.list_assignments", return_value={"records": []}
-        ), patch(
-            "codex_master.server.read_codex_usage_snapshot",
-            return_value={
-                "account": "a1",
-                "status": "blocked",
-                "blocked_until": "2099-06-08T06:50:00+00:00",
-                "blocked_reason": secret_reason,
-            },
+    def test_codex_usage_watchdog_status_fails_closed_on_unreadable_metadata(
+        self,
+    ) -> None:
+        inventory = SimpleNamespace(
+            agents={"a1": SimpleNamespace(account_id="account-a1", series_prefix="a")},
+            agent_ids=("a1",),
+        )
+        with (
+            patch(
+                "codex_master.server.current_agent_inventory", return_value=inventory
+            ),
+            patch(
+                "codex_master.server.read_usage_evidence_v2",
+                return_value=UsageEvidenceV2((), "unavailable", None, None),
+            ) as read_evidence,
+            patch(
+                "codex_master.server.read_meta",
+                side_effect=AssertionError("watchdog must not read metadata"),
+            ),
         ):
-            status = codex_usage_watchdog_status("a1")
+            status = codex_usage_watchdog_status("a")
 
-        self.assertNotIn("private-token", status["reason"])
-        self.assertNotIn("sk-usage-secret1234567890", status["reason"])
-        self.assertLessEqual(len(status["reason"]), 300)
-
-    def test_codex_usage_watchdog_status_fails_closed_on_unreadable_metadata(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={"meta_error": "could_not_read"}):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_metadata"):
-                codex_usage_watchdog_status("a")
-
-    def test_codex_usage_watchdog_status_fails_closed_on_unreadable_assignment_log(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.list_assignments",
-            side_effect=AgentError("could_not_read_assignment_log"),
-        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
-            with self.assertRaisesRegex(AgentError, "could_not_read_assignment_log"):
-                codex_usage_watchdog_status("a")
-
-        read_snapshot.assert_not_called()
-
-    def test_codex_usage_watchdog_status_fails_closed_on_invalid_marker_type(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"codex_usage_watchdog": []},
-        ):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_marker"):
-                codex_usage_watchdog_status("a")
-
-    def test_codex_usage_watchdog_status_fails_closed_on_unhashable_marker_agent(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={
-                "codex_usage_watchdog": {
-                    "agent": [],
-                    "blocked_until_utc": "2099-06-08T06:50:00+00:00",
-                }
-            },
-        ):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_marker"):
-                codex_usage_watchdog_status("a")
-
-    def test_codex_usage_watchdog_status_fails_closed_on_invalid_marker_expiry(self) -> None:
-        with patch(
-            "codex_master.server.read_meta",
-            return_value={"codex_usage_watchdog": {"agent": "a1", "blocked_until_utc": "not-a-timestamp"}},
-        ):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_marker"):
-                codex_usage_watchdog_status("a")
-
-    def test_codex_usage_watchdog_status_fails_closed_on_blocked_snapshot_without_expiry(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.read_codex_usage_snapshot",
-            return_value={"account": "a1", "status": "blocked", "blocked_reason": "usage limit reached"},
-        ):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                codex_usage_watchdog_status("a")
-
-    def test_codex_usage_watchdog_status_rejects_snapshot_expiry_without_status(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.list_assignments", return_value={"records": []}
-        ), patch(
-            "codex_master.server.read_codex_usage_snapshot",
-            return_value={"account": "a1", "blocked_until": "2099-06-08T06:50:00+00:00"},
-        ):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                codex_usage_watchdog_status("a")
-
-    def test_codex_usage_watchdog_status_rejects_invalid_snapshot_expiry(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.read_codex_usage_snapshot",
-            return_value={"account": "a1", "status": "ok", "blocked_until": "not-a-timestamp"},
-        ):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                codex_usage_watchdog_status("a")
-
-    def test_codex_usage_watchdog_status_rejects_unknown_snapshot_status(self) -> None:
-        with patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.read_codex_usage_snapshot",
-            return_value={"account": "a1", "status": "mystery"},
-        ):
-            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                codex_usage_watchdog_status("a")
-
-    def test_codex_usage_watchdog_status_fails_closed_on_invalid_snapshot_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            snapshot_dir = Path(tmpdir) / "snapshots"
-            snapshot_dir.mkdir()
-            (snapshot_dir / "a1.json").write_text("{not-json", encoding="utf-8")
-            with patch.dict("os.environ", {"CODEX_USAGE_STATE_ROOT": tmpdir}, clear=False), patch(
-                "codex_master.server.read_meta", return_value={}
-            ), patch("codex_master.server.list_assignments", return_value={"records": []}):
-                with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                    codex_usage_watchdog_status("a")
-
-    def test_read_codex_usage_snapshot_rejects_regular_file_swap_before_open(self) -> None:
-        from codex_master import server as server_module
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            snapshot_dir = root / "snapshots"
-            snapshot_dir.mkdir()
-            snapshot = snapshot_dir / "acct.json"
-            original = root / "original-snapshot.json"
-            replacement = root / "replacement-snapshot.json"
-            snapshot.write_text('{"status":"expected"}\n', encoding="utf-8")
-            replacement.write_text('{"status":"forged"}\n', encoding="utf-8")
-            real_open = server_module.os.open
-            swapped = False
-
-            def swap_before_snapshot_open(path, flags, *args, **kwargs):
-                nonlocal swapped
-                relative_snapshot_open = path == snapshot.name and kwargs.get("dir_fd") is not None
-                absolute_snapshot_open = isinstance(path, (str, bytes, Path)) and Path(path) == snapshot
-                if not swapped and (relative_snapshot_open or absolute_snapshot_open):
-                    snapshot.rename(original)
-                    replacement.rename(snapshot)
-                    swapped = True
-                return real_open(path, flags, *args, **kwargs)
-
-            with patch.dict("os.environ", {"CODEX_USAGE_STATE_ROOT": tmpdir}, clear=False), patch.object(
-                server_module.os, "open", side_effect=swap_before_snapshot_open
-            ):
-                with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                    server_module.read_codex_usage_snapshot("acct")
-
-            self.assertTrue(swapped)
-            self.assertEqual(original.read_text(encoding="utf-8"), '{"status":"expected"}\n')
-
-    def test_codex_usage_watchdog_rejects_symlinked_snapshot_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            outside = root / "outside"
-            outside.mkdir()
-            (outside / "a1.json").write_text(
-                json.dumps(
-                    {
-                        "account": "a1",
-                        "status": "blocked",
-                        "blocked_until": "2099-06-08T06:50:00+00:00",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (root / "snapshots").symlink_to(outside, target_is_directory=True)
-            with patch.dict("os.environ", {"CODEX_USAGE_STATE_ROOT": tmpdir}, clear=False), patch(
-                "codex_master.server.read_meta", return_value={}
-            ), patch("codex_master.server.list_assignments", return_value={"records": []}):
-                with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
-                    codex_usage_watchdog_status("a")
-
-    def test_usage_watchdog_dry_run_reports_marker_changes_without_mutating(self) -> None:
-        blocked_status = {
-            "agent": "a1",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-06-08T06:50:00+02:00",
-            "reason": "usage limit reached",
-            "source": "snapshot",
-            "raw_output": "not_returned",
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch("codex_master.server.ensure_state") as ensure_state, patch(
-            "codex_master.server.tmux_alive", return_value=False
-        ), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
-        ) as lease_status, patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
-            "codex_master.server.update_codex_usage_watchdog_marker"
-        ) as update_marker:
-            result = usage_watchdog_agent("a1", dry_run=True)
-
-        self.assertEqual(result["usage_watchdog_state"], "would_mark")
-        self.assertEqual(result["action_taken"], "none")
-        ensure_state.assert_not_called()
-        lease_status.assert_called_once_with("a1", initialize_state=False)
-        update_marker.assert_not_called()
-
-    def test_usage_watchdog_forces_policy_for_clear_routed_account_dry_run(self) -> None:
-        clear = {
-            "agent": "a1",
-            "account": "synthetic-account",
-            "account_mapping": "routing",
-            "state": "clear",
-            "blocked": False,
-            "blocked_until_utc": None,
-            "usage_v2": {"limit_windows": []},
-            "raw_output": "not_returned",
-        }
-        routing_block = {
-            "account": "synthetic-account",
-            "decision": "blocked",
-            "reason": "main_limit_at_or_below_threshold",
-            "remaining_percent": 2.0,
-            "threshold_percent": 10.0,
-            "blocked_until_utc": "2099-01-01T00:00:00+00:00",
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"),
-                    "home": Path("/tmp/a1"), "session": "synthetic-a1"}},
-            clear=True,
-        ), patch("codex_master.server.tmux_alive", return_value=False), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "unclaimed", "held_by_this_server": False,
-                          "raw_output": "not_returned"},
-        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=clear), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True},
-        ), patch(
-            "codex_master.server.codex_usage_routing_decision", return_value=routing_block,
-        ) as route, patch("codex_master.server.update_codex_usage_watchdog_marker") as marker:
-            result = usage_watchdog_agent("a1", dry_run=True)
-
-        self.assertEqual(result["usage_watchdog_state"], "would_mark")
-        self.assertEqual(result["action_taken"], "none")
-        self.assertTrue(result["usage_watchdog"]["blocked"])
-        self.assertEqual(result["usage_watchdog"]["source"], "routing_policy")
-        self.assertEqual(result["usage_watchdog"]["remaining_percent"], 2.0)
-        self.assertEqual(result["usage_watchdog"]["threshold_percent"], 10.0)
-        route.assert_called_once_with("a1", role="arbeitsbiene")
-        marker.assert_not_called()
-
-    def test_usage_watchdog_resolves_unmapped_account_before_marking(self) -> None:
-        missing = {
-            "agent": "a1",
-            "account": "a1",
-            "state": "missing",
-            "blocked": False,
-        }
-        blocked = {
-            "agent": "BW_Work",
-            "account": "BW_Work",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
-            "reason": "usage limit reached",
-            "source": "snapshot",
-        }
-        routing = {"account": "BW_Work", "decision": "blocked", "reason": "main_limit_unknown"}
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch("codex_master.server.ensure_state"), patch(
-            "codex_master.server.tmux_alive", return_value=False
-        ), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
-        ), patch(
-            "codex_master.server.codex_usage_watchdog_status", side_effect=[missing, blocked]
-        ), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
-        ), patch(
-            "codex_master.server.codex_usage_routing_decision", return_value=routing
-        ), patch("codex_master.server.remember_agent_usage_account") as remember, patch(
-            "codex_master.server.update_codex_usage_watchdog_marker"
-        ) as update_marker:
-            result = usage_watchdog_agent("a1", dry_run=False)
-
-        self.assertEqual(result["usage_watchdog_state"], "blocked_marked")
-        remember.assert_called_once_with("a1", "BW_Work")
-        update_marker.assert_called_once()
-        self.assertEqual(update_marker.call_args.args[1]["account"], "BW_Work")
-
-    def test_usage_watchdog_dry_run_does_not_persist_resolved_account(self) -> None:
-        missing = {
-            "agent": "a1",
-            "account": "a1",
-            "state": "missing",
-            "blocked": False,
-        }
-        blocked = {
-            "agent": "BW_Work",
-            "account": "BW_Work",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
-            "reason": "usage limit reached",
-            "source": "snapshot",
-        }
-        routing = {"account": "BW_Work", "decision": "blocked", "reason": "main_limit_unknown"}
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch("codex_master.server.ensure_state"), patch(
-            "codex_master.server.tmux_alive", return_value=False
-        ), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
-        ), patch(
-            "codex_master.server.codex_usage_watchdog_status", side_effect=[missing, blocked]
-        ), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
-        ), patch(
-            "codex_master.server.codex_usage_routing_decision", return_value=routing
-        ), patch("codex_master.server.remember_agent_usage_account") as remember, patch(
-            "codex_master.server.update_codex_usage_watchdog_marker"
-        ) as update_marker:
-            result = usage_watchdog_agent("a1", dry_run=True)
-
-        self.assertEqual(result["usage_watchdog_state"], "would_mark")
-        remember.assert_not_called()
-        update_marker.assert_not_called()
+        read_evidence.assert_called_once()
+        self.assertEqual(status["source"], "v2")
+        self.assertEqual(status["usage_status"], "unavailable")
+        self.assertFalse(status["blocked"])
 
     def test_fleet_usage_watchdog_dry_run_skips_lifecycle_lock(self) -> None:
         with patch("codex_master.server.agent_ids", return_value=["a1"]), patch(
@@ -23688,286 +22083,6 @@ google_accounts:
         self.assertEqual(result["result_count"], 1)
         run_agent.assert_called_once_with("a1", dry_run=True)
         lifecycle.assert_not_called()
-
-    def test_usage_watchdog_agent_stops_blocked_running_agent_and_writes_marker(self) -> None:
-        marker_store: list[dict[str, Any]] = []
-
-        def fake_update_marker(agent: str, marker: dict[str, Any] | None) -> None:
-            if marker is None:
-                marker_store.clear()
-            else:
-                marker_store.append(marker)
-
-        blocked_status = {
-            "agent": "a1",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-06-08T06:50:00+02:00",
-            "reason": "usage limit reached",
-            "source": "snapshot",
-            "raw_output": "not_returned",
-        }
-        with patch.dict("codex_master.server.AGENTS", {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}}, clear=True), patch(
-            "codex_master.server.ensure_state"
-        ), patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.pane_pid", return_value=123
-        ), patch(
-            "codex_master.server.agent_home_process_summary",
-            return_value={
-                "process_count": 1,
-                "managed_process_count": 1,
-                "managed_process_ids": [123],
-                "managed_root_process_ids": [123],
-                "external_process_count": 0,
-            },
-        ), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
-        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
-            "codex_master.server.update_codex_usage_watchdog_marker", side_effect=fake_update_marker
-        ), patch("codex_master.server.stop_agent", return_value={"agent": "a1", "status": "stopped", "lease": {"state": "released"}, "raw_output": "not_returned"}) as mock_stop:
-            result = usage_watchdog_agent("a1", dry_run=False)
-
-        self.assertEqual(result["usage_watchdog_state"], "stopped")
-        self.assertEqual(result["action_taken"], "stop")
-        self.assertEqual(marker_store[0]["blocked_until_utc"], "2099-06-08T06:50:00+02:00")
-        mock_stop.assert_called_once_with("a1", force=False)
-
-    def test_usage_watchdog_skips_unmanaged_tmux_session_before_claiming(self) -> None:
-        blocked_status = {
-            "agent": "a1",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
-            "reason": "usage limit reached",
-            "source": "snapshot",
-            "raw_output": "not_returned",
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch("codex_master.server.ensure_state"), patch(
-            "codex_master.server.tmux_alive", return_value=True
-        ), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
-        ), patch(
-            "codex_master.server.agent_home_process_summary",
-            return_value={"process_count": 1, "managed_process_count": 0, "external_process_count": 1},
-        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
-            "codex_master.server.claim_agent"
-        ) as mock_claim, patch("codex_master.server.update_codex_usage_watchdog_marker") as mock_update, patch(
-            "codex_master.server.stop_agent"
-        ) as mock_stop:
-            result = usage_watchdog_agent("a1", dry_run=False)
-
-        self.assertEqual(result["usage_watchdog_state"], "skipped_identity_unverified")
-        self.assertEqual(result["action_taken"], "none")
-        self.assertEqual(result["identity_guard"]["state"], "blocked_external_home_user")
-        mock_claim.assert_not_called()
-        mock_update.assert_not_called()
-        mock_stop.assert_not_called()
-
-    def test_usage_watchdog_claims_unclaimed_agent_before_stop(self) -> None:
-        blocked_status = {
-            "agent": "a1",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-06-08T06:50:00+02:00",
-            "reason": "usage limit reached",
-            "source": "snapshot",
-            "raw_output": "not_returned",
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch("codex_master.server.ensure_state"), patch(
-            "codex_master.server.tmux_alive", return_value=True
-        ), patch("codex_master.server.pane_pid", return_value=123), patch(
-            "codex_master.server.agent_home_process_summary",
-            return_value={
-                "process_count": 1,
-                "managed_process_count": 1,
-                "managed_process_ids": [123],
-                "managed_root_process_ids": [123],
-                "external_process_count": 0,
-            },
-        ), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
-        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
-            "codex_master.server.update_codex_usage_watchdog_marker"
-        ), patch(
-            "codex_master.server.claim_agent",
-            return_value={
-                "status": "claimed",
-                "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
-            },
-        ) as mock_claim, patch(
-            "codex_master.server.stop_agent",
-            return_value={"agent": "a1", "status": "stopped", "lease": {"state": "unclaimed"}, "raw_output": "not_returned"},
-        ) as mock_stop:
-            result = usage_watchdog_agent("a1", dry_run=False)
-
-        self.assertEqual(result["usage_watchdog_state"], "stopped")
-        self.assertEqual(result["lease_state"], "held")
-        self.assertTrue(result["held_by_this_server"])
-        mock_claim.assert_called_once_with("a1")
-        mock_stop.assert_called_once_with("a1", force=False)
-
-    def test_usage_watchdog_rolls_back_claim_when_stop_fails(self) -> None:
-        blocked_status = {
-            "agent": "a1",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
-            "reason": "usage limit reached",
-            "source": "snapshot",
-            "raw_output": "not_returned",
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch("codex_master.server.ensure_state"), patch(
-            "codex_master.server.tmux_alive", return_value=True
-        ), patch("codex_master.server.pane_pid", return_value=123), patch(
-            "codex_master.server.agent_home_process_summary",
-            return_value={
-                "process_count": 1,
-                "managed_process_count": 1,
-                "managed_process_ids": [123],
-                "managed_root_process_ids": [123],
-                "external_process_count": 0,
-            },
-        ), patch(
-            "codex_master.server.agent_lease_status",
-            side_effect=[
-                {"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
-                {
-                    "state": "held",
-                    "held_by_this_server": True,
-                    "lease_id": "watchdog-lease",
-                    "raw_output": "not_returned",
-                },
-            ],
-        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
-            "codex_master.server.update_codex_usage_watchdog_marker"
-        ), patch(
-            "codex_master.server.claim_agent",
-            return_value={
-                "status": "claimed",
-                "lease": {
-                    "state": "held",
-                    "held_by_this_server": True,
-                    "lease_id": "watchdog-lease",
-                    "raw_output": "not_returned",
-                },
-            },
-        ), patch("codex_master.server.stop_agent", side_effect=AgentError("tmux stop failed")), patch(
-            "codex_master.server.release_agent"
-        ) as mock_release:
-            with self.assertRaisesRegex(AgentError, "tmux stop failed"):
-                usage_watchdog_agent("a1", dry_run=False)
-
-        mock_release.assert_not_called()
-
-    def test_usage_watchdog_does_not_roll_back_renewed_lease_when_stop_fails(self) -> None:
-        blocked_status = {
-            "agent": "a1",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
-            "reason": "usage limit reached",
-            "source": "snapshot",
-            "raw_output": "not_returned",
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch("codex_master.server.ensure_state"), patch(
-            "codex_master.server.tmux_alive", return_value=True
-        ), patch("codex_master.server.pane_pid", return_value=123), patch(
-            "codex_master.server.agent_home_process_summary",
-            return_value={
-                "process_count": 1,
-                "managed_process_count": 1,
-                "managed_process_ids": [123],
-                "managed_root_process_ids": [123],
-                "external_process_count": 0,
-            },
-        ), patch(
-            "codex_master.server.agent_lease_status",
-            side_effect=[
-                {"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
-                {
-                    "state": "held",
-                    "held_by_this_server": True,
-                    "lease_id": "renewed-lease",
-                    "raw_output": "not_returned",
-                },
-            ],
-        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
-            "codex_master.server.update_codex_usage_watchdog_marker"
-        ), patch(
-            "codex_master.server.claim_agent",
-            return_value={
-                "status": "claimed",
-                "lease": {
-                    "state": "held",
-                    "held_by_this_server": True,
-                    "lease_id": "watchdog-lease",
-                    "raw_output": "not_returned",
-                },
-            },
-        ), patch("codex_master.server.stop_agent", side_effect=AgentError("tmux stop failed")), patch(
-            "codex_master.server.release_agent"
-        ) as mock_release:
-            with self.assertRaisesRegex(AgentError, "tmux stop failed"):
-                usage_watchdog_agent("a1", dry_run=False)
-
-        mock_release.assert_not_called()
-
-    def test_usage_watchdog_skips_running_agent_when_lease_is_unreadable(self) -> None:
-        blocked_status = {
-            "agent": "a1",
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2099-06-08T06:50:00+02:00",
-            "reason": "usage limit reached",
-            "source": "snapshot",
-            "raw_output": "not_returned",
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch("codex_master.server.ensure_state"), patch(
-            "codex_master.server.tmux_alive", return_value=True
-        ), patch("codex_master.server.pane_pid", return_value=123), patch(
-            "codex_master.server.agent_home_process_summary",
-            return_value={
-                "process_count": 1,
-                "managed_process_count": 1,
-                "managed_process_ids": [123],
-                "managed_root_process_ids": [123],
-                "external_process_count": 0,
-            },
-        ), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "unreadable", "held_by_this_server": False, "raw_output": "not_returned"},
-        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
-            "codex_master.server.update_codex_usage_watchdog_marker"
-        ) as mock_update, patch("codex_master.server.stop_agent") as mock_stop:
-            result = usage_watchdog_agent("a1", dry_run=False)
-
-        self.assertEqual(result["usage_watchdog_state"], "skipped_lease_unreadable")
-        self.assertEqual(result["action_taken"], "none")
-        mock_update.assert_not_called()
-        mock_stop.assert_not_called()
 
     def test_cli_usage_watchdog_routes_to_tool(self) -> None:
         captured: dict[str, Any] = {}
@@ -26866,18 +24981,23 @@ google_accounts:
         self.assertEqual(caught.exception.payload["raw_output"], "not_returned")
         mock_start_agent.assert_not_called()
 
-    @patch("codex_master.server.remember_agent_routing")
     @patch("codex_master.server.start_agent")
     @patch("codex_master.server.claim_agent")
     @patch("codex_master.server.tmux_alive", return_value=True)
     def test_start_agent_with_lease_rejects_running_model_mismatch(
-        self, _mock_alive, mock_claim, mock_start_agent, mock_remember_routing
+        self, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
-        mock_claim.return_value = {"status": "renewed", "lease": {"held_by_this_server": True}}
+        mock_claim.return_value = {
+            "status": "renewed",
+            "lease": {"held_by_this_server": True},
+        }
         mock_start_agent.return_value = {
             "agent": "a",
             "status": "already_running",
-            "meta": {"model": WRITE_AGENT_MODEL, "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT},
+            "meta": {
+                "model": WRITE_AGENT_MODEL,
+                "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
+            },
             "raw_output": "not_returned",
         }
 
@@ -26888,12 +25008,10 @@ google_accounts:
             with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
                 start_agent_with_lease("a")
 
-        mock_remember_routing.assert_not_called()
 
     @patch("codex_master.server.release_agent")
     @patch("codex_master.server.agent_home_process_summary", return_value={"process_count": 1})
     @patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True})
-    @patch("codex_master.server.remember_agent_routing")
     @patch("codex_master.server.start_agent")
     @patch("codex_master.server.claim_agent")
     @patch("codex_master.server.tmux_alive", return_value=True)
@@ -26902,37 +25020,46 @@ google_accounts:
         _mock_alive,
         mock_claim,
         mock_start_agent,
-        mock_remember_routing,
         _mock_lease_status,
         _mock_processes,
         mock_release,
     ) -> None:
-        mock_claim.return_value = {"status": "claimed", "lease": {"held_by_this_server": True}}
+        mock_claim.return_value = {
+            "status": "claimed",
+            "lease": {"held_by_this_server": True},
+        }
         mock_start_agent.return_value = {
             "agent": "a",
             "status": "already_running",
-            "meta": {"model": WRITE_AGENT_MODEL, "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT},
+            "meta": {
+                "model": WRITE_AGENT_MODEL,
+                "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
+            },
             "raw_output": "not_returned",
         }
 
         with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
             start_agent_with_lease("a", allow_unauthenticated=True)
 
-        mock_remember_routing.assert_not_called()
         mock_release.assert_called_once_with("a1", force=True)
 
-    @patch("codex_master.server.remember_agent_routing")
     @patch("codex_master.server.start_agent")
     @patch("codex_master.server.claim_agent")
     @patch("codex_master.server.tmux_alive", return_value=False)
     def test_start_agent_with_lease_rechecks_raced_running_session_model(
-        self, _mock_alive, mock_claim, mock_start_agent, mock_remember_routing
+        self, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
-        mock_claim.return_value = {"status": "claimed", "lease": {"held_by_this_server": True}}
+        mock_claim.return_value = {
+            "status": "claimed",
+            "lease": {"held_by_this_server": True},
+        }
         mock_start_agent.return_value = {
             "agent": "a",
             "status": "already_running",
-            "meta": {"model": WRITE_AGENT_MODEL, "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT},
+            "meta": {
+                "model": WRITE_AGENT_MODEL,
+                "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
+            },
             "raw_output": "not_returned",
         }
 
@@ -26944,16 +25071,17 @@ google_accounts:
                 start_agent_with_lease("a", allow_unauthenticated=True)
             mock_release.assert_called_once_with("a1", force=True)
 
-        mock_remember_routing.assert_not_called()
 
-    @patch("codex_master.server.remember_agent_routing")
     @patch("codex_master.server.start_agent")
     @patch("codex_master.server.claim_agent")
     @patch("codex_master.server.tmux_alive", return_value=True)
     def test_start_agent_with_lease_rejects_running_reasoning_effort_mismatch(
-        self, _mock_alive, mock_claim, mock_start_agent, mock_remember_routing
+        self, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
-        mock_claim.return_value = {"status": "renewed", "lease": {"held_by_this_server": True}}
+        mock_claim.return_value = {
+            "status": "renewed",
+            "lease": {"held_by_this_server": True},
+        }
         mock_start_agent.return_value = {
             "agent": "a",
             "status": "already_running",
@@ -26968,7 +25096,6 @@ google_accounts:
             with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
                 start_agent_with_lease("a", allow_unauthenticated=True)
 
-        mock_remember_routing.assert_not_called()
 
     def test_start_agent_with_lease_claims_transient_lease_for_running_session(self) -> None:
         lease = {"state": "held", "holder": "this_server", "held_by_this_server": True}
@@ -26994,104 +25121,6 @@ google_accounts:
         mock_claim.assert_called_once_with("a1")
         self.assertEqual(mock_start.call_args.kwargs["lease"], lease)
         self.assertTrue(mock_start.call_args.kwargs["release_lease_on_failure"])
-        mock_release.assert_called_once_with("a1", force=True)
-
-    @patch("codex_master.server.release_agent")
-    @patch("codex_master.server.cleanup_failed_start")
-    @patch(
-        "codex_master.server.allowed_agent_raw_log_identity",
-        return_value=(Path("/tmp/managed-a.log"), None),
-    )
-    @patch("codex_master.server.read_meta", return_value={"raw_log": "/tmp/managed-a.log"})
-    @patch("codex_master.server.remember_agent_routing", side_effect=AgentError("routing failed"))
-    @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
-    @patch("codex_master.server.claim_agent")
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    def test_start_agent_with_lease_cleans_up_after_routing_metadata_failure(
-        self,
-        _mock_alive,
-        mock_claim,
-        _mock_start,
-        _mock_remember,
-        _mock_read_meta,
-        _mock_allowed_raw_log_identity,
-        mock_cleanup,
-        mock_release,
-    ) -> None:
-        mock_claim.return_value = {
-            "status": "claimed",
-            "lease": {"held_by_this_server": True},
-        }
-
-        with patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}):
-            with self.assertRaisesRegex(AgentError, "routing failed"):
-                start_agent_with_lease("a", allow_unauthenticated=True)
-
-        mock_cleanup.assert_called_once_with(
-            AGENTS["a1"]["session"], Path("/tmp/managed-a.log"), kill_session=True
-        )
-        mock_release.assert_called_once_with("a1", force=True)
-
-    @patch("codex_master.server.release_agent")
-    @patch("codex_master.server.cleanup_failed_start")
-    @patch("codex_master.server.read_meta", return_value={"raw_log": "/tmp/foreign-b1.log"})
-    @patch("codex_master.server.remember_agent_routing", side_effect=AgentError("routing failed"))
-    @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
-    @patch("codex_master.server.claim_agent")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    def test_start_agent_with_lease_rejects_foreign_raw_log_cleanup(
-        self,
-        _mock_alive,
-        mock_claim,
-        _mock_start,
-        _mock_remember,
-        _mock_read_meta,
-        mock_cleanup,
-        mock_release,
-    ) -> None:
-        mock_claim.return_value = {
-            "status": "claimed",
-            "lease": {"held_by_this_server": True},
-        }
-
-        with patch("codex_master.server.RAW_DIR", Path("/tmp")), patch(
-            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
-        ), patch(
-            "codex_master.server.agent_home_process_summary",
-            return_value={"process_count": 0},
-        ), patch("codex_master.server.run_tmux") as mock_run_tmux:
-            with self.assertRaisesRegex(AgentError, "routing failed"):
-                start_agent_with_lease("a", allow_unauthenticated=True)
-
-        mock_cleanup.assert_not_called()
-        self.assertTrue(mock_run_tmux.called)
-        mock_release.assert_called_once_with("a1", force=True)
-
-    @patch("codex_master.server.release_agent")
-    @patch("codex_master.server.cleanup_failed_start")
-    @patch("codex_master.server.remember_agent_routing", side_effect=AgentError("routing failed"))
-    @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "already_running"})
-    @patch("codex_master.server.claim_agent")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    def test_start_agent_with_lease_does_not_clean_up_raced_existing_session(
-        self,
-        _mock_alive,
-        mock_claim,
-        _mock_start,
-        _mock_remember,
-        mock_cleanup,
-        mock_release,
-    ) -> None:
-        mock_claim.return_value = {
-            "status": "claimed",
-            "lease": {"held_by_this_server": True},
-        }
-
-        with patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}):
-            with self.assertRaisesRegex(AgentError, "routing failed"):
-                start_agent_with_lease("a", allow_unauthenticated=True)
-
-        mock_cleanup.assert_not_called()
         mock_release.assert_called_once_with("a1", force=True)
 
     def test_agent_claim_wait_rejects_invalid_direct_interval_values(self) -> None:
@@ -27767,6 +25796,81 @@ google_accounts:
             "low",
             None,
         )
+
+    def test_legacy_teamlead_target_stops_before_auth_routing_or_materialization(self) -> None:
+        with patch.object(server_module, "require_fleet_recovery_ready"), patch.object(
+            server_module, "require_authenticated_agent_for_mutation"
+        ) as auth, patch.object(
+            server_module, "ensure_agent_not_blocked_by_codex_usage"
+        ) as routing, patch.object(
+            server_module, "start_agent"
+        ) as lease_start:
+            with self.assertRaisesRegex(AgentError, "^dynamic_teamlead_legacy_target_forbidden$"):
+                server_module._start_agent_with_lease_unlocked(
+                    "a1",
+                    agent_class="teamleiterin",
+                    lifecycle="persistent",
+                    model="gpt-5.6-terra",
+                    reasoning_effort="xhigh",
+                )
+
+        auth.assert_not_called()
+        routing.assert_not_called()
+        lease_start.assert_not_called()
+
+    def test_masterjet_agent_start_reports_legacy_teamlead_target_without_auth_or_routing(self) -> None:
+        with patch.object(server_module, "agent_ids", return_value=["a1"]), patch.object(
+            server_module, "require_broad_mutation_confirmation", return_value={"required": False}
+        ), patch.object(
+            server_module, "call_agent_lifecycle", side_effect=lambda _agent, callback: callback()
+        ), patch.object(
+            server_module, "require_fleet_recovery_ready"
+        ), patch.object(
+            server_module, "require_authenticated_agent_for_mutation"
+        ) as auth, patch.object(
+            server_module, "ensure_agent_not_blocked_by_codex_usage"
+        ) as routing:
+            result = server_module.call_tool(
+                "agent_start",
+                {
+                    "agent": "a1",
+                    "class": "teamleiterin",
+                    "lifecycle": "persistent",
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "xhigh",
+                },
+            )
+
+        self.assertEqual(result["results"][0]["error"], "dynamic_teamlead_legacy_target_forbidden")
+        auth.assert_not_called()
+        routing.assert_not_called()
+
+    def test_resolved_legacy_teamlead_stops_before_lease_or_materialization(self) -> None:
+        selection = SimpleNamespace(class_id="teamleiterin", model="gpt-5.6-terra", reasoning="xhigh")
+        with patch.object(server_module, "require_fleet_recovery_ready"), patch.object(
+            server_module, "classify_runtime_task"
+        ), patch.object(
+            server_module, "ensure_agent_not_blocked_by_codex_usage"
+        ), patch.object(
+            server_module, "_resolver_target_selection_inputs", return_value=(None, None)
+        ), patch.object(
+            server_module, "resolve_runtime_agent_selection", return_value=selection
+        ), patch.object(
+            server_module, "claim_agent"
+        ) as claim:
+            with self.assertRaisesRegex(AgentError, "^dynamic_teamlead_legacy_target_forbidden$"):
+                server_module._start_agent_with_lease_unlocked("a1", allow_unauthenticated=True)
+
+        claim.assert_not_called()
+
+    def test_direct_legacy_teamlead_start_never_reaches_materialization(self) -> None:
+        with patch.object(server_module, "require_fleet_recovery_ready"), patch.object(
+            server_module, "_start_agent_unlocked"
+        ) as start:
+            with self.assertRaisesRegex(AgentError, "^dynamic_teamlead_legacy_target_forbidden$"):
+                start_agent("a1", agent_class="teamleiterin")
+
+        start.assert_not_called()
 
     def test_start_agent_materializes_resolved_worker_before_g5_and_preserves_unmanaged_file(self) -> None:
         process_summary = {
@@ -32272,439 +30376,6 @@ google_accounts:
         self.assertNotIn("Pruefe nur lesend.", ledger_text)
         self.assertNotIn("Skill body must not be returned", ledger_text)
 
-    def test_codex_usage_routing_uses_auth_identity_and_assignment_context(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            home = Path(tmpdir)
-            (home / "auth.json").write_text("{}\n", encoding="utf-8")
-            payload = {
-                "schema_version": 1,
-                "account": "BW_Nufker",
-                "backend_account_id": "backend-nufker",
-                "role": "arbeitsbiene",
-                "decision": "spark",
-                "model": WRITE_AGENT_MODEL,
-                "reason": "spark_available",
-                "usage_state": "known",
-                "paid_overage_allowed": False,
-                "policy_source": "job:release",
-            }
-            completed = subprocess.CompletedProcess(
-                ["codex-usage"], 0, json.dumps(payload), ""
-            )
-            with patch.dict(
-                "codex_master.server.AGENTS",
-                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
-                clear=False,
-            ), patch(
-                "codex_master.server.codex_usage_executable",
-                return_value="/usr/bin/codex-usage",
-            ), patch(
-                "codex_master.server.run_command",
-                return_value=completed,
-            ) as run:
-                decision = codex_usage_routing_decision(
-                    "a",
-                    role="arbeitsbiene",
-                    group_id="build",
-                    job_id="release",
-                )
-
-        command = run.call_args.args[0]
-        self.assertEqual(run.call_count, 1)
-        self.assertIn("--auth-json", command)
-        auth_path = command[command.index("--auth-json") + 1]
-        self.assertRegex(auth_path, r"^/proc/self/fd/\d+$")
-        self.assertEqual(run.call_args.kwargs["pass_fds"], (int(auth_path.rsplit("/", 1)[1]),))
-        self.assertIn("--agent", command)
-        self.assertIn("--group", command)
-        self.assertIn("build", command)
-        self.assertIn("--job", command)
-        self.assertIn("release", command)
-        self.assertEqual(decision["decision"], "spark")
-        self.assertEqual(decision["backend_account_id"], "backend-nufker")
-
-    def test_codex_usage_routing_keeps_auth_fd_across_path_swap(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            auth_file = root / "auth.json"
-            original = root / "auth-original.json"
-            replacement = root / "auth-replacement.json"
-            auth_file.write_text('{"account":"original"}\n', encoding="utf-8")
-            replacement.write_text('{"account":"replacement"}\n', encoding="utf-8")
-            payload = {
-                "schema_version": 1,
-                "account": "BW_Nufker",
-                "backend_account_id": "backend-nufker",
-                "role": "arbeitsbiene",
-                "decision": "spark",
-                "model": WRITE_AGENT_MODEL,
-                "reason": "spark_available",
-                "usage_state": "known",
-                "paid_overage_allowed": False,
-                "policy_source": "global",
-            }
-
-            def fake_run(command, *, pass_fds, **_kwargs):
-                path = Path(command[command.index("--auth-json") + 1])
-                auth_file.rename(original)
-                replacement.rename(auth_file)
-                self.assertEqual(path.read_text(encoding="utf-8"), '{"account":"original"}\n')
-                self.assertEqual(pass_fds, (int(path.name.rsplit("/", 1)[-1]),))
-                return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
-
-            with patch.dict(
-                "codex_master.server.AGENTS",
-                {"a": {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}},
-                clear=False,
-            ), patch(
-                "codex_master.server.codex_usage_executable",
-                return_value="/usr/bin/codex-usage",
-            ), patch("codex_master.server.run_command", side_effect=fake_run):
-                decision = codex_usage_routing_decision("a", role="arbeitsbiene")
-
-        self.assertEqual(decision["decision"], "spark")
-
-    def test_codex_usage_routing_accepts_structured_blocked_exit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            home = Path(tmpdir)
-            (home / "auth.json").write_text("{}\n", encoding="utf-8")
-            payload = {
-                "schema_version": 1,
-                "account": "BW_Privat",
-                "backend_account_id": "backend-private",
-                "role": "arbeitsbiene",
-                "decision": "blocked",
-                "model": None,
-                "reason": "main_limit_at_or_below_threshold",
-                "usage_state": "known",
-                "paid_overage_allowed": False,
-                "policy_source": "global",
-                "threshold_percent": 10.0,
-                "remaining": {"30d": 1.0},
-                "resets": {"30d": "2026-08-15T15:20:23+02:00"},
-            }
-            completed = subprocess.CompletedProcess(
-                ["codex-usage"], 2, json.dumps(payload), "account blocked"
-            )
-            with patch.dict(
-                "codex_master.server.AGENTS",
-                {"a1": {"label": "A1", "runner": home / "codex", "home": home, "session": "session-a1"}},
-                clear=False,
-            ), patch(
-                "codex_master.server.codex_usage_executable",
-                return_value="/usr/bin/codex-usage",
-            ), patch("codex_master.server.run_command", return_value=completed):
-                decision = codex_usage_routing_decision("a1", role="arbeitsbiene")
-
-        self.assertEqual(decision["decision"], "blocked")
-        self.assertEqual(decision["remaining_percent"], 1.0)
-        self.assertEqual(decision["blocked_until_utc"], "2026-08-15T15:20:23+02:00")
-
-    def test_codex_usage_routing_caps_subprocess_to_caller_budget(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            home = Path(tmpdir)
-            (home / "auth.json").write_text("{}\n", encoding="utf-8")
-            payload = {
-                "schema_version": 1,
-                "account": "BW_Privat",
-                "backend_account_id": "backend-private",
-                "role": "arbeitsbiene",
-                "decision": "blocked",
-                "model": None,
-                "reason": "main_limit_at_or_below_threshold",
-                "usage_state": "known",
-                "paid_overage_allowed": False,
-                "policy_source": "global",
-            }
-            completed = subprocess.CompletedProcess(
-                ["codex-usage"], 2, json.dumps(payload), "account blocked"
-            )
-            with patch.dict(
-                "codex_master.server.AGENTS",
-                {"a1": {"label": "A1", "runner": home / "codex", "home": home, "session": "session-a1"}},
-                clear=False,
-            ), patch(
-                "codex_master.server.codex_usage_executable",
-                return_value="/usr/bin/codex-usage",
-            ), patch("codex_master.server.run_command", return_value=completed) as run:
-                decision = codex_usage_routing_decision(
-                    "a1", role="arbeitsbiene", timeout_seconds=0.25
-                )
-
-        self.assertEqual(decision["decision"], "blocked")
-        self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
-
-    def test_codex_usage_routing_rejects_unhashable_decision(self) -> None:
-        with self.assertRaisesRegex(AgentError, "codex-usage routing decision is invalid"):
-            validate_codex_usage_routing_decision(
-                {"schema_version": 1, "role": "arbeitsbiene", "decision": []},
-                agent="a1",
-                role="arbeitsbiene",
-            )
-
-    def test_codex_usage_routing_rejects_oversized_backend_account_id(self) -> None:
-        with self.assertRaisesRegex(AgentError, "codex-usage routing backend account id exceeds"):
-            validate_codex_usage_routing_decision(
-                {
-                    "schema_version": 1,
-                    "account": "BW_Nufker",
-                    "backend_account_id": "x" * (MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID + 1),
-                    "role": "arbeitsbiene",
-                    "decision": "spark",
-                    "model": WRITE_AGENT_MODEL,
-                    "paid_overage_allowed": False,
-                },
-                agent="a1",
-                role="arbeitsbiene",
-            )
-
-    def test_codex_usage_routing_preserves_remaining_semantics_and_block_reset(self) -> None:
-        decision = validate_codex_usage_routing_decision(
-            {
-                "schema_version": 1,
-                "account": "BW_Privat",
-                "backend_account_id": "backend-private",
-                "role": "arbeitsbiene",
-                "decision": "blocked",
-                "model": None,
-                "reason": "main_limit_at_or_below_threshold",
-                "usage_state": "known",
-                "paid_overage_allowed": False,
-                "policy_source": "global",
-                "threshold_percent": 10.0,
-                "remaining": {"30d": 1.0, "weekly": 50.0},
-                "resets": {
-                    "30d": "2026-08-15T15:20:23+02:00",
-                    "weekly": "2026-08-11T04:57:12+02:00",
-                },
-            },
-            agent="a1",
-            role="arbeitsbiene",
-        )
-
-        self.assertEqual(decision["remaining_percent"], 1.0)
-        self.assertEqual(decision["threshold_percent"], 10.0)
-        self.assertEqual(decision["blocked_until_utc"], "2026-08-15T15:20:23+02:00")
-
-    def test_codex_usage_routing_accepts_blocked_account_without_backend_id(self) -> None:
-        decision = validate_codex_usage_routing_decision(
-            {
-                "schema_version": 1,
-                "account": "BW_Privat",
-                "backend_account_id": None,
-                "role": "arbeitsbiene",
-                "decision": "blocked",
-                "model": None,
-                "reason": "cache_invalidated",
-                "usage_state": "unknown",
-                "paid_overage_allowed": False,
-                "policy_source": "global",
-            },
-            agent="a2",
-            role="arbeitsbiene",
-        )
-
-        self.assertEqual(decision["decision"], "blocked")
-        self.assertIsNone(decision["backend_account_id"])
-
-    def test_spark_health_update_is_bounded_and_uses_config(self) -> None:
-        completed = subprocess.CompletedProcess(
-            ["codex-usage"], 0, '{"state":"failed"}\n', ""
-        )
-        with patch.dict("os.environ", {"CODEX_USAGE_CONFIG": "/tmp/codex-config.toml"}, clear=False), patch(
-            "codex_master.server.codex_usage_executable",
-            return_value="/usr/bin/codex-usage",
-        ), patch("codex_master.server.run_command", return_value=completed) as run:
-            result = codex_usage_spark_health_update(
-                "backend-nufker",
-                state="failed",
-                reason="spark_turn_timeout",
-            )
-
-        command = run.call_args.args[0]
-        self.assertEqual(command[:3], ["/usr/bin/codex-usage", "--config", "/tmp/codex-config.toml"])
-        self.assertIn("spark-health", command)
-        self.assertIn("backend-nufker", command)
-        self.assertEqual(result["state"], "failed")
-
-    def test_spark_health_update_rejects_unhashable_state(self) -> None:
-        with self.assertRaisesRegex(AgentError, "spark health state is invalid"):
-            codex_usage_spark_health_update("backend-nufker", state=[], reason="spark_turn_timeout")
-
-    @patch("codex_master.server.agent_lifecycle_lock")
-    @patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True})
-    @patch("codex_master.server.update_agent_spark_health")
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.status_agent")
-    def test_wait_marks_spark_activity_healthy(
-        self, mock_status_agent, _mock_sleep, mock_health, _mock_lease, mock_lifecycle_lock
-    ) -> None:
-        mock_lifecycle_lock.return_value.__enter__.return_value = None
-        _mock_lease.return_value = {"held_by_this_server": True, "lease_id": "b" * 32}
-        mock_status_agent.side_effect = [
-            {
-                "agent": "a",
-                "running": True,
-                "raw_log_bytes": 10,
-                "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
-                "response_state": {"state": "running_idle"},
-                "limit_state": {"limited": False},
-                "lease": {"state": "held", "held_by_this_server": True, "lease_id": "b" * 32},
-            },
-            {
-                "agent": "a",
-                "running": True,
-                "raw_log_bytes": 11,
-                "raw_log_updated_at_utc": "2026-06-07T10:00:01+00:00",
-                "response_state": {"state": "running_recent_output"},
-                "limit_state": {"limited": False},
-                "lease": {"state": "held", "held_by_this_server": True, "lease_id": "b" * 32},
-            },
-        ]
-        mock_health.return_value = {"state": "healthy", "updated": True, "raw_output": "not_returned"}
-
-        result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
-
-        self.assertEqual(result["status"], "activity_observed")
-        self.assertEqual(result["spark_health"]["state"], "healthy")
-        mock_health.assert_called_once_with(
-            "a1", state="healthy", reason="spark_turn_activity_observed"
-        )
-
-    @patch("codex_master.server.agent_lifecycle_lock")
-    @patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True})
-    @patch("codex_master.server.update_agent_spark_health")
-    @patch("codex_master.server.status_agent")
-    def test_wait_marks_spark_timeout_failed(
-        self, mock_status_agent, mock_health, _mock_lease, mock_lifecycle_lock
-    ) -> None:
-        mock_lifecycle_lock.return_value.__enter__.return_value = None
-        _mock_lease.return_value = {"held_by_this_server": True, "lease_id": "c" * 32}
-        mock_status_agent.return_value = {
-            "agent": "a",
-            "running": True,
-            "raw_log_bytes": 10,
-            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
-            "last_assignment": {
-                "assignment_id": "assign-1",
-                "created_at_utc": "2026-06-07T10:00:30+00:00",
-            },
-            "response_state": {"state": "running_tui_starter_context"},
-            "limit_state": {"limited": False},
-            "tui_context": {"state": "starter_placeholder", "evidence": "not_returned"},
-            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "c" * 32},
-        }
-        mock_health.return_value = {"state": "failed", "updated": True, "raw_output": "not_returned"}
-
-        result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
-
-        self.assertEqual(result["status"], "timeout")
-        self.assertEqual(result["spark_health"]["state"], "failed")
-        mock_health.assert_called_once_with(
-            "a1", state="failed", reason="spark_turn_timeout"
-        )
-
-    @patch("codex_master.server.update_agent_spark_health")
-    @patch("codex_master.server.status_agent")
-    def test_wait_does_not_update_spark_health_for_foreign_lease(
-        self, mock_status_agent, mock_health
-    ) -> None:
-        mock_status_agent.return_value = {
-            "agent": "a",
-            "running": True,
-            "raw_log_bytes": 10,
-            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
-            "last_assignment": {
-                "assignment_id": "assign-1",
-                "created_at_utc": "2026-06-07T10:00:30+00:00",
-            },
-            "response_state": {"state": "running_tui_starter_context"},
-            "limit_state": {"limited": False},
-            "lease": {"state": "held", "held_by_this_server": False},
-        }
-
-        result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
-
-        self.assertEqual(result["status"], "timeout")
-        self.assertEqual(result["spark_health"]["state"], "not_checked")
-        self.assertEqual(result["spark_health"]["reason"], "lease_not_held_by_this_server")
-        mock_health.assert_not_called()
-
-    @patch("codex_master.server.agent_lifecycle_lock")
-    @patch(
-        "codex_master.server.agent_lease_status",
-        return_value={"held_by_this_server": True, "lease_id": "d" * 32},
-    )
-    @patch("codex_master.server.update_agent_spark_health")
-    @patch("codex_master.server.status_agent")
-    def test_wait_does_not_update_spark_health_after_lease_replacement(
-        self, mock_status_agent, mock_health, _mock_lease, mock_lifecycle_lock
-    ) -> None:
-        mock_lifecycle_lock.return_value.__enter__.return_value = None
-        mock_status_agent.return_value = {
-            "agent": "a",
-            "running": True,
-            "raw_log_bytes": 10,
-            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
-            "response_state": {"state": "running_idle"},
-            "limit_state": {"limited": False},
-            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "e" * 32},
-        }
-
-        result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
-
-        self.assertEqual(result["status"], "timeout")
-        self.assertEqual(result["spark_health"]["state"], "not_checked")
-        self.assertEqual(result["spark_health"]["reason"], "lease_changed")
-        mock_health.assert_not_called()
-
-    def test_routing_decision_tool_is_prompt_free(self) -> None:
-        with patch("codex_master.server.send_agent") as send:
-            result = call_tool(
-                "agent_routing_decision",
-                {
-                    "agent": "a",
-                    "role": "arbeitsbiene",
-                    "group_id": "build",
-                    "job_id": "release",
-                },
-            )
-
-        self.assertEqual(result["decision"], "spark")
-        self.assertEqual(result["model"], WRITE_AGENT_MODEL)
-        send.assert_not_called()
-
-    def test_blocked_routing_sends_no_assignment_prompt(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            home = Path(tmpdir)
-            (home / "auth.json").write_text("{}\n", encoding="utf-8")
-            blocked = {
-                "schema_version": 1,
-                "account": "work",
-                "backend_account_id": "backend-work",
-                "role": "exploriererin",
-                "decision": "blocked",
-                "model": None,
-                "reason": "main_limit_at_or_below_threshold",
-                "usage_state": "known",
-                "paid_overage_allowed": False,
-                "policy_source": "global",
-                "raw_output": "not_returned",
-            }
-            with patch.dict(
-                "codex_master.server.AGENTS",
-                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
-                clear=False,
-            ), patch(
-                "codex_master.server.codex_usage_routing_decision",
-                return_value=blocked,
-            ), patch("codex_master.server.send_agent") as send:
-                with self.assertRaisesRegex(AgentError, "blocked assignment before prompt send"):
-                    call_tool(
-                        "agent_assign_readonly",
-                        {"agent": "a", "task": "do not send", "scope": ["src"]},
-                    )
-                send.assert_not_called()
 
     def test_model_switch_restarts_only_inactive_agentin(self) -> None:
         lease = {"state": "held", "holder": "test", "held_by_this_server": True}
@@ -33220,33 +30891,45 @@ google_accounts:
         self.assertEqual(start.call_args.kwargs["model"], DEFAULT_AGENT_MODEL)
         self.assertEqual(start.call_args.kwargs["model_reasoning_effort"], DEFAULT_AGENT_MODEL_EFFORT)
 
-    def test_agent_assign_keeps_fresh_lease_when_model_switch_leaves_home_process(self) -> None:
-        routing = {
-            "decision": "main",
-            "model": DEFAULT_AGENT_MODEL,
-            "account": "a1",
-            "backend_account_id": "backend",
-            "role": "exploriererin",
-            "paid_overage_allowed": False,
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": False, "auth_state": "empty"}
-        ), patch("codex_master.server.codex_usage_routing_decision", return_value=routing), patch(
-            "codex_master.server.claim_for_agent_mutation",
-            return_value=({"state": "held", "held_by_this_server": True}, True),
-        ), patch(
-            "codex_master.server.ensure_assignment_session_model",
-            side_effect=AgentError("orphaned process"),
-        ) as mock_model, patch(
-            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
-        ), patch(
-            "codex_master.server.agent_home_process_summary",
-            return_value={"process_count": 1},
-        ), patch("codex_master.server.release_agent") as mock_release:
+    def test_agent_assign_keeps_fresh_lease_when_model_switch_leaves_home_process(
+        self,
+    ) -> None:
+        with (
+            patch.dict(
+                "codex_master.server.AGENTS",
+                {
+                    "a1": {
+                        "label": "A1",
+                        "runner": Path("/tmp/codex"),
+                        "home": Path("/tmp/home"),
+                        "session": "session-a1",
+                    }
+                },
+                clear=True,
+            ),
+            patch(
+                "codex_master.server.agent_auth_status",
+                return_value={"authenticated": False, "auth_state": "empty"},
+            ),
+            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=({"state": "held", "held_by_this_server": True}, True),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                side_effect=AgentError("orphaned process"),
+            ) as mock_model,
+            patch(
+                "codex_master.server.agent_lease_status",
+                return_value={"held_by_this_server": True},
+            ),
+            patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={"process_count": 1},
+            ),
+            patch("codex_master.server.release_agent") as mock_release,
+        ):
             with self.assertRaisesRegex(AgentError, "orphaned process"):
                 assign_agent(
                     "a1",
@@ -33259,7 +30942,9 @@ google_accounts:
         self.assertTrue(mock_model.call_args.kwargs["release_lease_on_failure"])
         mock_release.assert_not_called()
 
-    def test_bound_teamleader_assign_uses_ensure_unchanged_without_restart_or_spawn(self) -> None:
+    def test_bound_teamleader_assign_uses_ensure_unchanged_without_restart_or_spawn(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             descriptor = SimpleNamespace(
@@ -33273,33 +30958,56 @@ google_accounts:
                 skill_profile="teamleiterin",
             )
             inventory = SimpleNamespace(agents={"q1": descriptor}, agent_ids=("q1",))
-            with patch(
-                "codex_master.server.ensure_assignment_session_model",
-                wraps=ensure_assignment_session_model,
-            ) as ensure_model, patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-                "codex_master.server.agent_config",
-                return_value={"session": "q1-tmux", "home": home, "label": "Q1"},
-            ), patch(
-                "codex_master.server._headless_descriptor", return_value=None
-            ), patch("codex_master.server._ollama_descriptor", return_value=None), patch(
-                "codex_master.server.require_ollama_admission", return_value={"allowed": True}
-            ), patch(
-                "codex_master.server.require_authenticated_agent_for_mutation",
-                return_value={"authenticated": True},
-            ), patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
-                "codex_master.server.codex_usage_routing_decision", return_value=None
-            ), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}) as require_managed_tmux_session, patch(
-                "codex_master.server.read_meta",
-                return_value={"model": "gpt-5.6-terra", "model_reasoning_effort": "xhigh"},
-            ), patch("codex_master.server.claim_for_agent_mutation", return_value=({"state": "held"}, False)), patch(
-                "codex_master.server.send_agent", return_value={"agent": "q1", "status": "sent"}
-            ), patch("codex_master.server.record_assignment"), patch(
-                "codex_master.server.run_tmux"
-            ) as run_tmux, patch("codex_master.server.start_agent") as start_agent, patch(
-                "codex_master.server.require_spawn_capacity"
-            ) as require_capacity:
+            with (
+                patch(
+                    "codex_master.server.ensure_assignment_session_model",
+                    return_value={"status": "unchanged"},
+                ) as ensure_model,
+                patch(
+                    "codex_master.server.current_agent_inventory",
+                    return_value=inventory,
+                ),
+                patch(
+                    "codex_master.server.agent_config",
+                    return_value={"session": "q1-tmux", "home": home, "label": "Q1"},
+                ),
+                patch("codex_master.server._headless_descriptor", return_value=None),
+                patch("codex_master.server._ollama_descriptor", return_value=None),
+                patch(
+                    "codex_master.server.require_ollama_admission",
+                    return_value={"allowed": True},
+                ),
+                patch(
+                    "codex_master.server.require_authenticated_agent_for_mutation",
+                    return_value={"authenticated": True},
+                ),
+                patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+                patch("codex_master.server.tmux_alive", return_value=True),
+                patch(
+                    "codex_master.server.require_managed_tmux_session",
+                    return_value={"ok": True},
+                ),
+                patch(
+                    "codex_master.server.read_meta",
+                    return_value={
+                        "agent_class": "arbeitsbiene",
+                        "model": "gpt-5.6-luna",
+                        "model_reasoning_effort": "medium",
+                    },
+                ),
+                patch(
+                    "codex_master.server.claim_for_agent_mutation",
+                    return_value=({"state": "held"}, False),
+                ),
+                patch(
+                    "codex_master.server.send_agent",
+                    return_value={"agent": "q1", "status": "sent"},
+                ),
+                patch("codex_master.server.record_assignment"),
+                patch("codex_master.server.run_tmux") as run_tmux,
+                patch("codex_master.server.start_agent") as start_agent,
+                patch("codex_master.server.require_spawn_capacity") as require_capacity,
+            ):
                 result = assign_agent(
                     "q1",
                     role="exploriererin",
@@ -33310,43 +31018,61 @@ google_accounts:
                 )
 
         self.assertEqual(
-            (result["model"], result["model_reasoning_effort"], result["model_switch"]["status"]),
-            ("gpt-5.6-terra", "xhigh", "unchanged"),
+            (
+                result["model"],
+                result["model_reasoning_effort"],
+                result["model_switch"]["status"],
+            ),
+            ("gpt-5.6-luna", "medium", "unchanged"),
         )
         ensure_model.assert_called_once()
-        require_managed_tmux_session.assert_called_once_with("q1")
+        self.assertIsNone(ensure_model.call_args.kwargs["agent_class"])
         run_tmux.assert_not_called()
         start_agent.assert_not_called()
         require_capacity.assert_not_called()
 
-    def test_agent_assign_keeps_fresh_lease_when_send_fails_after_model_switch(self) -> None:
-        routing = {
-            "decision": "main",
-            "model": DEFAULT_AGENT_MODEL,
-            "account": "a1",
-            "backend_account_id": "backend",
-            "role": "exploriererin",
-            "paid_overage_allowed": False,
-        }
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": False, "auth_state": "empty"}
-        ), patch("codex_master.server.codex_usage_routing_decision", return_value=routing), patch(
-            "codex_master.server.claim_for_agent_mutation",
-            return_value=({"state": "held", "held_by_this_server": True}, True),
-        ), patch(
-            "codex_master.server.ensure_assignment_session_model",
-            return_value={"status": "restarted"},
-        ), patch("codex_master.server.remember_agent_routing"), patch(
-            "codex_master.server.send_agent", side_effect=AgentError("send failed")
-        ), patch(
-            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
-        ), patch(
-            "codex_master.server.agent_home_process_summary", return_value={"process_count": 1}
-        ), patch("codex_master.server.release_agent") as mock_release:
+    def test_agent_assign_keeps_fresh_lease_when_send_fails_after_model_switch(
+        self,
+    ) -> None:
+        with (
+            patch.dict(
+                "codex_master.server.AGENTS",
+                {
+                    "a1": {
+                        "label": "A1",
+                        "runner": Path("/tmp/codex"),
+                        "home": Path("/tmp/home"),
+                        "session": "session-a1",
+                    }
+                },
+                clear=True,
+            ),
+            patch(
+                "codex_master.server.agent_auth_status",
+                return_value={"authenticated": False, "auth_state": "empty"},
+            ),
+            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=({"state": "held", "held_by_this_server": True}, True),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                return_value={"status": "restarted"},
+            ),
+            patch(
+                "codex_master.server.send_agent", side_effect=AgentError("send failed")
+            ),
+            patch(
+                "codex_master.server.agent_lease_status",
+                return_value={"held_by_this_server": True},
+            ),
+            patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={"process_count": 1},
+            ),
+            patch("codex_master.server.release_agent") as mock_release,
+        ):
             with self.assertRaisesRegex(AgentError, "send failed"):
                 assign_agent(
                     "a1",
@@ -33358,7 +31084,6 @@ google_accounts:
 
         mock_release.assert_not_called()
 
-    @patch("codex_master.server.remember_agent_routing")
     @patch("codex_master.server.record_assignment")
     @patch("codex_master.server.send_agent", side_effect=AgentError("send failed"))
     @patch("codex_master.server.ensure_assignment_session_model")
@@ -33367,7 +31092,6 @@ google_accounts:
         mock_switch,
         mock_send,
         mock_record,
-        mock_remember,
     ) -> None:
         mock_switch.return_value = {"status": "unchanged", "previous_model": DEFAULT_AGENT_MODEL}
 
@@ -33407,7 +31131,6 @@ google_accounts:
         mock_send.assert_called_once()
         mock_switch.assert_called_once()
         mock_record.assert_not_called()
-        mock_remember.assert_not_called()
         mock_release.assert_not_called()
 
     def test_run_with_agent_lease_keeps_fresh_lease_when_home_process_remains(self) -> None:
@@ -34671,46 +32394,15 @@ class AppletStatusContractTest(unittest.TestCase):
     @patch("codex_master.server.codex_usage_watchdog_status")
     @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
     @patch("codex_master.server.applet_agent_observation")
-    def test_applet_status_schema_v2_account_limit_blocks_start_and_reports_reset(
+
+    def test_applet_rows_uses_attested_usage_without_persisting_account(
         self,
-        mock_observation,
+        _mock_observation,
         _mock_read_key,
-        mock_usage,
-        mock_admission,
-        _mock_run_tmux,
-        _mock_native_status,
-    ) -> None:
-        mock_observation.return_value = self._row("a1")
-        mock_usage.return_value = {
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": "2026-08-03T15:00:00+00:00",
-        }
-        mock_admission.return_value = {
-            "allowed": True,
-            "required_slots": 1,
-            "reason_codes": [],
-            "raw_output": "not_returned",
-        }
-
-        payload = applet_status(["a1"], schema_version=2)
-
-        row = payload["agents"][0]
-        self.assertEqual(row["limit_state"], "blocked")
-        self.assertEqual(row["blocked_until_utc"], "2026-08-03T15:00:00+00:00")
-        self.assertEqual(row["allowed_action"], "none")
-        self.assertEqual(row["context_token"], "")
-
-    @patch("codex_master.server.read_meta", return_value={})
-    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
-    @patch("codex_master.server.codex_usage_status_with_routing")
-    @patch("codex_master.server.codex_usage_watchdog_status")
-    def test_applet_rows_force_fresh_policy_without_persisting_account(
-        self,
         mock_usage,
         mock_policy,
-        _mock_read_key,
-        _mock_meta,
+        _mock_tmux,
+        _mock_native_status,
     ) -> None:
         raw = {
             "agent": "a1",
@@ -34725,8 +32417,7 @@ class AppletStatusContractTest(unittest.TestCase):
             "blocked": True,
             "blocked_until_utc": "2026-08-15T15:20:23+02:00",
         }
-        mock_usage.return_value = raw
-        mock_policy.return_value = blocked
+        mock_usage.return_value = blocked
 
         rows = server_module.applet_action_rows(
             [self._row("a1")],
@@ -34736,23 +32427,7 @@ class AppletStatusContractTest(unittest.TestCase):
 
         self.assertEqual(rows[0]["limit_state"], "blocked")
         self.assertEqual(rows[0]["allowed_action"], "none")
-        mock_policy.assert_called_once()
-        self.assertEqual(mock_policy.call_args.args, ("a1", raw))
-        self.assertEqual(
-            {
-                key: value
-                for key, value in mock_policy.call_args.kwargs.items()
-                if key != "routing_timeout_seconds"
-            },
-            {
-                "persist_account": False,
-                "include_assignment_history": False,
-                "force_policy_check": True,
-            },
-        )
-        timeout = mock_policy.call_args.kwargs["routing_timeout_seconds"]
-        self.assertGreater(timeout, 0)
-        self.assertLessEqual(timeout, 10)
+        mock_policy.assert_called_once_with(1, running_agents_override=0)
 
     def test_applet_action_token_rejects_tampering_and_expiry(self) -> None:
         state = {
@@ -36187,12 +33862,20 @@ class CliLifecycleTest(unittest.TestCase):
             patch("codex_master.server.require_ollama_admission"),
             patch("codex_master.server.scope_check", return_value={"allowed": True}),
             patch("codex_master.server.claim_for_agent_mutation", return_value=(lease, False)),
-            patch("codex_master.server.agent_config", return_value={"session": "a1-session"}),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                return_value={"status": "unchanged"},
+            ),
+            patch(
+                "codex_master.server.agent_config",
+                return_value={"session": "a1-session", "home": Path("/tmp/home")},
+            ),
             patch("codex_master.server.tmux_alive", return_value=True),
             patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}),
             patch(
                 "codex_master.server.read_meta",
                 return_value={
+                    "agent_class": "arbeitsbiene",
                     "model": "gpt-5.6-luna",
                     "model_reasoning_effort": "xhigh",
                     "cwd": "/tmp",
@@ -36200,7 +33883,6 @@ class CliLifecycleTest(unittest.TestCase):
             ),
             patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()),
             patch("codex_master.server.send_agent", return_value={"agent": "a1", "status": "sent"}),
-            patch("codex_master.server.remember_agent_routing"),
             patch("codex_master.server.record_assignment"),
         ]
         with contextlib.ExitStack() as stack:
@@ -41640,39 +39322,50 @@ def native_agent_lock_blocked(path: Path) -> Any:
 
 
 def test_usage_state_home_resolver_uses_only_absolute_authorized_roots() -> None:
-    with patch.dict(
-        os.environ,
-        {
-            "CODEX_USAGE_INTEGRATION_STATE_HOME": "/synthetic/primary",
-            "XDG_STATE_HOME": "/synthetic/xdg",
-            "HOME": "/synthetic/home-marker",
-            "PATH": "/synthetic/path-marker",
-        },
-        clear=True,
+    evidence = UsageEvidenceV2((), "unavailable", None, None)
+    usage_snapshot = UsageSnapshot((), "unavailable", True, ("usage_unavailable",))
+    environment = Mock()
+    environment.get.side_effect = AssertionError("usage path must not read environment")
+    with (
+        patch.object(server_module.os, "environ", environment),
+        patch.object(
+            server_module, "_fleet_registry_read_lock", contextlib.nullcontext
+        ),
+        patch.object(
+            server_module,
+            "_readonly_fleet_service",
+            return_value=Mock(
+                registry_snapshot=Mock(return_value=_overview_cli_test_snapshot())
+            ),
+        ),
+        patch.object(server_module, "build_inventory", return_value=object()),
+        patch.object(server_module, "build_fleet_overview", return_value=object()),
+        patch.object(
+            server_module, "read_usage_evidence_v2", return_value=evidence
+        ) as reader,
+        patch.object(server_module, "derive_limit_decisions") as tracker,
+        patch.object(
+            server_module, "display_snapshot_from_evidence", return_value=usage_snapshot
+        ) as display,
+        patch.object(
+            server_module, "enrich_fleet_overview_usage", return_value=object()
+        ),
+        patch.object(server_module, "render_fleet_overview", return_value="rendered"),
     ):
-        assert server_module._resolve_codex_usage_state_home() == Path("/synthetic/primary")
-
-    with patch.dict(os.environ, {"XDG_STATE_HOME": "/synthetic/xdg"}, clear=True):
-        assert server_module._resolve_codex_usage_state_home() == Path("/synthetic/xdg")
-
-    with patch.dict(os.environ, {}, clear=True), patch.object(
-        server_module.Path, "home", return_value=Path("/synthetic/server-home")
-    ):
-        assert server_module._resolve_codex_usage_state_home() == Path(
-            "/synthetic/server-home/.local/state"
+        result = server_module._fleet_overview_local_admin(
+            active_only=True,
+            format="compact",
+            clock=lambda: datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
         )
 
-    for name, value in (
-        ("CODEX_USAGE_INTEGRATION_STATE_HOME", "relative"),
-        ("CODEX_USAGE_INTEGRATION_STATE_HOME", "/synthetic/./state"),
-        ("CODEX_USAGE_INTEGRATION_STATE_HOME", "/synthetic/../state"),
-    ):
-        with patch.dict(os.environ, {name: value}, clear=True):
-            assert server_module._resolve_codex_usage_state_home() is None
-    with patch.object(
-        server_module.os, "environ", {"XDG_STATE_HOME": "/synthetic/state\x00marker"}
-    ):
-        assert server_module._resolve_codex_usage_state_home() is None
+    assert result == "rendered"
+    reader.assert_called_once()
+    tracker.assert_not_called()
+    display.assert_called_once_with(
+        evidence,
+        known_account_ids=frozenset({"overview-account"}),
+    )
+    environment.get.assert_not_called()
 
 
 def test_fleet_overview_composes_registry_then_usage_then_enrichment_and_render() -> None:
@@ -41681,10 +39374,46 @@ def test_fleet_overview_composes_registry_then_usage_then_enrichment_and_render(
     service.registry_snapshot.side_effect = (
         lambda: events.append("registry") or _overview_cli_test_snapshot()
     )
-    bounded_runner = object()
+    observed_at = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+    evidence = UsageEvidenceV2(
+        (
+            AccountUsageEvidenceV2(
+                "overview-account",
+                (
+                    UsageLimitV2(
+                        "main",
+                        604800,
+                        "reset-1",
+                        1.0,
+                        99.0,
+                        observed_at + timedelta(days=1),
+                    ),
+                ),
+                (
+                    UsageTrendV2(
+                        "main",
+                        604800,
+                        "reset-1",
+                        "complete",
+                        observed_at,
+                        observed_at + timedelta(days=2),
+                    ),
+                ),
+                (
+                    TrackerEvidenceV2(
+                        "main", 604800, "reset-1", "complete", observed_at
+                    ),
+                ),
+            ),
+        ),
+        "complete",
+        observed_at,
+        observed_at,
+    )
+    usage_snapshot = UsageSnapshot((), "live", False, ())
 
-    def usage_clock() -> None:
-        return None
+    def usage_clock() -> datetime:
+        return observed_at
 
     @contextlib.contextmanager
     def lock(_path: Path) -> Any:
@@ -41704,22 +39433,24 @@ def test_fleet_overview_composes_registry_then_usage_then_enrichment_and_render(
         events.append("base")
         return object()
 
-    def load_usage(**kwargs: Any) -> object:
+    def read_usage(*, clock: object) -> UsageEvidenceV2:
         events.append("usage")
-        assert kwargs["clock"] is usage_clock
-        assert kwargs["runner"] is bounded_runner
-        active_reader = kwargs["active_release_reader"]
-        cache_reader = kwargs["cache_reader"]
-        assert isinstance(active_reader, functools.partial)
-        assert isinstance(cache_reader, functools.partial)
-        assert active_reader.func is server_module.read_active_launcher_v1
-        assert cache_reader.func is server_module.read_account_usage_cache_v1
-        assert active_reader.args == ()
-        assert cache_reader.args == ()
-        assert active_reader.keywords == {"state_home": Path("/synthetic/state")}
-        assert cache_reader.keywords == {"state_home": Path("/synthetic/state")}
-        assert kwargs["known_account_ids"] == frozenset({"overview-account"})
-        return object()
+        assert clock is usage_clock
+        return evidence
+
+    def tracker(evidence_arg: UsageEvidenceV2, *, now: datetime) -> tuple[object, ...]:
+        events.append("tracker")
+        assert evidence_arg is evidence
+        assert now == observed_at
+        return ()
+
+    def display(
+        evidence_arg: UsageEvidenceV2, *, known_account_ids: frozenset[str]
+    ) -> UsageSnapshot:
+        events.append("display")
+        assert evidence_arg is evidence
+        assert known_account_ids == frozenset({"overview-account"})
+        return usage_snapshot
 
     def enrich(base: object, usage: object) -> object:
         assert base is not None and usage is not None
@@ -41731,15 +39462,32 @@ def test_fleet_overview_composes_registry_then_usage_then_enrichment_and_render(
         events.append("render")
         return "rendered"
 
-    with patch.object(server_module, "_fleet_registry_read_lock", lock), patch.object(
-        server_module, "_readonly_fleet_service", return_value=service
-    ), patch.object(server_module, "build_inventory", side_effect=inventory), patch.object(
-        server_module, "build_fleet_overview", side_effect=base_overview
-    ), patch.object(server_module, "load_account_usage_v1", side_effect=load_usage, create=True), patch.object(
-        server_module, "enrich_fleet_overview_usage", side_effect=enrich, create=True
-    ), patch.object(server_module, "render_fleet_overview", side_effect=render), patch.object(
-        server_module, "_resolve_codex_usage_state_home", return_value=Path("/synthetic/state"), create=True
-    ), patch.object(server_module, "default_runner", bounded_runner, create=True):
+    with (
+        patch.object(server_module, "_fleet_registry_read_lock", lock),
+        patch.object(server_module, "_readonly_fleet_service", return_value=service),
+        patch.object(server_module, "build_inventory", side_effect=inventory),
+        patch.object(server_module, "build_fleet_overview", side_effect=base_overview),
+        patch.object(
+            server_module, "read_usage_evidence_v2", side_effect=read_usage
+        ) as reader,
+        patch.object(
+            server_module, "derive_limit_decisions", side_effect=tracker
+        ) as decision_tracker,
+        patch.object(
+            server_module, "display_snapshot_from_evidence", side_effect=display
+        ) as display_snapshot,
+        patch.object(server_module, "enrich_fleet_overview_usage", side_effect=enrich),
+        patch.object(server_module, "render_fleet_overview", side_effect=render),
+        patch.object(
+            server_module.os,
+            "environ",
+            Mock(
+                get=Mock(
+                    side_effect=AssertionError("usage path must not read environment")
+                )
+            ),
+        ),
+    ):
         result = server_module._fleet_overview_local_admin(
             active_only=True,
             format="json",
@@ -41756,32 +39504,60 @@ def test_fleet_overview_composes_registry_then_usage_then_enrichment_and_render(
         "base",
         "lock-exit",
         "usage",
+        "tracker",
+        "display",
         "enrich",
         "render",
     ]
     service.registry_snapshot.assert_called_once_with()
+    reader.assert_called_once()
+    decision_tracker.assert_called_once_with(evidence, now=observed_at)
+    display_snapshot.assert_called_once_with(
+        evidence,
+        known_account_ids=frozenset({"overview-account"}),
+    )
 
 
 def test_invalid_usage_state_home_fails_soft_to_unavailable_enrichment() -> None:
-    with patch.object(server_module, "_resolve_codex_usage_state_home", return_value=None, create=True), patch.object(
-        server_module, "_fleet_registry_read_lock", contextlib.nullcontext
-    ), patch.object(
-        server_module, "_readonly_fleet_service", return_value=Mock(registry_snapshot=Mock(return_value=object()))
-    ), patch.object(server_module, "build_inventory", return_value=object()), patch.object(
-        server_module, "build_fleet_overview", return_value=object()
-    ), patch.object(server_module, "load_account_usage_v1", create=True) as load_usage, patch.object(
-        server_module, "enrich_fleet_overview_usage", return_value=object(), create=True
-    ) as enrich, patch.object(server_module, "render_fleet_overview", return_value="rendered"):
-        result = server_module._fleet_overview_local_admin(
-            active_only=True,
-            format="compact",
-            clock=lambda: datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
-            usage_clock=lambda: datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
-        )
+    unavailable = UsageSnapshot((), "unavailable", True, ("usage_unavailable",))
+    for status in ("stale", "partial", "busy", "unavailable", "invalid"):
+        with (
+            patch.object(
+                server_module, "_fleet_registry_read_lock", contextlib.nullcontext
+            ),
+            patch.object(
+                server_module,
+                "_readonly_fleet_service",
+                return_value=Mock(
+                    registry_snapshot=Mock(return_value=_overview_cli_test_snapshot())
+                ),
+            ),
+            patch.object(server_module, "build_inventory", return_value=object()),
+            patch.object(server_module, "build_fleet_overview", return_value=object()),
+            patch.object(
+                server_module,
+                "read_usage_evidence_v2",
+                return_value=UsageEvidenceV2((), status, None, None),
+            ) as reader,
+            patch.object(server_module, "derive_limit_decisions") as tracker,
+            patch.object(
+                server_module, "enrich_fleet_overview_usage", return_value=object()
+            ) as enrich,
+            patch.object(
+                server_module, "render_fleet_overview", return_value="rendered"
+            ),
+        ):
+            result = server_module._fleet_overview_local_admin(
+                active_only=True,
+                format="compact",
+                clock=lambda: datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
+                usage_clock=lambda: datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
+            )
 
-    assert result == "rendered"
-    load_usage.assert_not_called()
-    enrich.assert_called_once()
+        assert result == "rendered"
+        reader.assert_called_once()
+        tracker.assert_not_called()
+        assert enrich.call_args.args[1] == unavailable
 
 
 def test_usage_loader_exception_becomes_canonical_unavailable_and_render_success() -> None:
@@ -41802,19 +39578,19 @@ def test_usage_loader_exception_becomes_canonical_unavailable_and_render_success
         return enriched_overview
 
     renderer = Mock(return_value="rendered")
-    with patch.object(server_module, "STATE_ROOT", Path("/synthetic-state")), patch.object(
-        server_module, "_fleet_registry_read_lock", fake_lock
-    ), patch.object(
-        server_module, "_readonly_fleet_service", return_value=service
-    ), patch.object(server_module, "build_inventory", return_value=object()), patch.object(
-        server_module, "build_fleet_overview", return_value=base_overview
-    ), patch.object(
-        server_module, "_resolve_codex_usage_state_home", return_value=Path("/synthetic/state")
-    ), patch.object(
-        server_module, "load_account_usage_v1", side_effect=RuntimeError(marker)
-    ) as loader, patch.object(
-        server_module, "enrich_fleet_overview_usage", side_effect=enrich
-    ), patch.object(server_module, "render_fleet_overview", renderer):
+    with (
+        patch.object(server_module, "STATE_ROOT", Path("/synthetic-state")),
+        patch.object(server_module, "_fleet_registry_read_lock", fake_lock),
+        patch.object(server_module, "_readonly_fleet_service", return_value=service),
+        patch.object(server_module, "build_inventory", return_value=object()),
+        patch.object(server_module, "build_fleet_overview", return_value=base_overview),
+        patch.object(
+            server_module, "read_usage_evidence_v2", side_effect=RuntimeError(marker)
+        ) as reader,
+        patch.object(server_module, "derive_limit_decisions") as tracker,
+        patch.object(server_module, "enrich_fleet_overview_usage", side_effect=enrich),
+        patch.object(server_module, "render_fleet_overview", renderer),
+    ):
         result = server_module._fleet_overview_local_admin(
             active_only=True,
             format="compact",
@@ -41824,7 +39600,8 @@ def test_usage_loader_exception_becomes_canonical_unavailable_and_render_success
 
     assert result == "rendered"
     assert marker not in result
-    loader.assert_called_once()
+    reader.assert_called_once()
+    tracker.assert_not_called()
     renderer.assert_called_once_with(enriched_overview, format="compact")
 
 

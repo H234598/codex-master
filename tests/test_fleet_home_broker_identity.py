@@ -1,207 +1,208 @@
-import ast
 import dataclasses
-from pathlib import Path
+from dataclasses import FrozenInstanceError
+from hashlib import sha256
 
 import pytest
 
 from codex_master.fleet_home_broker_identity import (
-    BrokerCapabilityModel,
-    BrokerIdentityCode,
-    BrokerIdentityError,
-    BrokerManifestV1,
+    BrokerIdentity,
+    IdentityValidationError,
+    ImportClosure,
     ImportClosureEntry,
-    ImportClosureManifestV1,
-    ObjectIdentity,
-    PeerCgroupEvidence,
-    principal_for_attested_peer,
-    validate_broker_manifest,
-    validate_empty_capability_model,
-    validate_import_closure_manifest,
-    validate_peer_cgroup_evidence,
 )
-from codex_master.fleet_home_broker_protocol import MAX_CHPB_GENERATION
+
+MAX_GENERATION = 2**63 - 1
+MAX_MCS_CATEGORY = 1023
 
 
-def identity(*, mode=0o40700, dev=7, ino=9, uid=0, gid=0, nlink=2):
-    return ObjectIdentity(dev, ino, mode, uid, gid, nlink)
+def _digest(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()
 
 
-def manifest(**changes):
-    values = {
-        "agent_id": "bee_1",
-        "manifest_generation": 3,
-        "policy_generation": 7,
-        "projection_digest": "a" * 64,
-        "executable_fingerprint": "b" * 64,
-        "mcs_pair": "c0,c1",
-        "slot": identity(),
-        "fencing_epoch": 4,
-    }
-    values.update(changes)
-    return BrokerManifestV1(**values)
-
-
-def peer(**changes):
-    values = {
-        "pid": 123,
-        "cgroup": identity(),
-        "invocation_id": "1" * 32,
-        "unit_name": "codex-master-agent@bee_1.service",
-        "unit_generation": 9,
-        "mcs_pair": "c0,c1",
-    }
-    values.update(changes)
-    return PeerCgroupEvidence(**values)
-
-
-def closure(*entries):
-    if not entries:
-        entries = (
-            ImportClosureEntry("codex_master/__init__.py", "c" * 64, identity(mode=0o100600, ino=11, nlink=1)),
-            ImportClosureEntry("codex_master/fleet_home_broker_identity.py", "d" * 64, identity(mode=0o100600, ino=12, nlink=1)),
-        )
-    return ImportClosureManifestV1("1.0.0", identity(), tuple(entries))
-
-
-def test_public_contract_types_are_frozen_and_slotted():
-    for klass in (ObjectIdentity, BrokerManifestV1, PeerCgroupEvidence, BrokerCapabilityModel, ImportClosureEntry, ImportClosureManifestV1):
-        assert dataclasses.is_dataclass(klass)
-        assert klass.__dataclass_params__.frozen
-        assert hasattr(klass, "__slots__")
-
-
-def test_manifest_and_peer_bind_only_the_exact_principal():
-    principal = principal_for_attested_peer(manifest(), peer())
-    assert principal.agent_id == "bee_1"
-    assert principal.manifest_generation == 3
-    assert principal.unit_generation == 9
-    assert principal.cgroup_dev == 7
-    assert principal.cgroup_ino == 9
-    assert principal.invocation_id == "1" * 32
-    assert principal.mcs_pair == "c0,c1"
-    assert principal.fencing_epoch == 4
-
-
-@pytest.mark.parametrize("altered_manifest,altered_peer", [(manifest(mcs_pair="c0,c2"), peer()), (manifest(), peer(mcs_pair="c0,c2"))])
-def test_manifest_and_peer_mcs_mismatch_is_rejected(altered_manifest, altered_peer):
-    with pytest.raises(BrokerIdentityError) as error:
-        principal_for_attested_peer(altered_manifest, altered_peer)
-    assert error.value.code in {BrokerIdentityCode.WRONG_PRINCIPAL, BrokerIdentityCode.STALE_PEER, BrokerIdentityCode.STALE_GENERATION, BrokerIdentityCode.FENCED}
-
-
-def test_manifest_and_peer_validators_require_exact_types_and_boundaries():
-    assert validate_broker_manifest(manifest(manifest_generation=1, policy_generation=1, fencing_epoch=0))
-    assert validate_broker_manifest(manifest(manifest_generation=MAX_CHPB_GENERATION, policy_generation=MAX_CHPB_GENERATION, fencing_epoch=MAX_CHPB_GENERATION))
-    assert validate_peer_cgroup_evidence(peer(pid=1, unit_generation=1))
-    assert validate_peer_cgroup_evidence(peer(pid=MAX_CHPB_GENERATION, unit_generation=MAX_CHPB_GENERATION))
-    for value in (object(), dataclasses.replace(manifest(), manifest_generation=True), dataclasses.replace(peer(), unit_generation=False)):
-        validator = validate_broker_manifest if isinstance(value, BrokerManifestV1) else validate_peer_cgroup_evidence
-        with pytest.raises(BrokerIdentityError) as error:
-            validator(value)
-        assert error.value.code in {BrokerIdentityCode.INVALID_TYPE, BrokerIdentityCode.INVALID_FIELD}
-
-
-@pytest.mark.parametrize(
-    "altered",
-    [
-        dataclasses.replace(manifest(), manifest_generation=0),
-        dataclasses.replace(manifest(), policy_generation=MAX_CHPB_GENERATION + 1),
-        dataclasses.replace(manifest(), projection_digest="A" * 64),
-        dataclasses.replace(manifest(), executable_fingerprint="z" * 64),
-        dataclasses.replace(manifest(), fencing_epoch=True),
-        dataclasses.replace(peer(), pid=0),
-        dataclasses.replace(peer(), cgroup=identity(mode=0o40722)),
-        dataclasses.replace(peer(), invocation_id="z" * 32),
-    ],
-)
-def test_manifest_and_peer_reject_invalid_fields(altered):
-    validator = validate_broker_manifest if isinstance(altered, BrokerManifestV1) else validate_peer_cgroup_evidence
-    with pytest.raises(BrokerIdentityError):
-        validator(altered)
-
-
-def test_capability_model_is_exactly_root_with_three_empty_sets():
-    root = BrokerCapabilityModel(0, (), (), ())
-    assert validate_empty_capability_model(root).euid == 0
-    for model in (
-        BrokerCapabilityModel(1, (), (), ()),
-        BrokerCapabilityModel(True, (), (), ()),
-        BrokerCapabilityModel(0, ("CAP_CHOWN",), (), ()),
-        BrokerCapabilityModel(0, (), ("CAP_CHOWN",), ()),
-        BrokerCapabilityModel(0, (), (), ("CAP_CHOWN",)),
-        BrokerCapabilityModel(0, [], (), ()),
-    ):
-        with pytest.raises(BrokerIdentityError) as error:
-            validate_empty_capability_model(model)
-        assert error.value.code in {BrokerIdentityCode.INVALID_TYPE, BrokerIdentityCode.INVALID_CAPABILITY_MODEL}
-
-
-def test_import_closure_requires_sorted_root_owned_regular_single_link_entries():
-    value = validate_import_closure_manifest(closure())
-    assert value.entries[0].relative_path < value.entries[1].relative_path
-@pytest.mark.parametrize(
-    "candidate",
-    [
-        closure(ImportClosureEntry("z.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)), ImportClosureEntry("a.py", "b" * 64, identity(mode=0o100600, ino=12, nlink=1))),
-        closure(ImportClosureEntry("a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=2))),
-        closure(ImportClosureEntry("a.py", "a" * 64, identity(mode=0o40700, ino=11, nlink=2))),
-        closure(ImportClosureEntry("../a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("./a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("a//b.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("/a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("a\\\\b.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("a\x00b.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("a.py", "A" * 64, identity(mode=0o100600, ino=11, nlink=1))),
-        closure(ImportClosureEntry("a.py", "a" * 64, identity(mode=0o100600, ino=11, nlink=1)), ImportClosureEntry("a.py", "b" * 64, identity(mode=0o100600, ino=12, nlink=1))),
-    ],
-)
-def test_import_closure_rejects_malformed_entries(candidate):
-    with pytest.raises(BrokerIdentityError) as error:
-        validate_import_closure_manifest(candidate)
-    assert error.value.code in {BrokerIdentityCode.INVALID_FIELD, BrokerIdentityCode.INVALID_IMPORT_CLOSURE}
-
-
-def test_import_closure_rejects_explicit_empty_relative_path():
-    manifest = ImportClosureManifestV1(
-        "1.0.0",
-        identity(),
-        (
-            ImportClosureEntry(
-                "",
-                "a" * 64,
-                identity(mode=0o100600, ino=11, nlink=1),
-            ),
-            ImportClosureEntry(
-                "codex_master/fleet_home_broker_identity.py",
-                "b" * 64,
-                identity(mode=0o100600, ino=12, nlink=1),
-            ),
-        ),
+def _identity() -> BrokerIdentity:
+    return BrokerIdentity(
+        agent_id="agent-17",
+        manifest_generation=4,
+        mcs_pair="c17,c42",
+        slot_snapshot="slot-snapshot-8f2",
+        policy_generation=9,
+        projection_digest=_digest("policy-v9"),
+        executable_fingerprint=_digest("broker-package-v4"),
+        fencing_epoch=2,
     )
 
-    with pytest.raises(BrokerIdentityError) as error:
-        validate_import_closure_manifest(manifest)
 
-    assert error.value.code is BrokerIdentityCode.INVALID_FIELD
+def test_public_contract_dataclasses_are_frozen_and_slotted() -> None:
+    entry = ImportClosureEntry("codex_master/a.py", _digest("a"))
+    values = (
+        (_identity(), "agent_id", "agent-18"),
+        (entry, "path", "codex_master/b.py"),
+        (ImportClosure((entry,)), "entries", ()),
+    )
+
+    for value, field, replacement in values:
+        klass = type(value)
+        assert dataclasses.is_dataclass(value)
+        assert klass.__dataclass_params__.frozen
+        assert hasattr(klass, "__slots__")
+        assert not hasattr(value, "__dict__")
+        with pytest.raises(FrozenInstanceError):
+            setattr(value, field, replacement)
 
 
-def test_import_closure_rejects_non_root_or_writable_identity():
-    for candidate in (
-        ImportClosureManifestV1("1.0.0", identity(uid=1), closure().entries),
-        ImportClosureManifestV1("1.0.0", identity(mode=0o40720), closure().entries),
-        closure(ImportClosureEntry("a.py", "a" * 64, identity(mode=0o100620, ino=11, nlink=1))),
-    ):
-        with pytest.raises(BrokerIdentityError):
-            validate_import_closure_manifest(candidate)
+def test_broker_identity_is_immutable_and_digest_bound() -> None:
+    identity = _identity()
+
+    with pytest.raises(FrozenInstanceError):
+        identity.agent_id = "agent-18"
+
+    assert identity.canonical_bytes() == _identity().canonical_bytes()
+    assert identity.digest() == _identity().digest()
+
+    changed = dataclasses.replace(identity, fencing_epoch=identity.fencing_epoch + 1)
+    assert changed.digest() != identity.digest()
 
 
-def test_identity_production_imports_are_stdlib_or_pb1_only():
-    source = Path("src/codex_master/fleet_home_broker_identity.py").read_text()
-    tree = ast.parse(source)
-    allowed = {"dataclasses", "enum", "re", "typing", "codex_master.fleet_home_broker_protocol"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            assert all(alias.name in allowed for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            assert node.module in allowed or (node.level == 1 and node.module == "fleet_home_broker_protocol")
-    assert all(token not in source.lower() for token in ("fleet_home_recovery", "server", "socket", "sqlite", "subprocess", "systemd", "selinux", "os.", "time."))
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("agent_id", ""),
+        ("mcs_pair", ""),
+        ("slot_snapshot", ""),
+        ("projection_digest", "not-a-sha256"),
+        ("executable_fingerprint", "not-a-sha256"),
+    ],
+)
+def test_broker_identity_rejects_unclear_static_identity(
+    field: str, value: str
+) -> None:
+    with pytest.raises(IdentityValidationError):
+        dataclasses.replace(_identity(), **{field: value})
+
+
+def test_broker_identity_accepts_exact_pb_s1_chpb2_boundaries() -> None:
+    assert dataclasses.replace(
+        _identity(),
+        agent_id="a",
+        manifest_generation=1,
+        mcs_pair="c0,c1",
+        policy_generation=1,
+        fencing_epoch=0,
+    )
+    assert dataclasses.replace(
+        _identity(),
+        agent_id="a" + "b" * 127,
+        manifest_generation=MAX_GENERATION,
+        mcs_pair=f"c0,c{MAX_MCS_CATEGORY}",
+        policy_generation=MAX_GENERATION,
+        fencing_epoch=MAX_GENERATION,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("manifest_generation", 0),
+        ("manifest_generation", MAX_GENERATION + 1),
+        ("manifest_generation", True),
+        ("policy_generation", 0),
+        ("policy_generation", MAX_GENERATION + 1),
+        ("policy_generation", False),
+        ("fencing_epoch", -1),
+        ("fencing_epoch", MAX_GENERATION + 1),
+        ("fencing_epoch", True),
+        ("agent_id", "Bee_1"),
+        ("agent_id", "1bee"),
+        ("agent_id", "bee.1"),
+        ("agent_id", "a" * 129),
+        ("mcs_pair", "c0,c0"),
+        ("mcs_pair", "c2,c1"),
+        ("mcs_pair", "c01,c2"),
+        ("mcs_pair", "c0,c1024"),
+        ("mcs_pair", "c-1,c2"),
+        ("mcs_pair", "c0,c2,x"),
+    ],
+)
+def test_broker_identity_rejects_pb_s1_chpb2_boundary_violations(
+    field: str, value: object
+) -> None:
+    with pytest.raises(IdentityValidationError):
+        dataclasses.replace(_identity(), **{field: value})
+
+
+def test_import_closure_direct_constructor_canonicalizes_like_from_entries() -> None:
+    entries = (
+        ImportClosureEntry("codex_master/b.py", _digest("b")),
+        ImportClosureEntry("codex_master/a.py", _digest("a")),
+    )
+
+    direct = ImportClosure(entries)
+    via_factory = ImportClosure.from_entries(entries)
+
+    assert direct.entries == (
+        ImportClosureEntry("codex_master/a.py", _digest("a")),
+        ImportClosureEntry("codex_master/b.py", _digest("b")),
+    )
+    assert direct == via_factory
+    assert direct.digest() == via_factory.digest()
+
+
+def test_import_closure_is_nonempty_canonical_and_digest_bound() -> None:
+    entries = [
+        ImportClosureEntry("codex_master/b.py", _digest("b")),
+        ImportClosureEntry("codex_master/a.py", _digest("a")),
+    ]
+
+    closure = ImportClosure.from_entries(entries)
+
+    assert closure.paths == ("codex_master/a.py", "codex_master/b.py")
+    assert closure.digest() == ImportClosure.from_entries(list(reversed(entries))).digest()
+
+    changed = ImportClosure.from_entries(
+        [ImportClosureEntry("codex_master/a.py", _digest("changed"))]
+    )
+    assert changed.digest() != closure.digest()
+
+
+@pytest.mark.parametrize(
+    "entry_data",
+    [
+        [],
+        [("", _digest("empty-path"))],
+        [("/absolute/module.py", _digest("absolute"))],
+        [("codex_master/../secret.py", _digest("traversal"))],
+        [
+            ("codex_master/module.py", _digest("one")),
+            ("codex_master/module.py", _digest("two")),
+        ],
+        [("codex_master/module.py", "")],
+    ],
+)
+def test_import_closure_blocks_empty_unsafe_duplicate_or_unclear_identity(
+    entry_data: list[tuple[str, str]],
+) -> None:
+    with pytest.raises(IdentityValidationError):
+        ImportClosure.from_entries(
+            [ImportClosureEntry(path, digest) for path, digest in entry_data]
+        )
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        (),
+        [],
+        (
+            ImportClosureEntry("codex_master/a.py", _digest("a")),
+            ImportClosureEntry("codex_master/a.py", _digest("other-a")),
+        ),
+        (object(),),
+        (ImportClosureEntry("codex_master/a.py", _digest("a")), object()),
+        None,
+    ],
+)
+def test_import_closure_direct_constructor_blocks_invalid_entries(
+    entries: object,
+) -> None:
+    with pytest.raises(IdentityValidationError):
+        ImportClosure(entries)  # type: ignore[arg-type]

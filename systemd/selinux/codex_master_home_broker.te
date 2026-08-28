@@ -1,0 +1,54 @@
+policy_module(codex_master_home_broker, 1.0)
+
+require {
+    type init_t;
+    class process transition;
+    class file { append create entrypoint execute getattr map open read setattr unlink write };
+    class dir { add_name getattr open read remove_name search setattr write };
+    class sock_file { create getattr open read setattr unlink write };
+}
+
+type codex_master_home_broker_t;
+typeattribute codex_master_home_broker_t domain;
+type codex_master_home_broker_exec_t;
+typeattribute codex_master_home_broker_exec_t exec_type;
+typeattribute codex_master_home_broker_exec_t file_type;
+type codex_master_home_broker_package_t;
+typeattribute codex_master_home_broker_package_t file_type;
+type codex_master_home_broker_config_t;
+typeattribute codex_master_home_broker_config_t file_type;
+type codex_master_home_broker_state_t;
+typeattribute codex_master_home_broker_state_t file_type;
+
+type codex_master_agent_t;
+typeattribute codex_master_agent_t domain;
+type codex_master_agent_exec_t;
+typeattribute codex_master_agent_exec_t exec_type;
+typeattribute codex_master_agent_exec_t file_type;
+type codex_master_agent_home_t;
+typeattribute codex_master_agent_home_t file_type;
+type codex_master_agent_endpoint_t;
+typeattribute codex_master_agent_endpoint_t file_type;
+
+type_transition init_t codex_master_home_broker_exec_t:process codex_master_home_broker_t;
+allow init_t codex_master_home_broker_exec_t:file { execute getattr map open read };
+allow init_t codex_master_home_broker_t:process transition;
+
+type_transition init_t codex_master_agent_exec_t:process codex_master_agent_t;
+allow init_t codex_master_agent_exec_t:file { execute getattr map open read };
+allow init_t codex_master_agent_t:process transition;
+
+allow codex_master_home_broker_t codex_master_home_broker_exec_t:file entrypoint;
+allow codex_master_agent_t codex_master_agent_exec_t:file entrypoint;
+
+allow codex_master_home_broker_t codex_master_home_broker_package_t:dir { getattr open read search };
+allow codex_master_home_broker_t codex_master_home_broker_package_t:file { getattr map open read };
+allow codex_master_home_broker_t codex_master_home_broker_config_t:dir { getattr open read search };
+allow codex_master_home_broker_t codex_master_home_broker_config_t:file { getattr open read };
+allow codex_master_home_broker_t codex_master_home_broker_state_t:dir { add_name getattr open read remove_name search setattr write };
+allow codex_master_home_broker_t codex_master_home_broker_state_t:file { append create getattr open read setattr unlink write };
+
+allow codex_master_agent_t codex_master_agent_home_t:dir { add_name getattr open read remove_name search setattr write };
+allow codex_master_agent_t codex_master_agent_home_t:file { append create getattr open read setattr unlink write };
+allow codex_master_agent_t codex_master_agent_endpoint_t:dir { add_name getattr open read remove_name search setattr write };
+allow codex_master_agent_t codex_master_agent_endpoint_t:sock_file { create getattr open read setattr unlink write };

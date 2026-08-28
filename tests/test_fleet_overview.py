@@ -100,6 +100,7 @@ def v2_snapshot() -> FleetSnapshotV2:
                 ),
             ),
         ),
+        (),
     )
 
 

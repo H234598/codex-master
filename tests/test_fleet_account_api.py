@@ -86,6 +86,7 @@ def v2_gemini_snapshot(*, generation: int = 2, enabled: bool = False) -> FleetSn
                 members,
             ),
         ),
+        (),
     )
 
 

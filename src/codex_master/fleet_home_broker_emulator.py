@@ -169,6 +169,7 @@ def persist_emulator_checkpoint(state: BrokerEmulatorState, transaction_id: str,
         _fail(ChpbValidationCode.INVALID_TRANSITION)
     terminal = {
         BrokerCheckpoint.COMMITTED: BrokerResultCode.COMMITTED,
+        BrokerCheckpoint.DEPROVISIONED: BrokerResultCode.COMMITTED,
         BrokerCheckpoint.ROLLED_BACK: BrokerResultCode.ROLLED_BACK,
         BrokerCheckpoint.BLOCKED_DRIFT: BrokerResultCode.BLOCKED_DRIFT,
     }.get(decision.next_checkpoint)
@@ -258,7 +259,11 @@ def handle_emulator_message(state: BrokerEmulatorState, peer: PrincipalBinding, 
     status = transaction.status
     if status.terminal_result is None:
         reply = _reply(request_id, BrokerResultCode.PENDING, status)
-    elif isinstance(message, AttestHomeRequest) and status.terminal_result is BrokerResultCode.COMMITTED:
+    elif (
+        isinstance(message, AttestHomeRequest)
+        and status.terminal_result is BrokerResultCode.COMMITTED
+        and status.checkpoint is BrokerCheckpoint.COMMITTED
+    ):
         reply = _reply(request_id, BrokerResultCode.OK, status, transaction.attestation)
     else:
         reply = _reply(request_id, status.terminal_result, status)

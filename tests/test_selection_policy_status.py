@@ -81,7 +81,7 @@ def test_configured_policy_caps_preview_features_and_mode(tmp_path: Path, monkey
         server, "_readonly_fleet_service", return_value=fleet_service
     ), patch.object(server, "agent_auth_status", return_value={"authenticated": True}), patch.object(
         server, "agent_lease_status", return_value={"state": "unclaimed"}
-    ), patch.object(server, "read_codex_usage_snapshot", return_value={}):
+    ):
         result = server.fleet_selection_preview(
             series="a", task_kind="simple", admission_mode="enforced", sp3=True
         )
@@ -107,7 +107,7 @@ def test_configured_policy_kill_switch_caps_preview_to_off(tmp_path: Path, monke
         server, "_readonly_fleet_service", return_value=fleet_service
     ), patch.object(server, "agent_auth_status", return_value={"authenticated": True}), patch.object(
         server, "agent_lease_status", return_value={"state": "unclaimed"}
-    ), patch.object(server, "read_codex_usage_snapshot", return_value={}):
+    ):
         result = server.fleet_selection_preview(
             series="a", task_kind="simple", admission_mode="enforced", sp3=True
         )

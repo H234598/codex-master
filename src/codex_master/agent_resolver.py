@@ -13,6 +13,9 @@ REASONING_RANK = {"low": 10, "medium": 20, "high": 30, "xhigh": 40, "max": 50}
 LIFECYCLE_ALIASES = {"invocation": "ephemeral"}
 LEADERSHIP_CLASS_IDS = frozenset({"goettin", "gottbiene", "koenigin", "teamleiterin"})
 LIFECYCLE_RANK = {"ephemeral": 10, "binding": 20, "persistent": 30}
+_MAX_RESOLUTION_TEXT_LENGTH = 256
+_MAX_REASON_CODES = 64
+_MAX_SELECTION_OPTIONS = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +124,163 @@ class SelectionOffer:
     models: tuple[str, ...]
     reasoning_levels: tuple[str, ...]
     options: tuple[SelectionOption, ...]
+
+
+def canonical_worker_lifecycle(lifecycle: object) -> str:
+    """Return the central canonical lifecycle name used by worker boundaries."""
+
+    if type(lifecycle) is not str:
+        raise ValueError("invalid_worker_lifecycle")
+    canonical = LIFECYCLE_ALIASES.get(lifecycle, lifecycle)
+    if canonical not in LIFECYCLE_RANK:
+        raise ValueError("invalid_worker_lifecycle")
+    return canonical
+
+
+def canonical_resolution_decision_digest(decision: object) -> str:
+    """Return one stable digest for every field of a central resolution decision."""
+
+    if type(decision) is not ResolutionDecision:
+        raise ValueError("invalid_resolution_decision")
+    required_text = {
+        "class_id": decision.class_id,
+        "lifecycle": decision.lifecycle,
+        "model": decision.model,
+        "reasoning": decision.reasoning,
+    }
+    if any(
+        type(value) is not str or not value or len(value) > _MAX_RESOLUTION_TEXT_LENGTH
+        for value in required_text.values()
+    ):
+        raise ValueError("invalid_resolution_decision")
+    if canonical_worker_lifecycle(decision.lifecycle) != decision.lifecycle:
+        raise ValueError("invalid_resolution_decision")
+    if decision.reasoning not in REASONING_RANK:
+        raise ValueError("invalid_resolution_decision")
+    if (
+        type(decision.reason_codes) is not tuple
+        or len(decision.reason_codes) > _MAX_REASON_CODES
+        or any(
+            type(code) is not str
+            or not code
+            or len(code) > _MAX_RESOLUTION_TEXT_LENGTH
+            for code in decision.reason_codes
+        )
+        or len(set(decision.reason_codes)) != len(decision.reason_codes)
+        or type(decision.fallback) is not bool
+    ):
+        raise ValueError("invalid_resolution_decision")
+    requested_values = (
+        decision.requested_class,
+        decision.requested_lifecycle,
+        decision.requested_model,
+        decision.requested_reasoning,
+    )
+    if any(
+        value is not None
+        and (
+            type(value) is not str
+            or not value
+            or len(value) > _MAX_RESOLUTION_TEXT_LENGTH
+        )
+        for value in requested_values
+    ):
+        raise ValueError("invalid_resolution_decision")
+    encoded = json.dumps(
+        {
+            "class_id": decision.class_id,
+            "lifecycle": decision.lifecycle,
+            "model": decision.model,
+            "reasoning": decision.reasoning,
+            "reason_codes": list(decision.reason_codes),
+            "fallback": decision.fallback,
+            "requested_class": decision.requested_class,
+            "requested_lifecycle": decision.requested_lifecycle,
+            "requested_model": decision.requested_model,
+            "requested_reasoning": decision.requested_reasoning,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def validate_resolution_decision_offer(decision: object, offer: object) -> None:
+    """Require one central decision to be present in one canonical central offer."""
+
+    canonical_resolution_decision_digest(decision)
+    if type(offer) is not SelectionOffer:
+        raise ValueError("invalid_selection_offer")
+    if (
+        type(offer.generation) is not str
+        or len(offer.generation) != 71
+        or not offer.generation.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in offer.generation[7:])
+    ):
+        raise ValueError("invalid_selection_offer")
+    public_values = (
+        offer.classes,
+        offer.lifecycles,
+        offer.models,
+        offer.reasoning_levels,
+    )
+    if any(
+        type(values) is not tuple
+        or len(values) > _MAX_SELECTION_OPTIONS
+        or any(
+            type(value) is not str
+            or not value
+            or len(value) > _MAX_RESOLUTION_TEXT_LENGTH
+            for value in values
+        )
+        or len(set(values)) != len(values)
+        for values in public_values
+    ):
+        raise ValueError("invalid_selection_offer")
+    if type(offer.options) is not tuple or len(offer.options) > _MAX_SELECTION_OPTIONS:
+        raise ValueError("invalid_selection_offer")
+    option_values: list[tuple[str, str, str, str]] = []
+    for option in offer.options:
+        if type(option) is not SelectionOption:
+            raise ValueError("invalid_selection_offer")
+        values = (option.class_id, option.lifecycle, option.model, option.reasoning)
+        if any(
+            type(value) is not str
+            or not value
+            or len(value) > _MAX_RESOLUTION_TEXT_LENGTH
+            for value in values
+        ):
+            raise ValueError("invalid_selection_offer")
+        if canonical_worker_lifecycle(option.lifecycle) != option.lifecycle:
+            raise ValueError("invalid_selection_offer")
+        if option.reasoning not in REASONING_RANK:
+            raise ValueError("invalid_selection_offer")
+        option_values.append(values)
+    if len(set(option_values)) != len(option_values):
+        raise ValueError("invalid_selection_offer")
+    if offer.lifecycles and any(
+        canonical_worker_lifecycle(lifecycle) != lifecycle for lifecycle in offer.lifecycles
+    ):
+        raise ValueError("invalid_selection_offer")
+    expected_public_values = (
+        tuple(dict.fromkeys(value[0] for value in option_values)),
+        tuple(dict.fromkeys(value[1] for value in option_values)),
+        tuple(dict.fromkeys(value[2] for value in option_values)),
+        tuple(dict.fromkeys(value[3] for value in option_values)),
+    )
+    if public_values != expected_public_values:
+        raise ValueError("invalid_selection_offer")
+    encoded = json.dumps(option_values, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    if offer.generation != "sha256:" + hashlib.sha256(encoded).hexdigest():
+        raise ValueError("invalid_selection_offer")
+    if (
+        decision.class_id,
+        decision.lifecycle,
+        decision.model,
+        decision.reasoning,
+    ) not in option_values:
+        raise ValueError("resolution_decision_not_offered")
 
 
 def _select_class(request: ResolutionRequest, classes: tuple[AgentClassPolicy, ...], reasons: list[str]) -> AgentClassPolicy:

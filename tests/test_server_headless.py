@@ -1408,7 +1408,10 @@ def test_headless_retry_policy_caps_existing_gemini_home_settings(tmp_path: Path
     assert settings["privacy"]["usageStatisticsEnabled"] is False
 
 
-def test_headless_retry_policy_refreshes_managed_home_marker(tmp_path: Path) -> None:
+def test_headless_retry_policy_refreshes_managed_home_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     settings_path = tmp_path / ".gemini" / "settings.json"
     settings_path.parent.mkdir()
     settings_path.write_text(
@@ -1416,11 +1419,17 @@ def test_headless_retry_policy_refreshes_managed_home_marker(tmp_path: Path) -> 
         encoding="utf-8",
     )
     marker_path = tmp_path / server.FLEET_AGENT_MARKER_FILE
-    marker_path.write_text(
-        json.dumps({"files": {".gemini/settings.json": "0" * 64}}) + "\n",
-        encoding="utf-8",
-    )
+    marker_path.write_text("{}\n", encoding="utf-8")
     marker_path.chmod(0o600)
+    marker = {
+        "runner": server.RunnerKind.GEMINI_CLI.value,
+        "files": {".gemini/settings.json": "0" * 64},
+    }
+    monkeypatch.setattr(
+        server,
+        "_fleet_read_current_agent_marker",
+        lambda *_args, **_kwargs: (b"", marker, None),
+    )
 
     server._ensure_gemini_headless_retry_policy(tmp_path)
 

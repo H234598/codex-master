@@ -1,254 +1,198 @@
-"""Immutable identity and root-TCB contract values."""
+"""Declarative PB-S2 broker identity and import-closure binding."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from hashlib import sha256
+from pathlib import PurePosixPath, PureWindowsPath
 import re
-
-from .fleet_home_broker_protocol import (
-    MAX_CHPB_DEVICE,
-    MAX_CHPB_GENERATION,
-    MAX_CHPB_INODE,
-    PrincipalBinding,
-    validate_principal_binding,
-)
+from typing import Iterable
 
 
-class BrokerIdentityCode(str, Enum):
-    INVALID_TYPE = "invalid_type"
-    INVALID_FIELD = "invalid_field"
-    WRONG_PRINCIPAL = "wrong_principal"
-    STALE_PEER = "stale_peer"
-    STALE_GENERATION = "stale_generation"
-    FENCED = "fenced"
-    INVALID_CAPABILITY_MODEL = "invalid_capability_model"
-    INVALID_IMPORT_CLOSURE = "invalid_import_closure"
+class IdentityValidationError(ValueError):
+    """Raised when a declarative identity or import closure is invalid."""
 
 
-class BrokerIdentityError(ValueError):
-    __slots__ = ("code",)
-    code: BrokerIdentityCode
+MAX_CHPB_AGENT_ID_BYTES = 128
+MAX_CHPB_GENERATION = 2**63 - 1
+MAX_CHPB_MCS_CATEGORY = 1023
 
-    def __init__(self, code: BrokerIdentityCode):
-        self.code = code
-        super().__init__(code.value)
+_AGENT = re.compile(r"[a-z][a-z0-9_-]{0,127}\Z", re.ASCII)
+_MCS = re.compile(r"c(0|[1-9][0-9]{0,3}),c(0|[1-9][0-9]{0,3})\Z", re.ASCII)
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+
+
+def _nonempty_text(value: object, field: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise IdentityValidationError(f"{field} must be non-empty text")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise IdentityValidationError(f"{field} must be UTF-8 text") from exc
+    return value
+
+
+def _bounded_integer(value: object, field: str, low: int) -> int:
+    if type(value) is not int or not low <= value <= MAX_CHPB_GENERATION:
+        raise IdentityValidationError(
+            f"{field} must be an integer in [{low}, {MAX_CHPB_GENERATION}]"
+        )
+    return value
+
+
+def _sha256_digest(value: object, field: str) -> str:
+    if type(value) is not str or _SHA256.fullmatch(value) is None:
+        raise IdentityValidationError(f"{field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _agent_id(value: object) -> str:
+    if type(value) is not str or len(value.encode("utf-8")) > MAX_CHPB_AGENT_ID_BYTES:
+        raise IdentityValidationError("agent_id is outside CHPB/2 bounds")
+    if _AGENT.fullmatch(value) is None:
+        raise IdentityValidationError("agent_id has invalid CHPB/2 grammar")
+    return value
+
+
+def _mcs_pair(value: object) -> str:
+    if type(value) is not str or _MCS.fullmatch(value) is None:
+        raise IdentityValidationError("mcs_pair has invalid CHPB/2 grammar")
+    low, high = (int(part[1:]) for part in value.split(","))
+    if not 0 <= low < high <= MAX_CHPB_MCS_CATEGORY:
+        raise IdentityValidationError("mcs_pair categories are outside CHPB/2 bounds")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
-class ObjectIdentity:
-    dev: int
-    ino: int
-    mode: int
-    uid: int
-    gid: int
-    nlink: int
+class BrokerIdentity:
+    """Immutable, statically declared identity of one home broker."""
 
-
-@dataclass(frozen=True, slots=True)
-class BrokerManifestV1:
     agent_id: str
     manifest_generation: int
+    mcs_pair: str
+    slot_snapshot: str
     policy_generation: int
     projection_digest: str
     executable_fingerprint: str
-    mcs_pair: str
-    slot: ObjectIdentity
     fencing_epoch: int
 
+    def __post_init__(self) -> None:
+        _agent_id(self.agent_id)
+        _bounded_integer(self.manifest_generation, "manifest_generation", 1)
+        _mcs_pair(self.mcs_pair)
+        _nonempty_text(self.slot_snapshot, "slot_snapshot")
+        _bounded_integer(self.policy_generation, "policy_generation", 1)
+        _sha256_digest(self.projection_digest, "projection_digest")
+        _sha256_digest(self.executable_fingerprint, "executable_fingerprint")
+        _bounded_integer(self.fencing_epoch, "fencing_epoch", 0)
 
-@dataclass(frozen=True, slots=True)
-class PeerCgroupEvidence:
-    pid: int
-    cgroup: ObjectIdentity
-    invocation_id: str
-    unit_name: str
-    unit_generation: int
-    mcs_pair: str
+    def canonical_bytes(self) -> bytes:
+        fields = (
+            ("agent_id", self.agent_id),
+            ("manifest_generation", str(self.manifest_generation)),
+            ("mcs_pair", self.mcs_pair),
+            ("slot_snapshot", self.slot_snapshot),
+            ("policy_generation", str(self.policy_generation)),
+            ("projection_digest", self.projection_digest),
+            ("executable_fingerprint", self.executable_fingerprint),
+            ("fencing_epoch", str(self.fencing_epoch)),
+        )
+        return b"broker-identity-v1\n" + b"".join(
+            key.encode("ascii")
+            + b"\0"
+            + value.encode("utf-8")
+            + b"\n"
+            for key, value in fields
+        )
+
+    def digest(self) -> str:
+        return sha256(self.canonical_bytes()).hexdigest()
 
 
-@dataclass(frozen=True, slots=True)
-class BrokerCapabilityModel:
-    euid: int
-    bounding: tuple[str, ...]
-    ambient: tuple[str, ...]
-    inheritable: tuple[str, ...]
+def _canonical_relative_path(value: object) -> str:
+    path = _nonempty_text(value, "import path")
+    if path != path.strip() or "\x00" in path or "\\" in path:
+        raise IdentityValidationError("import path is not canonical")
+    if PurePosixPath(path).is_absolute() or PureWindowsPath(path).is_absolute():
+        raise IdentityValidationError("import path must be relative")
+    if PureWindowsPath(path).drive:
+        raise IdentityValidationError("import path must not contain a drive")
+    parts = path.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise IdentityValidationError("import path contains traversal or empty segment")
+    return path
 
 
 @dataclass(frozen=True, slots=True)
 class ImportClosureEntry:
-    relative_path: str
-    sha256: str
-    identity: ObjectIdentity
+    """One canonical relative import path and its content digest."""
+
+    path: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        _canonical_relative_path(self.path)
+        _sha256_digest(self.digest, "import digest")
+
+
+def _validated_entries(entries: object) -> tuple[ImportClosureEntry, ...]:
+    try:
+        materialized = tuple(entries)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise IdentityValidationError("import closure identity is unclear") from exc
+    if not materialized:
+        raise IdentityValidationError("import closure must be non-empty")
+    if any(type(entry) is not ImportClosureEntry for entry in materialized):
+        raise IdentityValidationError("import closure entry identity is unclear")
+
+    paths = [entry.path for entry in materialized]
+    if len(paths) != len(set(paths)):
+        raise IdentityValidationError("import closure contains duplicate paths")
+    return tuple(sorted(materialized, key=lambda entry: entry.path))
 
 
 @dataclass(frozen=True, slots=True)
-class ImportClosureManifestV1:
-    package_version: str
-    package_root: ObjectIdentity
+class ImportClosure:
+    """Sorted, non-empty import closure with a deterministic SHA-256 binding."""
+
     entries: tuple[ImportClosureEntry, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "entries", _validated_entries(self.entries))
 
-_AGENT = re.compile(r"[a-z][a-z0-9_-]{0,127}\Z", re.ASCII)
-_HEX32 = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
-_HEX64 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
-_MCS = re.compile(r"c(0|[1-9][0-9]{0,3}),c(0|[1-9][0-9]{0,3})\Z", re.ASCII)
-_UNIT = re.compile(r"[A-Za-z0-9_.@:-]{1,255}\Z", re.ASCII)
-_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\Z", re.ASCII)
-_RELATIVE_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z", re.ASCII)
-_DIRECTORY_TYPE = 0o040000
-_REGULAR_TYPE = 0o100000
-_TYPE_MASK = 0o170000
-_NO_GROUP_OTHER_WRITE = 0o0022
+    @classmethod
+    def from_entries(cls, entries: Iterable[ImportClosureEntry]) -> "ImportClosure":
+        return cls(entries)
 
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(entry.path for entry in self.entries)
 
-def _fail(code: BrokerIdentityCode):
-    raise BrokerIdentityError(code)
+    def canonical_bytes(self) -> bytes:
+        return b"import-closure-v1\n" + b"".join(
+            entry.path.encode("utf-8")
+            + b"\0"
+            + entry.digest.encode("ascii")
+            + b"\n"
+            for entry in self.entries
+        )
 
-
-def _integer(value: object, low: int, high: int) -> int:
-    if type(value) is not int:
-        _fail(BrokerIdentityCode.INVALID_TYPE)
-    if not low <= value <= high:
-        _fail(BrokerIdentityCode.INVALID_FIELD)
-    return value
+    def digest(self) -> str:
+        return sha256(self.canonical_bytes()).hexdigest()
 
 
-def _text(value: object, pattern: re.Pattern[str], limit: int = 4096) -> str:
-    if type(value) is not str:
-        _fail(BrokerIdentityCode.INVALID_TYPE)
-    if len(value.encode("utf-8")) > limit or pattern.fullmatch(value) is None:
-        _fail(BrokerIdentityCode.INVALID_FIELD)
-    return value
+def canonical_import_closure(
+    entries: Iterable[ImportClosureEntry],
+) -> ImportClosure:
+    """Validate and bind a declarative import closure."""
+
+    return ImportClosure.from_entries(entries)
 
 
-def _digest(value: object) -> str:
-    return _text(value, _HEX64, 64)
-
-
-def _invocation(value: object) -> str:
-    return _text(value, _HEX32, 32)
-
-
-def _mcs(value: object) -> str:
-    text = _text(value, _MCS, 16)
-    left, right = (int(part[1:]) for part in text.split(","))
-    if not 0 <= left < right <= 1023:
-        _fail(BrokerIdentityCode.INVALID_FIELD)
-    return text
-
-
-def _object_identity(value: object) -> ObjectIdentity:
-    if type(value) is not ObjectIdentity:
-        _fail(BrokerIdentityCode.INVALID_TYPE)
-    _integer(value.dev, 0, MAX_CHPB_DEVICE)
-    _integer(value.ino, 1, MAX_CHPB_INODE)
-    _integer(value.mode, 0, 0o177777)
-    _integer(value.uid, 0, MAX_CHPB_GENERATION)
-    _integer(value.gid, 0, MAX_CHPB_GENERATION)
-    _integer(value.nlink, 1, MAX_CHPB_INODE)
-    return value
-
-
-def _root_owned(value: ObjectIdentity) -> ObjectIdentity:
-    if value.uid != 0 or value.gid != 0 or value.mode & _NO_GROUP_OTHER_WRITE:
-        _fail(BrokerIdentityCode.INVALID_FIELD)
-    return value
-
-
-def _directory_identity(value: ObjectIdentity) -> ObjectIdentity:
-    _object_identity(value)
-    if value.mode & _TYPE_MASK != _DIRECTORY_TYPE or value.nlink < 2:
-        _fail(BrokerIdentityCode.INVALID_FIELD)
-    return _root_owned(value)
-
-
-def _regular_identity(value: ObjectIdentity) -> ObjectIdentity:
-    _object_identity(value)
-    if value.mode & _TYPE_MASK != _REGULAR_TYPE or value.nlink != 1:
-        _fail(BrokerIdentityCode.INVALID_FIELD)
-    return _root_owned(value)
-
-
-def validate_broker_manifest(value: object) -> BrokerManifestV1:
-    if type(value) is not BrokerManifestV1:
-        _fail(BrokerIdentityCode.INVALID_TYPE)
-    _text(value.agent_id, _AGENT, 128)
-    _integer(value.manifest_generation, 1, MAX_CHPB_GENERATION)
-    _integer(value.policy_generation, 1, MAX_CHPB_GENERATION)
-    _digest(value.projection_digest)
-    _digest(value.executable_fingerprint)
-    _mcs(value.mcs_pair)
-    _directory_identity(value.slot)
-    _integer(value.fencing_epoch, 0, MAX_CHPB_GENERATION)
-    return value
-
-
-def validate_peer_cgroup_evidence(value: object) -> PeerCgroupEvidence:
-    if type(value) is not PeerCgroupEvidence:
-        _fail(BrokerIdentityCode.INVALID_TYPE)
-    _integer(value.pid, 1, MAX_CHPB_GENERATION)
-    _directory_identity(value.cgroup)
-    _invocation(value.invocation_id)
-    _text(value.unit_name, _UNIT, 255)
-    _integer(value.unit_generation, 1, MAX_CHPB_GENERATION)
-    _mcs(value.mcs_pair)
-    return value
-
-
-def principal_for_attested_peer(manifest: BrokerManifestV1, peer: PeerCgroupEvidence) -> PrincipalBinding:
-    validate_broker_manifest(manifest)
-    validate_peer_cgroup_evidence(peer)
-    if manifest.mcs_pair != peer.mcs_pair:
-        _fail(BrokerIdentityCode.WRONG_PRINCIPAL)
-    principal = PrincipalBinding(
-        manifest.agent_id,
-        manifest.manifest_generation,
-        peer.unit_generation,
-        peer.cgroup.dev,
-        peer.cgroup.ino,
-        peer.invocation_id,
-        peer.mcs_pair,
-        manifest.fencing_epoch,
-    )
-    try:
-        return validate_principal_binding(principal)
-    except ValueError:
-        _fail(BrokerIdentityCode.INVALID_FIELD)
-
-
-def validate_empty_capability_model(value: object) -> BrokerCapabilityModel:
-    if type(value) is not BrokerCapabilityModel:
-        _fail(BrokerIdentityCode.INVALID_TYPE)
-    if type(value.euid) is not int or value.euid != 0:
-        _fail(BrokerIdentityCode.INVALID_CAPABILITY_MODEL)
-    if type(value.bounding) is not tuple or type(value.ambient) is not tuple or type(value.inheritable) is not tuple:
-        _fail(BrokerIdentityCode.INVALID_TYPE)
-    if value.bounding or value.ambient or value.inheritable:
-        _fail(BrokerIdentityCode.INVALID_CAPABILITY_MODEL)
-    return value
-
-
-def _relative_path(value: object) -> str:
-    path = _text(value, _RELATIVE_PATH, 4096)
-    if any(segment in {".", ".."} for segment in path.split("/")):
-        _fail(BrokerIdentityCode.INVALID_IMPORT_CLOSURE)
-    return path
-
-
-def validate_import_closure_manifest(value: object) -> ImportClosureManifestV1:
-    if type(value) is not ImportClosureManifestV1:
-        _fail(BrokerIdentityCode.INVALID_TYPE)
-    _text(value.package_version, _VERSION, 64)
-    _directory_identity(value.package_root)
-    if type(value.entries) is not tuple or not value.entries:
-        _fail(BrokerIdentityCode.INVALID_IMPORT_CLOSURE)
-    previous = ""
-    for entry in value.entries:
-        if type(entry) is not ImportClosureEntry:
-            _fail(BrokerIdentityCode.INVALID_TYPE)
-        path = _relative_path(entry.relative_path)
-        if path <= previous:
-            _fail(BrokerIdentityCode.INVALID_IMPORT_CLOSURE)
-        previous = path
-        _digest(entry.sha256)
-        _regular_identity(entry.identity)
-    return value
+__all__ = [
+    "BrokerIdentity",
+    "IdentityValidationError",
+    "ImportClosure",
+    "ImportClosureEntry",
+    "canonical_import_closure",
+]

@@ -11,6 +11,7 @@ from codex_master.fleet_home_broker_protocol import (
     MAX_CHPB_MESSAGE_BYTES,
     MAX_CHPB_OBJECT_FIELDS,
     AttestHomeRequest,
+    DeprovisionHomeRequest,
     B2aRecoveryPhase,
     BindingExpectation,
     BrokerCheckpoint,
@@ -25,13 +26,16 @@ from codex_master.fleet_home_broker_protocol import (
     ChpbValidationError,
     DirectoryIdentity,
     GetTerminalResultRequest,
+    ChpbTransactionOperation,
     HomeAttestation,
     PolicyBinding,
     PrincipalBinding,
     QueryTransactionRequest,
+    ReplaceHomeRequest,
     RecoveryDecision,
     TransactionBinding,
     TransactionStatus,
+    ProvisionHomeRequest,
     b2a_phase_for_checkpoint,
     checkpoint_for_b2a_phase,
     decide_broker_recovery,
@@ -75,8 +79,9 @@ def policy(**changes):
     return PolicyBinding(**values)
 
 
-def binding(**changes):
+def binding(operation=ChpbTransactionOperation.PROVISION, **changes):
     values = {
+        "operation": operation,
         "transaction_id": T,
         "store_uuid": U,
         "principal": principal(),
@@ -103,12 +108,23 @@ def observation(state=BrokerObjectState.ABSENT, registry=BrokerRegistryState.NOT
     return BrokerObservation(state, registry, index)
 
 
-def status(checkpoint=BrokerCheckpoint.CREATE_INTENT, obs=None, total=1):
+def status(checkpoint=BrokerCheckpoint.CREATE_INTENT, obs=None, total=1, operation=ChpbTransactionOperation.PROVISION):
     if obs is None:
         obs = observation()
-    return TransactionStatus(
-        binding(), b2a_phase_for_checkpoint(checkpoint), checkpoint, obs, total, None
-    )
+    return TransactionStatus(binding(operation), b2a_phase_for_checkpoint(checkpoint), checkpoint, obs, total, None)
+
+
+def operation_for_checkpoint(checkpoint: BrokerCheckpoint) -> ChpbTransactionOperation:
+    if checkpoint in {
+        BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT,
+        BrokerCheckpoint.REPLACEMENT_PREPARED,
+        BrokerCheckpoint.SWITCH_INTENT,
+        BrokerCheckpoint.SWITCHED,
+    }:
+        return ChpbTransactionOperation.REPLACE
+    if checkpoint in {BrokerCheckpoint.DEPROVISION_INTENT, BrokerCheckpoint.DEPROVISIONED}:
+        return ChpbTransactionOperation.DEPROVISION
+    return ChpbTransactionOperation.PROVISION
 
 
 def attestation(bind=None):
@@ -121,7 +137,16 @@ def request(kind=ChpbMessageKind.ATTEST_HOME, request_id=REQUEST_ID, transaction
         ChpbMessageKind.ATTEST_HOME: AttestHomeRequest,
         ChpbMessageKind.QUERY_TRANSACTION: QueryTransactionRequest,
         ChpbMessageKind.GET_TERMINAL_RESULT: GetTerminalResultRequest,
+        ChpbMessageKind.PROVISION_HOME: ProvisionHomeRequest,
+        ChpbMessageKind.REPLACE_HOME: ReplaceHomeRequest,
+        ChpbMessageKind.DEPROVISION_HOME: DeprovisionHomeRequest,
     }[kind]
+    if kind is ChpbMessageKind.PROVISION_HOME:
+        return klass(CHPB_PROTOCOL, kind, request_id, transaction_id, expected(), binding(ChpbTransactionOperation.PROVISION))
+    if kind is ChpbMessageKind.REPLACE_HOME:
+        return klass(CHPB_PROTOCOL, kind, request_id, transaction_id, expected(), binding(ChpbTransactionOperation.REPLACE))
+    if kind is ChpbMessageKind.DEPROVISION_HOME:
+        return klass(CHPB_PROTOCOL, kind, request_id, transaction_id, expected(), binding(ChpbTransactionOperation.DEPROVISION))
     return klass(CHPB_PROTOCOL, kind, request_id, transaction_id, expected())
 
 
@@ -138,6 +163,9 @@ def test_public_contract_types_are_frozen_and_slotted():
         AttestHomeRequest,
         QueryTransactionRequest,
         GetTerminalResultRequest,
+        ProvisionHomeRequest,
+        ReplaceHomeRequest,
+        DeprovisionHomeRequest,
         BrokerReply,
         RecoveryDecision,
     ):
@@ -183,10 +211,11 @@ def test_validate_transaction_binding_binds_store_principal_policy_and_epoch():
 def test_validate_transaction_status_requires_exact_phase_checkpoint_terminal_combination(checkpoint):
     terminal = {
         BrokerCheckpoint.COMMITTED: BrokerResultCode.COMMITTED,
+        BrokerCheckpoint.DEPROVISIONED: BrokerResultCode.COMMITTED,
         BrokerCheckpoint.ROLLED_BACK: BrokerResultCode.ROLLED_BACK,
         BrokerCheckpoint.BLOCKED_DRIFT: BrokerResultCode.BLOCKED_DRIFT,
     }.get(checkpoint)
-    value = TransactionStatus(binding(), b2a_phase_for_checkpoint(checkpoint), checkpoint, observation(), 1, terminal)
+    value = TransactionStatus(binding(operation_for_checkpoint(checkpoint)), b2a_phase_for_checkpoint(checkpoint), checkpoint, observation(), 1, terminal)
     assert validate_transaction_status(value) == value
     if terminal is None:
         with pytest.raises(ChpbValidationError):
@@ -218,7 +247,14 @@ def test_encode_each_message_variant_matches_golden_chpb2_bytes():
 
 
 def test_decode_each_golden_message_roundtrips_byte_exactly():
-    for kind in (ChpbMessageKind.ATTEST_HOME, ChpbMessageKind.QUERY_TRANSACTION, ChpbMessageKind.GET_TERMINAL_RESULT):
+    for kind in (
+        ChpbMessageKind.ATTEST_HOME,
+        ChpbMessageKind.QUERY_TRANSACTION,
+        ChpbMessageKind.GET_TERMINAL_RESULT,
+        ChpbMessageKind.PROVISION_HOME,
+        ChpbMessageKind.REPLACE_HOME,
+        ChpbMessageKind.DEPROVISION_HOME,
+    ):
         raw = encode_chpb_message(request(kind))
         assert encode_chpb_message(decode_chpb_message(raw)) == raw
 
@@ -312,9 +348,121 @@ def test_validate_chpb_message_enforces_reply_payload_combinations():
         validate_chpb_message(dataclasses.replace(reply, result=BrokerResultCode.INVALID_MESSAGE, transaction=status()))
 
 
+def test_validate_mutating_requests_reject_binding_expectation_mismatch():
+    assert validate_chpb_message(request(ChpbMessageKind.PROVISION_HOME))
+    wrong = dataclasses.replace(request(ChpbMessageKind.REPLACE_HOME), expected=expected(manifest_generation=4))
+    with pytest.raises(ChpbValidationError):
+        validate_chpb_message(wrong)
+    bad_tx_id = dataclasses.replace(request(ChpbMessageKind.DEPROVISION_HOME), transaction_id=U, binding=request(ChpbMessageKind.DEPROVISION_HOME).binding)
+    with pytest.raises(ChpbValidationError):
+        validate_chpb_message(bad_tx_id)
+
+
+@pytest.mark.parametrize(
+    "kind,operation",
+    [
+        (ChpbMessageKind.PROVISION_HOME, ChpbTransactionOperation.REPLACE),
+        (ChpbMessageKind.PROVISION_HOME, ChpbTransactionOperation.DEPROVISION),
+        (ChpbMessageKind.REPLACE_HOME, ChpbTransactionOperation.PROVISION),
+        (ChpbMessageKind.REPLACE_HOME, ChpbTransactionOperation.DEPROVISION),
+        (ChpbMessageKind.DEPROVISION_HOME, ChpbTransactionOperation.PROVISION),
+        (ChpbMessageKind.DEPROVISION_HOME, ChpbTransactionOperation.REPLACE),
+    ],
+)
+def test_validate_mutating_requests_reject_binding_operation_mismatch(kind, operation):
+    base = request(kind)
+    wrong = dataclasses.replace(base, binding=dataclasses.replace(base.binding, operation=operation))
+    with pytest.raises(ChpbValidationError):
+        validate_chpb_message(wrong)
+
+
+@pytest.mark.parametrize("kind", [ChpbMessageKind.PROVISION_HOME, ChpbMessageKind.REPLACE_HOME, ChpbMessageKind.DEPROVISION_HOME])
+def test_validate_mutating_requests_fail_closed_when_binding_is_not_transaction_binding(kind):
+    value = request(kind)
+    wrong = dataclasses.replace(value, binding="x")
+    with pytest.raises(ChpbValidationError) as error:
+        validate_chpb_message(wrong)
+    assert error.value.code is ChpbValidationCode.INVALID_TYPE
+
+
+def test_decode_rejects_mutation_request_without_binding_key():
+    document = json.loads(encode_chpb_message(request(ChpbMessageKind.PROVISION_HOME)))
+    del document["binding"]
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    with pytest.raises(ChpbValidationError) as error:
+        decode_chpb_message(raw)
+    assert error.value.code is ChpbValidationCode.INVALID_FIELD
+
+
+def test_decode_rejects_mutation_request_with_unknown_top_level_key():
+    document = json.loads(encode_chpb_message(request(ChpbMessageKind.REPLACE_HOME)))
+    document["extra"] = 1
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    with pytest.raises(ChpbValidationError) as error:
+        decode_chpb_message(raw)
+    assert error.value.code is ChpbValidationCode.UNKNOWN_FIELD
+
+
+def test_decode_rejects_mutation_request_with_unknown_binding_key():
+    document = json.loads(encode_chpb_message(request(ChpbMessageKind.DEPROVISION_HOME)))
+    document["binding"]["extra"] = 1
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    with pytest.raises(ChpbValidationError) as error:
+        decode_chpb_message(raw)
+    assert error.value.code is ChpbValidationCode.UNKNOWN_FIELD
+
+
+def test_decode_rejects_mutation_request_with_non_string_binding_operation():
+    document = json.loads(encode_chpb_message(request(ChpbMessageKind.PROVISION_HOME)))
+    document["binding"]["operation"] = True
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    with pytest.raises(ChpbValidationError) as error:
+        decode_chpb_message(raw)
+    assert error.value.code is ChpbValidationCode.INVALID_TYPE
+
+
+def test_decode_rejects_mutation_request_with_missing_binding_operation_key():
+    document = json.loads(encode_chpb_message(request(ChpbMessageKind.PROVISION_HOME)))
+    del document["binding"]["operation"]
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    with pytest.raises(ChpbValidationError) as error:
+        decode_chpb_message(raw)
+    assert error.value.code is ChpbValidationCode.INVALID_FIELD
+
+
+def test_decode_rejects_mutation_request_with_unknown_string_binding_operation():
+    document = json.loads(encode_chpb_message(request(ChpbMessageKind.PROVISION_HOME)))
+    document["binding"]["operation"] = "mutate"
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    with pytest.raises(ChpbValidationError) as error:
+        decode_chpb_message(raw)
+    assert error.value.code is ChpbValidationCode.INVALID_FIELD
+
+
+def test_decode_rejects_mutation_request_with_duplicate_binding_key():
+    message = request(ChpbMessageKind.PROVISION_HOME)
+    document = json.loads(encode_chpb_message(message))
+    binding_raw = json.dumps(document["binding"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    expected_raw = json.dumps(document["expected"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    raw = (
+        "{"
+        f"\"binding\":{binding_raw},"
+        f"\"binding\":{binding_raw},"
+        f"\"expected\":{expected_raw},"
+        f"\"kind\":{json.dumps(document['kind'])},"
+        f"\"protocol\":{json.dumps(document['protocol'])},"
+        f"\"request_id\":{json.dumps(document['request_id'])},"
+        f"\"transaction_id\":{json.dumps(document['transaction_id'])}"
+        "}\n"
+    ).encode()
+    with pytest.raises(ChpbValidationError) as error:
+        decode_chpb_message(raw)
+    assert error.value.code is ChpbValidationCode.DUPLICATE_KEY
+
+
 def test_b2a_mapping_is_total_bijective_and_exact_for_all_15_phases():
-    assert len(B2aRecoveryPhase) == 15
-    assert len(BrokerCheckpoint) == 15
+    assert len(B2aRecoveryPhase) == 17
+    assert len(BrokerCheckpoint) == 17
     assert {checkpoint_for_b2a_phase(p) for p in B2aRecoveryPhase} == set(BrokerCheckpoint)
 
 
@@ -332,14 +480,31 @@ def test_b2a_mapping_matches_literal_brief_table_for_all_15_pairs():
         B2aRecoveryPhase.CAS_PENDING: BrokerCheckpoint.REGISTRY_CAS_INTENT,
         B2aRecoveryPhase.COMMIT_PENDING: BrokerCheckpoint.FINALIZE_INTENT,
         B2aRecoveryPhase.ROLLBACK_PENDING: BrokerCheckpoint.ROLLBACK_INTENT,
+        B2aRecoveryPhase.DEPROVISION_PENDING: BrokerCheckpoint.DEPROVISION_INTENT,
+        B2aRecoveryPhase.DEPROVISIONED: BrokerCheckpoint.DEPROVISIONED,
         B2aRecoveryPhase.COMMITTED: BrokerCheckpoint.COMMITTED,
         B2aRecoveryPhase.ROLLED_BACK: BrokerCheckpoint.ROLLED_BACK,
         B2aRecoveryPhase.BLOCKED: BrokerCheckpoint.BLOCKED_DRIFT,
     }
-    assert len(expected) == 15
+    assert len(expected) == 17
     for phase, checkpoint in expected.items():
         assert checkpoint_for_b2a_phase(phase) is checkpoint
         assert b2a_phase_for_checkpoint(checkpoint) is phase
+
+
+@pytest.mark.parametrize(
+    "checkpoint,operation",
+    [
+        (BrokerCheckpoint.CREATE_INTENT, ChpbTransactionOperation.DEPROVISION),
+        (BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT, ChpbTransactionOperation.PROVISION),
+        (BrokerCheckpoint.REPLACEMENT_PREPARED, ChpbTransactionOperation.DEPROVISION),
+        (BrokerCheckpoint.DEPROVISION_INTENT, ChpbTransactionOperation.PROVISION),
+        (BrokerCheckpoint.DEPROVISION_INTENT, ChpbTransactionOperation.REPLACE),
+    ],
+)
+def test_validate_transaction_status_rejects_operation_checkpoint_mismatch(checkpoint, operation):
+    with pytest.raises(ChpbValidationError):
+        validate_transaction_status(status(checkpoint=checkpoint, operation=operation))
 
 
 def test_b2a_mapping_functions_are_exact_inverses():
@@ -363,6 +528,8 @@ def test_checkpoint_transition_table_accepts_only_documented_edges():
         BrokerCheckpoint.REGISTRY_CAS_INTENT: {BrokerCheckpoint.FINALIZE_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
         BrokerCheckpoint.FINALIZE_INTENT: {BrokerCheckpoint.COMMITTED, BrokerCheckpoint.BLOCKED_DRIFT},
         BrokerCheckpoint.ROLLBACK_INTENT: {BrokerCheckpoint.ROLLED_BACK, BrokerCheckpoint.BLOCKED_DRIFT},
+        BrokerCheckpoint.DEPROVISION_INTENT: {BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
+        BrokerCheckpoint.DEPROVISIONED: {BrokerCheckpoint.DEPROVISIONED},
         BrokerCheckpoint.COMMITTED: {BrokerCheckpoint.COMMITTED},
         BrokerCheckpoint.ROLLED_BACK: {BrokerCheckpoint.ROLLED_BACK},
         BrokerCheckpoint.BLOCKED_DRIFT: {BrokerCheckpoint.BLOCKED_DRIFT},
@@ -397,11 +564,12 @@ def _decision(status_value, obs):
         (BrokerCheckpoint.FINALIZE_INTENT, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.COMMITTED, BrokerResultCode.COMMITTED),
         (BrokerCheckpoint.ROLLBACK_INTENT, BrokerObjectState.ROLLBACK_READY, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.ROLLBACK, None, BrokerResultCode.PENDING),
         (BrokerCheckpoint.ROLLBACK_INTENT, BrokerObjectState.ROLLED_BACK, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.ROLLED_BACK, BrokerResultCode.ROLLED_BACK),
+        (BrokerCheckpoint.DEPROVISION_INTENT, BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.DEPROVISIONED, BrokerResultCode.COMMITTED),
     ],
 )
 def test_recovery_decision_covers_every_documented_crash_row(checkpoint, obj, reg, index, action, next_checkpoint, result):
     total = max(1, index)
-    old = status(checkpoint, observation(), total)
+    old = status(checkpoint, observation(), total, operation_for_checkpoint(checkpoint))
     decision = _decision(old, observation(obj, reg, index))
     assert decision.action is action
     assert decision.next_checkpoint is next_checkpoint
@@ -411,6 +579,22 @@ def test_recovery_decision_covers_every_documented_crash_row(checkpoint, obj, re
 def test_recovery_default_is_blocked_drift():
     decision = decide_broker_recovery(status(), observation(BrokerObjectState.DRIFT, BrokerRegistryState.FOREIGN, 0))
     assert decision == RecoveryDecision(BrokerRecoveryAction.RETURN_BLOCKED, B2aRecoveryPhase.BLOCKED, BrokerCheckpoint.BLOCKED_DRIFT, BrokerResultCode.BLOCKED_DRIFT)
+
+
+def test_rollback_intent_absent_observation_is_not_terminal_rollback():
+    decision = _decision(status(BrokerCheckpoint.ROLLBACK_INTENT), observation(BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1))
+    assert decision.action is BrokerRecoveryAction.RETURN_BLOCKED
+
+
+def test_deprovision_intent_with_final_complete_requests_deprovision_home():
+    status_value = status(
+        BrokerCheckpoint.DEPROVISION_INTENT,
+        observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1),
+        1,
+        ChpbTransactionOperation.DEPROVISION,
+    )
+    d = _decision(status_value, status_value.observation)
+    assert d == RecoveryDecision(BrokerRecoveryAction.DEPROVISION_HOME, None, None, BrokerResultCode.PENDING)
 
 
 def test_publish_intent_with_only_final_persists_published():
@@ -439,3 +623,27 @@ def test_terminal_recovery_is_idempotent_only_for_exact_observation():
     committed = dataclasses.replace(status(BrokerCheckpoint.COMMITTED, observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1), 1), terminal_result=BrokerResultCode.COMMITTED)
     assert decide_broker_recovery(committed, committed.observation).action is BrokerRecoveryAction.RETURN_COMMITTED
     assert decide_broker_recovery(committed, observation(BrokerObjectState.DRIFT, BrokerRegistryState.CURRENT, 1)).action is BrokerRecoveryAction.RETURN_BLOCKED
+
+
+def test_terminal_recovery_is_idempotent_for_deprovision_only_at_absent_not_applicable():
+    deprovisioned = dataclasses.replace(
+        status(
+            BrokerCheckpoint.DEPROVISIONED,
+            observation(BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1),
+            1,
+            operation=ChpbTransactionOperation.DEPROVISION,
+        ),
+        terminal_result=BrokerResultCode.COMMITTED,
+    )
+    assert decide_broker_recovery(deprovisioned, deprovisioned.observation).action is BrokerRecoveryAction.RETURN_COMMITTED
+    assert decide_broker_recovery(deprovisioned, observation(BrokerObjectState.STAGING_EMPTY, BrokerRegistryState.NOT_APPLICABLE, 1)).action is BrokerRecoveryAction.RETURN_BLOCKED
+
+
+def test_deprovision_commits_when_absent_is_observed():
+    d = decide_broker_recovery(status(BrokerCheckpoint.DEPROVISION_INTENT, operation=ChpbTransactionOperation.DEPROVISION), observation(BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1))
+    assert d == RecoveryDecision(BrokerRecoveryAction.PERSIST_CHECKPOINT, B2aRecoveryPhase.DEPROVISIONED, BrokerCheckpoint.DEPROVISIONED, BrokerResultCode.COMMITTED)
+
+
+def test_deprovision_recovery_fails_closed_for_non_absent_terminal_state():
+    current = status(BrokerCheckpoint.DEPROVISION_INTENT, operation=ChpbTransactionOperation.DEPROVISION)
+    assert decide_broker_recovery(current, observation(BrokerObjectState.STAGING_EMPTY, BrokerRegistryState.NOT_APPLICABLE, 0)).action is BrokerRecoveryAction.RETURN_BLOCKED

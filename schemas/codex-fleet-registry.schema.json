@@ -24,6 +24,25 @@
         {"if": {"properties": {"provider": {"const": "ollama_local"}}}, "then": {"properties": {"auth_kind": {"const": "none"}}}}
       ]
     },
+    "v2_account": {
+      "allOf": [
+        {"$ref": "#/$defs/account"},
+        {
+          "if": {
+            "properties": {
+              "provider": {"const": "openai_chatgpt"},
+              "credential_binding_id": {"type": "string"}
+            },
+            "required": ["credential_binding_id"]
+          },
+          "then": {
+            "properties": {
+              "credential_binding_id": {"type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$"}
+            }
+          }
+        }
+      ]
+    },
     "v1_series": {
       "type": "object", "required": ["prefix", "display_name", "count", "runner", "provider", "model", "account_id", "enabled"], "additionalProperties": false,
       "properties": {
@@ -60,7 +79,119 @@
         {"if": {"properties": {"provider": {"enum": ["openai_chatgpt", "openai_api", "ollama_local", "huggingface_inference"]}}}, "then": {"properties": {"runner": {"const": "codex_cli"}}}}
       ]
     },
+    "runtime_principal": {
+      "type": "object",
+      "required": ["principal_id", "account_id", "profile_id", "credential_binding_id", "class_id", "lifecycle", "provider", "runner", "model", "reasoning", "enabled"],
+      "additionalProperties": false,
+      "properties": {
+        "principal_id": {"type": "string", "pattern": "^tl-[0-9a-f]{32}$"},
+        "account_id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$"},
+        "profile_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+        "credential_binding_id": {"type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$"},
+        "class_id": {"const": "teamleiterin"},
+        "lifecycle": {"const": "persistent"},
+        "provider": {"const": "openai_chatgpt"},
+        "runner": {"const": "codex_cli"},
+        "model": {"const": "gpt-5.6-terra"},
+        "reasoning": {"const": "xhigh"},
+        "enabled": {"type": "boolean"}
+      }
+    },
+    "resolution_value": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+    "nullable_resolution_value": {"type": ["string", "null"], "minLength": 1, "maxLength": 256, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+    "sha256_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "nullable_sha256_digest": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+    "resolution_decision": {
+      "type": "object",
+      "required": ["class_id", "lifecycle", "model", "reasoning", "reason_codes", "fallback", "requested_class", "requested_lifecycle", "requested_model", "requested_reasoning"],
+      "additionalProperties": false,
+      "properties": {
+        "class_id": {"$ref": "#/$defs/resolution_value"},
+        "lifecycle": {"$ref": "#/$defs/resolution_value"},
+        "model": {"$ref": "#/$defs/resolution_value"},
+        "reasoning": {"$ref": "#/$defs/resolution_value"},
+        "reason_codes": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/resolution_value"}},
+        "fallback": {"type": "boolean"},
+        "requested_class": {"$ref": "#/$defs/nullable_resolution_value"},
+        "requested_lifecycle": {"$ref": "#/$defs/nullable_resolution_value"},
+        "requested_model": {"$ref": "#/$defs/nullable_resolution_value"},
+        "requested_reasoning": {"$ref": "#/$defs/nullable_resolution_value"}
+      }
+    },
+    "selection_option": {
+      "type": "object",
+      "required": ["class_id", "lifecycle", "model", "reasoning"],
+      "additionalProperties": false,
+      "properties": {
+        "class_id": {"$ref": "#/$defs/resolution_value"},
+        "lifecycle": {"$ref": "#/$defs/resolution_value"},
+        "model": {"$ref": "#/$defs/resolution_value"},
+        "reasoning": {"$ref": "#/$defs/resolution_value"}
+      }
+    },
+    "selection_offer": {
+      "type": "object",
+      "required": ["generation", "classes", "lifecycles", "models", "reasoning_levels", "options"],
+      "additionalProperties": false,
+      "properties": {
+        "generation": {"$ref": "#/$defs/sha256_digest"},
+        "classes": {"type": "array", "maxItems": 4096, "uniqueItems": true, "items": {"$ref": "#/$defs/resolution_value"}},
+        "lifecycles": {"type": "array", "maxItems": 4096, "uniqueItems": true, "items": {"$ref": "#/$defs/resolution_value"}},
+        "models": {"type": "array", "maxItems": 4096, "uniqueItems": true, "items": {"$ref": "#/$defs/resolution_value"}},
+        "reasoning_levels": {"type": "array", "maxItems": 4096, "uniqueItems": true, "items": {"$ref": "#/$defs/resolution_value"}},
+        "options": {"type": "array", "maxItems": 4096, "uniqueItems": true, "items": {"$ref": "#/$defs/selection_option"}}
+      }
+    },
+    "worker_resolution_evidence": {
+      "type": "object",
+      "required": ["decision", "offer", "offer_generation", "capability_binding_digest", "resolution_generation", "policy_digest", "policy_generation", "ticket_fence_epoch"],
+      "additionalProperties": false,
+      "properties": {
+        "decision": {"$ref": "#/$defs/resolution_decision"},
+        "offer": {"$ref": "#/$defs/selection_offer"},
+        "offer_generation": {"$ref": "#/$defs/sha256_digest"},
+        "capability_binding_digest": {"$ref": "#/$defs/sha256_digest"},
+        "resolution_generation": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "policy_digest": {"$ref": "#/$defs/sha256_digest"},
+        "policy_generation": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "ticket_fence_epoch": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}
+      }
+    },
+    "dynamic_worker_principal": {
+      "type": "object",
+      "required": [
+        "principal_id", "ticket_id", "ticket_ledger_revision", "ticket_fence_epoch",
+        "ticket_resolution_generation", "ticket_policy_digest", "ticket_policy_generation",
+        "capability_binding_digest", "resolution_decision_digest", "resolver_offer_generation",
+        "lease_binding_digest", "class_id", "lifecycle", "model", "reasoning", "enabled",
+        "resolution_evidence", "reservation_lease_binding_digest",
+        "reservation_account_binding_digest", "reservation_profile_binding_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "principal_id": {"type": "string", "pattern": "^dw-[0-9a-f]{32}$"},
+        "ticket_id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "ticket_ledger_revision": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "ticket_fence_epoch": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "ticket_resolution_generation": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "ticket_policy_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "ticket_policy_generation": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "capability_binding_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "resolution_decision_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "resolver_offer_generation": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "lease_binding_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "class_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "lifecycle": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "model": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "reasoning": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "enabled": {"type": "boolean"},
+        "resolution_evidence": {"$ref": "#/$defs/worker_resolution_evidence"},
+        "reservation_lease_binding_digest": {"$ref": "#/$defs/nullable_sha256_digest"},
+        "reservation_account_binding_digest": {"$ref": "#/$defs/nullable_sha256_digest"},
+        "reservation_profile_binding_digest": {"$ref": "#/$defs/nullable_sha256_digest"}
+      }
+    },
     "v1": {"type": "object", "required": ["schema_version", "generation", "accounts", "series"], "additionalProperties": false, "properties": {"schema_version": {"const": 1}, "generation": {"type": "integer", "minimum": 0}, "accounts": {"type": "array", "maxItems": 64, "items": {"allOf": [{"$ref": "#/$defs/account"}, {"not": {"required": ["credential_binding_id"]}}]}}, "series": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v1_series"}}}},
-    "v2": {"type": "object", "required": ["schema_version", "generation", "accounts", "series"], "additionalProperties": false, "properties": {"schema_version": {"const": 2}, "generation": {"type": "integer", "minimum": 0}, "accounts": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/account"}}, "series": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v2_series"}}}}
+    "v2": {"type": "object", "required": ["schema_version", "generation", "accounts", "series", "runtime_principals"], "additionalProperties": false, "properties": {"schema_version": {"const": 2}, "generation": {"type": "integer", "minimum": 0}, "accounts": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v2_account"}}, "series": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v2_series"}}, "runtime_principals": {"type": "array", "maxItems": 64, "items": {"oneOf": [{"$ref": "#/$defs/runtime_principal"}, {"$ref": "#/$defs/dynamic_worker_principal"}]}}}}
   }
 }

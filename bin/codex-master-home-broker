@@ -1,0 +1,12 @@
+#!/usr/bin/python3
+"""Inert home-broker executable; trusted start is composed in R2-B."""
+
+INERT_EXIT_CODE = 78
+
+
+def main() -> int:
+    return INERT_EXIT_CODE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

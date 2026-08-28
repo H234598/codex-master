@@ -23,11 +23,14 @@ from codex_master.fleet_home_broker_protocol import (
     BrokerRegistryState,
     BrokerResultCode,
     ChpbMessageKind,
+    ChpbTransactionOperation,
     ChpbValidationError,
     DirectoryIdentity,
     HomeAttestation,
+    PolicyBinding,
     PrincipalBinding,
     QueryTransactionRequest,
+    TransactionBinding,
     TransactionStatus,
     b2a_phase_for_checkpoint,
     decide_broker_recovery,
@@ -49,9 +52,21 @@ def principal(**changes):
     return PrincipalBinding(**values)
 
 
-def bind(p=None):
-    from codex_master.fleet_home_broker_protocol import PolicyBinding, TransactionBinding
-    return TransactionBinding(T, U, p or principal(), PolicyBinding(7, A))
+def operation_for_checkpoint(checkpoint):
+    if checkpoint in {
+        BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT,
+        BrokerCheckpoint.REPLACEMENT_PREPARED,
+        BrokerCheckpoint.SWITCH_INTENT,
+        BrokerCheckpoint.SWITCHED,
+    }:
+        return ChpbTransactionOperation.REPLACE
+    if checkpoint in {BrokerCheckpoint.DEPROVISION_INTENT, BrokerCheckpoint.DEPROVISIONED}:
+        return ChpbTransactionOperation.DEPROVISION
+    return ChpbTransactionOperation.PROVISION
+
+
+def bind(p=None, checkpoint=BrokerCheckpoint.CREATE_INTENT):
+    return TransactionBinding(operation_for_checkpoint(checkpoint), T, U, p or principal(), PolicyBinding(7, A))
 
 
 def obs(state=BrokerObjectState.ABSENT, registry=BrokerRegistryState.NOT_APPLICABLE, index=0):
@@ -60,7 +75,7 @@ def obs(state=BrokerObjectState.ABSENT, registry=BrokerRegistryState.NOT_APPLICA
 
 def stat(checkpoint=BrokerCheckpoint.CREATE_INTENT, observation=None, total=1, p=None, terminal=None):
     observation = observation or obs()
-    return TransactionStatus(bind(p), b2a_phase_for_checkpoint(checkpoint), checkpoint, observation, total, terminal)
+    return TransactionStatus(bind(p, checkpoint), b2a_phase_for_checkpoint(checkpoint), checkpoint, observation, total, terminal)
 
 
 def attest(status_value):
@@ -102,8 +117,7 @@ def test_open_transaction_rejects_conflicting_id_and_capacity_overflow():
     for n in range(32):
         txid = f"{n + 10:032x}"
         p = principal()
-        from codex_master.fleet_home_broker_protocol import TransactionBinding, PolicyBinding
-        s = TransactionStatus(TransactionBinding(txid, U, p, PolicyBinding(7, A)), B2aRecoveryPhase.ABSENT_CREATE_PENDING, BrokerCheckpoint.CREATE_INTENT, obs(), 1, None)
+        s = TransactionStatus(TransactionBinding(ChpbTransactionOperation.PROVISION, txid, U, p, PolicyBinding(7, A)), B2aRecoveryPhase.ABSENT_CREATE_PENDING, BrokerCheckpoint.CREATE_INTENT, obs(), 1, None)
         full = open_emulator_transaction(full, s, HomeAttestation(s.binding, CANONICAL_AGENT_HOME, DirectoryIdentity(0, 1, 0o40700), A, "c0,c1"), now_ns=n)
     with pytest.raises(ChpbValidationError):
         open_emulator_transaction(full, stat(), attest(stat()), now_ns=33)
@@ -165,8 +179,11 @@ def test_recover_publish_conflicts_blocks_without_persisting_and_replays_determi
         (BrokerCheckpoint.FINALIZE_INTENT, BrokerObjectState.REPLACEMENT_SWITCHED, BrokerRegistryState.CURRENT, 1, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.COMMITTED, None),
         (BrokerCheckpoint.ROLLBACK_INTENT, BrokerObjectState.ROLLBACK_READY, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.ROLLBACK, None, None),
         (BrokerCheckpoint.ROLLBACK_INTENT, BrokerObjectState.ROLLED_BACK, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.ROLLED_BACK, None),
+        (BrokerCheckpoint.DEPROVISION_INTENT, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.DEPROVISION_HOME, None, None),
+        (BrokerCheckpoint.DEPROVISION_INTENT, BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.DEPROVISIONED, None),
         (BrokerCheckpoint.COMMITTED, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1, 1, BrokerRecoveryAction.RETURN_COMMITTED, BrokerCheckpoint.COMMITTED, BrokerResultCode.COMMITTED),
         (BrokerCheckpoint.ROLLED_BACK, BrokerObjectState.ROLLED_BACK, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.RETURN_ROLLED_BACK, BrokerCheckpoint.ROLLED_BACK, BrokerResultCode.ROLLED_BACK),
+        (BrokerCheckpoint.DEPROVISIONED, BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.RETURN_COMMITTED, BrokerCheckpoint.DEPROVISIONED, BrokerResultCode.COMMITTED),
         (BrokerCheckpoint.BLOCKED_DRIFT, BrokerObjectState.DRIFT, BrokerRegistryState.FOREIGN, 1, 1, BrokerRecoveryAction.RETURN_BLOCKED, BrokerCheckpoint.BLOCKED_DRIFT, BrokerResultCode.BLOCKED_DRIFT),
     ],
 )
@@ -181,6 +198,13 @@ def test_recover_complete_crash_matrix(checkpoint, current, registry, index, tot
     assert step.reply is None
     if target is not None:
         assert step.state.transactions[0].status.checkpoint is target
+        expected_terminal = {
+            BrokerCheckpoint.COMMITTED: BrokerResultCode.COMMITTED,
+            BrokerCheckpoint.DEPROVISIONED: BrokerResultCode.COMMITTED,
+            BrokerCheckpoint.ROLLED_BACK: BrokerResultCode.ROLLED_BACK,
+            BrokerCheckpoint.BLOCKED_DRIFT: BrokerResultCode.BLOCKED_DRIFT,
+        }.get(target)
+        assert step.state.transactions[0].status.terminal_result is expected_terminal
 
 
 def _committed_state():
@@ -258,6 +282,33 @@ def test_attest_home_for_committed_bound_transaction_returns_stored_attestation(
     assert step.reply.attestation == state.transactions[0].attestation
     assert step.reply.request_id == REQUEST_ID
     assert len(step.state.response_cache) == 1
+
+
+def test_attest_home_for_deprovisioned_transaction_returns_terminal_fact_without_attestation():
+    initial = stat(
+        BrokerCheckpoint.DEPROVISION_INTENT,
+        obs(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1),
+        1,
+    )
+    state = opened(status_value=initial)
+    recovered = recover_emulator_transaction(
+        state,
+        T,
+        principal(),
+        obs(BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1),
+        now_ns=2,
+    )
+    terminal = recovered.state.transactions[0].status
+    assert recovered.action is BrokerRecoveryAction.PERSIST_CHECKPOINT
+    assert terminal.checkpoint is BrokerCheckpoint.DEPROVISIONED
+    assert terminal.terminal_result is BrokerResultCode.COMMITTED
+
+    step = handle_emulator_message(recovered.state, principal(), request(), now_ns=3)
+
+    assert step.reply.result is BrokerResultCode.COMMITTED
+    assert step.reply.transaction == terminal
+    assert step.reply.attestation is None
+    assert encode_chpb_message(step.reply)
 
 
 def test_terminal_reconnect_with_new_request_id_returns_same_terminal_fact():
