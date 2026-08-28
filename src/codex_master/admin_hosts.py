@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import builtins
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -14,7 +14,9 @@ import math
 from pathlib import Path, PurePosixPath
 import re
 from types import MappingProxyType
-from typing import Any, Never
+from typing import Any, Never, cast
+import unicodedata
+from urllib.parse import unquote
 
 from codex_master.admin_contracts import (
     AdminContractError,
@@ -64,11 +66,31 @@ _HOST_FIELDS = frozenset(
     }
 )
 _BINDING_FIELDS = frozenset({"ref", "binding_state"})
-_SENSITIVE_PUBLIC_KEY = re.compile(
-    r"(?:^|[_.-])(?:credential|secret|token|password|passphrase|endpoint|"
-    r"root|path|socket|address|url|uri|host)(?:$|[_.-])",
-    re.IGNORECASE,
+_TRANSPORT_FIELDS = frozenset({"kind", "binding_ref"})
+_REACHABILITY_FIELDS = frozenset({"state", "latency_ms"})
+_RESOURCE_FIELDS = frozenset({"cpu_threads", "memory_bytes"})
+_SENSITIVE_KEY_PARTS = frozenset(
+    {
+        "address",
+        "auth",
+        "cookie",
+        "credential",
+        "endpoint",
+        "host",
+        "jwt",
+        "password",
+        "passphrase",
+        "path",
+        "private",
+        "root",
+        "secret",
+        "socket",
+        "token",
+        "uri",
+        "url",
+    }
 )
+_PRIVATE_HOST_SUFFIXES = (".home", ".internal", ".lan", ".local", ".localhost")
 
 
 class HostRegistryError(ValueError):
@@ -100,24 +122,14 @@ class ControlHostV1:
         object.__setattr__(self, "label", _public_text(self.label, error_code))
         if type(self.role) is not str or self.role not in _ROLES:
             raise HostRegistryError(error_code)
-        transport = _public_mapping(self.transport_binding, error_code)
-        if "kind" not in transport:
-            raise HostRegistryError(error_code)
-        _public_ref(transport["kind"], error_code)
+        transport = _transport_binding(self.transport_binding, error_code)
         object.__setattr__(self, "transport_binding", _freeze_mapping(transport))
         object.__setattr__(
             self, "capabilities", _capabilities(self.capabilities, error_code)
         )
-        reachability = _public_mapping(self.reachability, error_code)
-        if reachability.get("state") not in _REACHABILITY_STATES:
-            raise HostRegistryError(error_code)
-        latency = reachability.get("latency_ms")
-        if latency is not None and (type(latency) is not int or latency < 0):
-            raise HostRegistryError(error_code)
+        reachability = _reachability(self.reachability, error_code)
         object.__setattr__(self, "reachability", _freeze_mapping(reachability))
-        resources = _public_mapping(self.resource_evidence, error_code)
-        if not resources:
-            raise HostRegistryError(error_code)
+        resources = _resources(self.resource_evidence, error_code)
         object.__setattr__(self, "resource_evidence", _freeze_mapping(resources))
         object.__setattr__(self, "generation", _generation(self.generation, error_code))
         object.__setattr__(self, "observed_at", _utc_time(self.observed_at, error_code))
@@ -190,7 +202,7 @@ class HostRegistry:
     ) -> ControlHostV1:
         ref = _public_ref(ref, "control.host_invalid")
         generation = _generation(generation, "control.host_invalid")
-        record, binding = self._probe_record(
+        record, binding = _validated_probe_record(
             ref,
             generation,
             evidence,
@@ -199,7 +211,9 @@ class HostRegistry:
         with self._locked_state() as (hosts, bindings):
             existing = next((item for item in hosts if item["ref"] == ref), None)
             if existing is not None:
-                current_generation = int(existing["generation"])
+                current_generation = _generation(
+                    existing["generation"], "control.host_store_unavailable"
+                )
                 if generation < current_generation or (
                     generation == current_generation
                     and record["probe_digest"] != existing["probe_digest"]
@@ -250,6 +264,8 @@ class HostRegistry:
         if not isinstance(document, Mapping):
             raise HostRegistryError("control.host_store_unavailable")
         version = document.get("schema_version")
+        if type(version) is not int:
+            raise HostRegistryError("control.host_store_unavailable")
         if version == 1:
             return self._read_legacy(document)
         if version != _SCHEMA_VERSION or set(document) != {
@@ -342,26 +358,18 @@ class HostRegistry:
         error_code: str,
     ) -> tuple[dict[str, object], dict[str, object]]:
         generation = _generation(generation, error_code)
-        if not isinstance(evidence, Mapping) or set(evidence) != _EVIDENCE_FIELDS:
+        if type(evidence) is not dict or not _exact_keys(
+            evidence, _EVIDENCE_FIELDS, error_code
+        ):
             raise HostRegistryError(error_code)
         label = _public_text(evidence["label"], error_code)
         role = evidence["role"]
         if type(role) is not str or role not in _ROLES:
             raise HostRegistryError(error_code)
-        transport = _public_mapping(evidence["transport_binding"], error_code)
-        if "kind" not in transport:
-            raise HostRegistryError(error_code)
-        _public_ref(transport["kind"], error_code)
+        transport = _transport_binding(evidence["transport_binding"], error_code)
         capabilities = _capabilities(evidence["capabilities"], error_code)
-        reachability = _public_mapping(evidence["reachability"], error_code)
-        if reachability.get("state") not in _REACHABILITY_STATES:
-            raise HostRegistryError(error_code)
-        latency = reachability.get("latency_ms")
-        if latency is not None and (type(latency) is not int or latency < 0):
-            raise HostRegistryError(error_code)
-        resources = _public_mapping(evidence["resource_evidence"], error_code)
-        if not resources:
-            raise HostRegistryError(error_code)
+        reachability = _reachability(evidence["reachability"], error_code)
+        resources = _resources(evidence["resource_evidence"], error_code)
         observed = _parse_time(evidence["observed_at"], error_code)
         source = _public_ref(evidence["source"], error_code)
         binding = _private_mapping(evidence["binding_state"], error_code)
@@ -413,12 +421,12 @@ class HostRegistry:
             ref=str(record["ref"]),
             label=str(record["label"]),
             role=str(record["role"]),
-            transport_binding=_freeze_mapping(record["transport_binding"]),
+            transport_binding=cast(Mapping[str, object], record["transport_binding"]),
             capabilities=_capabilities(
                 record["capabilities"], "control.host_store_unavailable"
             ),
-            reachability=_freeze_mapping(record["reachability"]),
-            resource_evidence=_freeze_mapping(record["resource_evidence"]),
+            reachability=cast(Mapping[str, object], record["reachability"]),
+            resource_evidence=cast(Mapping[str, object], record["resource_evidence"]),
             generation=_generation(
                 record["generation"], "control.host_store_unavailable"
             ),
@@ -427,6 +435,27 @@ class HostRegistry:
             ),
             source=str(record["source"]),
         )
+
+
+def _validated_probe_record(
+    ref: str,
+    generation: object,
+    evidence: object,
+    *,
+    error_code: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    try:
+        return HostRegistry._probe_record(
+            ref,
+            generation,
+            evidence,  # type: ignore[arg-type]
+            error_code=error_code,
+        )
+    except HostRegistryError:
+        raise
+    except BaseException:
+        pass
+    raise HostRegistryError(error_code)
 
 
 def _raise(code: str) -> Never:
@@ -480,23 +509,129 @@ def _wire_time(value: datetime) -> str:
 
 
 def _capabilities(value: object, error_code: str) -> tuple[str, ...]:
-    if (
-        not isinstance(value, Sequence)
-        or isinstance(value, (str, bytes, bytearray))
-        or not 1 <= len(value) <= _MAX_COLLECTION_ITEMS
-    ):
+    if type(value) not in {list, tuple}:
         _raise(error_code)
-    capabilities = tuple(_public_ref(item, error_code) for item in value)
+    values = cast(list[object] | tuple[object, ...], value)
+    if not 1 <= len(values) <= _MAX_COLLECTION_ITEMS:
+        _raise(error_code)
+    capabilities = tuple(_public_ref(item, error_code) for item in values)
     if len(set(capabilities)) != len(capabilities):
         _raise(error_code)
     return capabilities
 
 
-def _public_mapping(value: object, error_code: str) -> dict[str, object]:
-    normalized = _json_value(value, error_code, public=True, depth=0)
-    if type(normalized) is not dict:
+def _normalized_key(value: object, error_code: str) -> str:
+    if type(value) is not str:
         _raise(error_code)
-    return normalized
+    candidate = value
+    try:
+        for _ in range(4):
+            candidate = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", candidate)
+            candidate = unicodedata.normalize("NFKC", candidate).casefold()
+            decoded = unquote(candidate, errors="strict")
+            if decoded == candidate:
+                break
+            candidate = decoded
+    except (UnicodeError, ValueError):
+        _raise(error_code)
+    return re.sub(r"[^a-z0-9]+", "_", candidate).strip("_")
+
+
+def _exact_keys(value: object, expected: frozenset[str], error_code: str) -> bool:
+    if type(value) is not dict:
+        _raise(error_code)
+    keys = tuple(value.keys())
+    if len(keys) != len(expected):
+        return False
+    for key in keys:
+        _normalized_key(key, error_code)
+        if type(key) is not str or key not in expected:
+            return False
+    return True
+
+
+def _public_object(
+    value: object,
+    *,
+    required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
+    error_code: str,
+) -> dict[str, object]:
+    allowed = required | optional
+    if type(value) is not dict:
+        _raise(error_code)
+    keys = tuple(value.keys())
+    for key in keys:
+        normalized = _normalized_key(key, error_code)
+        parts = frozenset(part for part in normalized.split("_") if part)
+        if parts & _SENSITIVE_KEY_PARTS or type(key) is not str or key not in allowed:
+            _raise(error_code)
+    if not required <= frozenset(keys):
+        _raise(error_code)
+    return value
+
+
+def _transport_binding(value: object, error_code: str) -> dict[str, object]:
+    transport = _public_object(
+        value,
+        required=_TRANSPORT_FIELDS,
+        error_code=error_code,
+    )
+    return {
+        "kind": _public_ref(transport["kind"], error_code),
+        "binding_ref": _opaque_binding_ref(transport["binding_ref"], error_code),
+    }
+
+
+def _opaque_binding_ref(value: object, error_code: str) -> str:
+    ref = _public_ref(value, error_code)
+    candidate = unicodedata.normalize("NFKC", ref).casefold()
+    if ":" in candidate or "/" in candidate or "\\" in candidate:
+        _raise(error_code)
+    if candidate == "localhost" or candidate.endswith(_PRIVATE_HOST_SUFFIXES):
+        _raise(error_code)
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return ref
+    _raise(error_code)
+
+
+def _reachability(value: object, error_code: str) -> dict[str, object]:
+    reachability = _public_object(
+        value,
+        required=frozenset({"state"}),
+        optional=frozenset({"latency_ms"}),
+        error_code=error_code,
+    )
+    state = reachability["state"]
+    if type(state) is not str or state not in _REACHABILITY_STATES:
+        _raise(error_code)
+    result: dict[str, object] = {"state": state}
+    if "latency_ms" in reachability:
+        result["latency_ms"] = _nonnegative_int(reachability["latency_ms"], error_code)
+    return result
+
+
+def _resources(value: object, error_code: str) -> dict[str, object]:
+    resources = _public_object(
+        value,
+        required=_RESOURCE_FIELDS,
+        error_code=error_code,
+    )
+    cpu_threads = _nonnegative_int(resources["cpu_threads"], error_code)
+    if cpu_threads == 0:
+        _raise(error_code)
+    return {
+        "cpu_threads": cpu_threads,
+        "memory_bytes": _nonnegative_int(resources["memory_bytes"], error_code),
+    }
+
+
+def _nonnegative_int(value: object, error_code: str) -> int:
+    if type(value) is not int or not 0 <= value <= 2**63 - 1:
+        _raise(error_code)
+    return value
 
 
 def _private_mapping(value: object, error_code: str) -> dict[str, object]:
@@ -544,7 +679,7 @@ def _json_value(
         except UnicodeError:
             _raise(error_code)
         return value
-    if isinstance(value, Mapping):
+    if type(value) is dict:
         if len(value) > _MAX_COLLECTION_ITEMS:
             _raise(error_code)
         result: dict[str, object] = {}
@@ -556,16 +691,15 @@ def _json_value(
                     _raise(error_code)
             except UnicodeError:
                 _raise(error_code)
-            if public and _SENSITIVE_PUBLIC_KEY.search(key):
-                _raise(error_code)
             result[key] = _json_value(item, error_code, public=public, depth=depth + 1)
         return result
-    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
-        if len(value) > _MAX_COLLECTION_ITEMS:
+    if type(value) in {list, tuple}:
+        values = cast(list[object] | tuple[object, ...], value)
+        if len(values) > _MAX_COLLECTION_ITEMS:
             _raise(error_code)
         return [
             _json_value(item, error_code, public=public, depth=depth + 1)
-            for item in value
+            for item in values
         ]
     _raise(error_code)
 

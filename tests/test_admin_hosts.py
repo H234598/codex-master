@@ -5,7 +5,7 @@ import json
 import multiprocessing
 from pathlib import Path
 import stat
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -13,6 +13,43 @@ from codex_master.admin_hosts import ControlHostV1, HostRegistry, HostRegistryEr
 
 
 OBSERVED_AT = "2026-08-28T10:00:00Z"
+
+
+class PrivateProbeFailure(BaseException):
+    def __str__(self) -> str:
+        return "/srv/private synthetic-credential-marker"
+
+
+class ExplodingMapping(dict[object, object]):
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        raise PrivateProbeFailure
+
+    def __len__(self) -> int:
+        raise PrivateProbeFailure
+
+    def __getitem__(self, key: object) -> object:  # type: ignore[override]
+        raise PrivateProbeFailure
+
+    @property
+    def items(self):  # type: ignore[no-untyped-def,override]
+        raise PrivateProbeFailure
+
+    def __repr__(self) -> str:
+        return "/srv/private synthetic-credential-marker"
+
+
+class ExplodingSequence(list[object]):
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        raise PrivateProbeFailure
+
+    def __len__(self) -> int:
+        raise PrivateProbeFailure
+
+    def __getitem__(self, key: object) -> object:  # type: ignore[override]
+        raise PrivateProbeFailure
+
+    def __repr__(self) -> str:
+        return "/srv/private synthetic-credential-marker"
 
 
 def valid_evidence(
@@ -158,6 +195,76 @@ def test_public_transport_binding_rejects_private_material(
 ) -> None:
     evidence = valid_evidence()
     evidence["transport_binding"] = transport_binding
+
+    with pytest.raises(HostRegistryError, match="control.host_invalid"):
+        registry_at(tmp_path).record_probe(
+            "worker-one", generation=1, evidence=evidence
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "key", "value"),
+    [
+        ("transport_binding", "clientSecret", "opaqueValue123"),
+        ("transport_binding", "ＣＬＩＥＮＴ＿ＳＥＣＲＥＴ", "opaqueValue123"),
+        ("transport_binding", "private%255Fendpoint", "opaqueValue123"),
+        ("reachability", "credentialToken", "opaqueValue123"),
+        ("reachability", "socketAddress", "opaqueValue123"),
+        ("resource_evidence", "modelsPath", "opaqueValue123"),
+        ("resource_evidence", "privateEndpoint", "opaqueValue123"),
+    ],
+)
+def test_public_field_allowlists_reject_normalized_private_key_variants(
+    tmp_path: Path, field: str, key: str, value: str
+) -> None:
+    evidence = valid_evidence()
+    public_mapping = evidence[field]
+    assert isinstance(public_mapping, dict)
+    public_mapping[key] = value
+
+    with pytest.raises(HostRegistryError, match="control.host_invalid"):
+        registry_at(tmp_path).record_probe(
+            "worker-one", generation=1, evidence=evidence
+        )
+
+
+@pytest.mark.parametrize(
+    "binding_ref",
+    [
+        "10.0.0.8:22",
+        "localhost:8022",
+        "worker-one.internal:22",
+        "ssh://worker-one.internal:22",
+        "/run/codex-master/private.sock",
+        "[fd00::8]:22",
+    ],
+)
+def test_transport_binding_ref_cannot_encode_private_endpoint(
+    tmp_path: Path, binding_ref: str
+) -> None:
+    evidence = valid_evidence(binding_ref=binding_ref)
+
+    with pytest.raises(HostRegistryError, match="control.host_invalid"):
+        registry_at(tmp_path).record_probe(
+            "worker-one", generation=1, evidence=evidence
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "key", "value"),
+    [
+        ("transport_binding", "description", "public"),
+        ("reachability", "detail", "public"),
+        ("resource_evidence", "note", "public"),
+    ],
+)
+def test_public_host_subobjects_reject_unknown_even_benign_fields(
+    tmp_path: Path, field: str, key: str, value: str
+) -> None:
+    evidence = valid_evidence()
+    public_mapping = evidence[field]
+    assert isinstance(public_mapping, dict)
+    public_mapping[key] = value
 
     with pytest.raises(HostRegistryError, match="control.host_invalid"):
         registry_at(tmp_path).record_probe(
@@ -355,3 +462,109 @@ def test_errors_and_repr_never_echo_private_input(tmp_path: Path) -> None:
     assert str(captured.value) == "control.host_invalid"
     assert repr(captured.value) == "HostRegistryError('control.host_invalid')"
     assert "private-top-secret" not in repr(captured.value)
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "evidence",
+        "transport_binding",
+        "reachability",
+        "resource_evidence",
+        "binding_state",
+        "capabilities",
+    ],
+)
+def test_foreign_probe_containers_fail_typed_without_private_exception_context(
+    tmp_path: Path, location: str
+) -> None:
+    evidence = valid_evidence()
+    supplied: object = evidence
+    if location == "evidence":
+        supplied = ExplodingMapping(evidence)
+    elif location == "capabilities":
+        evidence[location] = ExplodingSequence(["codex.execute"])
+    else:
+        evidence[location] = ExplodingMapping(
+            cast(dict[object, object], evidence[location])
+        )
+
+    with pytest.raises(HostRegistryError) as captured:
+        registry_at(tmp_path).record_probe(
+            "worker-one",
+            generation=1,
+            evidence=cast(Any, supplied),
+        )
+
+    assert captured.value.code == "control.host_invalid"
+    assert repr(captured.value) == "HostRegistryError('control.host_invalid')"
+    assert captured.value.__context__ is None
+    assert "private" not in repr(captured.value).casefold()
+    assert "credential" not in repr(captured.value).casefold()
+
+
+def test_direct_contract_rejects_foreign_mapping_without_calling_repr() -> None:
+    with pytest.raises(HostRegistryError) as captured:
+        ControlHostV1(
+            ref="worker-one",
+            label="Worker One",
+            role="execution",
+            transport_binding=cast(Any, ExplodingMapping()),
+            capabilities=("codex.execute",),
+            reachability={"state": "reachable"},
+            resource_evidence={"cpu_threads": 16, "memory_bytes": 1024},
+            generation=4,
+            observed_at=datetime(2026, 8, 28, 10, 0, tzinfo=UTC),
+            source="host-agent",
+        )
+
+    assert captured.value.code == "control.host_invalid"
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, 2.0])
+def test_state_schema_version_requires_exact_integer(
+    tmp_path: Path, schema_version: object
+) -> None:
+    payload: dict[str, object]
+    if schema_version == 2.0:
+        payload = {"schema_version": schema_version, "hosts": [], "bindings": []}
+    else:
+        payload = {"schema_version": schema_version, "hosts": []}
+    _write_registry_document(tmp_path, payload)
+
+    with pytest.raises(HostRegistryError, match="control.host_store_unavailable"):
+        registry_at(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("generation", True),
+        ("generation", 4.0),
+        ("latency_ms", True),
+        ("latency_ms", 12.0),
+        ("cpu_threads", True),
+        ("cpu_threads", 16.0),
+        ("memory_bytes", True),
+        ("memory_bytes", 1024.0),
+    ],
+)
+def test_probe_numeric_fields_reject_bool_and_float(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    evidence = valid_evidence()
+    generation: object = 4
+    if field == "generation":
+        generation = value
+    elif field == "latency_ms":
+        reachability = cast(dict[str, object], evidence["reachability"])
+        reachability[field] = value
+    else:
+        resources = cast(dict[str, object], evidence["resource_evidence"])
+        resources[field] = value
+
+    with pytest.raises(HostRegistryError, match="control.host_invalid"):
+        registry_at(tmp_path).record_probe(
+            "worker-one", generation=cast(Any, generation), evidence=evidence
+        )
