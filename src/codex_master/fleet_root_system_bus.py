@@ -25,8 +25,17 @@ from codex_master.dynamic_teamlead_a3_runner import (
     DynamicTeamleadRunnerOperations,
     RootDynamicTeamleadRunnerBindingEvidence,
     RootDynamicTeamleadRunnerPermit,
+    RootDynamicTeamleadStartComposition,
+)
+from codex_master.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
+from codex_master.dynamic_teamlead_a3_runtime_provider import (
+    DynamicTeamleadA3RuntimeContext,
+    validate_dynamic_teamlead_a3_runtime_context,
 )
 from codex_master.fleet_home_broker_client import AttestedHome
+from codex_master.fleet_home_broker_client_seqpacket import (
+    SeqpacketBrokerClientOperations,
+)
 from codex_master.fleet_home_broker_identity import BrokerIdentity
 from codex_master.fleet_home_broker_system import (
     BrokerStartReceipt,
@@ -213,6 +222,7 @@ class _DynamicTeamleadRunnerRecord:
     operations: DynamicTeamleadRunnerOperations
     active: _ActiveStart
     binding: _DynamicTeamleadRunnerBinding
+    composition: RootDynamicTeamleadStartComposition | None = None
     terminal: bool = False
 
 
@@ -1024,6 +1034,51 @@ class TrustedPrincipalGrantConsumer:
         except Exception:
             return False
 
+    def _issue_dynamic_teamlead_runner_record(
+        self,
+        operations: DynamicTeamleadRunnerOperations,
+        active: _ActiveStart,
+        binding: _DynamicTeamleadRunnerBinding,
+    ) -> _DynamicTeamleadRunnerRecord:
+        reference = object()
+        permit = object.__new__(RootDynamicTeamleadRunnerPermit)
+        values = (
+            ("opaque_reference", reference),
+            ("principal_diagnostic", "<redacted>"),
+            ("identity_diagnostic", "<redacted>"),
+            ("snapshot_generation", binding.snapshot_generation),
+            ("policy_generation", binding.expectation[3]),
+            ("release_diagnostic", "<redacted>"),
+            ("root_generation", binding.root_generation),
+        )
+        for name, value in values:
+            object.__setattr__(permit, name, value)
+        executor = object.__new__(_ConsumerDynamicTeamleadRunnerExecutor)
+        object.__setattr__(executor, "_consumer", self)
+        object.__setattr__(executor, "_permit", permit)
+        object.__setattr__(executor, "_operations", operations)
+        evidence = object.__new__(RootDynamicTeamleadRunnerBindingEvidence)
+        evidence_values = (
+            ("executor_identity", executor),
+            ("context_identity", self._context),
+            ("snapshot_identity", self._context.snapshot),
+            ("release_identity", self._bound_service._release),
+        )
+        for name, value in evidence_values:
+            object.__setattr__(evidence, name, value)
+        object.__setattr__(executor, "_binding_evidence", evidence)
+        record = _DynamicTeamleadRunnerRecord(
+            permit,
+            reference,
+            executor,
+            evidence,
+            operations,
+            active,
+            binding,
+        )
+        self._runner_records[id(permit)] = record
+        return record
+
     def issue_dynamic_teamlead_runner(
         self,
         operations: DynamicTeamleadRunnerOperations,
@@ -1056,43 +1111,83 @@ class TrustedPrincipalGrantConsumer:
             ):
                 _fail("dynamic_teamlead_runner_permit_invalid")
             binding = self._dynamic_teamlead_runner_binding(service, active)
-            reference = object()
-            permit = object.__new__(RootDynamicTeamleadRunnerPermit)
-            values = (
-                ("opaque_reference", reference),
-                ("principal_diagnostic", "<redacted>"),
-                ("identity_diagnostic", "<redacted>"),
-                ("snapshot_generation", binding.snapshot_generation),
-                ("policy_generation", binding.expectation[3]),
-                ("release_diagnostic", "<redacted>"),
-                ("root_generation", binding.root_generation),
+            record = self._issue_dynamic_teamlead_runner_record(
+                operations, active, binding
             )
-            for name, value in values:
-                object.__setattr__(permit, name, value)
-            executor = object.__new__(_ConsumerDynamicTeamleadRunnerExecutor)
-            object.__setattr__(executor, "_consumer", self)
-            object.__setattr__(executor, "_permit", permit)
-            object.__setattr__(executor, "_operations", operations)
-            evidence = object.__new__(RootDynamicTeamleadRunnerBindingEvidence)
-            evidence_values = (
-                ("executor_identity", executor),
-                ("context_identity", self._context),
-                ("snapshot_identity", self._context.snapshot),
+            return record.permit, record.executor
+
+    def issue_root_owned_dynamic_teamlead_start_composition(
+        self,
+        context: DynamicTeamleadA3RuntimeContext,
+        registry_operations: FleetV2RegistryOperations,
+        broker_operations: SeqpacketBrokerClientOperations,
+        operations: DynamicTeamleadRunnerOperations,
+    ) -> RootDynamicTeamleadStartComposition:
+        service = self._bound_service
+        if (
+            self._closed
+            or type(service) is not HomeBrokerControlService
+        ):
+            _fail("dynamic_teamlead_runner_permit_invalid")
+        try:
+            execute = operations.execute
+        except Exception:
+            _fail("dynamic_teamlead_runner_operations_invalid")
+        if not callable(execute):
+            _fail("dynamic_teamlead_runner_operations_invalid")
+        try:
+            validated_context = validate_dynamic_teamlead_a3_runtime_context(context)
+            registry_snapshot = registry_operations._snapshot
+            broker_context_identity = broker_operations.a3_context_identity
+            broker_release_identity = broker_operations.release_identity
+        except RootSystemBusError:
+            raise
+        except Exception:
+            _fail("dynamic_teamlead_runner_permit_invalid")
+        if (
+            validated_context is not context
+            or type(registry_operations) is not FleetV2RegistryOperations
+            or type(broker_operations) is not SeqpacketBrokerClientOperations
+            or context.context is not self._context
+            or context.release is not service._release
+            or registry_snapshot is not context.context.snapshot
+            or broker_context_identity is not context
+            or broker_release_identity is not service._release
+        ):
+            _fail("dynamic_teamlead_runner_permit_invalid")
+        active = self._active_start
+        if type(active) is not _ActiveStart:
+            _fail("dynamic_teamlead_runner_permit_invalid")
+        with self._runner_lock:
+            if active is not self._active_start or any(
+                record.active is active for record in self._runner_records.values()
+            ):
+                _fail("dynamic_teamlead_runner_permit_invalid")
+        self._reattest(service, active.attestation)
+        with self._runner_lock:
+            if active is not self._active_start or any(
+                record.active is active for record in self._runner_records.values()
+            ):
+                _fail("dynamic_teamlead_runner_permit_invalid")
+            binding = self._dynamic_teamlead_runner_binding(service, active)
+            record = self._issue_dynamic_teamlead_runner_record(
+                operations, active, binding
+            )
+            composition = object.__new__(RootDynamicTeamleadStartComposition)
+            values = (
+                ("request", context.request),
+                ("registry_operations", registry_operations),
+                ("broker_operations", broker_operations),
+                ("executor", record.executor),
+                ("evidence", record.evidence),
+                ("context_identity", context),
+                ("snapshot_identity", context.context.snapshot),
                 ("release_identity", service._release),
             )
-            for name, value in evidence_values:
-                object.__setattr__(evidence, name, value)
-            object.__setattr__(executor, "_binding_evidence", evidence)
-            self._runner_records[id(permit)] = _DynamicTeamleadRunnerRecord(
-                permit,
-                reference,
-                executor,
-                evidence,
-                operations,
-                active,
-                binding,
-            )
-            return permit, executor
+            for name, value in values:
+                object.__setattr__(composition, name, value)
+            record.composition = composition
+            return composition
 
     def _execute_issued_dynamic_teamlead_runner(
         self,

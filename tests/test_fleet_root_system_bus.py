@@ -26,12 +26,21 @@ import codex_master.fleet_root_system_bus as system_bus
 import codex_master.fleet_home_broker_runtime as runtime
 import codex_master.fleet_home_broker_system as broker_system
 import codex_master.dynamic_teamlead_a3_runner as runner
+from codex_master.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
+from codex_master.dynamic_teamlead_a3_runtime_provider import (
+    DynamicTeamleadA3RuntimeContext,
+)
+from codex_master.dynamic_teamlead_coordinator import DynamicTeamleadCoordinatorRequest
 from codex_master.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
 from codex_master.fleet_home_broker_identity import BrokerIdentity
+from codex_master.fleet_home_broker_client_seqpacket import (
+    SeqpacketBrokerClientOperations,
+)
 from codex_master.fleet_home_broker_protocol import PrincipalBinding
 from codex_master.fleet_home_broker_client import AttestedHome
 from codex_master.fleet_home_broker_protocol import (
     B2aRecoveryPhase,
+    AttestHomeRequest,
     BindingExpectation,
     BrokerCheckpoint,
     BrokerObservation,
@@ -45,6 +54,7 @@ from codex_master.fleet_home_broker_protocol import (
     DirectoryIdentity,
     HomeAttestation,
     PolicyBinding,
+    ProvisionHomeRequest,
     TransactionBinding,
     TransactionStatus,
 )
@@ -562,6 +572,110 @@ def runner_plan(context: TrustedPrincipalGrantContext) -> DynamicTeamleadRunnerP
         context.identity,
         runner_home(context),
     )
+
+
+def a3_runtime_context(
+    context: TrustedPrincipalGrantContext, release: BrokerReleaseSpec
+) -> DynamicTeamleadA3RuntimeContext:
+    expected = BindingExpectation(
+        context.expected_principal.agent_id,
+        context.expected_principal.manifest_generation,
+        context.expected_principal.unit_generation,
+        context.identity.policy_generation,
+        context.identity.projection_digest,
+        context.expected_principal.fencing_epoch,
+    )
+    binding = TransactionBinding(
+        ChpbTransactionOperation.PROVISION,
+        "b" * 32,
+        "b" * 32,
+        context.expected_principal,
+        PolicyBinding(
+            context.identity.policy_generation,
+            context.identity.projection_digest,
+        ),
+    )
+    request = DynamicTeamleadCoordinatorRequest(
+        context.snapshot,
+        context.selection,
+        context.profile_binding,
+        context.snapshot.runtime_principals[0],
+        context.expected_principal,
+        context.identity,
+        ProvisionHomeRequest(
+            "CHPB/2",
+            ChpbMessageKind.PROVISION_HOME,
+            "c" * 32,
+            "b" * 32,
+            expected,
+            binding,
+        ),
+        (),
+        AttestHomeRequest(
+            "CHPB/2",
+            ChpbMessageKind.ATTEST_HOME,
+            "d" * 32,
+            "b" * 32,
+            expected,
+        ),
+    )
+    return DynamicTeamleadA3RuntimeContext(context, request, release)
+
+
+class NoIoRegistryStore:
+    def __init__(self) -> None:
+        self.load_calls = 0
+        self.commit_calls = 0
+
+    def load(self) -> FleetSnapshotV2:
+        self.load_calls += 1
+        raise AssertionError("registry I/O is not part of composition issuance")
+
+    def commit_snapshot(
+        self, snapshot: FleetSnapshotV2, *, expected_generation: int
+    ) -> FleetSnapshotV2:
+        del snapshot, expected_generation
+        self.commit_calls += 1
+        raise AssertionError("registry I/O is not part of composition issuance")
+
+
+class NoIoBrokerExchange:
+    def __init__(self) -> None:
+        self.exchange_calls = 0
+
+    def exchange(self, request: object) -> object:
+        del request
+        self.exchange_calls += 1
+        raise AssertionError("broker I/O is not part of composition issuance")
+
+    def fstat(self, fd: int) -> object:
+        del fd
+        raise AssertionError("broker I/O is not part of composition issuance")
+
+    def close(self, fd: int) -> None:
+        del fd
+        raise AssertionError("broker I/O is not part of composition issuance")
+
+
+def composition_inputs(
+    consumer: TrustedPrincipalGrantConsumer, service: HomeBrokerControlService
+) -> tuple[
+    DynamicTeamleadA3RuntimeContext,
+    FleetV2RegistryOperations,
+    SeqpacketBrokerClientOperations,
+    NoIoRegistryStore,
+    NoIoBrokerExchange,
+]:
+    context = a3_runtime_context(consumer._context, service._release)
+    store = NoIoRegistryStore()
+    registry = FleetV2RegistryOperations(store, context.context.snapshot)
+    exchange = NoIoBrokerExchange()
+    broker = SeqpacketBrokerClientOperations(
+        exchange,
+        a3_context_identity=context,
+        release_identity=service._release,
+    )
+    return context, registry, broker, store, exchange
 
 
 def offline_runner_authority(
@@ -3073,3 +3187,95 @@ def test_real_pidfd_proc_cgroup_systemd_selinux_negative_has_no_fd_leak() -> Non
         child.stdin.write(b"x")
         child.stdin.close()
         child.wait(timeout=5)
+
+
+def test_consumer_issues_ledger_owned_start_composition_without_runtime_effect(
+    runner_authority,
+) -> None:
+    _host, consumer, service, trusted = runner_authority
+    context, registry, broker, store, exchange = composition_inputs(consumer, service)
+    operations = RecordingRunnerOperations()
+
+    composition = consumer.issue_root_owned_dynamic_teamlead_start_composition(
+        context,
+        registry,
+        broker,
+        operations,
+    )
+    record = consumer._runner_records[id(composition.executor._permit)]
+
+    assert composition.request is context.request
+    assert composition.registry_operations is registry
+    assert composition.broker_operations is broker
+    assert composition.executor is record.executor
+    assert composition.evidence is record.evidence
+    assert composition.context_identity is context
+    assert composition.snapshot_identity is trusted.snapshot
+    assert composition.release_identity is service._release
+    assert record.composition is composition
+    assert composition.executor.binding_evidence is composition.evidence
+    assert store.load_calls == 0
+    assert store.commit_calls == 0
+    assert exchange.exchange_calls == 0
+    assert operations.calls == []
+
+
+def test_second_start_composition_issuance_fails_for_same_active_record(
+    runner_authority,
+) -> None:
+    _host, consumer, service, _trusted = runner_authority
+    context, registry, broker, _store, _exchange = composition_inputs(consumer, service)
+    consumer.issue_root_owned_dynamic_teamlead_start_composition(
+        context,
+        registry,
+        broker,
+        RecordingRunnerOperations(),
+    )
+
+    with pytest.raises(RootSystemBusError):
+        consumer.issue_root_owned_dynamic_teamlead_start_composition(
+            context,
+            registry,
+            broker,
+            RecordingRunnerOperations(),
+        )
+
+
+@pytest.mark.parametrize("mismatch", ("context", "snapshot", "broker_context", "broker_release", "operations"))
+def test_composition_issuance_rejects_identity_or_operations_mismatch(
+    runner_authority,
+    mismatch: str,
+) -> None:
+    _host, consumer, service, _trusted = runner_authority
+    context, registry, broker, store, exchange = composition_inputs(consumer, service)
+    if mismatch == "context":
+        context = replace(context, context=replace(context.context))
+    elif mismatch == "snapshot":
+        foreign_snapshot = replace(context.context.snapshot)
+        registry = FleetV2RegistryOperations(NoIoRegistryStore(), foreign_snapshot)
+    elif mismatch == "broker_context":
+        broker = SeqpacketBrokerClientOperations(
+            exchange,
+            a3_context_identity=object(),
+            release_identity=service._release,
+        )
+    elif mismatch == "broker_release":
+        broker = SeqpacketBrokerClientOperations(
+            exchange,
+            a3_context_identity=context,
+            release_identity=replace(service._release),
+        )
+    else:
+        operations = object()
+
+    with pytest.raises(RootSystemBusError):
+        consumer.issue_root_owned_dynamic_teamlead_start_composition(
+            context,
+            registry,
+            broker,
+            operations if mismatch == "operations" else RecordingRunnerOperations(),
+        )
+
+    assert store.load_calls == 0
+    assert store.commit_calls == 0
+    assert exchange.exchange_calls == 0

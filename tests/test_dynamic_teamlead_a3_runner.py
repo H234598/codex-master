@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
-from dataclasses import fields
+from dataclasses import FrozenInstanceError, fields
 import gc
 import importlib
 import inspect
@@ -57,6 +57,7 @@ def test_runner_module_exports_only_data_permit_and_operations_protocol() -> Non
         "DynamicTeamleadRunnerOperations",
         "RootDynamicTeamleadRunnerPermit",
         "RootDynamicTeamleadRunnerBindingEvidence",
+        "RootDynamicTeamleadStartComposition",
     )
     assert inspect.isclass(module.RootDynamicTeamleadRunnerPermit)
     assert inspect.isclass(
@@ -191,3 +192,61 @@ def test_no_production_callable_accepts_injected_authority_capability() -> None:
                 node.name,
                 names,
             )
+
+
+def reconstructed_composition():
+    composition_type = getattr(
+        runner_module(), "RootDynamicTeamleadStartComposition", None
+    )
+    assert composition_type is not None
+    composition = object.__new__(composition_type)
+    values = {
+        "request": object(),
+        "registry_operations": object(),
+        "broker_operations": object(),
+        "executor": object(),
+        "evidence": reconstructed_evidence(),
+        "context_identity": object(),
+        "snapshot_identity": object(),
+        "release_identity": object(),
+    }
+    for name, value in values.items():
+        object.__setattr__(composition, name, value)
+    return composition
+
+
+def test_start_composition_is_redacted_frozen_and_nontransferable() -> None:
+    composition_type = getattr(
+        runner_module(), "RootDynamicTeamleadStartComposition", None
+    )
+    assert composition_type is not None
+
+    with pytest.raises(TypeError):
+        composition_type(*((object(),) * 8))
+
+    composition = reconstructed_composition()
+    assert [field.name for field in fields(composition_type)] == [
+        "request",
+        "registry_operations",
+        "broker_operations",
+        "executor",
+        "evidence",
+        "context_identity",
+        "snapshot_identity",
+        "release_identity",
+    ]
+    assert not hasattr(composition, "__dict__")
+    assert repr(composition) == "<RootDynamicTeamleadStartComposition redacted>"
+    assert str(composition) == repr(composition)
+
+    with pytest.raises(FrozenInstanceError):
+        composition.request = object()
+
+    for transfer in (copy.copy, copy.deepcopy, pickle.dumps):
+        with pytest.raises(TypeError):
+            transfer(composition)
+
+    with pytest.raises(TypeError):
+
+        class ForgedComposition(composition_type):
+            pass

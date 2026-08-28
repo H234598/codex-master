@@ -79,6 +79,42 @@ class RootDynamicTeamleadRunnerBindingEvidence(_NonTransferableBindingEvidence):
         raise TypeError("root_dynamic_teamlead_runner_binding_evidence_not_subclassable")
 
 
+class _NonTransferableStartComposition:
+    __slots__ = ()
+
+    def __init__(self) -> None:
+        raise TypeError("root_dynamic_teamlead_start_composition_factory_required")
+
+    def __copy__(self):
+        raise TypeError("root_dynamic_teamlead_start_composition_not_cloneable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("root_dynamic_teamlead_start_composition_not_cloneable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("root_dynamic_teamlead_start_composition_not_serializable")
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__} redacted>"
+
+    __str__ = __repr__
+
+
+@dataclass(frozen=True, slots=True, init=False, repr=False)
+class RootDynamicTeamleadStartComposition(_NonTransferableStartComposition):
+    request: object
+    registry_operations: object
+    broker_operations: object
+    executor: object
+    evidence: RootDynamicTeamleadRunnerBindingEvidence
+    context_identity: object
+    snapshot_identity: object
+    release_identity: object
+
+    def __init_subclass__(cls, **_kwargs: object) -> None:
+        raise TypeError("root_dynamic_teamlead_start_composition_not_subclassable")
+
+
 class DynamicTeamleadRunnerOperations(Protocol):
     def execute(
         self,
@@ -92,4 +128,5 @@ __all__ = (
     "DynamicTeamleadRunnerOperations",
     "RootDynamicTeamleadRunnerPermit",
     "RootDynamicTeamleadRunnerBindingEvidence",
+    "RootDynamicTeamleadStartComposition",
 )
