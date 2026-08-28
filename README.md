@@ -63,7 +63,7 @@ Status detects mixed or foreign state and the operator must recover manually.
 Rollback independently attempts both units, temp/backup cleanup, daemon-reload,
 UnitFileState restoration, and ActiveState restoration. Unknown state causes no
 guess. Initial `not-found` is valid only with inactive `LoadState=not-found`;
-otherwise UnitFileState must be `static`, `disabled`, `enabled`, or `enabled-runtime`, and
+otherwise UnitFileState must be `disabled`, `enabled`, or `enabled-runtime`, and
 ActiveState must be active/inactive. State restoration uses exact persistent vs
 runtime flags and never skips ActiveState recovery after UnitFileState failure.
 Public errors contain codes/return codes only, never paths or raw output.
@@ -86,7 +86,7 @@ BindReadOnlyPaths exposes only the installed monitor layout, fixed catalogs, and
 - `/home/teladi/.codex-agents/c1` through `/home/teladi/.codex-agents/c100`
 
 Legacy selectors `a` and `b` map to `a1` and `b1`; `both` maps to `a1,b1`.
-Series selectors `a-series`, `b-series`, `c-series`, `u-series`, and `all` are available
+Series selectors `a-series`, `b-series`, `c-series`, and `all` are available
 for status, skills, capabilities, lease status, start/stop, and watchdog calls.
 Selectors are case-insensitive, so `A1`, `a1`, `A-Series`, and `a-series`
 resolve identically. Numeric single-Agentin selectors use the current selector
@@ -369,8 +369,9 @@ snapshot schema v3, at most 26 series and 25 visible rows per series page;
 limited rows are status-only. Real provider credentials, account probes,
 Ollama resource admission, and desktop-session acceptance remain explicit
 local gates. Ollama series remain `simple_only` and reject complex or
-repository-changing tasks. Shared host-pressure gates remain enforced; there
-is no numeric global, series, or provider concurrency cap.
+repository-changing tasks. Their configured separate two-agent resource cap
+and host-pressure gates are enforced; the global ten-Bee cap remains an
+additional upper bound.
 
 ## Tools
 
@@ -506,8 +507,6 @@ Public, secret-free configuration examples live in
 - `agent_pool_status`: inspect data-sparse pool installation counts
 - `agent_pool_copy_auth`: explicitly copy one source `auth.json` to many
   installed Agentinnen, dry-run by default
-- `pool refresh_auth`: refresh one stopped Agentin from her mapped canonical
-  codex-usage profile, dry-run by default
 - `agent_pool_destroy_pool`: guarded removal of installed Agentinnen homes
 - `agent_doctor`: structured diagnostics without raw output
 - `agent_selection_options`: account- and authority-filtered first-round offer
@@ -628,20 +627,19 @@ PYTHONPATH=src python -m codex_master.server spawn-offers --required-slots 1
 lokale editable Installation kann auf einen anderen Quellstand zeigen.
 
 Ein Offer ist advisory, gilt 5 Sekunden und reserviert nichts
-(`reservation: "none"`). `start` prueft Ressourcendruck, Cgroup-Scope und
-weitere unabhaengige Admission-Gates unter dem Admission-Lock erneut.
-Session-/Native-Gesamtzahlen bleiben Observability-Evidenz; fehlende oder
-unbekannte Zahlen leeren Offers nicht. Die data-sparse Antwort enthaelt nur Reason-Codes, keine
+(`reservation: "none"`). `start` prueft freie Gesamtslots vor einem neuen
+tmux-Start unter dem Admission-Lock erneut. Ohne belastbare Gesamtzahl bleiben
+Offers leer; die data-sparse Antwort enthaelt nur Reason-Codes, keine
 `/proc`-Inhalte, tmux-Ausgabe, lokalen Pfade oder Environment-Texte. Sie ist
 retryable mit 15 Sekunden Wartehinweis.
 
 Temporäre Grenzen fuer einen neuen Start:
 
 - Ressourcendruck-Grenzen bleiben mit ihren bisherigen Werten konfiguriert und aktiv: CPU, Load, I/O-Wait und RAM können Spawn fail-closed blockieren.
-- Ollama bleibt `simple_only`; diese Capability-Grenze und Ressourcendruck gelten auch ohne numerische Providergrenze.
-- Es gibt keine numerische globale, Serien- oder Provider-Spawn-Grenze. Konfigurierte Homes und Agentinnen zaehlen nur Inventar, nicht Concurrency.
-- Laufende Masterjet-Sessions sowie aktive und unbestaetigte native Subagentinnen bleiben reine Observability-Evidenz.
-- `required_slots` liegt zwischen 1 und 10 und begrenzt nur einen einzelnen Operator-/Batch-Aufruf, nie laufende Concurrency.
+- die konfigurierte Ollama-Zweiergrenze bleibt erhalten und wird vor der globalen Zehnergrenze durchgesetzt
+- hoechstens `10` Bienen insgesamt; laufende Masterjet-Sessions sowie aktive und unbestaetigte native Subagentinnen zaehlen zusammen
+- ab `10` Bienen wird jede weitere Biene hart abgewiesen
+- `required_slots` liegt zwischen 1 und 10
 
 Verweigerte Admission-Antworten enthalten neben stabilen `reason_codes` eine
 strukturierte `errors`-Tabelle. Jeder Eintrag liefert `code`, `title`,
@@ -650,13 +648,16 @@ nicht aufgenommen.
 
 | Code | Bedeutung |
 |---|---|
-| `session_metrics_unavailable` | Masterjet kann Gesamtzahl nicht belastbar bestimmen; reine Observability, außer bei session-gebundenen Lifecycle-Nachweisen. |
+| `running_agent_limit` | Globale Zehnergrenze bereits erreicht. |
+| `insufficient_slots` | Anfrage passt nicht vollstaendig in verbleibende Gesamtslots. |
+| `session_metrics_unavailable` | Masterjet kann Gesamtzahl nicht belastbar bestimmen. |
 | `policy_invalid` | Konfigurierte Werte oder Enforcement-Flags sind ungueltig. |
 | `cpu_metrics_unavailable` | CPU-Evidenz fehlt; relevant, wenn Druck-Enforcement aktiv ist. |
 | `memory_metrics_unavailable` | Speicherevidenz fehlt; relevant, wenn Druck-Enforcement aktiv ist. |
 | `cpu_pressure_high` | Aktive CPU-Grenze ueberschritten. |
 | `io_pressure_high` | Aktive I/O-Wait-Grenze ueberschritten. |
 | `memory_pressure_high` | Aktive Speichergrenze unterschritten. |
+| `ollama_concurrency_limit` | Konfigurierte aktive Ollama-Zweiergrenze erreicht. |
 | `ollama_simple_task_only` | Aufgabe verletzt Ollama-Capability-Gate. |
 
 `CODEX_MASTER_SPAWN_PRIORITY` ist einzige Spawn-Environment-Konfiguration.
@@ -736,7 +737,6 @@ python3 -m codex_master.server pool validate --spec codex-agent-pool.json
 python3 -m codex_master.server pool install --spec codex-agent-pool.json --target-dir "$HOME/.codex-agents" --codex-bin /usr/local/bin/codex
 python3 -m codex_master.server pool status --spec codex-agent-pool.json
 python3 -m codex_master.server pool copy_auth --spec codex-agent-pool.json --from-agent a1 --to a-series
-python3 -m codex_master.server pool refresh_auth --spec codex-agent-pool.json --agent a2
 python3 -m codex_master.server pool destroy_pool --spec codex-agent-pool.json --yes
 python3 -m codex_master.server send a "Kurzer Auftrag"
 python3 -m codex_master.server release b
@@ -765,13 +765,9 @@ present and valid. Shared-asset diagnostics are counts only; local link targets
 and pool paths are not returned. Pool status also returns series counts without
 echoing concrete series names.
 
-The spec is only the map and never contains credentials. Each Codex series may
-declare its `codex_usage_account`; when a new home is provisioned, Masterjet
-copies the canonical regular file from
-`/home/teladi/.local/share/codex-usage/profiles/<ACCOUNT>/codex-home/auth.json`
-to the home (for example `~/.codex-agents/a1/auth.json`). Existing target auth
-is preserved. A missing canonical profile fails closed; no other account is
-silently substituted.
+The spec is only the map. The actual auth material is still the per-home
+`auth.json`, for example `~/.codex-agents/a1/auth.json`. Normal install never
+copies auth material.
 
 Two install paths are supported:
 
@@ -781,17 +777,12 @@ Two install paths are supported:
 ```
 
 Use `--codex-bin` when the Codex CLI binary is not `/usr/local/bin/codex`.
-For bulk auth propagation, run
+Normal install never copies auth material. For bulk auth propagation, run
 `pool copy_auth` first without `--yes` to inspect counts, then repeat with
 `--yes` when intentional. `copy_auth` copies only `auth.json`, skips the source
 Agentin when she is part of the target selector, requires the source Agentin home
 to be a real directory, and never returns auth content, the source Agentin id, or
 the requested target selector.
-
-For one stopped Agentin, `pool refresh_auth --agent a2` is a dry-run. Repeat
-with `--yes` to atomically replace `a2`'s stale private auth file from only her
-mapped canonical codex-usage profile. It blocks running or in-use homes and has
-no home-to-home or cross-account fallback.
 
 Do not use symlinks or hardlinks for `auth.json` in the normal pool model.
 Auth files are small; copies keep each Agentin isolated. Symlinks cross the

@@ -23,6 +23,3 @@ google-account-manager = "codex_master.google_account_manager_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-codex_master = ["markdown/*.md", "markdown/classes/*.md"]
