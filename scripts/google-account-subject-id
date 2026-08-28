@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Resolve a Google Account OIDC subject and optionally store it privately."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+from typing import Any
+
+import yaml
+
+
+DEFAULT_YAML_PATH = Path(
+    os.environ.get(
+        "CODEX_MASTER_MCP_API_TOKEN_YAML",
+        "~/.config/codex-master-mcp/api-token.yaml",
+    )
+).expanduser()
+OIDC_SCOPES = ("openid", "https://www.googleapis.com/auth/userinfo.email")
+ACCOUNT_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*")
+
+
+class IdentityError(RuntimeError):
+    """Raised when identity discovery or private storage is unsafe."""
+
+
+def require_private_regular_file(path: Path, *, label: str) -> os.stat_result:
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        raise IdentityError(f"{label} path must be absolute")
+    try:
+        file_stat = expanded.lstat()
+    except OSError as exc:
+        raise IdentityError(f"{label} is unavailable: {expanded}") from exc
+    if (
+        not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_nlink != 1
+        or file_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(file_stat.st_mode) & 0o077
+    ):
+        raise IdentityError(
+            f"{label} must be a private regular file owned by the current user (chmod 600): {expanded}"
+        )
+    return file_stat
+
+
+def load_client_id(path: Path) -> str:
+    require_private_regular_file(path, label="OAuth client-secrets file")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise IdentityError("OAuth client-secrets file is not valid JSON") from exc
+    if not isinstance(document, dict) or not isinstance(document.get("installed"), dict):
+        raise IdentityError("OAuth client-secrets file must contain an installed-app client")
+    client_id = document["installed"].get("client_id")
+    if not isinstance(client_id, str) or not client_id:
+        raise IdentityError("OAuth client-secrets file has no client_id")
+    return client_id
+
+
+def google_oidc_subject(
+    client_secrets: Path,
+    *,
+    open_browser: bool,
+    port: int,
+) -> dict[str, Any]:
+    client_id = load_client_id(client_secrets)
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.id_token import verify_oauth2_token
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError as exc:
+        raise IdentityError(
+            "Google OIDC libraries are missing; install the project extra with "
+            "python3 -m pip install '.[google-identity]'"
+        ) from exc
+
+    flow = InstalledAppFlow.from_client_secrets_file(
+        str(client_secrets),
+        scopes=list(OIDC_SCOPES),
+    )
+    credentials = flow.run_local_server(
+        host="127.0.0.1",
+        port=port,
+        open_browser=open_browser,
+        prompt="select_account",
+        access_type="online",
+        authorization_prompt_message="Open this URL to select exactly one Google Account:\n{url}",
+        success_message="Google identity verified. You may close this window.",
+    )
+    encoded_id_token = credentials.id_token
+    if not isinstance(encoded_id_token, str) or not encoded_id_token:
+        raise IdentityError("Google returned no ID token")
+    try:
+        claims = verify_oauth2_token(encoded_id_token, Request(), audience=client_id)
+    except Exception as exc:
+        raise IdentityError("Google ID token verification failed") from exc
+    subject_id = claims.get("sub")
+    if (
+        not isinstance(subject_id, str)
+        or not subject_id
+        or len(subject_id) > 255
+        or not subject_id.isascii()
+    ):
+        raise IdentityError("verified Google ID token has no valid subject_id")
+    email = claims.get("email")
+    if email is not None and not isinstance(email, str):
+        raise IdentityError("verified Google ID token has an invalid email claim")
+    return {
+        "subject_id": subject_id,
+        "email": email,
+        "email_verified": claims.get("email_verified") is True,
+        "issuer": claims.get("iss"),
+    }
+
+
+def load_private_yaml(path: Path) -> dict[str, Any]:
+    require_private_regular_file(path, label="Masterjet API-token YAML")
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise IdentityError("Masterjet API-token YAML is invalid") from exc
+    if not isinstance(document, dict) or set(document) != {"schema_version", "google_accounts"}:
+        raise IdentityError("Masterjet API-token YAML does not use the slim schema")
+    if document.get("schema_version") != 1:
+        raise IdentityError("unsupported Masterjet API-token YAML schema version")
+    if not isinstance(document.get("google_accounts"), list):
+        raise IdentityError("Masterjet API-token YAML google_accounts is invalid")
+    return document
+
+
+def validate_account_ref(value: str) -> str:
+    if not value or ACCOUNT_REF_RE.fullmatch(value) is None:
+        raise IdentityError("account ref must match [A-Za-z0-9][A-Za-z0-9_.:-]*")
+    return value
+
+
+def validate_label(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if any(ord(character) < 32 for character in value):
+        raise IdentityError("account label contains control characters")
+    return value
+
+
+def upsert_google_account(
+    document: dict[str, Any],
+    *,
+    account_ref: str,
+    subject_id: str,
+    login_email: str,
+    label: str | None,
+    replace: bool,
+) -> str:
+    account_ref = validate_account_ref(account_ref)
+    label = validate_label(label)
+    if not isinstance(subject_id, str) or not subject_id or len(subject_id) > 255 or not subject_id.isascii():
+        raise IdentityError("subject_id must be a non-empty ASCII string of at most 255 characters")
+    if not isinstance(login_email, str) or "@" not in login_email or any(ord(character) < 32 for character in login_email):
+        raise IdentityError("verified login email is invalid")
+    accounts = document.get("google_accounts")
+    if not isinstance(accounts, list):
+        raise IdentityError("google_accounts is not a list")
+
+    selected: dict[str, Any] | None = None
+    seen_refs: set[str] = set()
+    seen_subjects: set[str] = set()
+    seen_login_emails: set[str] = set()
+    allowed_account_keys = {
+        "ref",
+        "label",
+        "login_email",
+        "recovery_email",
+        "subject_id",
+        "billing_accounts",
+        "projects",
+    }
+    required_account_keys = allowed_account_keys - {"label"}
+    for account in accounts:
+        if (
+            not isinstance(account, dict)
+            or not required_account_keys <= set(account)
+            or not set(account) <= allowed_account_keys
+        ):
+            raise IdentityError("google_accounts contains an invalid record")
+        ref = account.get("ref")
+        if not isinstance(ref, str) or ACCOUNT_REF_RE.fullmatch(ref) is None or ref in seen_refs:
+            raise IdentityError("google_accounts contains an invalid or duplicate ref")
+        seen_refs.add(ref)
+        existing_login_email = account.get("login_email")
+        if not isinstance(existing_login_email, str) or "@" not in existing_login_email:
+            raise IdentityError("google_accounts contains an invalid login_email")
+        normalized_login_email = existing_login_email.casefold()
+        if normalized_login_email in seen_login_emails:
+            raise IdentityError("google_accounts contains a duplicate login_email")
+        seen_login_emails.add(normalized_login_email)
+        recovery_email = account.get("recovery_email")
+        if recovery_email is not None and (
+            not isinstance(recovery_email, str) or "@" not in recovery_email
+        ):
+            raise IdentityError("google_accounts contains an invalid recovery_email")
+        if not isinstance(account.get("billing_accounts"), list) or not isinstance(account.get("projects"), list):
+            raise IdentityError("google_accounts contains invalid nested collections")
+        existing_subject = account.get("subject_id")
+        if existing_subject is not None and (
+            not isinstance(existing_subject, str)
+            or not existing_subject
+            or len(existing_subject) > 255
+            or not existing_subject.isascii()
+        ):
+            raise IdentityError("google_accounts contains a non-string subject_id")
+        if existing_subject is not None:
+            if existing_subject in seen_subjects:
+                raise IdentityError("google_accounts already contains a duplicate subject_id")
+            seen_subjects.add(existing_subject)
+        if existing_subject == subject_id and ref != account_ref:
+            raise IdentityError(f"subject_id is already assigned to account ref {ref}")
+        if ref == account_ref:
+            selected = account
+
+    if selected is None:
+        if login_email.casefold() in seen_login_emails:
+            raise IdentityError("verified login email is already assigned to another account ref")
+        selected = {
+            "ref": account_ref,
+            "login_email": login_email,
+            "recovery_email": None,
+            "subject_id": subject_id,
+            "billing_accounts": [],
+            "projects": [],
+        }
+        if label is not None:
+            selected["label"] = label
+        accounts.append(selected)
+        return "created"
+
+    existing_login_email = selected["login_email"]
+    if existing_login_email.casefold() != login_email.casefold():
+        raise IdentityError(
+            f"selected Google login email does not match account ref {account_ref}"
+        )
+    previous_subject = selected.get("subject_id")
+    if previous_subject not in (None, subject_id) and not replace:
+        raise IdentityError(
+            "account ref already has a different subject_id; use --replace-subject to replace it"
+        )
+    selected["subject_id"] = subject_id
+    if label is not None:
+        selected["label"] = label
+    return "unchanged" if previous_subject == subject_id and label is None else "updated"
+
+
+def atomic_write_private_yaml(path: Path, document: dict[str, Any]) -> None:
+    require_private_regular_file(path, label="Masterjet API-token YAML")
+    parent = path.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise IdentityError("Masterjet API-token YAML parent must be a real directory")
+    payload = yaml.safe_dump(
+        document,
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+    ).encode("utf-8")
+    previous_umask = os.umask(0o077)
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=parent)
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.umask(previous_umask)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Resolve a Google OIDC subject without retaining OAuth tokens.",
+    )
+    result.add_argument("--client-secrets", type=Path, required=True)
+    result.add_argument("--no-browser", action="store_true")
+    result.add_argument("--port", type=int, default=0, help="loopback callback port; 0 chooses a free port")
+    result.add_argument("--write", action="store_true", help="store subject_id in the private Masterjet YAML")
+    result.add_argument("--yaml", type=Path, default=DEFAULT_YAML_PATH)
+    result.add_argument("--account-ref")
+    result.add_argument("--label")
+    result.add_argument("--replace-subject", action="store_true")
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        if not 0 <= args.port <= 65535:
+            raise IdentityError("--port must be between 0 and 65535")
+        if args.write and not args.account_ref:
+            raise IdentityError("--write requires --account-ref")
+        if not args.write and (args.account_ref or args.label or args.replace_subject):
+            raise IdentityError("--account-ref, --label, and --replace-subject require --write")
+
+        identity = google_oidc_subject(
+            args.client_secrets.expanduser(),
+            open_browser=not args.no_browser,
+            port=args.port,
+        )
+        result: dict[str, Any] = dict(identity)
+        result["oauth_tokens_stored"] = False
+        if args.write:
+            if identity.get("email_verified") is not True or not isinstance(identity.get("email"), str):
+                raise IdentityError("Google must return a verified email before subject_id can be stored")
+            yaml_path = args.yaml.expanduser()
+            document = load_private_yaml(yaml_path)
+            action = upsert_google_account(
+                document,
+                account_ref=args.account_ref,
+                subject_id=identity["subject_id"],
+                login_email=identity["email"],
+                label=args.label,
+                replace=args.replace_subject,
+            )
+            atomic_write_private_yaml(yaml_path, document)
+            result.update({"yaml_updated": True, "account_ref": args.account_ref, "action": action})
+        else:
+            result["yaml_updated"] = False
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    except (IdentityError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

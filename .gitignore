@@ -20,3 +20,7 @@ env/
 .tmp/
 tmp/
 .codex-master-worktrees/
+
+# Private Google OAuth desktop-client downloads
+client_secret*.json
+oauth-client*.json

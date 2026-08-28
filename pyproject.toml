@@ -7,7 +7,15 @@ name = "codex-master"
 version = "0.10.5"
 description = "Local MCP wrapper for controlling a sleeping Codex Agentinnen pool via tmux"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+google-identity = [
+    "google-auth>=2.35",
+    "google-auth-oauthlib>=1.2",
+]
 
 [project.scripts]
 codex-master-mcp = "codex_master.server:main"
@@ -15,3 +23,6 @@ google-account-manager = "codex_master.google_account_manager_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+codex_master = ["markdown/*.md", "markdown/classes/*.md"]
