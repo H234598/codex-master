@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import re
 from types import MappingProxyType
-from typing import Never
+from typing import Never, cast
 import unicodedata
 from urllib.parse import unquote
 
@@ -15,12 +15,44 @@ from urllib.parse import unquote
 _OPERATIONS = frozenset({
     "openai.accounts.list", "google.accounts.list", "google.projects.list", "hosts.list",
     "operations.get", "openai.auth.plan", "openai.auth.apply", "google.oauth.begin",
+    "secret.ingress.create", "google.oauth.complete",
+    "google.oauth-client-import.plan", "google.oauth-client-import.apply",
+    "google.inventory.refresh",
     "google.provision.plan", "google.provision.apply", "google.billing.plan",
     "google.billing.apply",
 })
-_GLOBAL_LISTS = frozenset({"openai.accounts.list", "google.accounts.list", "google.projects.list", "hosts.list"})
-_ACCOUNT_OPERATIONS = _OPERATIONS - _GLOBAL_LISTS - {"operations.get"}
-_APPLY_OPERATIONS = frozenset(operation for operation in _OPERATIONS if operation.endswith(".apply"))
+_GLOBAL_LISTS = frozenset({"openai.accounts.list", "google.accounts.list", "hosts.list"})
+_QUERY_OPERATIONS = _GLOBAL_LISTS | {"google.projects.list", "operations.get"}
+_COMMAND_OPERATIONS = _OPERATIONS - _QUERY_OPERATIONS
+_DIGEST_OPERATIONS = frozenset({
+    "openai.auth.apply", "secret.ingress.create", "google.oauth.complete",
+    "google.oauth-client-import.apply", "google.provision.apply", "google.billing.apply",
+})
+_ARGUMENT_FIELDS = {
+    "hosts.list": (),
+    "openai.accounts.list": (),
+    "google.accounts.list": (),
+    "google.projects.list": ("account_ref",),
+    "operations.get": ("account_ref", "operation_id"),
+    "openai.auth.plan": ("account_ref",),
+    "openai.auth.apply": ("account_ref",),
+    "secret.ingress.create": ("account_ref", "credential_kind"),
+    "google.oauth.begin": (
+        "account_ref", "oauth_client_ref", "redirect_uri", "scope_profile",
+    ),
+    "google.oauth.complete": (
+        "account_ref", "transaction_id", "redirect_uri", "state",
+    ),
+    "google.oauth-client-import.plan": ("account_ref",),
+    "google.oauth-client-import.apply": ("account_ref",),
+    "google.inventory.refresh": ("account_ref",),
+    "google.provision.plan": ("account_ref",),
+    "google.provision.apply": ("account_ref",),
+    "google.billing.plan": ("account_ref", "project_ref", "billing_ref"),
+    "google.billing.apply": (
+        "account_ref", "project_ref", "billing_ref", "plan_id",
+    ),
+}
 _REQUEST_FIELDS = frozenset({"schema_version", "operation", "arguments", "expected_generation", "idempotency_key", "plan_digest"})
 _MAX_TEXT_BYTES = 4096
 _MAX_KEY_BYTES = 128
@@ -159,31 +191,25 @@ def _mapping(value: object, *, private: bool = False) -> Mapping[str, object]:
     return result
 
 
-def _account_arguments(value: object) -> Mapping[str, object]:
-    arguments = _mapping(value)
-    if set(arguments) != {"account_ref"}:
-        _invalid()
-    return MappingProxyType({"account_ref": _token(arguments["account_ref"])})
-
-
 def _arguments(operation: str, value: object) -> Mapping[str, object]:
     arguments = _mapping(value)
-    if operation in _GLOBAL_LISTS:
-        if arguments:
-            _invalid()
-        return MappingProxyType({})
-    if operation == "operations.get":
-        if set(arguments) != {"operation_id"}:
-            _invalid()
-        return MappingProxyType({"operation_id": _token(arguments["operation_id"])})
-    return _account_arguments(arguments)
+    fields = _ARGUMENT_FIELDS[operation]
+    if set(arguments) != set(fields):
+        _invalid()
+    return MappingProxyType({
+        field: _text(arguments[field]) if field == "redirect_uri" else _token(arguments[field])
+        for field in fields
+    })
 
 
 def _reason_codes(value: object, *, private: bool = False) -> tuple[str, ...]:
     fail = _private if private else _invalid
-    if type(value) not in {list, tuple} or len(value) > 32:
+    if type(value) not in {list, tuple}:
         fail()
-    return tuple(_token(item, private=private) for item in value)
+    values = cast(list[object] | tuple[object, ...], value)
+    if len(values) > 32:
+        fail()
+    return tuple(_token(item, private=private) for item in values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,10 +226,13 @@ class AdminRequestV1:
             _invalid()
         object.__setattr__(self, "operation", operation)
         object.__setattr__(self, "arguments", _arguments(operation, self.arguments))
-        if operation in _APPLY_OPERATIONS:
+        if operation in _COMMAND_OPERATIONS:
             object.__setattr__(self, "expected_generation", _generation(self.expected_generation))
             object.__setattr__(self, "idempotency_key", _token(self.idempotency_key))
-            object.__setattr__(self, "plan_digest", _digest(self.plan_digest))
+            if operation in _DIGEST_OPERATIONS:
+                object.__setattr__(self, "plan_digest", _digest(self.plan_digest))
+            elif self.plan_digest is not None:
+                _invalid()
         elif any(value is not None for value in (self.expected_generation, self.idempotency_key, self.plan_digest)):
             _invalid()
 
@@ -303,8 +332,11 @@ def parse_admin_request(value: object) -> AdminRequestV1:
     if request.get("schema_version") != 1:
         _invalid()
     return AdminRequestV1(
-        request.get("operation"), request.get("arguments", {}), request.get("expected_generation"),
-        request.get("idempotency_key"), request.get("plan_digest"),
+        cast(str, request.get("operation")),
+        cast(Mapping[str, object], request.get("arguments", {})),
+        cast(int | None, request.get("expected_generation")),
+        cast(str | None, request.get("idempotency_key")),
+        cast(str | None, request.get("plan_digest")),
     )
 
 

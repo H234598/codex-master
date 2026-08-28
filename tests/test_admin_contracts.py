@@ -68,6 +68,147 @@ def test_apply_requires_all_concurrency_fields(missing: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("operation", "arguments", "requires_digest"),
+    [
+        ("openai.auth.plan", {"account_ref": "openai-one"}, False),
+        (
+            "secret.ingress.create",
+            {"account_ref": "openai-one", "credential_kind": "openai.auth-json"},
+            True,
+        ),
+        (
+            "google.oauth.begin",
+            {
+                "account_ref": "google-one",
+                "oauth_client_ref": "client-one",
+                "redirect_uri": "http://127.0.0.1/callback",
+                "scope_profile": "inventory_readonly",
+            },
+            False,
+        ),
+        (
+            "google.oauth.complete",
+            {
+                "account_ref": "google-one",
+                "transaction_id": "transaction-one",
+                "redirect_uri": "http://127.0.0.1/callback",
+                "state": "state-one",
+            },
+            True,
+        ),
+        ("google.oauth-client-import.plan", {"account_ref": "google-one"}, False),
+        ("google.oauth-client-import.apply", {"account_ref": "google-one"}, True),
+        ("google.inventory.refresh", {"account_ref": "google-one"}, False),
+        ("google.provision.plan", {"account_ref": "google-one"}, False),
+        (
+            "google.billing.plan",
+            {
+                "account_ref": "google-one",
+                "project_ref": "project-one",
+                "billing_ref": "billing-one",
+            },
+            False,
+        ),
+        (
+            "google.billing.apply",
+            {
+                "account_ref": "google-one",
+                "project_ref": "project-one",
+                "billing_ref": "billing-one",
+                "plan_id": "billing-plan-one",
+            },
+            True,
+        ),
+    ],
+)
+def test_command_contracts_require_generation_idempotency_and_optional_digest(
+    operation: str, arguments: dict[str, object], requires_digest: bool
+) -> None:
+    wire: dict[str, object] = {
+        "schema_version": 1,
+        "operation": operation,
+        "arguments": arguments,
+        "expected_generation": 4,
+        "idempotency_key": "request-one",
+    }
+    if requires_digest:
+        wire["plan_digest"] = DIGEST
+
+    request = parse_admin_request(wire)
+
+    assert request.operation == operation
+    assert request.expected_generation == 4
+    assert request.idempotency_key == "request-one"
+    assert request.plan_digest == (DIGEST if requires_digest else None)
+
+
+def test_operations_get_is_account_bound() -> None:
+    request = parse_admin_request(
+        {
+            "schema_version": 1,
+            "operation": "operations.get",
+            "arguments": {"account_ref": "google-one", "operation_id": "op-one"},
+        }
+    )
+
+    assert dict(request.arguments) == {
+        "account_ref": "google-one",
+        "operation_id": "op-one",
+    }
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "openai.auth.plan",
+        "secret.ingress.create",
+        "google.oauth.begin",
+        "google.oauth.complete",
+        "google.oauth-client-import.plan",
+        "google.oauth-client-import.apply",
+        "google.inventory.refresh",
+        "google.provision.plan",
+        "google.billing.plan",
+    ],
+)
+def test_commands_reject_missing_concurrency_fields(operation: str) -> None:
+    with pytest.raises(AdminContractError, match="control.request_invalid"):
+        parse_admin_request(
+            {
+                "schema_version": 1,
+                "operation": operation,
+                "arguments": _valid_command_arguments(operation),
+            }
+        )
+
+
+def _valid_command_arguments(operation: str) -> dict[str, object]:
+    if operation == "secret.ingress.create":
+        return {"account_ref": "openai-one", "credential_kind": "openai.auth-json"}
+    if operation == "google.oauth.begin":
+        return {
+            "account_ref": "google-one",
+            "oauth_client_ref": "client-one",
+            "redirect_uri": "http://127.0.0.1/callback",
+            "scope_profile": "inventory_readonly",
+        }
+    if operation == "google.oauth.complete":
+        return {
+            "account_ref": "google-one",
+            "transaction_id": "transaction-one",
+            "redirect_uri": "http://127.0.0.1/callback",
+            "state": "state-one",
+        }
+    if operation == "google.billing.plan":
+        return {
+            "account_ref": "google-one",
+            "project_ref": "project-one",
+            "billing_ref": "billing-one",
+        }
+    return {"account_ref": "google-one"}
+
+
+@pytest.mark.parametrize(
     ("operation", "arguments"),
     [
         ("hosts.list", {"account_ref": "google-one"}),
