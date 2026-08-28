@@ -33,14 +33,35 @@ def reconstructed_permit():
     return permit
 
 
+def reconstructed_evidence():
+    evidence_type = getattr(
+        runner_module(), "RootDynamicTeamleadRunnerBindingEvidence", None
+    )
+    assert evidence_type is not None
+    evidence = object.__new__(evidence_type)
+    values = {
+        "executor_identity": object(),
+        "context_identity": object(),
+        "snapshot_identity": object(),
+        "release_identity": object(),
+    }
+    for name, value in values.items():
+        object.__setattr__(evidence, name, value)
+    return evidence
+
+
 def test_runner_module_exports_only_data_permit_and_operations_protocol() -> None:
     module = runner_module()
 
     assert module.__all__ == (
         "DynamicTeamleadRunnerOperations",
         "RootDynamicTeamleadRunnerPermit",
+        "RootDynamicTeamleadRunnerBindingEvidence",
     )
     assert inspect.isclass(module.RootDynamicTeamleadRunnerPermit)
+    assert inspect.isclass(
+        getattr(module, "RootDynamicTeamleadRunnerBindingEvidence", None)
+    )
     assert inspect.isclass(module.DynamicTeamleadRunnerOperations)
     assert not any(
         "executor" in name.lower() and not name.startswith("_")
@@ -91,6 +112,45 @@ def test_permit_rejects_subclassing() -> None:
 
         class ForgedPermit(permit_type):
             pass
+
+
+def test_binding_evidence_is_non_transferable_data_only_and_not_attachable() -> None:
+    evidence_type = runner_module().RootDynamicTeamleadRunnerBindingEvidence
+
+    with pytest.raises(TypeError):
+        evidence_type(object(), object(), object(), object())
+
+    evidence = reconstructed_evidence()
+    assert [field.name for field in fields(evidence_type)] == [
+        "executor_identity",
+        "context_identity",
+        "snapshot_identity",
+        "release_identity",
+    ]
+    assert repr(evidence) == "<RootDynamicTeamleadRunnerBindingEvidence redacted>"
+    assert str(evidence) == repr(evidence)
+    assert not hasattr(evidence, "__dict__")
+
+    with pytest.raises(AttributeError):
+        evidence.executor_identity = object()
+
+    with pytest.raises(TypeError):
+
+        class ForgedEvidence(evidence_type):
+            pass
+
+
+@pytest.mark.parametrize(
+    "transfer",
+    (
+        pytest.param(copy.copy, id="copy"),
+        pytest.param(copy.deepcopy, id="deepcopy"),
+        pytest.param(pickle.dumps, id="pickle"),
+    ),
+)
+def test_binding_evidence_rejects_copy_deepcopy_and_pickle(transfer) -> None:
+    with pytest.raises(TypeError):
+        transfer(reconstructed_evidence())
 
 
 def test_permit_has_no_reachable_authority_or_nested_mutable_state() -> None:

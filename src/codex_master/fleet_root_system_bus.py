@@ -23,6 +23,7 @@ from codex_master.dynamic_teamlead import (
 )
 from codex_master.dynamic_teamlead_a3_runner import (
     DynamicTeamleadRunnerOperations,
+    RootDynamicTeamleadRunnerBindingEvidence,
     RootDynamicTeamleadRunnerPermit,
 )
 from codex_master.fleet_home_broker_client import AttestedHome
@@ -208,6 +209,7 @@ class _DynamicTeamleadRunnerRecord:
     permit: RootDynamicTeamleadRunnerPermit
     reference: object
     executor: object
+    evidence: RootDynamicTeamleadRunnerBindingEvidence
     operations: DynamicTeamleadRunnerOperations
     active: _ActiveStart
     binding: _DynamicTeamleadRunnerBinding
@@ -215,7 +217,7 @@ class _DynamicTeamleadRunnerRecord:
 
 
 class _ConsumerDynamicTeamleadRunnerExecutor:
-    __slots__ = ("_consumer", "_permit", "_operations")
+    __slots__ = ("_binding_evidence", "_consumer", "_permit", "_operations")
 
     def __init__(self) -> None:
         raise TypeError("root_dynamic_teamlead_runner_executor_factory_required")
@@ -230,6 +232,13 @@ class _ConsumerDynamicTeamleadRunnerExecutor:
         if type(consumer) is not TrustedPrincipalGrantConsumer:
             _fail("dynamic_teamlead_runner_permit_invalid")
         consumer._execute_issued_dynamic_teamlead_runner(self, plan)
+
+    @property
+    def binding_evidence(self) -> RootDynamicTeamleadRunnerBindingEvidence:
+        try:
+            return self._binding_evidence
+        except AttributeError:
+            _fail("dynamic_teamlead_runner_permit_invalid")
 
 
 class _PeerOperations(Protocol):
@@ -1064,10 +1073,21 @@ class TrustedPrincipalGrantConsumer:
             object.__setattr__(executor, "_consumer", self)
             object.__setattr__(executor, "_permit", permit)
             object.__setattr__(executor, "_operations", operations)
+            evidence = object.__new__(RootDynamicTeamleadRunnerBindingEvidence)
+            evidence_values = (
+                ("executor_identity", executor),
+                ("context_identity", self._context),
+                ("snapshot_identity", self._context.snapshot),
+                ("release_identity", service._release),
+            )
+            for name, value in evidence_values:
+                object.__setattr__(evidence, name, value)
+            object.__setattr__(executor, "_binding_evidence", evidence)
             self._runner_records[id(permit)] = _DynamicTeamleadRunnerRecord(
                 permit,
                 reference,
                 executor,
+                evidence,
                 operations,
                 active,
                 binding,
@@ -1083,6 +1103,7 @@ class TrustedPrincipalGrantConsumer:
             permit = executor._permit
             operations = executor._operations
             reference = permit.opaque_reference
+            evidence = executor.binding_evidence
         except Exception:
             _fail("dynamic_teamlead_runner_permit_invalid")
         with self._runner_lock:
@@ -1097,6 +1118,13 @@ class TrustedPrincipalGrantConsumer:
                 or record.permit is not permit
                 or record.reference is not reference
                 or record.executor is not executor
+                or type(evidence) is not RootDynamicTeamleadRunnerBindingEvidence
+                or record.evidence is not evidence
+                or evidence.executor_identity is not executor
+                or evidence.context_identity is not self._context
+                or evidence.snapshot_identity is not self._context.snapshot
+                or type(self._bound_service) is not HomeBrokerControlService
+                or evidence.release_identity is not self._bound_service._release
                 or record.operations is not operations
                 or record.terminal
             ):

@@ -25,6 +25,7 @@ import pytest
 import codex_master.fleet_root_system_bus as system_bus
 import codex_master.fleet_home_broker_runtime as runtime
 import codex_master.fleet_home_broker_system as broker_system
+import codex_master.dynamic_teamlead_a3_runner as runner
 from codex_master.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
 from codex_master.fleet_home_broker_identity import BrokerIdentity
 from codex_master.fleet_home_broker_protocol import PrincipalBinding
@@ -844,6 +845,139 @@ def test_consumer_issues_one_bound_permit_executor_pair_and_executes_once(
         issue(RecordingRunnerOperations())
     assert operations.calls == [(plan, permit)]
     assert consumer._operations.calls.count("pidfd_open") == reattestations
+
+
+def test_executor_exposes_root_binding_evidence_with_exact_identity_references(
+    runner_authority,
+) -> None:
+    _host, consumer, service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    record = consumer._runner_records[id(permit)]
+    evidence = getattr(executor, "binding_evidence", None)
+
+    assert evidence is not None
+    assert type(evidence) is getattr(
+        runner, "RootDynamicTeamleadRunnerBindingEvidence", None
+    )
+    assert record.evidence is evidence
+    assert evidence.executor_identity is executor
+    assert evidence.context_identity is context
+    assert evidence.context_identity is consumer._context
+    assert evidence.snapshot_identity is context.snapshot
+    assert evidence.snapshot_identity is consumer._context.snapshot
+    assert evidence.release_identity is service._release
+    assert not {
+        field.name
+        for field in dataclasses.fields(evidence)
+    } & {
+        "permit",
+        "receipt",
+        "fd",
+        "credential",
+        "consumer",
+        "ledger",
+        "callback",
+        "operations",
+    }
+
+    with pytest.raises(AttributeError):
+        executor.binding_evidence = evidence
+
+
+@pytest.mark.parametrize("identity", ("executor", "context", "snapshot", "release"))
+def test_executor_rejects_forged_binding_evidence_before_operation(
+    runner_authority,
+    identity: str,
+) -> None:
+    _host, consumer, service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    original = getattr(executor, "binding_evidence", None)
+    assert original is not None
+    forged = object.__new__(type(original))
+    values = {
+        "executor_identity": original.executor_identity,
+        "context_identity": original.context_identity,
+        "snapshot_identity": original.snapshot_identity,
+        "release_identity": original.release_identity,
+    }
+    values[identity + "_identity"] = object()
+    for name, value in values.items():
+        object.__setattr__(forged, name, value)
+    object.__setattr__(executor, "_binding_evidence", forged)
+
+    with pytest.raises(RootSystemBusError):
+        executor.execute_dynamic_teamlead_runner(runner_plan(context))
+
+    assert operations.calls == []
+    assert not consumer._runner_records[id(permit)].terminal
+
+
+@pytest.mark.parametrize("identity", ("executor", "context", "snapshot", "release"))
+def test_executor_rejects_other_bound_identity_before_operation(
+    runner_authority,
+    identity: str,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    _other_host, other_consumer, _other_service, _other_context = (
+        offline_runner_authority()
+    )
+    try:
+        _other_permit, other_executor = other_consumer.issue_dynamic_teamlead_runner(
+            RecordingRunnerOperations()
+        )
+        other_evidence = other_executor.binding_evidence
+        forged = object.__new__(type(other_evidence))
+        values = {
+            "executor_identity": executor,
+            "context_identity": consumer._context,
+            "snapshot_identity": consumer._context.snapshot,
+            "release_identity": consumer._bound_service._release,
+        }
+        values[identity + "_identity"] = getattr(
+            other_evidence, identity + "_identity"
+        )
+        for name, value in values.items():
+            object.__setattr__(forged, name, value)
+        object.__setattr__(executor, "_binding_evidence", forged)
+
+        with pytest.raises(RootSystemBusError):
+            executor.execute_dynamic_teamlead_runner(runner_plan(context))
+    finally:
+        other_consumer.close()
+
+    assert operations.calls == []
+    assert not consumer._runner_records[id(permit)].terminal
+
+
+def test_executor_rejects_stolen_binding_evidence_before_operation(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    _permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    _other_host, other_consumer, _other_service, _other_context = (
+        offline_runner_authority()
+    )
+    try:
+        _other_permit, other_executor = other_consumer.issue_dynamic_teamlead_runner(
+            RecordingRunnerOperations()
+        )
+        object.__setattr__(
+            executor,
+            "_binding_evidence",
+            getattr(other_executor, "binding_evidence", None),
+        )
+
+        with pytest.raises(RootSystemBusError):
+            executor.execute_dynamic_teamlead_runner(runner_plan(context))
+    finally:
+        other_consumer.close()
+
+    assert operations.calls == []
 
 
 @pytest.mark.parametrize("operations", (object(), SimpleNamespace(execute=None)))
