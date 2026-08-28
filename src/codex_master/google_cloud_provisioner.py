@@ -102,6 +102,20 @@ _MAX_QUOTA_AGE = timedelta(minutes=5)
 _MAX_QUOTA_FUTURE_SKEW = timedelta(seconds=30)
 _UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 _FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+_TRANSIENT_PROVIDER_ERRORS = frozenset(
+    {
+        "google.api_quota_exhausted",
+        "google.api_unavailable",
+        "google.api_operation_timeout",
+    }
+)
+_PERMANENT_PROVIDER_ERRORS = frozenset(
+    {
+        "google.api_auth_failed",
+        "google.api_operation_failed",
+        "google.api_request_failed",
+    }
+)
 
 
 def _utc_timestamp(value: object) -> datetime:
@@ -445,6 +459,17 @@ def _partial_failure(
     )
 
 
+def _provider_failure_code(phase: str, error: GoogleCloudApiError) -> str:
+    prefix = f"provisioner.{phase}"
+    if error.code in _TRANSIENT_PROVIDER_ERRORS:
+        return prefix + "_retryable"
+    if error.code == "google.api_conflict":
+        return prefix + "_conflict"
+    if error.code in _PERMANENT_PROVIDER_ERRORS:
+        return prefix + "_failed"
+    return prefix + "_provider_contract"
+
+
 def _persist_services(
     store: _Store,
     plan: FillToQuotaPlan,
@@ -526,9 +551,9 @@ def execute_fill_to_quota_plan(
     planned = len(plan.projects)
     try:
         subject_id = api.subject_id()
-    except GoogleCloudApiError:
+    except GoogleCloudApiError as error:
         raise _partial_failure(
-            "provisioner.setup_retryable",
+            _provider_failure_code("setup", error),
             attempted=attempted,
             completed=completed,
             planned=planned,
@@ -564,7 +589,7 @@ def execute_fill_to_quota_plan(
                     code = (
                         "quota.provider_exhausted"
                         if error.code == "google.api_quota_exhausted"
-                        else "provisioner.project_create_failed"
+                        else _provider_failure_code("project_create", error)
                     )
                     raise _partial_failure(
                         code,
@@ -572,7 +597,17 @@ def execute_fill_to_quota_plan(
                         completed=completed,
                         planned=planned,
                     ) from None
-                number = _project_number(response)
+                try:
+                    number = _project_number(response)
+                except GoogleCloudProvisionerError as error:
+                    if error.code != "provisioner.google_response_invalid":
+                        raise
+                    raise _partial_failure(
+                        "provisioner.project_create_provider_contract",
+                        attempted=attempted,
+                        completed=completed,
+                        planned=planned,
+                    ) from None
                 _persist_created(store, plan, item, number)
                 status = "provisioning"
             else:
@@ -594,9 +629,9 @@ def execute_fill_to_quota_plan(
             if status == "provisioning":
                 try:
                     api.enable_required_services(number)
-                except GoogleCloudApiError:
+                except GoogleCloudApiError as error:
                     raise _partial_failure(
-                        "provisioner.services_retryable",
+                        _provider_failure_code("services", error),
                         attempted=attempted,
                         completed=completed,
                         planned=planned,
@@ -619,14 +654,24 @@ def execute_fill_to_quota_plan(
                     key["keyString"] = api.get_key_string(str(key.get("name", "")))
                 else:
                     key = api.create_restricted_key(number, item.key_display_name)
-            except GoogleCloudApiError:
+            except GoogleCloudApiError as error:
                 raise _partial_failure(
-                    "provisioner.api_key_retryable",
+                    _provider_failure_code("api_key", error),
                     attempted=attempted,
                     completed=completed,
                     planned=planned,
                 ) from None
-            _persist_key(store, plan, item, number, key)
+            try:
+                _persist_key(store, plan, item, number, key)
+            except GoogleCloudProvisionerError as error:
+                if error.code != "provisioner.google_response_invalid":
+                    raise
+                raise _partial_failure(
+                    "provisioner.api_key_provider_contract",
+                    attempted=attempted,
+                    completed=completed,
+                    planned=planned,
+                ) from None
             completed += 1
         return ProvisionReceipt(completed=completed, planned=planned)
     except GoogleCloudProvisionerError:

@@ -24,9 +24,19 @@ class FakeTransport:
 
 @pytest.mark.parametrize(
     ("status", "code"),
-    [(409, "google.api_conflict"), (429, "google.api_quota_exhausted")],
+    [
+        (400, "google.api_request_failed"),
+        (401, "google.api_auth_failed"),
+        (403, "google.api_auth_failed"),
+        (404, "google.api_request_failed"),
+        (408, "google.api_unavailable"),
+        (409, "google.api_conflict"),
+        (429, "google.api_quota_exhausted"),
+        (500, "google.api_unavailable"),
+        (503, "google.api_unavailable"),
+    ],
 )
-def test_http_conflict_and_quota_exhaustion_are_machine_distinct(
+def test_http_statuses_distinguish_transient_permanent_conflict_and_quota(
     status: int, code: str
 ) -> None:
     class Opener:

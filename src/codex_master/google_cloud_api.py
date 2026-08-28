@@ -73,6 +73,8 @@ class _UrlLibTransport:
         except urllib.error.HTTPError as error:
             if error.code in {401, 403}:
                 raise GoogleCloudApiError("google.api_auth_failed") from None
+            if error.code == 408 or 500 <= error.code <= 599:
+                raise GoogleCloudApiError("google.api_unavailable") from None
             if error.code == 409:
                 raise GoogleCloudApiError("google.api_conflict") from None
             if error.code == 429:

@@ -164,23 +164,29 @@ class FakeApi:
 
 
 class PhaseFailApi(FakeApi):
-    def __init__(self, phase: str) -> None:
+    def __init__(self, phase: str, code: str = "google.api_quota_exhausted") -> None:
         super().__init__()
         self.phase = phase
+        self.code = code
 
     def subject_id(self):
         if self.phase == "setup":
-            raise GoogleCloudApiError("google.api_quota_exhausted")
+            raise GoogleCloudApiError(self.code)
         return super().subject_id()
+
+    def create_project(self, project_id, project_name):
+        if self.phase == "project_create":
+            raise GoogleCloudApiError(self.code)
+        return super().create_project(project_id, project_name)
 
     def enable_required_services(self, project_number):
         if self.phase == "services":
-            raise GoogleCloudApiError("google.api_quota_exhausted")
+            raise GoogleCloudApiError(self.code)
         return super().enable_required_services(project_number)
 
     def list_keys(self, project_number):
         if self.phase == "api_key":
-            raise GoogleCloudApiError("google.api_quota_exhausted")
+            raise GoogleCloudApiError(self.code)
         return super().list_keys(project_number)
 
 
@@ -381,6 +387,182 @@ def test_setup_429_attempts_no_project_and_keeps_setup_phase() -> None:
         failed=0,
         not_attempted=3,
         reason_code="provisioner.setup_retryable",
+    )
+
+
+@pytest.mark.parametrize(
+    ("phase", "provider_code", "reason_code", "attempted", "failed"),
+    [
+        ("setup", "google.api_unavailable", "provisioner.setup_retryable", 0, 0),
+        ("setup", "google.api_auth_failed", "provisioner.setup_failed", 0, 0),
+        ("setup", "google.api_conflict", "provisioner.setup_conflict", 0, 0),
+        (
+            "setup",
+            "google.api_response_invalid",
+            "provisioner.setup_provider_contract",
+            0,
+            0,
+        ),
+        (
+            "project_create",
+            "google.api_unavailable",
+            "provisioner.project_create_retryable",
+            1,
+            1,
+        ),
+        (
+            "project_create",
+            "google.api_auth_failed",
+            "provisioner.project_create_failed",
+            1,
+            1,
+        ),
+        (
+            "project_create",
+            "google.api_conflict",
+            "provisioner.project_create_conflict",
+            1,
+            1,
+        ),
+        (
+            "project_create",
+            "google.api_response_invalid",
+            "provisioner.project_create_provider_contract",
+            1,
+            1,
+        ),
+        (
+            "services",
+            "google.api_unavailable",
+            "provisioner.services_retryable",
+            1,
+            1,
+        ),
+        (
+            "services",
+            "google.api_auth_failed",
+            "provisioner.services_failed",
+            1,
+            1,
+        ),
+        (
+            "services",
+            "google.api_conflict",
+            "provisioner.services_conflict",
+            1,
+            1,
+        ),
+        (
+            "services",
+            "google.api_response_invalid",
+            "provisioner.services_provider_contract",
+            1,
+            1,
+        ),
+        (
+            "api_key",
+            "google.api_unavailable",
+            "provisioner.api_key_retryable",
+            1,
+            1,
+        ),
+        (
+            "api_key",
+            "google.api_auth_failed",
+            "provisioner.api_key_failed",
+            1,
+            1,
+        ),
+        (
+            "api_key",
+            "google.api_conflict",
+            "provisioner.api_key_conflict",
+            1,
+            1,
+        ),
+        (
+            "api_key",
+            "google.api_response_invalid",
+            "provisioner.api_key_provider_contract",
+            1,
+            1,
+        ),
+    ],
+)
+def test_provider_errors_keep_phase_retry_semantics_and_exact_counts(
+    phase: str,
+    provider_code: str,
+    reason_code: str,
+    attempted: int,
+    failed: int,
+) -> None:
+    document = _document()
+    plan = build_fill_to_quota_plan(
+        document,
+        account_ref="google-account-01",
+        expected_subject_id="subject-one",
+        quota_evidence=_evidence(3),
+        inventory_generation=INVENTORY_GENERATION,
+        inventory_fingerprint=INVENTORY_FINGERPRINT,
+        now=NOW,
+        visible_project_names=set(),
+        reserved_project_ids=set(),
+    )
+
+    with pytest.raises(GoogleCloudProvisionerError, match=reason_code) as caught:
+        _execute(
+            plan,
+            api=PhaseFailApi(phase, provider_code),
+            store=MemoryStore(document),
+        )
+
+    assert caught.value.partial == ProvisionPartialReceipt(
+        attempted=attempted,
+        completed=0,
+        planned=3,
+        failed=failed,
+        not_attempted=3 - attempted,
+        reason_code=reason_code,
+    )
+
+
+@pytest.mark.parametrize("phase", ["project_create", "api_key"])
+def test_malformed_provider_payload_is_permanent_contract_failure(phase: str) -> None:
+    document = _document()
+    plan = build_fill_to_quota_plan(
+        document,
+        account_ref="google-account-01",
+        expected_subject_id="subject-one",
+        quota_evidence=_evidence(1),
+        inventory_generation=INVENTORY_GENERATION,
+        inventory_fingerprint=INVENTORY_FINGERPRINT,
+        now=NOW,
+        visible_project_names=set(),
+        reserved_project_ids=set(),
+    )
+
+    class MalformedApi(FakeApi):
+        def create_project(self, project_id, project_name):
+            if phase == "project_create":
+                return {"unexpected": "provider payload"}
+            return super().create_project(project_id, project_name)
+
+        def create_restricted_key(self, project_number, display_name):
+            if phase == "api_key":
+                return {"unexpected": "provider payload"}
+            return super().create_restricted_key(project_number, display_name)
+
+    reason_code = f"provisioner.{phase}_provider_contract"
+    with pytest.raises(GoogleCloudProvisionerError, match=reason_code) as caught:
+        _execute(plan, api=MalformedApi(), store=MemoryStore(document))
+
+    assert caught.value.partial == ProvisionPartialReceipt(
+        attempted=1,
+        completed=0,
+        planned=1,
+        failed=1,
+        not_attempted=0,
+        reason_code=reason_code,
     )
 
 
