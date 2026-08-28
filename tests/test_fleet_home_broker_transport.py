@@ -172,10 +172,18 @@ def test_public_api_exports_exact_frozen_slotted_fields_and_protocol_methods():
     assert transport.__all__ == (
         "BrokerTransportError",
         "MAX_TRANSPORT_RESPONSE_FDS",
+        "MAX_OPERATION_REQUEST_BYTES",
+        "MAX_OPERATION_RESPONSE_BYTES",
+        "OPERATION_TIMEOUT_SECONDS",
         "BrokerPeer",
         "BrokerTransportResponse",
+        "BrokerOllamaInstancePayload",
+        "BrokerOperationRequest",
+        "BrokerOperationResponse",
         "BrokerTransportOperations",
         "BrokerRequestHandler",
+        "BrokerOperationClient",
+        "exchange_typed_operation",
         "serve_once",
     )
     assert issubclass(transport.BrokerTransportError, ValueError)
@@ -183,6 +191,47 @@ def test_public_api_exports_exact_frozen_slotted_fields_and_protocol_methods():
     for klass, fields in (
         (transport.BrokerPeer, ("pid",)),
         (transport.BrokerTransportResponse, ("reply", "fds")),
+        (
+            transport.BrokerOllamaInstancePayload,
+            (
+                "host_ref",
+                "instance_ref",
+                "selected_model_refs",
+                "allowed_cpus",
+                "cpu_quota_percent",
+                "cpu_weight",
+                "model_generation",
+                "runtime_generation",
+                "fence",
+                "plan_digest",
+                "idempotency_key",
+            ),
+        ),
+        (
+            transport.BrokerOperationRequest,
+            (
+                "schema_version",
+                "operation_type",
+                "action",
+                "host_ref",
+                "lease_id",
+                "request_id",
+                "payload",
+            ),
+        ),
+        (
+            transport.BrokerOperationResponse,
+            (
+                "schema_version",
+                "operation_type",
+                "action",
+                "host_ref",
+                "request_id",
+                "status_code",
+                "redirected",
+                "payload",
+            ),
+        ),
     ):
         assert dataclasses.is_dataclass(klass)
         assert klass.__dataclass_params__.frozen
@@ -190,6 +239,7 @@ def test_public_api_exports_exact_frozen_slotted_fields_and_protocol_methods():
         assert tuple(field.name for field in dataclasses.fields(klass)) == fields
     assert getattr(transport.BrokerTransportOperations, "_is_protocol", False)
     assert getattr(transport.BrokerRequestHandler, "_is_protocol", False)
+    assert getattr(transport.BrokerOperationClient, "_is_protocol", False)
     assert tuple(
         inspect.signature(transport.BrokerTransportOperations.receive_frame).parameters
     ) == ("self",)
@@ -212,6 +262,121 @@ def test_public_api_exports_exact_frozen_slotted_fields_and_protocol_methods():
         "peer",
         "request",
     )
+    assert tuple(
+        inspect.signature(transport.BrokerOperationClient.exchange).parameters
+    ) == ("self", "request", "timeout_seconds", "max_response_bytes")
+
+
+class FakeOperationClient:
+    def __init__(self, response=None, *, error=None):
+        self.response = response
+        self.error = error
+        self.calls = []
+
+    def exchange(self, request, *, timeout_seconds, max_response_bytes):
+        self.calls.append((request, timeout_seconds, max_response_bytes))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def _operation_payload():
+    return transport.BrokerOllamaInstancePayload(
+        "worker-west",
+        "ollama-west",
+        ("llama-small",),
+        "2-3",
+        200,
+        50,
+        8,
+        13,
+        3,
+        "d" * 64,
+        "e" * 64,
+    )
+
+
+def _operation_request(payload=None):
+    return transport.BrokerOperationRequest(
+        1,
+        "ollama.instance",
+        "plan",
+        "worker-west",
+        "lease-" + "a" * 32,
+        "b" * 32,
+        payload or _operation_payload(),
+    )
+
+
+def _operation_response(payload=b"{}", **changes):
+    values = {
+        "schema_version": 1,
+        "operation_type": "ollama.instance",
+        "action": "plan",
+        "host_ref": "worker-west",
+        "request_id": "b" * 32,
+        "status_code": 200,
+        "redirected": False,
+        "payload": payload,
+    }
+    values.update(changes)
+    return transport.BrokerOperationResponse(**values)
+
+
+def test_typed_operation_exchange_accepts_only_bound_bounded_response():
+    request = _operation_request()
+    response = _operation_response(b'{"status":"planned"}')
+    client = FakeOperationClient(response)
+
+    assert transport.exchange_typed_operation(client, request) is response
+    assert client.calls == [
+        (
+            request,
+            transport.OPERATION_TIMEOUT_SECONDS,
+            transport.MAX_OPERATION_RESPONSE_BYTES,
+        )
+    ]
+    assert "lease-" not in repr(request)
+
+
+def test_typed_operation_request_rejects_raw_or_free_operation_payload():
+    with pytest.raises(
+        transport.BrokerTransportError, match="^provider.operation_not_allowed$"
+    ):
+        _operation_request(b'{"argv":["/private/worker/ollama","serve"]}')
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        object(),
+        _operation_response(redirected=True),
+        _operation_response(host_ref="worker-east"),
+        _operation_response(request_id="c" * 32),
+        _operation_response(status_code=302),
+        _operation_response(payload=b"x" * (64 * 1024 + 1)),
+    ),
+)
+def test_typed_operation_exchange_rejects_malformed_oversize_or_redirected_response(
+    response,
+):
+    client = FakeOperationClient(response)
+
+    with pytest.raises(
+        transport.BrokerTransportError, match="^resource.host_response_invalid$"
+    ):
+        transport.exchange_typed_operation(client, _operation_request())
+
+
+def test_typed_operation_exchange_redacts_client_exception():
+    client = FakeOperationClient(error=RuntimeError("/secret/worker/path"))
+
+    with pytest.raises(
+        transport.BrokerTransportError, match="^resource.host_unreachable$"
+    ) as raised:
+        transport.exchange_typed_operation(client, _operation_request())
+
+    assert "/secret" not in repr(raised.value)
 
 
 def test_broker_peer_accepts_only_positive_real_int_pid():
@@ -411,8 +576,8 @@ def test_source_uses_only_allowed_imports_and_contains_no_forbidden_transport_to
             )
     assert imports == [
         ("__future__", ("annotations",)),
-        ("dataclasses", ("dataclass",)),
-        ("typing", ("Protocol",)),
+        ("dataclasses", ("dataclass", "field")),
+        ("typing", ("Protocol", "cast")),
         ("codex_master.fleet_home_broker_client", ("ScmFrame",)),
         (
             "codex_master.fleet_home_broker_protocol",
