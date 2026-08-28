@@ -381,6 +381,81 @@ def test_label_allowlist_does_not_reject_benign_embedded_short_fragments(
     assert host.label == "Curl Worker"
 
 
+@pytest.mark.parametrize(
+    ("field", "credential_value"),
+    [
+        ("ref", "sk-abcdefgh"),
+        ("binding_ref", "sk-abcdefgh"),
+        ("label", "AIzaABCDEFGHIJKLMNOPQRSTUVWX"),
+        ("label", "Bearer opaquevalue"),
+        ("label", "Basic opaquevalue"),
+        ("label", "apiKey opaquevalue"),
+        ("label", "api_key opaquevalue"),
+        ("label", "clientSecret opaquevalue"),
+        ("label", "accessToken opaquevalue"),
+        ("label", "session marker"),
+        ("label", "Ｂｅａｒｅｒ opaquevalue"),
+        ("label", "Bearer%2520opaquevalue"),
+        ("transport_kind", "sk-abcdefgh"),
+        ("capability", "sk-abcdefgh"),
+        ("source", "sk-abcdefgh"),
+    ],
+)
+def test_every_public_host_string_composes_central_credential_classification(
+    tmp_path: Path, field: str, credential_value: str
+) -> None:
+    registry = registry_at(tmp_path)
+    safe = registry.record_probe("worker-one", generation=1, evidence=valid_evidence())
+    evidence = valid_evidence()
+    ref = "worker-two"
+    if field == "ref":
+        ref = credential_value
+    elif field == "label":
+        evidence["label"] = credential_value
+    elif field == "binding_ref":
+        transport = cast(dict[str, object], evidence["transport_binding"])
+        transport["binding_ref"] = credential_value
+    elif field == "transport_kind":
+        transport = cast(dict[str, object], evidence["transport_binding"])
+        transport["kind"] = credential_value
+    elif field == "capability":
+        evidence["capabilities"] = [credential_value]
+    else:
+        evidence["source"] = credential_value
+
+    with pytest.raises(HostRegistryError) as captured:
+        registry.record_probe(ref, generation=1, evidence=evidence)
+
+    durable = (tmp_path / "admin-hosts" / "hosts.json").read_text(encoding="utf-8")
+    rendered = json.dumps(safe.public_projection(), sort_keys=True) + repr(safe)
+    assert captured.value.code == "control.host_invalid"
+    assert repr(captured.value) == "HostRegistryError('control.host_invalid')"
+    assert credential_value not in durable
+    assert credential_value not in rendered
+    assert registry.list() == (safe,)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Secretariat Worker",
+        "Tokenized Worker",
+        "Authenticationless Worker",
+        "Privateer Worker",
+        "Curl Worker",
+    ],
+)
+def test_pretty_labels_do_not_treat_embedded_word_fragments_as_credentials(
+    tmp_path: Path, label: str
+) -> None:
+    host = registry_at(tmp_path).record_probe(
+        "worker-one", generation=1, evidence=valid_evidence(label=label)
+    )
+
+    assert host.label == label
+    assert host.public_projection()["label"] == label
+
+
 def test_nested_private_binding_values_remain_private_only(tmp_path: Path) -> None:
     evidence = valid_evidence()
     evidence["binding_state"] = {

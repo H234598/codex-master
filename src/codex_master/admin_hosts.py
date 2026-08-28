@@ -480,25 +480,26 @@ def _field_string(
     *,
     pattern: re.Pattern[str],
     error_code: str,
+    embedded_sensitive: bool = True,
 ) -> str:
-    if type(value) is not str:
-        _raise(error_code)
-    normalized = _normalized_key(value, error_code)
+    text = _public_text(value, error_code)
+    normalized = _normalized_key(text, error_code)
     parts = frozenset(part for part in normalized.split("_") if part)
     compact = normalized.replace("_", "")
     if (
         parts & _SENSITIVE_VALUE_PARTS
-        or any(marker in compact for marker in _SENSITIVE_VALUE_SUBSTRINGS)
+        or embedded_sensitive
+        and any(marker in compact for marker in _SENSITIVE_VALUE_SUBSTRINGS)
         or any(marker in compact for marker in _PRIVATE_VALUE_MARKERS)
     ):
         _raise(error_code)
     try:
-        value.encode("ascii")
+        text.encode("ascii")
     except UnicodeError:
         _raise(error_code)
-    if pattern.fullmatch(value) is None:
+    if pattern.fullmatch(text) is None:
         _raise(error_code)
-    return value
+    return text
 
 
 def _host_ref(value: object, error_code: str) -> str:
@@ -506,7 +507,12 @@ def _host_ref(value: object, error_code: str) -> str:
 
 
 def _host_label(value: object, error_code: str) -> str:
-    return _field_string(value, pattern=_HOST_LABEL, error_code=error_code)
+    return _field_string(
+        value,
+        pattern=_HOST_LABEL,
+        error_code=error_code,
+        embedded_sensitive=False,
+    )
 
 
 def _registered_code(value: object, allowed: frozenset[str], error_code: str) -> str:
