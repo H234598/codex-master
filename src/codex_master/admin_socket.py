@@ -14,7 +14,7 @@ import re
 import socket
 import stat
 import struct
-from threading import Event, Thread, current_thread
+from threading import Event, Lock, Thread, current_thread
 from typing import cast
 import uuid
 
@@ -106,6 +106,12 @@ class UnixPeerCredentials:
 PeerAuthorizer = Callable[[UnixPeerCredentials], AdminPrincipalV1]
 
 
+@dataclass(frozen=True, slots=True)
+class _PinnedParent:
+    fd: int
+    metadata: os.stat_result
+
+
 class AdminSocketServer:
     """Owner-only AF_UNIX listener with one request per connection."""
 
@@ -130,9 +136,12 @@ class AdminSocketServer:
         self._service = service
         self._authorize_peer = authorize_peer
         self._timeout_seconds = float(timeout_seconds)
-        self._stop = Event()
+        self._state_lock = Lock()
+        self._stop: Event | None = None
         self._listener: socket.socket | None = None
+        self._active_connection: socket.socket | None = None
         self._thread: Thread | None = None
+        self._parent: _PinnedParent | None = None
         self._socket_identity: tuple[int, int] | None = None
 
     def __enter__(self) -> AdminSocketServer:
@@ -143,94 +152,165 @@ class AdminSocketServer:
         self.close()
 
     def start(self) -> None:
-        if self._listener is not None or self._thread is not None:
-            raise AdminSocketError(_problem("control.socket_invalid"))
-        listener: socket.socket | None = None
-        try:
-            _prepare_parent(self.path.parent)
-            try:
-                self.path.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                raise _SocketFailure("control.socket_invalid")
-            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            listener.set_inheritable(False)
-            listener.bind(os.fspath(self.path))
-            os.chmod(self.path, 0o600, follow_symlinks=False)
-            endpoint = self.path.lstat()
+        with self._state_lock:
             if (
-                not stat.S_ISSOCK(endpoint.st_mode)
-                or endpoint.st_uid != os.geteuid()
-                or stat.S_IMODE(endpoint.st_mode) != 0o600
+                self._listener is not None
+                or self._active_connection is not None
+                or self._thread is not None
+                or self._parent is not None
             ):
-                raise _SocketFailure("control.socket_invalid")
-            self._socket_identity = (endpoint.st_dev, endpoint.st_ino)
-            listener.listen(16)
-            listener.settimeout(0.1)
-            self._listener = listener
-            self._stop.clear()
-            self._thread = Thread(
-                target=self._serve,
-                name="masterjet-admin-socket",
-                daemon=False,
-            )
-            self._thread.start()
-        except BaseException:
-            if listener is not None:
-                listener.close()
-            self._listener = None
-            self._thread = None
-            self._remove_owned_socket()
-            raise AdminSocketError(_problem("control.socket_unavailable")) from None
+                raise AdminSocketError(_problem("control.socket_invalid"))
+            listener: socket.socket | None = None
+            try:
+                self._parent = _prepare_parent(self.path.parent)
+                _verify_pinned_parent(self._parent, self.path.parent)
+                try:
+                    os.stat(
+                        self.path.name,
+                        dir_fd=self._parent.fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise _SocketFailure("control.socket_invalid")
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.set_inheritable(False)
+                pinned_path = _pinned_socket_path(self._parent.fd, self.path.name)
+                listener.bind(pinned_path)
+                endpoint = os.stat(
+                    self.path.name,
+                    dir_fd=self._parent.fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISSOCK(endpoint.st_mode)
+                    or endpoint.st_uid != os.geteuid()
+                ):
+                    raise _SocketFailure("control.socket_invalid")
+                self._socket_identity = (endpoint.st_dev, endpoint.st_ino)
+                os.chmod(pinned_path, 0o600, follow_symlinks=False)
+                endpoint = os.stat(
+                    self.path.name,
+                    dir_fd=self._parent.fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    (endpoint.st_dev, endpoint.st_ino) != self._socket_identity
+                    or not stat.S_ISSOCK(endpoint.st_mode)
+                    or endpoint.st_uid != os.geteuid()
+                    or stat.S_IMODE(endpoint.st_mode) != 0o600
+                ):
+                    raise _SocketFailure("control.socket_invalid")
+                _verify_pinned_parent(self._parent, self.path.parent)
+                listener.listen(16)
+                listener.settimeout(0.1)
+                stop = Event()
+                thread = Thread(
+                    target=self._serve,
+                    args=(listener, stop),
+                    name="masterjet-admin-socket",
+                    daemon=False,
+                )
+                self._listener = listener
+                self._stop = stop
+                self._thread = thread
+                thread.start()
+            except BaseException:
+                if listener is not None:
+                    listener.close()
+                self._listener = None
+                self._stop = None
+                self._thread = None
+                self._remove_owned_socket()
+                self._close_parent()
+                raise AdminSocketError(_problem("control.socket_unavailable")) from None
 
     def close(self) -> None:
-        self._stop.set()
-        listener = self._listener
-        self._listener = None
+        with self._state_lock:
+            thread = self._thread
+            if thread is current_thread():
+                raise AdminSocketError(_problem("control.socket_invalid"))
+            stop = self._stop
+            listener = self._listener
+            connection = self._active_connection
+            if stop is not None:
+                stop.set()
         if listener is not None:
             listener.close()
-        thread = self._thread
-        if thread is not None and thread is not current_thread():
-            thread.join(timeout=2)
-        self._thread = None
-        self._remove_owned_socket()
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        if thread is not None:
+            thread.join()
+        with self._state_lock:
+            if self._thread is thread:
+                self._remove_owned_socket()
+                self._close_parent()
+                self._listener = None
+                self._active_connection = None
+                self._stop = None
+                self._thread = None
 
     def _remove_owned_socket(self) -> None:
         identity = self._socket_identity
+        parent = self._parent
         self._socket_identity = None
-        if identity is None:
+        if identity is None or parent is None:
             return
         try:
-            endpoint = self.path.lstat()
+            if _parent_binding(os.fstat(parent.fd)) != _parent_binding(parent.metadata):
+                return
+            endpoint = os.stat(
+                self.path.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
             if (
                 (endpoint.st_dev, endpoint.st_ino) == identity
                 and endpoint.st_uid == os.geteuid()
                 and stat.S_ISSOCK(endpoint.st_mode)
             ):
-                self.path.unlink()
+                os.unlink(self.path.name, dir_fd=parent.fd)
         except FileNotFoundError:
             pass
         except OSError:
             pass
 
-    def _serve(self) -> None:
-        while not self._stop.is_set():
-            listener = self._listener
-            if listener is None:
-                return
+    def _close_parent(self) -> None:
+        parent = self._parent
+        self._parent = None
+        if parent is not None:
+            try:
+                os.close(parent.fd)
+            except OSError:
+                pass
+
+    def _serve(self, listener: socket.socket, stop: Event) -> None:
+        while not stop.is_set():
             try:
                 connection, _address = listener.accept()
             except TimeoutError:
                 continue
             except OSError:
-                if self._stop.is_set():
+                if stop.is_set():
                     return
                 continue
             with connection:
                 connection.set_inheritable(False)
                 connection.settimeout(self._timeout_seconds)
-                self._handle(connection)
+                with self._state_lock:
+                    if stop.is_set():
+                        return
+                    self._active_connection = connection
+                try:
+                    self._handle(connection)
+                finally:
+                    with self._state_lock:
+                        if self._active_connection is connection:
+                            self._active_connection = None
 
     def _handle(self, connection: socket.socket) -> None:
         received_fds: list[int] = []
@@ -298,22 +378,22 @@ class AdminSocketServer:
         session_id: str,
         fd: int,
     ) -> dict[str, object]:
-        _validate_secret_fd(fd, peer)
-        buffer = bytearray(MAX_ADMIN_SECRET_BYTES + 1)
+        snapshot = _validate_secret_fd(fd, peer)
+        buffer = bytearray(snapshot.st_size + 1)
         view = memoryview(buffer)
         secret: memoryview | None = None
         used = 0
+        eof = False
         try:
             while used < len(buffer):
-                count = os.readv(fd, [view[used:]])
+                count = os.preadv(fd, [view[used:]], used)
                 if count == 0:
+                    eof = True
                     break
                 used += count
-            if used == 0:
+            if not eof or used != snapshot.st_size:
                 raise _SocketFailure("control.secret_fd_invalid")
-            if used > MAX_ADMIN_SECRET_BYTES:
-                raise _SocketFailure("control.secret_too_large")
-            _recheck_secret_fd(fd, peer)
+            _recheck_secret_fd(fd, snapshot)
             secret = view[:used]
             return self._service.put_secret(principal, session_id, secret)
         except _SocketFailure:
@@ -337,16 +417,27 @@ class AdminSocketClient:
         path: str | os.PathLike[str],
         *,
         timeout_seconds: float = 5.0,
+        expected_server_uid: int | None = None,
     ) -> None:
         candidate = Path(path)
         if (
             not candidate.is_absolute()
             or type(timeout_seconds) not in {int, float}
             or not 0 < timeout_seconds <= 60
+            or (
+                expected_server_uid is not None
+                and (
+                    type(expected_server_uid) is not int
+                    or not 0 <= expected_server_uid <= 2**32 - 1
+                )
+            )
         ):
             raise AdminSocketError(_problem("control.socket_invalid"))
         self.path = candidate
         self._timeout_seconds = float(timeout_seconds)
+        self._expected_server_uid = (
+            os.geteuid() if expected_server_uid is None else expected_server_uid
+        )
 
     def call(self, request: AdminRequestV1) -> dict[str, object]:
         if type(request) is not AdminRequestV1:
@@ -390,6 +481,7 @@ class AdminSocketClient:
                 connection.set_inheritable(False)
                 connection.settimeout(self._timeout_seconds)
                 connection.connect(os.fspath(self.path))
+                self._verify_server(connection)
                 if fd is None:
                     connection.sendall(payload)
                 else:
@@ -408,16 +500,70 @@ class AdminSocketClient:
         except BaseException:
             raise AdminSocketError(_problem("control.socket_unavailable")) from None
 
+    def _verify_server(self, connection: socket.socket) -> None:
+        try:
+            peer = _peer_credentials(connection)
+        except _SocketFailure:
+            raise AdminSocketError(_problem("authority.peer_denied")) from None
+        if peer.uid != self._expected_server_uid:
+            raise AdminSocketError(_problem("authority.peer_denied"))
 
-def _prepare_parent(parent: Path) -> None:
-    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    metadata = parent.lstat()
-    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+
+def _prepare_parent(parent: Path) -> _PinnedParent:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    current_fd = os.open("/", flags)
+    try:
+        for component in parent.parts[1:]:
+            if component in {"", ".", ".."}:
+                raise _SocketFailure("control.socket_invalid")
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                os.mkdir(component, 0o700, dir_fd=current_fd)
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        metadata = os.fstat(current_fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise _SocketFailure("control.socket_invalid")
+        os.fchmod(current_fd, 0o700)
+        metadata = os.fstat(current_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise _SocketFailure("control.socket_invalid")
+        return _PinnedParent(current_fd, metadata)
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _verify_pinned_parent(pinned: _PinnedParent, canonical: Path) -> None:
+    try:
+        current = os.fstat(pinned.fd)
+        by_path = canonical.lstat()
+    except OSError:
+        raise _SocketFailure("control.socket_invalid") from None
+    expected = _parent_binding(pinned.metadata)
+    if _parent_binding(current) != expected or _parent_binding(by_path) != expected:
         raise _SocketFailure("control.socket_invalid")
-    os.chmod(parent, 0o700, follow_symlinks=False)
-    metadata = parent.lstat()
-    if stat.S_IMODE(metadata.st_mode) != 0o700:
-        raise _SocketFailure("control.socket_invalid")
+
+
+def _parent_binding(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+    )
+
+
+def _pinned_socket_path(parent_fd: int, name: str) -> str:
+    return f"/proc/self/fd/{parent_fd}/{name}"
 
 
 def _peer_credentials(connection: socket.socket) -> UnixPeerCredentials:
@@ -477,18 +623,36 @@ def _collect_fds(
 ) -> None:
     if type(ancillary) is not list:
         raise _SocketFailure("control.request_invalid")
-    for level, kind, data in ancillary:
+    first_new_fd = len(received_fds)
+    invalid = False
+    for item in ancillary:
+        if type(item) is not tuple or len(item) != 3:
+            invalid = True
+            continue
+        level, kind, data = item
         if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
-            raise _SocketFailure("control.request_invalid")
-        if type(data) is not bytes or not data or len(data) % _INT_BYTES:
-            raise _SocketFailure("control.request_invalid")
-        values = array("i")
-        values.frombytes(data)
-        for fd in values:
-            if fd < 0:
-                raise _SocketFailure("control.request_invalid")
-            received_fds.append(fd)
+            invalid = True
+            continue
+        if type(data) is not bytes:
+            invalid = True
+            continue
+        complete_bytes = len(data) - len(data) % _INT_BYTES
+        if not data or complete_bytes != len(data):
+            invalid = True
+        if complete_bytes:
+            values = array("i")
+            values.frombytes(data[:complete_bytes])
+            received_fds.extend(values)
+    for fd in received_fds[first_new_fd:]:
+        if fd < 0:
+            invalid = True
+            continue
+        try:
             os.set_inheritable(fd, False)
+        except (OSError, ValueError):
+            invalid = True
+    if invalid:
+        raise _SocketFailure("control.request_invalid")
 
 
 def _close_fds(fds: list[int]) -> None:
@@ -521,7 +685,7 @@ def _drain_input(connection: socket.socket) -> None:
         _close_fds(discarded_fds)
 
 
-def _validate_secret_fd(fd: int, peer: UnixPeerCredentials) -> None:
+def _validate_secret_fd(fd: int, peer: UnixPeerCredentials) -> os.stat_result:
     try:
         metadata = os.fstat(fd)
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -531,27 +695,38 @@ def _validate_secret_fd(fd: int, peer: UnixPeerCredentials) -> None:
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != peer.uid
         or stat.S_IMODE(metadata.st_mode) & 0o077
-        or metadata.st_size < 0
+        or metadata.st_nlink != 1
+        or metadata.st_size <= 0
         or (hasattr(os, "O_PATH") and flags & os.O_PATH)
-        or flags & os.O_ACCMODE == os.O_WRONLY
+        or flags & os.O_ACCMODE != os.O_RDONLY
     ):
         raise _SocketFailure("control.secret_fd_invalid")
     if metadata.st_size > MAX_ADMIN_SECRET_BYTES:
         raise _SocketFailure("control.secret_too_large")
+    return metadata
 
 
-def _recheck_secret_fd(fd: int, peer: UnixPeerCredentials) -> None:
+def _recheck_secret_fd(fd: int, expected: os.stat_result) -> None:
     try:
         metadata = os.fstat(fd)
     except OSError:
         raise _SocketFailure("control.secret_fd_invalid") from None
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != peer.uid
-        or stat.S_IMODE(metadata.st_mode) & 0o077
-        or metadata.st_size > MAX_ADMIN_SECRET_BYTES
-    ):
+    if _secret_stat_binding(metadata) != _secret_stat_binding(expected):
         raise _SocketFailure("control.secret_fd_invalid")
+
+
+def _secret_stat_binding(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def _decode_json(payload: bytes) -> dict[str, object]:
