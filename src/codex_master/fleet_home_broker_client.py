@@ -3,8 +3,10 @@
 from dataclasses import dataclass
 from typing import Protocol
 
-from codex_master.fleet_home_broker_linux import FdStat
+from codex_master.fleet_home_broker_linux import FdStat, _validate_fd_stat
 from codex_master.fleet_home_broker_protocol import (
+    AgentStartClaim,
+    AgentStartEnvelope,
     AttestHomeRequest,
     BrokerReply,
     BrokerResultCode,
@@ -37,14 +39,37 @@ class ScmFrame:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentStartFrame:
+    payload: bytes
+    fds: tuple[int, ...]
+    message_truncated: bool = False
+    control_truncated: bool = False
+    scm_rights_count: int = 1
+
+
+@dataclass(frozen=True, slots=True)
 class AttestedHome:
     fd: int
     reply: BrokerReply
     attestation: HomeAttestation
 
 
+@dataclass(frozen=True, slots=True)
+class AttestedAgentStart:
+    fd: int
+    envelope: AgentStartEnvelope
+
+
 class BrokerClientOperations(Protocol):
     def receive_frame(self, request: BrokerRequest) -> ScmFrame: ...
+
+    def fstat(self, fd: int) -> FdStat: ...
+
+    def close(self, fd: int) -> None: ...
+
+
+class AgentStartClientOperations(Protocol):
+    def receive_frame(self, claim: AgentStartClaim) -> AgentStartFrame: ...
 
     def fstat(self, fd: int) -> FdStat: ...
 
@@ -294,11 +319,80 @@ def receive_attested_home(
         raise BrokerClientError("invalid broker frame") from exc
 
 
+def receive_attested_agent_start(
+    claim: AgentStartClaim,
+    expected: AgentStartEnvelope,
+    operations: AgentStartClientOperations,
+) -> AttestedAgentStart:
+    try:
+        if type(claim) is not AgentStartClaim:
+            raise BrokerClientError("agent start claim has wrong type")
+        if type(expected) is not AgentStartEnvelope:
+            raise BrokerClientError("agent start envelope has wrong type")
+        validate_chpb_message(claim)
+        validate_chpb_message(expected)
+    except Exception as exc:
+        if isinstance(exc, BrokerClientError):
+            raise
+        raise BrokerClientError("agent start binding is invalid") from exc
+
+    try:
+        frame = operations.receive_frame(claim)
+    except Exception as exc:
+        raise BrokerClientError("agent start frame receive failed") from exc
+
+    cleanup_fds = _frame_fds(frame)
+    try:
+        if type(frame) is not AgentStartFrame:
+            raise BrokerClientError("agent start frame has wrong type")
+        if type(frame.payload) is not bytes or type(frame.fds) is not tuple:
+            raise BrokerClientError("agent start frame is invalid")
+        if (
+            type(frame.message_truncated) is not bool
+            or type(frame.control_truncated) is not bool
+            or frame.message_truncated
+            or frame.control_truncated
+        ):
+            raise BrokerClientError("agent start frame is truncated")
+        if type(frame.scm_rights_count) is not int or frame.scm_rights_count != 1:
+            raise BrokerClientError("agent start frame ancillary count is invalid")
+        if len(frame.fds) != 1 or type(frame.fds[0]) is not int or frame.fds[0] < 0:
+            raise BrokerClientError("agent start frame does not contain one fd")
+        if len(cleanup_fds) != 1:
+            raise BrokerClientError("agent start frame fd identity is invalid")
+
+        envelope = decode_chpb_message(frame.payload)
+        if type(envelope) is not AgentStartEnvelope:
+            raise BrokerClientError("agent start frame has wrong payload")
+        if envelope != expected or envelope.request_id != claim.request_id:
+            raise BrokerClientError("agent start envelope binding drifted")
+
+        observed = _validate_fd_stat(operations.fstat(frame.fds[0]))
+        if (
+            observed.uid != 0
+            or observed.gid != 0
+            or observed.dev != envelope.attestation.directory.dev
+            or observed.ino != envelope.attestation.directory.ino
+            or observed.mode != envelope.attestation.directory.mode
+        ):
+            raise BrokerClientError("agent start fd stat drifted")
+        return AttestedAgentStart(frame.fds[0], envelope)
+    except Exception as exc:
+        _close_all(operations, cleanup_fds)
+        if isinstance(exc, BrokerClientError):
+            raise
+        raise BrokerClientError("invalid agent start frame") from exc
+
+
 __all__ = [
+    "AgentStartClientOperations",
+    "AgentStartFrame",
+    "AttestedAgentStart",
     "AttestedHome",
     "BrokerClientError",
     "BrokerClientOperations",
     "ScmFrame",
+    "receive_attested_agent_start",
     "receive_attested_home",
     "receive_transaction_reply",
 ]

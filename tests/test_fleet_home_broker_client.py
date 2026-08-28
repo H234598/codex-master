@@ -10,6 +10,10 @@ import pytest
 
 from codex_master.fleet_home_broker_linux import FdStat
 from codex_master.fleet_home_broker_protocol import (
+    AgentStartClaim,
+    AgentStartEnvironmentProjection,
+    AgentStartEnvelope,
+    AgentStartExecutablePin,
     AttestHomeRequest,
     B2aRecoveryPhase,
     BindingExpectation,
@@ -37,6 +41,11 @@ from codex_master.fleet_home_broker_protocol import (
     TransactionStatus,
     encode_chpb_message,
 )
+from codex_master.fleet_control_release_v2 import (
+    ControlReleaseSpecV2,
+    ReleasePayloadDigestV2,
+)
+from codex_master.fleet_home_broker_identity import BrokerIdentity
 
 
 client = importlib.import_module("codex_master.fleet_home_broker_client")
@@ -174,6 +183,32 @@ class FakeOperations:
             raise self.close_error
 
 
+class FakeAgentStartOperations:
+    def __init__(self, frame, *, stat=EXPECTED_STAT, fstat_error=None, close_error=None):
+        self.frame = frame
+        self.stat = stat
+        self.fstat_error = fstat_error
+        self.close_error = close_error
+        self.received = []
+        self.fstat_calls = []
+        self.closed = []
+
+    def receive_frame(self, claim):
+        self.received.append(claim)
+        return self.frame
+
+    def fstat(self, fd):
+        self.fstat_calls.append(fd)
+        if self.fstat_error is not None:
+            raise self.fstat_error
+        return self.stat
+
+    def close(self, fd):
+        self.closed.append(fd)
+        if self.close_error is not None:
+            raise self.close_error
+
+
 def frame(reply=REPLY, fds=(0,)):
     return client.ScmFrame(encode_chpb_message(reply), tuple(fds))
 
@@ -221,6 +256,70 @@ def transaction_reply(request, transaction=TRANSACTION, result=None):
         transaction.terminal_result if result is None else result,
         transaction,
         None,
+    )
+
+
+def agent_start_claim():
+    return AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID)
+
+
+def agent_start_release():
+    return ControlReleaseSpecV2(
+        2,
+        "0.10.5",
+        (
+            ReleasePayloadDigestV2("python_runtime", "a" * 64),
+            ReleasePayloadDigestV2("root_helpers", "b" * 64),
+            ReleasePayloadDigestV2("selinux_policy", "c" * 64),
+            ReleasePayloadDigestV2("systemd_units", "d" * 64),
+        ),
+        CHPB_PROTOCOL,
+        "org.codex_master.HomeBrokerControl2",
+        "StartDynamicTeamlead",
+        "codex-master-agent@.service",
+        "/usr/libexec/codex-master-agent-launcher",
+    )
+
+
+def agent_start_envelope():
+    identity = BrokerIdentity(
+        PRINCIPAL.agent_id,
+        PRINCIPAL.manifest_generation,
+        PRINCIPAL.mcs_pair,
+        "slot-1",
+        EXPECTED.policy_generation,
+        EXPECTED.projection_digest,
+        "f" * 64,
+        PRINCIPAL.fencing_epoch,
+    )
+    return AgentStartEnvelope(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.AGENT_START_ENVELOPE,
+        REQUEST_ID,
+        agent_start_release(),
+        "0.10.5",
+        13,
+        PRINCIPAL,
+        EXPECTED,
+        "codex-master-agent@c1\\x2cc2.service",
+        identity,
+        AgentStartExecutablePin("/usr/libexec/codex-master-agent-launcher", "f" * 64),
+        AgentStartEnvironmentProjection(
+            (
+                ("CODEX_HOME", CANONICAL_AGENT_HOME),
+                ("GEMINI_CLI_HOME", CANONICAL_AGENT_HOME),
+                ("HOME", CANONICAL_AGENT_HOME),
+            )
+        ),
+        ATTESTATION,
+    )
+
+
+def agent_start_frame(envelope=None, fds=(61,), **changes):
+    return client.AgentStartFrame(
+        encode_chpb_message(envelope or agent_start_envelope()),
+        tuple(fds),
+        **changes,
     )
 
 
@@ -805,3 +904,75 @@ def test_client_source_has_no_forbidden_transport_or_integration_surface():
                 node.module is None
                 or node.module.split(".")[0] not in forbidden_modules
             )
+
+
+def test_agent_start_client_returns_one_attested_fd_without_closing_success():
+    claim = agent_start_claim()
+    envelope = agent_start_envelope()
+    operations = FakeAgentStartOperations(agent_start_frame(envelope))
+
+    result = client.receive_attested_agent_start(claim, envelope, operations)
+
+    assert type(result) is client.AttestedAgentStart
+    assert result.fd == 61
+    assert result.envelope == envelope
+    assert operations.received == [claim]
+    assert operations.fstat_calls == [61]
+    assert operations.closed == []
+
+
+def test_agent_start_client_rejects_injected_frame_drift_and_closes_each_fd_once():
+    claim = agent_start_claim()
+    envelope = agent_start_envelope()
+    cases = (
+        (client.ScmFrame(b"", (61,)), (61,)),
+        (agent_start_frame(envelope, fds=(61, 61)), (61,)),
+        (agent_start_frame(envelope, fds=(61, -1, True, 62)), (61, 62)),
+        (agent_start_frame(envelope, message_truncated=True), (61,)),
+        (agent_start_frame(envelope, control_truncated=True), (61,)),
+        (agent_start_frame(envelope, scm_rights_count=2), (61,)),
+        (agent_start_frame(envelope, fds=()), ()),
+    )
+    for frame_, expected_closed in cases:
+        operations = FakeAgentStartOperations(frame_)
+        with pytest.raises(client.BrokerClientError):
+            client.receive_attested_agent_start(claim, envelope, operations)
+        assert operations.closed == list(expected_closed)
+        assert operations.received == [claim]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"request_id": OTHER_ID},
+        {"snapshot_generation": 14},
+        {"identity": replace(agent_start_envelope().identity, slot_snapshot="slot-2")},
+    ),
+)
+def test_agent_start_client_rejects_envelope_binding_drift(changes):
+    operations = FakeAgentStartOperations(agent_start_frame())
+    expected = replace(agent_start_envelope(), **changes)
+
+    with pytest.raises(client.BrokerClientError):
+        client.receive_attested_agent_start(
+            agent_start_claim(), expected, operations
+        )
+
+    assert operations.closed == [61]
+    assert operations.fstat_calls == []
+
+
+def test_agent_start_client_rejects_fd_stat_drift_and_close_errors_are_fail_closed():
+    operations = FakeAgentStartOperations(
+        agent_start_frame(),
+        stat=FdStat(DIRECTORY.dev + 1, DIRECTORY.ino, DIRECTORY.mode, 0, 0),
+        close_error=OSError("close failed"),
+    )
+
+    with pytest.raises(client.BrokerClientError):
+        client.receive_attested_agent_start(
+            agent_start_claim(), agent_start_envelope(), operations
+        )
+
+    assert operations.fstat_calls == [61]
+    assert operations.closed == [61]

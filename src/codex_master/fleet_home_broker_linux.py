@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from codex_master.fleet_home_broker_protocol import (
+    AgentStartEnvelope,
+    agent_unit_name_for_mcs,
     MAX_CHPB_DEVICE,
     MAX_CHPB_GENERATION,
     MAX_CHPB_INODE,
@@ -13,6 +15,7 @@ from codex_master.fleet_home_broker_protocol import (
     PrincipalBinding,
     _digest,
     _mcs,
+    validate_chpb_message,
     validate_principal_binding,
 )
 
@@ -49,6 +52,20 @@ class PeerSnapshot:
     cgroup_ino: int
     invocation_id: str
     unit_generation: int
+    mcs_pair: str
+
+
+@dataclass(frozen=True, slots=True)
+class AgentStartPeerObservation:
+    pid: int
+    uid: int
+    gid: int
+    start_time: int
+    cgroup_dev: int
+    cgroup_ino: int
+    unit_name: str
+    invocation_id: str
+    service_generation: int
     mcs_pair: str
 
 
@@ -493,7 +510,194 @@ def attest_peer_principal(
     return snapshot
 
 
+def _validate_agent_start_peer_observation(
+    value: object,
+    peer_pid: int,
+    peer_uid: int,
+    peer_gid: int,
+    expected: AgentStartEnvelope,
+) -> AgentStartPeerObservation:
+    if type(value) is not AgentStartPeerObservation:
+        raise LinuxBoundaryError("agent start peer observation is invalid")
+    _positive_integer(peer_pid, "peer pid")
+    _strict_integer(peer_uid, "peer uid", 0, 2**32 - 1)
+    _strict_integer(peer_gid, "peer gid", 0, 2**32 - 1)
+    _positive_integer(value.pid, "observation pid")
+    _positive_integer(value.start_time, "observation start time")
+    _strict_integer(value.cgroup_dev, "observation cgroup dev", 0, MAX_CHPB_DEVICE)
+    _strict_integer(value.cgroup_ino, "observation cgroup ino", 1, MAX_CHPB_INODE)
+    _positive_integer(value.service_generation, "observation service generation")
+    _strict_text(value.unit_name, "observation unit name")
+    try:
+        _digest(value.invocation_id, 32)
+        _mcs(value.mcs_pair)
+    except Exception as exc:
+        raise LinuxBoundaryError("agent start peer fields are invalid") from exc
+    if (
+        value.pid != peer_pid
+        or value.uid != peer_uid
+        or value.gid != peer_gid
+        or value.cgroup_dev != expected.principal.cgroup_dev
+        or value.cgroup_ino != expected.principal.cgroup_ino
+        or value.unit_name != agent_unit_name_for_mcs(expected.principal.mcs_pair)
+        or value.invocation_id != expected.principal.invocation_id
+        or value.service_generation != expected.principal.unit_generation
+        or value.mcs_pair != expected.principal.mcs_pair
+    ):
+        raise LinuxBoundaryError("agent start peer observation drifted")
+    return value
+
+
+def _observe_agent_start_peer_with_identity(
+    operations: LinuxOperations,
+    peer_pid: int,
+    peer_uid: int,
+    peer_gid: int,
+    expected: AgentStartEnvelope,
+) -> tuple[AgentStartPeerObservation, PidfdIdentity]:
+    """Read one envelope-bound peer using only injected Linux operations."""
+
+    if type(expected) is not AgentStartEnvelope:
+        raise LinuxBoundaryError("agent start envelope is invalid")
+    try:
+        validate_chpb_message(expected)
+    except Exception as exc:
+        raise LinuxBoundaryError("agent start envelope is invalid") from exc
+    _positive_integer(peer_pid, "peer pid")
+    _strict_integer(peer_uid, "peer uid", 0, 2**32 - 1)
+    _strict_integer(peer_gid, "peer gid", 0, 2**32 - 1)
+    pidfd = None
+    proc_fd = None
+    cgroup_fd = None
+    try:
+        pidfd = operations.pidfd_open(peer_pid, 0)
+        identity = _pidfd_guard(operations, pidfd, peer_pid, None, None, None)
+        proc_fd = operations.open_pinned_proc_pid(pidfd, peer_pid, identity)
+        identity = _pidfd_guard(operations, pidfd, peer_pid, proc_fd, None, identity)
+        cgroup_fd = operations.open_proc_cgroup(pidfd, proc_fd, identity)
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        cgroup_stat = _validate_cgroup_stat(operations.fstat(cgroup_fd))
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        cgroup_dev = cgroup_stat.dev
+        cgroup_ino = cgroup_stat.ino
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        proc_control_group = _strict_text(
+            operations.read_proc_control_group(
+                pidfd, proc_fd, cgroup_fd, cgroup_dev, cgroup_ino
+            ),
+            "proc control group",
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        unit_name = _strict_text(
+            operations.read_pid1_unit_name(
+                pidfd, cgroup_fd, cgroup_dev, cgroup_ino
+            ),
+            "PID-1 unit name",
+        )
+        if "/" in unit_name:
+            raise LinuxBoundaryError("PID-1 unit name is not canonical")
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        service_generation = operations.read_pid1_unit_generation(
+            pidfd, cgroup_fd, cgroup_dev, cgroup_ino
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        invocation_id = operations.read_pid1_invocation_id(
+            pidfd, cgroup_fd, cgroup_dev, cgroup_ino
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        pid1_control_group = _strict_text(
+            operations.read_pid1_control_group(
+                pidfd, cgroup_fd, cgroup_dev, cgroup_ino
+            ),
+            "PID-1 control group",
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        mcs_pair = operations.read_peer_mcs_pair(
+            pidfd, proc_fd, cgroup_fd, cgroup_dev, cgroup_ino
+        )
+        identity = _pidfd_guard(
+            operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
+        )
+        if proc_control_group != pid1_control_group:
+            raise LinuxBoundaryError("PID-1 control group does not match proc")
+        if not pid1_control_group.endswith(f"/{unit_name}"):
+            raise LinuxBoundaryError("PID-1 unit does not match cgroup")
+        observation = AgentStartPeerObservation(
+            identity.pid,
+            peer_uid,
+            peer_gid,
+            identity.start_time,
+            cgroup_dev,
+            cgroup_ino,
+            unit_name,
+            invocation_id,
+            service_generation,
+            mcs_pair,
+        )
+        _validate_agent_start_peer_observation(
+            observation, peer_pid, peer_uid, peer_gid, expected
+        )
+    except LinuxBoundaryError as exc:
+        _fail_with_cleanup(operations, (cgroup_fd, proc_fd, pidfd), str(exc), exc)
+    except Exception as exc:
+        _fail_with_cleanup(
+            operations,
+            (cgroup_fd, proc_fd, pidfd),
+            "agent start peer boundary operation failed",
+            exc,
+        )
+    _close_all(operations, (cgroup_fd, proc_fd, pidfd))
+    return observation, identity
+
+
+def observe_agent_start_peer(
+    operations: LinuxOperations,
+    peer_pid: int,
+    peer_uid: int,
+    peer_gid: int,
+    expected: AgentStartEnvelope,
+) -> AgentStartPeerObservation:
+    """Return one fully validated, pidfd-bound V2 peer observation."""
+
+    observation, _ = _observe_agent_start_peer_with_identity(
+        operations, peer_pid, peer_uid, peer_gid, expected
+    )
+    return observation
+
+
 __all__ = [
+    "AgentStartPeerObservation",
     "FdStat",
     "LinuxBoundaryError",
     "LinuxOperations",
@@ -502,4 +706,5 @@ __all__ = [
     "SAFE_DIRECTORY_MODE",
     "attest_peer_principal",
     "open_pinned_child_directory",
+    "observe_agent_start_peer",
 ]

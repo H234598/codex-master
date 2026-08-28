@@ -4,6 +4,10 @@ import json
 import pytest
 
 from codex_master.fleet_home_broker_protocol import (
+    AgentStartClaim,
+    AgentStartEnvironmentProjection,
+    AgentStartEnvelope,
+    AgentStartExecutablePin,
     CANONICAL_AGENT_HOME,
     CHPB_PROTOCOL,
     MAX_CHPB_GENERATION,
@@ -47,6 +51,12 @@ from codex_master.fleet_home_broker_protocol import (
     validate_transaction_binding,
     validate_transaction_status,
 )
+from codex_master.fleet_control_release_v2 import (
+    ControlReleaseSpecV2,
+    ReleasePayloadDigestV2,
+    encode_control_release_v2,
+)
+from codex_master.fleet_home_broker_identity import BrokerIdentity
 
 
 AGENT = "bee_1"
@@ -150,6 +160,77 @@ def request(kind=ChpbMessageKind.ATTEST_HOME, request_id=REQUEST_ID, transaction
     return klass(CHPB_PROTOCOL, kind, request_id, transaction_id, expected())
 
 
+def release():
+    return ControlReleaseSpecV2(
+        2,
+        "0.10.5",
+        (
+            ReleasePayloadDigestV2("python_runtime", "a" * 64),
+            ReleasePayloadDigestV2("root_helpers", "b" * 64),
+            ReleasePayloadDigestV2("selinux_policy", "c" * 64),
+            ReleasePayloadDigestV2("systemd_units", "d" * 64),
+        ),
+        "CHPB/2",
+        "org.codex_master.HomeBrokerControl2",
+        "StartDynamicTeamlead",
+        "codex-master-agent@.service",
+        "/usr/libexec/codex-master-agent-launcher",
+    )
+
+
+def agent_start_envelope(**changes):
+    principal_value = principal()
+    expected_value = expected()
+    identity = BrokerIdentity(
+        AGENT,
+        3,
+        "c0,c1",
+        "slot-1",
+        7,
+        A,
+        "e" * 64,
+        4,
+    )
+    transaction_binding = TransactionBinding(
+        ChpbTransactionOperation.PROVISION,
+        T,
+        U,
+        principal_value,
+        policy(),
+    )
+    home_attestation = HomeAttestation(
+        transaction_binding,
+        CANONICAL_AGENT_HOME,
+        DirectoryIdentity(0, 1, 0o40700),
+        A,
+        "c0,c1",
+    )
+    value = AgentStartEnvelope(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.AGENT_START_ENVELOPE,
+        REQUEST_ID,
+        release(),
+        "0.10.5",
+        13,
+        principal_value,
+        expected_value,
+        "codex-master-agent@c0\\x2cc1.service",
+        identity,
+        AgentStartExecutablePin(
+            "/usr/libexec/codex-master-agent-launcher", "e" * 64
+        ),
+        AgentStartEnvironmentProjection(
+            (
+                ("CODEX_HOME", CANONICAL_AGENT_HOME),
+                ("GEMINI_CLI_HOME", CANONICAL_AGENT_HOME),
+                ("HOME", CANONICAL_AGENT_HOME),
+            )
+        ),
+        home_attestation,
+    )
+    return dataclasses.replace(value, **changes)
+
+
 def test_public_contract_types_are_frozen_and_slotted():
     for klass in (
         PrincipalBinding,
@@ -240,7 +321,11 @@ def test_wire_contract_contains_no_list_field():
 
 def test_encode_each_message_variant_matches_golden_chpb2_bytes():
     for kind in ChpbMessageKind:
-        if kind is not ChpbMessageKind.REPLY:
+        if kind not in (
+            ChpbMessageKind.REPLY,
+            ChpbMessageKind.AGENT_START_CLAIM,
+            ChpbMessageKind.AGENT_START_ENVELOPE,
+        ):
             raw = encode_chpb_message(request(kind))
             assert raw.endswith(b"\n")
             assert raw == json.dumps(json.loads(raw), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
@@ -278,6 +363,103 @@ def test_reply_golden_bytes_and_roundtrips_cover_all_reply_variants():
         raw = encode_chpb_message(reply)
         assert decode_chpb_message(raw) == reply
         assert encode_chpb_message(decode_chpb_message(raw)) == raw
+
+
+def test_agent_start_contract_types_are_frozen_slotted_and_scalar_only():
+    claim = AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID)
+    envelope = agent_start_envelope()
+
+    for value in (claim, envelope, envelope.executable, envelope.environment):
+        klass = type(value)
+        assert dataclasses.is_dataclass(value)
+        assert klass.__dataclass_params__.frozen
+        assert hasattr(klass, "__slots__")
+        assert not hasattr(value, "__dict__")
+
+    assert tuple(field.name for field in dataclasses.fields(AgentStartClaim)) == (
+        "protocol",
+        "kind",
+        "request_id",
+    )
+    assert tuple(field.name for field in dataclasses.fields(AgentStartEnvelope)) == (
+        "protocol",
+        "kind",
+        "request_id",
+        "release",
+        "release_payload_version",
+        "snapshot_generation",
+        "principal",
+        "expected",
+        "unit_name",
+        "identity",
+        "executable",
+        "environment",
+        "attestation",
+    )
+
+
+def test_agent_start_claim_and_envelope_roundtrip_with_snapshot_generation():
+    claim = AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID)
+    envelope = agent_start_envelope()
+
+    claim_raw = encode_chpb_message(claim)
+    envelope_raw = encode_chpb_message(envelope)
+
+    assert b"[" not in claim_raw
+    assert type(json.loads(envelope_raw)["release"]) is str
+    assert decode_chpb_message(claim_raw) == claim
+    assert decode_chpb_message(envelope_raw) == envelope
+    assert decode_chpb_message(envelope_raw).snapshot_generation == 13
+    assert encode_chpb_message(decode_chpb_message(envelope_raw)) == envelope_raw
+    assert (
+        json.loads(envelope_raw)["release"]
+        == encode_control_release_v2(envelope.release).decode()
+    )
+
+
+@pytest.mark.parametrize(
+    "claim",
+    (
+        AgentStartClaim("CHPB/1", ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID),
+        AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.REPLY, REQUEST_ID),
+        AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, "A" * 32),
+        AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, "0" * 31),
+    ),
+)
+def test_agent_start_claim_rejects_schema_kind_and_correlation_drift(claim):
+    with pytest.raises(ChpbValidationError):
+        validate_chpb_message(claim)
+
+
+def test_agent_start_claim_rejects_unknown_wire_fields():
+    claim = AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID)
+    document = json.loads(encode_chpb_message(claim))
+    document["target"] = "teamleiterin"
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+    with pytest.raises(ChpbValidationError):
+        decode_chpb_message(raw)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"release_payload_version": "0.10.4"},
+        {"snapshot_generation": 0},
+        {"snapshot_generation": True},
+        {"unit_name": "codex-master-agent@c0-c1.service"},
+        {"executable": AgentStartExecutablePin("/tmp/agent", "e" * 64)},
+        {
+            "environment": AgentStartEnvironmentProjection(
+                (("OPENAI_API_KEY", "secret"),)
+            )
+        },
+        {"principal": principal(mcs_pair="c0,c2")},
+    ),
+)
+def test_agent_start_envelope_rejects_cross_binding_drift(changes):
+    with pytest.raises(ChpbValidationError):
+        validate_chpb_message(agent_start_envelope(**changes))
 
 
 def test_decode_rejects_unknown_missing_and_duplicate_fields():

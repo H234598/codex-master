@@ -8,6 +8,7 @@ import pytest
 
 import codex_master.fleet_home_broker_linux as linux
 from codex_master.fleet_home_broker_linux import (
+    AgentStartPeerObservation,
     FdStat,
     LinuxBoundaryError,
     LinuxOperations,
@@ -15,14 +16,30 @@ from codex_master.fleet_home_broker_linux import (
     PidfdIdentity,
     attest_peer_principal,
     open_pinned_child_directory,
+    observe_agent_start_peer,
 )
 from codex_master.fleet_home_broker_protocol import (
+    AgentStartEnvironmentProjection,
+    AgentStartEnvelope,
+    AgentStartExecutablePin,
+    BindingExpectation,
+    CHPB_PROTOCOL,
+    ChpbMessageKind,
     MAX_CHPB_DEVICE,
     MAX_CHPB_GENERATION,
     MAX_CHPB_INODE,
     DirectoryIdentity,
     PrincipalBinding,
+    HomeAttestation,
+    PolicyBinding,
+    TransactionBinding,
+    ChpbTransactionOperation,
 )
+from codex_master.fleet_control_release_v2 import (
+    ControlReleaseSpecV2,
+    ReleasePayloadDigestV2,
+)
+from codex_master.fleet_home_broker_identity import BrokerIdentity
 
 
 CHILD_FD = 41
@@ -65,6 +82,72 @@ def snapshot(**changes):
     }
     values.update(changes)
     return PeerSnapshot(**values)
+
+
+def agent_start_envelope():
+    expected_principal = principal()
+    expected_policy = PolicyBinding(7, "a" * 64)
+    transaction_binding = TransactionBinding(
+        ChpbTransactionOperation.PROVISION,
+        "2" * 32,
+        "3" * 32,
+        expected_principal,
+        expected_policy,
+    )
+    attestation = HomeAttestation(
+        transaction_binding,
+        "/run/codex-master-agent/home",
+        DirectoryIdentity(0, 1, 0o40700),
+        "a" * 64,
+        expected_principal.mcs_pair,
+    )
+    release = ControlReleaseSpecV2(
+        2,
+        "0.10.5",
+        (
+            ReleasePayloadDigestV2("python_runtime", "1" * 64),
+            ReleasePayloadDigestV2("root_helpers", "2" * 64),
+            ReleasePayloadDigestV2("selinux_policy", "3" * 64),
+            ReleasePayloadDigestV2("systemd_units", "4" * 64),
+        ),
+        CHPB_PROTOCOL,
+        "org.codex_master.HomeBrokerControl2",
+        "StartDynamicTeamlead",
+        "codex-master-agent@.service",
+        "/usr/libexec/codex-master-agent-launcher",
+    )
+    return AgentStartEnvelope(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.AGENT_START_ENVELOPE,
+        "5" * 32,
+        release,
+        "0.10.5",
+        13,
+        expected_principal,
+        BindingExpectation("bee_1", 3, 9, 7, "a" * 64, 4),
+        "codex-master-agent@c0\\x2cc1.service",
+        BrokerIdentity(
+            "bee_1",
+            3,
+            "c0,c1",
+            "slot-1",
+            7,
+            "a" * 64,
+            "b" * 64,
+            4,
+        ),
+        AgentStartExecutablePin(
+            "/usr/libexec/codex-master-agent-launcher", "b" * 64
+        ),
+        AgentStartEnvironmentProjection(
+            (
+                ("CODEX_HOME", "/run/codex-master-agent/home"),
+                ("GEMINI_CLI_HOME", "/run/codex-master-agent/home"),
+                ("HOME", "/run/codex-master-agent/home"),
+            )
+        ),
+        attestation,
+    )
 
 
 class FakeOperations:
@@ -547,6 +630,7 @@ def test_root_owned_snapshot_source_keeps_linux_api_and_guard_contract():
         "read_peer_mcs_pair",
     ]
     assert linux.__all__ == [
+        "AgentStartPeerObservation",
         "FdStat",
         "LinuxBoundaryError",
         "LinuxOperations",
@@ -555,6 +639,7 @@ def test_root_owned_snapshot_source_keeps_linux_api_and_guard_contract():
         "SAFE_DIRECTORY_MODE",
         "attest_peer_principal",
         "open_pinned_child_directory",
+        "observe_agent_start_peer",
     ]
 
 
@@ -745,3 +830,97 @@ def test_linux_module_import_scope_excludes_real_system_and_lifecycle_apis():
             imported.add(node.module.split(".")[0])
 
     assert imported <= {"__future__", "dataclasses", "typing", "codex_master"}
+
+
+def test_agent_start_peer_observation_binds_peer_credentials_and_unit_instance():
+    unit_name = "codex-master-agent@c0\\x2cc1.service"
+    control_group = f"/user.slice/user-1000.slice/{unit_name}"
+    operations = FakeOperations(
+        proc_control_group=control_group,
+        pid1_unit_name=unit_name,
+        pid1_control_group=control_group,
+    )
+
+    result = observe_agent_start_peer(
+        operations,
+        PEER_PID,
+        1000,
+        1001,
+        agent_start_envelope(),
+    )
+
+    assert type(result) is AgentStartPeerObservation
+    assert result.pid == PEER_PID
+    assert result.uid == 1000
+    assert result.gid == 1001
+    assert result.start_time == PID_START_TIME
+    assert result.cgroup_dev == 17
+    assert result.cgroup_ino == 29
+    assert result.unit_name == unit_name
+    assert result.invocation_id == "1" * 32
+    assert result.service_generation == 9
+    assert result.mcs_pair == "c0,c1"
+    assert operations.calls[-3:] == [
+        ("close", CGROUP_FD),
+        ("close", PROC_FD),
+        ("close", PID_FD),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "credentials"),
+    (
+        ({"pid1_unit_generation": 10}, (PEER_PID, 1000, 1001)),
+        ({"pid1_invocation_id": "2" * 32}, (PEER_PID, 1000, 1001)),
+        ({"peer_mcs_pair": "c0,c2"}, (PEER_PID, 1000, 1001)),
+        ({"pid1_unit_name": "codex-master-agent@c0-c1.service"}, (PEER_PID, 1000, 1001)),
+        ({}, (PEER_PID + 1, 1000, 1001)),
+        ({}, (PEER_PID, True, 1001)),
+        ({}, (PEER_PID, 1000, True)),
+    ),
+)
+def test_agent_start_peer_observation_rejects_pid_uid_gid_and_unit_drift(
+    kwargs, credentials
+):
+    operations = FakeOperations(**kwargs)
+    with pytest.raises(LinuxBoundaryError):
+        observe_agent_start_peer(
+            operations,
+            credentials[0],
+            credentials[1],
+            credentials[2],
+            agent_start_envelope(),
+        )
+    if credentials[1] is True or credentials[2] is True:
+        assert operations.calls == []
+    elif credentials[0] != PEER_PID:
+        assert operations.calls[-1] == ("close", PID_FD)
+    else:
+        assert operations.calls[-3:] == [
+            ("close", CGROUP_FD),
+            ("close", PROC_FD),
+            ("close", PID_FD),
+        ]
+
+
+def test_agent_start_observation_keeps_v1_peer_snapshot_shape_untouched():
+    assert tuple(field.name for field in dataclasses.fields(PeerSnapshot)) == (
+        "pid",
+        "cgroup_dev",
+        "cgroup_ino",
+        "invocation_id",
+        "unit_generation",
+        "mcs_pair",
+    )
+    assert tuple(field.name for field in dataclasses.fields(AgentStartPeerObservation)) == (
+        "pid",
+        "uid",
+        "gid",
+        "start_time",
+        "cgroup_dev",
+        "cgroup_ino",
+        "unit_name",
+        "invocation_id",
+        "service_generation",
+        "mcs_pair",
+    )

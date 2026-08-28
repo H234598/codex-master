@@ -14,6 +14,9 @@ import codex_master.fleet_home_broker_wal as wal
 from codex_master.fleet_home_broker_dispatch import BrokerDispatchCommand
 from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
 from codex_master.fleet_home_broker_protocol import (
+    AgentStartEnvironmentProjection,
+    AgentStartEnvelope,
+    AgentStartExecutablePin,
     MAX_CHPB_MESSAGE_BYTES,
     CHPB_PROTOCOL,
     AttestHomeRequest,
@@ -29,7 +32,9 @@ from codex_master.fleet_home_broker_protocol import (
     ChpbValidationCode,
     ChpbValidationError,
     DeprovisionHomeRequest,
+    DirectoryIdentity,
     GetTerminalResultRequest,
+    HomeAttestation,
     PolicyBinding,
     PrincipalBinding,
     ProvisionHomeRequest,
@@ -40,9 +45,15 @@ from codex_master.fleet_home_broker_protocol import (
     b2a_phase_for_checkpoint,
     encode_chpb_message,
 )
+from codex_master.fleet_control_release_v2 import (
+    ControlReleaseSpecV2,
+    ReleasePayloadDigestV2,
+)
+from codex_master.fleet_home_broker_identity import BrokerIdentity
 from codex_master.fleet_home_broker_runtime import BrokerReleaseSpec, KernelPeerEvidence
 from codex_master.fleet_home_broker_seqpacket import (
     SeqpacketPeerError,
+    reattest_agent_start_peer,
     reattest_seqpacket_peer,
 )
 from codex_master.fleet_home_broker_wal import append_status, encode_status_payload
@@ -84,6 +95,63 @@ def release_spec(**changes: object) -> BrokerReleaseSpec:
     }
     values.update(changes)
     return BrokerReleaseSpec(**values)
+
+
+def agent_start_envelope() -> AgentStartEnvelope:
+    binding = TransactionBinding(
+        ChpbTransactionOperation.PROVISION,
+        "2" * 32,
+        "3" * 32,
+        PRINCIPAL,
+        PolicyBinding(7, "a" * 64),
+    )
+    attestation = HomeAttestation(
+        binding,
+        "/run/codex-master-agent/home",
+        DirectoryIdentity(0, 1, 0o40700),
+        "a" * 64,
+        "c0,c1",
+    )
+    release = ControlReleaseSpecV2(
+        2,
+        "0.10.5",
+        (
+            ReleasePayloadDigestV2("python_runtime", "1" * 64),
+            ReleasePayloadDigestV2("root_helpers", "2" * 64),
+            ReleasePayloadDigestV2("selinux_policy", "3" * 64),
+            ReleasePayloadDigestV2("systemd_units", "4" * 64),
+        ),
+        CHPB_PROTOCOL,
+        "org.codex_master.HomeBrokerControl2",
+        "StartDynamicTeamlead",
+        "codex-master-agent@.service",
+        "/usr/libexec/codex-master-agent-launcher",
+    )
+    return AgentStartEnvelope(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.AGENT_START_ENVELOPE,
+        "5" * 32,
+        release,
+        "0.10.5",
+        13,
+        PRINCIPAL,
+        BindingExpectation("bee_1", 3, 9, 7, "a" * 64, 4),
+        "codex-master-agent@c0\\x2cc1.service",
+        BrokerIdentity(
+            "bee_1", 3, "c0,c1", "slot-1", 7, "a" * 64, "b" * 64, 4
+        ),
+        AgentStartExecutablePin(
+            "/usr/libexec/codex-master-agent-launcher", "b" * 64
+        ),
+        AgentStartEnvironmentProjection(
+            (
+                ("CODEX_HOME", "/run/codex-master-agent/home"),
+                ("GEMINI_CLI_HOME", "/run/codex-master-agent/home"),
+                ("HOME", "/run/codex-master-agent/home"),
+            )
+        ),
+        attestation,
+    )
 
 
 class RecordingOperations:
@@ -1338,6 +1406,7 @@ def test_public_surface_is_exact() -> None:
         "SeqpacketPeerOperations",
         "admit_connected_seqpacket_peer",
         "receive_admitted_seqpacket_request",
+        "reattest_agent_start_peer",
         "reattest_seqpacket_peer",
     )
 
@@ -1435,6 +1504,7 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
                 node.func.id if isinstance(node.func, ast.Name) else None
             )
             assert called_name not in forbidden_call_names
+
 
     receive_functions = [
         node
@@ -2522,3 +2592,59 @@ def test_receive_admitted_seqpacket_request_propagates_canonical_decode_errors(
         ]
         assert events.index(recv_events[0]) < events.index(("decode", payload))
         assert events[-1] == ("decode", payload)
+
+
+def test_agent_start_peer_reattestation_binds_so_peercred_and_peersec():
+    unit_name = "codex-master-agent@c0\\x2cc1.service"
+    control_group = f"/user.slice/user-1000.slice/{unit_name}"
+    events: list[tuple[object, ...]] = []
+    operations = RecordingOperations(events, credentials=(PEER_PID, 1000, 1001))
+    linux_operations = RecordingLinuxOperations(
+        events,
+        proc_control_group=control_group,
+        pid1_unit_name=unit_name,
+        pid1_control_group=control_group,
+    )
+
+    result = reattest_agent_start_peer(
+        operations, linux_operations, agent_start_envelope()
+    )
+
+    assert result.pid == PEER_PID
+    assert result.uid == 1000
+    assert result.gid == 1001
+    assert result.start_time == START_TIME
+    assert result.unit_name == unit_name
+    assert result.service_generation == 9
+    assert result.mcs_pair == "c0,c1"
+    assert ("peer_credentials",) in events
+    assert ("peer_security_context",) in events
+
+
+@pytest.mark.parametrize(
+    "operations",
+    (
+        RecordingOperations([], family=socket.AF_INET),
+        RecordingOperations([], kind=socket.SOCK_STREAM),
+        RecordingOperations([], credentials=(PEER_PID, True, 1001)),
+        RecordingOperations([], credentials=(PEER_PID, 1000, True)),
+        RecordingOperations([], context=b"system_u:system_r:wrong_t:s0:c0,c1\0"),
+    ),
+)
+def test_agent_start_peer_reattestation_rejects_socket_credential_and_label_drift(
+    operations,
+):
+    events = operations.events
+    unit_name = "codex-master-agent@c0\\x2cc1.service"
+    control_group = f"/user.slice/user-1000.slice/{unit_name}"
+    linux_operations = RecordingLinuxOperations(
+        events,
+        proc_control_group=control_group,
+        pid1_unit_name=unit_name,
+        pid1_control_group=control_group,
+    )
+
+    with pytest.raises(SeqpacketPeerError):
+        reattest_agent_start_peer(
+            operations, linux_operations, agent_start_envelope()
+        )
