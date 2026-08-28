@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+from codex_master.google_account_manager_cli import main
+
+
+raise SystemExit(main())

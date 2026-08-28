@@ -11,6 +11,7 @@ dependencies = []
 
 [project.scripts]
 codex-master-mcp = "codex_master.server:main"
+google-account-manager = "codex_master.google_account_manager_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

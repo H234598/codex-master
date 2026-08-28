@@ -1,16 +1,50 @@
 #!/usr/bin/env python3
-"""Release one held scope gate into a fixed absolute argv without a shell."""
+"""Authenticate one G5 scope gate before fixed tmux execution."""
 
 from __future__ import annotations
 
 import os
 import re
+import selectors
 import secrets
+import socket
+import stat
+import struct
+import subprocess
 import sys
+import time
+from dataclasses import dataclass, field
 
 
 _TMUX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_CHALLENGE = re.compile(r"^[a-f0-9]{64}$")
 _TMUX_PATH = "/usr/bin/tmux"
+_GATE_SOCKET_PREFIX = "\0codex-master-g5-"
+_GATE_TIMEOUT_SECONDS = 5.0
+_MAX_CONTROL_OUTPUT_BYTES = 512
+_MAX_CONTROL_RECOVERY_BYTES = 512
+_MAX_PROC_STAT_BYTES = 4096
+_PROCESS_KILL_WAIT_SECONDS = 1.0
+_COMMIT_BYTES = 16
+_COMMIT = re.compile(r"^[a-f0-9]{32}$")
+_SESSION_ID = re.compile(r"^\$[0-9]{1,20}$")
+
+
+@dataclass(frozen=True)
+class _TmuxServerGeneration:
+    pid: int
+    start_ticks: int
+    socket_device: int
+    socket_inode: int
+
+
+@dataclass
+class _TmuxControlCapability:
+    process: subprocess.Popen[bytes]
+    session_id: str | None = None
+    generation: _TmuxServerGeneration | None = None
+    buffered: bytearray = field(default_factory=bytearray)
+    command_active: bool = False
 
 
 def _reject() -> None:
@@ -21,34 +55,709 @@ def _valid_name(value: object) -> bool:
     return isinstance(value, str) and _TMUX_NAME.fullmatch(value) is not None and ".." not in value
 
 
-def main() -> None:
-    arguments = sys.argv[1:]
-    if len(arguments) != 2:
-        _reject()
-    socket_name, session_name = arguments
-    if not _valid_name(socket_name) or not _valid_name(session_name):
-        _reject()
-    challenge = secrets.token_hex(32)
+def _positive_int(value: object) -> int:
+    if not isinstance(value, str) or not value.isdecimal() or (len(value) > 1 and value[0] == "0"):
+        raise ValueError("invalid integer")
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("invalid integer")
+    return parsed
+
+
+def _gate_socket_address(socket_name: str) -> str:
+    if not _valid_name(socket_name):
+        raise ValueError("invalid socket")
+    address = _GATE_SOCKET_PREFIX + socket_name
+    if len(address.encode("ascii")) > 107:
+        raise ValueError("invalid socket")
+    return address
+
+
+def _parse_arguments(arguments: list[str]) -> tuple[str, str, int, int, int, int, str]:
+    if len(arguments) != 14:
+        raise ValueError("invalid arguments")
+    names = arguments[::2]
+    values = arguments[1::2]
+    if names != [
+        "--socket",
+        "--session",
+        "--owner-pid",
+        "--runner-fd",
+        "--device",
+        "--inode",
+        "--challenge",
+    ]:
+        raise ValueError("invalid arguments")
+    socket_name, session_name, owner_pid, parent_fd, device, inode, challenge = values
+    if (
+        not _valid_name(socket_name)
+        or not _valid_name(session_name)
+        or _CHALLENGE.fullmatch(challenge) is None
+    ):
+        raise ValueError("invalid arguments")
+    return (
+        socket_name,
+        session_name,
+        _positive_int(owner_pid),
+        _positive_int(parent_fd),
+        _positive_int(device),
+        _positive_int(inode),
+        challenge,
+    )
+
+
+def _open_pinned_parent_runner_fd(
+    *, owner_pid: int, parent_fd: int, device: int, inode: int
+) -> int:
+    if (
+        type(owner_pid) is not int
+        or type(parent_fd) is not int
+        or type(device) is not int
+        or type(inode) is not int
+        or owner_pid <= 0
+        or parent_fd <= 0
+        or device <= 0
+        or inode <= 0
+    ):
+        raise ValueError("invalid runner target")
     try:
-        sys.stdout.buffer.write(f"{challenge}\n".encode("ascii"))
-        sys.stdout.buffer.flush()
-    except OSError:
-        _reject()
-    expected = f"{challenge}\n".encode("ascii")
-    try:
-        received = sys.stdin.buffer.read(len(expected) + 1)
-    except OSError:
-        _reject()
-    if received != expected:
-        _reject()
-    try:
-        os.execve(
-            _TMUX_PATH,
-            [_TMUX_PATH, "-L", socket_name, "new-session", "-d", "-s", session_name],
-            {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        descriptor = os.open(
+            f"/proc/{owner_pid}/fd/{parent_fd}",
+            os.O_RDONLY | os.O_CLOEXEC,
         )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or (metadata.st_dev, metadata.st_ino) != (device, inode)
+            or os.pread(descriptor, 4, 0) != b"\x7fELF"
+        ):
+            os.close(descriptor)
+            raise ValueError("invalid runner target")
+        return descriptor
+    except OSError as exc:
+        raise ValueError("invalid runner target") from exc
+
+
+def _peer_is_expected_owner(connection: socket.socket, owner_pid: int) -> bool:
+    if not hasattr(socket, "SO_PEERCRED"):
+        return False
+    try:
+        raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, uid, _gid = struct.unpack("3i", raw)
     except OSError:
-        os._exit(127)
+        return False
+    return pid == owner_pid and uid == os.getuid()
+
+
+def _read_exact(connection: socket.socket, expected: bytes) -> bool:
+    payload = bytearray()
+    try:
+        while len(payload) <= len(expected):
+            chunk = connection.recv(len(expected) + 1 - len(payload))
+            if not chunk:
+                return False
+            payload.extend(chunk)
+            if payload.endswith(b"\n"):
+                break
+    except OSError:
+        return False
+    return bytes(payload) == expected
+
+
+def _read_release(connection: socket.socket, challenge: str) -> bool:
+    return _read_exact(connection, f"RELEASE {challenge}\n".encode("ascii"))
+
+
+def _read_ack(connection: socket.socket, challenge: str, commit: str) -> bool:
+    if not isinstance(commit, str) or _COMMIT.fullmatch(commit) is None:
+        return False
+    return _read_exact(connection, f"ACK {challenge} {commit}\n".encode("ascii"))
+
+
+def _read_parent_attest_or_ack(connection: socket.socket, challenge: str, commit: str) -> str | None:
+    if not isinstance(commit, str) or _COMMIT.fullmatch(commit) is None:
+        return None
+    expected_ack = f"ACK {challenge} {commit}\n".encode("ascii")
+    expected_attest = f"ATTEST {challenge} {commit}\n".encode("ascii")
+    payload = bytearray()
+    try:
+        while len(payload) <= max(len(expected_ack), len(expected_attest)):
+            chunk = connection.recv(max(len(expected_ack), len(expected_attest)) + 1 - len(payload))
+            if not chunk:
+                return None
+            payload.extend(chunk)
+            if payload.endswith(b"\n"):
+                if bytes(payload) == expected_ack:
+                    return "ack"
+                if bytes(payload) == expected_attest:
+                    return "attest"
+                return None
+    except OSError:
+        return None
+    return None
+
+
+def _parse_tmux_pid(raw: bytes) -> int:
+    if not isinstance(raw, bytes) or not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise ValueError("invalid tmux pid")
+    text = raw[:-1].decode("ascii")
+    return _positive_int(text)
+
+
+def _parse_tmux_session_id(raw: bytes) -> str:
+    if not isinstance(raw, bytes) or not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise ValueError("invalid tmux session")
+    value = raw[:-1].decode("ascii")
+    if _SESSION_ID.fullmatch(value) is None:
+        raise ValueError("invalid tmux session")
+    return value
+
+
+def _read_process_start_ticks(pid: int) -> int:
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("invalid tmux server")
+    descriptor = -1
+    try:
+        descriptor = os.open(f"/proc/{pid}/stat", os.O_RDONLY | os.O_CLOEXEC)
+        raw = os.read(descriptor, _MAX_PROC_STAT_BYTES + 1)
+    except OSError as exc:
+        raise ValueError("invalid tmux server") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not raw.endswith(b"\n") or len(raw) > _MAX_PROC_STAT_BYTES:
+        raise ValueError("invalid tmux server")
+    closing = raw.rfind(b") ")
+    if closing <= 0:
+        raise ValueError("invalid tmux server")
+    fields = raw[closing + 2 : -1].split(b" ")
+    if len(fields) < 20 or not fields[19].isdigit():
+        raise ValueError("invalid tmux server")
+    start_ticks = int(fields[19])
+    if start_ticks <= 0:
+        raise ValueError("invalid tmux server")
+    return start_ticks
+
+
+def _tmux_socket_identity(raw: bytes) -> tuple[int, int]:
+    if not isinstance(raw, bytes) or not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise ValueError("invalid tmux socket")
+    try:
+        path = raw[:-1].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("invalid tmux socket") from exc
+    if not path.startswith("/") or "\x00" in path or len(path) > 255:
+        raise ValueError("invalid tmux socket")
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise ValueError("invalid tmux socket") from exc
+    if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_dev <= 0 or metadata.st_ino <= 0:
+        raise ValueError("invalid tmux socket")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _tmux_environment(gate_fd: int) -> dict[str, str]:
+    if type(gate_fd) is not int or gate_fd <= 0:
+        raise ValueError("invalid gate fd")
+    return {
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "CODEX_MASTER_RUNNER_EXEC_PATH": f"/proc/self/fd/{gate_fd}",
+    }
+
+
+def _close_process_streams(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+
+
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.kill()
+    try:
+        process.wait(timeout=_PROCESS_KILL_WAIT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("tmux failed") from exc
+
+
+def _read_control_line(
+    control: _TmuxControlCapability, *, deadline: float, max_bytes: int | None = None
+) -> bytes:
+    if max_bytes is None:
+        max_bytes = _MAX_CONTROL_OUTPUT_BYTES
+    if type(max_bytes) is not int or not 1 <= max_bytes <= _MAX_CONTROL_RECOVERY_BYTES:
+        raise ValueError("tmux control failed")
+    process = control.process
+    if process.stdout is None or process.stderr is None or process.poll() is not None:
+        raise ValueError("tmux control failed")
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stderr, selectors.EVENT_READ)
+        while True:
+            newline = control.buffered.find(b"\n")
+            if newline >= 0:
+                line = bytes(control.buffered[:newline])
+                del control.buffered[: newline + 1]
+                return line
+            if len(control.buffered) >= max_bytes:
+                raise ValueError("tmux control failed")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or process.poll() is not None:
+                raise ValueError("tmux control failed")
+            events = selector.select(remaining)
+            if not events:
+                raise ValueError("tmux control failed")
+            for key, _mask in events:
+                chunk = os.read(
+                    key.fd,
+                    min(128, max_bytes + 1 - len(control.buffered)),
+                )
+                if not chunk or key.fileobj is process.stderr:
+                    raise ValueError("tmux control failed")
+                control.buffered.extend(chunk)
+                if len(control.buffered) > max_bytes:
+                    raise ValueError("tmux control failed")
+    except OSError as exc:
+        raise ValueError("tmux control failed") from exc
+    finally:
+        selector.close()
+
+
+def _control_marker(line: bytes, kind: bytes) -> tuple[bytes, bytes, bytes] | None:
+    fields = line.split(b" ")
+    if len(fields) != 4 or fields[0] != kind or any(not value.isdigit() for value in fields[1:]):
+        return None
+    return fields[1], fields[2], fields[3]
+
+
+def _control_command(
+    control: _TmuxControlCapability,
+    command: bytes,
+    *,
+    max_lines: int = 1,
+    max_bytes: int | None = None,
+    discard_prefix: bool = False,
+) -> tuple[bytes, ...]:
+    if max_bytes is None:
+        max_bytes = _MAX_CONTROL_OUTPUT_BYTES
+    if type(max_bytes) is not int or not 1 <= max_bytes <= _MAX_CONTROL_RECOVERY_BYTES:
+        raise ValueError("tmux control failed")
+    if (
+        control.command_active
+        or not isinstance(command, bytes)
+        or not 1 < len(command) <= max_bytes
+        or not command.isascii()
+        or command.count(b"\n") != 1
+        or not command.endswith(b"\n")
+        or type(max_lines) is not int
+        or not 1 <= max_lines <= 16
+        or type(discard_prefix) is not bool
+    ):
+        raise ValueError("tmux control failed")
+    process = control.process
+    if process.stdin is None or process.poll() is not None:
+        raise ValueError("tmux control failed")
+    control.command_active = True
+    try:
+        process.stdin.write(command)
+        process.stdin.flush()
+        deadline = time.monotonic() + _GATE_TIMEOUT_SECONDS
+        begin: tuple[bytes, bytes, bytes] | None = None
+        lines: list[bytes] = []
+        consumed = 0
+        while True:
+            line = _read_control_line(control, deadline=deadline, max_bytes=max_bytes)
+            consumed += len(line) + 1
+            if consumed > max_bytes:
+                raise ValueError("tmux control failed")
+            marker = _control_marker(line, b"%begin")
+            if marker is not None:
+                if begin is not None:
+                    raise ValueError("tmux control failed")
+                begin = marker
+                continue
+            marker = _control_marker(line, b"%end")
+            if marker is not None:
+                if begin is None and discard_prefix:
+                    continue
+                if begin is None or marker != begin:
+                    raise ValueError("tmux control failed")
+                return tuple(lines)
+            if line.startswith(b"%"):
+                if line.startswith(b"%error"):
+                    raise ValueError("tmux control failed")
+                continue
+            if begin is None and discard_prefix:
+                continue
+            if begin is None or len(lines) >= max_lines:
+                raise ValueError("tmux control failed")
+            lines.append(line)
+    except (OSError, ValueError) as exc:
+        raise ValueError("tmux control failed") from exc
+    finally:
+        control.command_active = False
+
+
+def _read_control_facts(
+    control: _TmuxControlCapability,
+) -> tuple[str, _TmuxServerGeneration]:
+    lines = _control_command(
+        control,
+        b'display-message -p "#{client_pid}|#{session_id}|#{pid}|#{socket_path}"\n',
+    )
+    if len(lines) != 1:
+        raise ValueError("tmux control failed")
+    try:
+        client_pid, session_id, tmux_pid, socket_path = lines[0].decode("ascii").split("|")
+        observed_client_pid = _positive_int(client_pid)
+        parsed_session_id = _parse_tmux_session_id(session_id.encode("ascii") + b"\n")
+        observed_tmux_pid = _positive_int(tmux_pid)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("tmux control failed") from exc
+    if observed_client_pid != control.process.pid:
+        raise ValueError("tmux control failed")
+    socket_device, socket_inode = _tmux_socket_identity(socket_path.encode("ascii") + b"\n")
+    return parsed_session_id, _TmuxServerGeneration(
+        pid=observed_tmux_pid,
+        start_ticks=_read_process_start_ticks(observed_tmux_pid),
+        socket_device=socket_device,
+        socket_inode=socket_inode,
+    )
+
+
+def _read_bound_control_client(control: _TmuxControlCapability) -> None:
+    lines = _control_command(control, b'list-clients -F "#{client_pid}|#{client_session}"\n', max_lines=16)
+    matches = 0
+    for line in lines:
+        try:
+            client_pid, session_name = line.decode("ascii").split("|")
+        except ValueError as exc:
+            raise ValueError("tmux control failed") from exc
+        if not session_name or _positive_int(client_pid) <= 0:
+            raise ValueError("tmux control failed")
+        if _positive_int(client_pid) == control.process.pid:
+            matches += 1
+    if matches != 1:
+        raise ValueError("tmux control failed")
+
+
+def _read_bound_attestation(
+    control: _TmuxControlCapability,
+) -> tuple[str, _TmuxServerGeneration, int]:
+    session_id, generation = _read_control_facts(control)
+    _read_bound_control_client(control)
+    pane_lines = _control_command(
+        control,
+        f'list-panes -F "#{{pane_pid}}" -t {session_id}\n'.encode("ascii"),
+    )
+    if len(pane_lines) != 1:
+        raise ValueError("tmux control failed")
+    pane_pid = _parse_tmux_pid(pane_lines[0] + b"\n")
+    confirmed_session_id, confirmed_generation = _read_control_facts(control)
+    if (confirmed_session_id, confirmed_generation) != (session_id, generation):
+        raise ValueError("tmux control failed")
+    if control.session_id is not None and control.session_id != session_id:
+        raise ValueError("tmux control failed")
+    if control.generation is not None and control.generation != generation:
+        raise ValueError("tmux control failed")
+    control.session_id = session_id
+    control.generation = generation
+    return session_id, generation, pane_pid
+
+
+def _close_tmux_control(control: _TmuxControlCapability) -> None:
+    process = control.process
+    if process.stdin is not None:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    try:
+        if process.poll() is None:
+            _stop_process(process)
+    except ValueError:
+        pass
+    finally:
+        _close_process_streams(process)
+
+
+def _read_control_ready(control: _TmuxControlCapability) -> None:
+    deadline = time.monotonic() + _GATE_TIMEOUT_SECONDS
+    session_id: str | None = None
+    begin: tuple[bytes, bytes, bytes] | None = None
+    consumed = 0
+    while True:
+        line = _read_control_line(control, deadline=deadline)
+        consumed += len(line) + 1
+        if consumed > _MAX_CONTROL_OUTPUT_BYTES:
+            raise ValueError("tmux control failed")
+        marker = _control_marker(line, b"%begin")
+        if marker is not None:
+            if begin is not None:
+                raise ValueError("tmux control failed")
+            begin = marker
+            continue
+        marker = _control_marker(line, b"%end")
+        if marker is not None:
+            if begin is None or marker != begin:
+                raise ValueError("tmux control failed")
+            begin = None
+            continue
+        if line.startswith(b"%"):
+            if line.startswith(b"%error"):
+                raise ValueError("tmux control failed")
+            if session_id is not None and begin is None and line.startswith(
+                f"%session-changed {session_id} ".encode("ascii")
+            ):
+                break
+            continue
+        if begin is None or session_id is not None:
+            raise ValueError("tmux control failed")
+        try:
+            session_id = _parse_tmux_session_id(line + b"\n")
+        except ValueError as exc:
+            raise ValueError("tmux control failed") from exc
+    observed_session_id, generation = _read_control_facts(control)
+    if observed_session_id != session_id:
+        raise ValueError("tmux control failed")
+    control.session_id = observed_session_id
+    control.generation = generation
+
+
+def _open_tmux_control(
+    gate_fd: int,
+    socket_name: str,
+    session_name: str,
+) -> _TmuxControlCapability:
+    process: subprocess.Popen[bytes] | None = None
+    control: _TmuxControlCapability | None = None
+    try:
+        process = subprocess.Popen(
+            (
+                _TMUX_PATH,
+                "-L",
+                socket_name,
+                "-C",
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_id}",
+                "-s",
+                session_name,
+                ";",
+                "attach-session",
+                "-t",
+                session_name,
+            ),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            pass_fds=(gate_fd,),
+            env=_tmux_environment(gate_fd),
+        )
+        control = _TmuxControlCapability(
+            process=process,
+        )
+        _read_control_ready(control)
+        if control.session_id is None or control.generation is None:
+            raise ValueError("tmux control failed")
+        return control
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if control is None and process is not None:
+            control = _TmuxControlCapability(
+                process=process,
+            )
+        if control is not None:
+            _cleanup_new_tmux_session(control)
+            _close_tmux_control(control)
+        raise ValueError("tmux control failed") from exc
+
+
+def _resolve_control_session_id(control: _TmuxControlCapability) -> str | None:
+    if control.session_id is not None:
+        return control.session_id
+    try:
+        lines = _control_command(
+            control,
+            b'display-message -p "#{session_id}"\n',
+            max_bytes=_MAX_CONTROL_RECOVERY_BYTES,
+            discard_prefix=True,
+        )
+        if len(lines) != 1:
+            return None
+        session_id = _parse_tmux_session_id(lines[0] + b"\n")
+        control.session_id = session_id
+        return session_id
+    except ValueError:
+        return None
+
+
+def _cleanup_new_tmux_session(control: _TmuxControlCapability) -> None:
+    process = control.process
+    if process.poll() is not None or process.stdin is None:
+        return
+    session_id = _resolve_control_session_id(control)
+    if session_id is None:
+        return
+    try:
+        process.stdin.write(f"kill-session -t {session_id}\n".encode("ascii"))
+        process.stdin.flush()
+        process.wait(timeout=_GATE_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _read_ack_with_control(
+    connection: socket.socket,
+    challenge: str,
+    commit: str,
+    control: _TmuxControlCapability,
+) -> bool:
+    if not isinstance(commit, str) or _COMMIT.fullmatch(commit) is None:
+        return False
+    process = control.process
+    if process.stdout is None or process.stderr is None or process.poll() is not None:
+        return False
+    selector = selectors.DefaultSelector()
+    payload = bytearray()
+    control_bytes = 0
+    try:
+        selector.register(connection, selectors.EVENT_READ)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stderr, selectors.EVENT_READ)
+        deadline = time.monotonic() + _GATE_TIMEOUT_SECONDS
+        expected = f"ACK {challenge} {commit}\n".encode("ascii")
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            events = selector.select(remaining)
+            if not events:
+                return False
+            for key, _mask in events:
+                if key.fileobj is connection:
+                    chunk = connection.recv(len(expected) + 1 - len(payload))
+                    if not chunk:
+                        return False
+                    payload.extend(chunk)
+                    if payload.endswith(b"\n"):
+                        return bytes(payload) == expected and process.poll() is None
+                    if len(payload) >= len(expected) + 1:
+                        return False
+                    continue
+                chunk = os.read(key.fd, min(128, _MAX_CONTROL_OUTPUT_BYTES - control_bytes + 1))
+                if not chunk:
+                    return False
+                control_bytes += len(chunk)
+                if control_bytes > _MAX_CONTROL_OUTPUT_BYTES or key.fileobj is process.stderr:
+                    return False
+    except OSError:
+        return False
+    finally:
+        selector.close()
+
+
+def _read_attestation_and_ack_with_control(
+    connection: socket.socket,
+    challenge: str,
+    commit: str,
+    control: _TmuxControlCapability,
+) -> bool:
+    parent_command = _read_parent_attest_or_ack(connection, challenge, commit)
+    if parent_command == "ack":
+        return control.process.poll() is None
+    if parent_command != "attest":
+        return False
+    try:
+        session_id, generation, pane_pid = _read_bound_attestation(control)
+        if control.session_id != session_id or control.generation != generation:
+            return False
+        connection.sendall(
+            f"ATTEST {challenge} {commit} {session_id} {generation.pid} {pane_pid}\n".encode("ascii")
+        )
+    except (OSError, ValueError):
+        return False
+    return _read_ack_with_control(connection, challenge, commit, control)
+
+
+def _start_tmux_and_read_handoff(
+    gate_fd: int, socket_name: str, session_name: str
+) -> tuple[str, int, int, _TmuxControlCapability]:
+    control: _TmuxControlCapability | None = None
+    try:
+        control = _open_tmux_control(gate_fd, socket_name, session_name)
+        if control.session_id is None or control.generation is None:
+            raise ValueError("tmux control failed")
+        session_id, generation, pane_pid = _read_bound_attestation(control)
+        tmux_pid = generation.pid
+        return session_id, tmux_pid, pane_pid, control
+    except ValueError:
+        if control is not None:
+            _cleanup_new_tmux_session(control)
+            _close_tmux_control(control)
+        raise
+
+
+def main() -> None:
+    connection: socket.socket | None = None
+    gate_fd = -1
+    control: _TmuxControlCapability | None = None
+    committed = False
+    try:
+        (
+            socket_name,
+            session_name,
+            owner_pid,
+            parent_fd,
+            device,
+            inode,
+            challenge,
+        ) = _parse_arguments(sys.argv[1:])
+        gate_fd = _open_pinned_parent_runner_fd(
+            owner_pid=owner_pid,
+            parent_fd=parent_fd,
+            device=device,
+            inode=inode,
+        )
+        os.set_inheritable(gate_fd, True)
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(_GATE_TIMEOUT_SECONDS)
+        connection.connect(_gate_socket_address(socket_name))
+        if not _peer_is_expected_owner(connection, owner_pid):
+            _reject()
+        connection.sendall(f"READY {challenge}\n".encode("ascii"))
+        if not _read_release(connection, challenge):
+            _reject()
+        session_id, tmux_pid, pane_pid, control = _start_tmux_and_read_handoff(
+            gate_fd, socket_name, session_name
+        )
+        commit = secrets.token_hex(_COMMIT_BYTES)
+        if _COMMIT.fullmatch(commit) is None:
+            raise ValueError("invalid commit")
+        connection.sendall(
+            f"HANDOFF {challenge} {commit} {session_id} {tmux_pid} {pane_pid}\n".encode("ascii")
+        )
+        if not _read_attestation_and_ack_with_control(connection, challenge, commit, control):
+            raise ValueError("invalid commit")
+        committed = True
+    except (OSError, ValueError, UnicodeDecodeError):
+        if control is not None and not committed:
+            _cleanup_new_tmux_session(control)
+        _reject()
+    finally:
+        if control is not None:
+            _close_tmux_control(control)
+        if connection is not None:
+            connection.close()
+        if gate_fd > 0:
+            os.close(gate_fd)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Pure cgroup profile, preflight, and held-scope contracts."""
+"""Cgroup profile, preflight, and G5 released-scope contracts."""
 
 from __future__ import annotations
 
@@ -9,7 +9,9 @@ from pathlib import Path
 import re
 import secrets
 import selectors
+import socket
 import stat
+import struct
 import subprocess
 import time
 from typing import Protocol
@@ -26,19 +28,57 @@ CGROUP_ROOT = Path("/sys/fs/cgroup")
 PROC_ROOT = Path("/proc")
 SYSTEMD_RUN_PATH = "/usr/bin/systemd-run"
 SYSTEMCTL_PATH = "/usr/bin/systemctl"
-TMUX_PATH = "/usr/bin/tmux"
 RESOURCE_SCOPE_GATE_PATH = "/usr/libexec/codex-master-resource-scope-gate"
 CODEX_MASTER_SLICE = "codex-master.slice"
 MAX_COMMAND_STDOUT_BYTES = 1024
 MAX_COMMAND_STDERR_BYTES = 1024
 COMMAND_TIMEOUT_SECONDS = 5.0
+_COMMAND_KILL_WAIT_SECONDS = 1.0
 _GATE_CHALLENGE_BYTES = 32
-_GATE_OUTPUT_BYTES = (_GATE_CHALLENGE_BYTES * 2) + 1
+_GATE_COMMIT_BYTES = 16
+_GATE_SESSION_ID_BYTES = 21
+_GATE_READY_BYTES = len(b"READY ") + (_GATE_CHALLENGE_BYTES * 2) + 1
+_GATE_RELEASE_BYTES = len(b"RELEASE ") + (_GATE_CHALLENGE_BYTES * 2) + 1
+_GATE_ACK_BYTES = len(b"ACK ") + (_GATE_CHALLENGE_BYTES * 2) + 1 + (_GATE_COMMIT_BYTES * 2) + 1
+_GATE_ATTEST_REQUEST_BYTES = (
+    len(b"ATTEST ") + (_GATE_CHALLENGE_BYTES * 2) + 1 + (_GATE_COMMIT_BYTES * 2) + 1
+)
+_GATE_HANDOFF_MAX_BYTES = (
+    len(b"HANDOFF ")
+    + (_GATE_CHALLENGE_BYTES * 2)
+    + 1
+    + (_GATE_COMMIT_BYTES * 2)
+    + 1
+    + _GATE_SESSION_ID_BYTES
+    + 1
+    + 10
+    + 1
+    + 10
+    + 1
+)
+_GATE_ATTEST_MAX_BYTES = (
+    len(b"ATTEST ")
+    + (_GATE_CHALLENGE_BYTES * 2)
+    + 1
+    + (_GATE_COMMIT_BYTES * 2)
+    + 1
+    + _GATE_SESSION_ID_BYTES
+    + 1
+    + 10
+    + 1
+    + 10
+    + 1
+)
+_GATE_PROTOCOL_MAX_BYTES = max(_GATE_HANDOFF_MAX_BYTES, _GATE_ATTEST_MAX_BYTES)
+_GATE_SOCKET_PREFIX = "\0codex-master-g5-"
+_GATE_SOCKET_MAX_BYTES = 107
 _UNSET_TARGET_SLICE_CONTROL_GROUP = object()
 _CPU_SET_PART = re.compile(r"(?:0|[1-9][0-9]*)(?:-(?:[1-9][0-9]*))?")
 _UNIT_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{0,127}$")
 _CHALLENGE = re.compile(r"^[a-f0-9]{64}$")
+_COMMIT = re.compile(r"^[a-f0-9]{32}$")
 _TMUX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_TMUX_SESSION_ID = re.compile(r"^\$[0-9]{1,20}$")
 _CGROUP_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$")
 _PSI_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 
@@ -183,6 +223,51 @@ class PreparedAgentScope:
 
 
 @dataclass(frozen=True, slots=True)
+class RunnerExecutionTargetV1:
+    owner_pid: int
+    fd: int
+    device: int
+    inode: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.owner_pid) is not int
+            or type(self.fd) is not int
+            or type(self.device) is not int
+            or type(self.inode) is not int
+            or self.owner_pid != os.getpid()
+            or self.fd <= 0
+            or self.device <= 0
+            or self.inode <= 0
+        ):
+            _fail()
+        self._validate()
+
+    def _validate(self) -> None:
+        try:
+            opened = os.fstat(self.fd)
+            source_text = os.readlink(f"/proc/{self.owner_pid}/fd/{self.fd}")
+            source_path = Path(source_text)
+            source = os.stat(source_path, follow_symlinks=False)
+        except (OSError, ValueError) as exc:
+            raise CgroupPreflightError("cgroup_preflight_failed") from exc
+        if (
+            not source_path.is_absolute()
+            or source_text.endswith(" (deleted)")
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or not stat.S_ISREG(source.st_mode)
+            or source.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (self.device, self.inode)
+            or (source.st_dev, source.st_ino) != (self.device, self.inode)
+        ):
+            _fail()
+
+    def verify_for_scope_start(self) -> None:
+        self._validate()
+
+
+@dataclass(frozen=True, slots=True)
 class CommandResultV1:
     returncode: int
     stdout: bytes
@@ -191,18 +276,6 @@ class CommandResultV1:
     def __post_init__(self) -> None:
         if type(self.returncode) is not int or type(self.stdout) is not bytes or type(self.stderr) is not bytes:
             _fail()
-
-
-class HeldGateProcess(Protocol):
-    def read_stdout(self, *, max_bytes: int, timeout_seconds: float) -> bytes: ...
-
-    def release_once(self, payload: bytes, *, timeout_seconds: float) -> None: ...
-
-    def finish(
-        self, *, timeout_seconds: float, max_stdout_bytes: int, max_stderr_bytes: int
-    ) -> CommandResultV1: ...
-
-    def terminate(self) -> None: ...
 
 
 class SystemdUserCommandRunner(Protocol):
@@ -215,16 +288,6 @@ class SystemdUserCommandRunner(Protocol):
         max_stderr_bytes: int,
     ) -> CommandResultV1: ...
 
-    def start_held(
-        self,
-        argv: tuple[str, ...],
-        *,
-        timeout_seconds: float,
-        max_stdout_bytes: int,
-        max_stderr_bytes: int,
-    ) -> HeldGateProcess: ...
-
-
 class CgroupSystemAdapter(Protocol):
     def read_bounded_cgroup_bytes(self, path: Path, *, max_bytes: int) -> bytes: ...
 
@@ -234,15 +297,18 @@ class CgroupSystemAdapter(Protocol):
 
     def inspect_preflight(self) -> CgroupPreflightV1: ...
 
-    def start_held_scope(
-        self, *, profile: CgroupProfileV1, socket_name: str, session_name: str
+    def start_released_scope(
+        self,
+        *,
+        profile: CgroupProfileV1,
+        socket_name: str,
+        session_name: str,
+        runner_target: RunnerExecutionTargetV1,
     ) -> PreparedAgentScope: ...
 
     def verify_scope(self, scope: PreparedAgentScope, profile: CgroupProfileV1) -> None: ...
 
-    def release_scope(self, scope: PreparedAgentScope) -> int: ...
-
-    def verify_tmux_membership_and_inheritance(self, scope: PreparedAgentScope, tmux_pid: int) -> None: ...
+    def confirm_scope(self, scope: PreparedAgentScope) -> int: ...
 
     def cleanup_new_scope(self, scope: PreparedAgentScope) -> None: ...
 
@@ -274,12 +340,47 @@ class _BoundDirectory:
     inode: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ProcessIdentity:
+    pid: int
+    start_ticks: int
+
+    def __post_init__(self) -> None:
+        if type(self.pid) is not int or self.pid <= 0 or type(self.start_ticks) is not int or self.start_ticks <= 0:
+            _fail()
+
+
+@dataclass(slots=True)
+class _GateHandoff:
+    commit: str
+    session_id: str
+    tmux_pid: int
+    pane_pid: int
+    connection: socket.socket | None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.commit, str)
+            or not _COMMIT.fullmatch(self.commit)
+            or not isinstance(self.session_id, str)
+            or not _TMUX_SESSION_ID.fullmatch(self.session_id)
+            or type(self.tmux_pid) is not int
+            or self.tmux_pid <= 0
+            or type(self.pane_pid) is not int
+            or self.pane_pid <= 0
+        ):
+            _fail()
+
+
 @dataclass(slots=True)
 class _OwnedScope:
     scope: PreparedAgentScope
-    gate: HeldGateProcess
+    runner_target: RunnerExecutionTargetV1
     slice_control_group: str
-    released: bool = False
+    tmux_server: _ProcessIdentity | None = None
+    pane: _ProcessIdentity | None = None
+    handoff: _GateHandoff | None = None
+    confirmed: bool = False
 
 
 def _validate_tmux_name(value: object) -> str:
@@ -510,98 +611,318 @@ def _bounded_process_environment() -> dict[str, str]:
     }
 
 
-class _SubprocessHeldGate:
-    def __init__(self, process: subprocess.Popen[bytes]) -> None:
-        self._process = process
-        self._released = False
-        self._stdout = bytearray()
-        self._stderr = bytearray()
+def _released_scope_argv(
+    *,
+    profile: CgroupProfileV1,
+    unit_name: str,
+    socket_name: str,
+    session_name: str,
+    runner_target: RunnerExecutionTargetV1,
+    challenge: str,
+) -> tuple[str, ...]:
+    if (
+        not isinstance(profile, CgroupProfileV1)
+        or not isinstance(runner_target, RunnerExecutionTargetV1)
+        or not isinstance(unit_name, str)
+        or not _UNIT_NAME.fullmatch(unit_name)
+        or not isinstance(challenge, str)
+        or not _CHALLENGE.fullmatch(challenge)
+    ):
+        _fail()
+    _validate_tmux_name(socket_name)
+    _validate_tmux_name(session_name)
+    runner_target.verify_for_scope_start()
+    return (
+        SYSTEMD_RUN_PATH,
+        "--user",
+        "--scope",
+        "--no-block",
+        "--quiet",
+        "--collect",
+        f"--unit={unit_name}",
+        f"--slice={CODEX_MASTER_SLICE}",
+        "--property=Delegate=cpu cpuset memory pids io",
+        f"--property=AllowedCPUs={profile.cpuset_expression}",
+        f"--property=CPUQuota={profile.cpu_quota_percent}%",
+        f"--property=CPUWeight={profile.cpu_weight}",
+        f"--property=MemoryHigh={profile.memory_high_bytes}",
+        f"--property=MemoryMax={profile.memory_max_bytes}",
+        f"--property=MemorySwapMax={profile.memory_swap_max_bytes}",
+        f"--property=IOWeight={profile.io_weight}",
+        RESOURCE_SCOPE_GATE_PATH,
+        "--socket",
+        socket_name,
+        "--session",
+        session_name,
+        "--owner-pid",
+        str(runner_target.owner_pid),
+        "--runner-fd",
+        str(runner_target.fd),
+        "--device",
+        str(runner_target.device),
+        "--inode",
+        str(runner_target.inode),
+        "--challenge",
+        challenge,
+    )
 
-    def _read_until(self, *, timeout_seconds: float, stop_at_newline: bool, max_stdout_bytes: int, max_stderr_bytes: int) -> None:
-        if self._process.stdout is None or self._process.stderr is None:
-            _fail()
-        deadline = time.monotonic() + timeout_seconds
-        selector = selectors.DefaultSelector()
-        selector.register(self._process.stdout, selectors.EVENT_READ, "stdout")
-        selector.register(self._process.stderr, selectors.EVENT_READ, "stderr")
+
+def _gate_socket_address(socket_name: str) -> str:
+    _validate_tmux_name(socket_name)
+    address = _GATE_SOCKET_PREFIX + socket_name
+    if len(address.encode("ascii")) > _GATE_SOCKET_MAX_BYTES:
+        _fail()
+    return address
+
+
+def _create_gate_listener(socket_name: str) -> socket.socket:
+    try:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.settimeout(COMMAND_TIMEOUT_SECONDS)
+        listener.bind(_gate_socket_address(socket_name))
+        listener.listen(1)
+        return listener
+    except OSError as exc:
+        raise CgroupPreflightError("cgroup_preflight_failed") from exc
+
+
+def _read_exact_socket(connection: socket.socket, size: int) -> bytes:
+    if type(size) is not int or not 0 < size <= _GATE_RELEASE_BYTES:
+        _fail()
+    payload = bytearray()
+    while len(payload) < size:
         try:
-            while selector.get_map():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("bounded")
-                events = selector.select(remaining)
-                if not events:
-                    raise TimeoutError("bounded")
-                for key, _event in events:
-                    chunk = os.read(key.fd, 256)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    destination = self._stdout if key.data == "stdout" else self._stderr
-                    limit = max_stdout_bytes if key.data == "stdout" else max_stderr_bytes
-                    destination.extend(chunk)
-                    if len(destination) > limit:
-                        _fail()
-                if stop_at_newline and b"\n" in self._stdout:
-                    return
-        finally:
-            selector.close()
-
-    def read_stdout(self, *, max_bytes: int, timeout_seconds: float) -> bytes:
-        self._read_until(
-            timeout_seconds=timeout_seconds,
-            stop_at_newline=True,
-            max_stdout_bytes=max_bytes,
-            max_stderr_bytes=MAX_COMMAND_STDERR_BYTES,
-        )
-        if self._stderr:
+            chunk = connection.recv(size - len(payload))
+        except OSError as exc:
+            raise CgroupPreflightError("cgroup_preflight_failed") from exc
+        if not chunk:
             _fail()
-        payload = bytes(self._stdout)
-        self._stdout.clear()
-        return payload
+        payload.extend(chunk)
+    return bytes(payload)
 
-    def release_once(self, payload: bytes, *, timeout_seconds: float) -> None:
-        if self._released or type(payload) is not bytes or timeout_seconds <= 0 or self._process.stdin is None:
-            _fail()
-        self._released = True
+
+def _read_socket_line(connection: socket.socket, *, max_bytes: int) -> bytes:
+    if type(max_bytes) is not int or not 1 <= max_bytes <= _GATE_PROTOCOL_MAX_BYTES:
+        _fail()
+    payload = bytearray()
+    while len(payload) < max_bytes:
         try:
-            self._process.stdin.write(payload)
-            self._process.stdin.flush()
-            self._process.stdin.close()
+            chunk = connection.recv(1)
+        except OSError as exc:
+            raise CgroupPreflightError("cgroup_preflight_failed") from exc
+        if not chunk:
+            _fail()
+        payload.extend(chunk)
+        if chunk == b"\n":
+            return bytes(payload)
+    _fail()
+
+
+def _parse_gate_handoff(raw: bytes, challenge: str) -> tuple[str, str, int, int]:
+    if type(raw) is not bytes or not isinstance(challenge, str) or not _CHALLENGE.fullmatch(challenge):
+        _fail()
+    expected_prefix = f"HANDOFF {challenge} ".encode("ascii")
+    if not raw.startswith(expected_prefix) or not raw.endswith(b"\n"):
+        _fail()
+    try:
+        values = raw[len(expected_prefix) : -1].decode("ascii").split(" ")
+    except UnicodeDecodeError:
+        _fail()
+    if (
+        len(values) != 4
+        or not _COMMIT.fullmatch(values[0])
+        or not _TMUX_SESSION_ID.fullmatch(values[1])
+    ):
+        _fail()
+    return values[0], values[1], _parse_positive_pid(values[2]), _parse_positive_pid(values[3])
+
+
+def _attest_gate_handoff(handoff: _GateHandoff, *, challenge: str) -> tuple[str, int, int]:
+    if not isinstance(handoff, _GateHandoff) or not isinstance(challenge, str) or not _CHALLENGE.fullmatch(challenge):
+        _fail()
+    connection = handoff.connection
+    if connection is None:
+        _fail()
+    try:
+        connection.sendall(f"ATTEST {challenge} {handoff.commit}\n".encode("ascii"))
+        raw = _read_socket_line(connection, max_bytes=_GATE_ATTEST_MAX_BYTES)
+        expected_prefix = f"ATTEST {challenge} {handoff.commit} ".encode("ascii")
+        if not raw.startswith(expected_prefix) or not raw.endswith(b"\n"):
+            _fail()
+        values = raw[len(expected_prefix) : -1].decode("ascii").split(" ")
+        if len(values) != 3 or not _TMUX_SESSION_ID.fullmatch(values[0]):
+            _fail()
+        tmux_pid = _parse_positive_pid(values[1])
+        pane_pid = _parse_positive_pid(values[2])
+        if (values[0], tmux_pid, pane_pid) != (
+            handoff.session_id,
+            handoff.tmux_pid,
+            handoff.pane_pid,
+        ):
+            _fail()
+        return values[0], tmux_pid, pane_pid
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CgroupPreflightError("cgroup_preflight_failed") from exc
+
+
+def _close_gate_handoff(handoff: _GateHandoff) -> None:
+    if not isinstance(handoff, _GateHandoff):
+        _fail()
+    connection = handoff.connection
+    handoff.connection = None
+    if connection is not None:
+        try:
+            connection.close()
         except OSError as exc:
             raise CgroupPreflightError("cgroup_preflight_failed") from exc
 
-    def finish(
-        self, *, timeout_seconds: float, max_stdout_bytes: int, max_stderr_bytes: int
-    ) -> CommandResultV1:
-        self._read_until(
-            timeout_seconds=timeout_seconds,
-            stop_at_newline=False,
-            max_stdout_bytes=max_stdout_bytes,
-            max_stderr_bytes=max_stderr_bytes,
-        )
-        try:
-            returncode = self._process.wait(timeout=max(0.01, timeout_seconds))
-        except subprocess.TimeoutExpired as exc:
-            raise CgroupPreflightError("cgroup_preflight_failed") from exc
-        return CommandResultV1(returncode=returncode, stdout=bytes(self._stdout), stderr=bytes(self._stderr))
 
-    def terminate(self) -> None:
-        if self._process.poll() is None:
-            self._process.kill()
-        try:
-            self._process.wait(timeout=COMMAND_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            pass
+def _commit_gate_handoff(handoff: _GateHandoff, *, challenge: str) -> None:
+    if not isinstance(handoff, _GateHandoff) or not isinstance(challenge, str) or not _CHALLENGE.fullmatch(challenge):
+        _fail()
+    connection = handoff.connection
+    if connection is None:
+        _fail()
+    try:
+        connection.sendall(f"ACK {challenge} {handoff.commit}\n".encode("ascii"))
+    except OSError as exc:
+        raise CgroupPreflightError("cgroup_preflight_failed") from exc
+    finally:
+        _close_gate_handoff(handoff)
+
+
+def _accept_gate_handoff(
+    listener: socket.socket, *, gate_pid: int, owner_pid: int, challenge: str
+) -> _GateHandoff:
+    if (
+        not isinstance(listener, socket.socket)
+        or type(gate_pid) is not int
+        or gate_pid <= 0
+        or type(owner_pid) is not int
+        or owner_pid != os.getpid()
+        or not isinstance(challenge, str)
+        or not _CHALLENGE.fullmatch(challenge)
+        or not hasattr(socket, "SO_PEERCRED")
+    ):
+        _fail()
+    connection: socket.socket | None = None
+    try:
+        connection, _address = listener.accept()
+        connection.settimeout(COMMAND_TIMEOUT_SECONDS)
+        credentials = connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, 12
+        )
+        if type(credentials) is not bytes or len(credentials) != 12:
+            _fail()
+        peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
+        if peer_pid != gate_pid or peer_uid != os.getuid():
+            _fail()
+        if _read_exact_socket(connection, _GATE_READY_BYTES) != f"READY {challenge}\n".encode(
+            "ascii"
+        ):
+            _fail()
+        connection.sendall(f"RELEASE {challenge}\n".encode("ascii"))
+        commit, session_id, tmux_pid, pane_pid = _parse_gate_handoff(
+            _read_socket_line(connection, max_bytes=_GATE_HANDOFF_MAX_BYTES),
+            challenge,
+        )
+        handoff = _GateHandoff(
+            commit=commit,
+            session_id=session_id,
+            tmux_pid=tmux_pid,
+            pane_pid=pane_pid,
+            connection=connection,
+        )
+        connection = None
+        return handoff
+    except (OSError, struct.error) as exc:
+        raise CgroupPreflightError("cgroup_preflight_failed") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+        listener.close()
+
+
+def _close_command_streams(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+
+
+def _stop_command_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=_COMMAND_KILL_WAIT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CgroupPreflightError("cgroup_preflight_failed") from exc
+
+
+def _read_bounded_command_output(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: float,
+    max_stdout_bytes: int,
+    max_stderr_bytes: int,
+) -> tuple[bytes, bytes]:
+    if (
+        process.stdout is None
+        or process.stderr is None
+        or not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= 0
+        or type(max_stdout_bytes) is not int
+        or type(max_stderr_bytes) is not int
+        or not 0 < max_stdout_bytes <= MAX_COMMAND_STDOUT_BYTES
+        or not 0 < max_stderr_bytes <= MAX_COMMAND_STDERR_BYTES
+    ):
+        _fail()
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    limits = {stdout_fd: max_stdout_bytes, stderr_fd: max_stderr_bytes}
+    buffers = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+    active = set(buffers)
+    selector = selectors.DefaultSelector()
+    try:
+        for descriptor in active:
+            selector.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout_seconds
+        while active:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _fail()
+            events = selector.select(remaining)
+            if not events:
+                _fail()
+            for key, _mask in events:
+                descriptor = key.fd
+                buffer = buffers[descriptor]
+                chunk = os.read(descriptor, (limits[descriptor] + 1) - len(buffer))
+                if not chunk:
+                    selector.unregister(descriptor)
+                    active.remove(descriptor)
+                    continue
+                buffer.extend(chunk)
+                if len(buffer) > limits[descriptor]:
+                    _fail()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _fail()
+        process.wait(timeout=remaining)
+        return bytes(buffers[stdout_fd]), bytes(buffers[stderr_fd])
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CgroupPreflightError("cgroup_preflight_failed") from exc
+    finally:
+        selector.close()
 
 
 class _SubprocessSystemdUserRunner:
-    def _popen(self, argv: tuple[str, ...], *, held: bool) -> subprocess.Popen[bytes]:
+    def _popen(self, argv: tuple[str, ...]) -> subprocess.Popen[bytes]:
         if not argv or any(type(argument) is not str or not argument for argument in argv):
             _fail()
         return subprocess.Popen(
             argv,
-            stdin=subprocess.PIPE if held else subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
@@ -618,32 +939,34 @@ class _SubprocessSystemdUserRunner:
         max_stdout_bytes: int,
         max_stderr_bytes: int,
     ) -> CommandResultV1:
-        process = self._popen(argv, held=False)
-        held = _SubprocessHeldGate(process)
+        process: subprocess.Popen[bytes] | None = None
         try:
-            return held.finish(
+            process = self._popen(argv)
+            stdout, stderr = _read_bounded_command_output(
+                process,
                 timeout_seconds=timeout_seconds,
                 max_stdout_bytes=max_stdout_bytes,
                 max_stderr_bytes=max_stderr_bytes,
             )
-        except Exception:
-            held.terminate()
-            raise
-
-    def start_held(
-        self,
-        argv: tuple[str, ...],
-        *,
-        timeout_seconds: float,
-        max_stdout_bytes: int,
-        max_stderr_bytes: int,
-    ) -> HeldGateProcess:
-        del timeout_seconds, max_stdout_bytes, max_stderr_bytes
-        return _SubprocessHeldGate(self._popen(argv, held=True))
+            return CommandResultV1(
+                returncode=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        except Exception as exc:
+            if process is not None:
+                try:
+                    _stop_command_process(process)
+                except CgroupPreflightError:
+                    pass
+            raise CgroupPreflightError("cgroup_preflight_failed") from exc
+        finally:
+            if process is not None:
+                _close_command_streams(process)
 
 
 class SystemdUserCgroupAdapter:
-    """Concrete, held-scope adapter; G5 alone may inject it into admission."""
+    """Concrete G5 released-scope adapter; G5 alone may inject it into admission."""
 
     __slots__ = ("_runner", "_cgroup_root", "_owned", "_target_slice_control_group_path")
 
@@ -908,11 +1231,17 @@ class SystemdUserCgroupAdapter:
     def _stop_new_unit(self, unit_name: str) -> None:
         self._run((SYSTEMCTL_PATH, "--user", "--no-pager", "stop", unit_name))
 
-    def start_held_scope(
-        self, *, profile: CgroupProfileV1, socket_name: str, session_name: str
+    def start_released_scope(
+        self,
+        *,
+        profile: CgroupProfileV1,
+        socket_name: str,
+        session_name: str,
+        runner_target: RunnerExecutionTargetV1,
     ) -> PreparedAgentScope:
         _validate_tmux_name(socket_name)
         _validate_tmux_name(session_name)
+        runner_target.verify_for_scope_start()
         slice_evidence = self._target_slice_evidence()
         if slice_evidence is None:
             _fail()
@@ -925,38 +1254,27 @@ class SystemdUserCgroupAdapter:
         )
         if collision.returncode != 4:
             _fail()
-        argv = (
-            SYSTEMD_RUN_PATH,
-            "--user",
-            "--scope",
-            "--pipe",
-            "--quiet",
-            "--collect",
-            f"--unit={unit_name}",
-            f"--slice={CODEX_MASTER_SLICE}",
-            "--property=Delegate=cpu cpuset memory pids io",
-            f"--property=AllowedCPUs={profile.cpuset_expression}",
-            f"--property=CPUQuota={profile.cpu_quota_percent}%",
-            f"--property=CPUWeight={profile.cpu_weight}",
-            f"--property=MemoryHigh={profile.memory_high_bytes}",
-            f"--property=MemoryMax={profile.memory_max_bytes}",
-            f"--property=MemorySwapMax={profile.memory_swap_max_bytes}",
-            f"--property=IOWeight={profile.io_weight}",
-            RESOURCE_SCOPE_GATE_PATH,
-            socket_name,
-            session_name,
-        )
-        gate: HeldGateProcess | None = None
+        challenge = secrets.token_hex(_GATE_CHALLENGE_BYTES)
+        if not _CHALLENGE.fullmatch(challenge):
+            _fail()
+        listener = _create_gate_listener(socket_name)
+        scope: PreparedAgentScope | None = None
+        handoff: _GateHandoff | None = None
+        started = False
         try:
-            gate = self._runner.start_held(
-                argv,
-                timeout_seconds=COMMAND_TIMEOUT_SECONDS,
-                max_stdout_bytes=_GATE_OUTPUT_BYTES,
-                max_stderr_bytes=MAX_COMMAND_STDERR_BYTES,
+            result = self._run(
+                _released_scope_argv(
+                    profile=profile,
+                    unit_name=unit_name,
+                    socket_name=socket_name,
+                    session_name=session_name,
+                    runner_target=runner_target,
+                    challenge=challenge,
+                )
             )
-            challenge = _parse_gate_challenge(
-                gate.read_stdout(max_bytes=_GATE_OUTPUT_BYTES, timeout_seconds=COMMAND_TIMEOUT_SECONDS)
-            )
+            started = True
+            if result.returncode != 0 or result.stdout or result.stderr:
+                _fail()
             control_group, gate_pid = self._show_scope(
                 unit_name,
                 expected_slice_control_group=slice_control_group,
@@ -971,16 +1289,41 @@ class SystemdUserCgroupAdapter:
             )
             self._owned[unit_name] = _OwnedScope(
                 scope=scope,
-                gate=gate,
+                runner_target=runner_target,
                 slice_control_group=slice_control_group,
             )
+            self.verify_scope(scope, profile)
+            handoff = _accept_gate_handoff(
+                listener,
+                gate_pid=scope.gate_pid,
+                owner_pid=runner_target.owner_pid,
+                challenge=scope.challenge,
+            )
+            tmux_pid = handoff.tmux_pid
+            pane_pid = handoff.pane_pid
+            members = _parse_pid_lines(self._read_cgroup_file(scope.control_group, "cgroup.procs"))
+            if tmux_pid not in members or pane_pid not in members:
+                _fail()
+            owned = self._owned_scope(scope)
+            owned.tmux_server = _process_identity(tmux_pid)
+            owned.pane = _process_identity(pane_pid)
+            owned.handoff = handoff
+            handoff = None
             return scope
         except Exception as exc:
-            if gate is not None:
+            if handoff is not None:
                 try:
-                    gate.terminate()
-                except Exception:
+                    _close_gate_handoff(handoff)
+                except CgroupPreflightError:
                     pass
+            if scope is not None and scope.unit_name in self._owned:
+                owned = self._owned.pop(scope.unit_name)
+                if owned.handoff is not None:
+                    try:
+                        _close_gate_handoff(owned.handoff)
+                    except CgroupPreflightError:
+                        pass
+            if started:
                 try:
                     self._stop_new_unit(unit_name)
                 except Exception:
@@ -988,6 +1331,8 @@ class SystemdUserCgroupAdapter:
             if isinstance(exc, CgroupPreflightError):
                 raise
             raise CgroupPreflightError("cgroup_preflight_failed") from exc
+        finally:
+            listener.close()
 
     def _owned_scope(self, scope: PreparedAgentScope) -> _OwnedScope:
         owned = self._owned.get(scope.unit_name)
@@ -1024,48 +1369,45 @@ class SystemdUserCgroupAdapter:
         ):
             _fail()
 
-    def release_scope(self, scope: PreparedAgentScope) -> int:
-        owned = self._owned_scope(scope)
-        if owned.released:
-            _fail()
-        control_group, gate_pid = self._show_scope(
-            scope.unit_name,
-            expected_slice_control_group=owned.slice_control_group,
-        )
-        if control_group != scope.control_group or gate_pid != scope.gate_pid:
-            _fail()
-        owned.released = True
+    def _attest_pane_runner(self, pane_pid: int, runner_target: RunnerExecutionTargetV1) -> None:
         try:
-            owned.gate.release_once(f"{scope.challenge}\n".encode("ascii"), timeout_seconds=COMMAND_TIMEOUT_SECONDS)
-            result = owned.gate.finish(
-                timeout_seconds=COMMAND_TIMEOUT_SECONDS,
-                max_stdout_bytes=MAX_COMMAND_STDOUT_BYTES,
-                max_stderr_bytes=MAX_COMMAND_STDERR_BYTES,
-            )
-        except Exception as exc:
+            descriptor = os.open(f"/proc/{pane_pid}/exe", os.O_RDONLY | os.O_CLOEXEC)
+        except OSError as exc:
             raise CgroupPreflightError("cgroup_preflight_failed") from exc
-        if (
-            not isinstance(result, CommandResultV1)
-            or result.returncode != 0
-            or result.stdout
-            or result.stderr
-        ):
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (metadata.st_dev, metadata.st_ino)
+                != (runner_target.device, runner_target.inode)
+                or os.pread(descriptor, 4, 0) != b"\x7fELF"
+            ):
+                _fail()
+        except OSError as exc:
+            raise CgroupPreflightError("cgroup_preflight_failed") from exc
+        finally:
+            os.close(descriptor)
+
+    def confirm_scope(self, scope: PreparedAgentScope) -> int:
+        owned = self._owned_scope(scope)
+        if owned.confirmed or owned.tmux_server is None or owned.pane is None or owned.handoff is None:
             _fail()
-        tmux = self._run(
-            (
-                TMUX_PATH,
-                "-L",
-                scope.socket_name,
-                "display-message",
-                "-p",
-                "-t",
-                scope.session_name,
-                "#{pid}",
-            )
-        )
-        if tmux.returncode != 0 or tmux.stderr:
+        handoff = owned.handoff
+        _session_id, tmux_pid, pane_pid = _attest_gate_handoff(handoff, challenge=scope.challenge)
+        if tmux_pid != owned.tmux_server.pid or pane_pid != owned.pane.pid:
             _fail()
-        return _parse_positive_pid(_read_single_line(tmux.stdout))
+        if _process_identity(tmux_pid) != owned.tmux_server or _process_identity(pane_pid) != owned.pane:
+            _fail()
+        members = _parse_pid_lines(self._read_cgroup_file(scope.control_group, "cgroup.procs"))
+        if tmux_pid not in members or pane_pid not in members:
+            _fail()
+        self._attest_pane_runner(pane_pid, owned.runner_target)
+        self._attest_tmux_membership_and_inheritance(scope, tmux_pid)
+        _commit_gate_handoff(handoff, challenge=scope.challenge)
+        owned.handoff = None
+        owned.confirmed = True
+        return tmux_pid
 
     def _read_tmux_children(self, tmux_pid: int) -> tuple[int, ...]:
         bound = _bind_directory(PROC_ROOT)
@@ -1082,9 +1424,8 @@ class SystemdUserCgroupAdapter:
             _fail()
         return children
 
-    def verify_tmux_membership_and_inheritance(self, scope: PreparedAgentScope, tmux_pid: int) -> None:
-        owned = self._owned_scope(scope)
-        if not owned.released or type(tmux_pid) is not int or tmux_pid <= 0:
+    def _attest_tmux_membership_and_inheritance(self, scope: PreparedAgentScope, tmux_pid: int) -> None:
+        if type(tmux_pid) is not int or tmux_pid <= 0:
             _fail()
         members = _parse_pid_lines(self._read_cgroup_file(scope.control_group, "cgroup.procs"))
         if tmux_pid not in members:
@@ -1096,10 +1437,9 @@ class SystemdUserCgroupAdapter:
     def cleanup_new_scope(self, scope: PreparedAgentScope) -> None:
         owned = self._owned_scope(scope)
         del self._owned[scope.unit_name]
-        try:
-            owned.gate.terminate()
-        finally:
-            self._stop_new_unit(scope.unit_name)
+        if owned.handoff is not None:
+            _close_gate_handoff(owned.handoff)
+        self._stop_new_unit(scope.unit_name)
 
 
 def _read_single_line(raw: bytes) -> str:
@@ -1150,16 +1490,27 @@ def _parse_pid_lines(raw: bytes) -> frozenset[int]:
     return frozenset(values)
 
 
-def _parse_gate_challenge(raw: bytes) -> str:
-    if type(raw) is not bytes or len(raw) != _GATE_OUTPUT_BYTES or not raw.endswith(b"\n"):
+def _process_identity(pid: int) -> _ProcessIdentity:
+    if type(pid) is not int or pid <= 0:
         _fail()
-    try:
-        challenge = raw[:-1].decode("ascii")
-    except UnicodeDecodeError:
+    bound = _bind_directory(PROC_ROOT)
+    raw = _read_bounded_under(
+        bound,
+        bound.path / str(pid) / "stat",
+        max_bytes=MAX_CGROUP_READ_BYTES,
+    )
+    if not raw.endswith(b"\n"):
         _fail()
-    if not _CHALLENGE.fullmatch(challenge):
+    closing = raw.rfind(b") ")
+    if closing <= 0:
         _fail()
-    return challenge
+    fields = raw[closing + 2 : -1].split(b" ")
+    if len(fields) < 20 or not fields[19].isdigit():
+        _fail()
+    start_ticks = int(fields[19])
+    if start_ticks <= 0 or start_ticks > (1 << 63) - 1:
+        _fail()
+    return _ProcessIdentity(pid=pid, start_ticks=start_ticks)
 
 
 def _read_text(backend: CgroupSystemAdapter, path: Path) -> str:
@@ -1424,24 +1775,31 @@ def require_cgroup_preflight(adapter: CgroupSystemAdapter, profile: CgroupProfil
     return preflight
 
 
-def start_verified_scope(
+def start_released_scope(
     adapter: CgroupSystemAdapter,
     *,
     profile: CgroupProfileV1,
     socket_name: str,
     session_name: str,
+    runner_target: RunnerExecutionTargetV1,
 ) -> PreparedAgentScope:
-    """Prepare, verify, release once, and roll back only a new held scope."""
+    """Prepare one private G5 scope; dispatch remains outside this function."""
 
+    if not isinstance(profile, CgroupProfileV1) or not isinstance(
+        runner_target, RunnerExecutionTargetV1
+    ):
+        _fail()
     _validate_tmux_name(socket_name)
     _validate_tmux_name(session_name)
+    runner_target.verify_for_scope_start()
     scope: PreparedAgentScope | None = None
     try:
         require_cgroup_preflight(adapter, profile)
-        scope = adapter.start_held_scope(
+        scope = adapter.start_released_scope(
             profile=profile,
             socket_name=socket_name,
             session_name=session_name,
+            runner_target=runner_target,
         )
         if (
             not isinstance(scope, PreparedAgentScope)
@@ -1450,10 +1808,6 @@ def start_verified_scope(
         ):
             _fail()
         adapter.verify_scope(scope, profile)
-        tmux_pid = adapter.release_scope(scope)
-        if type(tmux_pid) is not int or tmux_pid <= 0:
-            _fail()
-        adapter.verify_tmux_membership_and_inheritance(scope, tmux_pid)
         return scope
     except Exception as exc:
         if scope is not None:
@@ -1461,6 +1815,25 @@ def start_verified_scope(
                 adapter.cleanup_new_scope(scope)
             except Exception:
                 pass
+        if isinstance(exc, CgroupPreflightError):
+            raise
+        raise CgroupPreflightError("cgroup_preflight_failed") from exc
+
+
+def confirm_verified_scope(adapter: CgroupSystemAdapter, scope: PreparedAgentScope) -> None:
+    """Confirm exactly one dispatched G5 pane against its prepared scope."""
+
+    if not isinstance(scope, PreparedAgentScope):
+        _fail()
+    try:
+        tmux_pid = adapter.confirm_scope(scope)
+        if type(tmux_pid) is not int or tmux_pid <= 0:
+            _fail()
+    except Exception as exc:
+        try:
+            adapter.cleanup_new_scope(scope)
+        except Exception:
+            pass
         if isinstance(exc, CgroupPreflightError):
             raise
         raise CgroupPreflightError("cgroup_preflight_failed") from exc
