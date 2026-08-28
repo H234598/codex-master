@@ -1372,6 +1372,8 @@ class CredentialVault:
                     for observed in present.values()
                 ):
                     return False
+                if len(present) == 1 and next(iter(present.values())).st_nlink != 1:
+                    return False
             elif claim_format == "legacy_v1":
                 if any(
                     not self._bound_legacy_materialized_file(

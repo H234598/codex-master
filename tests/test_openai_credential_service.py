@@ -1215,6 +1215,40 @@ def test_restart_removes_claim_bound_file_after_in_place_update(
         restarted.close()
 
 
+def test_restart_retains_published_claim_with_unknown_hardlink(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    service = synced_service(tmp_path, clock=clock)
+    service.close()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    runtime.chmod(0o700)
+    target = write_materialization_claim(
+        service,
+        runtime,
+        legacy_v1=False,
+        token="d" * 64,
+        expires_at=clock.value - 1,
+    )
+    unknown_hardlink = runtime / "unknown-auth-copy"
+    os.link(target, unknown_hardlink)
+
+    restarted = make_service(tmp_path, clock=clock)
+    try:
+        assert target.exists()
+        assert unknown_hardlink.exists()
+        claims = json.loads(
+            (tmp_path / "vault" / "materialization-claims.json").read_text(
+                encoding="ascii"
+            )
+        )["claims"]
+        assert len(claims) == 1
+        assert claims[0]["token"] == "d" * 64
+    finally:
+        restarted.close()
+
+
 def test_materialization_claim_schema_newer_than_supported_fails_closed(
     tmp_path: Path,
 ) -> None:
