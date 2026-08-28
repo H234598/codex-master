@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 from threading import Event, Thread
+from types import SimpleNamespace
 from typing import Callable
 import xml.etree.ElementTree as ET
 
@@ -27,6 +28,25 @@ import codex_master.fleet_home_broker_system as broker_system
 from codex_master.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
 from codex_master.fleet_home_broker_identity import BrokerIdentity
 from codex_master.fleet_home_broker_protocol import PrincipalBinding
+from codex_master.fleet_home_broker_client import AttestedHome
+from codex_master.fleet_home_broker_protocol import (
+    B2aRecoveryPhase,
+    BindingExpectation,
+    BrokerCheckpoint,
+    BrokerObservation,
+    BrokerObjectState,
+    BrokerRegistryState,
+    BrokerReply,
+    BrokerResultCode,
+    CANONICAL_AGENT_HOME,
+    ChpbMessageKind,
+    ChpbTransactionOperation,
+    DirectoryIdentity,
+    HomeAttestation,
+    PolicyBinding,
+    TransactionBinding,
+    TransactionStatus,
+)
 from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     CredentialProjection,
@@ -42,6 +62,7 @@ from codex_master.fleet_registry import (
     RunnerKind,
     SecretState,
 )
+from codex_master.fleet_runners import DynamicTeamleadRunnerPlan
 from codex_master.fleet_root_runtime_host import (
     FleetRootRuntimeHost,
     FleetRootRuntimeHostError,
@@ -448,6 +469,33 @@ class R2AOperations:
             raise OSError("private close detail")
 
 
+class RecordingRunnerOperations:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[DynamicTeamleadRunnerPlan, object]] = []
+
+    def execute(
+        self, plan: DynamicTeamleadRunnerPlan, *, permit: object
+    ) -> None:
+        self.calls.append((plan, permit))
+        if self.error is not None:
+            raise self.error
+
+
+class BlockingRunnerOperations(RecordingRunnerOperations):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+
+    def execute(
+        self, plan: DynamicTeamleadRunnerPlan, *, permit: object
+    ) -> None:
+        self.calls.append((plan, permit))
+        self.entered.set()
+        assert self.release.wait(5)
+
+
 def reattest_operations() -> GrantOperations:
     operations = GrantOperations()
     operations.alive *= 2
@@ -455,6 +503,119 @@ def reattest_operations() -> GrantOperations:
     operations.stats *= 2
     operations.units *= 2
     return operations
+
+
+def runner_home(context: TrustedPrincipalGrantContext) -> AttestedHome:
+    binding = TransactionBinding(
+        ChpbTransactionOperation.PROVISION,
+        "c" * 32,
+        "b" * 32,
+        context.expected_principal,
+        PolicyBinding(
+            context.identity.policy_generation,
+            context.identity.projection_digest,
+        ),
+    )
+    attestation = HomeAttestation(
+        binding,
+        CANONICAL_AGENT_HOME,
+        DirectoryIdentity(17, 31, 0o40700),
+        "7" * 64,
+        binding.principal.mcs_pair,
+    )
+    status = TransactionStatus(
+        binding,
+        B2aRecoveryPhase.COMMITTED,
+        BrokerCheckpoint.COMMITTED,
+        BrokerObservation(
+            BrokerObjectState.FINAL_COMPLETE,
+            BrokerRegistryState.CURRENT,
+            1,
+        ),
+        1,
+        BrokerResultCode.COMMITTED,
+    )
+    reply = BrokerReply(
+        "CHPB/2",
+        ChpbMessageKind.REPLY,
+        "d" * 32,
+        BrokerResultCode.OK,
+        status,
+        attestation,
+    )
+    return AttestedHome(61, reply, attestation)
+
+
+def runner_plan(context: TrustedPrincipalGrantContext) -> DynamicTeamleadRunnerPlan:
+    return DynamicTeamleadRunnerPlan(
+        context.snapshot.runtime_principals[0],
+        context.expected_principal,
+        BindingExpectation(
+            context.expected_principal.agent_id,
+            context.expected_principal.manifest_generation,
+            context.expected_principal.unit_generation,
+            context.identity.policy_generation,
+            context.identity.projection_digest,
+            context.expected_principal.fencing_epoch,
+        ),
+        context.identity,
+        runner_home(context),
+    )
+
+
+def offline_runner_authority(
+    context: TrustedPrincipalGrantContext | None = None,
+) -> tuple[
+    FleetRootRuntimeHost,
+    TrustedPrincipalGrantConsumer,
+    HomeBrokerControlService,
+    TrustedPrincipalGrantContext,
+]:
+    context = context or trusted_context()
+    host = reconciled_host()
+    operations = GrantOperations()
+    operations.alive *= 3
+    operations.proc *= 3
+    operations.stats *= 3
+    operations.units *= 3
+    boundary = broker_system.BrokerSystemBoundary(R2AOperations())
+    consumer = TrustedPrincipalGrantConsumer(
+        context,
+        RecordingResolver(context.expected_principal),
+        RecordingProjectionProvider(),
+        boundary,
+        _operations=operations,
+        _credential_reader=lambda _sender: raw_credentials(),
+    )
+    service = object.__new__(HomeBrokerControlService)
+    object.__setattr__(service, "_host", host)
+    object.__setattr__(service, "_generation", GENERATION)
+    object.__setattr__(service, "_release", release_spec())
+    consumer._bind_service(service)
+    observation = _attest_peer(
+        ":1.1",
+        lambda _sender: raw_credentials(),
+        ScriptedOperations(),
+        service._release,
+    )
+    attestation = system_bus._issue_attestation(
+        ":1.1", observation, service._generation
+    )
+    ownership = host.begin_principal_or_agent()
+    consumer._consume_from_service(service, attestation, ownership)
+    return host, consumer, service, context
+
+
+@pytest.fixture
+def runner_authority():
+    authority = offline_runner_authority()
+    try:
+        yield authority
+    finally:
+        try:
+            authority[1].close()
+        except RootSystemBusError:
+            pass
 
 
 def _trusted_service(
@@ -661,6 +822,247 @@ def test_trusted_principal_grant_consumer_surface_is_narrow() -> None:
         "_operations",
         "_credential_reader",
     )
+
+
+def test_consumer_issues_one_bound_permit_executor_pair_and_executes_once(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    issue = getattr(consumer, "issue_dynamic_teamlead_runner")
+
+    permit, executor = issue(operations)
+    plan = runner_plan(context)
+
+    assert tuple(inspect.signature(issue).parameters) == ("operations",)
+    assert executor.execute_dynamic_teamlead_runner(plan) is None
+    assert operations.calls == [(plan, permit)]
+    reattestations = consumer._operations.calls.count("pidfd_open")
+    with pytest.raises(RootSystemBusError):
+        executor.execute_dynamic_teamlead_runner(plan)
+    with pytest.raises(RootSystemBusError):
+        issue(RecordingRunnerOperations())
+    assert operations.calls == [(plan, permit)]
+    assert consumer._operations.calls.count("pidfd_open") == reattestations
+
+
+@pytest.mark.parametrize("operations", (object(), SimpleNamespace(execute=None)))
+def test_consumer_rejects_non_runner_operations_before_issuance(
+    runner_authority,
+    operations: object,
+) -> None:
+    _host, consumer, _service, _context = runner_authority
+    reattestations = consumer._operations.calls.count("pidfd_open")
+
+    with pytest.raises(RootSystemBusError):
+        consumer.issue_dynamic_teamlead_runner(operations)
+
+    assert consumer._operations.calls.count("pidfd_open") == reattestations
+
+
+def test_reconstructed_and_transplanted_permit_never_reaches_operation(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    permit_type = type(permit)
+    forged = object.__new__(permit_type)
+    for slot in permit_type.__slots__:
+        object.__setattr__(forged, slot, getattr(permit, slot))
+    executor_type = type(executor)
+    forged_executor = object.__new__(executor_type)
+    for slot in executor_type.__slots__:
+        value = forged if slot == "_permit" else getattr(executor, slot)
+        object.__setattr__(forged_executor, slot, value)
+
+    with pytest.raises(RootSystemBusError):
+        forged_executor.execute_dynamic_teamlead_runner(runner_plan(context))
+
+    assert operations.calls == []
+    assert executor.execute_dynamic_teamlead_runner(runner_plan(context)) is None
+    assert len(operations.calls) == 1
+
+
+def test_permit_state_attachment_transplant_and_terminal_reset_fail_closed(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    original_reference = permit.opaque_reference
+
+    for name in ("_token", "_binding", "_used", "_state", "_permit_state"):
+        with pytest.raises(AttributeError):
+            object.__setattr__(permit, name, object())
+
+    object.__setattr__(permit, "principal_diagnostic", "forged-principal")
+    object.__setattr__(permit, "identity_diagnostic", "forged-identity")
+    object.__setattr__(permit, "release_diagnostic", "forged-release")
+    for name in ("snapshot_generation", "policy_generation", "root_generation"):
+        object.__setattr__(permit, name, 1)
+    assert executor.execute_dynamic_teamlead_runner(runner_plan(context)) is None
+    object.__setattr__(permit, "opaque_reference", object())
+    object.__setattr__(permit, "opaque_reference", original_reference)
+
+    with pytest.raises(RootSystemBusError):
+        executor.execute_dynamic_teamlead_runner(runner_plan(context))
+    assert len(operations.calls) == 1
+
+
+def test_importable_fake_authorities_cannot_construct_executor(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, _context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    executor_type = type(executor)
+
+    class FakeLedger:
+        def consume(self, *_args: object) -> bool:
+            return True
+
+    class FakeIssuer:
+        def issue(self, *_args: object) -> object:
+            return permit
+
+    class FakeGate:
+        def claim(self, *_args: object) -> bool:
+            return True
+
+    for authority in (FakeLedger(), FakeIssuer(), FakeGate()):
+        with pytest.raises(TypeError):
+            executor_type(permit, operations, authority)
+    assert operations.calls == []
+
+
+def test_same_permit_transplanted_to_second_executor_is_rejected(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    other = object.__new__(type(executor))
+    for slot in type(executor).__slots__:
+        object.__setattr__(other, slot, getattr(executor, slot))
+
+    with pytest.raises(RootSystemBusError):
+        other.execute_dynamic_teamlead_runner(runner_plan(context))
+    assert executor.execute_dynamic_teamlead_runner(runner_plan(context)) is None
+    assert operations.calls == [(runner_plan(context), permit)]
+
+
+def test_concurrent_calls_claim_once_before_operation(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = BlockingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    plan = runner_plan(context)
+    results: list[object] = []
+
+    def execute() -> None:
+        try:
+            results.append(executor.execute_dynamic_teamlead_runner(plan))
+        except Exception as exc:
+            results.append(exc)
+
+    first = Thread(target=execute)
+    second = Thread(target=execute)
+    first.start()
+    assert operations.entered.wait(5)
+    second.start()
+    second.join(timeout=5)
+    operations.release.set()
+    first.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(operations.calls) == 1
+    assert operations.calls[0] == (plan, permit)
+    assert sum(result is None for result in results) == 1
+    assert sum(type(result) is RootSystemBusError for result in results) == 1
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ("release", "identity", "principal", "snapshot", "policy", "root_generation"),
+)
+def test_executor_rejects_canonical_binding_mismatch_before_operation(
+    runner_authority,
+    mismatch: str,
+) -> None:
+    host, consumer, service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    _permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    plan = runner_plan(context)
+
+    if mismatch == "release":
+        object.__setattr__(
+            service, "_release", replace(service._release, release_id="0.11.1")
+        )
+    elif mismatch == "identity":
+        object.__setattr__(
+            context.identity, "executable_fingerprint", "e" * 64
+        )
+    elif mismatch == "principal":
+        object.__setattr__(context.expected_principal, "cgroup_ino", 11)
+    elif mismatch == "snapshot":
+        object.__setattr__(context.snapshot, "generation", 14)
+    elif mismatch == "policy":
+        object.__setattr__(context.identity, "policy_generation", 10)
+    else:
+        object.__setattr__(host, "_host_generation", 2)
+
+    with pytest.raises(RootSystemBusError):
+        executor.execute_dynamic_teamlead_runner(plan)
+    assert operations.calls == []
+
+
+def test_operation_exception_is_terminal_and_never_retried(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    failure = RuntimeError("private operation failure")
+    operations = RecordingRunnerOperations(failure)
+    _permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    plan = runner_plan(context)
+
+    with pytest.raises(RuntimeError) as caught:
+        executor.execute_dynamic_teamlead_runner(plan)
+    assert caught.value is failure
+    with pytest.raises(RootSystemBusError):
+        executor.execute_dynamic_teamlead_runner(plan)
+    assert len(operations.calls) == 1
+
+
+def test_runner_issuance_does_not_reuse_copy_or_claim_start_grant(
+    runner_authority,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    start_claims = 0
+    start_issues = 0
+
+    def unexpected_claim(_state: object) -> bool:
+        nonlocal start_claims
+        start_claims += 1
+        return True
+
+    def unexpected_issue(_binding: object) -> object:
+        nonlocal start_issues
+        start_issues += 1
+        return object()
+
+    monkeypatch.setattr(runtime._StartGrantState, "claim", unexpected_claim)
+    monkeypatch.setattr(runtime, "_issue_start_grant", unexpected_issue)
+
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    assert type(permit.opaque_reference) is object
+    assert executor.execute_dynamic_teamlead_runner(runner_plan(context)) is None
+    assert start_claims == 0
+    assert start_issues == 0
+    assert len(operations.calls) == 1
 
 
 def test_trusted_consumer_composes_r2b_to_r2a_with_same_ownership_once(

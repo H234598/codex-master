@@ -16,6 +16,17 @@ from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 
 import codex_master.fleet_home_broker_runtime as broker_runtime
+from codex_master.dynamic_teamlead import (
+    DynamicTeamleadRequest,
+    ProfileBinding,
+    require_committed_home_attestation,
+)
+from codex_master.dynamic_teamlead_a3_runner import (
+    DynamicTeamleadRunnerOperations,
+    RootDynamicTeamleadRunnerPermit,
+)
+from codex_master.fleet_home_broker_client import AttestedHome
+from codex_master.fleet_home_broker_identity import BrokerIdentity
 from codex_master.fleet_home_broker_system import (
     BrokerStartReceipt,
     BrokerSystemBoundary,
@@ -23,12 +34,14 @@ from codex_master.fleet_home_broker_system import (
     build_broker_system_plan,
 )
 from codex_master.fleet_home_broker_protocol import (
+    BindingExpectation,
     MAX_CHPB_DEVICE,
     MAX_CHPB_GENERATION,
     MAX_CHPB_INODE,
     MAX_CHPB_MCS_CATEGORY,
     MAX_CHPB_MESSAGE_BYTES,
     MAX_CHPB_OBJECT_FIELDS,
+    PrincipalBinding,
 )
 from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
@@ -39,6 +52,7 @@ from codex_master.fleet_home_broker_runtime import (
     _validate_release_spec,
 )
 from codex_master.fleet_home_broker_transport import BrokerPeer
+from codex_master.fleet_registry import FleetRuntimePrincipalV2, FleetSnapshotV2
 from codex_master.fleet_root_runtime_host import (
     FleetRootRuntimeHost,
     FleetRootRuntimeHostError,
@@ -46,6 +60,7 @@ from codex_master.fleet_root_runtime_host import (
     RootHostParticipantBinding,
     RootRuntimeActivityOwnership,
 )
+from codex_master.fleet_runners import DynamicTeamleadRunnerPlan
 
 
 BUS_NAME = "org.codex_master.HomeBrokerControl"
@@ -170,6 +185,51 @@ class _IssuedAttestation(_NonTransferable):
 class _ActiveStart:
     receipt: BrokerStartReceipt
     ownership: RootRuntimeActivityOwnership
+    attestation: RootSystemBusPeerAttestation
+
+
+@dataclass(frozen=True, slots=True)
+class _DynamicTeamleadRunnerBinding:
+    runtime_principal: tuple[object, ...]
+    expected_principal: tuple[object, ...]
+    expectation: tuple[object, ...]
+    identity: tuple[object, ...]
+    selection: tuple[object, ...]
+    profile_binding: tuple[object, ...]
+    snapshot_generation: int
+    release: tuple[object, ...]
+    root_generation: int
+    receipt: tuple[object, ...]
+    ownership: tuple[int, int]
+
+
+@dataclass(slots=True)
+class _DynamicTeamleadRunnerRecord:
+    permit: RootDynamicTeamleadRunnerPermit
+    reference: object
+    executor: object
+    operations: DynamicTeamleadRunnerOperations
+    active: _ActiveStart
+    binding: _DynamicTeamleadRunnerBinding
+    terminal: bool = False
+
+
+class _ConsumerDynamicTeamleadRunnerExecutor:
+    __slots__ = ("_consumer", "_permit", "_operations")
+
+    def __init__(self) -> None:
+        raise TypeError("root_dynamic_teamlead_runner_executor_factory_required")
+
+    def execute_dynamic_teamlead_runner(
+        self, plan: DynamicTeamleadRunnerPlan
+    ) -> None:
+        try:
+            consumer = self._consumer
+        except AttributeError:
+            _fail("dynamic_teamlead_runner_permit_invalid")
+        if type(consumer) is not TrustedPrincipalGrantConsumer:
+            _fail("dynamic_teamlead_runner_permit_invalid")
+        consumer._execute_issued_dynamic_teamlead_runner(self, plan)
 
 
 class _PeerOperations(Protocol):
@@ -669,6 +729,8 @@ class TrustedPrincipalGrantConsumer:
         "_projection_provider",
         "_boundary",
         "_active_start",
+        "_runner_lock",
+        "_runner_records",
         "_system_bus",
     )
 
@@ -722,6 +784,8 @@ class TrustedPrincipalGrantConsumer:
         self._projection_provider = projection_provider
         self._boundary = boundary
         self._active_start: _ActiveStart | None = None
+        self._runner_lock = Lock()
+        self._runner_records: dict[int, _DynamicTeamleadRunnerRecord] = {}
         self._credential_bus = credential_bus
         self._system_bus = system_bus
         self._credential_reader = credential_reader
@@ -739,12 +803,13 @@ class TrustedPrincipalGrantConsumer:
         self._bound_service = service
 
     def _ensure_start_available(self, service: HomeBrokerControlService) -> None:
-        if (
-            self._closed
-            or service is not self._bound_service
-            or self._active_start is not None
-        ):
-            _fail("trusted_consumer_start_active")
+        with self._runner_lock:
+            if (
+                self._closed
+                or service is not self._bound_service
+                or self._active_start is not None
+            ):
+                _fail("trusted_consumer_start_active")
 
     def _reattest(
         self,
@@ -789,6 +854,265 @@ class TrustedPrincipalGrantConsumer:
             observed.invocation_id,
             observed.mcs_pair,
         )
+
+    def _dynamic_teamlead_runner_binding(
+        self,
+        service: HomeBrokerControlService,
+        active: _ActiveStart,
+    ) -> _DynamicTeamleadRunnerBinding:
+        try:
+            context = self._context
+            snapshot = context.snapshot
+            selection = context.selection
+            profile_binding = context.profile_binding
+            expected = context.expected_principal
+            identity = context.identity
+            release = service._release
+            receipt = active.receipt
+            ownership = active.ownership
+            state = service._host.snapshot()
+            runtime_principals = snapshot.runtime_principals
+            if (
+                self._closed
+                or service is not self._bound_service
+                or type(active) is not _ActiveStart
+                or active is not self._active_start
+                or type(active.attestation) is not RootSystemBusPeerAttestation
+                or active.attestation.service_generation != service._generation
+                or type(context) is not TrustedPrincipalGrantContext
+                or type(snapshot) is not FleetSnapshotV2
+                or type(selection) is not DynamicTeamleadRequest
+                or type(profile_binding) is not ProfileBinding
+                or type(expected) is not PrincipalBinding
+                or type(identity) is not BrokerIdentity
+                or type(release) is not BrokerReleaseSpec
+                or type(receipt) is not BrokerStartReceipt
+                or type(ownership) is not RootRuntimeActivityOwnership
+                or receipt.ownership is not ownership
+                or receipt.release_id != release.release_id
+                or receipt.socket_unit != release.socket_unit
+                or type(runtime_principals) is not tuple
+                or len(runtime_principals) != 1
+                or type(runtime_principals[0]) is not FleetRuntimePrincipalV2
+                or runtime_principals[0].principal_id != selection.agent_id
+                or runtime_principals[0].account_id != selection.account_id
+                or runtime_principals[0].profile_id != profile_binding.profile_id
+                or runtime_principals[0].credential_binding_id
+                != profile_binding.credential_binding_id
+                or selection.registry_generation != snapshot.generation
+                or selection.agent_id != expected.agent_id
+                or runtime_principals[0].principal_id != expected.agent_id
+                or identity.agent_id != expected.agent_id
+                or identity.manifest_generation != expected.manifest_generation
+                or identity.mcs_pair != expected.mcs_pair
+                or identity.fencing_epoch != expected.fencing_epoch
+                or expected.unit_generation != service._generation
+                or state.reconciled is not True
+                or state.participant_generation != service._generation
+                or state.host_generation != ownership.host_generation
+                or state.active_principals_or_agents < 1
+            ):
+                raise ValueError
+            _validate_release_spec(release)
+            with self._boundary._lock:
+                receipt_record = self._boundary._receipts.get(id(receipt))
+                if (
+                    receipt_record is None
+                    or receipt_record.receipt is not receipt
+                    or receipt_record.terminal
+                ):
+                    raise ValueError
+            runtime_principal = runtime_principals[0]
+            expectation = (
+                expected.agent_id,
+                expected.manifest_generation,
+                expected.unit_generation,
+                identity.policy_generation,
+                identity.projection_digest,
+                expected.fencing_epoch,
+            )
+            return _DynamicTeamleadRunnerBinding(
+                tuple(
+                    getattr(runtime_principal, name)
+                    for name in FleetRuntimePrincipalV2.__slots__
+                ),
+                tuple(getattr(expected, name) for name in PrincipalBinding.__slots__),
+                expectation,
+                tuple(getattr(identity, name) for name in BrokerIdentity.__slots__),
+                tuple(
+                    getattr(selection, name) for name in DynamicTeamleadRequest.__slots__
+                ),
+                tuple(
+                    getattr(profile_binding, name) for name in ProfileBinding.__slots__
+                ),
+                snapshot.generation,
+                tuple(getattr(release, name) for name in BrokerReleaseSpec.__slots__),
+                state.host_generation,
+                (receipt.release_id, receipt.socket_unit),
+                (ownership.host_generation, ownership.begin_epoch),
+            )
+        except RootSystemBusError:
+            raise
+        except Exception:
+            _fail("dynamic_teamlead_runner_permit_invalid")
+
+    def _dynamic_teamlead_runner_plan_matches(
+        self,
+        plan: object,
+        binding: _DynamicTeamleadRunnerBinding,
+    ) -> bool:
+        try:
+            if (
+                type(plan) is not DynamicTeamleadRunnerPlan
+                or type(binding) is not _DynamicTeamleadRunnerBinding
+                or type(plan.runtime_principal) is not FleetRuntimePrincipalV2
+                or type(plan.expected_principal) is not PrincipalBinding
+                or type(plan.expectation) is not BindingExpectation
+                or type(plan.identity) is not BrokerIdentity
+                or type(plan.home) is not AttestedHome
+                or type(plan.home.fd) is not int
+                or plan.home.fd < 0
+            ):
+                return False
+            committed = require_committed_home_attestation(
+                plan.home.reply, plan.expectation
+            )
+            if (
+                tuple(
+                    getattr(plan.runtime_principal, name)
+                    for name in FleetRuntimePrincipalV2.__slots__
+                )
+                != binding.runtime_principal
+                or tuple(
+                    getattr(plan.expected_principal, name)
+                    for name in PrincipalBinding.__slots__
+                )
+                != binding.expected_principal
+                or tuple(
+                    getattr(plan.expectation, name)
+                    for name in BindingExpectation.__slots__
+                )
+                != binding.expectation
+                or tuple(
+                    getattr(plan.identity, name) for name in BrokerIdentity.__slots__
+                )
+                != binding.identity
+                or committed != plan.home.attestation
+                or plan.home.reply.attestation != plan.home.attestation
+                or tuple(
+                    getattr(committed.binding.principal, name)
+                    for name in PrincipalBinding.__slots__
+                )
+                != binding.expected_principal
+                or (
+                    committed.binding.policy.policy_generation,
+                    committed.binding.policy.projection_digest,
+                )
+                != (binding.expectation[3], binding.expectation[4])
+            ):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def issue_dynamic_teamlead_runner(
+        self,
+        operations: DynamicTeamleadRunnerOperations,
+    ) -> tuple[
+        RootDynamicTeamleadRunnerPermit,
+        _ConsumerDynamicTeamleadRunnerExecutor,
+    ]:
+        try:
+            execute = operations.execute
+        except Exception:
+            _fail("dynamic_teamlead_runner_operations_invalid")
+        service = self._bound_service
+        active = self._active_start
+        if (
+            self._closed
+            or type(service) is not HomeBrokerControlService
+            or type(active) is not _ActiveStart
+            or not callable(execute)
+        ):
+            _fail("dynamic_teamlead_runner_operations_invalid")
+        with self._runner_lock:
+            if active is not self._active_start or any(
+                record.active is active for record in self._runner_records.values()
+            ):
+                _fail("dynamic_teamlead_runner_permit_invalid")
+        self._reattest(service, active.attestation)
+        with self._runner_lock:
+            if active is not self._active_start or any(
+                record.active is active for record in self._runner_records.values()
+            ):
+                _fail("dynamic_teamlead_runner_permit_invalid")
+            binding = self._dynamic_teamlead_runner_binding(service, active)
+            reference = object()
+            permit = object.__new__(RootDynamicTeamleadRunnerPermit)
+            values = (
+                ("opaque_reference", reference),
+                ("principal_diagnostic", "<redacted>"),
+                ("identity_diagnostic", "<redacted>"),
+                ("snapshot_generation", binding.snapshot_generation),
+                ("policy_generation", binding.expectation[3]),
+                ("release_diagnostic", "<redacted>"),
+                ("root_generation", binding.root_generation),
+            )
+            for name, value in values:
+                object.__setattr__(permit, name, value)
+            executor = object.__new__(_ConsumerDynamicTeamleadRunnerExecutor)
+            object.__setattr__(executor, "_consumer", self)
+            object.__setattr__(executor, "_permit", permit)
+            object.__setattr__(executor, "_operations", operations)
+            self._runner_records[id(permit)] = _DynamicTeamleadRunnerRecord(
+                permit,
+                reference,
+                executor,
+                operations,
+                active,
+                binding,
+            )
+            return permit, executor
+
+    def _execute_issued_dynamic_teamlead_runner(
+        self,
+        executor: _ConsumerDynamicTeamleadRunnerExecutor,
+        plan: DynamicTeamleadRunnerPlan,
+    ) -> None:
+        try:
+            permit = executor._permit
+            operations = executor._operations
+            reference = permit.opaque_reference
+        except Exception:
+            _fail("dynamic_teamlead_runner_permit_invalid")
+        with self._runner_lock:
+            record = (
+                self._runner_records.get(id(permit))
+                if type(permit) is RootDynamicTeamleadRunnerPermit
+                else None
+            )
+            if (
+                type(executor) is not _ConsumerDynamicTeamleadRunnerExecutor
+                or record is None
+                or record.permit is not permit
+                or record.reference is not reference
+                or record.executor is not executor
+                or record.operations is not operations
+                or record.terminal
+            ):
+                _fail("dynamic_teamlead_runner_permit_invalid")
+            record.terminal = True
+            if (
+                self._closed
+                or self._active_start is not record.active
+                or self._dynamic_teamlead_runner_binding(
+                    self._bound_service, record.active
+                )
+                != record.binding
+                or not self._dynamic_teamlead_runner_plan_matches(plan, record.binding)
+            ):
+                _fail("dynamic_teamlead_runner_permit_invalid")
+        operations.execute(plan, permit=permit)
 
     def _consume_from_service(
         self,
@@ -837,15 +1161,22 @@ class TrustedPrincipalGrantConsumer:
             or receipt.projection is not grant.projection
         ):
             _fail("trusted_consumer_start_failed")
-        self._active_start = _ActiveStart(receipt, ownership)
+        with self._runner_lock:
+            if self._closed or self._active_start is not None:
+                _fail("trusted_consumer_start_failed")
+            self._active_start = _ActiveStart(receipt, ownership, attestation)
 
     def _release_active(self, service: HomeBrokerControlService) -> None:
         if service is not self._bound_service:
             _fail("trusted_consumer_configuration_invalid")
-        active = self._active_start
-        if active is None:
-            return
-        self._active_start = None
+        with self._runner_lock:
+            active = self._active_start
+            if active is None:
+                return
+            self._active_start = None
+            for record in self._runner_records.values():
+                if record.active is active:
+                    record.terminal = True
         failed = False
         try:
             self._boundary.close_start_receipt(active.receipt)
