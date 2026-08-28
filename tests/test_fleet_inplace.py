@@ -18,7 +18,7 @@ from codex_master.fleet_inplace import (
 TX_ID = "a" * 32
 OLD_GENERATION = 8
 NEW_GENERATION = 9
-MANAGED = ("codex", "config.toml", ".codex-fleet-agent.json")
+MANAGED = ("codex", "config.toml", "AGENTS.md", "AGENTS.class-teamleiterin.md", ".codex-fleet-agent.json")
 
 
 class Crash(BaseException):
@@ -43,6 +43,7 @@ def make_home(tmp_path: Path, home_id: str, *, absent: str | None = None) -> QHo
     old = {
         "codex": f"old wrapper {home_id}\n".encode(),
         "config.toml": f"old config {home_id}\n".encode(),
+        "AGENTS.md": f"old instructions {home_id}\n".encode(),
         ".codex-fleet-agent.json": f'{{"generation":8,"id":"{home_id}"}}\n'.encode(),
     }
     for name, data in old.items():
@@ -66,7 +67,9 @@ def make_home(tmp_path: Path, home_id: str, *, absent: str | None = None) -> QHo
         home=home,
         wrapper=f"new wrapper {home_id}\n".encode(),
         config=f"new config {home_id}\n".encode(),
+        instructions=f"new instructions {home_id}\n".encode(),
         marker=f'{{"generation":9,"id":"{home_id}"}}\n'.encode(),
+        class_instructions=f"new class instructions {home_id}\n".encode(),
     )
 
 
@@ -398,7 +401,14 @@ def test_corrupt_global_marker_order_and_tight_bounds_are_rejected(tmp_path: Pat
     assert caught.value.code == "invalid_journal"
 
     fresh = private_dir(tmp_path / "fresh-transactions")
-    oversized = QHomeUpdate("q4", private_dir(tmp_path / "q4"), b"x", b"x" * 262145, b"x")
+    oversized = QHomeUpdate(
+        "q4",
+        private_dir(tmp_path / "q4"),
+        b"x",
+        b"x" * 262145,
+        b"x",
+        b"x",
+    )
     with pytest.raises(InplaceError) as caught:
         apply((oversized,), fresh, lambda _a, _b: True)
     assert caught.value.code == "invalid_request"

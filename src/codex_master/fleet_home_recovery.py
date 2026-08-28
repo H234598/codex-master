@@ -18,7 +18,7 @@ FLEET_HOME_RECOVERY_SCHEMA_VERSION = 2
 MAX_FLEET_HOME_RECOVERY_BYTES = 256 * 1024
 MAX_FLEET_HOME_RECOVERY_HOMES = 256
 MAX_FLEET_HOME_RECOVERY_ENTRIES = 256
-MAX_FLEET_HOME_RECOVERY_RECORDS = 16
+MAX_FLEET_HOME_RECOVERY_RECORDS = 32
 MAX_FLEET_HOME_RECOVERY_PATH = 512
 MAX_FLEET_HOME_RECOVERY_RETRIES = 3
 
@@ -41,6 +41,11 @@ class FleetHomeEntryKind(str, Enum):
 
 
 class FleetHomeRecoveryPhase(str, Enum):
+    ABSENT_CREATE_PENDING = "absent_create_pending"
+    ABSENT_PIN_PENDING = "absent_pin_pending"
+    ABSENT_POPULATE_PENDING = "absent_populate_pending"
+    ABSENT_PUBLISH_PENDING = "absent_publish_pending"
+    ABSENT_PUBLISHED = "absent_published"
     PREPARE_PENDING = "prepare_pending"
     PREPARED = "prepared"
     SWITCH_PENDING = "switch_pending"
@@ -54,6 +59,10 @@ class FleetHomeRecoveryPhase(str, Enum):
 
 
 class FleetHomeRecoveryAction(str, Enum):
+    CREATE_STAGING = "create_staging"
+    PIN_STAGING = "pin_staging"
+    POPULATE_STAGING = "populate_staging"
+    PUBLISH_HOME = "publish_home"
     PERSIST = "persist"
     PREPARE = "prepare"
     SWITCH = "switch"
@@ -124,6 +133,28 @@ class FleetHomeRecoveryHomeV2:
 
 
 @dataclass(frozen=True, slots=True)
+class FleetHomeRecoveryAbsentHomeV2:
+    membership_index: int
+    member_id: str
+    final_name: str
+    staging_name: str
+    marker_path: str
+    entries: tuple[FleetHomeRecoveryEntryV2, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FleetHomeRecoveryPopulationEntryV2:
+    name: str
+    content: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class FleetHomeRecoveryPopulationV2:
+    member_id: str
+    entries: tuple[FleetHomeRecoveryPopulationEntryV2, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class FleetHomeRecoverySnapshotIdentity:
     generation: int
     digest: str
@@ -156,9 +187,26 @@ class FleetHomeRecoveryHomeObservationV2:
 
 
 @dataclass(frozen=True, slots=True)
+class FleetHomeRecoveryAbsentEntryObservationV2:
+    name: str
+    current: FleetHomeRecoveryObjectSnapshot | None
+
+
+@dataclass(frozen=True, slots=True)
+class FleetHomeRecoveryAbsentHomeObservationV2:
+    membership_index: int
+    member_id: str
+    final_identity: FleetHomeRecoveryObjectSnapshot | None
+    staging_identity: FleetHomeRecoveryObjectSnapshot | None
+    unexpected_entries: tuple[str, ...]
+    entries: tuple[FleetHomeRecoveryAbsentEntryObservationV2, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class FleetHomeRecoveryTransactionObservationV2:
     pool_parent: FleetHomeRecoveryStat
     homes: tuple[FleetHomeRecoveryHomeObservationV2, ...]
+    absent_homes: tuple[FleetHomeRecoveryAbsentHomeObservationV2, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +230,7 @@ class FleetHomeRecoveryTransactionV2:
     planned_snapshot: FleetHomeRecoverySnapshotIdentity
     homes: tuple[FleetHomeRecoveryHomeV2, ...]
     records: tuple[FleetHomeRecoveryPhaseRecordV2, ...]
+    absent_homes: tuple[FleetHomeRecoveryAbsentHomeV2, ...] = ()
 
     @property
     def phase(self) -> FleetHomeRecoveryPhase:
@@ -480,9 +529,65 @@ def _validate_home(home: object) -> FleetHomeRecoveryHomeV2:
     return home
 
 
+def _validate_absent_home(
+    home: object,
+    *,
+    transaction_nonce: str,
+) -> FleetHomeRecoveryAbsentHomeV2:
+    if type(home) is not FleetHomeRecoveryAbsentHomeV2:
+        _fail()
+    _integer(home.membership_index, 0, MAX_FLEET_HOME_RECOVERY_HOMES - 1)
+    if type(home.member_id) is not str or _MEMBER_RE.fullmatch(home.member_id) is None:
+        _fail()
+    if (
+        type(home.final_name) is not str
+        or _PATH_PART_RE.fullmatch(home.final_name) is None
+        or home.final_name in {".", ".."}
+    ):
+        _fail()
+    expected_staging = (
+        f".fleet-home-staging-v2-{transaction_nonce}-{home.membership_index:04d}"
+    )
+    if home.staging_name != expected_staging:
+        _fail()
+    if (
+        type(home.entries) is not tuple
+        or not home.entries
+        or len(home.entries) > MAX_FLEET_HOME_RECOVERY_ENTRIES
+    ):
+        _fail()
+    names: set[str] = set()
+    directories: set[str] = set()
+    for entry in home.entries:
+        _validate_entry(entry)
+        if (
+            entry.before_kind is not None
+            or entry.before is not None
+            or entry.replacement_kind is None
+            or entry.name in names
+        ):
+            _fail()
+        parent = PurePosixPath(entry.name).parent.as_posix()
+        parent = "" if parent == "." else parent
+        if parent and parent not in directories:
+            _fail()
+        names.add(entry.name)
+        if entry.replacement_kind is FleetHomeEntryKind.DIRECTORY:
+            directories.add(entry.name)
+    marker = home.entries[-1]
+    if (
+        _relative_path(home.marker_path) != marker.name
+        or marker.replacement_kind is not FleetHomeEntryKind.FILE
+        or marker.replacement_mode != 0o600
+    ):
+        _fail()
+    return home
+
+
 def _before_observation(
     pool_parent: FleetHomeRecoveryStat,
     homes: tuple[FleetHomeRecoveryHomeV2, ...],
+    absent_homes: tuple[FleetHomeRecoveryAbsentHomeV2, ...] = (),
 ) -> FleetHomeRecoveryTransactionObservationV2:
     return FleetHomeRecoveryTransactionObservationV2(
         pool_parent,
@@ -506,6 +611,20 @@ def _before_observation(
                 ),
             )
             for home in homes
+        ),
+        tuple(
+            FleetHomeRecoveryAbsentHomeObservationV2(
+                home.membership_index,
+                home.member_id,
+                None,
+                None,
+                (),
+                tuple(
+                    FleetHomeRecoveryAbsentEntryObservationV2(entry.name, None)
+                    for entry in home.entries
+                ),
+            )
+            for home in absent_homes
         ),
     )
 
@@ -570,6 +689,42 @@ def _validate_observation(
             for snapshot in (actual.live, actual.old_slot, actual.replacement_slot):
                 if snapshot is not None:
                     _validate_object(snapshot)
+    if type(observation.absent_homes) is not tuple or len(
+        observation.absent_homes
+    ) != len(transaction.absent_homes):
+        _fail()
+    for home, current in zip(
+        transaction.absent_homes, observation.absent_homes, strict=True
+    ):
+        if (
+            type(current) is not FleetHomeRecoveryAbsentHomeObservationV2
+            or current.membership_index != home.membership_index
+            or current.member_id != home.member_id
+        ):
+            _fail()
+        for identity in (current.final_identity, current.staging_identity):
+            if identity is not None:
+                _validate_object(identity, FleetHomeEntryKind.DIRECTORY)
+        if (
+            type(current.unexpected_entries) is not tuple
+            or len(current.unexpected_entries) > MAX_FLEET_HOME_RECOVERY_ENTRIES
+            or len(current.unexpected_entries) != len(set(current.unexpected_entries))
+        ):
+            _fail()
+        for name in current.unexpected_entries:
+            _relative_path(name)
+        if type(current.entries) is not tuple or len(current.entries) != len(
+            home.entries
+        ):
+            _fail()
+        for entry, actual in zip(home.entries, current.entries, strict=True):
+            if (
+                type(actual) is not FleetHomeRecoveryAbsentEntryObservationV2
+                or actual.name != entry.name
+            ):
+                _fail()
+            if actual.current is not None:
+                _validate_object(actual.current)
     return observation
 
 
@@ -589,6 +744,152 @@ def _replacement_matches(
         stat.S_IMODE(snapshot.stat.mode) == entry.replacement_mode
         and snapshot.sha256 == entry.replacement_sha256
     )
+
+
+def _absent_observation_state(
+    transaction: FleetHomeRecoveryTransactionV2,
+    observation: FleetHomeRecoveryTransactionObservationV2,
+) -> str:
+    states: list[str] = []
+    for home, current in zip(
+        transaction.absent_homes, observation.absent_homes, strict=True
+    ):
+        if current.unexpected_entries or (
+            current.final_identity is not None and current.staging_identity is not None
+        ):
+            return "drift"
+        entries = tuple(
+            "target"
+            if _replacement_matches(entry, actual.current)
+            else "absent"
+            if actual.current is None
+            else "drift"
+            for entry, actual in zip(home.entries, current.entries, strict=True)
+        )
+        if "drift" in entries:
+            return "drift"
+        if current.final_identity is not None:
+            states.append("published" if set(entries) == {"target"} else "drift")
+        elif current.staging_identity is not None:
+            if set(entries) == {"absent"}:
+                states.append("staged")
+            elif set(entries) == {"target"}:
+                states.append("populated")
+            else:
+                states.append("partial")
+        else:
+            states.append("absent" if set(entries) == {"absent"} else "drift")
+    if "drift" in states:
+        return "drift"
+    if len(set(states)) == 1:
+        return states[0]
+    if set(states) <= {"staged", "partial", "populated"}:
+        return "partial"
+    if set(states) <= {"populated", "published"}:
+        return "publishing"
+    return "drift"
+
+
+def _absent_staging_identity_matches(
+    previous: FleetHomeRecoveryTransactionObservationV2,
+    current: FleetHomeRecoveryTransactionObservationV2,
+    *,
+    published_allowed: bool,
+) -> bool:
+    for before, after in zip(previous.absent_homes, current.absent_homes, strict=True):
+        expected = before.staging_identity or before.final_identity
+        actual = (
+            after.final_identity
+            if after.final_identity is not None
+            else after.staging_identity
+        )
+        if (
+            expected is None
+            or actual is None
+            or not _same_identity(expected.stat, actual.stat)
+            or (after.final_identity is not None and not published_allowed)
+        ):
+            return False
+    return True
+
+
+def _absent_publish_progress_valid(
+    previous: FleetHomeRecoveryTransactionObservationV2,
+    current: FleetHomeRecoveryTransactionObservationV2,
+) -> bool:
+    if not _same_identity(previous.pool_parent, current.pool_parent):
+        return False
+    progressed = False
+    for before, after in zip(previous.absent_homes, current.absent_homes, strict=True):
+        if before.final_identity is not None:
+            if after != before:
+                return False
+            continue
+        if after.staging_identity is not None:
+            if after != before:
+                return False
+            continue
+        if (
+            before.staging_identity is None
+            or after.final_identity != before.staging_identity
+            or after.unexpected_entries != before.unexpected_entries
+            or after.entries != before.entries
+        ):
+            return False
+        progressed = True
+    return progressed
+
+
+def _absent_commit_progress(
+    transaction: FleetHomeRecoveryTransactionV2,
+    previous: FleetHomeRecoveryTransactionObservationV2,
+    current: FleetHomeRecoveryTransactionObservationV2,
+) -> str:
+    expected_pool = replace(
+        previous.pool_parent,
+        mtime_ns=transaction.pool_parent_before.mtime_ns,
+    )
+    if (
+        current.homes != previous.homes
+        or current.absent_homes != previous.absent_homes
+        or _absent_observation_state(transaction, current) != "published"
+    ):
+        return "drift"
+    if current.pool_parent == expected_pool:
+        return "success"
+    return "same" if current == previous else "drift"
+
+
+def _absent_rollback_progress(
+    transaction: FleetHomeRecoveryTransactionV2,
+    previous: FleetHomeRecoveryTransactionObservationV2,
+    current: FleetHomeRecoveryTransactionObservationV2,
+) -> str:
+    before = _before_observation(
+        transaction.pool_parent_before,
+        (),
+        transaction.absent_homes,
+    )
+    if current == before:
+        return "success"
+    if not _same_identity(previous.pool_parent, current.pool_parent):
+        return "drift"
+    progressed = False
+    for old_home, current_home in zip(
+        previous.absent_homes, current.absent_homes, strict=True
+    ):
+        if current_home == old_home:
+            continue
+        if (
+            old_home.final_identity is None
+            or current_home.final_identity is not None
+            or current_home.staging_identity is not None
+            or current_home.unexpected_entries
+            or any(entry.current is not None for entry in current_home.entries)
+        ):
+            return "drift"
+        progressed = True
+    return "partial" if progressed else "same" if current == previous else "drift"
 
 
 def _prepared_observation_valid(
@@ -946,6 +1247,28 @@ def _rollback_progress(
 
 
 _ALLOWED_TRANSITIONS = {
+    FleetHomeRecoveryPhase.ABSENT_CREATE_PENDING: {
+        FleetHomeRecoveryPhase.ABSENT_PIN_PENDING,
+        FleetHomeRecoveryPhase.BLOCKED,
+    },
+    FleetHomeRecoveryPhase.ABSENT_PIN_PENDING: {
+        FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+        FleetHomeRecoveryPhase.BLOCKED,
+    },
+    FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING: {
+        FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+        FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+        FleetHomeRecoveryPhase.BLOCKED,
+    },
+    FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING: {
+        FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+        FleetHomeRecoveryPhase.ABSENT_PUBLISHED,
+        FleetHomeRecoveryPhase.BLOCKED,
+    },
+    FleetHomeRecoveryPhase.ABSENT_PUBLISHED: {
+        FleetHomeRecoveryPhase.CAS_PENDING,
+        FleetHomeRecoveryPhase.BLOCKED,
+    },
     FleetHomeRecoveryPhase.PREPARE_PENDING: {
         FleetHomeRecoveryPhase.PREPARED,
         FleetHomeRecoveryPhase.BLOCKED,
@@ -1011,15 +1334,29 @@ def _validate_basis(transaction: FleetHomeRecoveryTransactionV2) -> None:
         _fail()
     if (
         type(transaction.homes) is not tuple
-        or not transaction.homes
-        or len(transaction.homes) > MAX_FLEET_HOME_RECOVERY_HOMES
+        or type(transaction.absent_homes) is not tuple
     ):
+        _fail()
+    if (not transaction.homes and not transaction.absent_homes) or len(
+        transaction.homes
+    ) + len(transaction.absent_homes) > MAX_FLEET_HOME_RECOVERY_HOMES:
+        _fail()
+    if transaction.homes and transaction.absent_homes:
         _fail()
     for index, home in enumerate(transaction.homes):
         _validate_home(home)
         if home.membership_index != index:
             _fail()
-    if len({home.member_id for home in transaction.homes}) != len(transaction.homes):
+    for offset, home in enumerate(transaction.absent_homes, len(transaction.homes)):
+        _validate_absent_home(home, transaction_nonce=transaction.nonce)
+        if home.membership_index != offset:
+            _fail()
+    all_homes = (*transaction.homes, *transaction.absent_homes)
+    if len({home.member_id for home in all_homes}) != len(all_homes):
+        _fail()
+    if len({home.final_name for home in transaction.absent_homes}) != len(
+        transaction.absent_homes
+    ):
         _fail()
 
 
@@ -1072,12 +1409,19 @@ def _validate_transaction(value: object) -> FleetHomeRecoveryTransactionV2:
         _validate_authoritative(record)
         if index == 0:
             if (
-                record.phase is not FleetHomeRecoveryPhase.PREPARE_PENDING
+                record.phase
+                is not (
+                    FleetHomeRecoveryPhase.ABSENT_CREATE_PENDING
+                    if transaction.absent_homes
+                    else FleetHomeRecoveryPhase.PREPARE_PENDING
+                )
                 or record.retry_count != 0
                 or record.previous_digest is not None
                 or record.observation
                 != _before_observation(
-                    transaction.pool_parent_before, transaction.homes
+                    transaction.pool_parent_before,
+                    transaction.homes,
+                    transaction.absent_homes,
                 )
             ):
                 _fail()
@@ -1105,6 +1449,75 @@ def _validate_transaction(value: object) -> FleetHomeRecoveryTransactionV2:
             and record.authoritative_readable is not None
         ):
             _fail()
+        if record.phase is FleetHomeRecoveryPhase.ABSENT_PIN_PENDING:
+            if (
+                previous.phase is not FleetHomeRecoveryPhase.ABSENT_CREATE_PENDING
+                or _absent_observation_state(transaction, previous.observation)
+                != "absent"
+                or _absent_observation_state(transaction, record.observation)
+                != "staged"
+                or not _same_identity(
+                    previous.observation.pool_parent,
+                    record.observation.pool_parent,
+                )
+            ):
+                _fail()
+        if record.phase is FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING:
+            if previous.phase is FleetHomeRecoveryPhase.ABSENT_PIN_PENDING:
+                if (
+                    record.observation != previous.observation
+                    or _absent_observation_state(transaction, record.observation)
+                    != "staged"
+                ):
+                    _fail()
+            elif previous.phase is FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING:
+                if (
+                    _absent_observation_state(transaction, record.observation)
+                    not in {"partial", "populated"}
+                    or record.observation.pool_parent
+                    != previous.observation.pool_parent
+                    or not _absent_staging_identity_matches(
+                        previous.observation,
+                        record.observation,
+                        published_allowed=False,
+                    )
+                ):
+                    _fail()
+        if record.phase is FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING:
+            if previous.phase is FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING:
+                if (
+                    _absent_observation_state(transaction, record.observation)
+                    != "populated"
+                    or record.observation.pool_parent
+                    != previous.observation.pool_parent
+                    or not _absent_staging_identity_matches(
+                        previous.observation,
+                        record.observation,
+                        published_allowed=False,
+                    )
+                ):
+                    _fail()
+            elif previous.phase is FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING:
+                if _absent_observation_state(
+                    transaction, record.observation
+                ) != "publishing" or not _absent_publish_progress_valid(
+                    previous.observation,
+                    record.observation,
+                ):
+                    _fail()
+            else:
+                _fail()
+        if record.phase is FleetHomeRecoveryPhase.ABSENT_PUBLISHED:
+            if (
+                previous.phase is not FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING
+                or _absent_observation_state(transaction, record.observation)
+                != "published"
+                or not _absent_publish_progress_valid(
+                    previous.observation,
+                    record.observation,
+                )
+            ):
+                _fail()
         if (
             record.phase is FleetHomeRecoveryPhase.PREPARED
             and not _prepared_observation_valid(
@@ -1142,6 +1555,15 @@ def _validate_transaction(value: object) -> FleetHomeRecoveryTransactionV2:
                 _fail()
         if (
             record.phase is FleetHomeRecoveryPhase.CAS_PENDING
+            and previous.phase is FleetHomeRecoveryPhase.ABSENT_PUBLISHED
+            and (
+                record.observation != previous.observation
+                or record.authoritative_readable is not None
+            )
+        ):
+            _fail()
+        if (
+            record.phase is FleetHomeRecoveryPhase.CAS_PENDING
             and previous.phase is FleetHomeRecoveryPhase.CAS_PENDING
         ):
             if (
@@ -1161,9 +1583,10 @@ def _validate_transaction(value: object) -> FleetHomeRecoveryTransactionV2:
             elif previous.phase is FleetHomeRecoveryPhase.COMMIT_PENDING:
                 prefix = replace(transaction, records=transaction.records[:index])
                 if (
-                    _commit_progress(prefix, previous.observation, record.observation)
-                    != "partial"
-                ):
+                    _absent_commit_progress
+                    if transaction.absent_homes
+                    else _commit_progress
+                )(prefix, previous.observation, record.observation) != "partial":
                     _fail()
             if (
                 record.authoritative_snapshot != previous.authoritative_snapshot
@@ -1182,9 +1605,10 @@ def _validate_transaction(value: object) -> FleetHomeRecoveryTransactionV2:
             elif previous.phase is FleetHomeRecoveryPhase.ROLLBACK_PENDING:
                 prefix = replace(transaction, records=transaction.records[:index])
                 if (
-                    _rollback_progress(prefix, previous.observation, record.observation)
-                    != "partial"
-                ):
+                    _absent_rollback_progress
+                    if transaction.absent_homes
+                    else _rollback_progress
+                )(prefix, previous.observation, record.observation) != "partial":
                     _fail()
             if (
                 record.authoritative_snapshot != previous.authoritative_snapshot
@@ -1195,7 +1619,11 @@ def _validate_transaction(value: object) -> FleetHomeRecoveryTransactionV2:
         if record.phase is FleetHomeRecoveryPhase.COMMITTED:
             prefix = replace(transaction, records=transaction.records[:index])
             if (
-                _commit_progress(prefix, previous.observation, record.observation)
+                (
+                    _absent_commit_progress
+                    if transaction.absent_homes
+                    else _commit_progress
+                )(prefix, previous.observation, record.observation)
                 != "success"
                 or record.authoritative_readable != previous.authoritative_readable
                 or record.authoritative_snapshot != previous.authoritative_snapshot
@@ -1205,7 +1633,11 @@ def _validate_transaction(value: object) -> FleetHomeRecoveryTransactionV2:
         if record.phase is FleetHomeRecoveryPhase.ROLLED_BACK:
             prefix = replace(transaction, records=transaction.records[:index])
             if (
-                _rollback_progress(prefix, previous.observation, record.observation)
+                (
+                    _absent_rollback_progress
+                    if transaction.absent_homes
+                    else _rollback_progress
+                )(prefix, previous.observation, record.observation)
                 != "success"
                 or record.authoritative_readable != previous.authoritative_readable
                 or record.authoritative_snapshot != previous.authoritative_snapshot
@@ -1222,8 +1654,9 @@ def make_fleet_home_recovery_transaction_v2(
     current_snapshot: FleetHomeRecoverySnapshotIdentity,
     planned_snapshot: FleetHomeRecoverySnapshotIdentity,
     homes: tuple[FleetHomeRecoveryHomeV2, ...],
+    absent_homes: tuple[FleetHomeRecoveryAbsentHomeV2, ...] = (),
 ) -> FleetHomeRecoveryTransactionV2:
-    observation = _before_observation(pool_parent_before, homes)
+    observation = _before_observation(pool_parent_before, homes, absent_homes)
     transaction = FleetHomeRecoveryTransactionV2(
         FLEET_HOME_RECOVERY_SCHEMA_VERSION,
         nonce,
@@ -1234,7 +1667,11 @@ def make_fleet_home_recovery_transaction_v2(
         (
             FleetHomeRecoveryPhaseRecordV2(
                 0,
-                FleetHomeRecoveryPhase.PREPARE_PENDING,
+                (
+                    FleetHomeRecoveryPhase.ABSENT_CREATE_PENDING
+                    if absent_homes
+                    else FleetHomeRecoveryPhase.PREPARE_PENDING
+                ),
                 0,
                 None,
                 observation,
@@ -1243,6 +1680,7 @@ def make_fleet_home_recovery_transaction_v2(
                 False,
             ),
         ),
+        absent_homes,
     )
     _validate_transaction(transaction)
     if (
@@ -1351,6 +1789,64 @@ def plan_fleet_home_recovery_v2(
         return FleetHomeRecoveryAction.BLOCK, transaction
     if phase is not FleetHomeRecoveryPhase.CAS_PENDING and not no_result:
         _fail()
+    if phase is FleetHomeRecoveryPhase.ABSENT_CREATE_PENDING:
+        if observation == previous.observation:
+            return FleetHomeRecoveryAction.CREATE_STAGING, transaction
+        return _block(transaction, observation)
+    if phase is FleetHomeRecoveryPhase.ABSENT_PIN_PENDING:
+        if observation == previous.observation:
+            return FleetHomeRecoveryAction.PIN_STAGING, transaction
+        return _block(transaction, observation)
+    if phase is FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING:
+        state = _absent_observation_state(transaction, observation)
+        if (
+            observation.pool_parent != previous.observation.pool_parent
+            or not _absent_staging_identity_matches(
+                previous.observation,
+                observation,
+                published_allowed=False,
+            )
+        ):
+            return _block(transaction, observation)
+        if state == "partial" and observation != previous.observation:
+            return _checkpoint_pending(transaction, observation)
+        if state in {"staged", "partial"}:
+            return FleetHomeRecoveryAction.POPULATE_STAGING, transaction
+        if state == "populated":
+            return FleetHomeRecoveryAction.PERSIST, advance_fleet_home_recovery_v2(
+                transaction,
+                FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+                observation,
+            )
+        return _block(transaction, observation)
+    if phase is FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING:
+        state = _absent_observation_state(transaction, observation)
+        if state == "populated":
+            if observation != previous.observation:
+                return _block(transaction, observation)
+            return FleetHomeRecoveryAction.PUBLISH_HOME, transaction
+        if state == "publishing":
+            if observation == previous.observation:
+                return FleetHomeRecoveryAction.PUBLISH_HOME, transaction
+            if _absent_publish_progress_valid(previous.observation, observation):
+                return _checkpoint_pending(transaction, observation)
+        if state == "published" and _absent_publish_progress_valid(
+            previous.observation, observation
+        ):
+            return FleetHomeRecoveryAction.PERSIST, advance_fleet_home_recovery_v2(
+                transaction,
+                FleetHomeRecoveryPhase.ABSENT_PUBLISHED,
+                observation,
+            )
+        return _block(transaction, observation)
+    if phase is FleetHomeRecoveryPhase.ABSENT_PUBLISHED:
+        if observation != previous.observation:
+            return _block(transaction, observation)
+        return FleetHomeRecoveryAction.PERSIST, advance_fleet_home_recovery_v2(
+            transaction,
+            FleetHomeRecoveryPhase.CAS_PENDING,
+            observation,
+        )
     if phase is FleetHomeRecoveryPhase.PREPARE_PENDING:
         if observation == previous.observation:
             return FleetHomeRecoveryAction.PREPARE, transaction
@@ -1442,7 +1938,9 @@ def plan_fleet_home_recovery_v2(
             explicit_conflict=previous.explicit_conflict,
         )
     if phase is FleetHomeRecoveryPhase.COMMIT_PENDING:
-        state = _commit_progress(transaction, previous.observation, observation)
+        state = (
+            _absent_commit_progress if transaction.absent_homes else _commit_progress
+        )(transaction, previous.observation, observation)
         if state == "same":
             return FleetHomeRecoveryAction.COMMIT, transaction
         if state == "partial":
@@ -1458,7 +1956,11 @@ def plan_fleet_home_recovery_v2(
             )
         return _block(transaction, observation)
     if phase is FleetHomeRecoveryPhase.ROLLBACK_PENDING:
-        state = _rollback_progress(transaction, previous.observation, observation)
+        state = (
+            _absent_rollback_progress
+            if transaction.absent_homes
+            else _rollback_progress
+        )(transaction, previous.observation, observation)
         if state == "same":
             return FleetHomeRecoveryAction.ROLLBACK, transaction
         if state == "partial":
@@ -1504,6 +2006,16 @@ _HOME_FIELDS = frozenset(
         "entries",
     }
 )
+_ABSENT_HOME_FIELDS = frozenset(
+    {
+        "membership_index",
+        "member_id",
+        "final_name",
+        "staging_name",
+        "marker_path",
+        "entries",
+    }
+)
 _ENTRY_OBSERVATION_FIELDS = frozenset({"name", "live", "old_slot", "replacement_slot"})
 _HOME_OBSERVATION_FIELDS = frozenset(
     {
@@ -1517,7 +2029,18 @@ _HOME_OBSERVATION_FIELDS = frozenset(
         "entries",
     }
 )
-_OBSERVATION_FIELDS = frozenset({"pool_parent", "homes"})
+_ABSENT_ENTRY_OBSERVATION_FIELDS = frozenset({"name", "current"})
+_ABSENT_HOME_OBSERVATION_FIELDS = frozenset(
+    {
+        "membership_index",
+        "member_id",
+        "final_identity",
+        "staging_identity",
+        "unexpected_entries",
+        "entries",
+    }
+)
+_OBSERVATION_FIELDS = frozenset({"pool_parent", "homes", "absent_homes"})
 _SNAPSHOT_IDENTITY_FIELDS = frozenset({"generation", "digest"})
 _RECORD_FIELDS = frozenset(
     {
@@ -1533,7 +2056,13 @@ _RECORD_FIELDS = frozenset(
 )
 _RECORD0_FIELDS = _RECORD_FIELDS - {"current_observation"}
 _BASIS_FIELDS = frozenset(
-    {"pool_parent_before", "current_snapshot", "planned_snapshot", "homes"}
+    {
+        "pool_parent_before",
+        "current_snapshot",
+        "planned_snapshot",
+        "homes",
+        "absent_homes",
+    }
 )
 _TRANSACTION_FIELDS = frozenset({"schema_version", "nonce", "basis", "records"})
 _RECORD0_FILE_FIELDS = frozenset({"schema_version", "nonce", "basis", "record"})
@@ -1745,12 +2274,47 @@ def _home_from_document(value: object) -> FleetHomeRecoveryHomeV2:
     )
 
 
+def _absent_home_document(
+    home: FleetHomeRecoveryAbsentHomeV2,
+) -> dict[str, object]:
+    return {
+        "membership_index": home.membership_index,
+        "member_id": home.member_id,
+        "final_name": home.final_name,
+        "staging_name": home.staging_name,
+        "marker_path": home.marker_path,
+        "entries": [_entry_document(entry) for entry in home.entries],
+    }
+
+
+def _absent_home_from_document(value: object) -> FleetHomeRecoveryAbsentHomeV2:
+    raw = _exact_dict(value, _ABSENT_HOME_FIELDS)
+    entries = raw["entries"]
+    if (
+        type(entries) is not list
+        or not entries
+        or len(entries) > MAX_FLEET_HOME_RECOVERY_ENTRIES
+    ):
+        _fail()
+    return FleetHomeRecoveryAbsentHomeV2(
+        _integer(raw["membership_index"], 0, MAX_FLEET_HOME_RECOVERY_HOMES - 1),
+        raw["member_id"],
+        raw["final_name"],
+        raw["staging_name"],
+        raw["marker_path"],
+        tuple(_entry_from_document(entry) for entry in entries),
+    )
+
+
 def _basis_document(transaction: FleetHomeRecoveryTransactionV2) -> dict[str, object]:
     return {
         "pool_parent_before": _stat_document(transaction.pool_parent_before),
         "current_snapshot": _snapshot_identity_document(transaction.current_snapshot),
         "planned_snapshot": _snapshot_identity_document(transaction.planned_snapshot),
         "homes": [_home_document(home) for home in transaction.homes],
+        "absent_homes": [
+            _absent_home_document(home) for home in transaction.absent_homes
+        ],
     }
 
 
@@ -1761,13 +2325,19 @@ def _basis_from_document(
     FleetHomeRecoverySnapshotIdentity,
     FleetHomeRecoverySnapshotIdentity,
     tuple[FleetHomeRecoveryHomeV2, ...],
+    tuple[FleetHomeRecoveryAbsentHomeV2, ...],
 ]:
     raw = _exact_dict(value, _BASIS_FIELDS)
     homes_raw = raw["homes"]
+    absent_homes_raw = raw["absent_homes"]
     if (
         type(homes_raw) is not list
-        or not homes_raw
         or len(homes_raw) > MAX_FLEET_HOME_RECOVERY_HOMES
+        or type(absent_homes_raw) is not list
+        or len(absent_homes_raw) > MAX_FLEET_HOME_RECOVERY_HOMES
+        or not homes_raw
+        and not absent_homes_raw
+        or len(homes_raw) + len(absent_homes_raw) > MAX_FLEET_HOME_RECOVERY_HOMES
     ):
         _fail()
     return (
@@ -1775,6 +2345,7 @@ def _basis_from_document(
         _snapshot_identity_from_document(raw["current_snapshot"]),
         _snapshot_identity_from_document(raw["planned_snapshot"]),
         tuple(_home_from_document(home) for home in homes_raw),
+        tuple(_absent_home_from_document(home) for home in absent_homes_raw),
     )
 
 
@@ -1807,6 +2378,20 @@ def _observation_document(
             }
             for home in observation.homes
         ],
+        "absent_homes": [
+            {
+                "membership_index": home.membership_index,
+                "member_id": home.member_id,
+                "final_identity": _object_document(home.final_identity),
+                "staging_identity": _object_document(home.staging_identity),
+                "unexpected_entries": list(home.unexpected_entries),
+                "entries": [
+                    {"name": entry.name, "current": _object_document(entry.current)}
+                    for entry in home.entries
+                ],
+            }
+            for home in observation.absent_homes
+        ],
     }
 
 
@@ -1815,10 +2400,15 @@ def _observation_from_document(
 ) -> FleetHomeRecoveryTransactionObservationV2:
     raw = _exact_dict(value, _OBSERVATION_FIELDS)
     homes_raw = raw["homes"]
+    absent_homes_raw = raw["absent_homes"]
     if (
         type(homes_raw) is not list
-        or not homes_raw
         or len(homes_raw) > MAX_FLEET_HOME_RECOVERY_HOMES
+        or type(absent_homes_raw) is not list
+        or len(absent_homes_raw) > MAX_FLEET_HOME_RECOVERY_HOMES
+        or not homes_raw
+        and not absent_homes_raw
+        or len(homes_raw) + len(absent_homes_raw) > MAX_FLEET_HOME_RECOVERY_HOMES
     ):
         _fail()
     homes: list[FleetHomeRecoveryHomeObservationV2] = []
@@ -1868,9 +2458,46 @@ def _observation_from_document(
                 ),
             )
         )
+    absent_homes: list[FleetHomeRecoveryAbsentHomeObservationV2] = []
+    for item in absent_homes_raw:
+        home = _exact_dict(item, _ABSENT_HOME_OBSERVATION_FIELDS)
+        entries_raw = home["entries"]
+        unexpected = home["unexpected_entries"]
+        if (
+            type(entries_raw) is not list
+            or len(entries_raw) > MAX_FLEET_HOME_RECOVERY_ENTRIES
+            or type(unexpected) is not list
+            or len(unexpected) > MAX_FLEET_HOME_RECOVERY_ENTRIES
+        ):
+            _fail()
+        absent_homes.append(
+            FleetHomeRecoveryAbsentHomeObservationV2(
+                _integer(
+                    home["membership_index"], 0, MAX_FLEET_HOME_RECOVERY_HOMES - 1
+                ),
+                home["member_id"],
+                _object_from_document(home["final_identity"]),
+                _object_from_document(home["staging_identity"]),
+                tuple(_relative_path(name) for name in unexpected),
+                tuple(
+                    FleetHomeRecoveryAbsentEntryObservationV2(
+                        _relative_path(entry["name"]),
+                        _object_from_document(entry["current"]),
+                    )
+                    for item_entry in entries_raw
+                    for entry in (
+                        _exact_dict(
+                            item_entry,
+                            _ABSENT_ENTRY_OBSERVATION_FIELDS,
+                        ),
+                    )
+                ),
+            )
+        )
     return FleetHomeRecoveryTransactionObservationV2(
         _stat_from_document(raw["pool_parent"]),
         tuple(homes),
+        tuple(absent_homes),
     )
 
 
@@ -1970,7 +2597,9 @@ def decode_fleet_home_recovery_transaction_v2(
             or len(records_raw) > MAX_FLEET_HOME_RECOVERY_RECORDS
         ):
             _fail()
-        pool_parent, current, planned, homes = _basis_from_document(document["basis"])
+        pool_parent, current, planned, homes, absent_homes = _basis_from_document(
+            document["basis"]
+        )
         transaction = FleetHomeRecoveryTransactionV2(
             _integer(document["schema_version"], 2, 2),
             document["nonce"],
@@ -1979,6 +2608,7 @@ def decode_fleet_home_recovery_transaction_v2(
             planned,
             homes,
             tuple(_record_from_document(record) for record in records_raw),
+            absent_homes,
         )
         _validate_transaction(transaction)
         if encode_fleet_home_recovery_transaction_v2(transaction) != raw:
@@ -2106,8 +2736,10 @@ def _preflight_absent(parent_fd: int, names: tuple[str, ...]) -> None:
 def _decode_record0(raw: bytes) -> FleetHomeRecoveryTransactionV2:
     try:
         document = _exact_dict(json.loads(raw.decode()), _RECORD0_FILE_FIELDS)
-        pool, current, planned, homes = _basis_from_document(document["basis"])
-        observation = _before_observation(pool, homes)
+        pool, current, planned, homes, absent_homes = _basis_from_document(
+            document["basis"]
+        )
+        observation = _before_observation(pool, homes, absent_homes)
         record = _record_from_document(document["record"], observation=observation)
         transaction = FleetHomeRecoveryTransactionV2(
             _integer(document["schema_version"], 2, 2),
@@ -2117,6 +2749,7 @@ def _decode_record0(raw: bytes) -> FleetHomeRecoveryTransactionV2:
             planned,
             homes,
             (record,),
+            absent_homes,
         )
         _validate_transaction(transaction)
         if _record_file_bytes_unchecked(transaction, 0) != raw:
@@ -2185,6 +2818,7 @@ def persist_fleet_home_recovery_transaction_v2(
             or current.current_snapshot != transaction.current_snapshot
             or current.planned_snapshot != transaction.planned_snapshot
             or current.homes != transaction.homes
+            or current.absent_homes != transaction.absent_homes
         ):
             _fail()
     encoded = _record_file_bytes_unchecked(transaction, index)
@@ -2477,3 +3111,723 @@ def load_fleet_home_recovery_transaction_v2(
         for _, fd, _, _, _ in opened:
             with contextlib.suppress(OSError):
                 os.close(fd)
+
+
+def _recovery_stat(current: os.stat_result) -> FleetHomeRecoveryStat:
+    return FleetHomeRecoveryStat(
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_uid,
+        current.st_gid,
+        current.st_nlink,
+        current.st_size,
+        current.st_mtime_ns,
+    )
+
+
+def _snapshot_fd(fd: int) -> FleetHomeRecoveryObjectSnapshot:
+    target = os.fstat(fd)
+    current = _recovery_stat(target)
+    kind = _stat_kind(current)
+    raw = b"" if kind is FleetHomeEntryKind.DIRECTORY else _read_fd_bytes(fd, target)
+    return _validate_object(
+        FleetHomeRecoveryObjectSnapshot(
+            current,
+            None
+            if kind is FleetHomeEntryKind.DIRECTORY
+            else hashlib.sha256(raw).hexdigest(),
+        ),
+        kind,
+    )
+
+
+def _open_snapshot_at(
+    parent_fd: int,
+    name: str,
+) -> tuple[int, FleetHomeRecoveryObjectSnapshot]:
+    try:
+        target = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise FleetHomeRecoveryValidationError() from exc
+    kind = _stat_kind(_recovery_stat(target))
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if kind is FleetHomeEntryKind.DIRECTORY:
+        flags |= os.O_DIRECTORY
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise FleetHomeRecoveryValidationError() from exc
+    try:
+        snapshot = _snapshot_fd(fd)
+        if snapshot.stat != _recovery_stat(target) or _metadata(
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        ) != _metadata(target):
+            _fail()
+        return fd, snapshot
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _revalidate_open_snapshot_at(
+    parent_fd: int,
+    name: str,
+    fd: int,
+    expected: FleetHomeRecoveryObjectSnapshot,
+) -> None:
+    try:
+        path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise FleetHomeRecoveryValidationError() from exc
+    if _snapshot_fd(fd) != expected or _recovery_stat(path) != expected.stat:
+        _fail()
+
+
+def _snapshot_at(
+    parent_fd: int,
+    name: str,
+) -> FleetHomeRecoveryObjectSnapshot | None:
+    try:
+        fd, snapshot = _open_snapshot_at(parent_fd, name)
+    except FleetHomeRecoveryValidationError as exc:
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            pass
+        raise exc
+    try:
+        return snapshot
+    finally:
+        os.close(fd)
+
+
+def _open_relative_directory(root_fd: int, path: str) -> int:
+    current_fd = os.dup(root_fd)
+    try:
+        for part in () if not path else PurePosixPath(path).parts:
+            target = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current_fd,
+            )
+            try:
+                if _metadata(os.fstat(next_fd)) != _metadata(target) or _metadata(
+                    os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+                ) != _metadata(target):
+                    _fail()
+                _validate_stat(_recovery_stat(target), FleetHomeEntryKind.DIRECTORY)
+            except BaseException:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(current_fd)
+        raise
+
+
+def _observe_absent_tree(
+    container_fd: int,
+    home: FleetHomeRecoveryAbsentHomeV2,
+    container_identity: FleetHomeRecoveryObjectSnapshot,
+) -> tuple[
+    tuple[str, ...],
+    tuple[FleetHomeRecoveryAbsentEntryObservationV2, ...],
+]:
+    observed = {entry.name: None for entry in home.entries}
+    unexpected: list[str] = []
+    if _snapshot_fd(container_fd) != container_identity:
+        _fail()
+    parent_paths = ("",) + tuple(
+        entry.name
+        for entry in home.entries
+        if entry.replacement_kind is FleetHomeEntryKind.DIRECTORY
+    )
+    for parent_path in parent_paths:
+        try:
+            parent_fd = _open_relative_directory(container_fd, parent_path)
+        except FileNotFoundError:
+            continue
+        try:
+            expected = {
+                PurePosixPath(entry.name).name
+                for entry in home.entries
+                if (
+                    ""
+                    if PurePosixPath(entry.name).parent.as_posix() == "."
+                    else PurePosixPath(entry.name).parent.as_posix()
+                )
+                == parent_path
+            }
+            actual = set(os.listdir(parent_fd))
+            unexpected.extend(
+                name if not parent_path else f"{parent_path}/{name}"
+                for name in sorted(actual - expected)
+            )
+            for entry in home.entries:
+                parent = PurePosixPath(entry.name).parent.as_posix()
+                parent = "" if parent == "." else parent
+                if parent == parent_path:
+                    observed[entry.name] = _snapshot_at(
+                        parent_fd, PurePosixPath(entry.name).name
+                    )
+        finally:
+            os.close(parent_fd)
+    if _snapshot_fd(container_fd) != container_identity:
+        _fail()
+    return (
+        tuple(sorted(unexpected)),
+        tuple(
+            FleetHomeRecoveryAbsentEntryObservationV2(entry.name, observed[entry.name])
+            for entry in home.entries
+        ),
+    )
+
+
+def _observe_absent_home(
+    pool_fd: int,
+    home: FleetHomeRecoveryAbsentHomeV2,
+) -> FleetHomeRecoveryAbsentHomeObservationV2:
+    final_identity = _snapshot_at(pool_fd, home.final_name)
+    staging_identity = _snapshot_at(pool_fd, home.staging_name)
+    container_name = (
+        home.final_name if final_identity is not None else home.staging_name
+    )
+    container_identity = final_identity or staging_identity
+    unexpected: tuple[str, ...] = ()
+    entries = tuple(
+        FleetHomeRecoveryAbsentEntryObservationV2(entry.name, None)
+        for entry in home.entries
+    )
+    if container_identity is not None:
+        _validate_object(container_identity, FleetHomeEntryKind.DIRECTORY)
+        container_fd, pinned = _open_snapshot_at(pool_fd, container_name)
+        try:
+            if pinned != container_identity:
+                _fail()
+            unexpected, entries = _observe_absent_tree(
+                container_fd, home, container_identity
+            )
+            _revalidate_open_snapshot_at(
+                pool_fd,
+                container_name,
+                container_fd,
+                container_identity,
+            )
+        finally:
+            os.close(container_fd)
+    return FleetHomeRecoveryAbsentHomeObservationV2(
+        home.membership_index,
+        home.member_id,
+        final_identity,
+        staging_identity,
+        unexpected,
+        entries,
+    )
+
+
+def _observe_absent_transaction(
+    pool_fd: int,
+    transaction: FleetHomeRecoveryTransactionV2,
+) -> FleetHomeRecoveryTransactionObservationV2:
+    parent_before = _private_parent_stat(pool_fd)
+    observation = FleetHomeRecoveryTransactionObservationV2(
+        _recovery_stat(parent_before),
+        (),
+        tuple(_observe_absent_home(pool_fd, home) for home in transaction.absent_homes),
+    )
+    if _metadata(_private_parent_stat(pool_fd)) != _metadata(parent_before):
+        _fail()
+    return _validate_observation(transaction, observation)
+
+
+def _validate_population(
+    transaction: FleetHomeRecoveryTransactionV2,
+    population: object,
+) -> tuple[FleetHomeRecoveryPopulationV2, ...]:
+    if type(population) is not tuple or len(population) != len(
+        transaction.absent_homes
+    ):
+        _fail()
+    total = 0
+    for home, content_home in zip(transaction.absent_homes, population, strict=True):
+        if (
+            type(content_home) is not FleetHomeRecoveryPopulationV2
+            or content_home.member_id != home.member_id
+            or type(content_home.entries) is not tuple
+            or len(content_home.entries) != len(home.entries)
+        ):
+            _fail()
+        for entry, content_entry in zip(
+            home.entries, content_home.entries, strict=True
+        ):
+            if (
+                type(content_entry) is not FleetHomeRecoveryPopulationEntryV2
+                or content_entry.name != entry.name
+            ):
+                _fail()
+            content = content_entry.content
+            if entry.replacement_kind is FleetHomeEntryKind.DIRECTORY:
+                if content is not None:
+                    _fail()
+            elif (
+                type(content) is not bytes
+                or hashlib.sha256(content).hexdigest() != entry.replacement_sha256
+            ):
+                _fail()
+            total += 0 if content is None else len(content)
+            if total > MAX_FLEET_HOME_RECOVERY_BYTES:
+                _fail()
+    return population
+
+
+def _populate_absent_homes(
+    pool_fd: int,
+    transaction: FleetHomeRecoveryTransactionV2,
+    population: tuple[FleetHomeRecoveryPopulationV2, ...],
+    faultpoint: Callable[[str], None] | None,
+) -> None:
+    for home, content_home, before_home in zip(
+        transaction.absent_homes,
+        population,
+        transaction.records[-1].observation.absent_homes,
+        strict=True,
+    ):
+        root_fd = _open_relative_directory(pool_fd, home.staging_name)
+        try:
+            trusted_root = _snapshot_fd(root_fd)
+            trusted_tree = _observe_absent_tree(root_fd, home, trusted_root)
+            if before_home.staging_identity != trusted_root or trusted_tree != (
+                before_home.unexpected_entries,
+                before_home.entries,
+            ):
+                _fail()
+            for entry, content_entry in zip(
+                home.entries, content_home.entries, strict=True
+            ):
+                _revalidate_open_snapshot_at(
+                    pool_fd,
+                    home.staging_name,
+                    root_fd,
+                    trusted_root,
+                )
+                if _observe_absent_tree(root_fd, home, trusted_root) != trusted_tree:
+                    _fail()
+                parent_path = PurePosixPath(entry.name).parent.as_posix()
+                parent_path = "" if parent_path == "." else parent_path
+                parent_fd = _open_relative_directory(root_fd, parent_path)
+                try:
+                    leaf = PurePosixPath(entry.name).name
+                    current = _snapshot_at(parent_fd, leaf)
+                    if _replacement_matches(entry, current):
+                        continue
+                    if current is not None:
+                        _fail()
+                    is_marker = entry.name == home.marker_path
+                    if is_marker and faultpoint is not None:
+                        faultpoint("before_absent_marker")
+                    if faultpoint is not None:
+                        faultpoint("before_absent_population_entry")
+                    if entry.replacement_kind is FleetHomeEntryKind.DIRECTORY:
+                        os.mkdir(leaf, entry.replacement_mode, dir_fd=parent_fd)
+                    else:
+                        file_fd = os.open(
+                            leaf,
+                            os.O_WRONLY
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | getattr(os, "O_NOFOLLOW", 0),
+                            entry.replacement_mode,
+                            dir_fd=parent_fd,
+                        )
+                        try:
+                            os.fchmod(file_fd, entry.replacement_mode)
+                            content = content_entry.content
+                            if type(content) is not bytes:
+                                _fail()
+                            offset = 0
+                            while offset < len(content):
+                                written = os.write(file_fd, content[offset:])
+                                if written <= 0:
+                                    _fail()
+                                offset += written
+                            os.fsync(file_fd)
+                        finally:
+                            os.close(file_fd)
+                    if not _replacement_matches(entry, _snapshot_at(parent_fd, leaf)):
+                        _fail()
+                    os.fsync(parent_fd)
+                    trusted_root = _snapshot_fd(root_fd)
+                    trusted_tree = _observe_absent_tree(
+                        root_fd,
+                        home,
+                        trusted_root,
+                    )
+                    if faultpoint is not None:
+                        faultpoint("after_absent_population_entry")
+                    if is_marker and faultpoint is not None:
+                        faultpoint("after_absent_marker")
+                    _revalidate_open_snapshot_at(
+                        pool_fd,
+                        home.staging_name,
+                        root_fd,
+                        trusted_root,
+                    )
+                    if (
+                        _observe_absent_tree(root_fd, home, trusted_root)
+                        != trusted_tree
+                    ):
+                        _fail()
+                finally:
+                    os.close(parent_fd)
+            os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+
+
+def _remove_exact_absent_final(
+    pool_fd: int,
+    home: FleetHomeRecoveryAbsentHomeV2,
+    expected: FleetHomeRecoveryAbsentHomeObservationV2,
+) -> None:
+    if expected.final_identity is None or expected.staging_identity is not None:
+        _fail()
+    final_fd, final_identity = _open_snapshot_at(pool_fd, home.final_name)
+    try:
+        if final_identity != expected.final_identity or _observe_absent_tree(
+            final_fd, home, final_identity
+        ) != (expected.unexpected_entries, expected.entries):
+            _fail()
+        for entry, expected_entry in reversed(
+            tuple(zip(home.entries, expected.entries, strict=True))
+        ):
+            if expected_entry.current is None:
+                _fail()
+            parent_path = PurePosixPath(entry.name).parent.as_posix()
+            parent_path = "" if parent_path == "." else parent_path
+            parent_fd = _open_relative_directory(final_fd, parent_path)
+            try:
+                leaf = PurePosixPath(entry.name).name
+                object_fd, current = _open_snapshot_at(parent_fd, leaf)
+                try:
+                    if entry.replacement_kind is FleetHomeEntryKind.FILE:
+                        if current != expected_entry.current:
+                            _fail()
+                        _revalidate_open_snapshot_at(
+                            parent_fd,
+                            leaf,
+                            object_fd,
+                            current,
+                        )
+                        os.unlink(leaf, dir_fd=parent_fd)
+                    else:
+                        if not _same_identity(
+                            current.stat,
+                            expected_entry.current.stat,
+                        ) or os.listdir(object_fd):
+                            _fail()
+                        path = os.stat(
+                            leaf,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                        if not _same_identity(_recovery_stat(path), current.stat):
+                            _fail()
+                        os.rmdir(leaf, dir_fd=parent_fd)
+                finally:
+                    os.close(object_fd)
+                if _snapshot_at(parent_fd, leaf) is not None:
+                    _fail()
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        if os.listdir(final_fd):
+            _fail()
+        path = os.stat(
+            home.final_name,
+            dir_fd=pool_fd,
+            follow_symlinks=False,
+        )
+        if not _same_identity(_recovery_stat(path), final_identity.stat):
+            _fail()
+        os.rmdir(home.final_name, dir_fd=pool_fd)
+        if _snapshot_at(pool_fd, home.final_name) is not None:
+            _fail()
+        os.fsync(pool_fd)
+    finally:
+        os.close(final_fd)
+
+
+def apply_fleet_home_recovery_absent_v2(
+    recovery_fd: int,
+    pool_fd: int,
+    transaction: FleetHomeRecoveryTransactionV2,
+    population: tuple[FleetHomeRecoveryPopulationV2, ...],
+    *,
+    faultpoint: Callable[[str], None] | None = None,
+) -> FleetHomeRecoveryTransactionV2:
+    _validate_transaction(transaction)
+    if transaction.homes or not transaction.absent_homes:
+        _fail()
+    population = _validate_population(transaction, population)
+    if (
+        load_fleet_home_recovery_transaction_v2(recovery_fd, transaction.nonce)
+        != transaction
+    ):
+        _fail()
+    observation = _observe_absent_transaction(pool_fd, transaction)
+    action, planned = plan_fleet_home_recovery_v2(
+        transaction,
+        observation,
+        authoritative_readable=None,
+        authoritative_snapshot=None,
+        explicit_conflict=False,
+    )
+    if action in {FleetHomeRecoveryAction.BLOCK, FleetHomeRecoveryAction.PERSIST}:
+        return planned
+    if action is FleetHomeRecoveryAction.CREATE_STAGING:
+        pinned_created: list[
+            tuple[
+                FleetHomeRecoveryAbsentHomeV2,
+                int,
+                FleetHomeRecoveryObjectSnapshot,
+            ]
+        ] = []
+        try:
+            for home in transaction.absent_homes:
+                if faultpoint is not None:
+                    faultpoint("before_absent_staging_create")
+                try:
+                    os.mkdir(home.staging_name, 0o700, dir_fd=pool_fd)
+                    created = os.stat(
+                        home.staging_name,
+                        dir_fd=pool_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise FleetHomeRecoveryValidationError() from exc
+                if faultpoint is not None:
+                    faultpoint("after_absent_staging_create")
+                created_fd, identity = _open_snapshot_at(pool_fd, home.staging_name)
+                if identity.stat != _recovery_stat(created):
+                    os.close(created_fd)
+                    _fail()
+                pinned_created.append((home, created_fd, identity))
+                if faultpoint is not None:
+                    faultpoint("after_absent_staging_pin")
+                _revalidate_open_snapshot_at(
+                    pool_fd,
+                    home.staging_name,
+                    created_fd,
+                    identity,
+                )
+            os.fsync(pool_fd)
+            current = _observe_absent_transaction(pool_fd, transaction)
+            for home, created_fd, identity in pinned_created:
+                observed = current.absent_homes[home.membership_index]
+                if observed.staging_identity != identity:
+                    _fail()
+                _revalidate_open_snapshot_at(
+                    pool_fd,
+                    home.staging_name,
+                    created_fd,
+                    identity,
+                )
+            return advance_fleet_home_recovery_v2(
+                transaction,
+                FleetHomeRecoveryPhase.ABSENT_PIN_PENDING,
+                current,
+            )
+        finally:
+            for _, created_fd, _ in pinned_created:
+                with contextlib.suppress(OSError):
+                    os.close(created_fd)
+    if action is FleetHomeRecoveryAction.PIN_STAGING:
+        for home, expected in zip(
+            transaction.absent_homes, observation.absent_homes, strict=True
+        ):
+            if faultpoint is not None:
+                faultpoint("before_absent_staging_pin")
+            current_fd, current = _open_snapshot_at(pool_fd, home.staging_name)
+            try:
+                if expected.staging_identity is None or current != (
+                    expected.staging_identity
+                ):
+                    _fail()
+                if faultpoint is not None:
+                    faultpoint("after_absent_staging_pin")
+                _revalidate_open_snapshot_at(
+                    pool_fd,
+                    home.staging_name,
+                    current_fd,
+                    current,
+                )
+            finally:
+                os.close(current_fd)
+        return advance_fleet_home_recovery_v2(
+            transaction,
+            FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+            observation,
+        )
+    if action is FleetHomeRecoveryAction.COMMIT:
+        expected_pool = replace(
+            observation.pool_parent,
+            mtime_ns=transaction.pool_parent_before.mtime_ns,
+        )
+        current_pool = os.fstat(pool_fd)
+        os.utime(
+            pool_fd,
+            ns=(current_pool.st_atime_ns, transaction.pool_parent_before.mtime_ns),
+        )
+        os.fsync(pool_fd)
+        if _recovery_stat(os.fstat(pool_fd)) != expected_pool:
+            _fail()
+    elif action is FleetHomeRecoveryAction.ROLLBACK:
+        removed = False
+        for home, expected in zip(
+            transaction.absent_homes,
+            observation.absent_homes,
+            strict=True,
+        ):
+            if expected.final_identity is None:
+                continue
+            _remove_exact_absent_final(pool_fd, home, expected)
+            removed = True
+            break
+        if not removed:
+            _fail()
+        after_removal = _observe_absent_transaction(pool_fd, transaction)
+        if all(
+            home.final_identity is None and home.staging_identity is None
+            for home in after_removal.absent_homes
+        ):
+            current_pool = os.fstat(pool_fd)
+            os.utime(
+                pool_fd,
+                ns=(
+                    current_pool.st_atime_ns,
+                    transaction.pool_parent_before.mtime_ns,
+                ),
+            )
+            os.fsync(pool_fd)
+            if _recovery_stat(os.fstat(pool_fd)) != transaction.pool_parent_before:
+                _fail()
+    elif action is FleetHomeRecoveryAction.POPULATE_STAGING:
+        _populate_absent_homes(pool_fd, transaction, population, faultpoint)
+    elif action is FleetHomeRecoveryAction.PUBLISH_HOME:
+        for home, expected in zip(
+            transaction.absent_homes,
+            transaction.records[-1].observation.absent_homes,
+            strict=True,
+        ):
+            current = _observe_absent_transaction(pool_fd, transaction)
+            current_home = current.absent_homes[home.membership_index]
+            if current_home.final_identity is not None:
+                continue
+            if (
+                current_home.staging_identity is None
+                or expected.staging_identity is None
+                or current_home != expected
+            ):
+                _fail()
+            staging_fd, staging_identity = _open_snapshot_at(pool_fd, home.staging_name)
+            try:
+                if staging_identity != expected.staging_identity:
+                    _fail()
+                expected_tree = (
+                    expected.unexpected_entries,
+                    expected.entries,
+                )
+                if (
+                    _observe_absent_tree(staging_fd, home, staging_identity)
+                    != expected_tree
+                ):
+                    _fail()
+                if faultpoint is not None:
+                    faultpoint("before_absent_home_publish")
+                _revalidate_open_snapshot_at(
+                    pool_fd,
+                    home.staging_name,
+                    staging_fd,
+                    staging_identity,
+                )
+                if (
+                    _observe_absent_tree(staging_fd, home, staging_identity)
+                    != expected_tree
+                    or _recovery_stat(_private_parent_stat(pool_fd))
+                    != current.pool_parent
+                ):
+                    _fail()
+                _rename_noreplace(pool_fd, home.staging_name, home.final_name)
+                _revalidate_open_snapshot_at(
+                    pool_fd,
+                    home.final_name,
+                    staging_fd,
+                    staging_identity,
+                )
+                if (
+                    _observe_absent_tree(staging_fd, home, staging_identity)
+                    != expected_tree
+                ):
+                    _fail()
+                if faultpoint is not None:
+                    faultpoint("after_absent_home_publish")
+                _revalidate_open_snapshot_at(
+                    pool_fd,
+                    home.final_name,
+                    staging_fd,
+                    staging_identity,
+                )
+                if (
+                    _observe_absent_tree(staging_fd, home, staging_identity)
+                    != expected_tree
+                ):
+                    _fail()
+                os.fsync(pool_fd)
+                published = _observe_absent_transaction(pool_fd, transaction)
+                published_home = published.absent_homes[home.membership_index]
+                if (
+                    published_home.final_identity != staging_identity
+                    or published_home.staging_identity is not None
+                    or published_home.unexpected_entries != expected.unexpected_entries
+                    or published_home.entries != expected.entries
+                ):
+                    _fail()
+                _revalidate_open_snapshot_at(
+                    pool_fd,
+                    home.final_name,
+                    staging_fd,
+                    staging_identity,
+                )
+                action, planned = plan_fleet_home_recovery_v2(
+                    transaction,
+                    published,
+                    authoritative_readable=None,
+                    authoritative_snapshot=None,
+                    explicit_conflict=False,
+                )
+                if action is not FleetHomeRecoveryAction.PERSIST:
+                    _fail()
+                return planned
+            finally:
+                os.close(staging_fd)
+        _fail()
+    else:
+        _fail()
+    current = _observe_absent_transaction(pool_fd, transaction)
+    action, planned = plan_fleet_home_recovery_v2(
+        transaction,
+        current,
+        authoritative_readable=None,
+        authoritative_snapshot=None,
+        explicit_conflict=False,
+    )
+    if action is not FleetHomeRecoveryAction.PERSIST:
+        _fail()
+    return planned

@@ -1,4 +1,4 @@
-"""Crash-safe in-place updates for the three managed files in Q-series homes."""
+"""Crash-safe in-place updates for the managed files in Q-series homes."""
 
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ _TEMP_RE = re.compile(r"\.codex-inplace-[0-9a-f]{32}\Z")
 _SPECS = (
     ("codex", "wrapper", 0o700, 512 * 1024),
     ("config.toml", "config", 0o600, 256 * 1024),
+    ("AGENTS.md", "instructions", 0o600, 256 * 1024),
+    ("AGENTS.class-teamleiterin.md", "class_instructions", 0o600, 256 * 1024),
     (".codex-fleet-agent.json", "marker", 0o600, 64 * 1024),
 )
 _SPEC_BY_NAME = {item[0]: item for item in _SPECS}
@@ -49,7 +51,9 @@ class QHomeUpdate:
     home: Path = field(repr=False)
     wrapper: bytes = field(repr=False)
     config: bytes = field(repr=False)
+    instructions: bytes = field(repr=False)
     marker: bytes = field(repr=False)
+    class_instructions: bytes = field(default=b"", repr=False)
 
 
 @dataclass(frozen=True, slots=True)

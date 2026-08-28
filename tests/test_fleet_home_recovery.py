@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -13,6 +14,9 @@ from codex_master.fleet_home_recovery import (
     MAX_FLEET_HOME_RECOVERY_BYTES,
     FleetHomeEntryKind,
     FleetHomeRecoveryAction,
+    FleetHomeRecoveryAbsentEntryObservationV2,
+    FleetHomeRecoveryAbsentHomeObservationV2,
+    FleetHomeRecoveryAbsentHomeV2,
     FleetHomeRecoveryEntryObservationV2,
     FleetHomeRecoveryEntryV2,
     FleetHomeRecoveryHomeObservationV2,
@@ -26,7 +30,10 @@ from codex_master.fleet_home_recovery import (
     FleetHomeRecoveryTransactionObservationV2,
     FleetHomeRecoveryTransactionV2,
     FleetHomeRecoveryValidationError,
+    FleetHomeRecoveryPopulationEntryV2,
+    FleetHomeRecoveryPopulationV2,
     advance_fleet_home_recovery_v2,
+    apply_fleet_home_recovery_absent_v2,
     decode_fleet_home_recovery_transaction_v2,
     encode_fleet_home_recovery_transaction_v2,
     load_fleet_home_recovery_transaction_v2,
@@ -44,6 +51,7 @@ HOME_B_NONCE = "22222222222222222222222222222222"
 OLD_DIGEST = "1" * 64
 NEW_DIGEST = "2" * 64
 OTHER_DIGEST = "3" * 64
+ABSENT_STAGING_NAME = f".fleet-home-staging-v2-{NONCE}-0000"
 
 
 def stat_fixture(
@@ -178,6 +186,1136 @@ def transaction_fixture() -> FleetHomeRecoveryTransactionV2:
         planned_snapshot=FleetHomeRecoverySnapshotIdentity(5, NEW_DIGEST),
         homes=homes_fixture(),
     )
+
+
+def absent_home_fixture(
+    *, membership_index: int = 0, member_id: str = "a1", final_name: str = "a1"
+) -> FleetHomeRecoveryAbsentHomeV2:
+    return FleetHomeRecoveryAbsentHomeV2(
+        membership_index=membership_index,
+        member_id=member_id,
+        final_name=final_name,
+        staging_name=f".fleet-home-staging-v2-{NONCE}-{membership_index:04d}",
+        marker_path=".fleet-home-marker-v2.json",
+        entries=(
+            FleetHomeRecoveryEntryV2(
+                "common.md",
+                None,
+                None,
+                FleetHomeEntryKind.FILE,
+                0o600,
+                NEW_DIGEST,
+            ),
+            FleetHomeRecoveryEntryV2(
+                "profiles",
+                None,
+                None,
+                FleetHomeEntryKind.DIRECTORY,
+                0o700,
+                None,
+            ),
+            FleetHomeRecoveryEntryV2(
+                "profiles/worker.md",
+                None,
+                None,
+                FleetHomeEntryKind.FILE,
+                0o600,
+                OTHER_DIGEST,
+            ),
+            FleetHomeRecoveryEntryV2(
+                ".fleet-home-marker-v2.json",
+                None,
+                None,
+                FleetHomeEntryKind.FILE,
+                0o600,
+                OLD_DIGEST,
+            ),
+        ),
+    )
+
+
+def absent_transaction_fixture(
+    *absent_homes: FleetHomeRecoveryAbsentHomeV2,
+) -> FleetHomeRecoveryTransactionV2:
+    return make_fleet_home_recovery_transaction_v2(
+        nonce=NONCE,
+        pool_parent_before=stat_fixture(1, FleetHomeEntryKind.DIRECTORY),
+        current_snapshot=FleetHomeRecoverySnapshotIdentity(4, OLD_DIGEST),
+        planned_snapshot=FleetHomeRecoverySnapshotIdentity(5, NEW_DIGEST),
+        homes=(),
+        absent_homes=absent_homes or (absent_home_fixture(),),
+    )
+
+
+def filesystem_stat(current: os.stat_result) -> FleetHomeRecoveryStat:
+    return FleetHomeRecoveryStat(
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_uid,
+        current.st_gid,
+        current.st_nlink,
+        current.st_size,
+        current.st_mtime_ns,
+    )
+
+
+def absent_population_fixture() -> tuple[FleetHomeRecoveryPopulationV2, ...]:
+    common = b"common-policy\n"
+    profile = b"worker-profile\n"
+    marker = b'{"schema_version":2}\n'
+    return (
+        FleetHomeRecoveryPopulationV2(
+            "a1",
+            (
+                FleetHomeRecoveryPopulationEntryV2("common.md", common),
+                FleetHomeRecoveryPopulationEntryV2("profiles", None),
+                FleetHomeRecoveryPopulationEntryV2("profiles/worker.md", profile),
+                FleetHomeRecoveryPopulationEntryV2(
+                    ".fleet-home-marker-v2.json", marker
+                ),
+            ),
+        ),
+    )
+
+
+def filesystem_absent_transaction(pool_fd: int) -> FleetHomeRecoveryTransactionV2:
+    population = absent_population_fixture()[0]
+    entries = (
+        FleetHomeRecoveryEntryV2(
+            "common.md",
+            None,
+            None,
+            FleetHomeEntryKind.FILE,
+            0o600,
+            hashlib.sha256(population.entries[0].content).hexdigest(),
+        ),
+        FleetHomeRecoveryEntryV2(
+            "profiles",
+            None,
+            None,
+            FleetHomeEntryKind.DIRECTORY,
+            0o700,
+            None,
+        ),
+        FleetHomeRecoveryEntryV2(
+            "profiles/worker.md",
+            None,
+            None,
+            FleetHomeEntryKind.FILE,
+            0o600,
+            hashlib.sha256(population.entries[2].content).hexdigest(),
+        ),
+        FleetHomeRecoveryEntryV2(
+            ".fleet-home-marker-v2.json",
+            None,
+            None,
+            FleetHomeEntryKind.FILE,
+            0o600,
+            hashlib.sha256(population.entries[3].content).hexdigest(),
+        ),
+    )
+    return make_fleet_home_recovery_transaction_v2(
+        nonce=NONCE,
+        pool_parent_before=filesystem_stat(os.fstat(pool_fd)),
+        current_snapshot=FleetHomeRecoverySnapshotIdentity(4, OLD_DIGEST),
+        planned_snapshot=FleetHomeRecoverySnapshotIdentity(5, NEW_DIGEST),
+        homes=(),
+        absent_homes=(
+            FleetHomeRecoveryAbsentHomeV2(
+                0,
+                "a1",
+                "a1",
+                ABSENT_STAGING_NAME,
+                ".fleet-home-marker-v2.json",
+                entries,
+            ),
+        ),
+    )
+
+
+def absent_staged_observation(
+    transaction: FleetHomeRecoveryTransactionV2,
+    *,
+    populated: int = 0,
+    published: int = 0,
+) -> FleetHomeRecoveryTransactionObservationV2:
+    absent_homes = []
+    for home_index, home in enumerate(transaction.absent_homes):
+        staging = object_fixture(
+            200 + home_index,
+            FleetHomeEntryKind.DIRECTORY,
+            size=96,
+            mtime_ns=20 + populated,
+        )
+        entries = tuple(
+            FleetHomeRecoveryAbsentEntryObservationV2(
+                entry.name,
+                (
+                    replacement_fixture(home_index, entry_index, entry)
+                    if entry_index < populated
+                    else None
+                ),
+            )
+            for entry_index, entry in enumerate(home.entries)
+        )
+        is_published = home_index < published
+        absent_homes.append(
+            FleetHomeRecoveryAbsentHomeObservationV2(
+                home.membership_index,
+                home.member_id,
+                staging if is_published else None,
+                None if is_published else staging,
+                (),
+                entries,
+            )
+        )
+    return FleetHomeRecoveryTransactionObservationV2(
+        replace(transaction.pool_parent_before, size=96, mtime_ns=20 + published),
+        (),
+        tuple(absent_homes),
+    )
+
+
+def test_absent_home_basis_roundtrips_strictly_with_exact_initial_absence() -> None:
+    transaction = absent_transaction_fixture()
+    assert transaction.phase is FleetHomeRecoveryPhase.ABSENT_CREATE_PENDING
+    assert transaction.absent_homes[0].staging_name == ABSENT_STAGING_NAME
+    assert transaction.records[0].observation.absent_homes == (
+        FleetHomeRecoveryAbsentHomeObservationV2(
+            membership_index=0,
+            member_id="a1",
+            final_identity=None,
+            staging_identity=None,
+            unexpected_entries=(),
+            entries=(
+                FleetHomeRecoveryAbsentEntryObservationV2("common.md", None),
+                FleetHomeRecoveryAbsentEntryObservationV2("profiles", None),
+                FleetHomeRecoveryAbsentEntryObservationV2("profiles/worker.md", None),
+                FleetHomeRecoveryAbsentEntryObservationV2(
+                    ".fleet-home-marker-v2.json", None
+                ),
+            ),
+        ),
+    )
+
+    encoded = encode_fleet_home_recovery_transaction_v2(transaction)
+    assert decode_fleet_home_recovery_transaction_v2(encoded) == transaction
+    document = json.loads(encoded)
+    assert document["basis"]["absent_homes"][0].get("marker_path") == (
+        ".fleet-home-marker-v2.json"
+    )
+    assert set(document["basis"]) == {
+        "pool_parent_before",
+        "current_snapshot",
+        "planned_snapshot",
+        "homes",
+        "absent_homes",
+    }
+
+    for mutation in ("missing", "unknown"):
+        malformed = json.loads(encoded)
+        if mutation == "missing":
+            del malformed["basis"]["absent_homes"]
+        else:
+            malformed["basis"]["absent_homes"][0]["unknown"] = True
+        with pytest.raises(FleetHomeRecoveryValidationError):
+            decode_fleet_home_recovery_transaction_v2(
+                json.dumps(
+                    malformed,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            )
+
+
+def test_mixed_existing_and_absent_homes_are_strictly_rejected() -> None:
+    absent = replace(
+        absent_home_fixture(),
+        membership_index=2,
+        member_id="c1",
+        final_name="c1",
+        staging_name=f".fleet-home-staging-v2-{NONCE}-0002",
+    )
+    with pytest.raises(FleetHomeRecoveryValidationError):
+        make_fleet_home_recovery_transaction_v2(
+            nonce=NONCE,
+            pool_parent_before=stat_fixture(1, FleetHomeEntryKind.DIRECTORY),
+            current_snapshot=FleetHomeRecoverySnapshotIdentity(4, OLD_DIGEST),
+            planned_snapshot=FleetHomeRecoverySnapshotIdentity(5, NEW_DIGEST),
+            homes=homes_fixture(),
+            absent_homes=(absent,),
+        )
+
+
+@pytest.mark.parametrize(
+    ("marker_path", "marker_mode"),
+    (("common.md", 0o600), (".fleet-home-marker-v2.json", 0o700)),
+)
+def test_absent_home_marker_must_be_exactly_last_private_file(
+    marker_path: str,
+    marker_mode: int,
+) -> None:
+    home = absent_home_fixture()
+    marker = replace(home.entries[-1], replacement_mode=marker_mode)
+    with pytest.raises(FleetHomeRecoveryValidationError):
+        absent_transaction_fixture(
+            replace(
+                home,
+                marker_path=marker_path,
+                entries=(*home.entries[:-1], marker),
+            )
+        )
+
+
+def test_absent_home_planner_requires_persisted_pending_phases_and_blocks_drift() -> (
+    None
+):
+    transaction = absent_transaction_fixture()
+    before = transaction.records[-1].observation
+    assert plan_fleet_home_recovery_v2(
+        transaction,
+        before,
+        authoritative_readable=None,
+        authoritative_snapshot=None,
+        explicit_conflict=False,
+    ) == (FleetHomeRecoveryAction.CREATE_STAGING, transaction)
+
+    created = absent_staged_observation(transaction)
+    action, blocked = plan_fleet_home_recovery_v2(
+        transaction,
+        created,
+        authoritative_readable=None,
+        authoritative_snapshot=None,
+        explicit_conflict=False,
+    )
+    assert action is FleetHomeRecoveryAction.BLOCK
+    assert blocked.phase is FleetHomeRecoveryPhase.BLOCKED
+
+    pinned = advance_fleet_home_recovery_v2(
+        transaction,
+        FleetHomeRecoveryPhase.ABSENT_PIN_PENDING,
+        created,
+    )
+    assert plan_fleet_home_recovery_v2(
+        pinned,
+        created,
+        authoritative_readable=None,
+        authoritative_snapshot=None,
+        explicit_conflict=False,
+    ) == (FleetHomeRecoveryAction.PIN_STAGING, pinned)
+
+    populate = advance_fleet_home_recovery_v2(
+        pinned,
+        FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+        created,
+    )
+    assert plan_fleet_home_recovery_v2(
+        populate,
+        created,
+        authoritative_readable=None,
+        authoritative_snapshot=None,
+        explicit_conflict=False,
+    ) == (FleetHomeRecoveryAction.POPULATE_STAGING, populate)
+
+    populated = absent_staged_observation(
+        transaction, populated=len(transaction.absent_homes[0].entries)
+    )
+    action, publish = plan_fleet_home_recovery_v2(
+        populate,
+        populated,
+        authoritative_readable=None,
+        authoritative_snapshot=None,
+        explicit_conflict=False,
+    )
+    assert action is FleetHomeRecoveryAction.PERSIST
+    assert publish.phase is FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING
+    assert plan_fleet_home_recovery_v2(
+        publish,
+        populated,
+        authoritative_readable=None,
+        authoritative_snapshot=None,
+        explicit_conflict=False,
+    ) == (FleetHomeRecoveryAction.PUBLISH_HOME, publish)
+
+    published_observation = absent_staged_observation(
+        transaction,
+        populated=len(transaction.absent_homes[0].entries),
+        published=1,
+    )
+    action, published = plan_fleet_home_recovery_v2(
+        publish,
+        published_observation,
+        authoritative_readable=None,
+        authoritative_snapshot=None,
+        explicit_conflict=False,
+    )
+    assert action is FleetHomeRecoveryAction.PERSIST
+    assert published.phase is FleetHomeRecoveryPhase.ABSENT_PUBLISHED
+
+    action, cas = plan_fleet_home_recovery_v2(
+        published,
+        published_observation,
+        authoritative_readable=None,
+        authoritative_snapshot=None,
+        explicit_conflict=False,
+    )
+    assert action is FleetHomeRecoveryAction.PERSIST
+    assert cas.phase is FleetHomeRecoveryPhase.CAS_PENDING
+
+
+def test_absent_home_apply_requires_durable_intent_then_publishes_exact_tree(
+    tmp_path: Path,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        transaction = filesystem_absent_transaction(pool_fd)
+        population = absent_population_fixture()
+        with pytest.raises(FleetHomeRecoveryValidationError):
+            apply_fleet_home_recovery_absent_v2(
+                recovery_fd, pool_fd, transaction, population
+            )
+        assert list(pool.iterdir()) == []
+
+        expected_phases = (
+            FleetHomeRecoveryPhase.ABSENT_PIN_PENDING,
+            FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+            FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+            FleetHomeRecoveryPhase.ABSENT_PUBLISHED,
+            FleetHomeRecoveryPhase.CAS_PENDING,
+        )
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+        for expected in expected_phases:
+            transaction = apply_fleet_home_recovery_absent_v2(
+                recovery_fd,
+                pool_fd,
+                transaction,
+                population,
+            )
+            assert transaction.phase is expected
+            persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+
+        home = pool / "a1"
+        assert not (pool / ABSENT_STAGING_NAME).exists()
+        assert (home / "common.md").read_bytes() == b"common-policy\n"
+        assert (home / "profiles" / "worker.md").read_bytes() == b"worker-profile\n"
+        assert stat.S_IMODE(home.stat().st_mode) == 0o700
+        assert stat.S_IMODE((home / "common.md").stat().st_mode) == 0o600
+        assert sorted(
+            path.relative_to(home).as_posix() for path in home.rglob("*")
+        ) == [
+            ".fleet-home-marker-v2.json",
+            "common.md",
+            "profiles",
+            "profiles/worker.md",
+        ]
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
+
+
+def test_absent_home_unknown_prepin_or_final_object_is_preserved_and_blocked(
+    tmp_path: Path,
+) -> None:
+    for foreign_name in (ABSENT_STAGING_NAME, "a1"):
+        case = tmp_path / foreign_name.replace("/", "_")
+        recovery = case / "recovery"
+        pool = case / "pool"
+        recovery.mkdir(parents=True, mode=0o700)
+        pool.mkdir(mode=0o700)
+        foreign = pool / foreign_name
+        foreign.mkdir(mode=0o700)
+        payload = foreign / "foreign"
+        payload.write_bytes(b"keep")
+        recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+        pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            transaction = filesystem_absent_transaction(pool_fd)
+            persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+            blocked = apply_fleet_home_recovery_absent_v2(
+                recovery_fd,
+                pool_fd,
+                transaction,
+                absent_population_fixture(),
+            )
+            assert blocked.phase is FleetHomeRecoveryPhase.BLOCKED
+            assert payload.read_bytes() == b"keep"
+        finally:
+            os.close(pool_fd)
+            os.close(recovery_fd)
+
+
+def advance_absent_filesystem(
+    recovery_fd: int,
+    pool_fd: int,
+    transaction: FleetHomeRecoveryTransactionV2,
+    target: FleetHomeRecoveryPhase,
+    population: tuple[FleetHomeRecoveryPopulationV2, ...],
+) -> FleetHomeRecoveryTransactionV2:
+    while transaction.phase is not target:
+        transaction = apply_fleet_home_recovery_absent_v2(
+            recovery_fd, pool_fd, transaction, population
+        )
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+    return transaction
+
+
+def classify_absent_authoritative_result(
+    recovery_fd: int,
+    pool_fd: int,
+    transaction: FleetHomeRecoveryTransactionV2,
+    population: tuple[FleetHomeRecoveryPopulationV2, ...],
+    *,
+    readable: bool,
+    snapshot: FleetHomeRecoverySnapshotIdentity | None,
+) -> FleetHomeRecoveryTransactionV2:
+    action, observed = plan_fleet_home_recovery_v2(
+        transaction,
+        transaction.records[-1].observation,
+        authoritative_readable=readable,
+        authoritative_snapshot=snapshot,
+        explicit_conflict=True,
+    )
+    assert action is FleetHomeRecoveryAction.PERSIST
+    persist_fleet_home_recovery_transaction_v2(recovery_fd, observed)
+    classified = apply_fleet_home_recovery_absent_v2(
+        recovery_fd, pool_fd, observed, population
+    )
+    persist_fleet_home_recovery_transaction_v2(recovery_fd, classified)
+    return classified
+
+
+@pytest.mark.parametrize(
+    ("authoritative", "readable", "decision", "terminal"),
+    (
+        (
+            "new",
+            True,
+            FleetHomeRecoveryPhase.COMMIT_PENDING,
+            FleetHomeRecoveryPhase.COMMITTED,
+        ),
+        (
+            "old",
+            True,
+            FleetHomeRecoveryPhase.ROLLBACK_PENDING,
+            FleetHomeRecoveryPhase.ROLLED_BACK,
+        ),
+        ("third", True, FleetHomeRecoveryPhase.BLOCKED, FleetHomeRecoveryPhase.BLOCKED),
+        (
+            "unreadable",
+            False,
+            FleetHomeRecoveryPhase.BLOCKED,
+            FleetHomeRecoveryPhase.BLOCKED,
+        ),
+    ),
+)
+def test_absent_home_authoritative_result_commits_rolls_back_or_blocks(
+    tmp_path: Path,
+    authoritative: str,
+    readable: bool,
+    decision: FleetHomeRecoveryPhase,
+    terminal: FleetHomeRecoveryPhase,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    population = absent_population_fixture()
+    try:
+        transaction = filesystem_absent_transaction(pool_fd)
+        pool_before = transaction.pool_parent_before
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+        transaction = advance_absent_filesystem(
+            recovery_fd,
+            pool_fd,
+            transaction,
+            FleetHomeRecoveryPhase.CAS_PENDING,
+            population,
+        )
+        final = pool / "a1"
+        final_before = final.stat()
+        snapshot = {
+            "new": transaction.planned_snapshot,
+            "old": transaction.current_snapshot,
+            "third": FleetHomeRecoverySnapshotIdentity(9, OTHER_DIGEST),
+            "unreadable": None,
+        }[authoritative]
+        transaction = classify_absent_authoritative_result(
+            recovery_fd,
+            pool_fd,
+            transaction,
+            population,
+            readable=readable,
+            snapshot=snapshot,
+        )
+        assert transaction.phase is decision
+
+        if decision is not FleetHomeRecoveryPhase.BLOCKED:
+            transaction = apply_fleet_home_recovery_absent_v2(
+                recovery_fd, pool_fd, transaction, population
+            )
+        assert transaction.phase is terminal
+        assert not (pool / ABSENT_STAGING_NAME).exists()
+        if terminal is FleetHomeRecoveryPhase.COMMITTED:
+            assert final.stat().st_ino == final_before.st_ino
+            assert (final / ".fleet-home-marker-v2.json").read_bytes() == (
+                b'{"schema_version":2}\n'
+            )
+            pool_after = filesystem_stat(os.fstat(pool_fd))
+            assert pool_after.mtime_ns == pool_before.mtime_ns
+        elif terminal is FleetHomeRecoveryPhase.ROLLED_BACK:
+            assert not final.exists()
+            assert filesystem_stat(os.fstat(pool_fd)) == pool_before
+        else:
+            assert final.stat().st_ino == final_before.st_ino
+            assert (final / "common.md").read_bytes() == b"common-policy\n"
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
+
+
+def test_absent_home_rollback_never_removes_drifted_bound_final(
+    tmp_path: Path,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    population = absent_population_fixture()
+    try:
+        transaction = filesystem_absent_transaction(pool_fd)
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+        transaction = advance_absent_filesystem(
+            recovery_fd,
+            pool_fd,
+            transaction,
+            FleetHomeRecoveryPhase.CAS_PENDING,
+            population,
+        )
+        transaction = classify_absent_authoritative_result(
+            recovery_fd,
+            pool_fd,
+            transaction,
+            population,
+            readable=True,
+            snapshot=transaction.current_snapshot,
+        )
+        final = pool / "a1"
+        foreign = final / "foreign"
+        foreign.write_bytes(b"keep")
+
+        blocked = apply_fleet_home_recovery_absent_v2(
+            recovery_fd, pool_fd, transaction, population
+        )
+        assert blocked.phase is FleetHomeRecoveryPhase.BLOCKED
+        assert foreign.read_bytes() == b"keep"
+        assert final.is_dir()
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
+
+
+@pytest.mark.parametrize(
+    ("start_phase", "selected_faultpoint", "expected_phase", "unknown_staging"),
+    (
+        (
+            FleetHomeRecoveryPhase.ABSENT_CREATE_PENDING,
+            "before_absent_staging_create",
+            FleetHomeRecoveryPhase.ABSENT_PIN_PENDING,
+            False,
+        ),
+        (
+            FleetHomeRecoveryPhase.ABSENT_CREATE_PENDING,
+            "after_absent_staging_create",
+            FleetHomeRecoveryPhase.BLOCKED,
+            True,
+        ),
+        (
+            FleetHomeRecoveryPhase.ABSENT_CREATE_PENDING,
+            "after_absent_staging_pin",
+            FleetHomeRecoveryPhase.BLOCKED,
+            True,
+        ),
+        (
+            FleetHomeRecoveryPhase.ABSENT_PIN_PENDING,
+            "before_absent_staging_pin",
+            FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+            False,
+        ),
+        (
+            FleetHomeRecoveryPhase.ABSENT_PIN_PENDING,
+            "after_absent_staging_pin",
+            FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+            False,
+        ),
+        (
+            FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+            "before_absent_population_entry",
+            FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+            False,
+        ),
+        (
+            FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+            "after_absent_population_entry",
+            FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+            False,
+        ),
+        (
+            FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+            "before_absent_home_publish",
+            FleetHomeRecoveryPhase.ABSENT_PUBLISHED,
+            False,
+        ),
+        (
+            FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+            "after_absent_home_publish",
+            FleetHomeRecoveryPhase.ABSENT_PUBLISHED,
+            False,
+        ),
+    ),
+)
+def test_absent_home_faultpoints_restart_or_preserve_unknown_prepin_orphan(
+    tmp_path: Path,
+    start_phase: FleetHomeRecoveryPhase,
+    selected_faultpoint: str,
+    expected_phase: FleetHomeRecoveryPhase,
+    unknown_staging: bool,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        population = absent_population_fixture()
+        transaction = filesystem_absent_transaction(pool_fd)
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+        transaction = advance_absent_filesystem(
+            recovery_fd, pool_fd, transaction, start_phase, population
+        )
+
+        def fail(marker: str) -> None:
+            if marker == selected_faultpoint:
+                raise RuntimeError(marker)
+
+        with pytest.raises(RuntimeError, match=selected_faultpoint):
+            apply_fleet_home_recovery_absent_v2(
+                recovery_fd,
+                pool_fd,
+                transaction,
+                population,
+                faultpoint=fail,
+            )
+        assert (
+            load_fleet_home_recovery_transaction_v2(recovery_fd, NONCE) == transaction
+        )
+
+        restarted = apply_fleet_home_recovery_absent_v2(
+            recovery_fd, pool_fd, transaction, population
+        )
+        if restarted.phase is start_phase and restarted != transaction:
+            persist_fleet_home_recovery_transaction_v2(recovery_fd, restarted)
+            restarted = apply_fleet_home_recovery_absent_v2(
+                recovery_fd, pool_fd, restarted, population
+            )
+        assert restarted.phase is expected_phase
+        if unknown_staging:
+            assert (pool / ABSENT_STAGING_NAME).is_dir()
+            assert not (pool / "a1").exists()
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
+
+
+@pytest.mark.parametrize(
+    ("selected_faultpoint", "marker_exists"),
+    (("before_absent_marker", False), ("after_absent_marker", True)),
+)
+def test_absent_home_marker_is_last_with_persistent_before_after_faultpoints(
+    tmp_path: Path,
+    selected_faultpoint: str,
+    marker_exists: bool,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    population = absent_population_fixture()
+    try:
+        transaction = filesystem_absent_transaction(pool_fd)
+        home = transaction.absent_homes[0]
+        assert home.marker_path == home.entries[-1].name
+        assert home.entries[-1].replacement_mode == 0o600
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+        transaction = advance_absent_filesystem(
+            recovery_fd,
+            pool_fd,
+            transaction,
+            FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+            population,
+        )
+
+        def fail(marker: str) -> None:
+            if marker == selected_faultpoint:
+                raise RuntimeError(marker)
+
+        with pytest.raises(RuntimeError, match=selected_faultpoint):
+            apply_fleet_home_recovery_absent_v2(
+                recovery_fd,
+                pool_fd,
+                transaction,
+                population,
+                faultpoint=fail,
+            )
+        staging = pool / ABSENT_STAGING_NAME
+        marker = staging / home.marker_path
+        assert marker.exists() is marker_exists
+        assert all((staging / entry.name).exists() for entry in home.entries[:-1])
+        assert (
+            load_fleet_home_recovery_transaction_v2(recovery_fd, NONCE) == transaction
+        )
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
+
+
+def test_absent_home_population_revalidates_checkpoint_before_next_mutation(
+    tmp_path: Path,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    population = absent_population_fixture()
+    try:
+        transaction = filesystem_absent_transaction(pool_fd)
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+        transaction = advance_absent_filesystem(
+            recovery_fd,
+            pool_fd,
+            transaction,
+            FleetHomeRecoveryPhase.ABSENT_POPULATE_PENDING,
+            population,
+        )
+        staging = pool / ABSENT_STAGING_NAME
+        tampered = False
+
+        def tamper(marker: str) -> None:
+            nonlocal tampered
+            if marker != "after_absent_population_entry" or tampered:
+                return
+            tampered = True
+            common = staging / "common.md"
+            before = common.stat()
+            common.write_bytes(b"foreign-data!\n")
+            os.utime(common, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        with pytest.raises(FleetHomeRecoveryValidationError):
+            apply_fleet_home_recovery_absent_v2(
+                recovery_fd,
+                pool_fd,
+                transaction,
+                population,
+                faultpoint=tamper,
+            )
+        assert (staging / "common.md").read_bytes() == b"foreign-data!\n"
+        assert not (staging / "profiles").exists()
+        assert not (staging / ".fleet-home-marker-v2.json").exists()
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
+
+
+def test_absent_home_publish_rejects_hardlink_nlink_drift(
+    tmp_path: Path,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    population = absent_population_fixture()
+    try:
+        transaction = filesystem_absent_transaction(pool_fd)
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+        transaction = advance_absent_filesystem(
+            recovery_fd,
+            pool_fd,
+            transaction,
+            FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+            population,
+        )
+        staging = pool / ABSENT_STAGING_NAME
+        linked = pool / "foreign-link"
+        os.link(staging / "common.md", linked)
+
+        with pytest.raises(FleetHomeRecoveryValidationError):
+            apply_fleet_home_recovery_absent_v2(
+                recovery_fd, pool_fd, transaction, population
+            )
+        assert linked.read_bytes() == b"common-policy\n"
+        assert staging.is_dir()
+        assert not (pool / "a1").exists()
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
+
+
+@pytest.mark.parametrize(
+    "selected_faultpoint",
+    ("after_absent_staging_create", "after_absent_staging_pin"),
+)
+def test_absent_home_create_rejects_mkdir_to_open_and_after_open_path_swaps(
+    tmp_path: Path,
+    selected_faultpoint: str,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    original = pool / f"{ABSENT_STAGING_NAME}.original"
+    replacement = pool / ABSENT_STAGING_NAME
+    try:
+        transaction = filesystem_absent_transaction(pool_fd)
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+
+        def swap(marker: str) -> None:
+            if marker != selected_faultpoint:
+                return
+            replacement.rename(original)
+            replacement.mkdir(mode=0o700)
+
+        with pytest.raises(FleetHomeRecoveryValidationError):
+            apply_fleet_home_recovery_absent_v2(
+                recovery_fd,
+                pool_fd,
+                transaction,
+                absent_population_fixture(),
+                faultpoint=swap,
+            )
+        assert original.is_dir()
+        assert replacement.is_dir()
+        assert list(replacement.iterdir()) == []
+        assert (
+            load_fleet_home_recovery_transaction_v2(recovery_fd, NONCE) == transaction
+        )
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
+
+
+@pytest.mark.parametrize(
+    "selected_faultpoint",
+    ("before_absent_home_publish", "after_absent_home_publish"),
+)
+def test_absent_home_publish_keeps_staging_fd_pinned_across_path_swaps(
+    tmp_path: Path,
+    selected_faultpoint: str,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    population = absent_population_fixture()
+    try:
+        transaction = filesystem_absent_transaction(pool_fd)
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+        transaction = advance_absent_filesystem(
+            recovery_fd,
+            pool_fd,
+            transaction,
+            FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+            population,
+        )
+        staging = pool / ABSENT_STAGING_NAME
+        final = pool / "a1"
+        original = pool / "original"
+
+        def swap(marker: str) -> None:
+            if marker != selected_faultpoint:
+                return
+            current = staging if staging.exists() else final
+            current.rename(original)
+            replacement = staging if marker.startswith("before") else final
+            replacement.mkdir(mode=0o700)
+            (replacement / "foreign").write_bytes(b"keep")
+
+        with pytest.raises(FleetHomeRecoveryValidationError):
+            apply_fleet_home_recovery_absent_v2(
+                recovery_fd,
+                pool_fd,
+                transaction,
+                population,
+                faultpoint=swap,
+            )
+        assert original.is_dir()
+        foreign = staging if selected_faultpoint.startswith("before") else final
+        assert (foreign / "foreign").read_bytes() == b"keep"
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
+
+
+@pytest.mark.parametrize("drift_target", ("pool", "home", "nested", "file"))
+def test_absent_home_publish_requires_exact_full_stat_checkpoint(
+    tmp_path: Path,
+    drift_target: str,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    population = absent_population_fixture()
+    try:
+        transaction = filesystem_absent_transaction(pool_fd)
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+        transaction = advance_absent_filesystem(
+            recovery_fd,
+            pool_fd,
+            transaction,
+            FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+            population,
+        )
+        staging = pool / ABSENT_STAGING_NAME
+        target = {
+            "pool": pool,
+            "home": staging,
+            "nested": staging / "profiles",
+            "file": staging / "common.md",
+        }[drift_target]
+        before = target.stat()
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns + 1))
+
+        blocked = apply_fleet_home_recovery_absent_v2(
+            recovery_fd, pool_fd, transaction, population
+        )
+        assert blocked.phase is FleetHomeRecoveryPhase.BLOCKED
+        assert not (pool / "a1").exists()
+        assert staging.exists()
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
+
+
+def test_absent_home_publish_blocks_same_size_sha_tamper_and_staging_swap(
+    tmp_path: Path,
+) -> None:
+    for case_name in ("sha", "staging-swap"):
+        case = tmp_path / case_name
+        recovery = case / "recovery"
+        pool = case / "pool"
+        recovery.mkdir(parents=True, mode=0o700)
+        pool.mkdir(mode=0o700)
+        recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+        pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            population = absent_population_fixture()
+            transaction = filesystem_absent_transaction(pool_fd)
+            persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+            transaction = advance_absent_filesystem(
+                recovery_fd,
+                pool_fd,
+                transaction,
+                FleetHomeRecoveryPhase.ABSENT_PUBLISH_PENDING,
+                population,
+            )
+            staging = pool / ABSENT_STAGING_NAME
+            if case_name == "sha":
+                common = staging / "common.md"
+                before = common.stat()
+                common.write_bytes(b"foreign-data!\n")
+                os.utime(common, ns=(before.st_atime_ns, before.st_mtime_ns))
+            else:
+                original = pool / f"{ABSENT_STAGING_NAME}.original"
+                staging.rename(original)
+                staging.mkdir(mode=0o700)
+                (staging / "foreign").write_bytes(b"keep")
+
+            blocked = apply_fleet_home_recovery_absent_v2(
+                recovery_fd, pool_fd, transaction, population
+            )
+            assert blocked.phase is FleetHomeRecoveryPhase.BLOCKED
+            assert not (pool / "a1").exists()
+            if case_name == "sha":
+                assert (staging / "common.md").read_bytes() == b"foreign-data!\n"
+            else:
+                assert (staging / "foreign").read_bytes() == b"keep"
+                assert original.is_dir()
+        finally:
+            os.close(pool_fd)
+            os.close(recovery_fd)
+
+
+def test_absent_home_multi_home_publish_has_one_pool_and_exact_membership(
+    tmp_path: Path,
+) -> None:
+    recovery = tmp_path / "recovery"
+    pool = tmp_path / "pool"
+    recovery.mkdir(mode=0o700)
+    pool.mkdir(mode=0o700)
+    recovery_fd = os.open(recovery, os.O_RDONLY | os.O_DIRECTORY)
+    pool_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        first_population = absent_population_fixture()[0]
+        first = filesystem_absent_transaction(pool_fd).absent_homes[0]
+        second = replace(
+            first,
+            membership_index=1,
+            member_id="b1",
+            final_name="b1",
+            staging_name=f".fleet-home-staging-v2-{NONCE}-0001",
+        )
+        transaction = make_fleet_home_recovery_transaction_v2(
+            nonce=NONCE,
+            pool_parent_before=filesystem_stat(os.fstat(pool_fd)),
+            current_snapshot=FleetHomeRecoverySnapshotIdentity(4, OLD_DIGEST),
+            planned_snapshot=FleetHomeRecoverySnapshotIdentity(5, NEW_DIGEST),
+            homes=(),
+            absent_homes=(first, second),
+        )
+        population = (
+            first_population,
+            replace(first_population, member_id="b1"),
+        )
+        persist_fleet_home_recovery_transaction_v2(recovery_fd, transaction)
+        transaction = advance_absent_filesystem(
+            recovery_fd,
+            pool_fd,
+            transaction,
+            FleetHomeRecoveryPhase.ABSENT_PUBLISHED,
+            population,
+        )
+        assert (
+            transaction.records[-1].observation.pool_parent.dev
+            == os.fstat(pool_fd).st_dev
+        )
+        assert sorted(path.name for path in pool.iterdir()) == ["a1", "b1"]
+        assert all((pool / member / "common.md").is_file() for member in ("a1", "b1"))
+    finally:
+        os.close(pool_fd)
+        os.close(recovery_fd)
 
 
 def replacement_fixture(
@@ -1313,6 +2451,9 @@ def _b2a_ast_findings(path: Path, source_root: Path, source: str) -> list[str]:
     public_b2a = {
         "FleetHomeEntryKind",
         "FleetHomeRecoveryAction",
+        "FleetHomeRecoveryAbsentEntryObservationV2",
+        "FleetHomeRecoveryAbsentHomeObservationV2",
+        "FleetHomeRecoveryAbsentHomeV2",
         "FleetHomeRecoveryEntryObservationV2",
         "FleetHomeRecoveryEntryV2",
         "FleetHomeRecoveryHomeObservationV2",
@@ -1322,6 +2463,8 @@ def _b2a_ast_findings(path: Path, source_root: Path, source: str) -> list[str]:
         "FleetHomeRecoveryParentV2",
         "FleetHomeRecoveryPhase",
         "FleetHomeRecoveryPhaseRecordV2",
+        "FleetHomeRecoveryPopulationEntryV2",
+        "FleetHomeRecoveryPopulationV2",
         "FleetHomeRecoverySnapshotIdentity",
         "FleetHomeRecoveryStat",
         "FleetHomeRecoveryTransactionObservationV2",
@@ -1330,6 +2473,7 @@ def _b2a_ast_findings(path: Path, source_root: Path, source: str) -> list[str]:
         "FleetIdentityJournalPlan",
         "FleetIdentityJournalSlot",
         "advance_fleet_home_recovery_v2",
+        "apply_fleet_home_recovery_absent_v2",
         "decode_fleet_home_recovery_transaction_v2",
         "encode_fleet_home_recovery_transaction_v2",
         "load_fleet_home_recovery_transaction_v2",
