@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from codex_master.dynamic_teamlead import prepare_dynamic_teamlead
-from codex_master.dynamic_teamlead_coordinator import DynamicTeamleadCoordinatorRequest
+from codex_master.dynamic_teamlead_coordinator import (
+    DynamicTeamleadCoordinatorRequest,
+    _check_static_request,
+)
 from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     TrustedPrincipalGrantContext,
@@ -12,6 +15,7 @@ from codex_master.fleet_registry import FleetRuntimePrincipalV2, FleetSnapshotV2
 
 
 _INVALID_CONTEXT = "invalid_dynamic_teamlead_a3_runtime_context"
+_NONTRANSFERABLE_CONTEXT = "dynamic_teamlead_a3_runtime_context_nontransferable"
 
 
 class DynamicTeamleadA3RuntimeProviderError(ValueError):
@@ -27,6 +31,17 @@ class DynamicTeamleadA3RuntimeContext:
     context: TrustedPrincipalGrantContext
     request: DynamicTeamleadCoordinatorRequest
     release: BrokerReleaseSpec
+
+    def __copy__(self) -> DynamicTeamleadA3RuntimeContext:
+        raise DynamicTeamleadA3RuntimeProviderError(_NONTRANSFERABLE_CONTEXT)
+
+    def __deepcopy__(self, memo: object) -> DynamicTeamleadA3RuntimeContext:
+        del memo
+        raise DynamicTeamleadA3RuntimeProviderError(_NONTRANSFERABLE_CONTEXT)
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise DynamicTeamleadA3RuntimeProviderError(_NONTRANSFERABLE_CONTEXT)
 
 
 def validate_dynamic_teamlead_a3_runtime_context(
@@ -85,6 +100,7 @@ def validate_dynamic_teamlead_a3_runtime_context(
     ):
         raise DynamicTeamleadA3RuntimeProviderError(_INVALID_CONTEXT)
     try:
+        _check_static_request(request)
         plan = prepare_dynamic_teamlead(
             context.snapshot,
             context.selection,
