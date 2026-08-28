@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Copy an external Markdown-plan path and notify the user."""
+
+from __future__ import annotations
+
+import secrets
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+ANREDE = [
+    "Meisterin", "große Meisterin", "verehrte Meisterin", "liebe Meisterin",
+    "kluge Meisterin", "aufmerksame Meisterin", "geschätzte Meisterin",
+    "wachsame Meisterin", "weise Meisterin", "liebe Bienenmeisterin",
+]
+NOMEN = [
+    {"nom": "Das vollständige Dokument", "acc": "das vollständige Dokument", "dat": "dem vollständigen Dokument", "poss": "euer vollständiges Dokument"},
+    {"nom": "Der vollständige Markdownplan", "acc": "den vollständigen Markdownplan", "dat": "dem vollständigen Markdownplan", "poss": "euren vollständigen Markdownplan"},
+    {"nom": "Der fertige Arbeitsplan", "acc": "den fertigen Arbeitsplan", "dat": "dem fertigen Arbeitsplan", "poss": "euren fertigen Arbeitsplan"},
+    {"nom": "Die aktuelle Anleitung", "acc": "die aktuelle Anleitung", "dat": "der aktuellen Anleitung", "poss": "eure aktuelle Anleitung"},
+    {"nom": "Die fertige Datei", "acc": "die fertige Datei", "dat": "der fertigen Datei", "poss": "eure fertige Datei"},
+    {"nom": "Das vollständige Vault-Dokument", "acc": "das vollständige Vault-Dokument", "dat": "dem vollständigen Vault-Dokument", "poss": "euer vollständiges Vault-Dokument"},
+    {"nom": "Der absolute Dokumentpfad", "acc": "den absoluten Dokumentpfad", "dat": "dem absoluten Dokumentpfad", "poss": "euren absoluten Dokumentpfad"},
+    {"nom": "Die aktuelle Planreferenz", "acc": "die aktuelle Planreferenz", "dat": "der aktuellen Planreferenz", "poss": "eure aktuelle Planreferenz"},
+    {"nom": "Das fertige Schriftstück", "acc": "das fertige Schriftstück", "dat": "dem fertigen Schriftstück", "poss": "euer fertiges Schriftstück"},
+    {"nom": "Die passende Unterlage", "acc": "die passende Unterlage", "dat": "der passenden Unterlage", "poss": "eure passende Unterlage"},
+    {"nom": "Die aktuelle Notiz", "acc": "die aktuelle Notiz", "dat": "der aktuellen Notiz", "poss": "eure aktuelle Notiz"},
+    {"nom": "Die vollständige Planunterlage", "acc": "die vollständige Planunterlage", "dat": "der vollständigen Planunterlage", "poss": "eure vollständige Planunterlage"},
+    {"nom": "Der direkte Dokumentweg", "acc": "den direkten Dokumentweg", "dat": "dem direkten Dokumentweg", "poss": "euren direkten Dokumentweg"},
+    {"nom": "Die komplette Dateireferenz", "acc": "die komplette Dateireferenz", "dat": "der kompletten Dateireferenz", "poss": "eure komplette Dateireferenz"},
+]
+VERBEN = [
+    "liegt bereit", "ist vorbereitet", "wurde übergeben", "wartet auf euch",
+    "ist nun einfügbar", "wurde für euch hinterlegt", "kann jetzt geöffnet werden",
+    "ist erfolgreich abgelegt", "steht zur Verwendung bereit", "ist griffbereit",
+]
+AKTIONEN = [
+    "kopiert", "übertragen", "bereitgelegt", "hinterlegt", "in die Zwischenablage gelegt",
+    "für euch vorbereitet", "zur direkten Verwendung abgelegt", "sauber übergeben",
+]
+EINLEITUNGEN = [
+    "Hallo", "Eine kurze Nachricht", "Die Biene meldet",
+    "Kleine Übergabe", "Für euch", "Zur Information", "Soeben",
+    "Mit einer kurzen Meldung", "Aus dem Bienenstock", ]
+STATUS = [
+    "sofort nutzbar", "sicher erreichbar", "direkt einfügbar", "vollständig bereit",
+    "für euch vorbereitet", "ohne weitere Bearbeitung verwendbar",
+]
+ZWECKE = [
+    "für den nächsten Arbeitsschritt", "für die weitere Prüfung",
+    "für eure Dokumentation", "für die direkte Verwendung",
+    "für den nächsten Planabschnitt", "für eure Ablage",
+]
+ZEITPUNKTE = ["soeben", "gerade", "direkt danach", "in diesem Moment", "ohne Verzögerung"]
+UEBERGABEN = [
+    "ohne Zusatztext", "als reiner Pfad", "direkt aus der Zwischenablage",
+    "für ein beliebiges Programm", "ohne Markdown-Verpackung", "in einfügbarer Form",
+]
+ABSENDER = ["Der Bienenstock", "Masterjet", "Die Dokumentenbiene", "Die Hive-Verwaltung"]
+
+# Eigenständige Nachrichtengrundsätze. Jede Schablone wird zusätzlich mit
+# Anrede, Nominalformen, Verben, Aktionen und Einleitung vervielfacht.
+GRUNDSAETZE = [
+    "{einleitung}, {anrede}: {nom} {verb}.",
+    "{anrede}, {acc} wurde {aktion}.",
+    "{einleitung} für {anrede}: {nom} {verb}.",
+    "{einleitung}, {anrede}: {nom} {verb}.",
+    "{anrede}, ihr könnt {acc} jetzt verwenden; es wurde {aktion}.",
+    "{einleitung}: {nom} ist für euch bereit.",
+    "{anrede}: Der Pfad zu {dat} wurde {aktion}.",
+    "{einleitung}, {anrede}: {poss} ist griffbereit.",
+    "{anrede}, ich melde: {nom} {verb}.",
+    "{einleitung}: {nom} {verb}; der Pfad ist kopiert.",
+    "{anrede}, die Übergabe ist erfolgt: {nom} {verb}.",
+    "{einleitung}, {anrede}: Ihr könnt {acc} direkt einfügen.",
+    "{anrede}, für euch wurde {acc} {aktion}.",
+    "{einleitung}: Der Zugriff auf {acc} ist vorbereitet.",
+    "{anrede}, {nom} wartet auf eure nächste Verwendung.",
+    "{einleitung}, {anrede}: {poss} kann sofort geöffnet werden.",
+    "{anrede}, der Dokumentweg zu {dat} ist nun frei.",
+    "{einleitung}: {nom} wurde ohne Zusatztext übertragen.",
+    "{anrede}, ich habe {acc} für euch abgelegt.",
+    "{einleitung}, {anrede}: Der vollständige Pfad zu {dat} steht bereit.",
+    "{anrede}, {nom} ist für die weitere Arbeit vorbereitet.",
+    "{einleitung}: Ihr findet {acc} jetzt in der Zwischenablage.",
+    "{anrede}, die Biene übergibt {acc} zur direkten Nutzung.",
+    "{einleitung}, {anrede}: {poss} ist sauber hinterlegt.",
+    "{anrede}, die Dokumentreferenz zu {dat} wurde {aktion}.",
+    "{einleitung}: {nom} ist für euch zugänglich.",
+    "{anrede}, {acc} könnt ihr nun in ein Programm einfügen.",
+    "{einleitung}, {anrede}: Der externe Pfad zu {dat} wurde gesichert.",
+    "{anrede}, {nom} steht nach dieser Übergabe bereit.",
+    "{einleitung}: Ich habe {acc} für eure nächste Aktion vorbereitet.",
+    "{anrede}, über {dat} gelangt ihr direkt zum Dokument.",
+    "{einleitung}, {anrede}: {nom} ist vollständig übergeben.",
+    "{anrede}, der Pfad zu {dat} liegt nun in Reichweite.",
+    "{einleitung}: {poss} wurde für die direkte Verwendung vorbereitet.",
+    "{anrede}, {acc} findet ihr ohne Markdown-Zusatz in der Zwischenablage.",
+    "{einleitung}, {anrede}: Die Übergabe von {acc} ist abgeschlossen.",
+    "{anrede}, {nom} kann jetzt aus der Zwischenablage eingefügt werden.",
+    "{einleitung}: Der Weg zu {dat} ist für euch vorbereitet.",
+    "{anrede}, {poss} wartet bereits auf den nächsten Schritt.",
+    "{einleitung}, {anrede}: {acc} wurde für euch erreichbar gemacht.",
+    "{zeitpunkt}, {anrede}: {nom} ist {status}.",
+    "{absender} meldet, {anrede}: {acc} wurde {aktion}.",
+    "{anrede}, {nom} steht {zweck} bereit.",
+    "{einleitung}: Ihr könnt {acc} {zweck} verwenden.",
+    "{anrede}, {poss} ist {status} und wartet auf euch.",
+    "{zeitpunkt} wurde {acc} {uebergabe} übergeben, {anrede}.",
+    "{absender} hat {acc} {aktion}; {nom} ist damit {status}.",
+    "{anrede}, der Pfad zu {dat} ist {uebergabe} verfügbar.",
+    "{einleitung}, {anrede}: {acc} ist {zweck} vorbereitet.",
+    "{anrede}, {nom} wurde geprüft und ist {status}.",
+    "{zeitpunkt}, {absender}: {poss} ist {zweck} hinterlegt.",
+    "{anrede}, die Übergabe von {acc} erfolgte {uebergabe}.",
+    "{einleitung}: {nom} kann {zweck} direkt verwendet werden.",
+    "{absender} bestätigt, {anrede}: Der Weg zu {dat} ist frei.",
+    "{anrede}, {acc} wurde {aktion} und bleibt {zweck} verfügbar.",
+    "{zeitpunkt}: {poss} ist für euch {uebergabe} abgelegt, {anrede}.",
+    "{anrede}, {nom} ist nun {status}; ihr könnt fortfahren.",
+    "{einleitung}, {absender} meldet: {acc} ist {zweck} bereit.",
+    "{anrede}, die Dokumentübergabe wurde {zeitpunkt} für {acc} abgeschlossen.",
+    "{absender} übergibt {acc} an euch, {anrede}: Der nächste Schritt kann beginnen.",
+]
+
+
+def random_message() -> str:
+    """Create a genuinely random notification from bounded word lists."""
+    anrede = secrets.choice(ANREDE)
+    nomen = secrets.choice(NOMEN)
+    verb = secrets.choice(VERBEN)
+    aktion = secrets.choice(AKTIONEN)
+    status = secrets.choice(STATUS)
+    zweck = secrets.choice(ZWECKE)
+    zeitpunkt = secrets.choice(ZEITPUNKTE)
+    uebergabe = secrets.choice(UEBERGABEN)
+    absender = secrets.choice(ABSENDER)
+    template = secrets.choice(GRUNDSAETZE)
+    return template.format(
+        anrede=anrede,
+        nom=nomen["nom"],
+        acc=nomen["acc"],
+        dat=nomen["dat"],
+        poss=nomen["poss"],
+        verb=verb,
+        aktion=aktion,
+        einleitung=secrets.choice(EINLEITUNGEN),
+        status=status,
+        zweck=zweck,
+        zeitpunkt=zeitpunkt,
+        uebergabe=uebergabe,
+        absender=absender,
+    )
+
+
+def notify(message: str) -> None:
+    notify_send = shutil.which("notify-send")
+    if not notify_send:
+        return
+    try:
+        subprocess.run(
+            [notify_send, "--urgency=normal", "Masterjet: Dokumentübergabe", message],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def copy_clipboard(value: str) -> str | None:
+    candidates = [
+        (["wl-copy"], "wayland"),
+        (["xclip", "-selection", "clipboard"], "xclip"),
+        (["xsel", "--clipboard", "--input"], "xsel"),
+    ]
+    for command, name in candidates:
+        if not shutil.which(command[0]):
+            continue
+        try:
+            subprocess.run(
+                command,
+                input=value.encode("utf-8"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=True,
+            )
+            return name
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(f"Verwendung: {sys.argv[0]} /absoluter/pfad/plan.md", file=sys.stderr)
+        return 2
+    path = Path(sys.argv[1]).expanduser().resolve()
+    if path.suffix.lower() != ".md" or not path.is_file():
+        print("Es muss eine vorhandene Markdowndatei angegeben werden.", file=sys.stderr)
+        return 2
+    if not path.is_absolute():  # defensive; resolve() should already ensure this
+        print("Der Dokumentpfad muss absolut sein.", file=sys.stderr)
+        return 2
+    clipboard = copy_clipboard(str(path))
+    if clipboard is None:
+        notify("Keine Zwischenablage verfügbar; der Pfad wurde nicht als kopiert gemeldet.")
+        print("Keine unterstützte Zwischenablage gefunden (wl-copy, xclip, xsel).", file=sys.stderr)
+        return 1
+    message = random_message()
+    notify(message)
+    print(str(path))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
