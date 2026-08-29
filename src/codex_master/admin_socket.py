@@ -467,8 +467,10 @@ class AdminSocketServer:
             if not delegated:
                 try:
                     self._service.rollback_secret_upload(claim)
-                except BaseException:
-                    if isinstance(error, Exception):
+                except BaseException as cleanup_error:
+                    if isinstance(error, Exception) and not isinstance(
+                        cleanup_error, Exception
+                    ):
                         raise
             from .admin_service import AdminServiceError
 
@@ -1001,14 +1003,14 @@ def _receive_frame(connection: socket.socket) -> tuple[bytes, list[int]]:
         ):
             raise _SocketFailure("control.request_invalid")
         return bytes(payload[:-1]), received_fds
-    except _SocketFailure:
-        _close_fds(received_fds)
+    except _SocketFailure as error:
+        _close_fds_after_failure(received_fds, error)
         raise
-    except Exception:
-        _close_fds(received_fds)
+    except Exception as error:
+        _close_fds_after_failure(received_fds, error)
         raise _SocketFailure("control.request_invalid") from None
-    except BaseException:
-        _close_fds(received_fds)
+    except BaseException as error:
+        _close_fds_after_failure(received_fds, error)
         raise
 
 
@@ -1064,6 +1066,14 @@ def _close_fds(fds: list[int]) -> None:
         raise failure
 
 
+def _close_fds_after_failure(fds: list[int], primary: BaseException) -> None:
+    try:
+        _close_fds(fds)
+    except BaseException as cleanup_error:
+        if isinstance(primary, Exception) and not isinstance(cleanup_error, Exception):
+            raise
+
+
 def _cleanup_connection(connection: socket.socket, received_fds: list[int]) -> None:
     failure: BaseException | None = None
     try:
@@ -1092,12 +1102,14 @@ def _drain_input(connection: socket.socket) -> None:
             )
             _collect_fds(ancillary, discarded_fds)
             if not data:
-                return
+                break
             remaining -= len(data)
     except Exception:
         pass
-    finally:
-        _close_fds(discarded_fds)
+    except BaseException as error:
+        _close_fds_after_failure(discarded_fds, error)
+        raise
+    _close_fds(discarded_fds)
 
 
 def _validate_secret_fd(fd: int, peer: UnixPeerCredentials) -> os.stat_result:

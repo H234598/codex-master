@@ -1171,6 +1171,39 @@ def test_put_secret_preserves_primary_signal_over_rollback_signal(
         )
 
 
+def test_put_secret_normal_rollback_failure_stays_canonical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, owners = service_at()
+    who = principal("fleet.secrets.ingress", step_up=True)
+    claim = service.reserve_secret_upload(
+        who,
+        "ingress-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    monkeypatch.setattr(
+        owners.secret_ingress,
+        "put_secret",
+        lambda *_args, **_values: (_ for _ in ()).throw(RuntimeError("private-owner")),
+    )
+    monkeypatch.setattr(
+        owners.secret_ingress,
+        "rollback_upload",
+        lambda _claim: (_ for _ in ()).throw(ValueError("private-rollback")),
+    )
+
+    with pytest.raises(AdminServiceError, match="control.owner_unavailable") as caught:
+        service.put_secret(
+            who,
+            "ingress-one",
+            bytearray(b"private-marker"),
+            upload_claim=claim,
+        )
+
+    assert "private" not in repr(caught.value)
+
+
 def test_put_secret_without_owner_reservation_is_rejected_before_owner() -> None:
     service, owners = service_at()
 

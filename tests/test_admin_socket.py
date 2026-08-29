@@ -476,6 +476,47 @@ def test_receive_frame_closes_received_fds_without_normalizing_process_signals(
         os.close(write_fd)
 
 
+@pytest.mark.parametrize("target", ["receive", "drain"])
+def test_fd_cleanup_does_not_replace_primary_process_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    received_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    rights = array("i", [received_fd]).tobytes()
+    real_close = os.close
+
+    class _InterruptingSocket:
+        calls = 0
+
+        def recvmsg(self, *_args: object) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
+            self.calls += 1
+            if self.calls == 1:
+                return b"x", [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)], 0, None
+            raise KeyboardInterrupt("primary")
+
+    def close_then_interrupt(fd: int) -> None:
+        real_close(fd)
+        if fd == received_fd:
+            raise SystemExit("cleanup")
+
+    monkeypatch.setattr(admin_socket.os, "close", close_then_interrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="primary"):
+            if target == "receive":
+                admin_socket._receive_frame(_InterruptingSocket())
+            else:
+                admin_socket._drain_input(_InterruptingSocket())
+        with pytest.raises(OSError):
+            os.fstat(received_fd)
+    finally:
+        monkeypatch.setattr(admin_socket.os, "close", real_close)
+        for fd in (received_fd, write_fd):
+            try:
+                real_close(fd)
+            except OSError:
+                pass
+
+
 @pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("seam", ["reserve", "read", "put", "rollback"])
 def test_secret_upload_rolls_back_without_normalizing_process_signals(

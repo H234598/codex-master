@@ -418,8 +418,10 @@ class MasterjetControlService:
             if result is None:
                 try:
                     ingress.rollback_upload(upload_claim)
-                except BaseException:
-                    if isinstance(error, Exception):
+                except BaseException as cleanup_error:
+                    if isinstance(error, Exception) and not isinstance(
+                        cleanup_error, Exception
+                    ):
                         raise
             if not isinstance(error, Exception):
                 raise
