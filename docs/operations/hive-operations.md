@@ -125,19 +125,36 @@ lease executor. Retry attempts receive distinct admission IDs; no MCP tool
 calls the bridge implicitly, and no provider operation exists unless the
 caller supplies the operation callback.
 
-## Obsidian annotation responses
+## Obsidian section and annotation responses
 
 ### Operator materialization
 
-When answering an Obsidian annotation, first find and read the matching
-Annotation Marker sidecar under
+Every direct answer to a document section must be bidirectionally linked, even
+without an Annotation Marker. The answer contains exactly one uniquely
+resolved Markdown link to the source section or its heading. The source
+section contains exactly one backlink to the concrete answer target and answer
+heading. For a section-only answer, an existing Annotation ID is an optional
+additional anchor, not a prerequisite. A direct annotation answer still
+requires the Annotation ID.
+
+Before mutating a section answer, uniquely resolve the source document, source
+section, source heading, source-link target, answer target, and answer heading.
+A missing, ambiguous, or contradictory resolution is fail-closed: write
+neither answer chapter nor backlink. Reuse a matching existing backlink and
+answer link. A conflicting existing backlink or answer link is a blocker;
+never write a second backlink or answer link. Resolve and compare these values
+again before every retry.
+
+When directly answering an Obsidian annotation, first find and read the
+matching Annotation Marker sidecar under
 `.obsidian/plugins/annotation-marker/annotations/`. Its `color1`–`color6`
 suffix is authoritative; evaluate `data-annotation-note` and use
 `data-annotation-id` to distinguish markers. Retain marker data and notes. If
 the matching sidecar is absent, do not change the Obsidian source.
 
-Append each answer, explanation, ADR, or question as its own chapter at the
-end of the document. The answer heading must use exactly this Markdown form:
+For a direct annotation, append each answer, explanation, ADR, or question as
+its own chapter at the end of the document. The answer heading must use
+exactly this Markdown form:
 
 ```text
 ## <exakte Annotation-Überschrift ohne finale ID> — [<Annotation-ID>](<eindeutiger Link auf referenzierten Annotationsabschnitt oder dessen Überschrift>)

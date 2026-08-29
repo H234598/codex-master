@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":3,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":4,"schema_version":1} -->\n'
 )
 
 
@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 3
+    assert contract.generation == 4
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -217,6 +217,72 @@ def test_common_policy_fails_closed_on_unresolved_or_conflicting_annotation_data
         "passender vorhandener Rückverweis wird wiederverwendet",
         "nichtpassender vorhandener Rückverweis ist ein Blocker",
         "nie eine zweite Zeile",
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy
+
+
+def test_common_policy_links_section_answers_without_requiring_annotation_id() -> None:
+    policy_api = load_policy_api()
+    policy = " ".join(
+        policy_api.load_common_policy().common_bytes.decode("utf-8").split()
+    )
+
+    required_meanings = [
+        (
+            "Jede direkte Antwort auf einen Dokumentabschnitt ist auch ohne "
+            "Annotation Marker bidirektional zu verlinken"
+        ),
+        (
+            "Die Antwort enthält genau einen eindeutig aufgelösten Markdown-Link "
+            "auf den Quellabschnitt oder seine Überschrift"
+        ),
+        (
+            "Der Quellabschnitt enthält genau einen Rückverweis auf das konkrete "
+            "Antwortziel und die konkrete Antwortüberschrift"
+        ),
+        (
+            "Eine vorhandene Annotation-ID ist bei einer reinen "
+            "Abschnittsantwort ein optionaler zusätzlicher Anker"
+        ),
+        "sie ist dafür nicht erforderlich",
+        (
+            "Bei einer direkten Antwort auf eine Annotation bleibt die "
+            "Annotation-ID dagegen erforderlich"
+        ),
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy
+
+
+def test_common_policy_fails_closed_and_reuses_links_for_section_answers() -> None:
+    policy_api = load_policy_api()
+    policy = " ".join(
+        policy_api.load_common_policy().common_bytes.decode("utf-8").split()
+    )
+
+    required_meanings = [
+        "Vor jeder Dokumentmutation einer Abschnittsantwort",
+        "Quelldokument",
+        "Quellabschnitt",
+        "Quellüberschrift",
+        "Source-Link-Ziel",
+        "Antwortziel",
+        "Antwortüberschrift",
+        "fehlende, mehrdeutige oder widersprüchliche Auflösung",
+        "fail-closed",
+        "weder Antwortkapitel noch Rückverweis",
+        (
+            "Passender vorhandener Rückverweis und passender vorhandener "
+            "Antwortlink werden wiederverwendet"
+        ),
+        (
+            "Ein konfliktierender vorhandener Rückverweis oder Antwortlink ist "
+            "ein Blocker"
+        ),
+        "nie einen zweiten Rückverweis oder Antwortlink schreiben",
     ]
 
     for meaning in required_meanings:

@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":3,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":4,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -58,7 +58,28 @@ Fehler gemeldet werden; der Pfad darf nicht stillschweigend als erledigt
 gelten. Die Regel gilt für Vaults, `/Baupläne!` und alle anderen externen
 Dokumentpfade serverweit.
 
-## Bidirektionale Annotation-Antworten in Obsidian
+## Bidirektionale Abschnitts- und Annotation-Antworten in Obsidian
+
+Jede direkte Antwort auf einen Dokumentabschnitt ist auch ohne Annotation
+Marker bidirektional zu verlinken. Die Antwort enthält genau einen eindeutig
+aufgelösten Markdown-Link auf den Quellabschnitt oder seine Überschrift. Der
+Quellabschnitt enthält genau einen Rückverweis auf das konkrete Antwortziel
+und die konkrete Antwortüberschrift. Eine vorhandene Annotation-ID ist bei
+einer reinen Abschnittsantwort ein optionaler zusätzlicher Anker; sie ist
+dafür nicht erforderlich. Bei einer direkten Antwort auf eine Annotation
+bleibt die Annotation-ID dagegen erforderlich; zusätzlich gelten die
+nachfolgenden exakten Annotation-Regeln.
+
+Vor jeder Dokumentmutation einer Abschnittsantwort sind Quelldokument,
+Quellabschnitt, Quellüberschrift, Source-Link-Ziel, Antwortziel und
+Antwortüberschrift eindeutig aufzulösen. Jede Auflösung muss genau einen
+widerspruchsfreien Wert ergeben. Eine fehlende, mehrdeutige oder
+widersprüchliche Auflösung erzwingt fail-closed: Es wird weder Antwortkapitel
+noch Rückverweis geschrieben. Passender vorhandener Rückverweis und passender
+vorhandener Antwortlink werden wiederverwendet. Ein konfliktierender
+vorhandener Rückverweis oder Antwortlink ist ein Blocker; nie einen zweiten
+Rückverweis oder Antwortlink schreiben. Vor jedem Retry erneut auflösen und
+abgleichen.
 
 Eine beantwortete Annotation erhält ein eigenes Kapitel am Dokumentende. Die
 Antwortüberschrift muss exakt dieser Markdown-Form folgen:
@@ -89,9 +110,10 @@ Ein nichtpassender vorhandener Rückverweis ist ein Blocker,
 nie eine zweite Zeile. Vor jedem Retry sind Annotation, Quellziel, Antwortziel
 und Antwortüberschrift erneut gegen den vorhandenen Rückverweis zu prüfen.
 
-Vor jeder Änderung einer Obsidian-Quelldatei ist das passende Annotation
-Marker-Sidecar unter `.obsidian/plugins/annotation-marker/annotations/` zu
-finden und auszuwerten. Fehlt das passende Sidecar, wird die Quelldatei nicht
-geändert. Die Regeln für `color1` bis `color6`, `data-annotation-note` als
-User-Notiz und `data-annotation-id` als eindeutige Marker-ID bleiben bindend;
-Marker und ihre Notizen werden erhalten.
+Vor jeder Änderung einer Obsidian-Quelldatei als direkte Antwort auf eine
+Annotation ist das passende Annotation Marker-Sidecar unter
+`.obsidian/plugins/annotation-marker/annotations/` zu finden und auszuwerten.
+Fehlt für die direkt beantwortete Annotation das passende Sidecar, wird die
+Quelldatei nicht geändert. Die Regeln für `color1` bis `color6`,
+`data-annotation-note` als User-Notiz und `data-annotation-id` als eindeutige
+Marker-ID bleiben bindend; Marker und ihre Notizen werden erhalten.
