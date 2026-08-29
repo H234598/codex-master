@@ -41065,23 +41065,29 @@ def test_targetless_teamlead_agent_start_keeps_a1_b1_legacy_forbidden() -> None:
 
 
 def test_fleet_home_v2_cutover_adapter_owns_product_ports_and_operation_id() -> None:
-    from codex_master.fleet_home_v2_cutover import FleetHomeV2CutoverError
+    from codex_master.fleet_home_v2_cutover import (
+        FleetHomeV2CutoverError,
+        FleetHomeV2PlanHandle,
+    )
+
+    handle = object.__new__(FleetHomeV2PlanHandle)
 
     class ProductCore:
-        def plan(self, targets: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
-            return ("plan", targets)
+        def plan(self, targets: tuple[str, ...]) -> FleetHomeV2PlanHandle:
+            assert targets == ("g1",)
+            return handle
 
-        def apply(self, plan: object) -> tuple[str, object]:
-            return ("apply", plan)
+        def apply(self, plan_handle: object) -> tuple[str, object]:
+            return ("apply", plan_handle)
 
-        def verify(self, plan: object) -> tuple[str, object]:
-            return ("verify", plan)
+        def verify(self, plan_handle: object) -> tuple[str, object]:
+            return ("verify", plan_handle)
 
-        def recover(self, plan: object) -> tuple[str, object]:
-            return ("recover", plan)
+        def recover(self, plan_handle: object) -> tuple[str, object]:
+            return ("recover", plan_handle)
 
-        def rollback(self, plan: object) -> tuple[str, object]:
-            return ("rollback", plan)
+        def rollback(self, plan_handle: object) -> tuple[str, object]:
+            return ("rollback", plan_handle)
 
     core = ProductCore()
     with patch.object(server_module, "_fleet_home_v2_product_service", return_value=core):
@@ -41090,22 +41096,22 @@ def test_fleet_home_v2_cutover_adapter_owns_product_ports_and_operation_id() -> 
             target_ids=("g1",),
         )
 
-        assert plan == ("plan", ("g1",))
+        assert plan is handle
         for operation in ("apply", "verify", "recover", "rollback"):
             assert server_module.fleet_home_v2_cutover_operation(
                 operation=operation,
-                plan=plan,
+                plan_handle=plan,
             ) == (operation, plan)
 
     class SafetyFailure:
-        def apply(self, _plan: object) -> object:
+        def apply(self, _plan_handle: object) -> object:
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
 
     with patch.object(server_module, "_fleet_home_v2_product_service", return_value=SafetyFailure()):
         try:
             server_module.fleet_home_v2_cutover_operation(
                 operation="apply",
-                plan=plan,
+                plan_handle=plan,
             )
         except AgentError as exc:
             assert str(exc) == "fleet_home_v2_recovery_required"
@@ -41115,6 +41121,8 @@ def test_fleet_home_v2_cutover_adapter_owns_product_ports_and_operation_id() -> 
     signature = inspect.signature(server_module.fleet_home_v2_cutover_operation)
     assert "service" not in signature.parameters
     assert "operation_id" not in signature.parameters
+    assert "plan" not in signature.parameters
+    assert signature.parameters["plan_handle"].annotation == "FleetHomeV2PlanHandle | None"
 
 if __name__ == "__main__":
     unittest.main()

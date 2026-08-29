@@ -1,5 +1,6 @@
 import ast
 import hashlib
+import inspect
 import json
 import os
 import stat
@@ -17,6 +18,7 @@ from codex_master.fleet_home_v2_cutover import (
     FleetHomeV2EntropyPort,
     FleetHomeV2Inventory,
     FleetHomeV2Policy,
+    FleetHomeV2PlanHandle,
     FleetHomeV2QuiescencePort,
     FleetHomeV2SnapshotAuthorityPort,
     LocalFleetHomeV2Filesystem,
@@ -91,6 +93,45 @@ class PostMutationFailureFilesystem(LocalFleetHomeV2Filesystem):
 class NoExchangeFilesystem(LocalFleetHomeV2Filesystem):
     def exchange_at(self, parent_fd: int, source: str, target: str) -> None:
         raise FleetHomeV2CutoverError("fleet_home_v2_exchange_unavailable")
+
+
+class CountingQuiescencePort(FleetHomeV2QuiescencePort):
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.observed: list[object] = []
+
+    def observe(self, authority: FleetHomeV2Authority, home_identity: object):  # type: ignore[override]
+        self.observed.append(home_identity)
+        return super().observe(authority, home_identity)  # type: ignore[arg-type]
+
+
+class QuiescenceOrderFilesystem(LocalFleetHomeV2Filesystem):
+    def __init__(self, quiescence: CountingQuiescencePort) -> None:
+        self._quiescence = quiescence
+        self.before_stage: int | None = None
+        self.before_exchange: int | None = None
+
+    def mkdir_private_at(self, parent_fd: int, name: str, uid: int, gid: int) -> int:
+        self.before_stage = len(self._quiescence.observed)
+        return super().mkdir_private_at(parent_fd, name, uid, gid)
+
+    def exchange_at(self, parent_fd: int, source: str, target: str) -> None:
+        self.before_exchange = len(self._quiescence.observed)
+        super().exchange_at(parent_fd, source, target)
+
+
+class UnexpectedEmptyDirectoryFilesystem(LocalFleetHomeV2Filesystem):
+    def fsync_tree_at(self, directory_fd: int) -> None:
+        super().fsync_tree_at(directory_fd)
+        os.mkdir("unexpected", 0o700, dir_fd=directory_fd)
+
+
+class ForeignNestedDeviceFilesystem(LocalFleetHomeV2Filesystem):
+    def identity_at(self, parent_fd: int, name: str):  # type: ignore[override]
+        identity = super().identity_at(parent_fd, name)
+        if name == ".gemini" and stat.S_ISDIR(identity.mode):
+            return replace(identity, device=identity.device + 1)
+        return identity
 
 
 def _authority(parent: Path, agent_id: str) -> FleetHomeV2Authority:
@@ -178,10 +219,11 @@ def test_plan_internal_operation_id_g1_first_and_full_target_binding(tmp_path: P
     service, _port = _service((g1, h1))
 
     plan = service.plan(("h1", "g1"))
+    bound = service._resolve_handle(plan)
 
     assert len(plan.operation_id) == 48
-    assert [target.authority.agent_id for target in plan.targets] == ["g1", "h1"]
-    assert plan.targets[0].manifest_digest
+    assert [target.authority.agent_id for target in bound.targets] == ["g1", "h1"]
+    assert bound.targets[0].manifest_digest
 
 
 def test_apply_exchange_keeps_complete_bound_v1_backup_and_verify_requires_it(tmp_path: Path) -> None:
@@ -195,7 +237,7 @@ def test_apply_exchange_keeps_complete_bound_v1_backup_and_verify_requires_it(tm
     backup.rename(tmp_path / "removed-backup")
 
     assert service.recover(plan)[0].state == "recovery-required"
-    assert service.verify(plan)[0].state == "failed-terminal"
+    assert service.verify(plan)[0].state == "recovery-required"
 
 
 def test_rename_window_source_swap_never_completes_or_backs_up_foreign_home(tmp_path: Path) -> None:
@@ -227,22 +269,14 @@ def test_service_has_bound_ports_and_collision_resistant_internal_operation_ids(
         repeated.plan(("g1",))
 
 
-@pytest.mark.parametrize("forgery", ("reordered", "duplicate", "target-swap"))
-def test_apply_revalidates_directly_constructed_or_tampered_plan(
-    tmp_path: Path, forgery: str
-) -> None:
+def test_apply_rejects_caller_constructed_handle(tmp_path: Path) -> None:
     g1 = _authority(tmp_path, "g1")
     h1 = _authority(tmp_path, "h1")
     for authority in (g1, h1):
         _v1_home(authority)
     service, _port = _service((g1, h1))
     plan = service.plan(("g1", "h1"))
-    if forgery == "reordered":
-        forged = replace(plan, targets=tuple(reversed(plan.targets)))
-    elif forgery == "duplicate":
-        forged = replace(plan, targets=(plan.targets[0], plan.targets[0]))
-    else:
-        forged = replace(plan, targets=(replace(plan.targets[0], authority=h1), plan.targets[1]))
+    forged = FleetHomeV2PlanHandle(plan.operation_id)
 
     with pytest.raises(FleetHomeV2CutoverError, match="fleet_home_v2_plan_invalid"):
         service.apply(forged)
@@ -315,7 +349,6 @@ def test_journal_fsm_rejects_downgrade_replay_and_foreign_binding(tmp_path: Path
     journal = next(tmp_path.glob("*.journal.json"))
     document = json.loads(journal.read_text())
     document["history"] = []
-    document = service._append_journal_state(document, "planned")
     journal.write_text(json.dumps(document, sort_keys=True) + "\n")
 
     assert service.recover(plan)[0].state == "recovery-required"
@@ -394,3 +427,130 @@ def test_crash_recovery_table(tmp_path: Path, point: str, operation: str, expect
 
     recovery, _port = _service((authority,), entropy=FixedEntropy(99))
     assert recovery.recover(plan)[0].state == expected
+
+
+def test_red_public_operations_require_product_owned_opaque_handle(tmp_path: Path) -> None:
+    _authority_value, service, _port, plan = _single_plan(tmp_path)
+
+    assert not hasattr(plan, "targets")
+    for operation in (service.apply, service.verify, service.recover, service.rollback):
+        assert tuple(inspect.signature(operation).parameters) == ("handle",)
+
+
+def test_red_forged_already_current_cannot_bypass_missing_v1_backup(tmp_path: Path) -> None:
+    authority, service, _port, plan = _single_plan(tmp_path)
+    assert service.apply(plan)[0].state == "cutover-complete"
+    next(tmp_path.glob("*.backup")).rename(tmp_path / "removed-backup")
+    assert authority.home.exists()
+    forged = FleetHomeV2PlanHandle(plan.operation_id)
+
+    with pytest.raises((TypeError, FleetHomeV2CutoverError)):
+        service.apply(forged)
+
+
+def test_red_quiescence_precedes_staging_and_exchange_and_rollback_uses_active_v2(tmp_path: Path) -> None:
+    quiescence = CountingQuiescencePort()
+    filesystem = QuiescenceOrderFilesystem(quiescence)
+    authority, service, _port, plan = _single_plan(
+        tmp_path, filesystem=filesystem, quiescence=quiescence
+    )
+
+    assert service.apply(plan)[0].state == "cutover-complete"
+    assert (filesystem.before_stage, filesystem.before_exchange) == (1, 2)
+
+    active_v2 = LocalFleetHomeV2Filesystem.identity_from_stat(authority.home.lstat())
+    quiescence.observed.clear()
+    assert service.rollback(plan)[0].state == "rolled-back"
+    assert quiescence.observed == [active_v2]
+
+
+def test_red_recovery_requires_fresh_quiescence_for_active_v2(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, "g1")
+    _v1_home(authority)
+    crashing, _port = _service((authority,), filesystem=CrashFilesystem("after-exchange"))
+    plan = crashing.plan(("g1",))
+    with pytest.raises(Crash, match="after-exchange"):
+        crashing.apply(plan)
+
+    quiescence = CountingQuiescencePort(external_processes=1)
+    recovery, _port = _service(
+        (authority,),
+        quiescence=quiescence,
+    )
+    result = recovery.recover(plan)[0]
+    assert (result.state, result.code) == (
+        "recovery-required", "fleet_home_v2_recovery_required"
+    )
+    assert quiescence.observed == [
+        LocalFleetHomeV2Filesystem.identity_from_stat(authority.home.lstat())
+    ]
+
+
+@pytest.mark.parametrize("filesystem", (UnexpectedEmptyDirectoryFilesystem(), ForeignNestedDeviceFilesystem()))
+def test_red_stage_tree_rejects_unexpected_directory_or_nested_foreign_mount(
+    tmp_path: Path, filesystem: LocalFleetHomeV2Filesystem
+) -> None:
+    _authority_value, service, _port, plan = _single_plan(tmp_path, filesystem=filesystem)
+
+    result = service.apply(plan)[0]
+
+    assert result.state == "failed-terminal"
+    assert result.code in {
+        "fleet_home_v2_artifact_attestation_failed",
+        "fleet_home_v2_stage_invalid",
+    }
+
+
+def test_red_per_home_lock_blocks_second_operation_before_stage_or_journal(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, "g1")
+    _v1_home(authority)
+    first, _port = _service((authority,), filesystem=CrashFilesystem("after-stage-fsync"))
+    first_plan = first.plan(("g1",))
+    with pytest.raises(Crash, match="after-stage-fsync"):
+        first.apply(first_plan)
+
+    second, _port = _service((authority,))
+    second_plan = second.plan(("g1",))
+    result = second.apply(second_plan)[0]
+    assert (result.state, result.code) == (
+        "failed-terminal", "fleet_home_v2_operation_active"
+    )
+    assert len(list(tmp_path.glob("*.journal.json"))) == 1
+
+
+def test_red_journal_hash_chain_binds_v2_identity(tmp_path: Path) -> None:
+    _authority_value, service, _port, plan = _single_plan(tmp_path)
+    assert service.apply(plan)[0].state == "cutover-complete"
+    journal = next(tmp_path.glob("*.journal.json"))
+    document = json.loads(journal.read_text())
+    document["v2_identity"]["mtime_ns"] += 1
+    journal.write_text(json.dumps(document, sort_keys=True) + "\n")
+
+    result = service.recover(plan)[0]
+    assert (result.state, result.code) == (
+        "recovery-required", "fleet_home_v2_journal_invalid"
+    )
+
+
+def test_red_pre_active_recovery_releases_bound_stage_for_same_plan_retry(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, "g1")
+    _v1_home(authority)
+    crashing, _port = _service((authority,), filesystem=CrashFilesystem("after-stage-fsync"))
+    plan = crashing.plan(("g1",))
+    with pytest.raises(Crash, match="after-stage-fsync"):
+        crashing.apply(plan)
+
+    recovery, _port = _service((authority,))
+    assert recovery.recover(plan)[0].state == "failed-retryable"
+    assert recovery.apply(plan)[0].state == "cutover-complete"
+
+
+def test_red_verify_after_possible_exchange_has_recovery_required_precedence(tmp_path: Path) -> None:
+    _authority_value, service, _port, plan = _single_plan(tmp_path)
+    assert service.apply(plan)[0].state == "cutover-complete"
+    next(tmp_path.glob("*.backup")).rename(tmp_path / "removed-backup")
+
+    result = service.verify(plan)[0]
+    assert (result.state, result.code) == (
+        "recovery-required", "fleet_home_v2_recovery_required"
+    )
