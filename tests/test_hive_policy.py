@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":1,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":2,"schema_version":1} -->\n'
 )
 
 
@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 1
+    assert contract.generation == 2
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -149,3 +149,31 @@ def test_common_policy_contains_complete_no_transition_semantics() -> None:
 
     for meaning in required_meanings:
         assert meaning in policy
+
+
+def test_common_policy_contains_bidirectional_annotation_response_contract() -> None:
+    policy_api = load_policy_api()
+    raw_policy = policy_api.load_common_policy().common_bytes.decode("utf-8")
+    policy = " ".join(raw_policy.split())
+
+    required_meanings = [
+        "eigenes Kapitel am Dokumentende",
+        "exakte Annotation-Überschrift",
+        "Markdown-Selbstlink",
+        "sichtbare ID bleibt unverändert",
+        "genau eine idempotente",
+        "konkrete Biene",
+        "konkrete Antwortüberschrift",
+        "Retry",
+        "data-annotation-note",
+        "data-annotation-id",
+        "Antworten, Erklärungen, ADRs und Fragen",
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy
+    assert (
+        "Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: "
+        "[[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]"
+        in raw_policy
+    )

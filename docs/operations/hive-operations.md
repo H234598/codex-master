@@ -124,3 +124,45 @@ objects, builds the persistent SelectionService, and supplies the allowlisted
 lease executor. Retry attempts receive distinct admission IDs; no MCP tool
 calls the bridge implicitly, and no provider operation exists unless the
 caller supplies the operation callback.
+
+## Obsidian annotation responses
+
+### Operator materialization
+
+When answering an Obsidian annotation, first find and read the matching
+Annotation Marker sidecar under
+`.obsidian/plugins/annotation-marker/annotations/`. Its `color1`–`color6`
+suffix is authoritative; evaluate `data-annotation-note` and use
+`data-annotation-id` to distinguish markers. Retain marker data and notes. If
+the matching sidecar is absent, do not change the Obsidian source.
+
+Append each answer, explanation, ADR, or question as its own chapter at the
+end of the document. Preserve the exact annotation heading and end the answer
+heading with a self-link to the unchanged visible annotation ID. Add exactly
+one idempotent backlink to the cited source section, using concrete values for
+the bee, answer target, and answer heading:
+
+```text
+Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: [[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]
+```
+
+On retry, detect that exact annotation/target/heading backlink before writing;
+an existing line is reused, never duplicated.
+
+### Generator and provider projection
+
+`src/codex_master/markdown/common.md` is the sole canonical policy source.
+When it changes, bump its `generation` header according to the strict
+`CommonPolicyContract` contract. `load_common_policy()` validates and loads
+the complete bytes; `CommonPolicyContract.project()` builds both provider
+variants; `fleet_markdown_projection()` selects the provider artifact and
+materializes the class profile. Do not maintain parallel policy copies or edit
+`AGENTS.md` / `.gemini/GEMINI.md` directly.
+
+The Codex `AGENTS.md` and Gemini `.gemini/GEMINI.md` projections must retain
+the same canonical common-policy bytes and differ only in their provider
+profile reference. Verify this contract with the focused checks:
+
+```sh
+pytest -q tests/test_hive_policy.py tests/test_fleet_markdown.py
+```

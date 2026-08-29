@@ -105,7 +105,7 @@ def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
     primary = projection.artifacts[metadata.provider_artifact_name]
 
     assert metadata.schema_version == 1
-    assert metadata.generation == 1
+    assert metadata.generation == 2
     assert metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
     assert metadata.common_size == len(_COMMON_BYTES) <= MAX_COMMON_POLICY_BYTES
     assert metadata.provider_artifact_name == "AGENTS.md"
@@ -133,13 +133,33 @@ def test_provider_projection_digests_are_deterministic_and_distinct() -> None:
 
 def test_canonical_header_remains_first_in_both_provider_artifacts() -> None:
     expected_header = (
-        b'<!-- codex-master-common-policy:{"generation":1,"schema_version":1} -->'
+        b'<!-- codex-master-common-policy:{"generation":2,"schema_version":1} -->'
     )
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
         projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
         primary = projection.artifacts[projection.metadata.provider_artifact_name]
         assert primary.splitlines()[0] == expected_header
+
+
+def test_both_provider_projections_carry_same_annotation_response_policy() -> None:
+    contract = load_common_policy()
+    required_line = (
+        "Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: "
+        "[[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]"
+    ).encode("utf-8")
+
+    projections = [
+        fleet_markdown.fleet_markdown_projection(_agent()),
+        fleet_markdown.fleet_markdown_projection(_agent(RunnerKind.GEMINI_CLI)),
+    ]
+
+    for projection in projections:
+        primary = projection.artifacts[projection.metadata.provider_artifact_name]
+        assert primary.startswith(contract.common_bytes)
+        assert required_line in primary
+        assert projection.metadata.common_digest == contract.common_digest
+        assert projection.metadata.generation == contract.generation == 2
 
 
 @pytest.mark.parametrize("profile", ["../../worker", "worker.md", "", "x" * 65])

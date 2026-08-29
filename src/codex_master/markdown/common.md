@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":1,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":2,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -57,3 +57,29 @@ Desktop-Benachrichtigung an. Ist keine Zwischenablage verfügbar, muss der
 Fehler gemeldet werden; der Pfad darf nicht stillschweigend als erledigt
 gelten. Die Regel gilt für Vaults, `/Baupläne!` und alle anderen externen
 Dokumentpfade serverweit.
+
+## Bidirektionale Annotation-Antworten in Obsidian
+
+Eine beantwortete Annotation erhält ein eigenes Kapitel am Dokumentende. Seine
+Überschrift übernimmt die exakte Annotation-Überschrift und
+endet mit einem Markdown-Selbstlink auf die Annotation-ID, zum Beispiel:
+`## <Annotation-Überschrift> [[#<Annotation-ID>|<Annotation-ID>]]`. Die
+sichtbare ID bleibt unverändert. Antworten, Erklärungen, ADRs und Fragen
+bleiben jeweils eigene Kapitel am Dokumentende und werden nicht zu einem
+Sammelkapitel oder Inline-Text zusammengezogen.
+
+Der zitierte Annotation-Quellabschnitt erhält genau eine idempotente
+Bidirektionszeile in exakt diesem Format:
+`Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: [[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]`.
+`<Biene>` muss durch die konkrete Biene, `<Antwortziel>` durch das konkrete
+Antwortziel und `<Antwortüberschrift>` durch die konkrete Antwortüberschrift
+ersetzt werden. Vor jedem Retry ist die bestehende Zeile anhand von Annotation,
+Ziel und Überschrift zu prüfen; existiert sie bereits, wird keine zweite Zeile
+angelegt.
+
+Vor jeder Änderung einer Obsidian-Quelldatei ist das passende Annotation
+Marker-Sidecar unter `.obsidian/plugins/annotation-marker/annotations/` zu
+finden und auszuwerten. Fehlt das passende Sidecar, wird die Quelldatei nicht
+geändert. Die Regeln für `color1` bis `color6`, `data-annotation-note` als
+User-Notiz und `data-annotation-id` als eindeutige Marker-ID bleiben bindend;
+Marker und ihre Notizen werden erhalten.
