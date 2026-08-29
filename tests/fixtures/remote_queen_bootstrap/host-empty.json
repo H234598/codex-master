@@ -1,0 +1,48 @@
+{
+  "desired_generation": {
+    "generation": "rq-bootstrap-2026-08-29",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "host_facts": {
+    "architecture": "x86_64",
+    "distribution_id": "fedora",
+    "distribution_version": "41",
+    "package_manager": "dnf"
+  },
+  "object_states": [
+    {
+      "generation": null,
+      "object_id": "packages",
+      "owner": null
+    },
+    {
+      "generation": null,
+      "object_id": "release-artifacts",
+      "owner": null
+    },
+    {
+      "generation": null,
+      "object_id": "user-services",
+      "owner": null
+    },
+    {
+      "generation": null,
+      "object_id": "syncthing-folder:Teladi_Programming",
+      "owner": null
+    },
+    {
+      "generation": null,
+      "object_id": "queen-binding",
+      "owner": null
+    }
+  ],
+  "queen_binding": {
+    "repo_id": "codex-master",
+    "role": "queen",
+    "scope": [
+      "plan",
+      "exclusive-g18-files"
+    ],
+    "topic_id": "g18-vertex-overflow"
+  }
+}
