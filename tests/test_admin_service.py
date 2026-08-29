@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from threading import Lock
 
 import pytest
+import codex_master.admin_service as admin_service_module
 
 from codex_master.admin_contracts import AdminPrincipalV1, OperationV1
 from codex_master.admin_hosts import ControlHostV1
@@ -146,6 +147,7 @@ class OpenAICredentials:
         self.plan_calls = 0
         self.apply_calls = 0
         self.last_plan: tuple[object, ...] | None = None
+        self.resolve_error = False
 
     def plan_auth_sync(
         self,
@@ -173,6 +175,8 @@ class OpenAICredentials:
         return AuthSyncReceiptV1("openai-one", 5, "a" * 64)
 
     def resolve_auth_sync_plan(self, *_args: object, **_values: object) -> object:
+        if self.resolve_error:
+            raise RuntimeError("private-plan-error")
         return "openai-plan"
 
     def authorize_auth_ingress(self, _plan: object, upload: bytearray) -> bytearray:
@@ -439,9 +443,12 @@ class SecretIngress:
         self.upload_rollbacks = 0
         self.resolve_commits = 0
         self.resolve_rollbacks = 0
+        self.created_values: dict[str, object] | None = None
+        self.last_resolution: SecretIngressResolutionV1 | None = None
 
     def create_session(self, **values: object) -> SecretIngressSessionV1:
         self.create_calls += 1
+        self.created_values = dict(values)
         return SecretIngressSessionV1(
             "ingress-one",
             str(values["account_ref"]),
@@ -450,6 +457,33 @@ class SecretIngress:
             int(values["expected_generation"]),
             2_000_000_120.0,
             int(values["expected_generation"]),
+        )
+
+    def continue_resolve(self, **values: object) -> SecretIngressCapabilityV1:
+        created = self.created_values or {
+            "principal": values["principal"],
+            "account_ref": values["account_ref"],
+            "credential_kind": values["credential_kind"],
+            "transaction_id": values.get("transaction_id"),
+            "plan_digest": values.get("plan_digest") or DIGEST,
+            "expected_generation": values["expected_generation"],
+            "idempotency_key": "idem-session",
+        }
+        return SecretIngressCapabilityV1(
+            "ingress-one",
+            str(values["principal"]),
+            str(values["account_ref"]),
+            str(values["operation"]),
+            str(values["credential_kind"]),
+            values.get("transaction_id"),
+            str(created["plan_digest"]),
+            int(values["expected_generation"]),
+            str(created["idempotency_key"]),
+            "idem-upload",
+            str(values["idempotency_key"]),
+            int(values["expected_generation"]),
+            int(values["expected_generation"]) + 1,
+            2_000_000_120.0,
         )
 
     def reserve_resolve(self, session_id: str, **values: object) -> object:
@@ -461,16 +495,19 @@ class SecretIngress:
         session_id, values = claim
         kind = values["credential_kind"]
         if kind == "openai.auth-json":
-            return SecretIngressResolutionV1(
+            self.last_resolution = SecretIngressResolutionV1(
                 session_id, bytearray(b"openai-upload"), claim
             )
+            return self.last_resolution
         if kind == "google-oauth-code":
-            return SecretIngressResolutionV1(
+            self.last_resolution = SecretIngressResolutionV1(
                 session_id, bytearray(b"oauth-code"), claim
             )
-        return SecretIngressResolutionV1(
+            return self.last_resolution
+        self.last_resolution = SecretIngressResolutionV1(
             session_id, bytearray(b"google-client-upload"), claim
         )
+        return self.last_resolution
 
     def commit_resolve(self, resolution: SecretIngressResolutionV1) -> None:
         self.resolve_commits += 1
@@ -778,6 +815,27 @@ def test_put_secret_requires_exact_scope_and_step_up_before_owner() -> None:
     assert owners.secret_ingress.put_calls == 0
 
 
+def test_continue_secret_upload_requires_authenticated_ingress_scope() -> None:
+    service, owners = service_at()
+
+    with pytest.raises(AdminDenied, match="authority.scope_denied"):
+        service.continue_secret_upload(
+            principal("fleet.read"),
+            "ingress-one",
+            expected_generation=4,
+            idempotency_key="idem-upload",
+        )
+    with pytest.raises(AdminServiceError, match="control.request_invalid"):
+        service.continue_secret_upload(  # type: ignore[arg-type]
+            object(),
+            "ingress-one",
+            expected_generation=4,
+            idempotency_key="idem-upload",
+        )
+
+    assert owners.secret_ingress.upload_claims == []
+
+
 @pytest.mark.parametrize(
     ("session_id", "secret"),
     [
@@ -930,6 +988,43 @@ def test_openai_apply_resolves_bound_ingress_and_calls_owner_once() -> None:
     assert result["state"] == "succeeded"
     assert owners.secret_ingress.resolve_calls == 1
     assert owners.openai_credentials.apply_calls == 1
+
+
+def test_openai_plan_precondition_failure_rolls_back_and_wipes_resolution() -> None:
+    """Break caught: failed plan lookup must not strand secret or owner claim."""
+
+    service, owners = service_at()
+    owners.openai_credentials.resolve_error = True
+
+    with pytest.raises(AdminServiceError, match="control.owner_unavailable"):
+        command(
+            service,
+            "openai.auth.apply",
+            {"account_ref": "openai-one"},
+            "fleet.secrets.ingress",
+            digest=DIGEST,
+            ingress_session="ingress-session",
+            step_up=True,
+        )
+
+    assert owners.secret_ingress.resolve_rollbacks == 1
+    assert owners.secret_ingress.last_resolution is not None
+    assert owners.secret_ingress.last_resolution.upload == bytearray()
+
+
+def test_oauth_code_decodes_mutable_buffer_without_bytes_copy(monkeypatch) -> None:
+    """Break caught: mutable OAuth code must not cross a project `bytes()` copy."""
+
+    def forbidden_bytes(_value):
+        raise AssertionError("immutable project copy")
+
+    monkeypatch.setattr(admin_service_module, "bytes", forbidden_bytes, raising=False)
+    raw = bytearray(b"oauth-code")
+
+    code, wipe = admin_service_module._oauth_code(raw)  # noqa: SLF001
+
+    assert code == "oauth-code"
+    assert wipe is raw
 
 
 @pytest.mark.parametrize(

@@ -436,6 +436,27 @@ def test_resolve_oauth_client_import_plan_from_durable_digest_after_restart(
     )
 
 
+def test_client_import_keeps_vault_input_mutable_until_crypto_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: project code must not create an immutable secret copy."""
+
+    observed: list[type[object]] = []
+    real_store = CredentialVault.store_projection
+
+    def require_mutable(vault, account_ref, generation, payload):
+        observed.append(type(payload))
+        if type(payload) is bytes:
+            raise AssertionError("immutable project copy")
+        return real_store(vault, account_ref, generation, payload)
+
+    monkeypatch.setattr(CredentialVault, "store_projection", require_mutable)
+    service, ingress, _exchange, _manager = _service(tmp_path)
+    _import_client(service, ingress)
+
+    assert observed == [bytearray]
+
+
 def _begin(
     service,
     client_ref: str,
@@ -757,7 +778,7 @@ def test_client_import_recovers_receipt_after_control_write_crash(
     restarted, _ingress, _exchange, _manager_instance = _service(
         tmp_path, ingress=ingress, exchange=exchange, manager=manager
     )
-    receipt = restarted.apply_oauth_client_import(plan, session)
+    receipt = restarted.reconcile_oauth_client_import(plan, session)
     assert receipt.account_ref == "google-account-01"
     assert receipt.inventory_generation == 1
     assert session.acknowledged is True
@@ -798,7 +819,16 @@ def test_token_write_receipt_recovers_after_control_write_crash(
         token_writer=token_writer,
         clock=clock,
     )
-    assert _complete(restarted, transaction).refresh_token_stored is True
+    assert (
+        restarted.reconcile_oauth_transaction(
+            transaction.id,
+            account_ref="google-account-01",
+            redirect_uri="http://127.0.0.1:8765/callback",
+            expected_generation=1,
+            state=_state(transaction),
+        ).refresh_token_stored
+        is True
+    )
     assert len(token_writer.writes) == 1
     assert len(exchange.calls) == 1
 

@@ -1759,7 +1759,7 @@ class GoogleOAuthControlService:
                     self._client_vault.store_projection(
                         self._client_vault_ref(plan.account_ref),
                         vault_generation,
-                        bytes(raw),
+                        raw,
                     )
                 except CredentialVaultError:
                     if not self._client_projection_matches(
@@ -1782,6 +1782,45 @@ class GoogleOAuthControlService:
         finally:
             client_data.clear()
             _zero_bytes(raw)
+
+    def reconcile_oauth_client_import(
+        self,
+        plan: GoogleOAuthClientImportPlanV1,
+        ingress_session: object,
+    ) -> GoogleOAuthClientImportReceiptV1:
+        """Finish only an already durable client-import effect and ingress ack."""
+
+        if not isinstance(plan, GoogleOAuthClientImportPlanV1):
+            raise GoogleOAuthSessionError("oauth.import_plan_invalid")
+        with self._state.locked():
+            document = self._read_locked()
+            record = self._find(cast(list[object], document["imports"]), "id", plan.id)
+            if record is None or any(
+                record.get(field) != getattr(plan, field)
+                for field in (
+                    "account_ref",
+                    "expected_generation",
+                    "expires_at",
+                    "idempotency_key",
+                    "plan_digest",
+                )
+            ):
+                raise GoogleOAuthSessionError("oauth.import_plan_invalid")
+            state = record.get("state")
+            if state == "succeeded":
+                self._ack_ingress(plan, ingress_session, plan.plan_digest)
+                return self._import_receipt(record)
+            if state in {"ack_pending", "cleanup"}:
+                return self._finish_import_ack(document, record, plan, ingress_session)
+            if state != "persisting" or not self._client_projection_matches(
+                plan.account_ref,
+                cast(int, record["vault_generation"]),
+                cast(str, record["client_digest"]),
+            ):
+                raise GoogleOAuthSessionError("oauth.client_repair_required")
+            self._finalize_client_projection(document, record)
+            self._write_import_locked(document)
+            return self._finish_import_ack(document, record, plan, ingress_session)
 
     def _read_ingress(
         self, plan: GoogleOAuthClientImportPlanV1, ingress_session: object
@@ -2324,6 +2363,56 @@ class GoogleOAuthControlService:
             code = ""
             verifier = ""
         return GoogleOAuthSessionReceipt(account_ref, True, True)
+
+    def reconcile_oauth_transaction(
+        self,
+        transaction_id: str,
+        *,
+        account_ref: str,
+        redirect_uri: str,
+        expected_generation: int,
+        state: str,
+    ) -> GoogleOAuthSessionReceipt:
+        """Return only a receipt proven by an existing durable token effect."""
+
+        transaction_id = self._ref(transaction_id)
+        account_ref = self._ref(account_ref)
+        redirect_uri = self._redirect_uri(redirect_uri)
+        expected_generation = self._generation(expected_generation)
+        if type(state) is not str or not 1 <= len(state) <= 512:
+            raise GoogleOAuthSessionError("oauth.request_invalid")
+        with self._state.locked():
+            document = self._read_locked()
+            record = self._find(
+                cast(list[object], document["transactions"]),
+                "id",
+                transaction_id,
+            )
+            if record is None:
+                raise GoogleOAuthSessionError("oauth.transaction_expired")
+            mismatch = self._callback_mismatch(
+                record,
+                account_ref=account_ref,
+                redirect_uri=redirect_uri,
+                expected_generation=expected_generation,
+                state=state,
+                check_expiry=False,
+            )
+            if mismatch is not None:
+                raise GoogleOAuthSessionError(mismatch)
+            if record["state"] == "succeeded":
+                return GoogleOAuthSessionReceipt(account_ref, True, True)
+            if record["state"] not in {"persisting", "reconcile_required"}:
+                raise GoogleOAuthSessionError("oauth.transaction_expired")
+            receipt = self._lookup_token_receipt(record)
+            if receipt is None:
+                raise GoogleOAuthSessionError("oauth.token_write_failed")
+            self._validate_token_receipt(record, receipt)
+            if record["effect_subject_id"] is None:
+                record["effect_subject_id"] = receipt.subject_id
+            self._mark_transaction_terminal(record, "succeeded")
+            self._write_locked(document)
+            return GoogleOAuthSessionReceipt(account_ref, True, True)
 
     def _callback_mismatch(
         self,

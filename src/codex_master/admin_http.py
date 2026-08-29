@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
@@ -31,7 +31,7 @@ from .admin_contracts import (
     parse_admin_request,
     public_admin_result,
 )
-from .admin_service import AdminServiceError, SecretIngressCapabilityV1
+from .admin_service import AdminServiceError
 
 
 MAX_ADMIN_JSON_BYTES: Final[int] = 1_000_000
@@ -47,11 +47,6 @@ _ORIGIN = re.compile(
 )
 _INGRESS_PREFIX = "/admin/v1/secret-ingress-sessions/"
 _AUTHORITY_MODES = frozenset({"cloudflare", "bearer", "require_both"})
-_FLOW_APPLY = {
-    "openai.auth-json": "openai.auth.apply",
-    "google.oauth-client": "google.oauth-client-import.apply",
-    "google-oauth-code": "google.oauth.complete",
-}
 
 
 class _ControlService(Protocol):
@@ -84,234 +79,21 @@ class _ControlService(Protocol):
 
     def rollback_secret_upload(self, upload_claim: object) -> None: ...
 
+    def continue_secret_upload(
+        self,
+        principal: AdminPrincipalV1,
+        session_id: str,
+        *,
+        expected_generation: int,
+        idempotency_key: str,
+    ) -> object: ...
+
 
 class AdminHttpShutdownError(RuntimeError):
     """Typed incomplete drain; authorities remain live until finalization."""
 
     def __init__(self) -> None:
         super().__init__("control.http_shutdown_incomplete")
-
-
-@dataclass(frozen=True, slots=True)
-class _FlowGrant:
-    subject: str
-    account_ref: str
-    plan_digest: str
-    transaction_id: str | None
-    apply_operation: str
-    credential_kind: str
-    expected_generation: int
-    create_idempotency_key: str
-    upload_idempotency_key: str | None
-    receipt_generation: int | None
-    session_id: str
-    expires_at: float
-    stage: str
-
-
-class _FlowGrants:
-    __slots__ = ("_clock", "_consumed", "_grants", "_lock", "_ttl")
-
-    def __init__(self, clock: Callable[[], float], *, ttl_seconds: int = 120) -> None:
-        self._clock = clock
-        self._ttl = ttl_seconds
-        self._lock = threading.Lock()
-        self._grants: dict[str, _FlowGrant] = {}
-        self._consumed: dict[str, float] = {}
-
-    def add(
-        self,
-        principal: AdminPrincipalV1,
-        request: AdminRequestV1,
-        result: Mapping[str, object],
-    ) -> None:
-        session_id = result.get("id")
-        credential_kind = request.arguments.get("credential_kind")
-        account_ref = request.arguments.get("account_ref")
-        plan_digest = request.plan_digest
-        apply_operation = _FLOW_APPLY.get(cast(str, credential_kind))
-        expires_at = result.get("expires_at")
-        result_digest = result.get("plan_digest")
-        result_generation = result.get("expected_generation")
-        session_generation = result.get("session_generation")
-        if (
-            type(session_id) is not str
-            or _SESSION.fullmatch(session_id) is None
-            or type(account_ref) is not str
-            or type(plan_digest) is not str
-            or apply_operation is None
-            or type(expires_at) not in {int, float}
-            or not math.isfinite(cast(float, expires_at))
-            or cast(float, expires_at) <= _clock_value(self._clock)
-            or result_digest != plan_digest
-            or result_generation != request.expected_generation
-            or session_generation != request.expected_generation
-        ):
-            return
-        now = _clock_value(self._clock)
-        grant = _FlowGrant(
-            principal.subject,
-            account_ref,
-            plan_digest,
-            cast(str | None, request.arguments.get("transaction_id")),
-            apply_operation,
-            cast(str, credential_kind),
-            cast(int, request.expected_generation),
-            cast(str, request.idempotency_key),
-            None,
-            None,
-            session_id,
-            cast(float, expires_at),
-            "upload",
-        )
-        with self._lock:
-            self._prune(now)
-            self._grants[session_id] = grant
-
-    def claim_upload(
-        self,
-        subject: str,
-        session_id: str,
-        *,
-        expected_generation: int,
-        idempotency_key: str,
-    ) -> _FlowGrant | None:
-        now = _clock_value(self._clock)
-        with self._lock:
-            self._prune(now)
-            grant = self._grants.get(session_id)
-            if (
-                grant is None
-                or grant.subject != subject
-                or grant.stage != "upload"
-                or grant.expires_at <= now
-                or grant.expected_generation != expected_generation
-            ):
-                return None
-            claimed = replace(
-                grant,
-                stage="uploading",
-                upload_idempotency_key=idempotency_key,
-            )
-            self._grants[session_id] = claimed
-            return claimed
-
-    def finish_upload(self, claimed: _FlowGrant, generation: int) -> None:
-        with self._lock:
-            grant = self._grants.get(claimed.session_id)
-            if grant != claimed or grant.stage != "uploading":
-                raise AdminAuthError("authority.step_up_invalid")
-            self._grants[claimed.session_id] = replace(
-                grant, stage="apply", receipt_generation=generation
-            )
-            self._consumed[claimed.session_id] = grant.expires_at
-
-    def rollback_upload(self, claimed: _FlowGrant) -> None:
-        with self._lock:
-            grant = self._grants.get(claimed.session_id)
-            if grant == claimed and grant.stage == "uploading":
-                self._grants[claimed.session_id] = replace(
-                    grant,
-                    stage="upload",
-                    upload_idempotency_key=None,
-                )
-
-    def fail_upload(self, session_id: str) -> None:
-        now = _clock_value(self._clock)
-        with self._lock:
-            self._grants.pop(session_id, None)
-            self._consumed[session_id] = now + self._ttl
-
-    def reserve_apply(
-        self, subject: str, request: AdminRequestV1
-    ) -> SecretIngressCapabilityV1 | None:
-        account_ref = request.arguments.get("account_ref")
-        now = _clock_value(self._clock)
-
-        def request_matches(grant: _FlowGrant) -> bool:
-            if grant.apply_operation == "google.oauth.complete":
-                return (
-                    grant.transaction_id == request.arguments.get("transaction_id")
-                    and request.plan_digest is None
-                )
-            return grant.plan_digest == request.plan_digest
-
-        with self._lock:
-            self._prune(now)
-            matches = [
-                session_id
-                for session_id, grant in self._grants.items()
-                if grant.stage == "apply"
-                and grant.subject == subject
-                and grant.account_ref == account_ref
-                and grant.apply_operation == request.operation
-                and request_matches(grant)
-                and grant.expected_generation == request.expected_generation
-                and grant.expires_at > now
-            ]
-            if len(matches) != 1:
-                return None
-            grant = self._grants[matches[0]]
-            if grant.upload_idempotency_key is None or grant.receipt_generation is None:
-                return None
-            capability = SecretIngressCapabilityV1(
-                grant.session_id,
-                grant.subject,
-                grant.account_ref,
-                grant.apply_operation,
-                grant.credential_kind,
-                grant.transaction_id,
-                grant.plan_digest,
-                grant.expected_generation,
-                grant.create_idempotency_key,
-                grant.upload_idempotency_key,
-                request.idempotency_key
-                or cast(str, request.arguments.get("transaction_id")),
-                grant.expected_generation,
-                grant.receipt_generation,
-                grant.expires_at,
-            )
-            self._grants[grant.session_id] = replace(grant, stage="applying")
-            return capability
-
-    def finish_apply(self, capability: SecretIngressCapabilityV1) -> None:
-        with self._lock:
-            grant = self._grants.get(capability.session_id)
-            if grant is None or grant.stage != "applying":
-                raise AdminAuthError("authority.step_up_invalid")
-            self._grants.pop(capability.session_id)
-            self._consumed[capability.session_id] = grant.expires_at
-
-    def rollback_apply(self, capability: SecretIngressCapabilityV1) -> None:
-        with self._lock:
-            grant = self._grants.get(capability.session_id)
-            if grant is not None and grant.stage == "applying":
-                self._grants[capability.session_id] = replace(grant, stage="apply")
-
-    def fail_apply(self, capability: SecretIngressCapabilityV1) -> None:
-        now = _clock_value(self._clock)
-        with self._lock:
-            self._grants.pop(capability.session_id, None)
-            self._consumed[capability.session_id] = now + self._ttl
-
-    def consumed(self, session_id: str) -> bool:
-        now = _clock_value(self._clock)
-        with self._lock:
-            self._prune(now)
-            return session_id in self._consumed
-
-    def mark_consumed(self, session_id: str) -> None:
-        now = _clock_value(self._clock)
-        with self._lock:
-            self._consumed[session_id] = now + self._ttl
-
-    def _prune(self, now: float) -> None:
-        self._grants = {
-            key: grant for key, grant in self._grants.items() if grant.expires_at > now
-        }
-        self._consumed = {
-            key: expires for key, expires in self._consumed.items() if expires > now
-        }
 
 
 class _AdminHandler(BaseHTTPRequestHandler):
@@ -347,34 +129,16 @@ class _AdminHandler(BaseHTTPRequestHandler):
         ):
             self._reply_problem(400, "control.request_invalid")
             return
-        ingress_session: SecretIngressCapabilityV1 | None = None
         try:
-            principal, verified = self._authorize_step_up(principal, request)
-            ingress_session = self.server.flow_grants.reserve_apply(
-                principal.subject, request
-            )
-            if ingress_session is not None:
-                principal = replace(principal, step_up=True)
-            result = self.server.service.handle(
-                principal, request, ingress_session=ingress_session
-            )
-            if ingress_session is not None:
-                self.server.flow_grants.finish_apply(ingress_session)
-            if verified and request.operation == "secret.ingress.create":
-                self.server.flow_grants.add(principal, request, result)
+            principal, _verified = self._authorize_step_up(principal, request)
+            result = self.server.service.handle(principal, request)
         except AdminAuthError as error:
-            if ingress_session is not None:
-                self.server.flow_grants.rollback_apply(ingress_session)
             self._reply_auth_error(error)
             return
         except AdminServiceError as error:
-            if ingress_session is not None:
-                self.server.flow_grants.rollback_apply(ingress_session)
             self._reply_service_error(error)
             return
         except Exception:
-            if ingress_session is not None:
-                self.server.flow_grants.fail_apply(ingress_session)
             self._reply_problem(503, "control.owner_unavailable")
             return
         self._reply_json(200, self._wire_result(request, result))
@@ -391,10 +155,6 @@ class _AdminHandler(BaseHTTPRequestHandler):
         except AdminAuthError as error:
             self._reply_auth_error(error)
             return
-        if self.server.flow_grants.consumed(session_id):
-            self._reply_problem(410, "credential.upload_expired")
-            return
-        grant: _FlowGrant | None = None
         upload_claim: object | None = None
         body: bytearray | None = None
         try:
@@ -402,26 +162,16 @@ class _AdminHandler(BaseHTTPRequestHandler):
             idempotency_key = self._required_header("Idempotency-Key")
             if self._required_header("X-Masterjet-Operation") != "secret.ingress.put":
                 raise AdminAuthError("authority.step_up_invalid")
-            grant = self.server.flow_grants.claim_upload(
-                principal.subject,
-                session_id,
-                expected_generation=expected_generation,
-                idempotency_key=idempotency_key,
-            )
-            if grant is None:
-                self._reply_problem(410, "credential.upload_expired")
-                return
-            principal = replace(principal, step_up=True)
-            upload_claim = self.server.service.reserve_secret_upload(
+            upload_claim = self.server.service.continue_secret_upload(
                 principal,
                 session_id,
                 expected_generation=expected_generation,
                 idempotency_key=idempotency_key,
             )
+            principal = replace(principal, step_up=True)
             body = self._read_body(MAX_ADMIN_SECRET_BYTES, "application/octet-stream")
             if body is None:
                 self.server.service.rollback_secret_upload(upload_claim)
-                self.server.flow_grants.rollback_upload(grant)
                 return
             result = self.server.service.put_secret(
                 principal,
@@ -432,10 +182,7 @@ class _AdminHandler(BaseHTTPRequestHandler):
             generation = result.get("generation")
             if type(generation) is not int:
                 raise AdminAuthError("authority.step_up_invalid")
-            self.server.flow_grants.finish_upload(grant, generation)
         except AdminAuthError as error:
-            if grant is not None:
-                self.server.flow_grants.rollback_upload(grant)
             self._reply_auth_error(error)
             return
         except AdminServiceError as error:
@@ -444,8 +191,6 @@ class _AdminHandler(BaseHTTPRequestHandler):
                     self.server.service.rollback_secret_upload(upload_claim)
                 except AdminServiceError:
                     pass
-            if grant is not None:
-                self.server.flow_grants.rollback_upload(grant)
             self._reply_service_error(error)
             return
         except Exception:
@@ -454,8 +199,6 @@ class _AdminHandler(BaseHTTPRequestHandler):
                     self.server.service.rollback_secret_upload(upload_claim)
                 except Exception:
                     pass
-            if grant is not None:
-                self.server.flow_grants.fail_upload(session_id)
             self._reply_problem(503, "control.owner_unavailable")
             return
         finally:
@@ -754,7 +497,6 @@ class AdminHttpServer(ThreadingHTTPServer):
         access_verifier: CloudflareAccessVerifier | None,
         step_up_verifier: TotpStepUpVerifier,
         origin_host: str,
-        clock: Callable[[], float] = time.monotonic,
         trusted_proxy_addresses: tuple[str, ...] | None = None,
         socket_timeout_seconds: float = 10.0,
     ) -> None:
@@ -770,6 +512,7 @@ class AdminHttpServer(ThreadingHTTPServer):
             or not callable(getattr(service, "put_secret", None))
             or not callable(getattr(service, "reserve_secret_upload", None))
             or not callable(getattr(service, "rollback_secret_upload", None))
+            or not callable(getattr(service, "continue_secret_upload", None))
         ):
             raise ValueError("control.owner_unavailable")
         if not callable(getattr(step_up_verifier, "verify", None)):
@@ -795,7 +538,6 @@ class AdminHttpServer(ThreadingHTTPServer):
         self.step_up_verifier = step_up_verifier
         self.origin_host = origin_host
         self.trusted_proxy_addresses = trusted_proxies
-        self.flow_grants = _FlowGrants(clock)
         self.socket_timeout_seconds = float(socket_timeout_seconds)
         self._drain_condition = threading.Condition()
         self._active_handlers = 0
@@ -902,13 +644,6 @@ def _bind_host(address: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address
         return host
     except (TypeError, ValueError):
         raise ValueError("control.origin_invalid") from None
-
-
-def _clock_value(clock: Callable[[], float]) -> float:
-    value = clock()
-    if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
-        raise AdminAuthError("authority.configuration_invalid")
-    return float(value)
 
 
 def _trusted_proxies(values: object) -> frozenset[str]:
