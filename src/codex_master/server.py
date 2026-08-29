@@ -45,6 +45,7 @@ from codex_master.fleet_home_v2_cutover import (
     FleetHomeV2AuthorityPort,
     FleetHomeV2CutoverError,
     FleetHomeV2PlanHandle,
+    FleetHomeV2Result,
     FleetHomeV2QuiescencePort,
     LocalFleetHomeV2Filesystem,
 )
@@ -441,6 +442,46 @@ MAX_AGENT_LEASE_SECONDS = 7200
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 MCP_DEFAULT_TOOLS_APPROVAL_MODE = "approve"
+MASTER_FLEET_HOME_V2_CUTOVER_OPERATIONS = (
+    "plan",
+    "apply",
+    "verify",
+    "recover",
+    "rollback",
+)
+MASTER_FLEET_HOME_V2_CUTOVER_HANDLE_RE = re.compile(r"^[0-9a-f]{48}$")
+MASTER_FLEET_HOME_V2_CUTOVER_RESULT_STATES = frozenset(
+    {
+        "already-current",
+        "cutover-complete",
+        "failed-terminal",
+        "failed-retryable",
+        "recovery-required",
+        "rolled-back",
+    }
+)
+MASTER_FLEET_HOME_V2_CUTOVER_RESULT_CODES = frozenset(
+    {
+        "fleet_home_v2_already_current",
+        "fleet_home_v2_artifact_attestation_failed",
+        "fleet_home_v2_cutover_collision",
+        "fleet_home_v2_cutover_failed",
+        "fleet_home_v2_exchange_unavailable",
+        "fleet_home_v2_generation_stale",
+        "fleet_home_v2_journal_invalid",
+        "fleet_home_v2_marker_invalid",
+        "fleet_home_v2_operation_active",
+        "fleet_home_v2_operation_collision",
+        "fleet_home_v2_plan_invalid",
+        "fleet_home_v2_process_scan_unavailable",
+        "fleet_home_v2_quiescence_invalid",
+        "fleet_home_v2_recovery_required",
+        "fleet_home_v2_rollback_failed",
+        "fleet_home_v2_source_invalid",
+        "fleet_home_v2_stage_invalid",
+        "fleet_home_v2_target_not_quiescent",
+    }
+)
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
 CONTROL_CENTER_ENV_KEYS = frozenset(
     {
@@ -24571,6 +24612,8 @@ def call_tool(
             "reason": "dynamic_teamlead_runtime_unavailable",
             "raw_output": "not_returned",
         }
+    if name == "master_fleet_home_v2_cutover":
+        return _master_fleet_home_v2_cutover(args)
     if name == "agent_start":
         selected = agent_ids(str(args.get("agent", "both")))
         allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
@@ -34187,6 +34230,22 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "master_fleet_home_v2_cutover",
+        "description": "Operate the g1-only Fleet Home V2 cutover through the product-owned restart-safe plan handle.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["operation"],
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["plan", "apply", "verify", "recover", "rollback"],
+                },
+                "handle": {"type": "string", "maxLength": 48},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_start",
         "description": "Start selected Codex Agentinnen in tmux through the shared class/lifecycle/model/reasoning resolver. Does not return raw output.",
         "inputSchema": {
@@ -43111,6 +43170,98 @@ def fleet_home_v2_cutover_operation(
     except Exception as exc:
         raise AgentError("fleet_home_v2_cutover_failed") from exc
     raise AgentError("fleet_home_v2_cutover_failed")
+
+
+def _master_fleet_home_v2_cutover(args: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(args, dict):
+        raise AgentError("tools/call arguments must be an object")
+    allowed_args = {"operation", "handle"}
+    if set(args) - allowed_args:
+        raise AgentError("unknown argument(s) for master_fleet_home_v2_cutover")
+
+    operation = args.get("operation")
+    if (
+        type(operation) is not str
+        or operation not in MASTER_FLEET_HOME_V2_CUTOVER_OPERATIONS
+    ):
+        raise AgentError(
+            "operation must be one of: "
+            + ", ".join(MASTER_FLEET_HOME_V2_CUTOVER_OPERATIONS)
+        )
+
+    if operation == "plan":
+        if "handle" in args:
+            raise AgentError("handle is not allowed for plan")
+        try:
+            plan_handle = fleet_home_v2_cutover_operation(
+                operation="plan", target_ids=("g1",)
+            )
+        except (AgentError, FleetHomeV2CutoverError) as exc:
+            code = str(exc)
+            if code not in MASTER_FLEET_HOME_V2_CUTOVER_RESULT_CODES:
+                code = "fleet_home_v2_cutover_failed"
+            raise AgentError(code) from None
+        except Exception:
+            raise AgentError("fleet_home_v2_cutover_failed") from None
+        if type(plan_handle) is not FleetHomeV2PlanHandle:
+            raise AgentError("fleet_home_v2_cutover_failed")
+        handle = plan_handle.operation_id
+        if (
+            type(handle) is not str
+            or MASTER_FLEET_HOME_V2_CUTOVER_HANDLE_RE.fullmatch(handle) is None
+        ):
+            raise AgentError("fleet_home_v2_cutover_failed")
+        return {
+            "operation": "plan",
+            "status": "planned",
+            "handle": handle,
+            "raw_output": "not_returned",
+        }
+
+    if "handle" not in args:
+        raise AgentError(f"handle is required for {operation}")
+    handle = args["handle"]
+    if type(handle) is not str:
+        raise AgentError("handle must be a string")
+    if MASTER_FLEET_HOME_V2_CUTOVER_HANDLE_RE.fullmatch(handle) is None:
+        raise AgentError("handle is invalid")
+
+    try:
+        results = fleet_home_v2_cutover_operation(
+            operation=operation,
+            plan_handle=FleetHomeV2PlanHandle(handle),
+        )
+    except (AgentError, FleetHomeV2CutoverError) as exc:
+        code = str(exc)
+        if code not in MASTER_FLEET_HOME_V2_CUTOVER_RESULT_CODES:
+            code = "fleet_home_v2_cutover_failed"
+        raise AgentError(code) from None
+    except Exception:
+        raise AgentError("fleet_home_v2_cutover_failed") from None
+
+    if type(results) is not tuple or len(results) != 1:
+        raise AgentError("fleet_home_v2_cutover_failed")
+    result = results[0]
+    if (
+        type(result) is not FleetHomeV2Result
+        or type(result.agent_id) is not str
+        or result.agent_id != "g1"
+        or type(result.state) is not str
+        or result.state not in MASTER_FLEET_HOME_V2_CUTOVER_RESULT_STATES
+        or (result.code is not None and type(result.code) is not str)
+    ):
+        raise AgentError("fleet_home_v2_cutover_failed")
+    code = result.code
+    if code is not None and code not in MASTER_FLEET_HOME_V2_CUTOVER_RESULT_CODES:
+        code = "fleet_home_v2_cutover_failed"
+    response: dict[str, Any] = {
+        "operation": operation,
+        "status": result.state,
+        "raw_output": "not_returned",
+    }
+    if code is not None:
+        response["code"] = code
+    return response
 
 
 def main() -> int:

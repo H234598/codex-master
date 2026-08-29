@@ -41158,5 +41158,286 @@ def test_fleet_home_v2_quiescence_propagates_unexpected_filesystem_programming_e
         with unittest.TestCase().assertRaisesRegex(TypeError, "programmer-bug"):
             quiescence.observe(authority, None)
 
+
+def test_master_fleet_home_v2_cutover_registers_closed_g1_mcp_schema() -> None:
+    response = server_module.handle_rpc(
+        {"jsonrpc": "2.0", "id": "schema", "method": "tools/list"}
+    )
+    assert response is not None
+    tool = next(
+        item
+        for item in response["result"]["tools"]
+        if item["name"] == "master_fleet_home_v2_cutover"
+    )
+    schema = tool["inputSchema"]
+    assert schema == {
+        "type": "object",
+        "required": ["operation"],
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["plan", "apply", "verify", "recover", "rollback"],
+            },
+            "handle": {
+                "type": "string",
+                "maxLength": 48,
+            },
+        },
+        "additionalProperties": False,
+    }
+
+
+def test_master_fleet_home_v2_cutover_mcp_plan_binds_g1_and_returns_opaque_handle() -> None:
+    from codex_master.fleet_home_v2_cutover import FleetHomeV2PlanHandle
+
+    handle = FleetHomeV2PlanHandle("a" * 48)
+    with patch.object(
+        server_module,
+        "fleet_home_v2_cutover_operation",
+        return_value=handle,
+    ) as operation:
+        response = server_module.handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": "plan",
+                "method": "tools/call",
+                "params": {
+                    "name": "master_fleet_home_v2_cutover",
+                    "arguments": {"operation": "plan"},
+                },
+            }
+        )
+
+    assert response is not None
+    assert response["result"]["isError"] is False
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload == {
+        "operation": "plan",
+        "status": "planned",
+        "handle": "a" * 48,
+        "raw_output": "not_returned",
+    }
+    operation.assert_called_once_with(operation="plan", target_ids=("g1",))
+
+
+def test_master_fleet_home_v2_cutover_reconstructs_string_handle_across_calls() -> None:
+    from codex_master.fleet_home_v2_cutover import FleetHomeV2PlanHandle, FleetHomeV2Result
+
+    operation_id = "b" * 48
+    calls: list[tuple[str, object | None]] = []
+
+    def adapter(*, operation: str, target_ids: tuple[str, ...] | None = None, plan_handle: object | None = None) -> object:
+        calls.append((operation, plan_handle))
+        if operation == "plan":
+            assert target_ids == ("g1",)
+            return FleetHomeV2PlanHandle(operation_id)
+        assert target_ids is None
+        assert isinstance(plan_handle, FleetHomeV2PlanHandle)
+        assert plan_handle.operation_id == operation_id
+        return (FleetHomeV2Result("g1", "cutover-complete"),)
+
+    with patch.object(server_module, "fleet_home_v2_cutover_operation", side_effect=adapter):
+        plan_response = server_module.handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "master_fleet_home_v2_cutover",
+                    "arguments": {"operation": "plan"},
+                },
+            }
+        )
+        plan_payload = json.loads(plan_response["result"]["content"][0]["text"])
+        apply_response = server_module.handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "master_fleet_home_v2_cutover",
+                    "arguments": {
+                        "operation": "apply",
+                        "handle": plan_payload["handle"],
+                    },
+                },
+            }
+        )
+
+    assert apply_response is not None
+    assert apply_response["result"]["isError"] is False
+    assert json.loads(apply_response["result"]["content"][0]["text"]) == {
+        "operation": "apply",
+        "status": "cutover-complete",
+        "raw_output": "not_returned",
+    }
+    assert calls[0][0] == "plan"
+    assert calls[0][1] is None
+    assert calls[1][0] == "apply"
+    assert isinstance(calls[1][1], FleetHomeV2PlanHandle)
+    assert calls[1][1].operation_id == operation_id
+    assert calls[1][1] is not calls[0][1]
+
+
+def test_master_fleet_home_v2_cutover_routes_each_followup_operation() -> None:
+    from codex_master.fleet_home_v2_cutover import FleetHomeV2PlanHandle, FleetHomeV2Result
+
+    seen: list[tuple[str, str]] = []
+    states = {
+        "apply": "cutover-complete",
+        "verify": "cutover-complete",
+        "recover": "recovery-required",
+        "rollback": "rolled-back",
+    }
+
+    def adapter(*, operation: str, plan_handle: FleetHomeV2PlanHandle) -> tuple[FleetHomeV2Result]:
+        assert isinstance(plan_handle, FleetHomeV2PlanHandle)
+        seen.append((operation, plan_handle.operation_id))
+        return (FleetHomeV2Result("g1", states[operation]),)
+
+    with patch.object(server_module, "fleet_home_v2_cutover_operation", side_effect=adapter):
+        for operation in states:
+            payload = server_module.call_tool(
+                "master_fleet_home_v2_cutover",
+                {"operation": operation, "handle": "e" * 48},
+            )
+            assert payload["operation"] == operation
+            assert payload["status"] == states[operation]
+
+    assert seen == [(operation, "e" * 48) for operation in states]
+
+
+def test_master_fleet_home_v2_cutover_rejects_wrong_combinations_before_adapter() -> None:
+    invalid_calls = (
+        ({"operation": "plan", "handle": "a" * 48}, "handle is not allowed for plan"),
+        ({"operation": "apply"}, "handle is required for apply"),
+        ({"operation": "plan", "target": "g1"}, "unknown argument"),
+        ({"operation": "apply", "handle": "a" * 48, "target": "g1"}, "unknown argument"),
+        ({"operation": "apply", "handle": "not-a-handle"}, "handle is invalid"),
+        ({"operation": "plan", "operation_id": "a" * 48}, "unknown argument"),
+    )
+    with patch.object(
+        server_module,
+        "fleet_home_v2_cutover_operation",
+        side_effect=AssertionError("invalid call reached adapter"),
+    ):
+        for arguments, message in invalid_calls:
+            with unittest.TestCase().assertRaisesRegex(AgentError, message):
+                server_module.call_tool("master_fleet_home_v2_cutover", arguments)
+
+
+def test_master_fleet_home_v2_cutover_maps_adapter_errors_without_raw_details() -> None:
+    from codex_master.fleet_home_v2_cutover import FleetHomeV2CutoverError
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": "error",
+        "method": "tools/call",
+        "params": {
+            "name": "master_fleet_home_v2_cutover",
+            "arguments": {"operation": "apply", "handle": "c" * 48},
+        },
+    }
+    with patch.object(
+        server_module,
+        "fleet_home_v2_cutover_operation",
+        side_effect=FleetHomeV2CutoverError("fleet_home_v2_recovery_required"),
+    ):
+        response = server_module.handle_rpc(request)
+    assert response is not None
+    assert response["result"]["isError"] is True
+    assert json.loads(response["result"]["content"][0]["text"]) == {
+        "error": "fleet_home_v2_recovery_required"
+    }
+
+    with patch.object(
+        server_module,
+        "fleet_home_v2_cutover_operation",
+        side_effect=RuntimeError("secret /home/teladi/private-state"),
+    ):
+        response = server_module.handle_rpc(request)
+    assert response is not None
+    assert response["result"]["isError"] is True
+    assert json.loads(response["result"]["content"][0]["text"]) == {
+        "error": "fleet_home_v2_cutover_failed"
+    }
+
+
+def test_master_fleet_home_v2_cutover_returns_only_bounded_result_state() -> None:
+    from codex_master.fleet_home_v2_cutover import FleetHomeV2Result
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": "result",
+        "method": "tools/call",
+        "params": {
+            "name": "master_fleet_home_v2_cutover",
+            "arguments": {"operation": "verify", "handle": "d" * 48},
+        },
+    }
+    with patch.object(
+        server_module,
+        "fleet_home_v2_cutover_operation",
+        return_value=(
+            FleetHomeV2Result(
+                "g1",
+                "recovery-required",
+                "fleet_home_v2_recovery_required",
+            ),
+        ),
+    ):
+        response = server_module.handle_rpc(request)
+    assert response is not None
+    assert response["result"]["isError"] is False
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload == {
+        "operation": "verify",
+        "status": "recovery-required",
+        "code": "fleet_home_v2_recovery_required",
+        "raw_output": "not_returned",
+    }
+    assert not any(
+        key in payload
+        for key in (
+            "agent_id",
+            "authority",
+            "home",
+            "manifest",
+            "registry_generation",
+            "plan",
+            "path",
+            "secret",
+        )
+    )
+
+    with patch.object(
+        server_module,
+        "fleet_home_v2_cutover_operation",
+        return_value=(FleetHomeV2Result("g1", "failed-retryable", "/tmp/raw"),),
+    ):
+        response = server_module.handle_rpc(request)
+    assert response is not None
+    assert response["result"]["isError"] is False
+    assert json.loads(response["result"]["content"][0]["text"])["code"] == (
+        "fleet_home_v2_cutover_failed"
+    )
+
+
+def test_master_fleet_home_v2_cutover_is_queen_only_when_master_role_is_enforced() -> None:
+    teamleader_status = {
+        "authorized": True,
+        "role": "teamleiterin",
+        "principal_class": "teamleiterin",
+    }
+    with patch.object(server_module, "master_tool_access_status", return_value=teamleader_status):
+        response = server_module.handle_rpc(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            enforce_master_role=True,
+        )
+    assert response is not None
+    assert "master_fleet_home_v2_cutover" not in {
+        item["name"] for item in response["result"]["tools"]
+    }
+
 if __name__ == "__main__":
     unittest.main()
