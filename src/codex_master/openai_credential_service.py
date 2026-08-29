@@ -310,6 +310,19 @@ class OpenAIAuthReceiptStore:
         with self._locked_records() as records:
             return str(self._matching_record(records, plan)["state"])
 
+    def resolve(
+        self, account_ref: str, expected_generation: int, plan_digest: str
+    ) -> dict[str, object]:
+        with self._locked_records() as records:
+            for record in records:
+                if (
+                    record["account_ref"] == account_ref
+                    and record["expected_generation"] == expected_generation
+                    and hmac.compare_digest(str(record["plan_digest"]), plan_digest)
+                ):
+                    return dict(record)
+        raise OpenAICredentialError("control.plan_stale")
+
     def succeed(self, plan: AuthSyncPlanV1) -> None:
         with self._locked_records() as records:
             record = self._matching_record(records, plan)
@@ -482,12 +495,12 @@ class AuthorizedAuthIngress:
         cls,
         authority: object,
         plan: object,
-        payload: bytes,
+        payload: bytes | bytearray,
     ) -> AuthorizedAuthIngress:
         if (
             authority is None
             or not isinstance(plan, AuthSyncPlanV1)
-            or type(payload) is not bytes
+            or type(payload) not in {bytes, bytearray}
             or not 1 <= len(payload) <= MAX_AUTH_BYTES
         ):
             raise OpenAICredentialError("control.request_invalid")
@@ -498,7 +511,7 @@ class AuthorizedAuthIngress:
         ingress._generation = plan.expected_generation
         ingress._nonce = plan.nonce
         ingress._plan_digest = plan.plan_digest
-        ingress._payload = bytearray(payload)
+        ingress._payload = payload if type(payload) is bytearray else bytearray(payload)
         ingress._consumed = False
         ingress._closed = False
         ingress._process_id = os.getpid()
@@ -811,6 +824,59 @@ class OpenAICredentialService:
         )
         self._register_plan(plan)
         return plan
+
+    def resolve_auth_sync_plan(
+        self,
+        account_ref: str,
+        *,
+        expected_generation: int,
+        plan_digest: str,
+    ) -> AuthSyncPlanV1:
+        account_ref = _account_ref(account_ref)
+        expected_generation = _generation(expected_generation)
+        if type(plan_digest) is not str:
+            raise OpenAICredentialError("control.plan_stale")
+        stored_digest = plan_digest.removeprefix("sha256:")
+        if re.fullmatch(r"[0-9a-f]{64}", stored_digest, re.ASCII) is None:
+            raise OpenAICredentialError("control.plan_stale")
+        record = self._receipts.resolve(account_ref, expected_generation, stored_digest)
+        plan = AuthSyncPlanV1(
+            account_ref,
+            expected_generation,
+            cast(float, record["expires_at"]),
+            cast(str, record["nonce"]),
+            cast(str, record["idempotency_key"]),
+            stored_digest,
+            self._plan_issuer,
+        )
+        self._register_plan(plan)
+        return plan
+
+    def authorize_auth_ingress(
+        self, plan: AuthSyncPlanV1, payload: bytearray
+    ) -> AuthorizedAuthIngress:
+        plan = self._validated_plan(plan)
+        if type(payload) is not bytearray:
+            raise OpenAICredentialError("credential.upload_expired")
+        return AuthorizedAuthIngress.issue(self._ingress_authority, plan, payload)
+
+    def reconcile_auth_sync_plan(
+        self, plan: AuthSyncPlanV1
+    ) -> AuthSyncReceiptV1 | None:
+        plan = self._validated_plan(plan)
+        status = self._receipts.status(plan)
+        if status == "succeeded":
+            return self._receipt(plan)
+        if status != "running":
+            return None
+        try:
+            metadata = self._vault.projection_metadata(plan.account_ref)
+        except CredentialVaultError:
+            raise OpenAICredentialError("credential.source_unavailable") from None
+        if metadata != ("active", plan.expected_generation):
+            raise OpenAICredentialError("control.operation_ambiguous")
+        self._receipts.succeed(plan)
+        return self._receipt(plan)
 
     def apply_auth_sync(
         self,

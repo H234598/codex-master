@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import codex_master.admin_secret_ingress as ingress_module
 
 from codex_master.admin_secret_ingress import (
     AdminSecretIngressError,
     AdminSecretIngressOwner,
+    SecretUploadClaimV1,
 )
-from codex_master.admin_service import SecretIngressCapabilityV1
+from codex_master.admin_service import (
+    MasterjetControlService,
+    SecretIngressCapabilityV1,
+)
 from codex_master.credential_vault import CredentialVault
 from test_admin_service import command, principal, service_at
 
@@ -21,9 +27,6 @@ def _owner(root: Path, clock=lambda: 1_000.0) -> AdminSecretIngressOwner:
     return AdminSecretIngressOwner(
         root / "state",
         vault=vault,
-        plan_resolver=lambda kind, _account, plan_id: (
-            "google-client-plan" if kind == "google.oauth-client" else "plan:" + plan_id
-        ),
         clock=clock,
     )
 
@@ -36,8 +39,52 @@ def _session(owner: AdminSecretIngressOwner):
         expected_generation=4,
         idempotency_key="idem-create",
         plan_digest=DIGEST,
-        plan_id="plan-one",
     )
+
+
+def test_create_replay_returns_original_session_after_clock_advance_and_restart(
+    tmp_path,
+) -> None:
+    now = [1_000.0]
+    owner = _owner(tmp_path, clock=lambda: now[0])
+    first = _session(owner)
+
+    now[0] = 1_050.0
+    replay = _session(_owner(tmp_path, clock=lambda: now[0]))
+
+    assert replay == first
+    assert replay.expires_at == 1_120.0
+    assert replay.plan_digest == DIGEST
+    assert replay.expected_generation == 4
+
+
+def test_create_concurrent_replay_returns_one_persisted_session(tmp_path) -> None:
+    owner = _owner(tmp_path)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        sessions = list(pool.map(lambda _index: _session(owner), range(8)))
+
+    assert sessions == [sessions[0]] * 8
+
+
+def test_create_prunes_expired_authorized_session_at_bound(
+    tmp_path, monkeypatch
+) -> None:
+    now = [1_000.0]
+    owner = _owner(tmp_path, clock=lambda: now[0])
+    monkeypatch.setattr(ingress_module, "_MAX_SESSIONS", 1)
+    _session(owner)
+    now[0] = 1_121.0
+
+    replacement = owner.create_session(
+        principal="operator-one",
+        account_ref="google-two",
+        credential_kind="google.oauth-client",
+        expected_generation=4,
+        idempotency_key="idem-other",
+        plan_digest=DIGEST,
+    )
+
+    assert replacement.account_ref == "google-two"
 
 
 def test_concrete_owner_rejects_upload_without_reserved_exact_session(tmp_path) -> None:
@@ -49,6 +96,116 @@ def test_concrete_owner_rejects_upload_without_reserved_exact_session(tmp_path) 
             principal="operator-one",
             upload_claim=None,
         )
+
+
+def test_upload_claim_is_restart_verifiable_and_forgery_is_denied(tmp_path) -> None:
+    owner = _owner(tmp_path)
+    session = _session(owner)
+    claim = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+
+    restarted = _owner(tmp_path)
+    replay = restarted.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    assert replay == claim
+    with pytest.raises(AdminSecretIngressError, match="credential.upload_expired"):
+        restarted.put_secret(
+            session.id,
+            bytearray(b"forged"),
+            principal="operator-one",
+            upload_claim=SecretUploadClaimV1(session.id, "0" * 64),
+        )
+
+    receipt = restarted.put_secret(
+        session.id,
+        bytearray(b"oauth-client-json"),
+        principal="operator-one",
+        upload_claim=replay,
+    )
+    restarted.commit_upload(replay, receipt)
+
+
+def test_upload_reconciles_vault_success_when_store_reports_failure(
+    tmp_path, monkeypatch
+) -> None:
+    owner = _owner(tmp_path)
+    session = _session(owner)
+    claim = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    real_store = CredentialVault.store_projection
+
+    def write_then_fail(vault, *args, **kwargs):
+        real_store(vault, *args, **kwargs)
+        raise RuntimeError("fault after durable write")
+
+    monkeypatch.setattr(CredentialVault, "store_projection", write_then_fail)
+    receipt = owner.put_secret(
+        session.id,
+        bytearray(b"oauth-client-json"),
+        principal="operator-one",
+        upload_claim=claim,
+    )
+    owner.commit_upload(claim, receipt)
+
+    assert receipt.generation == 5
+
+
+def test_upload_commit_failure_is_reconciled_after_restart(
+    tmp_path, monkeypatch
+) -> None:
+    owner = _owner(tmp_path)
+    session = _session(owner)
+    claim = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    receipt = owner.put_secret(
+        session.id,
+        bytearray(b"oauth-client-json"),
+        principal="operator-one",
+        upload_claim=claim,
+    )
+    real_write = owner._write_locked  # noqa: SLF001 - durable fault injection
+
+    def fail_uploaded(document):
+        record = document["sessions"][session.id]
+        if record["state"] == "uploaded":
+            raise AdminSecretIngressError("control.owner_unavailable")
+        real_write(document)
+
+    monkeypatch.setattr(owner, "_write_locked", fail_uploaded)
+    with pytest.raises(AdminSecretIngressError, match="control.owner_unavailable"):
+        owner.commit_upload(claim, receipt)
+
+    restarted = _owner(tmp_path)
+    replay = restarted.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    replay_receipt = restarted.put_secret(
+        session.id,
+        bytearray(b"same-request-retry"),
+        principal="operator-one",
+        upload_claim=replay,
+    )
+    restarted.commit_upload(replay, replay_receipt)
+    assert replay_receipt == receipt
 
 
 def test_concrete_owner_persists_exact_one_shot_capability_across_restart(
@@ -77,7 +234,6 @@ def test_concrete_owner_persists_exact_one_shot_capability_across_restart(
         operation="google.oauth-client-import.apply",
         account_ref="google-one",
         credential_kind="google.oauth-client",
-        plan_id="plan-one",
         plan_digest=DIGEST,
         expected_generation=4,
         create_idempotency_key="idem-create",
@@ -95,7 +251,6 @@ def test_concrete_owner_persists_exact_one_shot_capability_across_restart(
             operation="google.oauth-client-import.apply",
             account_ref="google-one",
             credential_kind="google.oauth-client",
-            plan_id="plan-one",
             plan_digest=DIGEST,
             expected_generation=4,
             create_idempotency_key="idem-create",
@@ -129,7 +284,6 @@ def test_concrete_owner_rolls_back_known_owner_failure_for_idempotent_retry(
         operation="google.oauth-client-import.apply",
         account_ref="google-one",
         credential_kind="google.oauth-client",
-        plan_id="plan-one",
         plan_digest=DIGEST,
         expected_generation=4,
         create_idempotency_key="idem-create",
@@ -145,7 +299,6 @@ def test_concrete_owner_rolls_back_known_owner_failure_for_idempotent_retry(
         operation="google.oauth-client-import.apply",
         account_ref="google-one",
         credential_kind="google.oauth-client",
-        plan_id="plan-one",
         plan_digest=DIGEST,
         expected_generation=4,
         create_idempotency_key="idem-create",
@@ -156,17 +309,143 @@ def test_concrete_owner_rolls_back_known_owner_failure_for_idempotent_retry(
     assert retry.session_id == session.id
 
 
+def test_resolve_commit_reconciles_revoked_vault_after_journal_failure(
+    tmp_path, monkeypatch
+) -> None:
+    owner = _owner(tmp_path)
+    session = _session(owner)
+    upload = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    receipt = owner.put_secret(
+        session.id,
+        bytearray(b"oauth-client-json"),
+        principal="operator-one",
+        upload_claim=upload,
+    )
+    owner.commit_upload(upload, receipt)
+    claim = owner.reserve_resolve(
+        session.id,
+        principal="operator-one",
+        operation="google.oauth-client-import.apply",
+        account_ref="google-one",
+        credential_kind="google.oauth-client",
+        plan_digest=DIGEST,
+        expected_generation=4,
+        create_idempotency_key="idem-create",
+        upload_idempotency_key="idem-upload",
+        idempotency_key="idem-apply",
+        receipt_generation=receipt.generation,
+    )
+    resolution = owner.resolve(claim)
+    real_write = owner._write_locked  # noqa: SLF001 - durable fault injection
+
+    def fail_resolved(document):
+        record = document["sessions"][session.id]
+        if record["state"] == "resolved":
+            raise AdminSecretIngressError("control.owner_unavailable")
+        real_write(document)
+
+    monkeypatch.setattr(owner, "_write_locked", fail_resolved)
+    with pytest.raises(AdminSecretIngressError, match="control.owner_unavailable"):
+        owner.commit_resolve(resolution)
+
+    restarted = _owner(tmp_path)
+    restarted.reconcile_resolve(claim)
+    with pytest.raises(AdminSecretIngressError, match="credential.upload_expired"):
+        restarted.reserve_resolve(
+            session.id,
+            principal="operator-one",
+            operation="google.oauth-client-import.apply",
+            account_ref="google-one",
+            credential_kind="google.oauth-client",
+            plan_digest=DIGEST,
+            expected_generation=4,
+            create_idempotency_key="idem-create",
+            upload_idempotency_key="idem-upload",
+            idempotency_key="idem-apply",
+            receipt_generation=receipt.generation,
+        )
+
+
+def test_apply_unknown_retries_same_durable_claim_then_commits(tmp_path) -> None:
+    owner = _owner(tmp_path)
+    session = _session(owner)
+    upload = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    receipt = owner.put_secret(
+        session.id,
+        bytearray(b"oauth-client-json"),
+        principal="operator-one",
+        upload_claim=upload,
+    )
+    owner.commit_upload(upload, receipt)
+    values = {
+        "principal": "operator-one",
+        "operation": "google.oauth-client-import.apply",
+        "account_ref": "google-one",
+        "credential_kind": "google.oauth-client",
+        "plan_digest": DIGEST,
+        "expected_generation": 4,
+        "create_idempotency_key": "idem-create",
+        "upload_idempotency_key": "idem-upload",
+        "idempotency_key": "idem-apply",
+        "receipt_generation": receipt.generation,
+    }
+    claim = owner.reserve_resolve(session.id, **values)
+    first = owner.resolve(claim)
+    owner.mark_resolve_unknown(first)
+
+    restarted = _owner(tmp_path)
+    assert restarted.reserve_resolve(session.id, **values) == claim
+    retry = restarted.resolve(claim)
+    assert restarted.read_oauth_client(
+        retry,
+        account_ref="google-one",
+        expected_generation=4,
+        plan_digest=DIGEST,
+    ) == bytearray(b"oauth-client-json")
+    restarted.acknowledge_oauth_client(
+        retry,
+        account_ref="google-one",
+        expected_generation=4,
+        plan_digest=DIGEST,
+        ack_operation_id=DIGEST,
+    )
+
+
 def test_real_service_create_put_apply_uses_concrete_owner_one_shot(tmp_path) -> None:
-    service, owners = service_at()
-    service._secret_ingress = _owner(tmp_path)  # noqa: SLF001 - injected owner port
-    who = principal("fleet.secrets.ingress", "fleet.google.oauth", step_up=True)
+    _service, owners = service_at()
+    service = MasterjetControlService.with_admin_secret_ingress(
+        secret_ingress_state_root=tmp_path / "state",
+        secret_ingress_vault=CredentialVault.for_test(
+            tmp_path / "vault", key=b"k" * 32, clock=lambda: 1_000.0
+        ),
+        operation_store=owners.operation_store,
+        openai_accounts=owners.openai_accounts,
+        openai_credentials=owners.openai_credentials,
+        google_manager=owners.google_manager,
+        google_oauth=owners.google_oauth,
+        quota_collector=owners.quota_collector,
+        google_provisioner=owners.google_provisioner,
+        google_billing=owners.google_billing,
+        host_registry=owners.hosts,
+        clock=lambda: 1_000.0,
+    )
+    who = principal("fleet.secrets.ingress", step_up=True)
     created = command(
         service,
         "secret.ingress.create",
         {
-            "account_ref": "google-one",
-            "credential_kind": "google.oauth-client",
-            "plan_id": "plan-one",
+            "account_ref": "openai-one",
+            "credential_kind": "openai.auth-json",
         },
         "fleet.secrets.ingress",
         digest=DIGEST,
@@ -181,16 +460,16 @@ def test_real_service_create_put_apply_uses_concrete_owner_one_shot(tmp_path) ->
     receipt = service.put_secret(
         who,
         created["id"],
-        bytearray(b"oauth-client-json"),
+        bytearray(b"openai-upload"),
         upload_claim=claim,
     )
     capability = SecretIngressCapabilityV1(
         created["id"],
         "operator-one",
-        "google-one",
-        "google.oauth-client-import.apply",
-        "google.oauth-client",
-        "plan-one",
+        "openai-one",
+        "openai.auth.apply",
+        "openai.auth-json",
+        None,
         DIGEST,
         4,
         "request-one",
@@ -203,22 +482,22 @@ def test_real_service_create_put_apply_uses_concrete_owner_one_shot(tmp_path) ->
 
     applied = command(
         service,
-        "google.oauth-client-import.apply",
-        {"account_ref": "google-one", "plan_id": "plan-one"},
-        "fleet.google.oauth",
+        "openai.auth.apply",
+        {"account_ref": "openai-one"},
+        "fleet.secrets.ingress",
         digest=DIGEST,
         ingress_session=capability,
         step_up=True,
     )
 
-    assert applied["account_ref"] == "google-one"
-    assert owners.google_oauth.calls == ["client-apply"]
+    assert applied["account_ref"] == "openai-one"
+    assert owners.openai_credentials.apply_calls == 1
     with pytest.raises(Exception, match="credential.upload_expired"):
         command(
             service,
-            "google.oauth-client-import.apply",
-            {"account_ref": "google-one", "plan_id": "plan-one"},
-            "fleet.google.oauth",
+            "openai.auth.apply",
+            {"account_ref": "openai-one"},
+            "fleet.secrets.ingress",
             digest=DIGEST,
             ingress_session=capability,
             step_up=True,

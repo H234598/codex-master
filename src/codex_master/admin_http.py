@@ -97,7 +97,7 @@ class _FlowGrant:
     subject: str
     account_ref: str
     plan_digest: str
-    plan_id: str | None
+    transaction_id: str | None
     apply_operation: str
     credential_kind: str
     expected_generation: int
@@ -130,12 +130,22 @@ class _FlowGrants:
         account_ref = request.arguments.get("account_ref")
         plan_digest = request.plan_digest
         apply_operation = _FLOW_APPLY.get(cast(str, credential_kind))
+        expires_at = result.get("expires_at")
+        result_digest = result.get("plan_digest")
+        result_generation = result.get("expected_generation")
+        session_generation = result.get("session_generation")
         if (
             type(session_id) is not str
             or _SESSION.fullmatch(session_id) is None
             or type(account_ref) is not str
             or type(plan_digest) is not str
             or apply_operation is None
+            or type(expires_at) not in {int, float}
+            or not math.isfinite(cast(float, expires_at))
+            or cast(float, expires_at) <= _clock_value(self._clock)
+            or result_digest != plan_digest
+            or result_generation != request.expected_generation
+            or session_generation != request.expected_generation
         ):
             return
         now = _clock_value(self._clock)
@@ -143,7 +153,7 @@ class _FlowGrants:
             principal.subject,
             account_ref,
             plan_digest,
-            cast(str | None, request.arguments.get("plan_id")),
+            cast(str | None, request.arguments.get("transaction_id")),
             apply_operation,
             cast(str, credential_kind),
             cast(int, request.expected_generation),
@@ -151,7 +161,7 @@ class _FlowGrants:
             None,
             None,
             session_id,
-            now + self._ttl,
+            cast(float, expires_at),
             "upload",
         )
         with self._lock:
@@ -221,13 +231,10 @@ class _FlowGrants:
         def request_matches(grant: _FlowGrant) -> bool:
             if grant.apply_operation == "google.oauth.complete":
                 return (
-                    grant.plan_id == request.arguments.get("transaction_id")
+                    grant.transaction_id == request.arguments.get("transaction_id")
                     and request.plan_digest is None
                 )
-            return (
-                grant.plan_digest == request.plan_digest
-                and grant.plan_id == request.arguments.get("plan_id")
-            )
+            return grant.plan_digest == request.plan_digest
 
         with self._lock:
             self._prune(now)
@@ -253,7 +260,7 @@ class _FlowGrants:
                 grant.account_ref,
                 grant.apply_operation,
                 grant.credential_kind,
-                grant.plan_id,
+                grant.transaction_id,
                 grant.plan_digest,
                 grant.expected_generation,
                 grant.create_idempotency_key,

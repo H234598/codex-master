@@ -27,6 +27,7 @@ _MAX_STATE_BYTES: Final[int] = 2 * 1024 * 1024
 _MAX_SESSIONS: Final[int] = 4096
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+_CLAIM = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _KINDS = frozenset({"openai.auth-json", "google.oauth-client", "google-oauth-code"})
 _OPERATIONS = {
     "openai.auth-json": "openai.auth.apply",
@@ -41,8 +42,7 @@ AdminSecretIngressError = SecretIngressOwnerError
 @dataclass(frozen=True, slots=True, repr=False)
 class SecretUploadClaimV1:
     session_id: str
-    nonce: str
-    _issuer: object
+    claim_id: str
 
     def __repr__(self) -> str:
         return "SecretUploadClaimV1(<redacted>)"
@@ -51,8 +51,7 @@ class SecretUploadClaimV1:
 @dataclass(frozen=True, slots=True, repr=False)
 class SecretResolveClaimV1:
     session_id: str
-    nonce: str
-    _issuer: object
+    claim_id: str
 
     def __repr__(self) -> str:
         return "SecretResolveClaimV1(<redacted>)"
@@ -66,13 +65,11 @@ class AdminSecretIngressOwner:
         state_root: Path,
         *,
         vault: CredentialVault,
-        plan_resolver: Callable[[str, str, str], object],
         clock: Callable[[], float] = time.time,
         ttl_seconds: int = 120,
     ) -> None:
         if (
             not isinstance(vault, CredentialVault)
-            or not callable(plan_resolver)
             or not callable(clock)
             or type(ttl_seconds) is not int
             or not 30 <= ttl_seconds <= 900
@@ -83,10 +80,8 @@ class AdminSecretIngressOwner:
         except HiveStateError:
             raise AdminSecretIngressError("control.owner_unavailable") from None
         self._vault = vault
-        self._plan_resolver = plan_resolver
         self._clock = clock
         self._ttl = ttl_seconds
-        self._issuer = object()
 
     def create_session(self, **values: object) -> SecretIngressSessionV1:
         principal = _token(values.get("principal"))
@@ -97,17 +92,28 @@ class AdminSecretIngressOwner:
         generation = _generation(values.get("expected_generation"))
         idempotency_key = _token(values.get("idempotency_key"))
         digest = _digest(values.get("plan_digest"))
-        plan_id_value = values.get("plan_id")
-        plan_id = _token(plan_id_value) if plan_id_value is not None else None
+        transaction_value = values.get("transaction_id")
+        transaction_id = (
+            _token(transaction_value) if transaction_value is not None else None
+        )
         now = _now(self._clock)
         session_id = _session_id(principal, account_ref, kind, idempotency_key)
-        record = {
+        fingerprint = _request_fingerprint(
+            principal,
+            account_ref,
+            kind,
+            digest,
+            generation,
+            idempotency_key,
+            transaction_id,
+        )
+        record: dict[str, object] = {
             "session_id": session_id,
             "principal": principal,
             "account_ref": account_ref,
             "credential_kind": kind,
             "operation": _OPERATIONS[kind],
-            "plan_id": plan_id,
+            "transaction_id": transaction_id,
             "plan_digest": digest,
             "expected_generation": generation,
             "create_idempotency_key": idempotency_key,
@@ -115,22 +121,71 @@ class AdminSecretIngressOwner:
             "apply_idempotency_key": None,
             "receipt_generation": None,
             "expires_at": now + self._ttl,
-            "claim_nonce": None,
+            "claim_id": None,
+            "request_fingerprint": fingerprint,
             "state": "authorized",
         }
         with self._state.locked():
             document = self._read_locked()
             sessions = cast(dict[str, object], document["sessions"])
+            pruned = self._prune_locked(sessions, now)
             existing = sessions.get(session_id)
             if existing is not None:
-                if existing != record:
+                if (
+                    type(existing) is not dict
+                    or existing.get("request_fingerprint") != fingerprint
+                ):
                     raise AdminSecretIngressError("control.request_invalid")
+                record = cast(dict[str, object], existing)
             else:
                 if len(sessions) >= _MAX_SESSIONS:
                     raise AdminSecretIngressError("control.owner_unavailable")
                 sessions[session_id] = record
                 self._write_locked(document)
-        return SecretIngressSessionV1(session_id, account_ref, "authorized")
+            if pruned and existing is not None:
+                self._write_locked(document)
+        return SecretIngressSessionV1(
+            session_id,
+            account_ref,
+            cast(str, record["state"]),
+            digest,
+            generation,
+            cast(float, record["expires_at"]),
+            generation,
+        )
+
+    def _prune_locked(self, sessions: dict[str, object], now: float) -> bool:
+        removed = False
+        for session_id, value in tuple(sessions.items()):
+            if type(value) is not dict:
+                continue
+            state = value.get("state")
+            expires_at = value.get("expires_at")
+            expired = (
+                type(expires_at) in {int, float} and cast(float, expires_at) <= now
+            )
+            if state == "resolved" or (state == "authorized" and expired):
+                sessions.pop(session_id)
+                removed = True
+                continue
+            if state != "uploaded" or not expired:
+                continue
+            generation = value.get("receipt_generation")
+            if type(generation) is not int:
+                continue
+            try:
+                metadata = self._vault.projection_metadata(session_id)
+                if metadata == ("active", generation):
+                    self._vault.revoke_account(
+                        session_id, expected_generation=generation
+                    )
+                    metadata = ("revoked", generation)
+                if metadata in {None, ("revoked", generation)}:
+                    sessions.pop(session_id)
+                    removed = True
+            except CredentialVaultError:
+                continue
+        return removed
 
     def reserve_upload(
         self,
@@ -144,22 +199,30 @@ class AdminSecretIngressOwner:
         principal = _token(principal)
         expected_generation = _generation(expected_generation)
         idempotency_key = _token(idempotency_key)
-        nonce = secrets.token_hex(32)
+        claim_id = secrets.token_hex(32)
         with self._state.locked():
             document = self._read_locked()
             record = self._record(document, session_id)
             self._live(record)
+            if (
+                record["state"] in {"upload_reserved", "upload_in_progress"}
+                and record["principal"] == principal
+                and record["expected_generation"] == expected_generation
+                and record["upload_idempotency_key"] == idempotency_key
+                and type(record["claim_id"]) is str
+            ):
+                return SecretUploadClaimV1(session_id, record["claim_id"])
             if (
                 record["state"] != "authorized"
                 or record["principal"] != principal
                 or record["expected_generation"] != expected_generation
             ):
                 raise AdminSecretIngressError("credential.upload_expired")
-            record["state"] = "uploading"
-            record["claim_nonce"] = nonce
+            record["state"] = "upload_reserved"
+            record["claim_id"] = claim_id
             record["upload_idempotency_key"] = idempotency_key
             self._write_locked(document)
-        return SecretUploadClaimV1(session_id, nonce, self._issuer)
+        return SecretUploadClaimV1(session_id, claim_id)
 
     def put_secret(
         self,
@@ -175,18 +238,31 @@ class AdminSecretIngressOwner:
             document = self._read_locked()
             record = self._record(document, claim.session_id)
             if (
-                record["state"] != "uploading"
-                or record["claim_nonce"] != claim.nonce
+                record["state"] not in {"upload_reserved", "upload_in_progress"}
+                or record["claim_id"] != claim.claim_id
                 or record["principal"] != principal
             ):
                 raise AdminSecretIngressError("credential.upload_expired")
             generation = cast(int, record["expected_generation"]) + 1
-        raw = _secret_bytes(secret)
+            if record["state"] == "upload_reserved":
+                record["state"] = "upload_in_progress"
+                self._write_locked(document)
+        raw = _secret_view(secret)
         try:
-            self._vault.store_projection(claim.session_id, generation, raw)
-        except CredentialVaultError:
-            self._mark_unknown(claim)
-            raise AdminSecretIngressError("control.owner_unavailable") from None
+            try:
+                existing = self._vault.projection_metadata(claim.session_id)
+                if existing != ("active", generation):
+                    self._vault.store_projection(claim.session_id, generation, raw)
+            except BaseException:
+                existing = self._projection_metadata_or_unknown(claim)
+                if existing != ("active", generation):
+                    if existing is None:
+                        self._restore_upload_reservation(claim)
+                    else:
+                        self._mark_unknown(claim)
+                    raise AdminSecretIngressError("control.owner_unavailable") from None
+        finally:
+            raw.release()
         return SecretIngressUploadReceiptV1(
             claim.session_id,
             cast(str, record["account_ref"]),
@@ -202,14 +278,14 @@ class AdminSecretIngressOwner:
             document = self._read_locked()
             record = self._record(document, claim.session_id)
             if (
-                record["state"] != "uploading"
-                or record["claim_nonce"] != claim.nonce
+                record["state"] != "upload_in_progress"
+                or record["claim_id"] != claim.claim_id
                 or receipt.generation != cast(int, record["expected_generation"]) + 1
             ):
                 raise AdminSecretIngressError("control.owner_unavailable")
             record["state"] = "uploaded"
             record["receipt_generation"] = receipt.generation
-            record["claim_nonce"] = None
+            record["claim_id"] = None
             self._write_locked(document)
 
     def rollback_upload(self, claim: SecretUploadClaimV1) -> None:
@@ -217,9 +293,12 @@ class AdminSecretIngressOwner:
         with self._state.locked():
             document = self._read_locked()
             record = self._record(document, claim.session_id)
-            if record["state"] == "uploading" and record["claim_nonce"] == claim.nonce:
+            if (
+                record["state"] == "upload_reserved"
+                and record["claim_id"] == claim.claim_id
+            ):
                 record["state"] = "authorized"
-                record["claim_nonce"] = None
+                record["claim_id"] = None
                 record["upload_idempotency_key"] = None
                 self._write_locked(document)
 
@@ -232,7 +311,7 @@ class AdminSecretIngressOwner:
             "operation": _token(values.get("operation")),
             "account_ref": _token(values.get("account_ref")),
             "credential_kind": _token(values.get("credential_kind")),
-            "plan_id": _optional_token(values.get("plan_id")),
+            "transaction_id": _optional_token(values.get("transaction_id")),
             "plan_digest": _digest(values.get("plan_digest")),
             "expected_generation": _generation(values.get("expected_generation")),
             "create_idempotency_key": _token(values.get("create_idempotency_key")),
@@ -240,41 +319,114 @@ class AdminSecretIngressOwner:
             "receipt_generation": _generation(values.get("receipt_generation")),
         }
         idempotency_key = _token(values.get("idempotency_key"))
-        nonce = secrets.token_hex(32)
+        claim_id = secrets.token_hex(32)
         with self._state.locked():
             document = self._read_locked()
             record = self._record(document, session_id)
             self._live(record)
+            if (
+                record["state"]
+                in {"resolve_reserved", "resolve_in_progress", "apply_unknown"}
+                and record["apply_idempotency_key"] == idempotency_key
+                and all(record[key] == value for key, value in expected.items())
+                and type(record["claim_id"]) is str
+            ):
+                return SecretResolveClaimV1(session_id, record["claim_id"])
             if record["state"] != "uploaded" or any(
                 record[key] != value for key, value in expected.items()
             ):
                 raise AdminSecretIngressError("credential.upload_expired")
-            record["state"] = "resolving"
-            record["claim_nonce"] = nonce
+            record["state"] = "resolve_reserved"
+            record["claim_id"] = claim_id
             record["apply_idempotency_key"] = idempotency_key
             self._write_locked(document)
-        return SecretResolveClaimV1(session_id, nonce, self._issuer)
+        return SecretResolveClaimV1(session_id, claim_id)
 
     def resolve(self, claim: object) -> SecretIngressResolutionV1:
         claim = self._resolve_claim(claim)
         with self._state.locked():
             document = self._read_locked()
             record = self._record(document, claim.session_id)
-            if record["state"] != "resolving" or record["claim_nonce"] != claim.nonce:
+            if (
+                record["state"]
+                not in {"resolve_reserved", "resolve_in_progress", "apply_unknown"}
+                or record["claim_id"] != claim.claim_id
+            ):
                 raise AdminSecretIngressError("credential.upload_expired")
+            if record["state"] in {"resolve_reserved", "apply_unknown"}:
+                record["state"] = "resolve_in_progress"
+                self._write_locked(document)
             generation = cast(int, record["receipt_generation"])
-            plan_id = cast(str | None, record["plan_id"])
-            kind = cast(str, record["credential_kind"])
-            account_ref = cast(str, record["account_ref"])
         try:
             lease = self._vault.lease(
                 claim.session_id, expected_generation=generation, ttl_seconds=30
             )
             upload = bytearray(self._vault.consume_lease(lease))
-            plan = self._plan_resolver(kind, account_ref, plan_id or claim.session_id)
-        except (CredentialVaultError, Exception):
+        except CredentialVaultError:
             raise AdminSecretIngressError("control.owner_unavailable") from None
-        return SecretIngressResolutionV1(claim.session_id, plan, upload, claim)
+        return SecretIngressResolutionV1(claim.session_id, upload, claim)
+
+    def read_oauth_client(
+        self,
+        session: object,
+        *,
+        account_ref: str,
+        expected_generation: int,
+        plan_digest: str,
+    ) -> bytearray:
+        if type(session) is not SecretIngressResolutionV1:
+            raise AdminSecretIngressError("credential.upload_expired")
+        claim = self._resolution_claim(session)
+        self._assert_resolve_binding(
+            claim,
+            account_ref=account_ref,
+            expected_generation=expected_generation,
+            plan_digest=plan_digest,
+        )
+        return session.upload
+
+    def acknowledge_oauth_client(
+        self,
+        session: object,
+        *,
+        account_ref: str,
+        expected_generation: int,
+        plan_digest: str,
+        ack_operation_id: str,
+    ) -> None:
+        if (
+            ack_operation_id != plan_digest
+            or type(session) is not SecretIngressResolutionV1
+        ):
+            raise AdminSecretIngressError("credential.upload_expired")
+        claim = self._resolution_claim(session)
+        self._assert_resolve_binding(
+            claim,
+            account_ref=account_ref,
+            expected_generation=expected_generation,
+            plan_digest=plan_digest,
+        )
+        self.commit_resolve(session)
+
+    def _assert_resolve_binding(
+        self,
+        claim: SecretResolveClaimV1,
+        *,
+        account_ref: str,
+        expected_generation: int,
+        plan_digest: str,
+    ) -> None:
+        with self._state.locked():
+            document = self._read_locked()
+            record = self._record(document, claim.session_id)
+            if (
+                record["state"] != "resolve_in_progress"
+                or record["claim_id"] != claim.claim_id
+                or record["account_ref"] != account_ref
+                or record["expected_generation"] != expected_generation
+                or record["plan_digest"] != plan_digest
+            ):
+                raise AdminSecretIngressError("credential.upload_expired")
 
     def commit_resolve(self, resolution: SecretIngressResolutionV1) -> None:
         claim = self._resolution_claim(resolution)
@@ -283,21 +435,57 @@ class AdminSecretIngressOwner:
                 document = self._read_locked()
                 record = self._record(document, claim.session_id)
                 if (
-                    record["state"] != "resolving"
-                    or record["claim_nonce"] != claim.nonce
+                    record["state"] != "resolve_in_progress"
+                    or record["claim_id"] != claim.claim_id
                 ):
                     raise AdminSecretIngressError("control.owner_unavailable")
-                record["state"] = "resolved"
-                record["claim_nonce"] = None
-                self._write_locked(document)
-            self._vault.revoke_account(
-                claim.session_id,
-                expected_generation=cast(int, record["receipt_generation"]),
-            )
-        except CredentialVaultError:
-            raise AdminSecretIngressError("control.owner_unavailable") from None
+                generation = cast(int, record["receipt_generation"])
+            try:
+                metadata = self._vault.projection_metadata(claim.session_id)
+                if metadata == ("active", generation):
+                    self._vault.revoke_account(
+                        claim.session_id, expected_generation=generation
+                    )
+                elif metadata != ("revoked", generation):
+                    raise CredentialVaultError("credential.generation_conflict")
+            except CredentialVaultError:
+                self._mark_resolve_unknown(claim)
+                raise AdminSecretIngressError("control.owner_unavailable") from None
+            self.reconcile_resolve(claim)
         finally:
             _wipe(resolution.upload)
+
+    def reconcile_resolve(self, claim: object) -> None:
+        claim = self._resolve_claim(claim)
+        with self._state.locked():
+            document = self._read_locked()
+            record = self._record(document, claim.session_id)
+            if (
+                record["state"] not in {"resolve_in_progress", "apply_unknown"}
+                or record["claim_id"] != claim.claim_id
+            ):
+                raise AdminSecretIngressError("credential.upload_expired")
+            generation = cast(int, record["receipt_generation"])
+            try:
+                metadata = self._vault.projection_metadata(claim.session_id)
+            except CredentialVaultError:
+                raise AdminSecretIngressError("control.owner_unavailable") from None
+            if metadata != ("revoked", generation):
+                raise AdminSecretIngressError("control.owner_unavailable")
+            record["state"] = "resolved"
+            record["claim_id"] = None
+            self._write_locked(document)
+
+    def _mark_resolve_unknown(self, claim: SecretResolveClaimV1) -> None:
+        with self._state.locked():
+            document = self._read_locked()
+            record = self._record(document, claim.session_id)
+            if (
+                record["state"] == "resolve_in_progress"
+                and record["claim_id"] == claim.claim_id
+            ):
+                record["state"] = "apply_unknown"
+                self._write_locked(document)
 
     def rollback_resolve(self, resolution: SecretIngressResolutionV1) -> None:
         claim = self._resolution_claim(resolution)
@@ -306,12 +494,19 @@ class AdminSecretIngressOwner:
                 document = self._read_locked()
                 record = self._record(document, claim.session_id)
                 if (
-                    record["state"] == "resolving"
-                    and record["claim_nonce"] == claim.nonce
+                    record["state"] in {"resolve_reserved", "resolve_in_progress"}
+                    and record["claim_id"] == claim.claim_id
                 ):
                     record["state"] = "uploaded"
-                    record["claim_nonce"] = None
+                    record["claim_id"] = None
                     self._write_locked(document)
+        finally:
+            _wipe(resolution.upload)
+
+    def mark_resolve_unknown(self, resolution: SecretIngressResolutionV1) -> None:
+        claim = self._resolution_claim(resolution)
+        try:
+            self._mark_resolve_unknown(claim)
         finally:
             _wipe(resolution.upload)
 
@@ -319,9 +514,35 @@ class AdminSecretIngressOwner:
         with self._state.locked():
             document = self._read_locked()
             record = self._record(document, claim.session_id)
-            if record["state"] == "uploading" and record["claim_nonce"] == claim.nonce:
+            if (
+                record["state"] == "upload_in_progress"
+                and record["claim_id"] == claim.claim_id
+            ):
                 record["state"] = "upload_unknown"
                 self._write_locked(document)
+
+    def _restore_upload_reservation(self, claim: SecretUploadClaimV1) -> None:
+        with self._state.locked():
+            document = self._read_locked()
+            record = self._record(document, claim.session_id)
+            if (
+                record["state"] == "upload_in_progress"
+                and record["claim_id"] == claim.claim_id
+            ):
+                record["state"] = "upload_reserved"
+                self._write_locked(document)
+
+    def _projection_metadata_or_unknown(
+        self, claim: SecretUploadClaimV1
+    ) -> tuple[str, int] | None:
+        try:
+            return cast(
+                tuple[str, int] | None,
+                self._vault.projection_metadata(claim.session_id),
+            )
+        except CredentialVaultError:
+            self._mark_unknown(claim)
+            raise AdminSecretIngressError("control.owner_unavailable") from None
 
     def _read_locked(self) -> dict[str, object]:
         try:
@@ -368,14 +589,17 @@ class AdminSecretIngressOwner:
     def _upload_claim(self, value: object, session_id: str) -> SecretUploadClaimV1:
         if (
             type(value) is not SecretUploadClaimV1
-            or value._issuer is not self._issuer
             or value.session_id != session_id
+            or _CLAIM.fullmatch(value.claim_id) is None
         ):
             raise AdminSecretIngressError("credential.upload_expired")
         return value
 
     def _resolve_claim(self, value: object) -> SecretResolveClaimV1:
-        if type(value) is not SecretResolveClaimV1 or value._issuer is not self._issuer:
+        if (
+            type(value) is not SecretResolveClaimV1
+            or _CLAIM.fullmatch(value.claim_id) is None
+        ):
             raise AdminSecretIngressError("credential.upload_expired")
         return value
 
@@ -388,6 +612,29 @@ class AdminSecretIngressOwner:
 def _session_id(principal: str, account: str, kind: str, key: str) -> str:
     payload = "\0".join((principal, account, kind, key)).encode("ascii")
     return "ingress-" + hashlib.sha256(payload).hexdigest()[:48]
+
+
+def _request_fingerprint(
+    principal: str,
+    account: str,
+    kind: str,
+    digest: str,
+    generation: int,
+    key: str,
+    transaction_id: str | None,
+) -> str:
+    payload = "\0".join(
+        (
+            principal,
+            account,
+            kind,
+            digest,
+            str(generation),
+            key,
+            transaction_id or "",
+        )
+    ).encode("ascii")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def _token(value: object) -> str:
@@ -419,18 +666,16 @@ def _now(clock: Callable[[], float]) -> float:
     return float(value)
 
 
-def _secret_bytes(value: object) -> bytes:
-    if type(value) is bytes and value:
-        return value
-    if type(value) is bytearray and value:
-        return bytes(value)
+def _secret_view(value: object) -> memoryview:
+    if type(value) in {bytes, bytearray} and value:
+        return memoryview(cast(bytes | bytearray, value))
     if (
         type(value) is memoryview
         and value.nbytes
         and value.ndim == 1
         and value.contiguous
     ):
-        return value.tobytes()
+        return memoryview(value)
     raise AdminSecretIngressError("control.request_invalid")
 
 

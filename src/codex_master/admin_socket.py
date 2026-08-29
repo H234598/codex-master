@@ -429,13 +429,15 @@ class AdminSocketServer:
             expected_generation=expected_generation,
             idempotency_key=idempotency_key,
         )
-        snapshot = _validate_secret_fd(fd, peer)
-        buffer = bytearray(snapshot.st_size + 1)
-        view = memoryview(buffer)
+        buffer = bytearray()
+        view: memoryview | None = None
         secret: memoryview | None = None
         used = 0
         eof = False
         try:
+            snapshot = _validate_secret_fd(fd, peer)
+            buffer = bytearray(snapshot.st_size + 1)
+            view = memoryview(buffer)
             while used < len(buffer):
                 count = os.preadv(fd, [view[used:]], used)
                 if count == 0:
@@ -449,21 +451,20 @@ class AdminSocketServer:
             return self._service.put_secret(
                 principal, session_id, secret, upload_claim=claim
             )
-        except _SocketFailure:
-            raise
-        except AdminServiceError:
-            raise
-        except BaseException:
+        except BaseException as error:
             try:
                 self._service.rollback_secret_upload(claim)
             except BaseException:
                 pass
+            if isinstance(error, (_SocketFailure, AdminServiceError)):
+                raise
             raise _SocketFailure("control.secret_fd_invalid") from None
         finally:
             if secret is not None:
                 secret.release()
-            view.release()
-            buffer[:used] = b"\0" * used
+            if view is not None:
+                view.release()
+            buffer[:] = b"\0" * len(buffer)
 
 
 class AdminSocketClient:

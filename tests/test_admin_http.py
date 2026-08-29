@@ -93,9 +93,10 @@ class _Service:
                 "id": "ingress-one",
                 "account_ref": "google-one",
                 "state": "pending",
-                "plan_id": request.arguments.get("plan_id") or request.plan_digest,
-                "expires_at": "2033-05-18T03:35:20Z",
+                "plan_digest": request.plan_digest,
+                "expires_at": NOW + 120.0,
                 "expected_generation": request.expected_generation,
+                "session_generation": request.expected_generation,
             }
         return {
             "operation": request.operation,
@@ -554,7 +555,7 @@ def test_google_oauth_code_crosses_only_typed_raw_ingress_boundary(tmp_path) -> 
         {
             "account_ref": "google-one",
             "credential_kind": "google-oauth-code",
-            "plan_id": "transaction-one",
+            "transaction_id": "transaction-one",
         },
         expected_generation=4,
         idempotency_key="idem-oauth-code",

@@ -90,6 +90,77 @@ def ingress(plan: object, raw: bytes) -> AuthorizedAuthIngress:
     return AuthorizedAuthIngress.issue(INGRESS_AUTHORITY, plan, raw)
 
 
+def test_resolve_auth_sync_plan_from_durable_digest_after_restart(tmp_path) -> None:
+    first = make_service(tmp_path)
+    plan = first.plan_auth_sync(
+        "openai-one", expected_generation=2, idempotency_key="resolve-one"
+    )
+    restarted = make_service(tmp_path)
+    resolved = restarted.resolve_auth_sync_plan(
+        "openai-one",
+        expected_generation=2,
+        plan_digest="sha256:" + plan.plan_digest,
+    )
+
+    assert (
+        resolved.account_ref,
+        resolved.expected_generation,
+        resolved.expires_at,
+        resolved.nonce,
+        resolved.idempotency_key,
+        resolved.plan_digest,
+    ) == (
+        plan.account_ref,
+        plan.expected_generation,
+        plan.expires_at,
+        plan.nonce,
+        plan.idempotency_key,
+        plan.plan_digest,
+    )
+
+
+def test_authorize_auth_ingress_accepts_mutable_owner_buffer_without_copy(
+    tmp_path,
+) -> None:
+    service = make_service(tmp_path)
+    plan = service.plan_auth_sync(
+        "openai-one", expected_generation=2, idempotency_key="mutable-one"
+    )
+    payload = bytearray(auth_json("acct-one"))
+    authorized = service.authorize_auth_ingress(plan, payload)
+
+    service.apply_auth_sync(plan, authorized)
+
+    assert payload == bytearray(len(payload))
+
+
+def test_reconcile_running_plan_from_durable_vault_projection_after_restart(
+    tmp_path, monkeypatch
+) -> None:
+    service = make_service(tmp_path)
+    plan = service.plan_auth_sync(
+        "openai-one", expected_generation=2, idempotency_key="reconcile-one"
+    )
+
+    def fail_receipt_commit(_store, _plan):
+        raise OpenAICredentialError("credential.source_unavailable")
+
+    monkeypatch.setattr(OpenAIAuthReceiptStore, "succeed", fail_receipt_commit)
+    with pytest.raises(OpenAICredentialError, match="credential.source_unavailable"):
+        service.apply_auth_sync(plan, ingress(plan, auth_json("acct-one")))
+    monkeypatch.undo()
+
+    restarted = make_service(tmp_path)
+    resolved = restarted.resolve_auth_sync_plan(
+        "openai-one",
+        expected_generation=2,
+        plan_digest="sha256:" + plan.plan_digest,
+    )
+    receipt = restarted.reconcile_auth_sync_plan(resolved)
+
+    assert receipt.state == "succeeded"
+
+
 def synced_service(
     tmp_path: Path, *, clock: Clock | None = None
 ) -> OpenAICredentialService:

@@ -1575,6 +1575,31 @@ class GoogleOAuthControlService:
             self._write_locked(document)
             return self._import_plan(record)
 
+    def resolve_oauth_client_import_plan(
+        self,
+        account_ref: str,
+        *,
+        expected_generation: int,
+        plan_digest: str,
+    ) -> GoogleOAuthClientImportPlanV1:
+        account_ref = self._ref(account_ref)
+        expected_generation = self._generation(expected_generation)
+        if type(plan_digest) is not str or _DIGEST.fullmatch(plan_digest) is None:
+            raise GoogleOAuthSessionError("oauth.import_plan_invalid")
+        with self._state.locked():
+            document = self._read_locked()
+            for value in cast(list[object], document["imports"]):
+                record = cast(dict[str, object], value)
+                if (
+                    record["account_ref"] == account_ref
+                    and record["expected_generation"] == expected_generation
+                    and secrets.compare_digest(
+                        cast(str, record["plan_digest"]), plan_digest
+                    )
+                ):
+                    return self._import_plan(record)
+        raise GoogleOAuthSessionError("oauth.import_plan_invalid")
+
     @staticmethod
     def _import_plan(record: Mapping[str, object]) -> GoogleOAuthClientImportPlanV1:
         return GoogleOAuthClientImportPlanV1(

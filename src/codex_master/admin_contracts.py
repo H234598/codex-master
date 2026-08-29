@@ -86,15 +86,7 @@ _OPERATION_ALIASES = {
     "openai.auth-sync.plan": "openai.auth.plan",
     "openai.auth-sync.apply": "openai.auth.apply",
 }
-_PLAN_ID_ARGUMENT_OPERATIONS = frozenset(
-    {
-        "openai.auth.apply",
-        "secret.ingress.create",
-        "google.oauth-client-import.apply",
-        "google.provision.apply",
-        "google.billing.apply",
-    }
-)
+_PLAN_ID_ARGUMENT_OPERATIONS = frozenset({"google.billing.apply"})
 _REQUEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -263,6 +255,8 @@ def _arguments(operation: str, value: object) -> Mapping[str, object]:
     allowed = set(fields)
     if operation in _PLAN_ID_ARGUMENT_OPERATIONS:
         allowed.add("plan_id")
+    if operation == "secret.ingress.create":
+        allowed.add("transaction_id")
     if set(arguments) - allowed or not set(fields) <= set(arguments):
         _invalid()
     result = {
@@ -279,6 +273,10 @@ def _arguments(operation: str, value: object) -> Mapping[str, object]:
         "google_oauth_client_json",
     }:
         _invalid()
+    if operation == "secret.ingress.create":
+        has_transaction = "transaction_id" in result
+        if (result["credential_kind"] == "google-oauth-code") != has_transaction:
+            _invalid()
     if operation == "secret.ingress.create":
         result["credential_kind"] = {
             "openai_auth_json": "openai.auth-json",

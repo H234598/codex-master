@@ -172,6 +172,15 @@ class OpenAICredentials:
         assert upload == bytearray(b"openai-upload")
         return AuthSyncReceiptV1("openai-one", 5, "a" * 64)
 
+    def resolve_auth_sync_plan(self, *_args: object, **_values: object) -> object:
+        return "openai-plan"
+
+    def authorize_auth_ingress(self, _plan: object, upload: bytearray) -> bytearray:
+        return upload
+
+    def reconcile_auth_sync_plan(self, _plan: object) -> None:
+        return None
+
 
 class GoogleManager:
     def __init__(self) -> None:
@@ -280,10 +289,16 @@ class GoogleOAuth:
     ) -> GoogleOAuthClientImportReceiptV1:
         self.calls.append("client-apply")
         assert plan == "google-client-plan"
-        assert type(ingress_session) is bytearray and ingress_session
+        assert type(ingress_session) is SecretIngressResolutionV1
+        assert ingress_session.upload
         return GoogleOAuthClientImportReceiptV1(
             "google-one", "client-one", "Quiet Client", 4, "a" * 64
         )
+
+    def resolve_oauth_client_import_plan(
+        self, *_args: object, **_values: object
+    ) -> object:
+        return "google-client-plan"
 
 
 class QuotaCollector:
@@ -428,7 +443,13 @@ class SecretIngress:
     def create_session(self, **values: object) -> SecretIngressSessionV1:
         self.create_calls += 1
         return SecretIngressSessionV1(
-            "ingress-one", str(values["account_ref"]), "authorized"
+            "ingress-one",
+            str(values["account_ref"]),
+            "authorized",
+            str(values["plan_digest"]),
+            int(values["expected_generation"]),
+            2_000_000_120.0,
+            int(values["expected_generation"]),
         )
 
     def reserve_resolve(self, session_id: str, **values: object) -> object:
@@ -441,14 +462,14 @@ class SecretIngress:
         kind = values["credential_kind"]
         if kind == "openai.auth-json":
             return SecretIngressResolutionV1(
-                session_id, "openai-plan", bytearray(b"openai-upload"), claim
+                session_id, bytearray(b"openai-upload"), claim
             )
         if kind == "google-oauth-code":
             return SecretIngressResolutionV1(
-                session_id, "oauth-transaction", bytearray(b"oauth-code"), claim
+                session_id, bytearray(b"oauth-code"), claim
             )
         return SecretIngressResolutionV1(
-            session_id, "google-client-plan", bytearray(b"google-client-upload"), claim
+            session_id, bytearray(b"google-client-upload"), claim
         )
 
     def commit_resolve(self, resolution: SecretIngressResolutionV1) -> None:
@@ -456,6 +477,10 @@ class SecretIngress:
         resolution.upload.clear()
 
     def rollback_resolve(self, resolution: SecretIngressResolutionV1) -> None:
+        self.resolve_rollbacks += 1
+        resolution.upload.clear()
+
+    def mark_resolve_unknown(self, resolution: SecretIngressResolutionV1) -> None:
         self.resolve_rollbacks += 1
         resolution.upload.clear()
 

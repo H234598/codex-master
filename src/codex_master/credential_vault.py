@@ -309,15 +309,26 @@ class CredentialVault:
         )
 
     def store_projection(
-        self, account_ref: str, generation: int, plaintext: bytes
+        self,
+        account_ref: str,
+        generation: int,
+        plaintext: bytes | bytearray | memoryview,
     ) -> None:
         self._ensure_current_process()
         account_ref = self._validated_account_ref(account_ref)
         generation = self._validated_generation(generation)
         if (
-            type(plaintext) is not bytes
-            or not plaintext
+            type(plaintext) not in {bytes, bytearray, memoryview}
+            or len(plaintext) == 0
             or len(plaintext) > MAX_PROJECTION_BYTES
+            or (
+                type(plaintext) is memoryview
+                and (
+                    plaintext.ndim != 1
+                    or plaintext.itemsize != 1
+                    or not plaintext.contiguous
+                )
+            )
         ):
             raise CredentialVaultError("credential.vault_request_invalid")
 
@@ -343,6 +354,27 @@ class CredentialVault:
         self._invoke_invalidators(invalidators)
         if cleanup_failed:
             raise CredentialVaultError("credential.source_unavailable")
+
+    def projection_metadata(self, account_ref: str) -> tuple[str, int] | None:
+        """Return authenticated non-secret projection state for reconciliation.
+
+        AESGCM.decrypt necessarily returns an immutable runtime ``bytes`` object;
+        this boundary cannot be wiped by Python. No plaintext leaves this method.
+        """
+
+        self._ensure_current_process()
+        account_ref = self._validated_account_ref(account_ref)
+        try:
+            with self._state.locked():
+                current = self._read_or_migrate_locked(account_ref)
+        except CredentialVaultError:
+            raise
+        except HiveStateError:
+            raise CredentialVaultError("credential.source_unavailable") from None
+        if current is None:
+            return None
+        state, generation, _plaintext = current
+        return ("active" if state == _STATE_ACTIVE else "revoked", generation)
 
     def lease(
         self,
@@ -953,7 +985,7 @@ class CredentialVault:
         account_ref: str,
         generation: int,
         record_state: int,
-        plaintext: bytes,
+        plaintext: bytes | bytearray | memoryview,
     ) -> bytes:
         nonce: bytes | None
         try:
@@ -963,15 +995,21 @@ class CredentialVault:
         if type(nonce) is not bytes or len(nonce) != _NONCE_BYTES:
             raise CredentialVaultError("credential.source_unavailable")
         encoded_ref = account_ref.encode("ascii")
-        envelope = len(encoded_ref).to_bytes(2, "big") + encoded_ref + plaintext
-        ciphertext = self._cipher.encrypt(
-            nonce,
-            envelope,
-            self._aad(account_ref, generation, record_state),
-        )
-        return (
+        envelope = bytearray(len(encoded_ref).to_bytes(2, "big"))
+        envelope.extend(encoded_ref)
+        envelope.extend(plaintext)
+        try:
+            ciphertext = self._cipher.encrypt(
+                nonce,
+                envelope,
+                self._aad(account_ref, generation, record_state),
+            )
+        finally:
+            self._zero(envelope)
+        return cast(
+            bytes,
             _HEADER.pack(_MAGIC, _SCHEMA_VERSION, record_state, generation, nonce)
-            + ciphertext
+            + ciphertext,
         )
 
     @staticmethod

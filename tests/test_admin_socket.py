@@ -86,6 +86,7 @@ class _SecretIngress:
         self.buffer: bytearray | None = None
         self.fail = False
         self.claims: list[object] = []
+        self.rollback_calls = 0
 
     def reserve_upload(self, session_id: str, **values: object) -> object:
         claim = (session_id, dict(values))
@@ -113,7 +114,7 @@ class _SecretIngress:
         return None
 
     def rollback_upload(self, _claim: object) -> None:
-        return None
+        self.rollback_calls += 1
 
     def create_session(self, **_values: object) -> SecretIngressSessionV1:
         raise AssertionError("not used")
@@ -1381,6 +1382,7 @@ def test_secret_put_rejects_non_regular_fd_and_closes_duplicate(
         assert _fd_count() == before
         assert os.fstat(read_fd)
         assert server.ingress.put_calls == 0
+        assert server.ingress.rollback_calls == 1
     finally:
         os.close(read_fd)
         os.close(write_fd)

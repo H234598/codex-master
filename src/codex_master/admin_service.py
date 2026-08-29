@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 import re
 from types import MappingProxyType
 from typing import Any, Protocol, cast
@@ -20,6 +21,7 @@ from .admin_contracts import (
 )
 from .admin_hosts import ControlHostV1, HostRegistry, HostRegistryError
 from .admin_operations import AdminOperationError, AdminOperationStore
+from .credential_vault import CredentialVault
 from .google_account_inventory import GoogleAccountInventoryError
 from .google_account_inventory_manager import GoogleAccountInventoryManager
 from .google_billing_service import (
@@ -164,6 +166,8 @@ class SecretIngressPort(Protocol):
 
     def rollback_resolve(self, resolution: SecretIngressResolutionV1) -> None: ...
 
+    def mark_resolve_unknown(self, resolution: SecretIngressResolutionV1) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class OpenAIAccountSummaryV1:
@@ -176,6 +180,10 @@ class SecretIngressSessionV1:
     id: str
     account_ref: str
     state: str
+    plan_digest: str = ""
+    expected_generation: int = 0
+    expires_at: float = 0.0
+    session_generation: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,7 +197,6 @@ class SecretIngressUploadReceiptV1:
 @dataclass(slots=True, repr=False)
 class SecretIngressResolutionV1:
     session_id: str
-    plan: object
     upload: bytearray
     claim: object
 
@@ -216,7 +223,7 @@ class SecretIngressCapabilityV1:
     account_ref: str
     operation: str
     credential_kind: str
-    plan_id: str | None
+    transaction_id: str | None
     plan_digest: str
     expected_generation: int
     create_idempotency_key: str
@@ -274,6 +281,45 @@ class MasterjetControlService:
         self._google_billing = google_billing
         self._host_registry = host_registry
         self._secret_ingress = secret_ingress
+
+    @classmethod
+    def with_admin_secret_ingress(
+        cls,
+        *,
+        secret_ingress_state_root: Path,
+        secret_ingress_vault: CredentialVault,
+        operation_store: AdminOperationStore,
+        openai_accounts: OpenAIAccountsPort | None,
+        openai_credentials: OpenAICredentialService | None,
+        google_manager: GoogleAccountInventoryManager,
+        google_oauth: GoogleOAuthControlService | None,
+        quota_collector: QuotaCollectorPort | None,
+        google_provisioner: GoogleProvisionerPort | None,
+        google_billing: GoogleBillingService | None,
+        host_registry: HostRegistry,
+        clock: Callable[[], float],
+    ) -> MasterjetControlService:
+        """Compose one concrete ingress owner with the existing business owners."""
+
+        from .admin_secret_ingress import AdminSecretIngressOwner
+
+        ingress = AdminSecretIngressOwner(
+            secret_ingress_state_root,
+            vault=secret_ingress_vault,
+            clock=clock,
+        )
+        return cls(
+            operation_store=operation_store,
+            openai_accounts=openai_accounts,
+            openai_credentials=openai_credentials,
+            google_manager=google_manager,
+            google_oauth=google_oauth,
+            quota_collector=quota_collector,
+            google_provisioner=google_provisioner,
+            google_billing=google_billing,
+            host_registry=host_registry,
+            secret_ingress=cast(SecretIngressPort, ingress),
+        )
 
     def query(
         self,
@@ -529,10 +575,20 @@ class MasterjetControlService:
             ingress_session,
             credential_kind="openai.auth-json",
         )
+        plan = credentials.resolve_auth_sync_plan(
+            cast(str, request.arguments["account_ref"]),
+            expected_generation=_generation(request),
+            plan_digest=_digest(request),
+        )
+        reconciled = credentials.reconcile_auth_sync_plan(plan)
+        if reconciled is not None:
+            ingress.commit_resolve(resolution)
+            return _serialize_openai_receipt(reconciled)
+        authorized = credentials.authorize_auth_ingress(plan, resolution.upload)
         try:
-            result = credentials.apply_auth_sync(resolution.plan, resolution.upload)
+            result = credentials.apply_auth_sync(plan, authorized)
         except Exception:
-            ingress.rollback_resolve(resolution)
+            ingress.mark_resolve_unknown(resolution)
             raise
         ingress.commit_resolve(resolution)
         return _serialize_openai_receipt(result)
@@ -552,7 +608,7 @@ class MasterjetControlService:
                 expected_generation=_generation(request),
                 idempotency_key=_idempotency(request),
                 plan_digest=_digest(request),
-                plan_id=request.arguments.get("plan_id"),
+                transaction_id=request.arguments.get("transaction_id"),
             )
         )
 
@@ -644,12 +700,16 @@ class MasterjetControlService:
             ingress_session,
             credential_kind="google.oauth-client",
         )
+        plan = owner.resolve_oauth_client_import_plan(
+            cast(str, request.arguments["account_ref"]),
+            expected_generation=_generation(request),
+            plan_digest=_digest(request),
+        )
         try:
-            result = owner.apply_oauth_client_import(resolution.plan, resolution.upload)
+            result = owner.apply_oauth_client_import(plan, resolution)
         except Exception:
-            ingress.rollback_resolve(resolution)
+            ingress.mark_resolve_unknown(resolution)
             raise
-        ingress.commit_resolve(resolution)
         return _serialize_oauth_client_receipt(result)
 
     def _google_inventory_refresh(
@@ -838,17 +898,17 @@ def _reserve_ingress_resolution(
 ) -> SecretIngressResolutionV1:
     capability = _capability(ingress_session)
     account_ref = cast(str, request.arguments["account_ref"])
-    plan_id = request.arguments.get("plan_id")
+    transaction_id = request.arguments.get("transaction_id")
     apply_key = request.idempotency_key
     if request.operation == "google.oauth.complete":
-        plan_id = request.arguments.get("transaction_id")
-        apply_key = cast(str, plan_id)
+        transaction_id = request.arguments.get("transaction_id")
+        apply_key = cast(str, transaction_id)
     if (
         capability.subject != principal.subject
         or capability.account_ref != account_ref
         or capability.operation != request.operation
         or capability.credential_kind != credential_kind
-        or capability.plan_id != plan_id
+        or capability.transaction_id != transaction_id
         or capability.expected_generation != _generation(request)
         or capability.session_generation != _generation(request)
         or capability.apply_idempotency_key != apply_key
@@ -865,7 +925,7 @@ def _reserve_ingress_resolution(
         operation=request.operation,
         account_ref=account_ref,
         credential_kind=credential_kind,
-        plan_id=plan_id,
+        transaction_id=transaction_id,
         plan_digest=capability.plan_digest,
         expected_generation=capability.expected_generation,
         create_idempotency_key=capability.create_idempotency_key,
@@ -1129,7 +1189,15 @@ def _serialize_openai_receipt(value: AuthSyncReceiptV1) -> dict[str, object]:
 def _serialize_ingress_session(value: SecretIngressSessionV1) -> dict[str, object]:
     if type(value) is not SecretIngressSessionV1:
         raise _service_error("control.response_private")
-    return {"id": value.id, "account_ref": value.account_ref, "state": value.state}
+    return {
+        "id": value.id,
+        "account_ref": value.account_ref,
+        "state": value.state,
+        "plan_digest": _public_digest(value.plan_digest),
+        "expected_generation": value.expected_generation,
+        "expires_at": value.expires_at,
+        "session_generation": value.session_generation,
+    }
 
 
 def _serialize_ingress_upload_receipt(

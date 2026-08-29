@@ -417,6 +417,25 @@ def _import_client(service, ingress: _SecretIngress, *, key: str = "import-one")
     return plan, session, service.apply_oauth_client_import(plan, session)
 
 
+def test_resolve_oauth_client_import_plan_from_durable_digest_after_restart(
+    tmp_path: Path,
+) -> None:
+    service, _ingress, _exchange, _manager = _service(tmp_path)
+    plan = service.plan_oauth_client_import(
+        "google-account-01", expected_generation=1, idempotency_key="resolve-one"
+    )
+    restarted, _ingress, _exchange, _manager = _service(tmp_path)
+
+    assert (
+        restarted.resolve_oauth_client_import_plan(
+            "google-account-01",
+            expected_generation=1,
+            plan_digest=plan.plan_digest,
+        )
+        == plan
+    )
+
+
 def _begin(
     service,
     client_ref: str,

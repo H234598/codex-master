@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
@@ -82,6 +83,23 @@ def test_vault_file_does_not_contain_auth_json(tmp_path: Path) -> None:
     assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
     assert stat.S_IMODE(vault_path(tmp_path).stat().st_mode) == 0o600
     assert vault_path(tmp_path).stat().st_uid == os.geteuid()
+
+
+def test_projection_metadata_reports_only_state_and_generation(tmp_path: Path) -> None:
+    vault = vault_at(tmp_path)
+    secret = bytearray(b"mutable-secret")
+    vault.store_projection("openai-one", 3, memoryview(secret))
+
+    assert vault.projection_metadata("openai-one") == ("active", 3)
+    vault.revoke_account("openai-one", expected_generation=3)
+    assert vault.projection_metadata("openai-one") == ("revoked", 3)
+    assert vault.projection_metadata("missing") is None
+
+
+def test_store_projection_rejects_non_byte_memoryview(tmp_path: Path) -> None:
+    vault = vault_at(tmp_path)
+    with pytest.raises(CredentialVaultError, match="credential.vault_request_invalid"):
+        vault.store_projection("openai-one", 3, memoryview(array("I", [1])))
 
 
 def test_old_generation_cannot_be_leased_after_replace(tmp_path: Path) -> None:
