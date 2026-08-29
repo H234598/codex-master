@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":5,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":6,"schema_version":1} -->\n'
 )
 
 
