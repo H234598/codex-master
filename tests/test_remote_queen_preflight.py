@@ -685,7 +685,15 @@ def _assert_no_runtime_effects_source(source: str) -> None:
                 assert not _is_forbidden_import(alias.name, forbidden_imports)
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
-            assert not _is_forbidden_import(module, forbidden_imports)
+            imported_names = (module,) + tuple(
+                f"{module}.{alias.name}" if module else alias.name
+                for alias in node.names
+            )
+            for imported_name in imported_names:
+                assert not _is_forbidden_import(
+                    imported_name,
+                    forbidden_imports,
+                )
         elif isinstance(node, ast.Call):
             dotted = _dotted_name(node.func)
             assert dotted not in forbidden_calls
@@ -724,6 +732,10 @@ def test_no_runtime_effects():
         "import urllib.request\nurllib.request.urlopen('https://example.test')",
         "import socket.socket\nsocket.socket.socket()",
         "from os.path import exists\nexists('/tmp/example')",
+        (
+            "from asyncio import subprocess\n"
+            "subprocess.create_subprocess_exec('/bin/false')"
+        ),
     ],
 )
 def test_runtime_effect_gate_rejects_forbidden_import_submodules(source):
