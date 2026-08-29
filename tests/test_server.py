@@ -40912,6 +40912,107 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
         self.assertEqual(cli, mcp["payload"])
         self.assertEqual(cli["accounts"][0]["ref"], "google-one")
 
+    def test_google_oauth_redirect_cli_and_mcp_accept_same_long_ascii_value(
+        self,
+    ) -> None:
+        from test_admin_service import principal
+
+        prefix = "http://127.0.0.1/callback?state="
+        redirect_uri = prefix + "a" * (2517 - len(prefix))
+        arguments = {
+            "account_ref": "google-one",
+            "oauth_client_ref": "client-one",
+            "redirect_uri": redirect_uri,
+            "scope_profile": "inventory_readonly",
+            "expected_generation": 4,
+            "idempotency_key": "oauth-mcp",
+        }
+
+        with self._binding(principal(*self.principal.scopes, step_up=True)):
+            status, cli = self._cli(
+                "fleet",
+                "google",
+                "oauth-begin",
+                "--account-ref",
+                "google-one",
+                "--oauth-client-ref",
+                "client-one",
+                "--redirect-uri",
+                redirect_uri,
+                "--scope-profile",
+                "inventory_readonly",
+                "--expected-generation",
+                "4",
+                "--idempotency-key",
+                "oauth-cli",
+            )
+            mcp = self._mcp("fleet_google_oauth_begin", arguments)
+
+        tool = next(
+            item
+            for item in server_module.TOOLS
+            if item["name"] == "fleet_google_oauth_begin"
+        )
+        self.assertEqual(
+            tool["inputSchema"]["properties"]["redirect_uri"]["maxLength"],
+            4096,
+        )
+        self.assertEqual(len(redirect_uri), 2517)
+        self.assertEqual(status, 0)
+        self.assertFalse(mcp["isError"])
+        self.assertEqual(cli, mcp["payload"])
+        self.assertEqual(self.owners.google_oauth.calls, ["begin", "begin"])
+
+    def test_google_oauth_redirect_cli_and_mcp_reject_same_utf8_oversize(
+        self,
+    ) -> None:
+        prefix = "http://127.0.0.1/callback?state="
+        invalid_redirects = (
+            prefix + "a" * (4097 - len(prefix)),
+            prefix + "ä" * 2048,
+        )
+
+        with self._binding():
+            results = []
+            for index, redirect_uri in enumerate(invalid_redirects):
+                status, cli = self._cli(
+                    "fleet",
+                    "google",
+                    "oauth-begin",
+                    "--account-ref",
+                    "google-one",
+                    "--oauth-client-ref",
+                    "client-one",
+                    "--redirect-uri",
+                    redirect_uri,
+                    "--scope-profile",
+                    "inventory_readonly",
+                    "--expected-generation",
+                    "4",
+                    "--idempotency-key",
+                    f"oauth-cli-{index}",
+                )
+                mcp = self._mcp(
+                    "fleet_google_oauth_begin",
+                    {
+                        "account_ref": "google-one",
+                        "oauth_client_ref": "client-one",
+                        "redirect_uri": redirect_uri,
+                        "scope_profile": "inventory_readonly",
+                        "expected_generation": 4,
+                        "idempotency_key": f"oauth-mcp-{index}",
+                    },
+                )
+                results.append((status, cli, mcp))
+
+        for status, cli, mcp in results:
+            self.assertEqual(status, 1)
+            self.assertTrue(mcp["isError"])
+            for payload in (cli, mcp["payload"]):
+                self.assertEqual(payload["code"], "control.request_invalid")
+                self.assertNotIn("error", payload)
+        self.assertEqual(self.owners.google_oauth.calls, [])
+
     def test_fleet_openai_list_cli_and_mcp_outputs_are_identical(self) -> None:
         with self._binding():
             status, cli = self._cli("fleet", "openai", "list")
@@ -41205,6 +41306,45 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
                 ValueError, "invalid admin capabilities"
             ):
                 server_module._masterjet_admin_capabilities(payload)
+
+    def test_admin_capability_catalog_requires_exact_integer_field_types(self) -> None:
+        from codex_master.admin_contracts import (
+            ADMIN_OPERATION_CATALOG,
+            ADMIN_OPERATION_CATALOG_DIGEST,
+            ADMIN_OPERATION_METADATA,
+        )
+
+        class IntSubclass(int):
+            pass
+
+        valid = {
+            "schema_version": 1,
+            "catalog_digest": ADMIN_OPERATION_CATALOG_DIGEST,
+            "operation_count": len(ADMIN_OPERATION_CATALOG),
+            "allowed": [
+                ADMIN_OPERATION_METADATA[operation].scope is not None
+                for operation in ADMIN_OPERATION_CATALOG
+            ],
+        }
+        invalid_versions = (True, 1.0, IntSubclass(1), "1")
+        invalid_counts = (
+            True,
+            float(len(ADMIN_OPERATION_CATALOG)),
+            IntSubclass(len(ADMIN_OPERATION_CATALOG)),
+            str(len(ADMIN_OPERATION_CATALOG)),
+        )
+
+        for field, values in (
+            ("schema_version", invalid_versions),
+            ("operation_count", invalid_counts),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    ValueError, "invalid admin capabilities"
+                ):
+                    server_module._masterjet_admin_capabilities(
+                        {**valid, field: value}
+                    )
 
     def test_fleet_google_provision_plan_preserves_generation_and_idempotency(
         self,

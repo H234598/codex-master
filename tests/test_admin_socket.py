@@ -3,6 +3,7 @@ from __future__ import annotations
 from array import array
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 import hmac
 import json
 import os
@@ -11,7 +12,7 @@ import socket
 import stat
 import struct
 from threading import Event, Thread, enumerate as enumerate_threads
-from time import monotonic
+from time import monotonic, sleep
 from typing import Iterator
 
 import pytest
@@ -309,6 +310,113 @@ def _client(server: _RunningServer) -> AdminSocketClient:
         server.path,
         attestation_key_fd=server.attestation_key_fd,
     )
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+def test_client_process_signals_propagate_after_real_socket_connection_closes(
+    server: _RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+) -> None:
+    real_attestation = getattr(admin_socket, "_client_attestation")
+    before = _fd_count()
+
+    def interrupt_after_attestation(*args: object) -> None:
+        real_attestation(*args)
+        raise signal_type(23)
+
+    monkeypatch.setattr(
+        admin_socket, "_client_attestation", interrupt_after_attestation
+    )
+
+    with pytest.raises(signal_type):
+        _client(server).call(AdminRequestV1("hosts.list", {}, None, None, None))
+
+    deadline = monotonic() + 1
+    while getattr(server.socket, "_active_connection") is not None:
+        assert monotonic() < deadline
+        sleep(0.01)
+    assert _fd_count() == before
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    "seam",
+    ["peer", "principal", "decode", "dispatch", "reply"],
+)
+def test_server_adapter_process_signals_propagate_and_received_fds_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+    seam: str,
+) -> None:
+    adapter = AdminSocketServer(
+        tmp_path / "private" / "admin.sock",
+        _service(_SecretIngress()),
+        lambda _peer: PRINCIPAL,
+    )
+    server_connection, client_connection = socket.socketpair()
+    received_fd = os.dup(server_connection.fileno())
+    peer = UnixPeerCredentials(os.getpid(), os.geteuid(), os.getegid())
+
+    def interrupt(*_args: object, **_kwargs: object) -> None:
+        raise signal_type(23)
+
+    monkeypatch.setattr(admin_socket, "_peer_credentials", lambda _socket: peer)
+    monkeypatch.setattr(admin_socket, "_server_attestation", lambda *_args: None)
+    monkeypatch.setattr(
+        admin_socket,
+        "_receive_frame",
+        lambda _socket: (b"{}", [received_fd]),
+    )
+    monkeypatch.setattr(admin_socket, "_decode_json", lambda _payload: {})
+    monkeypatch.setattr(adapter, "_dispatch", lambda *_args: {})
+    monkeypatch.setattr(admin_socket, "_send_reply", lambda *_args, **_kwargs: None)
+    if seam == "peer":
+        monkeypatch.setattr(admin_socket, "_peer_credentials", interrupt)
+    elif seam == "principal":
+        monkeypatch.setattr(adapter, "_authorize_peer", interrupt)
+    elif seam == "decode":
+        monkeypatch.setattr(admin_socket, "_decode_json", interrupt)
+    elif seam == "dispatch":
+        monkeypatch.setattr(adapter, "_dispatch", interrupt)
+    else:
+        monkeypatch.setattr(admin_socket, "_send_reply", interrupt)
+    client_connection.shutdown(socket.SHUT_WR)
+    try:
+        with pytest.raises(signal_type):
+            adapter._handle(server_connection)
+        if seam in {"decode", "dispatch", "reply"}:
+            with pytest.raises(OSError):
+                os.fstat(received_fd)
+    finally:
+        try:
+            os.close(received_fd)
+        except OSError:
+            pass
+        server_connection.close()
+        client_connection.close()
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("codec", ["decode", "encode"])
+def test_socket_json_codecs_do_not_normalize_process_signals(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+    codec: str,
+) -> None:
+    def interrupt(*_args: object, **_kwargs: object) -> None:
+        raise signal_type(23)
+
+    if codec == "decode":
+        monkeypatch.setattr(admin_socket.json, "loads", interrupt)
+        call = partial(admin_socket._decode_json, b"{}")
+    else:
+        monkeypatch.setattr(admin_socket.json, "dumps", interrupt)
+        call = partial(admin_socket._encode_json, {}, MAX_ADMIN_REQUEST_BYTES)
+
+    with pytest.raises(signal_type):
+        call()
 
 
 def _recv_line(connection: socket.socket, limit: int = 4096) -> bytes:

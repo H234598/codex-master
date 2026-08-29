@@ -33544,8 +33544,10 @@ def _masterjet_admin_capabilities(
     if (
         set(result)
         != {"schema_version", "catalog_digest", "operation_count", "allowed"}
+        or type(result.get("schema_version")) is not int
         or result.get("schema_version") != 1
         or result.get("catalog_digest") != ADMIN_OPERATION_CATALOG_DIGEST
+        or type(result.get("operation_count")) is not int
         or result.get("operation_count") != len(ADMIN_OPERATION_CATALOG)
         or type(allowed) is not list
         or len(allowed) != len(ADMIN_OPERATION_CATALOG)
@@ -33652,9 +33654,21 @@ def _masterjet_admin_tool_definition(
     alternate_operation: str | None,
 ) -> dict[str, Any]:
     required, optional = _masterjet_admin_operation_fields(operation)
+    metadata = ADMIN_OPERATION_METADATA[operation]
+    text_max_lengths = {
+        field: metadata.text_argument_max_utf8_bytes
+        for field in metadata.text_argument_fields
+    }
     if alternate_operation is not None:
         alternate_required, alternate_optional = _masterjet_admin_operation_fields(
             alternate_operation
+        )
+        alternate_metadata = ADMIN_OPERATION_METADATA[alternate_operation]
+        text_max_lengths.update(
+            {
+                field: alternate_metadata.text_argument_max_utf8_bytes
+                for field in alternate_metadata.text_argument_fields
+            }
         )
         optional = tuple(
             dict.fromkeys((*optional, *alternate_required, *alternate_optional))
@@ -33663,7 +33677,7 @@ def _masterjet_admin_tool_definition(
         field: (
             {"type": "integer", "minimum": 0}
             if field == "expected_generation"
-            else text_schema(2048 if field == "redirect_uri" else 128)
+            else text_schema(text_max_lengths.get(field, 128))
         )
         for field in (*required, *optional)
     }
@@ -35108,14 +35122,30 @@ def handle_rpc(
                 params = {}
             if not isinstance(params, dict):
                 raise AgentError("tools/call params must be an object")
+            requested_name = params.get("name")
             if enforce_master_role:
-                requested_name = params.get("name")
                 if not isinstance(requested_name, str):
                     raise AgentError("tools/call requires a known tool name")
                 principal_class = require_principal_tool_access(requested_name, status)
-            name, args = validate_tool_call(
-                params.get("name"), params.get("arguments", {})
-            )
+            try:
+                name, args = validate_tool_call(
+                    requested_name, params.get("arguments", {})
+                )
+            except AgentError:
+                if (
+                    type(requested_name) is not str
+                    or requested_name not in _MASTERJET_ADMIN_TOOL_ROUTES
+                ):
+                    raise
+                from codex_master.admin_contracts import (
+                    canonical_admin_problem,
+                    public_admin_result,
+                )
+
+                problem = canonical_admin_problem("control.request_invalid")
+                raise MasterjetAdminError(
+                    problem.code, public_admin_result(problem)
+                ) from None
             payload = (
                 call_tool(name, args, principal_class=principal_class)
                 if principal_class is not None

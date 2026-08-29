@@ -337,28 +337,27 @@ class AdminSocketServer:
         problem: HiveProblemV1 | None = None
         result: dict[str, object] | None = None
         try:
-            peer = _peer_credentials(connection)
-            _server_attestation(connection, self._attestation_key_fd)
-            principal = self._principal(peer)
-            payload, received_fds = _receive_frame(connection)
-            value = _decode_json(payload)
-            result = self._dispatch(principal, peer, value, received_fds)
-        except _SocketFailure as error:
-            problem = _problem(error.code)
-        except Exception as error:
-            from .admin_service import AdminServiceError
+            try:
+                peer = _peer_credentials(connection)
+                _server_attestation(connection, self._attestation_key_fd)
+                principal = self._principal(peer)
+                payload, received_fds = _receive_frame(connection)
+                value = _decode_json(payload)
+                result = self._dispatch(principal, peer, value, received_fds)
+            except _SocketFailure as error:
+                problem = _problem(error.code)
+            except Exception as error:
+                from .admin_service import AdminServiceError
 
-            problem = (
-                error.problem
-                if isinstance(error, AdminServiceError)
-                else _problem("control.internal_error")
-            )
-        except BaseException:
-            problem = _problem("control.internal_error")
-        try:
-            _send_reply(connection, result=result, problem=problem)
-        except BaseException:
-            pass
+                problem = (
+                    error.problem
+                    if isinstance(error, AdminServiceError)
+                    else _problem("control.internal_error")
+                )
+            try:
+                _send_reply(connection, result=result, problem=problem)
+            except Exception:
+                pass
         finally:
             _drain_input(connection)
             _close_fds(received_fds)
@@ -366,7 +365,7 @@ class AdminSocketServer:
     def _principal(self, peer: UnixPeerCredentials) -> AdminPrincipalV1:
         try:
             principal = self._authorize_peer(peer)
-        except BaseException:
+        except Exception:
             raise _SocketFailure("authority.peer_denied") from None
         if type(principal) is not AdminPrincipalV1:
             raise _SocketFailure("authority.peer_denied")
@@ -597,7 +596,7 @@ class AdminSocketClient:
             return _decode_reply(response)
         except AdminSocketError:
             raise
-        except BaseException:
+        except Exception:
             raise AdminSocketError(_problem("control.socket_unavailable")) from None
 
     def _verify_server(self, connection: socket.socket) -> UnixPeerCredentials:
@@ -1118,7 +1117,7 @@ def _decode_json(payload: bytes) -> dict[str, object]:
             object_pairs_hook=_unique_object,
             parse_constant=lambda _value: _raise_value_error(),
         )
-    except BaseException:
+    except Exception:
         raise _SocketFailure("control.request_invalid") from None
     if type(value) is not dict:
         raise _SocketFailure("control.request_invalid")
@@ -1150,7 +1149,7 @@ def _encode_json(value: object, limit: int) -> bytes:
             ).encode("ascii")
             + b"\n"
         )
-    except BaseException:
+    except Exception:
         raise _SocketFailure("control.request_invalid") from None
     if len(payload) > limit:
         raise _SocketFailure("control.request_too_large")

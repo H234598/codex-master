@@ -14,6 +14,9 @@ from urllib.parse import unquote
 import uuid
 
 
+MAX_ADMIN_TEXT_UTF8_BYTES = 4096
+
+
 @dataclass(frozen=True, slots=True)
 class AdminOperationMetadataV1:
     scope: str | None
@@ -21,6 +24,7 @@ class AdminOperationMetadataV1:
     argument_fields: tuple[str, ...]
     optional_argument_fields: tuple[str, ...] = ()
     text_argument_fields: tuple[str, ...] = ()
+    text_argument_max_utf8_bytes: int = MAX_ADMIN_TEXT_UTF8_BYTES
     requires_idempotency: bool = False
     requires_digest: bool = False
     generation_domain: str | None = None
@@ -189,7 +193,6 @@ _REQUEST_FIELDS = frozenset(
         "plan_digest",
     }
 )
-_MAX_TEXT_BYTES = 4096
 _MAX_KEY_BYTES = 128
 _MAX_GENERATION = 2**63 - 1
 _MAX_COUNT = 100_000
@@ -235,12 +238,17 @@ def _private() -> Never:
     raise AdminContractError("control.response_private")
 
 
-def _text(value: object, *, private: bool = False) -> str:
+def _text(
+    value: object,
+    *,
+    private: bool = False,
+    max_utf8_bytes: int = MAX_ADMIN_TEXT_UTF8_BYTES,
+) -> str:
     fail = _private if private else _invalid
     if type(value) is not str:
         fail()
     try:
-        if not value or len(value.encode("utf-8")) > _MAX_TEXT_BYTES:
+        if not value or len(value.encode("utf-8")) > max_utf8_bytes:
             fail()
     except UnicodeError:
         fail()
@@ -349,7 +357,10 @@ def _arguments(operation: str, value: object) -> Mapping[str, object]:
     if set(arguments) - allowed or not set(fields) <= set(arguments):
         _invalid()
     result = {
-        field: _text(arguments[field])
+        field: _text(
+            arguments[field],
+            max_utf8_bytes=metadata.text_argument_max_utf8_bytes,
+        )
         if field in metadata.text_argument_fields
         else _token(arguments[field])
         for field in arguments

@@ -233,6 +233,42 @@ def test_oauth_complete_uses_transaction_generation_without_shadow_replay_fields
     assert request.plan_digest is None
 
 
+def test_redirect_uri_uses_exact_utf8_byte_limit() -> None:
+    prefix = "http://127.0.0.1/callback?state="
+    exact = prefix + "a" * (4096 - len(prefix.encode("utf-8")))
+    multibyte_oversized = prefix + "ä" * 2048
+
+    request = AdminRequestV1(
+        "google.oauth.begin",
+        {
+            "account_ref": "google-one",
+            "oauth_client_ref": "client-one",
+            "redirect_uri": exact,
+            "scope_profile": "inventory_readonly",
+        },
+        4,
+        "request-one",
+        None,
+    )
+
+    assert request.arguments["redirect_uri"] == exact
+    assert len(exact.encode("utf-8")) == 4096
+    for redirect_uri in (exact + "a", multibyte_oversized):
+        with pytest.raises(AdminContractError, match="control.request_invalid"):
+            AdminRequestV1(
+                "google.oauth.begin",
+                {
+                    "account_ref": "google-one",
+                    "oauth_client_ref": "client-one",
+                    "redirect_uri": redirect_uri,
+                    "scope_profile": "inventory_readonly",
+                },
+                4,
+                "request-two",
+                None,
+            )
+
+
 @pytest.mark.parametrize("credential_kind", ["openai.auth-json", "google.oauth-client"])
 def test_secret_ingress_accepts_only_closed_v1_credential_kinds(
     credential_kind: str,
