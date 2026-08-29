@@ -6,24 +6,31 @@ from pathlib import Path
 import pytest
 
 
-MODULE = runpy.run_path(Path(__file__).parents[1] / "bin/codex-master-publish-plan-path")
+MODULE = runpy.run_path(
+    Path(__file__).parents[1] / "bin/codex-master-publish-plan-path"
+)
 
 
 def test_handoff_has_thirty_additional_message_principles():
     assert len(MODULE["GRUNDSAETZE"]) >= 60
-    assert all("{nom}" in template or "{acc}" in template or "{dat}" in template or "{poss}" in template
-               for template in MODULE["GRUNDSAETZE"])
+    assert all(
+        "{nom}" in template
+        or "{acc}" in template
+        or "{dat}" in template
+        or "{poss}" in template
+        for template in MODULE["GRUNDSAETZE"]
+    )
 
 
 def test_message_generation_multiplies_principles_and_word_lists():
     messages = {MODULE["random_message"]() for _ in range(500)}
     assert len(messages) >= 100
-    assert all(message and "{" not in message and "}" not in message for message in messages)
+    assert all(
+        message and "{" not in message and "}" not in message for message in messages
+    )
 
 
-def test_handoff_never_discovers_or_mutates_existing_clipboard(
-    monkeypatch, tmp_path
-):
+def test_handoff_never_discovers_or_mutates_existing_clipboard(monkeypatch, tmp_path):
     plan = tmp_path / "plan.md"
     plan.write_text("# Plan\n", encoding="utf-8")
     existing_clipboard = {"value": "pre-existing clipboard content"}

@@ -286,6 +286,8 @@ def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> N
         for fragment in required_fragments:
             assert fragment in primary
         assert projection.metadata.generation == contract.generation == 7
+
+
 def test_both_provider_projections_carry_side_effect_free_external_plan_handoff():
     contract = load_common_policy()
     required_fragments = [

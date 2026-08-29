@@ -11,54 +11,173 @@ from pathlib import Path
 
 
 ANREDE = [
-    "Meisterin", "große Meisterin", "verehrte Meisterin", "liebe Meisterin",
-    "kluge Meisterin", "aufmerksame Meisterin", "geschätzte Meisterin",
-    "wachsame Meisterin", "weise Meisterin", "liebe Bienenmeisterin",
+    "Meisterin",
+    "große Meisterin",
+    "verehrte Meisterin",
+    "liebe Meisterin",
+    "kluge Meisterin",
+    "aufmerksame Meisterin",
+    "geschätzte Meisterin",
+    "wachsame Meisterin",
+    "weise Meisterin",
+    "liebe Bienenmeisterin",
 ]
 NOMEN = [
-    {"nom": "Das vollständige Dokument", "acc": "das vollständige Dokument", "dat": "dem vollständigen Dokument", "poss": "euer vollständiges Dokument"},
-    {"nom": "Der vollständige Markdownplan", "acc": "den vollständigen Markdownplan", "dat": "dem vollständigen Markdownplan", "poss": "euren vollständigen Markdownplan"},
-    {"nom": "Der fertige Arbeitsplan", "acc": "den fertigen Arbeitsplan", "dat": "dem fertigen Arbeitsplan", "poss": "euren fertigen Arbeitsplan"},
-    {"nom": "Die aktuelle Anleitung", "acc": "die aktuelle Anleitung", "dat": "der aktuellen Anleitung", "poss": "eure aktuelle Anleitung"},
-    {"nom": "Die fertige Datei", "acc": "die fertige Datei", "dat": "der fertigen Datei", "poss": "eure fertige Datei"},
-    {"nom": "Das vollständige Vault-Dokument", "acc": "das vollständige Vault-Dokument", "dat": "dem vollständigen Vault-Dokument", "poss": "euer vollständiges Vault-Dokument"},
-    {"nom": "Der absolute Dokumentpfad", "acc": "den absoluten Dokumentpfad", "dat": "dem absoluten Dokumentpfad", "poss": "euren absoluten Dokumentpfad"},
-    {"nom": "Die aktuelle Planreferenz", "acc": "die aktuelle Planreferenz", "dat": "der aktuellen Planreferenz", "poss": "eure aktuelle Planreferenz"},
-    {"nom": "Das fertige Schriftstück", "acc": "das fertige Schriftstück", "dat": "dem fertigen Schriftstück", "poss": "euer fertiges Schriftstück"},
-    {"nom": "Die passende Unterlage", "acc": "die passende Unterlage", "dat": "der passenden Unterlage", "poss": "eure passende Unterlage"},
-    {"nom": "Die aktuelle Notiz", "acc": "die aktuelle Notiz", "dat": "der aktuellen Notiz", "poss": "eure aktuelle Notiz"},
-    {"nom": "Die vollständige Planunterlage", "acc": "die vollständige Planunterlage", "dat": "der vollständigen Planunterlage", "poss": "eure vollständige Planunterlage"},
-    {"nom": "Der direkte Dokumentweg", "acc": "den direkten Dokumentweg", "dat": "dem direkten Dokumentweg", "poss": "euren direkten Dokumentweg"},
-    {"nom": "Die komplette Dateireferenz", "acc": "die komplette Dateireferenz", "dat": "der kompletten Dateireferenz", "poss": "eure komplette Dateireferenz"},
+    {
+        "nom": "Das vollständige Dokument",
+        "acc": "das vollständige Dokument",
+        "dat": "dem vollständigen Dokument",
+        "poss": "euer vollständiges Dokument",
+    },
+    {
+        "nom": "Der vollständige Markdownplan",
+        "acc": "den vollständigen Markdownplan",
+        "dat": "dem vollständigen Markdownplan",
+        "poss": "euren vollständigen Markdownplan",
+    },
+    {
+        "nom": "Der fertige Arbeitsplan",
+        "acc": "den fertigen Arbeitsplan",
+        "dat": "dem fertigen Arbeitsplan",
+        "poss": "euren fertigen Arbeitsplan",
+    },
+    {
+        "nom": "Die aktuelle Anleitung",
+        "acc": "die aktuelle Anleitung",
+        "dat": "der aktuellen Anleitung",
+        "poss": "eure aktuelle Anleitung",
+    },
+    {
+        "nom": "Die fertige Datei",
+        "acc": "die fertige Datei",
+        "dat": "der fertigen Datei",
+        "poss": "eure fertige Datei",
+    },
+    {
+        "nom": "Das vollständige Vault-Dokument",
+        "acc": "das vollständige Vault-Dokument",
+        "dat": "dem vollständigen Vault-Dokument",
+        "poss": "euer vollständiges Vault-Dokument",
+    },
+    {
+        "nom": "Der absolute Dokumentpfad",
+        "acc": "den absoluten Dokumentpfad",
+        "dat": "dem absoluten Dokumentpfad",
+        "poss": "euren absoluten Dokumentpfad",
+    },
+    {
+        "nom": "Die aktuelle Planreferenz",
+        "acc": "die aktuelle Planreferenz",
+        "dat": "der aktuellen Planreferenz",
+        "poss": "eure aktuelle Planreferenz",
+    },
+    {
+        "nom": "Das fertige Schriftstück",
+        "acc": "das fertige Schriftstück",
+        "dat": "dem fertigen Schriftstück",
+        "poss": "euer fertiges Schriftstück",
+    },
+    {
+        "nom": "Die passende Unterlage",
+        "acc": "die passende Unterlage",
+        "dat": "der passenden Unterlage",
+        "poss": "eure passende Unterlage",
+    },
+    {
+        "nom": "Die aktuelle Notiz",
+        "acc": "die aktuelle Notiz",
+        "dat": "der aktuellen Notiz",
+        "poss": "eure aktuelle Notiz",
+    },
+    {
+        "nom": "Die vollständige Planunterlage",
+        "acc": "die vollständige Planunterlage",
+        "dat": "der vollständigen Planunterlage",
+        "poss": "eure vollständige Planunterlage",
+    },
+    {
+        "nom": "Der direkte Dokumentweg",
+        "acc": "den direkten Dokumentweg",
+        "dat": "dem direkten Dokumentweg",
+        "poss": "euren direkten Dokumentweg",
+    },
+    {
+        "nom": "Die komplette Dateireferenz",
+        "acc": "die komplette Dateireferenz",
+        "dat": "der kompletten Dateireferenz",
+        "poss": "eure komplette Dateireferenz",
+    },
 ]
 VERBEN = [
-    "liegt bereit", "ist vorbereitet", "wurde übergeben", "wartet auf euch",
-    "ist nun zugänglich", "wurde für euch hinterlegt", "kann jetzt geöffnet werden",
-    "ist erfolgreich abgelegt", "steht zur Verwendung bereit", "ist griffbereit",
+    "liegt bereit",
+    "ist vorbereitet",
+    "wurde übergeben",
+    "wartet auf euch",
+    "ist nun zugänglich",
+    "wurde für euch hinterlegt",
+    "kann jetzt geöffnet werden",
+    "ist erfolgreich abgelegt",
+    "steht zur Verwendung bereit",
+    "ist griffbereit",
 ]
 AKTIONEN = [
-    "bereitgestellt", "übergeben", "bereitgelegt", "hinterlegt", "zur Verwendung bereitgelegt",
-    "für euch vorbereitet", "zur direkten Verwendung abgelegt", "sauber übergeben",
+    "bereitgestellt",
+    "übergeben",
+    "bereitgelegt",
+    "hinterlegt",
+    "zur Verwendung bereitgelegt",
+    "für euch vorbereitet",
+    "zur direkten Verwendung abgelegt",
+    "sauber übergeben",
 ]
 EINLEITUNGEN = [
-    "Hallo", "Eine kurze Nachricht", "Die Biene meldet",
-    "Kleine Übergabe", "Für euch", "Zur Information", "Soeben",
-    "Mit einer kurzen Meldung", "Aus dem Bienenstock", ]
+    "Hallo",
+    "Eine kurze Nachricht",
+    "Die Biene meldet",
+    "Kleine Übergabe",
+    "Für euch",
+    "Zur Information",
+    "Soeben",
+    "Mit einer kurzen Meldung",
+    "Aus dem Bienenstock",
+]
 STATUS = [
-    "sofort nutzbar", "sicher erreichbar", "direkt verfügbar", "vollständig bereit",
-    "für euch vorbereitet", "ohne weitere Bearbeitung verwendbar",
+    "sofort nutzbar",
+    "sicher erreichbar",
+    "direkt verfügbar",
+    "vollständig bereit",
+    "für euch vorbereitet",
+    "ohne weitere Bearbeitung verwendbar",
 ]
 ZWECKE = [
-    "für den nächsten Arbeitsschritt", "für die weitere Prüfung",
-    "für eure Dokumentation", "für die direkte Verwendung",
-    "für den nächsten Planabschnitt", "für eure Ablage",
+    "für den nächsten Arbeitsschritt",
+    "für die weitere Prüfung",
+    "für eure Dokumentation",
+    "für die direkte Verwendung",
+    "für den nächsten Planabschnitt",
+    "für eure Ablage",
 ]
-ZEITPUNKTE = ["soeben", "gerade", "direkt danach", "in diesem Moment", "ohne Verzögerung"]
+ZEITPUNKTE = [
+    "soeben",
+    "gerade",
+    "direkt danach",
+    "in diesem Moment",
+    "ohne Verzögerung",
+]
 UEBERGABEN = [
-    "ohne Zusatztext", "als reiner Pfad", "direkt über den Pfad",
-    "für ein beliebiges Programm", "ohne Markdown-Verpackung", "in klarer Form",
+    "ohne Zusatztext",
+    "als reiner Pfad",
+    "direkt über den Pfad",
+    "für ein beliebiges Programm",
+    "ohne Markdown-Verpackung",
+    "in klarer Form",
 ]
-ABSENDER = ["Der Bienenstock", "Masterjet", "Die Dokumentenbiene", "Die Hive-Verwaltung"]
+ABSENDER = [
+    "Der Bienenstock",
+    "Masterjet",
+    "Die Dokumentenbiene",
+    "Die Hive-Verwaltung",
+]
 
 # Eigenständige Nachrichtengrundsätze. Jede Schablone wird zusätzlich mit
 # Anrede, Nominalformen, Verben, Aktionen und Einleitung vervielfacht.
@@ -178,7 +297,9 @@ def main() -> int:
         return 2
     path = Path(sys.argv[1]).expanduser().resolve()
     if path.suffix.lower() != ".md" or not path.is_file():
-        print("Es muss eine vorhandene Markdowndatei angegeben werden.", file=sys.stderr)
+        print(
+            "Es muss eine vorhandene Markdowndatei angegeben werden.", file=sys.stderr
+        )
         return 2
     if not path.is_absolute():  # defensive; resolve() should already ensure this
         print("Der Dokumentpfad muss absolut sein.", file=sys.stderr)
