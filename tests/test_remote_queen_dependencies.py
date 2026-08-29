@@ -267,6 +267,7 @@ def _expected_manifest_dict(host_facts=FEDORA, include_google=False):
             }
             for distribution, version, imports_for in pins
         ],
+        "required_imports": list(imports),
         "google_identity_required": include_google,
     }
 
@@ -485,13 +486,29 @@ def test_google_pins_are_forbidden_without_explicit_flag(python_distributions):
     assert exc_info.value.code == "RQ_E_PLAN_INCONSISTENT"
 
 
+def test_manifest_serialization_includes_required_imports():
+    manifest = _manifest()
+
+    assert deps.dependency_manifest_as_dict(manifest)["required_imports"] == [
+        "yaml",
+        "dbus",
+        "gi",
+    ]
+
+
+def test_manifest_digest_binds_required_imports():
+    manifest = _manifest()
+
+    assert _digest(_expected_manifest_dict()) == manifest.manifest_digest
+
+
 def test_manifest_serialization_and_fixed_digest_are_literal_contract():
     manifest = _manifest()
     expected_without_digest = _expected_manifest_dict()
     expected = {
         **expected_without_digest,
         "manifest_digest": (
-            "sha256:fcc6b1f9eebe505ea73ecea2b9725ae80e33f11ea8587134461892d6ac367762"
+            "sha256:b799d481fc48f5928dc54a316fc7c23500680185c2ab6769f41d47862a6b0b1f"
         ),
     }
 
@@ -566,6 +583,27 @@ def test_plan_partial_state_lists_only_missing_packages_in_allowlist_order():
     assert plan.steps[0].packages == missing
     assert plan.rollback_packages == missing
     assert plan.steps[1].action == deps.DependencyActionV1.CREATE_PYTHON_ENVIRONMENT
+
+
+def test_plan_owned_desired_environment_with_missing_package_is_install_only():
+    manifest = _manifest()
+    missing = manifest.package_plan.packages[0]
+    snapshot = _owned_snapshot(manifest, missing=(missing,))
+
+    plan = deps.plan_remote_queen_dependencies(
+        manifest=manifest,
+        operations=FakeDependencyOperations(snapshot),
+    )
+
+    assert plan.steps == (
+        deps.DependencyPlanStepV1(
+            action=deps.DependencyActionV1.INSTALL_SYSTEM_PACKAGES,
+            packages=(missing,),
+        ),
+    )
+    assert plan.rollback_packages == (missing,)
+    assert plan.rollback_environment_generation is None
+    assert plan.privilege_required is True
 
 
 def test_plan_stale_owned_environment_replaces_and_binds_prior_generation():
@@ -708,7 +746,7 @@ def test_fixed_before_and_plan_digest_vectors_use_literal_nested_contract():
         "manifest": {
             **_expected_manifest_dict(),
             "manifest_digest": (
-                "sha256:fcc6b1f9eebe505ea73ecea2b9725ae80e33f11ea8587134461892d6ac367762"
+                "sha256:b799d481fc48f5928dc54a316fc7c23500680185c2ab6769f41d47862a6b0b1f"
             ),
         },
         "before": {
@@ -741,7 +779,7 @@ def test_fixed_before_and_plan_digest_vectors_use_literal_nested_contract():
         },
         "privilege_required": True,
         "plan_digest": (
-            "sha256:beecb00382adee7c2ae7a313454a9ce617338206f004279f90050fa9f7b5d760"
+            "sha256:818d0e8d556abfe9a8562a6a4da0a4ceb28e758009d50c728a1e81c30b162627"
         ),
     }
 
@@ -1045,6 +1083,32 @@ def test_rollback_validates_generation_and_restores_before_digest():
     assert result.restored_snapshot_digest == _snapshot_digest(before)
     assert fake.calls == ["inspect", "rollback", "inspect"]
     assert fake.rollback_arguments == (plan, journal)
+
+
+def test_rollback_rejects_noop_plan_before_any_operations_call():
+    manifest = _manifest()
+    snapshot = _owned_snapshot(manifest)
+    plan = deps.plan_remote_queen_dependencies(
+        manifest=manifest,
+        operations=FakeDependencyOperations(snapshot),
+    )
+    journal = _journal(plan, snapshot)
+    fake = FakeDependencyOperations(snapshot, after=snapshot)
+    error = None
+
+    try:
+        deps.rollback_remote_queen_dependencies(
+            plan=plan,
+            journal=journal,
+            request=_rollback_request_for(plan),
+            operations=fake,
+        )
+    except RemoteQueenBootstrapError as exc:
+        error = exc
+
+    assert fake.calls == []
+    assert error is not None
+    assert error.code == "RQ_E_PLAN_INCONSISTENT"
 
 
 def test_rollback_passes_only_journalized_new_packages():

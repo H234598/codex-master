@@ -559,6 +559,7 @@ def _manifest_payload(
             }
             for item in python_distributions
         ],
+        "required_imports": [import_id.value for import_id in required_imports],
         "google_identity_required": google_identity_required,
     }
     if manifest_digest is not None:
@@ -807,9 +808,7 @@ def _desired_environment(
     if snapshot.environment.ownership is not DependencyOwnershipV1.OWNED:
         return False
     return (
-        all(item.version is not None for item in snapshot.packages)
-        and snapshot.environment.generation
-        == manifest.desired_generation.generation
+        snapshot.environment.generation == manifest.desired_generation.generation
         and snapshot.environment.distributions == manifest.python_distributions
         and snapshot.environment.imports_available == manifest.required_imports
     )
@@ -1071,6 +1070,8 @@ def rollback_remote_queen_dependencies(
     _validate_plan(plan)
     _validate_rollback_request(plan, request)
     _validate_journal(plan, journal)
+    if not plan.steps:
+        raise _inconsistent()
     current = _inspect_operation(operations, plan.manifest)
     try:
         _validate_snapshot(plan.manifest, current, desired=True)
