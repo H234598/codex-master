@@ -38,6 +38,8 @@ from .google_cloud_provisioner import (
 )
 from .google_oauth_authorization import GoogleOAuthProfileIdV1
 from .google_oauth_session import (
+    GoogleOAuthClientAvailabilityV1,
+    GoogleOAuthClientBindingV1,
     GoogleOAuthClientImportPlanV1,
     GoogleOAuthClientImportReceiptV1,
     GoogleOAuthControlService,
@@ -182,6 +184,18 @@ class SecretIngressPort(Protocol):
 class OpenAIAccountSummaryV1:
     ref: str
     generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class GoogleAccountSummaryV1:
+    ref: str
+    label: str | None
+    subject_bound: bool
+    inventory_generation: int
+    project_count: int
+    billing_count: int
+    default_oauth_client_ref: str | None
+    oauth_client_availability: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -586,10 +600,58 @@ class MasterjetControlService:
     def _google_accounts_list(self, *_values: object) -> dict[str, object]:
         return {
             "accounts": [
-                _serialize_google_account(item)
+                _serialize_google_account(self._google_account_summary(item))
                 for item in self._google_manager.list_accounts()
             ]
         }
+
+    def _google_account_summary(self, value: object) -> GoogleAccountSummaryV1:
+        account = _google_inventory_account(value)
+        account_ref = cast(str, account["ref"])
+        generation = cast(int, account["inventory_generation"])
+        binding = GoogleOAuthClientBindingV1(
+            account_ref,
+            generation,
+            None,
+            GoogleOAuthClientAvailabilityV1.UNAVAILABLE,
+        )
+        owner = self._google_oauth
+        if owner is not None:
+            try:
+                candidate = owner.default_oauth_client_binding(
+                    account_ref, expected_generation=generation
+                )
+            except GoogleOAuthSessionError:
+                pass
+            else:
+                if (
+                    type(candidate) is GoogleOAuthClientBindingV1
+                    and candidate.account_ref == account_ref
+                    and candidate.inventory_generation == generation
+                    and (
+                        (
+                            candidate.availability
+                            is GoogleOAuthClientAvailabilityV1.AVAILABLE
+                            and type(candidate.default_oauth_client_ref) is str
+                        )
+                        or (
+                            candidate.availability
+                            is not GoogleOAuthClientAvailabilityV1.AVAILABLE
+                            and candidate.default_oauth_client_ref is None
+                        )
+                    )
+                ):
+                    binding = candidate
+        return GoogleAccountSummaryV1(
+            account_ref,
+            cast(str | None, account["label"]),
+            cast(bool, account["subject_bound"]),
+            generation,
+            cast(int, account["project_count"]),
+            cast(int, account["billing_count"]),
+            binding.default_oauth_client_ref,
+            binding.availability.value,
+        )
 
     def _google_projects_list(
         self,
@@ -1248,7 +1310,7 @@ def _exact_mapping(value: object, fields: frozenset[str]) -> dict[str, object]:
         raise _service_error("control.response_private") from None
 
 
-def _serialize_google_account(value: object) -> dict[str, object]:
+def _google_inventory_account(value: object) -> dict[str, object]:
     return _exact_mapping(
         value,
         frozenset(
@@ -1262,6 +1324,21 @@ def _serialize_google_account(value: object) -> dict[str, object]:
             }
         ),
     )
+
+
+def _serialize_google_account(value: GoogleAccountSummaryV1) -> dict[str, object]:
+    if type(value) is not GoogleAccountSummaryV1:
+        raise _service_error("control.response_private")
+    return {
+        "ref": value.ref,
+        "label": value.label,
+        "subject_bound": value.subject_bound,
+        "inventory_generation": value.inventory_generation,
+        "project_count": value.project_count,
+        "billing_count": value.billing_count,
+        "default_oauth_client_ref": value.default_oauth_client_ref,
+        "oauth_client_availability": value.oauth_client_availability,
+    }
 
 
 def _serialize_google_project(value: object) -> dict[str, object]:

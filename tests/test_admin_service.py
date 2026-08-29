@@ -254,6 +254,27 @@ class GoogleOAuth:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.last_begin: tuple[str, dict[str, object]] | None = None
+        self.bindings: dict[str, object] = {
+            "google-one": admin_service_module.GoogleOAuthClientBindingV1(
+                "google-one",
+                4,
+                "oauth-client-opaque",
+                admin_service_module.GoogleOAuthClientAvailabilityV1.AVAILABLE,
+            )
+        }
+
+    def default_oauth_client_binding(
+        self, account_ref: str, *, expected_generation: int
+    ) -> object:
+        return self.bindings.get(
+            account_ref,
+            admin_service_module.GoogleOAuthClientBindingV1(
+                account_ref,
+                expected_generation,
+                None,
+                admin_service_module.GoogleOAuthClientAvailabilityV1.MISSING,
+            ),
+        )
 
     def begin_oauth_transaction(
         self, account_ref: str, **values: object
@@ -663,6 +684,59 @@ def test_google_inventory_query_uses_manager_once() -> None:
     assert result["accounts"][0]["ref"] == "google-one"  # type: ignore[index]
     assert result["accounts"][0]["inventory_generation"] == 4  # type: ignore[index]
     assert owners.google_manager.list_calls == 1
+
+
+def test_google_accounts_list_projects_exact_opaque_default_oauth_client_ref() -> None:
+    service, _owners = service_at()
+
+    result = service.query(principal("fleet.read"), "google.accounts.list", {})
+
+    account = result["accounts"][0]  # type: ignore[index]
+    assert account["default_oauth_client_ref"] == "oauth-client-opaque"
+    assert account["oauth_client_availability"] == "available"
+    assert "client_id" not in account
+    assert "client_secret" not in account
+
+
+@pytest.mark.parametrize("availability", ["missing", "ambiguous", "revoked", "stale"])
+def test_google_accounts_list_disables_unusable_oauth_client_binding(
+    availability: str,
+) -> None:
+    service, owners = service_at()
+    owners.google_oauth.bindings["google-one"] = (
+        admin_service_module.GoogleOAuthClientBindingV1(
+            "google-one",
+            4,
+            None,
+            admin_service_module.GoogleOAuthClientAvailabilityV1(availability),
+        )
+    )
+
+    account = service.query(principal("fleet.read"), "google.accounts.list", {})[
+        "accounts"
+    ][0]  # type: ignore[index]
+
+    assert account["default_oauth_client_ref"] is None
+    assert account["oauth_client_availability"] == availability
+
+
+def test_google_accounts_list_never_accepts_cross_account_client_binding() -> None:
+    service, owners = service_at()
+    owners.google_oauth.bindings["google-one"] = (
+        admin_service_module.GoogleOAuthClientBindingV1(
+            "google-two",
+            4,
+            "oauth-client-foreign",
+            admin_service_module.GoogleOAuthClientAvailabilityV1.AVAILABLE,
+        )
+    )
+
+    account = service.query(principal("fleet.read"), "google.accounts.list", {})[
+        "accounts"
+    ][0]  # type: ignore[index]
+
+    assert account["default_oauth_client_ref"] is None
+    assert account["oauth_client_availability"] == "unavailable"
 
 
 @pytest.mark.parametrize(

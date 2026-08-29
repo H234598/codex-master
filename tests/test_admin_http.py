@@ -37,6 +37,7 @@ from test_openai_credential_service import (
 )
 from test_google_oauth_session import (
     _client_json as google_client_json,
+    _import_client as import_google_client,
     _service as make_google_service,
 )
 
@@ -1106,6 +1107,60 @@ def test_google_client_http_restart_reconciles_durable_owner_receipt(
         (tmp_path / "google" / "oauth-state" / "google-oauth-control.json").read_text()
     )
     assert [record["state"] for record in google_state["imports"]] == ["succeeded"]
+
+
+def test_google_accounts_http_projects_real_bound_opaque_oauth_client_ref(
+    tmp_path,
+) -> None:
+    google_root = tmp_path / "google-list"
+    google_root.mkdir()
+    google, ingress, _exchange, manager = make_google_service(google_root)
+    _plan, _session, imported = import_google_client(google, ingress)
+    _unused, owners = service_at()
+    service = MasterjetControlService(
+        operation_store=owners.operation_store,
+        openai_accounts=owners.openai_accounts,
+        openai_credentials=owners.openai_credentials,
+        google_manager=manager,
+        google_oauth=google,
+        quota_collector=owners.quota_collector,
+        google_provisioner=owners.google_provisioner,
+        google_billing=owners.google_billing,
+        host_registry=owners.hosts,
+        secret_ingress=owners.secret_ingress,
+    )
+
+    with _running_server(tmp_path, service=service) as (server, _service):
+        status, _headers_out, payload = _request(
+            server,
+            "POST",
+            "/admin/v1",
+            _document("google.accounts.list", {}),
+            _headers(),
+        )
+
+    document = json.loads(payload)
+    account = next(
+        item for item in document["accounts"] if item["ref"] == "google-account-01"
+    )
+    assert status == 200
+    assert document["schema_version"] == 1
+    assert account["default_oauth_client_ref"] == imported.client_ref
+    assert account["oauth_client_availability"] == "available"
+    assert set(account) == {
+        "ref",
+        "label",
+        "subject_bound",
+        "inventory_generation",
+        "project_count",
+        "billing_count",
+        "default_oauth_client_ref",
+        "oauth_client_availability",
+    }
+    lowered = payload.lower()
+    assert b"private-client-secret" not in lowered
+    assert b"client_secret" not in lowered
+    assert b"577074103233-clientpart" not in lowered
 
 
 def test_secret_ingress_is_one_shot_with_gone_response(tmp_path) -> None:

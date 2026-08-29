@@ -728,6 +728,59 @@ def test_oauth_client_ref_cannot_cross_accounts(tmp_path: Path) -> None:
         )
 
 
+def test_default_oauth_client_binding_is_exact_account_scoped_and_redacted(
+    tmp_path: Path,
+) -> None:
+    service, ingress, _exchange, _manager_instance = _service(tmp_path)
+    _plan, _session, imported = _import_client(service, ingress)
+
+    bound = service.default_oauth_client_binding(
+        "google-account-01", expected_generation=1
+    )
+    missing = service.default_oauth_client_binding(
+        "google-account-02", expected_generation=1
+    )
+
+    assert bound == oauth_session.GoogleOAuthClientBindingV1(
+        account_ref="google-account-01",
+        inventory_generation=1,
+        default_oauth_client_ref=imported.client_ref,
+        availability=oauth_session.GoogleOAuthClientAvailabilityV1.AVAILABLE,
+    )
+    assert missing == oauth_session.GoogleOAuthClientBindingV1(
+        account_ref="google-account-02",
+        inventory_generation=1,
+        default_oauth_client_ref=None,
+        availability=oauth_session.GoogleOAuthClientAvailabilityV1.MISSING,
+    )
+    rendered = repr((bound, missing))
+    assert "private-client-secret" not in rendered
+    assert "577074103233-clientpart" not in rendered
+
+
+def test_default_oauth_client_binding_disables_stale_or_revoked_projection(
+    tmp_path: Path,
+) -> None:
+    service, ingress, _exchange, manager = _service(tmp_path)
+    _plan, _session, _imported = _import_client(service, ingress)
+
+    service._client_vault.revoke_account(
+        service._client_vault_ref("google-account-01"), expected_generation=1
+    )
+    revoked = service.default_oauth_client_binding(
+        "google-account-01", expected_generation=1
+    )
+    manager.reload(expected_generation=1)
+    stale = service.default_oauth_client_binding(
+        "google-account-01", expected_generation=2
+    )
+
+    assert stale.default_oauth_client_ref is None
+    assert stale.availability is oauth_session.GoogleOAuthClientAvailabilityV1.STALE
+    assert revoked.default_oauth_client_ref is None
+    assert revoked.availability is oauth_session.GoogleOAuthClientAvailabilityV1.REVOKED
+
+
 def test_provisioner_grant_is_rejected_before_any_transaction_or_token_write(
     tmp_path: Path,
 ) -> None:

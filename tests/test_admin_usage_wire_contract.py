@@ -4,9 +4,6 @@ import json
 from pathlib import Path
 import sys
 
-import pytest
-
-
 USAGE_SRC = Path(
     "/home/teladi/.codex-worktrees/codex-usage/google-control-ui-20260828/src"
 )
@@ -14,15 +11,11 @@ sys.path.insert(0, str(USAGE_SRC))
 
 from codex_usage.masterjet_client import _encode_request, _step_up_challenge  # noqa: E402
 from codex_usage.masterjet_contracts import (  # noqa: E402
-    ControlContractError,
     parse_secret_ingress_receipt,
     parse_secret_ingress_session,
 )
 
-from codex_master.admin_contracts import (  # noqa: E402
-    AdminContractError,
-    parse_admin_request,
-)
+from codex_master.admin_contracts import parse_admin_request  # noqa: E402
 from test_admin_http import (  # noqa: E402
     _headers,
     _request,
@@ -32,10 +25,10 @@ from test_admin_http import (  # noqa: E402
 from test_admin_service import service_at  # noqa: E402
 
 
-def test_real_usage_plan_id_without_digest_is_explicit_migration_gap() -> None:
+def test_real_usage_mutation_requests_match_canonical_admin_parser() -> None:
     openai, _secret = _encode_request(
         "openai.auth.apply",
-        {"account_ref": "openai-one", "plan_id": "plan-one"},
+        {"account_ref": "openai-one"},
         expected_generation=4,
         idempotency_key="idem-openai",
         plan_digest="sha256:" + "a" * 64,
@@ -45,19 +38,17 @@ def test_real_usage_plan_id_without_digest_is_explicit_migration_gap() -> None:
         {
             "account_ref": "openai-one",
             "credential_kind": "openai.auth-json",
-            "plan_id": "plan-one",
         },
         expected_generation=4,
         idempotency_key="idem-ingress",
         plan_digest="sha256:" + "a" * 64,
     )
 
-    for document in (openai, ingress):
-        with pytest.raises(AdminContractError, match="control.request_invalid"):
-            parse_admin_request(json.loads(document))
+    assert parse_admin_request(json.loads(openai)).operation == "openai.auth.apply"
+    assert parse_admin_request(json.loads(ingress)).operation == "secret.ingress.create"
 
 
-def test_real_usage_parser_exposes_canonical_session_migration_gap(tmp_path) -> None:
+def test_real_usage_parser_accepts_canonical_admin_secret_session(tmp_path) -> None:
     problem = {
         "schema_version": 1,
         "code": "control.step_up_required",
@@ -96,20 +87,19 @@ def test_real_usage_parser_exposes_canonical_session_migration_gap(tmp_path) -> 
             _headers(**{"Content-Type": "application/octet-stream"}),
         )
     assert created[0] == uploaded[0] == 200
-    with pytest.raises(ControlContractError, match="control.response_invalid"):
-        parse_secret_ingress_session(json.loads(created[2]))
+    session = parse_secret_ingress_session(json.loads(created[2]))
     receipt = parse_secret_ingress_receipt(json.loads(uploaded[2]))
+    assert session.id == "ingress-one"
     assert receipt.session_id == "ingress-one"
 
 
-def test_real_usage_secret_flow_fails_closed_until_digest_migration(tmp_path) -> None:
+def test_real_usage_secret_flow_uses_canonical_digest_binding(tmp_path) -> None:
     service, _owners = service_at()
     create_body, _ = _encode_request(
         "secret.ingress.create",
         {
             "account_ref": "google-one",
             "credential_kind": "google.oauth-client",
-            "plan_id": "plan-one",
         },
         expected_generation=4,
         idempotency_key="idem-create",
@@ -117,7 +107,7 @@ def test_real_usage_secret_flow_fails_closed_until_digest_migration(tmp_path) ->
     )
     apply_body, _ = _encode_request(
         "google.oauth-client-import.apply",
-        {"account_ref": "google-one", "plan_id": "plan-one"},
+        {"account_ref": "google-one"},
         expected_generation=4,
         idempotency_key="idem-apply",
         plan_digest="sha256:" + "a" * 64,
@@ -130,8 +120,38 @@ def test_real_usage_secret_flow_fails_closed_until_digest_migration(tmp_path) ->
             create_body,
             _headers(**{"X-Masterjet-Step-Up": _totp()}),
         )
-        assert created[0] == 400
-        assert json.loads(created[2])["code"] == "control.request_invalid"
+        assert created[0] == 200
+        uploaded = _request(
+            server,
+            "PUT",
+            "/admin/v1/secret-ingress-sessions/ingress-one",
+            b"oauth-client-json",
+            _headers(**{"Content-Type": "application/octet-stream"}),
+        )
+        assert uploaded[0] == 200
         applied = _request(server, "POST", "/admin/v1", apply_body, _headers())
-        assert applied[0] == 400
-        assert json.loads(applied[2])["code"] == "control.request_invalid"
+        assert applied[0] == 200
+
+
+def test_real_usage_accounts_request_receives_server_bound_oauth_client_ref(
+    tmp_path,
+) -> None:
+    service, _owners = service_at()
+    body, _secret = _encode_request(
+        "google.accounts.list",
+        {},
+        expected_generation=None,
+        idempotency_key=None,
+    )
+
+    with _running_server(tmp_path, service=service) as (server, _service):
+        status, _headers_out, payload = _request(
+            server, "POST", "/admin/v1", body, _headers()
+        )
+
+    account = json.loads(payload)["accounts"][0]
+    assert status == 200
+    assert account["default_oauth_client_ref"] == "oauth-client-opaque"
+    assert account["oauth_client_availability"] == "available"
+    assert "client_id" not in account
+    assert "client_secret" not in account

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from hashlib import sha256
 import json
 import os
@@ -478,6 +479,23 @@ class GoogleOAuthClientImportReceiptV1:
 
     def __repr__(self) -> str:
         return "GoogleOAuthClientImportReceiptV1(<redacted>)"
+
+
+class GoogleOAuthClientAvailabilityV1(str, Enum):
+    AVAILABLE = "available"
+    MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
+    REVOKED = "revoked"
+    STALE = "stale"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class GoogleOAuthClientBindingV1:
+    account_ref: str
+    inventory_generation: int
+    default_oauth_client_ref: str | None
+    availability: GoogleOAuthClientAvailabilityV1
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1395,6 +1413,65 @@ class GoogleOAuthControlService:
         if type(subject_id) is not str or not subject_id:
             raise GoogleOAuthSessionError("oauth.subject_mismatch")
         return subject_id
+
+    def default_oauth_client_binding(
+        self, account_ref: str, *, expected_generation: int
+    ) -> GoogleOAuthClientBindingV1:
+        """Project only one current account-bound opaque client reference."""
+
+        account_ref = self._ref(account_ref)
+        expected_generation = self._generation(expected_generation)
+        try:
+            snapshot = self._manager._snapshot_for_internal_use()
+            if snapshot.generation != expected_generation:
+                raise GoogleOAuthSessionError("oauth.generation_mismatch")
+            snapshot.by_account_ref[account_ref]
+        except GoogleOAuthSessionError:
+            raise
+        except (GoogleAccountInventoryError, KeyError, AttributeError):
+            raise GoogleOAuthSessionError("oauth.account_mismatch") from None
+        with self._state.locked():
+            document = self._read_locked()
+            clients = cast(list[object], document["clients"])
+            active = [
+                cast(dict[str, object], item)
+                for item in clients
+                if cast(dict[str, object], item)["account_ref"] == account_ref
+                and cast(dict[str, object], item)["state"] == "active"
+            ]
+            if len(active) > 1:
+                availability = GoogleOAuthClientAvailabilityV1.AMBIGUOUS
+            elif not active:
+                availability = GoogleOAuthClientAvailabilityV1.MISSING
+            else:
+                record = active[0]
+                if record["inventory_generation"] != expected_generation:
+                    availability = GoogleOAuthClientAvailabilityV1.STALE
+                else:
+                    try:
+                        metadata = self._client_vault.projection_metadata(
+                            self._client_vault_ref(account_ref)
+                        )
+                    except CredentialVaultError:
+                        metadata = None
+                        availability = GoogleOAuthClientAvailabilityV1.UNAVAILABLE
+                    else:
+                        if metadata is None:
+                            availability = GoogleOAuthClientAvailabilityV1.MISSING
+                        elif metadata[0] == "revoked":
+                            availability = GoogleOAuthClientAvailabilityV1.REVOKED
+                        elif metadata[1] != record["vault_generation"]:
+                            availability = GoogleOAuthClientAvailabilityV1.STALE
+                        else:
+                            return GoogleOAuthClientBindingV1(
+                                account_ref,
+                                expected_generation,
+                                cast(str, record["id"]),
+                                GoogleOAuthClientAvailabilityV1.AVAILABLE,
+                            )
+        return GoogleOAuthClientBindingV1(
+            account_ref, expected_generation, None, availability
+        )
 
     @staticmethod
     def _digest(*values: object) -> str:
