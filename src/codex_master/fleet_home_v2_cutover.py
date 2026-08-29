@@ -20,6 +20,14 @@ from pathlib import PurePosixPath
 MARKER_FILE = ".codex-fleet-agent.json"
 MAX_TARGETS = 27
 _OPERATION_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{15,95}\Z")
+_JOURNAL_GENERATIONS = {
+    "planned": 0,
+    "staged": 1,
+    "old-moved": 2,
+    "cutover-complete": 3,
+    "failed-retryable": 4,
+    "rolled-back": 4,
+}
 
 
 class FleetHomeV2CutoverError(RuntimeError):
@@ -728,6 +736,7 @@ class FleetHomeV2CutoverService:
             "parent_identity": asdict(target.parent_identity),
             "stage": stage.name,
             "backup": backup.name,
+            "journal_generation": self._journal_generation(state),
             "state": state,
         }
         encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -771,6 +780,9 @@ class FleetHomeV2CutoverService:
             raise
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid") from exc
+        if not isinstance(document, dict):
+            raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
+        state = document.get("state")
         expected = {
             "schema_version": 2,
             "operation_id": plan.operation_id,
@@ -783,23 +795,20 @@ class FleetHomeV2CutoverService:
             "parent_identity": asdict(target.parent_identity),
             "stage": stage.name,
             "backup": backup.name,
+            "journal_generation": self._journal_generation(state),
         }
         if (
-            not isinstance(document, dict)
-            or set(document) != {*expected, "state"}
+            set(document) != {*expected, "state"}
             or any(document.get(key) != value for key, value in expected.items())
-            or document.get("state")
-            not in {
-                "planned",
-                "staged",
-                "old-moved",
-                "cutover-complete",
-                "failed-retryable",
-                "rolled-back",
-            }
         ):
             raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
-        return document["state"]
+        return state
+
+    @staticmethod
+    def _journal_generation(state: object) -> int:
+        if not isinstance(state, str) or state not in _JOURNAL_GENERATIONS:
+            raise FleetHomeV2CutoverError("fleet_home_v2_journal_invalid")
+        return _JOURNAL_GENERATIONS[state]
 
     def _restore_backup(self, home: Path, backup: Path) -> None:
         if self._filesystem.exists(home):

@@ -231,6 +231,7 @@ def test_apply_replaces_whole_opaque_home_and_keeps_complete_backup(tmp_path: Pa
             tmp_path / ".fleet-home-v2-cutover-apply-g1-20260829-g1.json"
         ).read_text()
     )
+    assert journal["journal_generation"] == 3
     assert journal["artifact_manifest_digest"] == hashlib.sha256(
         json.dumps(
             {
