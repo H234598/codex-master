@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from codex_master.hive import principals as principals_module
 from codex_master.hive.principals import (
     ExecutionBinding,
     Principal,
@@ -19,6 +20,18 @@ NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
 def principal(principal_id: str, class_id: str, parent: str | None, repo: str | None):
     scope = "global" if repo is None else "repository"
     return Principal(principal_id, class_id, parent, "profile", scope, repo, "active", DIGEST, 1)
+
+
+def test_principal_public_projection_omits_config_digest() -> None:
+    public = principal("queen-repo", "koenigin", "godbee-main", "repo-one").public()
+    assert public["principal_id"] == "queen-repo"
+    assert "config_digest" not in public
+
+
+def test_principal_text_validator_rejects_control_characters() -> None:
+    assert principals_module._text("profile", "invalid_profile") == "profile"
+    with pytest.raises(PrincipalError, match="invalid_profile"):
+        principals_module._text("bad\nprofile", "invalid_profile")
 
 
 def chain(registry: PrincipalRegistry) -> None:

@@ -10,12 +10,15 @@ from typing import Protocol
 
 from codex_master.fleet_home_broker_dispatch import BrokerDispatchCommand
 from codex_master.fleet_home_broker_linux import (
+    AgentStartPeerObservation,
     LinuxOperations,
     PeerSnapshot,
     _attest_peer_principal_with_identity,
     _observe_peer_snapshot_with_identity,
+    observe_agent_start_peer,
 )
 from codex_master.fleet_home_broker_protocol import (
+    AgentStartEnvelope,
     AttestHomeRequest,
     BrokerReply,
     GetTerminalResultRequest,
@@ -24,6 +27,7 @@ from codex_master.fleet_home_broker_protocol import (
     QueryTransactionRequest,
     decode_chpb_message,
     validate_principal_binding,
+    validate_chpb_message,
 )
 from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
@@ -160,7 +164,7 @@ def _credentials(value: object) -> tuple[int, int, int]:
 
 def _peer_security_context(
     value: object, agent_domain: str, expected_mcs_pair: str
-) -> None:
+) -> str:
     if type(value) is not bytes or not 1 <= len(value) <= _MAX_SO_PEERSEC_BYTES:
         raise ValueError
     if not value.endswith(b"\0"):
@@ -180,6 +184,19 @@ def _peer_security_context(
         or fields[3] != f"s0:{expected_mcs_pair}"
     ):
         raise ValueError
+    return label
+
+
+def _agent_start_security_context(value: object, expected_mcs_pair: str) -> str:
+    label = _peer_security_context(
+        value, "codex_master_agent_t", expected_mcs_pair
+    )
+    if (
+        label
+        != f"system_u:system_r:codex_master_agent_t:s0:{expected_mcs_pair}"
+    ):
+        raise ValueError
+    return label
 
 
 def _snapshot_matches(value: object, pid: int, expected: PrincipalBinding) -> PeerSnapshot:
@@ -361,6 +378,37 @@ def reattest_seqpacket_peer(
         raise SeqpacketPeerError("seqpacket peer attestation failed") from None
 
 
+def reattest_agent_start_peer(
+    operations: SeqpacketPeerOperations,
+    linux_operations: LinuxOperations,
+    expected: AgentStartEnvelope,
+) -> AgentStartPeerObservation:
+    """Reattest one injected V2 peer without owning transport or state."""
+
+    try:
+        if type(expected) is not AgentStartEnvelope:
+            raise ValueError
+        validate_chpb_message(expected)
+        family = operations.socket_family()
+        if type(family) is not socket.AddressFamily or family is not socket.AF_UNIX:
+            raise ValueError
+        kind = operations.socket_type()
+        if type(kind) is not socket.SocketKind or kind is not socket.SOCK_SEQPACKET:
+            raise ValueError
+        pid, uid, gid = _credentials(operations.peer_credentials())
+        if operations.selinux_enforcing() is not True:
+            raise ValueError
+        selinux_context = _agent_start_security_context(
+            operations.peer_security_context(), expected.principal.mcs_pair
+        )
+        observation = observe_agent_start_peer(
+            linux_operations, pid, uid, gid, expected, selinux_context
+        )
+        return observation
+    except Exception:
+        raise SeqpacketPeerError("agent start peer attestation failed") from None
+
+
 __all__ = (
     "SeqpacketPacketCode",
     "SeqpacketPacketError",
@@ -372,5 +420,6 @@ __all__ = (
     "SeqpacketPeerOperations",
     "admit_connected_seqpacket_peer",
     "receive_admitted_seqpacket_request",
+    "reattest_agent_start_peer",
     "reattest_seqpacket_peer",
 )

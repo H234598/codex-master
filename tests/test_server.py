@@ -31,6 +31,7 @@ import codex_master.resource_cgroup as resource_cgroup
 from codex_master import __version__
 from codex_master.hive.types import TaskComplexity
 from codex_master.hive.state import HiveStateStore
+from codex_master.masterjet_runtime import MasterjetRuntime
 from codex_master.fleet_home_recovery import make_fleet_identity_journal_plan
 from codex_master.resource_cgroup import (
     CgroupPreflightError,
@@ -41420,6 +41421,83 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
             ):
                 with self.assertRaises(type(signal)):
                     server_module.call_validated_tool("fleet_google_inventory", {})
+
+
+def test_dynamic_teamlead_dispatch_does_not_enter_legacy_agent_start() -> None:
+    class Control:
+        calls = 0
+
+        def start_dynamic_teamlead(self) -> dict[str, int | str]:
+            self.calls += 1
+            return {
+                "schema_version": 1,
+                "status": "started",
+                "raw_output": "not_returned",
+            }
+
+    control = Control()
+    with patch.object(
+        server_module,
+        "agent_ids",
+        side_effect=AssertionError("dynamic dispatch must not select legacy agents"),
+    ), patch.object(
+        server_module,
+        "start_agent",
+        side_effect=AssertionError("dynamic dispatch must not start legacy agents"),
+    ):
+        result = server_module.call_tool(
+            "dynamic_teamlead_start",
+            {},
+            runtime=MasterjetRuntime(control),
+        )
+
+    assert result == {
+        "schema_version": 1,
+        "status": "started",
+        "raw_output": "not_returned",
+    }
+    assert control.calls == 1
+
+
+def test_targetless_teamlead_agent_start_keeps_a1_b1_legacy_forbidden() -> None:
+    class Control:
+        calls = 0
+
+        def start_dynamic_teamlead(self) -> dict[str, int | str]:
+            self.calls += 1
+            raise AssertionError("agent_start must ignore runtime")
+
+    control = Control()
+    with patch.object(
+        server_module, "agent_ids", return_value=["a1", "b1"]
+    ), patch.object(
+        server_module,
+        "require_broad_mutation_confirmation",
+        return_value={"required": False},
+    ), patch.object(
+        server_module,
+        "call_agent_lifecycle",
+        side_effect=lambda _agent, callback: callback(),
+    ), patch.object(
+        server_module, "require_fleet_recovery_ready"
+    ), patch.object(
+        server_module, "require_authenticated_agent_for_mutation"
+    ) as auth, patch.object(
+        server_module, "ensure_agent_not_blocked_by_codex_usage"
+    ) as routing:
+        result = server_module.call_tool(
+            "agent_start",
+            {"agent": "both", "class": "teamleiterin"},
+            runtime=MasterjetRuntime(control),
+        )
+
+    assert [item["error"] for item in result["results"]] == [
+        "dynamic_teamlead_legacy_target_forbidden",
+        "dynamic_teamlead_legacy_target_forbidden",
+    ]
+    auth.assert_not_called()
+    routing.assert_not_called()
+    assert control.calls == 0
 
 
 if __name__ == "__main__":

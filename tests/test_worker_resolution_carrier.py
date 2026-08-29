@@ -1,5 +1,6 @@
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
+import copy
 import importlib
 import json
 import pickle
@@ -401,6 +402,82 @@ def test_carriers_redact_and_refuse_serialization_or_runtime_data() -> None:
             asdict(value)
         with pytest.raises(TypeError):
             json.dumps(value)
+
+
+def test_redacted_carrier_copy_is_denied() -> None:
+    _ticket, _evidence_value, carrier = _carrier()
+
+    with pytest.raises(TypeError, match="not serializable"):
+        copy.copy(carrier)
+
+
+def test_redacted_carrier_deepcopy_is_denied() -> None:
+    _ticket, _evidence_value, carrier = _carrier()
+
+    with pytest.raises(TypeError, match="not serializable"):
+        copy.deepcopy(carrier)
+
+
+def test_resolution_payload_rejects_mutation() -> None:
+    import codex_master.worker_resolution_carrier as carrier_module
+
+    ticket, evidence, _carrier_value = _carrier()
+    payload = carrier_module._ResolutionPayload(
+        ticket_id=ticket.ticket_id,
+        ticket_fence_epoch=ticket.fence_epoch,
+        ticket_resolution_generation=ticket.resolution_generation,
+        ticket_policy_digest=ticket.policy_digest,
+        ticket_policy_generation=ticket.policy_generation,
+        capability_binding_digest=evidence.capability_binding_digest,
+        resolution_decision_digest=ticket.resolution_decision_digest,
+        decision=evidence.decision,
+        offer=evidence.offer,
+        resolver_offer_generation=evidence.offer_generation,
+    )
+
+    with pytest.raises(AttributeError, match="immutable"):
+        payload.ticket_id = "ticket:replacement"
+
+
+def test_resolution_payload_deepcopy_is_denied() -> None:
+    import codex_master.worker_resolution_carrier as carrier_module
+
+    ticket, evidence, _carrier_value = _carrier()
+    payload = carrier_module._ResolutionPayload(
+        ticket_id=ticket.ticket_id,
+        ticket_fence_epoch=ticket.fence_epoch,
+        ticket_resolution_generation=ticket.resolution_generation,
+        ticket_policy_digest=ticket.policy_digest,
+        ticket_policy_generation=ticket.policy_generation,
+        capability_binding_digest=evidence.capability_binding_digest,
+        resolution_decision_digest=ticket.resolution_decision_digest,
+        decision=evidence.decision,
+        offer=evidence.offer,
+        resolver_offer_generation=evidence.offer_generation,
+    )
+
+    with pytest.raises(TypeError, match="not serializable"):
+        copy.deepcopy(payload)
+
+
+def test_reservation_payload_rejects_mutation() -> None:
+    _allocator, _ticket, _current_ticket, _carrier, _binding, reservation = (
+        _bound_reservation()
+    )
+    payload = object.__getattribute__(reservation, "_payload")
+
+    with pytest.raises(AttributeError, match="immutable"):
+        payload.principal_id = "dw-" + "8" * 32
+
+
+def test_reservation_payload_deepcopy_is_denied() -> None:
+    _allocator, _ticket, _current_ticket, _carrier, _binding, reservation = (
+        _bound_reservation()
+    )
+    payload = object.__getattribute__(reservation, "_payload")
+
+    with pytest.raises(TypeError, match="not serializable"):
+        copy.deepcopy(payload)
 
 
 @pytest.mark.parametrize(

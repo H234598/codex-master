@@ -5,6 +5,7 @@ import urllib.error
 
 import pytest
 
+from codex_master import google_cloud_api
 from codex_master.google_cloud_api import (
     GoogleCloudApi,
     GoogleCloudApiError,
@@ -20,6 +21,129 @@ class FakeTransport:
     def request(self, method, url, headers, body):
         self.calls.append((method, url, headers, body))
         return next(self.responses)
+
+
+class FakeHttpResponse:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.read_limits: list[int] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
+
+    def read(self, limit: int) -> bytes:
+        self.read_limits.append(limit)
+        return self.payload
+
+
+class FakeOpener:
+    def __init__(self, response: FakeHttpResponse) -> None:
+        self.response = response
+        self.requests: list[object] = []
+
+    def open(self, request, timeout: int) -> FakeHttpResponse:
+        self.requests.append((request, timeout))
+        return self.response
+
+
+def test_no_redirect_handler_declines_redirect_requests() -> None:
+    handler = google_cloud_api._NoRedirect()
+
+    assert (
+        handler.redirect_request(None, None, 302, "Found", {}, "https://elsewhere")
+        is None
+    )
+
+
+def test_urllib_transport_constructor_installs_no_redirect_opener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opener = object()
+    handlers: list[object] = []
+
+    def build_opener(handler: object) -> object:
+        handlers.append(handler)
+        return opener
+
+    monkeypatch.setattr(google_cloud_api.urllib.request, "build_opener", build_opener)
+
+    transport = google_cloud_api._UrlLibTransport()
+
+    assert transport._opener is opener
+    assert len(handlers) == 1
+    assert isinstance(handlers[0], google_cloud_api._NoRedirect)
+
+
+def test_urllib_transport_encodes_json_and_decodes_object_response() -> None:
+    response = FakeHttpResponse(b'{"result":"ok"}')
+    opener = FakeOpener(response)
+    transport = google_cloud_api._UrlLibTransport.__new__(
+        google_cloud_api._UrlLibTransport
+    )
+    transport._opener = opener
+
+    result = transport.request(
+        "POST",
+        "https://example.invalid/resource",
+        {"Accept": "application/json"},
+        {"item": 1},
+    )
+
+    request, timeout = opener.requests[0]
+    assert result == {"result": "ok"}
+    assert timeout == 30
+    assert request.get_method() == "POST"
+    assert request.data == b'{"item":1}'
+    assert response.read_limits == [1_048_577]
+
+
+def test_constructor_rejects_missing_auth_and_creates_a_redacted_client() -> None:
+    with pytest.raises(GoogleCloudApiError, match="google.api_auth_failed"):
+        GoogleCloudApi("")
+
+    assert repr(GoogleCloudApi("private-access-token")) == "GoogleCloudApi()"
+
+
+def test_list_keys_returns_response_items_and_uses_project_collection_url() -> None:
+    transport = FakeTransport(
+        [{"keys": [{"name": "projects/123/locations/global/keys/key-one"}]}]
+    )
+    api = GoogleCloudApi._for_test("private-access-token", transport)
+
+    keys = api.list_keys("123")
+
+    assert keys == [{"name": "projects/123/locations/global/keys/key-one"}]
+    assert transport.calls[0][0:2] == (
+        "GET",
+        "https://apikeys.googleapis.com/v2/projects/123/locations/global/keys",
+    )
+    assert transport.calls[0][3] is None
+
+
+def test_list_enabled_services_returns_only_enabled_service_collection() -> None:
+    transport = FakeTransport(
+        [{"services": [{"name": "projects/123/services/apikeys.googleapis.com"}]}]
+    )
+    api = GoogleCloudApi._for_test("private-access-token", transport)
+
+    services = api.list_enabled_services("123")
+
+    assert services == [{"name": "projects/123/services/apikeys.googleapis.com"}]
+    assert transport.calls[0][0:2] == (
+        "GET",
+        "https://serviceusage.googleapis.com/v1/projects/123/services?"
+        "filter=state%3AENABLED",
+    )
+    assert transport.calls[0][3] is None
+
+
+def test_google_cloud_api_error_repr_exposes_only_its_code() -> None:
+    error = GoogleCloudApiError("google.api_auth_failed")
+
+    assert repr(error) == "GoogleCloudApiError('google.api_auth_failed')"
 
 
 @pytest.mark.parametrize(

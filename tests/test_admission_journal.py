@@ -13,13 +13,28 @@ from codex_master.admission import (
     ScopeBinding,
     create_admission,
 )
-from codex_master.admission_journal import CompletionJournalError, FileCompletionJournal
+from codex_master.admission_journal import CompletionJournal, CompletionJournalError, FileCompletionJournal
 from codex_master.admission_runtime import ADMISSION_RUNTIME_GATES, AdmissionRuntimeError, RuntimeGateDecision, ServerAdmissionRuntime
 from codex_master.hive.events import HiveEventStore
 from codex_master.selection_service import SelectionService
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+
+
+def test_completion_journal_base_record_started_requires_adapter() -> None:
+    with pytest.raises(NotImplementedError):
+        CompletionJournal().record_started(executing_record(), "assign")
+
+
+def test_completion_journal_base_record_completed_requires_adapter() -> None:
+    with pytest.raises(NotImplementedError):
+        CompletionJournal().record_completed(executing_record(), "assign", {"status": "ok"})
+
+
+def test_completion_journal_base_execution_completed_requires_adapter() -> None:
+    with pytest.raises(NotImplementedError):
+        CompletionJournal().execution_completed(executing_record())
 
 
 def admission():

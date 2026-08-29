@@ -19,6 +19,7 @@ from codex_master.fleet_overview import (
     fleet_overview_document,
     render_fleet_overview,
 )
+import codex_master.fleet_overview as overview_module
 from codex_master.fleet_registry import (
     AuthKind,
     FleetAccount,
@@ -696,3 +697,21 @@ def test_overview_row_dto_names_remain_exact_types() -> None:
     assert type(overview.series[0]) is FleetOverviewSeriesRow
     assert type(overview.agents[0]) is FleetOverviewAgentRow
     assert type(overview.account_limits[0]) is FleetOverviewAccountLimitRow
+
+
+def test_limit_label_maps_standard_windows_and_preserves_unknown_seconds() -> None:
+    assert overview_module._limit_label(UsageLimit("primary", 18_000, None, 50.0, None)) == "primary/5h"
+    assert overview_module._limit_label(UsageLimit("primary", 604_800, None, 50.0, None)) == "primary/7d"
+    assert overview_module._limit_label(UsageLimit("spark", 123, None, None, None)) == "spark/123s"
+
+
+def test_usage_limit_document_preserves_only_the_public_limit_fields() -> None:
+    limit = UsageLimit("primary", 18_000, 25.0, 75.0, SHORT_RESET)
+
+    assert overview_module._usage_limit_document(limit) == {
+        "pool": "primary",
+        "window_seconds": 18_000,
+        "used_percent": 25.0,
+        "remaining_percent": 75.0,
+        "reset_at": SHORT_RESET.isoformat(),
+    }

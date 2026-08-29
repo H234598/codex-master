@@ -85,6 +85,14 @@ def grant(engine: AuthorityEngine, *, expires: datetime | None = None):
     )
 
 
+def test_public_grants_returns_redacted_grant_projection(tmp_path: Path) -> None:
+    authority = engine(tmp_path)
+    grant(authority)
+    public = authority.public_grants()
+    assert public[0]["grant_id"] == "grant-one"
+    assert "nonce" not in public[0]
+
+
 def test_authorize_is_deny_by_default_and_checks_scope_and_repo(tmp_path: Path) -> None:
     authority = engine(tmp_path)
     assert authority.authorize(request()).allowed is True

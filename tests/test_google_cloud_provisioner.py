@@ -20,6 +20,12 @@ INVENTORY_GENERATION = 7
 INVENTORY_FINGERPRINT = "sha256:" + "a" * 64
 
 
+def test_google_cloud_provisioner_error_repr_contains_only_code() -> None:
+    error = GoogleCloudProvisionerError("provisioner.synthetic")
+
+    assert repr(error) == "GoogleCloudProvisionerError('provisioner.synthetic')"
+
+
 def _evidence(
     remaining: object,
     *,

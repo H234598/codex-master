@@ -5,6 +5,13 @@ from enum import Enum
 import json
 import re
 
+from codex_master.fleet_control_release_v2 import (
+    ControlReleaseSpecV2,
+    decode_control_release_v2,
+    encode_control_release_v2,
+)
+from codex_master.fleet_home_broker_identity import BrokerIdentity
+
 
 CHPB_PROTOCOL = "CHPB/2"
 CHPB_SCHEMA_VERSION = 2
@@ -44,6 +51,8 @@ class ChpbMessageKind(str, Enum):
     REPLACE_HOME = "replace_home"
     DEPROVISION_HOME = "deprovision_home"
     REPLY = "reply"
+    AGENT_START_CLAIM = "agent_start_claim"
+    AGENT_START_ENVELOPE = "agent_start_envelope"
 
 
 class ChpbTransactionOperation(str, Enum):
@@ -298,6 +307,41 @@ class BrokerReply:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentStartClaim:
+    protocol: str
+    kind: ChpbMessageKind
+    request_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class AgentStartExecutablePin:
+    path: str
+    fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class AgentStartEnvironmentProjection:
+    values: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AgentStartEnvelope:
+    protocol: str
+    kind: ChpbMessageKind
+    request_id: str
+    release: ControlReleaseSpecV2
+    release_payload_version: str
+    snapshot_generation: int
+    principal: PrincipalBinding
+    expected: BindingExpectation
+    unit_name: str
+    identity: BrokerIdentity
+    executable: AgentStartExecutablePin
+    environment: AgentStartEnvironmentProjection
+    attestation: HomeAttestation
+
+
+@dataclass(frozen=True, slots=True)
 class RecoveryDecision:
     action: BrokerRecoveryAction
     next_b2a_phase: B2aRecoveryPhase | None
@@ -306,13 +350,32 @@ class RecoveryDecision:
 
 
 BrokerRequest = AttestHomeRequest | QueryTransactionRequest | GetTerminalResultRequest | ProvisionHomeRequest | ReplaceHomeRequest | DeprovisionHomeRequest
-ChpbMessage = BrokerRequest | BrokerReply
+ChpbMessage = BrokerRequest | BrokerReply | AgentStartClaim | AgentStartEnvelope
 
 
 _HEX32 = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _AGENT = re.compile(r"[a-z][a-z0-9_-]{0,127}\Z", re.ASCII)
 _MCS = re.compile(r"c(0|[1-9][0-9]{0,3}),c(0|[1-9][0-9]{0,3})\Z", re.ASCII)
+_MCS_INSTANCE = re.compile(r"c[0-9]{1,4}\\x2cc[0-9]{1,4}\Z", re.ASCII)
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+
+_AGENT_START_ENVIRONMENT = (
+    ("CODEX_HOME", CANONICAL_AGENT_HOME),
+    ("GEMINI_CLI_HOME", CANONICAL_AGENT_HOME),
+    ("HOME", CANONICAL_AGENT_HOME),
+)
+
+
+def agent_unit_name_for_mcs(mcs_pair: object) -> str:
+    """Return the only unit spelling permitted for one validated MCS pair."""
+
+    mcs = _mcs(mcs_pair)
+    low, high = (int(part[1:]) for part in mcs.split(","))
+    instance = f"c{low}\\x2cc{high}"
+    if _MCS_INSTANCE.fullmatch(instance) is None:
+        _fail(ChpbValidationCode.INVALID_BINDING)
+    return f"codex-master-agent@{instance}.service"
 
 
 def _fail(code: ChpbValidationCode):
@@ -494,6 +557,159 @@ def _validate_attestation(value: object) -> HomeAttestation:
     return value
 
 
+def _validate_identity(value: object) -> BrokerIdentity:
+    if type(value) is not BrokerIdentity:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    try:
+        BrokerIdentity(
+            value.agent_id,
+            value.manifest_generation,
+            value.mcs_pair,
+            value.slot_snapshot,
+            value.policy_generation,
+            value.projection_digest,
+            value.executable_fingerprint,
+            value.fencing_epoch,
+        )
+    except Exception:
+        _fail(ChpbValidationCode.INVALID_BINDING)
+    return value
+
+
+def _validate_executable_pin(value: object) -> AgentStartExecutablePin:
+    if type(value) is not AgentStartExecutablePin:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    path = value.path
+    if (
+        type(path) is not str
+        or not path.startswith("/")
+        or path != path.strip()
+        or "//" in path
+        or path.endswith("/")
+        or "\x00" in path
+        or "\\" in path
+    ):
+        _fail(ChpbValidationCode.INVALID_FIELD)
+    parts = path.split("/")
+    if any(part in {"", ".", ".."} for part in parts[1:]):
+        _fail(ChpbValidationCode.INVALID_FIELD)
+    if tuple(parts[-3:-1]) == ("self", "fd"):
+        _fail(ChpbValidationCode.INVALID_FIELD)
+    _digest(value.fingerprint, 64)
+    return value
+
+
+def _validate_environment_projection(
+    value: object,
+) -> AgentStartEnvironmentProjection:
+    if type(value) is not AgentStartEnvironmentProjection:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    if type(value.values) is not tuple or value.values != _AGENT_START_ENVIRONMENT:
+        _fail(ChpbValidationCode.INVALID_FIELD)
+    for pair in value.values:
+        if (
+            type(pair) is not tuple
+            or len(pair) != 2
+            or type(pair[0]) is not str
+            or type(pair[1]) is not str
+        ):
+            _fail(ChpbValidationCode.INVALID_TYPE)
+    return value
+
+
+def _validate_agent_start_claim(value: object) -> AgentStartClaim:
+    if type(value) is not AgentStartClaim:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    if type(value.protocol) is not str:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    if value.protocol != CHPB_PROTOCOL:
+        _fail(ChpbValidationCode.UNSUPPORTED_PROTOCOL)
+    if type(value.kind) is not ChpbMessageKind:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    if value.kind is not ChpbMessageKind.AGENT_START_CLAIM:
+        _fail(ChpbValidationCode.INVALID_FIELD)
+    _digest(value.request_id, 32)
+    return value
+
+
+def _validate_agent_start_envelope(value: object) -> AgentStartEnvelope:
+    if type(value) is not AgentStartEnvelope:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    if type(value.protocol) is not str:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    if value.protocol != CHPB_PROTOCOL:
+        _fail(ChpbValidationCode.UNSUPPORTED_PROTOCOL)
+    if type(value.kind) is not ChpbMessageKind:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    if value.kind is not ChpbMessageKind.AGENT_START_ENVELOPE:
+        _fail(ChpbValidationCode.INVALID_FIELD)
+    _digest(value.request_id, 32)
+    if type(value.release_payload_version) is not str:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    if type(value.release) is not ControlReleaseSpecV2:
+        _fail(ChpbValidationCode.INVALID_TYPE)
+    try:
+        release = ControlReleaseSpecV2(
+            value.release.schema_version,
+            value.release.payload_version,
+            value.release.payloads,
+            value.release.broker_protocol,
+            value.release.system_bus_interface,
+            value.release.system_bus_method,
+            value.release.agent_unit_template,
+            value.release.launcher_path,
+        )
+        release_bytes = encode_control_release_v2(release)
+        decoded_release = decode_control_release_v2(
+            release_bytes, value.release_payload_version
+        )
+    except Exception:
+        _fail(ChpbValidationCode.INVALID_BINDING)
+    if release != value.release or decoded_release != value.release:
+        _fail(ChpbValidationCode.INVALID_BINDING)
+    _integer(value.snapshot_generation, 1, MAX_CHPB_GENERATION)
+    validate_principal_binding(value.principal)
+    _validate_expectation(value.expected)
+    if (
+        value.principal.agent_id != value.expected.agent_id
+        or value.principal.manifest_generation != value.expected.manifest_generation
+        or value.principal.unit_generation != value.expected.unit_generation
+        or value.principal.fencing_epoch != value.expected.fencing_epoch
+    ):
+        _fail(ChpbValidationCode.INVALID_BINDING)
+    _validate_identity(value.identity)
+    if (
+        value.identity.agent_id != value.principal.agent_id
+        or value.identity.manifest_generation != value.principal.manifest_generation
+        or value.identity.mcs_pair != value.principal.mcs_pair
+        or value.identity.policy_generation != value.expected.policy_generation
+        or value.identity.projection_digest != value.expected.projection_digest
+        or value.identity.fencing_epoch != value.principal.fencing_epoch
+    ):
+        _fail(ChpbValidationCode.INVALID_BINDING)
+    if value.unit_name != agent_unit_name_for_mcs(value.principal.mcs_pair):
+        _fail(ChpbValidationCode.INVALID_BINDING)
+    _validate_executable_pin(value.executable)
+    if (
+        value.executable.path != value.release.launcher_path
+        or value.executable.fingerprint != value.identity.executable_fingerprint
+    ):
+        _fail(ChpbValidationCode.INVALID_BINDING)
+    _validate_environment_projection(value.environment)
+    _validate_attestation(value.attestation)
+    attestation = value.attestation
+    if (
+        attestation.binding.principal != value.principal
+        or attestation.binding.policy.policy_generation
+        != value.expected.policy_generation
+        or attestation.binding.policy.projection_digest
+        != value.expected.projection_digest
+        or attestation.mcs_pair != value.principal.mcs_pair
+    ):
+        _fail(ChpbValidationCode.INVALID_BINDING)
+    return value
+
+
 def _validate_request(
     value: BrokerRequest,
     klass: type,
@@ -548,6 +764,10 @@ def validate_chpb_message(value: object) -> ChpbMessage:
         return _validate_request(value, ReplaceHomeRequest, ChpbMessageKind.REPLACE_HOME, has_binding=True)
     if type(value) is DeprovisionHomeRequest:
         return _validate_request(value, DeprovisionHomeRequest, ChpbMessageKind.DEPROVISION_HOME, has_binding=True)
+    if type(value) is AgentStartClaim:
+        return _validate_agent_start_claim(value)
+    if type(value) is AgentStartEnvelope:
+        return _validate_agent_start_envelope(value)
     if type(value) is not BrokerReply:
         _fail(ChpbValidationCode.INVALID_TYPE)
     if value.protocol != CHPB_PROTOCOL:
@@ -608,7 +828,56 @@ def _attestation_doc(value: HomeAttestation) -> dict[str, object]:
     return {"binding": _binding_doc(value.binding), "canonical_path": value.canonical_path, "directory": _directory_doc(value.directory), "manifest_digest": value.manifest_digest, "mcs_pair": value.mcs_pair}
 
 
+def _identity_doc(value: BrokerIdentity) -> dict[str, object]:
+    return {
+        "agent_id": value.agent_id,
+        "fencing_epoch": value.fencing_epoch,
+        "executable_fingerprint": value.executable_fingerprint,
+        "manifest_generation": value.manifest_generation,
+        "mcs_pair": value.mcs_pair,
+        "policy_generation": value.policy_generation,
+        "projection_digest": value.projection_digest,
+        "slot_snapshot": value.slot_snapshot,
+    }
+
+
+def _executable_doc(value: AgentStartExecutablePin) -> dict[str, object]:
+    return {"fingerprint": value.fingerprint, "path": value.path}
+
+
+def _environment_doc(
+    value: AgentStartEnvironmentProjection,
+) -> dict[str, object]:
+    return {
+        "codex_home": value.values[0][1],
+        "gemini_cli_home": value.values[1][1],
+        "home": value.values[2][1],
+    }
+
+
 def _message_doc(value: ChpbMessage) -> dict[str, object]:
+    if type(value) is AgentStartClaim:
+        return {
+            "kind": value.kind.value,
+            "protocol": value.protocol,
+            "request_id": value.request_id,
+        }
+    if type(value) is AgentStartEnvelope:
+        return {
+            "attestation": _attestation_doc(value.attestation),
+            "environment": _environment_doc(value.environment),
+            "executable": _executable_doc(value.executable),
+            "expected": _expectation_doc(value.expected),
+            "identity": _identity_doc(value.identity),
+            "kind": value.kind.value,
+            "principal": _principal_doc(value.principal),
+            "protocol": value.protocol,
+            "release": encode_control_release_v2(value.release).decode("utf-8"),
+            "release_payload_version": value.release_payload_version,
+            "request_id": value.request_id,
+            "snapshot_generation": value.snapshot_generation,
+            "unit_name": value.unit_name,
+        }
     if type(value) in (
         AttestHomeRequest,
         QueryTransactionRequest,
@@ -731,6 +1000,51 @@ def _attestation_from(document: object) -> HomeAttestation:
     return HomeAttestation(_binding_from(doc["binding"]), doc["canonical_path"], _directory_from(doc["directory"]), doc["manifest_digest"], doc["mcs_pair"])
 
 
+def _identity_from(document: object) -> BrokerIdentity:
+    doc = _keys(
+        document,
+        {
+            "agent_id",
+            "executable_fingerprint",
+            "fencing_epoch",
+            "manifest_generation",
+            "mcs_pair",
+            "policy_generation",
+            "projection_digest",
+            "slot_snapshot",
+        },
+    )
+    try:
+        return BrokerIdentity(
+            doc["agent_id"],
+            doc["manifest_generation"],
+            doc["mcs_pair"],
+            doc["slot_snapshot"],
+            doc["policy_generation"],
+            doc["projection_digest"],
+            doc["executable_fingerprint"],
+            doc["fencing_epoch"],
+        )
+    except Exception as exc:
+        raise ChpbValidationError(ChpbValidationCode.INVALID_BINDING) from exc
+
+
+def _executable_from(document: object) -> AgentStartExecutablePin:
+    doc = _keys(document, {"fingerprint", "path"})
+    return AgentStartExecutablePin(doc["path"], doc["fingerprint"])
+
+
+def _environment_from(document: object) -> AgentStartEnvironmentProjection:
+    doc = _keys(document, {"codex_home", "gemini_cli_home", "home"})
+    return AgentStartEnvironmentProjection(
+        (
+            ("CODEX_HOME", doc["codex_home"]),
+            ("GEMINI_CLI_HOME", doc["gemini_cli_home"]),
+            ("HOME", doc["home"]),
+        )
+    )
+
+
 def _message_from(document: object) -> ChpbMessage:
     if type(document) is not dict:
         _fail(ChpbValidationCode.INVALID_TYPE)
@@ -740,6 +1054,51 @@ def _message_from(document: object) -> ChpbMessage:
         transaction = None if doc["transaction"] is None else _status_from(doc["transaction"])
         attestation = None if doc["attestation"] is None else _attestation_from(doc["attestation"])
         return BrokerReply(doc["protocol"], kind, doc["request_id"], _as_enum(doc["result"], BrokerResultCode), transaction, attestation)
+    if kind is ChpbMessageKind.AGENT_START_CLAIM:
+        doc = _keys(document, {"kind", "protocol", "request_id"})
+        return AgentStartClaim(doc["protocol"], kind, doc["request_id"])
+    if kind is ChpbMessageKind.AGENT_START_ENVELOPE:
+        doc = _keys(
+            document,
+            {
+                "attestation",
+                "environment",
+                "executable",
+                "expected",
+                "identity",
+                "kind",
+                "principal",
+                "protocol",
+                "release",
+                "release_payload_version",
+                "request_id",
+                "snapshot_generation",
+                "unit_name",
+            },
+        )
+        if type(doc["release"]) is not str:
+            _fail(ChpbValidationCode.INVALID_TYPE)
+        try:
+            release = decode_control_release_v2(
+                doc["release"].encode("utf-8"), doc["release_payload_version"]
+            )
+        except Exception as exc:
+            raise ChpbValidationError(ChpbValidationCode.INVALID_BINDING) from exc
+        return AgentStartEnvelope(
+            doc["protocol"],
+            kind,
+            doc["request_id"],
+            release,
+            doc["release_payload_version"],
+            doc["snapshot_generation"],
+            _principal_from(doc["principal"]),
+            _expectation_from(doc["expected"]),
+            doc["unit_name"],
+            _identity_from(doc["identity"]),
+            _executable_from(doc["executable"]),
+            _environment_from(doc["environment"]),
+            _attestation_from(doc["attestation"]),
+        )
     klass = {
         ChpbMessageKind.ATTEST_HOME: AttestHomeRequest,
         ChpbMessageKind.QUERY_TRANSACTION: QueryTransactionRequest,

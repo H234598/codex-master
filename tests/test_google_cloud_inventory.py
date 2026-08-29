@@ -11,6 +11,11 @@ from codex_master.google_cloud_inventory import (
 )
 
 
+def test_google_cloud_inventory_error_repr_contains_only_code() -> None:
+    error = GoogleCloudInventoryError("inventory.synthetic")
+    assert repr(error) == "GoogleCloudInventoryError('inventory.synthetic')"
+
+
 class MemoryStore:
     def __init__(self, document):
         self.document = copy.deepcopy(document)

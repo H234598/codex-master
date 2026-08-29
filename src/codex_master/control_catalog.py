@@ -121,6 +121,9 @@ _READ_ONLY_TOOLS = {
     "fleet_status_compact",
     "goddess_report_status",
     "goddess_report_list",
+    "hive_test_index_status",
+    "hive_test_plan",
+    "hive_test_status",
 }
 _MUTATING_TOOLS = {
     "agent_claim",
@@ -151,6 +154,8 @@ _MUTATING_TOOLS = {
     "fleet_series_disable",
     "fleet_series_delete",
     "goddess_report_run",
+    "hive_test_run",
+    "hive_test_invalidate",
 }
 _BROAD_TOOLS = {
     "agent_start",

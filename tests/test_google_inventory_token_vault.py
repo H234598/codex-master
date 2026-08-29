@@ -1928,10 +1928,43 @@ def test_every_pre_rename_failure_preserves_old_record_cleans_temp_and_retries(
     assert not list(tokens.glob(".test-account.*.tmp"))
     _assert_no_race_secret(tokens, token_marker)
     assert not vault_module._IN_PROCESS_LOCKS
-
     monkeypatch.undo()
     assert _store(vault, manager, generation=1).vault_generation == 2
 
+
+def test_directory_node_repr_is_a_fixed_redacted_capability_label() -> None:
+    assert repr(object.__new__(vault_module._DirectoryNode)) == (
+        "<private inventory token vault directory node>"
+    )
+
+
+def test_open_production_tokens_directory_classifies_root_open_failure(monkeypatch) -> None:
+    def denied(*args, **kwargs):
+        raise OSError(vault_module.errno.EACCES, "denied")
+
+    monkeypatch.setattr(vault_module.os, "open", denied)
+
+    assert vault_module._open_production_tokens_directory() == (
+        "credential.inventory_token_vault_permissions",
+        None,
+    )
+
+
+def test_validate_regular_private_fd_requires_a_single_owner_only_regular_file(
+    tmp_path: Path,
+) -> None:
+    record = tmp_path / "record"
+    record.write_bytes(b"test")
+    record.chmod(0o600)
+    fd = os.open(record, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        assert vault_module._validate_regular_private_fd(fd) is None
+        record.chmod(0o644)
+        assert vault_module._validate_regular_private_fd(fd) == (
+            "credential.inventory_token_vault_permissions"
+        )
+    finally:
+        os.close(fd)
 
 @pytest.mark.parametrize(
     "invalid_b64",

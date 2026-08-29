@@ -5,7 +5,9 @@ from contextlib import contextmanager
 from dataclasses import asdict
 import json
 from pathlib import Path
+import sys
 import threading
+from types import ModuleType
 import urllib.parse
 
 import pytest
@@ -169,6 +171,103 @@ def test_profile_browser_can_open_in_existing_remote_debug_session(
             5,
         )
     ]
+
+
+def test_session_error_repr_contains_only_its_stable_code() -> None:
+    assert repr(GoogleOAuthSessionError("oauth.session_client_invalid")) == (
+        "GoogleOAuthSessionError('oauth.session_client_invalid')"
+    )
+
+
+def test_authorize_google_account_runs_the_local_flow_and_persists_subject_bound_result(
+    monkeypatch, tmp_path: Path
+) -> None:
+    browser_profile = tmp_path / "browser"
+    browser_profile.mkdir(mode=0o700)
+    stored: dict[str, object] = {}
+
+    class Credentials:
+        token = "access-test"
+        refresh_token = "refresh-test"
+
+    class Flow:
+        @classmethod
+        def from_client_secrets_file(cls, path, scopes):
+            assert str(path) == "/private/client.json"
+            assert tuple(scopes) == oauth_session._SCOPES
+            return cls()
+
+        def run_local_server(self, **kwargs):
+            assert kwargs["host"] == "127.0.0.1"
+            return Credentials()
+
+    class Api:
+        def __init__(self, token):
+            assert token == "access-test"
+
+        def subject_id(self):
+            return "subject-one"
+
+        def enable_control_services(self, project_number):
+            assert project_number == "123"
+
+    package = ModuleType("google_auth_oauthlib")
+    flow_module = ModuleType("google_auth_oauthlib.flow")
+    flow_module.InstalledAppFlow = Flow
+    monkeypatch.setitem(sys.modules, "google_auth_oauthlib", package)
+    monkeypatch.setitem(sys.modules, "google_auth_oauthlib.flow", flow_module)
+    monkeypatch.setattr(
+        oauth_session,
+        "_client",
+        lambda path: (
+            {"client_id": "123-test.apps.googleusercontent.com"},
+            "sha256:test",
+        ),
+    )
+    monkeypatch.setattr(
+        oauth_session.shutil,
+        "which",
+        lambda name: "/mock/vivaldi" if name == "vivaldi-stable" else None,
+    )
+    monkeypatch.setattr(oauth_session, "GoogleCloudApi", Api)
+    monkeypatch.setattr(
+        oauth_session,
+        "_persist_authorization",
+        lambda *args, **kwargs: stored.update(kwargs),
+    )
+
+    receipt = oauth_session.authorize_google_account(
+        object(),
+        account_ref="one",
+        client_file=Path("/private/client.json"),
+        browser_profile=browser_profile,
+    )
+
+    assert receipt.account_ref == "one"
+    assert receipt.subject_bound is True
+    assert receipt.refresh_token_stored is True
+    assert stored["observed_subject_id"] == "subject-one"
+
+
+def test_load_access_token_returns_unrefreshable_bound_access_token(monkeypatch) -> None:
+    store = MemoryStore(_document())
+    store.document["google_accounts"][0]["auth"] = {
+        "client_fingerprint": "sha256:test",
+        "access_token": "access-test",
+        "refresh_token": None,
+    }
+    monkeypatch.setattr(
+        oauth_session, "_client", lambda path: ({}, "sha256:test")
+    )
+
+    assert (
+        oauth_session.load_access_token(
+            store,
+            account_ref="google-account-01",
+            client_file=Path("/private/client.json"),
+        )
+        == "access-test"
+    )
 
 
 class _Clock:

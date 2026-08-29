@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 1
+    assert contract.generation == 3
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -145,6 +145,30 @@ def test_common_policy_contains_complete_no_transition_semantics() -> None:
         "kanonischem Profil, Policy, Credentials und ResumeCapsule",
         "Einmalige Migration ist erlaubt",
         "kein Reader, Writer, Router, Fallback oder Kompatibilitätspfad",
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy
+
+
+def test_common_policy_requires_function_tests_and_minimal_test_execution() -> None:
+    policy_api = load_policy_api()
+    policy = " ".join(
+        policy_api.load_common_policy().common_bytes.decode("utf-8").split()
+    )
+
+    required_meanings = [
+        "Jede produktive Funktion braucht mindestens einen eindeutig zugeordneten, ausführbaren Test",
+        "jede Funktion einen eigenen Fall besitzen",
+        "so wenig Tests wie möglich, so viele wie nötig",
+        "Testcode, Fixtures, Mocks und Test-Infrastruktur",
+        "Tests müssen tatsächlich ausgeführt werden",
+        "Manuelle Prüfung oder bloßes Lesen ersetzt keinen Testlauf",
+        "minimiert Bauarbeit und die Zahl ausgeführter Tests",
+        "niemals, einen erforderlichen Testlauf durch Eigenprüfung zu ersetzen",
+        "Zuerst den kleinstmöglichen gezielten Test für die Funktion ausführen",
+        "nur bei unveränderten relevanten Inputs und noch gültigem Evidence-Reuse-Fenster",
+        "Voll- und Release-Gates bleiben verbindlich",
     ]
 
     for meaning in required_meanings:

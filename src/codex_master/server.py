@@ -146,6 +146,12 @@ from codex_master.fleet_headless import (
     MAX_HEADLESS_TIMEOUT_SECONDS,
     run_bounded_process,
 )
+from codex_master.headless_write_scope import (
+    HeadlessWriteScopeFailure,
+    HeadlessWriteScopeStore,
+    ScopeBinding,
+    ScopeResult,
+)
 from codex_master.fleet_recovery import (
     ArtifactDigest,
     EntryPhase,
@@ -218,7 +224,7 @@ from codex_master.fleet_runners import (
     probe_provider_models,
     validate_gemini_probe_model,
 )
-from codex_master.dynamic_teamlead_start import dynamic_teamlead_start
+from codex_master.masterjet_runtime import MasterjetRuntime
 from codex_master.selection import (
     AdmissionMode,
     AdmissionPolicy,
@@ -351,6 +357,13 @@ G5_TMUX_SOCKET_RE = re.compile(r"g5-[0-9a-f]{20}")
 G5_NATIVE_RUNNER_META_KEY = "g5_native_runner"
 G5_SCOPE_UNIT_RE = re.compile(r"codex-master-resource-[a-f0-9]{32}\.scope")
 DEFAULT_HEADLESS_TIMEOUT_SECONDS = 600
+HEADLESS_ROLLBACK_DIR_NAME = "headless-write-scope-rollback"
+HEADLESS_ROLLBACK_SCHEMA_VERSION = 1
+MAX_HEADLESS_ROLLBACK_RECORDS = 32
+MAX_HEADLESS_ROLLBACK_RECORD_BYTES = 16 * 1024
+HEADLESS_ROLLBACK_RECORD_RE = re.compile(
+    r"^rollback-[0-9TZ-]+-[0-9a-f]{32}\.json$"
+)
 
 
 def agent_base_args(
@@ -590,8 +603,14 @@ TEAMLEADER_TOOL_NAMES = frozenset(
         "hive_authority_check",
         "hive_admission_status",
         "agent_selection_status",
+        "hive_test_index_status",
+        "hive_test_plan",
+        "hive_test_run",
+        "hive_test_status",
+        "hive_test_invalidate",
     }
 )
+HIVE_TEST_MUTATING_TOOL_NAMES = frozenset({"hive_test_run", "hive_test_invalidate"})
 MAX_PAGED_OFFSET = 10_000_000
 PLUGIN_CACHE_ALLOWED_FILES = (
     ".app.json",
@@ -12397,6 +12416,43 @@ def _headless_descriptor(
     return descriptor
 
 
+def _headless_write_scope_store() -> HeadlessWriteScopeStore:
+    """Return the durable write-boundary store for this server state root."""
+
+    ensure_state()
+    return HeadlessWriteScopeStore(
+        STATE_ROOT / "headless-write-scope",
+        git_runner=run_command,
+    )
+
+
+def _raise_headless_scope_failure(failure: HeadlessWriteScopeFailure) -> None:
+    if failure.code == "headless_write_scope_unenforced":
+        raise HeadlessWriteScopeError()
+    raise AgentError(
+        failure.code,
+        {
+            "code": failure.code,
+            "explanation": failure.explanation,
+            "action": failure.action,
+        },
+    )
+
+
+def _public_headless_scope_result(result: ScopeResult) -> dict[str, Any]:
+    """Expose counts and a stable code, never changed paths or filesystem paths."""
+
+    return {
+        "ok": result.ok,
+        "code": result.code,
+        "changed_count": result.changed_count,
+        "attributed_count": result.attributed_count,
+        "out_of_scope_count": result.out_of_scope_count,
+        "paths": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
 def _ollama_descriptor(
     agent: str, snapshot: InventorySnapshot | None = None
 ) -> AgentDescriptor | None:
@@ -12832,6 +12888,21 @@ def _start_headless_agent_unlocked(agent: str) -> dict[str, Any]:
     }
 
 
+def _headless_scope_result_error(result: ScopeResult | None) -> AgentError | None:
+    if result is None or result.ok:
+        return None
+    return AgentError(
+        result.code,
+        {
+            "code": result.code,
+            "explanation": "headless write attribution failed",
+            "action": "discard the assignment and inspect the bound worktree",
+            "changed_count": result.changed_count,
+            "out_of_scope_count": result.out_of_scope_count,
+        },
+    )
+
+
 def _run_headless_process(
     agent: str,
     prompt: str,
@@ -12844,6 +12915,8 @@ def _run_headless_process(
     reservation: object | None = None,
     headless_inflight_reservation: object | None = None,
     structured_gate: Mapping[str, Any] | None = None,
+    write_scope_binding: ScopeBinding | None = None,
+    write_scope_store: HeadlessWriteScopeStore | None = None,
 ) -> dict[str, Any]:
     headless_inflight_reservation_id = (
         headless_inflight_reservation.get("reservation_id")
@@ -12852,6 +12925,14 @@ def _run_headless_process(
     )
     release_bound_headless_inflight_called = False
     terminal: str | None = None
+    scope_result: ScopeResult | None = None
+    normal_return = False
+    active_write_scope_store = write_scope_store
+    role = role.strip().lower()
+    if role not in {"exploriererin", "arbeitsbiene"}:
+        raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
+    if role == "arbeitsbiene" and write_scope_binding is None:
+        raise HeadlessWriteScopeError()
 
     def release_bound_headless_inflight() -> None:
         nonlocal release_bound_headless_inflight_called
@@ -12884,10 +12965,35 @@ def _run_headless_process(
             with contextlib.suppress(Exception):
                 _write_headless_marker(agent, marker)
 
+    def consume_write_scope() -> ScopeResult | None:
+        """Consume binding once, including failures before process launch."""
+
+        nonlocal active_write_scope_store, scope_result
+        if write_scope_binding is None or scope_result is not None:
+            return scope_result
+        if active_write_scope_store is None:
+            try:
+                active_write_scope_store = _headless_write_scope_store()
+            except Exception as exc:
+                raise AgentError("headless_write_scope_unenforced") from exc
+        try:
+            scope_result = active_write_scope_store.finalize(write_scope_binding)
+        except HeadlessWriteScopeFailure as exc:
+            scope_result = ScopeResult(False, exc.code, 0, 0, 0)
+        except Exception:
+            scope_result = ScopeResult(
+                False, "headless_write_attribution_unverified", 0, 0, 0
+            )
+        return scope_result
+
     try:
         service = current_fleet_service()
     except Exception:
+        finished_scope = consume_write_scope()
         release_bound_headless_inflight()
+        scope_error = _headless_scope_result_error(finished_scope)
+        if scope_error is not None:
+            raise scope_error from None
         raise
     try:
         descriptor = _headless_descriptor(agent)
@@ -12900,15 +13006,13 @@ def _run_headless_process(
             or ""
         )
         _validate_headless_timeout(timeout_seconds)
-        role = role.strip().lower()
-        if role not in {"exploriererin", "arbeitsbiene"}:
-            raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
         if lease.get("state") != "held" or lease.get("held_by_this_server") is not True:
             raise AgentError("headless_lease_not_held")
         marker = _headless_marker(agent)
         if marker.get("state") not in {"ready", "running"}:
             raise AgentError("headless_slot_not_ready")
     except Exception:
+        finished_scope = consume_write_scope()
         release_bound_headless_inflight()
         if reservation is not None:
             with contextlib.suppress(Exception):
@@ -12916,13 +13020,29 @@ def _run_headless_process(
         if release_lease_on_completion:
             with contextlib.suppress(Exception):
                 release_agent(agent, force=True)
+        scope_error = _headless_scope_result_error(finished_scope)
+        if scope_error is not None:
+            raise scope_error from None
         raise
-    structured_gate = (
-        _gemini_headless_gate(agent)
-        if structured_gate is None
-        else dict(structured_gate)
-    )
+    try:
+        structured_gate = dict(
+            _gemini_headless_gate(agent) if structured_gate is None else structured_gate
+        )
+    except Exception:
+        finished_scope = consume_write_scope()
+        release_bound_headless_inflight()
+        if reservation is not None:
+            with contextlib.suppress(Exception):
+                service.release_gemini_request(reservation, outcome="provider_error")
+        if release_lease_on_completion:
+            with contextlib.suppress(Exception):
+                release_agent(agent, force=True)
+        scope_error = _headless_scope_result_error(finished_scope)
+        if scope_error is not None:
+            raise scope_error from None
+        raise
     if structured_gate.get("action") != "allow":
+        finished_scope = consume_write_scope()
         account_id = structured_gate.get("account_id")
         gate_code = structured_gate.get("diagnostic_code")
         with contextlib.suppress(Exception):
@@ -12956,20 +13076,39 @@ def _run_headless_process(
         if release_lease_on_completion:
             with contextlib.suppress(Exception):
                 release_agent(agent, force=True)
+        scope_error = (
+            {
+                "kind": finished_scope.code,
+                "retryable": False,
+                "changed_count": finished_scope.changed_count,
+                "out_of_scope_count": finished_scope.out_of_scope_count,
+            }
+            if finished_scope is not None and not finished_scope.ok
+            else None
+        )
         return {
             "agent": agent,
             "assignment_id": assignment_id,
-            "status": "deferred"
+            "status": "failed"
+            if scope_error is not None
+            else "deferred"
             if structured_gate.get("action") == "defer_until"
             else "failed",
             "model": descriptor.model,
             "response": "",
             "gate": structured_gate,
+            "error": scope_error,
+            "write_scope": (
+                _public_headless_scope_result(finished_scope)
+                if finished_scope is not None
+                else None
+            ),
             "raw_output": "not_returned",
         }
     gate_action = structured_gate.get("action")
     gate_code = structured_gate.get("diagnostic_code")
     if not isinstance(gate_action, str) or not isinstance(gate_code, str):
+        finished_scope = consume_write_scope()
         release_bound_headless_inflight()
         if reservation is not None:
             with contextlib.suppress(Exception):
@@ -12977,6 +13116,9 @@ def _run_headless_process(
         if release_lease_on_completion:
             with contextlib.suppress(Exception):
                 release_agent(agent, force=True)
+        scope_error = _headless_scope_result_error(finished_scope)
+        if scope_error is not None:
+            raise scope_error from None
         raise AgentError("headless_gate_invalid")
     try:
         status = status_agent(agent, initialize_state=False)
@@ -13016,6 +13158,7 @@ def _run_headless_process(
         )
         assignment_id = assignment_id or f"{now_id()}-{agent}"
     except Exception:
+        finished_scope = consume_write_scope()
         release_bound_headless_inflight()
         if reservation is not None:
             with contextlib.suppress(Exception):
@@ -13023,12 +13166,17 @@ def _run_headless_process(
         if release_lease_on_completion:
             with contextlib.suppress(Exception):
                 release_agent(agent, force=True)
+        scope_error = _headless_scope_result_error(finished_scope)
+        if scope_error is not None:
+            raise scope_error from None
         raise
     process: object | None = None
     job: HeadlessJob | None = None
     result: HeadlessProcessResult | None = None
     parsed = None
     popen_env: dict[str, str] | None = None
+    worktree_fd = -1
+    process_end_confirmed = False
     rate_outcome = "provider_error"
     rate_reset_at_utc: str | None = None
     secret = ""
@@ -13042,21 +13190,72 @@ def _run_headless_process(
                 gate.account_id, expected_generation=gate.generation
             )
             child_env[plan.secret_env_name] = secret
+            run_cwd = descriptor.home
+            if write_scope_binding is not None:
+                active_write_scope_store = (
+                    active_write_scope_store or _headless_write_scope_store()
+                )
+                try:
+                    verified_attestation = active_write_scope_store.revalidate(
+                        write_scope_binding,
+                        repo_root(),
+                        provider_generation=gate.generation,
+                    )
+                except HeadlessWriteScopeFailure as exc:
+                    _raise_headless_scope_failure(exc)
+                try:
+                    verified_worktree = Path(verified_attestation.worktree_path)
+                    expected_device = verified_attestation.worktree_device
+                    expected_inode = verified_attestation.worktree_inode
+                except (AttributeError, TypeError) as exc:
+                    raise AgentError("headless_worktree_identity_changed") from exc
+                if (
+                    type(expected_device) is not int
+                    or type(expected_inode) is not int
+                    or expected_device < 0
+                    or expected_inode <= 0
+                ):
+                    raise AgentError("headless_worktree_identity_changed")
+                try:
+                    expected_worktree_stat = os.stat(
+                        verified_worktree, follow_symlinks=False
+                    )
+                except OSError as exc:
+                    raise AgentError("headless_worktree_identity_changed") from exc
+                worktree_fd = open_directory_chain_no_follow_matching(
+                    verified_worktree,
+                    expected_worktree_stat,
+                    error_text="headless_worktree_identity_changed",
+                    changed_text="headless_worktree_identity_changed",
+                )
+                opened_worktree_stat = os.fstat(worktree_fd)
+                if (
+                    opened_worktree_stat.st_dev != expected_device
+                    or opened_worktree_stat.st_ino != expected_inode
+                ):
+                    raise AgentError("headless_worktree_identity_changed")
+                run_cwd = Path(f"/proc/self/fd/{worktree_fd}")
+            popen_env = dict(child_env)
+            popen_kwargs: dict[str, Any] = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "env": popen_env,
+                "cwd": run_cwd,
+                "shell": False,
+                "start_new_session": True,
+            }
+            if worktree_fd >= 0:
+                popen_kwargs["pass_fds"] = (worktree_fd,)
             try:
-                popen_env = dict(child_env)
                 process = subprocess.Popen(
                     tuple(argv),
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=popen_env,
-                    cwd=descriptor.home,
-                    shell=False,
-                    start_new_session=True,
+                    **popen_kwargs,
                 )
             except (OSError, ValueError) as exc:
                 raise AgentError("headless_start_failed") from exc
         except Exception:
+            consume_write_scope()
             release_bound_headless_inflight()
             raise
         job = HeadlessJob(
@@ -13164,6 +13363,12 @@ def _run_headless_process(
                 else "failed"
             )
         )
+        if write_scope_binding is not None:
+            finished_scope = consume_write_scope()
+            if finished_scope is None:
+                raise AgentError("headless_write_scope_unenforced")
+            if not finished_scope.ok:
+                terminal = "failed"
         usage_status = (
             "rate_limited"
             if parsed.error is not None and parsed.error.kind == "account_limited"
@@ -13179,6 +13384,8 @@ def _run_headless_process(
             "stdout_truncated": result.stdout_truncated,
             "stderr_truncated": result.stderr_truncated,
         }
+        if scope_result is not None:
+            terminal_marker["write_scope"] = _public_headless_scope_result(scope_result)
         if isinstance(headless_inflight_reservation_id, str):
             terminal_marker["headless_inflight_reservation_id"] = (
                 headless_inflight_reservation_id
@@ -13216,6 +13423,7 @@ def _run_headless_process(
         response = parsed.response if terminal == "completed" else ""
         if terminal == "completed":
             rate_outcome = "completed"
+        normal_return = True
         return {
             "agent": agent,
             "assignment_id": assignment_id,
@@ -13231,12 +13439,26 @@ def _run_headless_process(
             "unknown_event_count": parsed.unknown_event_count,
             "error": (
                 {
-                    "kind": parsed.error.kind,
-                    "retryable": parsed.error.retryable,
-                    "status_code": parsed.error.status_code,
-                    "reset_at_utc": parsed.error.reset_at_utc,
+                    "kind": scope_result.code,
+                    "retryable": False,
+                    "changed_count": scope_result.changed_count,
+                    "out_of_scope_count": scope_result.out_of_scope_count,
                 }
-                if parsed.error is not None
+                if scope_result is not None and not scope_result.ok
+                else (
+                    {
+                        "kind": parsed.error.kind,
+                        "retryable": parsed.error.retryable,
+                        "status_code": parsed.error.status_code,
+                        "reset_at_utc": parsed.error.reset_at_utc,
+                    }
+                    if parsed.error is not None
+                    else None
+                )
+            ),
+            "write_scope": (
+                _public_headless_scope_result(scope_result)
+                if scope_result is not None
                 else None
             ),
             "raw_output": "not_returned",
@@ -13289,9 +13511,7 @@ def _run_headless_process(
                     outcome=rate_outcome,
                     reset_at_utc=rate_reset_at_utc,
                 )
-        if job is not None and result is not None:
-            HEADLESS_JOBS.finish(job, result)
-            release_bound_headless_inflight()
+        finished_result = result
         if job is not None and result is None:
             process_returncode: int | None = None
             with contextlib.suppress(Exception):
@@ -13316,39 +13536,84 @@ def _run_headless_process(
                     process_returncode, bool
                 ):
                     terminal = "completed" if process_returncode == 0 else "failed"
-                    HEADLESS_JOBS.finish(
-                        job,
-                        HeadlessProcessResult(
-                            process_returncode,
-                            b"",
-                            b"",
-                            False,
-                            False,
-                            False,
-                            True,
-                        ),
+                    process_end_confirmed = True
+                    finished_result = HeadlessProcessResult(
+                        process_returncode,
+                        b"",
+                        b"",
+                        False,
+                        False,
+                        False,
+                        True,
                     )
-                    _write_headless_marker(
-                        agent,
+        if process_end_confirmed:
+            _write_headless_marker(
+                agent,
+                {
+                    "agent": agent,
+                    "backend": "headless_job",
+                    "state": "failed" if write_scope_binding is not None else terminal,
+                    "assignment_id": assignment_id,
+                    "generation": gate.generation,
+                    "returncode": finished_result.returncode
+                    if finished_result is not None
+                    else None,
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                    **(
                         {
-                            "agent": agent,
-                            "backend": "headless_job",
-                            "state": terminal,
-                            "assignment_id": assignment_id,
-                            "generation": gate.generation,
-                            "returncode": process_returncode,
-                            "stdout_truncated": False,
-                            "stderr_truncated": False,
-                            **(
-                                {
-                                    "headless_inflight_reservation_id": headless_inflight_reservation_id
-                                }
-                                if isinstance(headless_inflight_reservation_id, str)
-                                else {}
-                            ),
-                        },
-                    )
-                    release_bound_headless_inflight()
+                            "headless_inflight_reservation_id": headless_inflight_reservation_id
+                        }
+                        if isinstance(headless_inflight_reservation_id, str)
+                        else {}
+                    ),
+                },
+            )
+        if write_scope_binding is not None and scope_result is None:
+            try:
+                scope_result = consume_write_scope()
+            except Exception:
+                scope_result = ScopeResult(
+                    False, "headless_write_attribution_unverified", 0, 0, 0
+                )
+        scope_failed = scope_result is not None and not scope_result.ok
+        if scope_failed:
+            terminal = "failed"
+            if finished_result is not None:
+                finished_result = dataclass_replace(finished_result, returncode=1)
+            with contextlib.suppress(Exception):
+                current_marker = _headless_marker(agent)
+                current_marker.update(
+                    {
+                        "state": "failed",
+                        "assignment_id": assignment_id,
+                        "write_scope": _public_headless_scope_result(scope_result),
+                    }
+                )
+                _write_headless_marker(agent, current_marker)
+            with contextlib.suppress(Exception):
+                service.record_gemini_usage(
+                    gate.account_id,
+                    model=descriptor.model,
+                    status="failed",
+                    gate_action=gate_action,
+                    gate_code=gate_code,
+                )
+            with contextlib.suppress(Exception):
+                service.record_gemini_event(
+                    event_type="headless_scope_failure",
+                    agent_id=agent,
+                    account_id=gate.account_id,
+                    assignment_id=assignment_id,
+                    status="failed",
+                    reason=scope_result.code,
+                    model=descriptor.model,
+                    gate_action=gate_action,
+                    gate_code=gate_code,
+                )
+        if job is not None and finished_result is not None:
+            HEADLESS_JOBS.finish(job, finished_result)
+            release_bound_headless_inflight()
         if release_lease_on_completion:
             with contextlib.suppress(Exception):
                 current_lease = agent_lease_status(agent)
@@ -13357,6 +13622,13 @@ def _run_headless_process(
                     or lease.get("lease_id") == current_lease.get("lease_id")
                 ):
                     release_agent(agent, force=True)
+        if worktree_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(worktree_fd)
+        if scope_failed and not normal_return:
+            scope_error = _headless_scope_result_error(scope_result)
+            if scope_error is not None:
+                raise scope_error from None
 
 
 def run_headless_assignment(
@@ -13366,7 +13638,13 @@ def run_headless_assignment(
     timeout_seconds: float,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
-    return _run_headless_process(agent, prompt, lease, timeout_seconds)
+    return _run_headless_process(
+        agent,
+        prompt,
+        lease,
+        timeout_seconds,
+        role="exploriererin",
+    )
 
 
 def _headless_route_candidates(
@@ -13491,8 +13769,16 @@ def _assign_headless_agent(
         raise AgentError(
             "arbeitsbiene assignments require at least one explicit write path"
         )
+    write_scope_store: HeadlessWriteScopeStore | None = None
+    write_scope_binding: ScopeBinding | None = None
     if role == "arbeitsbiene":
-        raise HeadlessWriteScopeError()
+        write_scope_store = _headless_write_scope_store()
+        try:
+            available = write_scope_store.has_available(requested_agent)
+        except HeadlessWriteScopeFailure as exc:
+            _raise_headless_scope_failure(exc)
+        if not available:
+            raise HeadlessWriteScopeError()
     agent, descriptor, gate, routing_gate = _resolve_gemini_headless_route(
         requested_agent
     )
@@ -13538,21 +13824,67 @@ def _assign_headless_agent(
         descriptor, "account_id", None
     ):
         raise AgentError("headless_gate_binding_changed")
-    assignment_id = f"{now_id()}-{agent}"
-    with spawn_admission_lock():
-        require_spawn_capacity(1, agent=agent, task=task, role=role)
-        headless_inflight_reservation = reserve_headless_inflight(agent, assignment_id)
-        if headless_inflight_reservation is None:
-            raise AgentCapacityError(
-                "capacity unavailable",
+    if role == "arbeitsbiene":
+        scope_result = scope_check(scope, write_paths, cwd=repo_root())
+        if not isinstance(scope_result, Mapping) or scope_result.get("allowed") is not True:
+            violations = (
+                scope_result.get("violations", [])
+                if isinstance(scope_result, Mapping)
+                else []
+            )
+            raise AgentError(
+                "headless_write_scope_violation",
                 {
-                    "error_code": "spawn_capacity_unavailable",
-                    "retryable": True,
-                    "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
-                    "reason_codes": ["session_metrics_unavailable"],
-                    "errors": spawn_error_details(["session_metrics_unavailable"]),
+                    "code": "headless_write_scope_violation",
+                    "explanation": "declared write paths are outside the assignment scope",
+                    "action": "declare only repository-relative paths inside the assignment scope",
+                    "violations": violations,
                 },
             )
+    assignment_id = f"{now_id()}-{agent}"
+    headless_inflight_reservation: dict[str, Any] | None = None
+    try:
+        with spawn_admission_lock():
+            require_spawn_capacity(1, agent=agent, task=task, role=role)
+            if role == "arbeitsbiene":
+                assert write_scope_store is not None
+                try:
+                    if agent != requested_agent and not write_scope_store.has_available(agent):
+                        raise HeadlessWriteScopeFailure(
+                            "headless_write_scope_unenforced",
+                            "headless writes lack isolated worktree and diff attribution",
+                            "use an isolated worktree or submit a read-only headless assignment",
+                        )
+                    snapshot = current_fleet_service().load()
+                    current_generation = getattr(snapshot, "generation", None)
+                    if current_generation is None:
+                        raise AgentError("headless_assignment_generation_invalid")
+                    write_scope_binding = write_scope_store.bind(
+                        agent,
+                        repo_root(),
+                        write_paths,
+                        assignment_id=assignment_id,
+                        provider_generation=current_generation,
+                    )
+                except HeadlessWriteScopeFailure as exc:
+                    _raise_headless_scope_failure(exc)
+            headless_inflight_reservation = reserve_headless_inflight(agent, assignment_id)
+            if headless_inflight_reservation is None:
+                raise AgentCapacityError(
+                    "capacity unavailable",
+                    {
+                        "error_code": "spawn_capacity_unavailable",
+                        "retryable": True,
+                        "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+                        "reason_codes": ["session_metrics_unavailable"],
+                        "errors": spawn_error_details(["session_metrics_unavailable"]),
+                    },
+                )
+    except Exception:
+        if write_scope_binding is not None and write_scope_store is not None:
+            with contextlib.suppress(Exception):
+                write_scope_store.finalize(write_scope_binding)
+        raise
     headless_inflight_reservation_id = (
         headless_inflight_reservation.get("reservation_id")
         if isinstance(headless_inflight_reservation, Mapping)
@@ -13595,6 +13927,15 @@ def _assign_headless_agent(
                     "write_policy": "read_only"
                     if role == "exploriererin"
                     else "explicit_paths_only",
+                    "write_scope": (
+                        {
+                            "state": "bound",
+                            "attestation_id": write_scope_binding.attestation_id,
+                            "raw_output": "not_returned",
+                        }
+                        if write_scope_binding is not None
+                        else None
+                    ),
                     "allow_subagents": allow_subagents,
                     "requires_search": requires_search,
                     "live_data": {
@@ -13613,6 +13954,9 @@ def _assign_headless_agent(
             marker.update({"state": "ready", "assignment_id": assignment_id})
             _write_headless_marker(agent, marker)
     except Exception:
+        if write_scope_binding is not None and write_scope_store is not None:
+            with contextlib.suppress(Exception):
+                write_scope_store.finalize(write_scope_binding)
         release_headless_inflight_claim()
         if release_on_completion:
             with contextlib.suppress(Exception):
@@ -13629,6 +13973,8 @@ def _assign_headless_agent(
             headless_inflight_reservation=headless_inflight_reservation,
             release_lease_on_completion=release_on_completion,
             structured_gate=gate,
+            write_scope_binding=write_scope_binding,
+            write_scope_store=write_scope_store,
         )
     except FleetRateLimitError as exc:
         result = {
@@ -13638,6 +13984,15 @@ def _assign_headless_agent(
             "model": descriptor.model,
             "response": "",
             "error": {"kind": exc.reason, "retryable": True},
+            "raw_output": "not_returned",
+        }
+    except Exception:
+        raise
+    result_write_scope = result.get("write_scope")
+    if result_write_scope is None and write_scope_binding is not None:
+        result_write_scope = {
+            "state": "bound",
+            "attestation_id": write_scope_binding.attestation_id,
             "raw_output": "not_returned",
         }
     result.update(
@@ -13651,6 +14006,7 @@ def _assign_headless_agent(
             "name": name or default_agentin_name(agent),
             "scope_count": len(scope),
             "write_path_count": len(write_paths),
+            "write_scope": result_write_scope,
             "prompt_chars": len(prompt),
             "result_tool": "agent_assignment_report",
             "prompt_output": "not_returned",
@@ -16593,6 +16949,8 @@ def path_is_within(path: Path, scope: Path) -> bool:
 def scope_check(
     scope: list[str], write_paths: list[str], cwd: Any = None
 ) -> dict[str, Any]:
+    if isinstance(cwd, os.PathLike):
+        cwd = os.fspath(cwd)
     cwd = (
         bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT)
         if cwd is not None
@@ -17965,10 +18323,430 @@ def normalize_git_branch_name(value: str) -> str:
     return value
 
 
+def _headless_rollback_directory(
+    *, create: bool
+) -> tuple[Path, os.stat_result] | None:
+    root = Path(STATE_ROOT).expanduser()
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    root = Path(os.path.abspath(root))
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        if not create:
+            return None
+        ensure_private_dir(root)
+        try:
+            root_stat = root.lstat()
+        except OSError as exc:
+            raise AgentError("headless_attestation_rollback_incomplete") from exc
+    except OSError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    if (
+        stat_module.S_ISLNK(root_stat.st_mode)
+        or not stat_module.S_ISDIR(root_stat.st_mode)
+        or root_stat.st_uid != os.getuid()
+        or stat_module.S_IMODE(root_stat.st_mode) != 0o700
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    directory = root / HEADLESS_ROLLBACK_DIR_NAME
+    try:
+        directory_stat = directory.lstat()
+    except FileNotFoundError:
+        if not create:
+            return None
+        try:
+            os.mkdir(directory, 0o700)
+            directory_stat = directory.lstat()
+        except FileExistsError:
+            try:
+                directory_stat = directory.lstat()
+            except OSError as exc:
+                raise AgentError("headless_attestation_rollback_incomplete") from exc
+        except OSError as exc:
+            raise AgentError("headless_attestation_rollback_incomplete") from exc
+    except OSError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    if (
+        stat_module.S_ISLNK(directory_stat.st_mode)
+        or not stat_module.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_uid != os.getuid()
+        or stat_module.S_IMODE(directory_stat.st_mode) != 0o700
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    return directory, directory_stat
+
+
+def _headless_rollback_directory_fd(*, create: bool) -> tuple[Path, int] | None:
+    resolved = _headless_rollback_directory(create=create)
+    if resolved is None:
+        return None
+    directory, expected_stat = resolved
+    try:
+        fd = open_directory_chain_no_follow_matching(
+            directory,
+            expected_stat,
+            error_text="headless_attestation_rollback_incomplete",
+            changed_text="headless_attestation_rollback_incomplete",
+        )
+    except AgentError:
+        raise
+    return directory, fd
+
+
+def _headless_rollback_record_names(directory_fd: int) -> list[str]:
+    names: list[str] = []
+    try:
+        with os.scandir(f"/proc/self/fd/{directory_fd}") as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_HEADLESS_ROLLBACK_RECORDS * 2:
+                    raise AgentError("headless_attestation_rollback_incomplete")
+                if not entry.name.startswith("rollback-"):
+                    continue
+                if HEADLESS_ROLLBACK_RECORD_RE.fullmatch(entry.name) is None:
+                    raise AgentError("headless_attestation_rollback_incomplete")
+                names.append(entry.name)
+                if len(names) > MAX_HEADLESS_ROLLBACK_RECORDS:
+                    raise AgentError("headless_attestation_rollback_incomplete")
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    return sorted(names)
+
+
+def _headless_verify_rollback_record_stat(
+    info: os.stat_result,
+) -> None:
+    if (
+        not stat_module.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat_module.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+        or info.st_size > MAX_HEADLESS_ROLLBACK_RECORD_BYTES
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+
+
+def _headless_read_rollback_record(
+    directory_fd: int, name: str
+) -> tuple[os.stat_result, dict[str, Any]]:
+    try:
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _headless_verify_rollback_record_stat(info)
+        fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+    except (OSError, AgentError) as exc:
+        if isinstance(exc, AgentError):
+            raise
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    try:
+        opened = os.fstat(fd)
+        if (
+            not source_identity_matches(opened, info)
+            or opened.st_uid != os.getuid()
+            or stat_module.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+        ):
+            raise AgentError("headless_attestation_rollback_incomplete")
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            raw = stream.read(MAX_HEADLESS_ROLLBACK_RECORD_BYTES + 1)
+        if len(raw) > MAX_HEADLESS_ROLLBACK_RECORD_BYTES:
+            raise AgentError("headless_attestation_rollback_incomplete")
+        latest = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _headless_verify_rollback_record_stat(latest)
+        if not source_identity_matches(latest, info):
+            raise AgentError("headless_attestation_rollback_incomplete")
+    except AgentError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    if not isinstance(payload, dict):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    return info, payload
+
+
+def _headless_rollback_record_payload(
+    agent: str,
+    repository: Path,
+    target: Path,
+    target_stat: os.stat_result | None,
+    parent_stat: os.stat_result | None,
+    *,
+    registered: bool,
+    reason: str,
+) -> bytes:
+    repository_stat: os.stat_result | None
+    try:
+        repository_stat = repository.lstat()
+    except OSError:
+        repository_stat = None
+    payload = {
+        "schema_version": HEADLESS_ROLLBACK_SCHEMA_VERSION,
+        "state": "pending",
+        "agent": agent,
+        "repository": str(repository),
+        "repository_device": (
+            int(repository_stat.st_dev) if repository_stat is not None else None
+        ),
+        "repository_inode": (
+            int(repository_stat.st_ino) if repository_stat is not None else None
+        ),
+        "target": str(target),
+        "target_device": int(target_stat.st_dev) if target_stat is not None else None,
+        "target_inode": int(target_stat.st_ino) if target_stat is not None else None,
+        "parent_device": int(parent_stat.st_dev) if parent_stat is not None else None,
+        "parent_inode": int(parent_stat.st_ino) if parent_stat is not None else None,
+        "registered": registered,
+        "reason": reason,
+        "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }
+    raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    if len(raw) > MAX_HEADLESS_ROLLBACK_RECORD_BYTES:
+        raise AgentError("headless_attestation_rollback_incomplete")
+    return raw
+
+
+def _persist_headless_rollback_state(
+    agent: str,
+    repository: Path,
+    target: Path,
+    target_stat: os.stat_result | None,
+    parent_stat: os.stat_result | None,
+    *,
+    registered: bool,
+    reason: str,
+) -> None:
+    directory_info = _headless_rollback_directory_fd(create=True)
+    if directory_info is None:
+        raise AgentError("headless_attestation_rollback_incomplete")
+    _directory, directory_fd = directory_info
+    try:
+        names = _headless_rollback_record_names(directory_fd)
+        if len(names) >= MAX_HEADLESS_ROLLBACK_RECORDS:
+            raise AgentError("headless_attestation_rollback_incomplete")
+        for existing_name in names:
+            _headless_read_rollback_record(directory_fd, existing_name)
+        raw = _headless_rollback_record_payload(
+            agent,
+            repository,
+            target,
+            target_stat,
+            parent_stat,
+            registered=registered,
+            reason=reason,
+        )
+        name = f"rollback-{now_id()}-{uuid.uuid4().hex}.json"
+        write_private_new_bytes(
+            Path(name), raw, mode=0o600, dir_fd=directory_fd
+        )
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _headless_verify_rollback_record_stat(info)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _headless_remove_rollback_record(directory_fd: int, name: str) -> None:
+    info, _payload = _headless_read_rollback_record(directory_fd, name)
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not source_identity_matches(current, info):
+            raise AgentError("headless_attestation_rollback_incomplete")
+        os.unlink(name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+
+
+def _headless_resume_rollback_payload(
+    directory_fd: int, name: str, payload: Mapping[str, Any]
+) -> None:
+    if (
+        payload.get("schema_version") != HEADLESS_ROLLBACK_SCHEMA_VERSION
+        or payload.get("state") != "pending"
+        or not isinstance(payload.get("agent"), str)
+        or not isinstance(payload.get("repository"), str)
+        or not isinstance(payload.get("target"), str)
+        or type(payload.get("registered")) is not bool
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    repository = Path(payload["repository"])
+    target = Path(payload["target"])
+    if (
+        not repository.is_absolute()
+        or not target.is_absolute()
+        or len(str(repository)) > MAX_PATH_TEXT
+        or len(str(target)) > MAX_PATH_TEXT
+        or any(part in {".", ".."} for part in repository.parts[1:])
+        or any(part in {".", ".."} for part in target.parts[1:])
+        or target == repository
+        or not directory_chain_is_real_no_symlink(repository)
+        or not directory_chain_is_real_no_symlink(target.parent)
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    try:
+        target.relative_to(repository)
+    except ValueError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    repository_device = payload.get("repository_device")
+    repository_inode = payload.get("repository_inode")
+    target_device = payload.get("target_device")
+    target_inode = payload.get("target_inode")
+    parent_device = payload.get("parent_device")
+    parent_inode = payload.get("parent_inode")
+    if any(
+        type(value) is not int or value < 0
+        for value in (repository_device, repository_inode, parent_device, parent_inode)
+    ) or any(
+        type(value) is not int or value <= 0
+        for value in (repository_inode, parent_inode)
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    target_identity_available = (
+        type(target_device) is int
+        and target_device >= 0
+        and type(target_inode) is int
+        and target_inode > 0
+    )
+    if (target_device is None) != (target_inode is None) or (
+        target_device is not None and not target_identity_available
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    try:
+        repository_stat = repository.lstat()
+        if (
+            stat_module.S_ISLNK(repository_stat.st_mode)
+            or not stat_module.S_ISDIR(repository_stat.st_mode)
+            or repository_stat.st_dev != repository_device
+            or repository_stat.st_ino != repository_inode
+        ):
+            raise AgentError("headless_attestation_rollback_incomplete")
+        repository_fd = open_directory_chain_no_follow_matching(
+            repository,
+            repository_stat,
+            error_text="headless_attestation_rollback_incomplete",
+            changed_text="headless_attestation_rollback_incomplete",
+        )
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    target_fd = -1
+    parent_fd = -1
+    try:
+        try:
+            target_stat = target.lstat()
+        except FileNotFoundError:
+            if not payload["registered"]:
+                _headless_remove_rollback_record(directory_fd, name)
+                return
+            raise AgentError("headless_attestation_rollback_incomplete")
+        except OSError as exc:
+            raise AgentError("headless_attestation_rollback_incomplete") from exc
+        if not target_identity_available or (
+            stat_module.S_ISLNK(target_stat.st_mode)
+            or not stat_module.S_ISDIR(target_stat.st_mode)
+            or target_stat.st_dev != target_device
+            or target_stat.st_ino != target_inode
+        ):
+            raise AgentError("headless_attestation_rollback_incomplete")
+        target_fd = open_directory_chain_no_follow_matching(
+            target,
+            target_stat,
+            error_text="headless_attestation_rollback_incomplete",
+            changed_text="headless_attestation_rollback_incomplete",
+        )
+        parent = target.parent
+        try:
+            parent_stat = parent.lstat()
+        except OSError as exc:
+            raise AgentError("headless_attestation_rollback_incomplete") from exc
+        if (
+            stat_module.S_ISLNK(parent_stat.st_mode)
+            or not stat_module.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_dev != parent_device
+            or parent_stat.st_ino != parent_inode
+        ):
+            raise AgentError("headless_attestation_rollback_incomplete")
+        parent_fd = open_directory_chain_no_follow_matching(
+            parent,
+            parent_stat,
+            error_text="headless_attestation_rollback_incomplete",
+            changed_text="headless_attestation_rollback_incomplete",
+        )
+        if payload["registered"]:
+            cleanup = run_command(
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    "--",
+                    f"/proc/self/fd/{target_fd}",
+                ],
+                cwd=Path(f"/proc/self/fd/{repository_fd}"),
+                pass_fds=(repository_fd, target_fd),
+            )
+            returncode = getattr(cleanup, "returncode", None)
+            if not isinstance(returncode, int) or isinstance(returncode, bool) or returncode != 0:
+                raise AgentError("headless_attestation_rollback_incomplete")
+        else:
+            try:
+                os.rmdir(target.name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise AgentError("headless_attestation_rollback_incomplete") from exc
+        try:
+            os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            _headless_remove_rollback_record(directory_fd, name)
+            return
+        except OSError as exc:
+            raise AgentError("headless_attestation_rollback_incomplete") from exc
+        raise AgentError("headless_attestation_rollback_incomplete")
+    finally:
+        if target_fd >= 0:
+            os.close(target_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        os.close(repository_fd)
+
+
+def _resume_headless_rollback_records() -> list[str]:
+    directory_info = _headless_rollback_directory_fd(create=False)
+    if directory_info is None:
+        return []
+    _directory, directory_fd = directory_info
+    try:
+        names = _headless_rollback_record_names(directory_fd)
+        for name in names:
+            _info, payload = _headless_read_rollback_record(directory_fd, name)
+            _headless_resume_rollback_payload(directory_fd, name, payload)
+        return []
+    finally:
+        os.close(directory_fd)
+
+
 def worktree_create_for_agent(
     agent: str, path: Any = None, base_ref: Any = None
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("worktree_create_for_agent")
+    _resume_headless_rollback_records()
     agent = canonical_agent_id(agent)
     path = (
         bounded_text(path, field="path", max_chars=MAX_PATH_TEXT)
@@ -18022,6 +18800,87 @@ def worktree_create_for_agent(
     target_stat: os.stat_result | None = None
     created_target = False
     cp: subprocess.CompletedProcess[str] | None = None
+    worktree_registered = False
+
+    def raise_rollback_incomplete(
+        reason: str, cause: BaseException | None = None
+    ) -> None:
+        try:
+            _persist_headless_rollback_state(
+                agent,
+                repo,
+                target,
+                target_stat,
+                parent_stat,
+                registered=worktree_registered,
+                reason=reason,
+            )
+        except Exception as exc:
+            raise AgentError(
+                "headless_attestation_rollback_incomplete",
+                {"recovery_state": "unavailable"},
+            ) from exc
+        error = AgentError(
+            "headless_attestation_rollback_incomplete",
+            {"recovery_state": "pending"},
+        )
+        if cause is None:
+            raise error
+        raise error from cause
+
+    def rollback_registered_worktree() -> None:
+        if not worktree_registered:
+            return
+        if target_stat is None or target_fd < 0:
+            raise_rollback_incomplete("target_identity_unavailable")
+        try:
+            current_path = os.stat(
+                target.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+        except FileNotFoundError as exc:
+            raise_rollback_incomplete("target_path_missing", exc)
+        except OSError as exc:
+            raise_rollback_incomplete("target_path_stat_failed", exc)
+        if (
+            not stat_module.S_ISDIR(current_path.st_mode)
+            or not source_identity_matches(current_path, target_stat)
+        ):
+            raise_rollback_incomplete("target_path_identity_changed")
+        try:
+            current_target = os.fstat(target_fd)
+        except OSError as exc:
+            raise_rollback_incomplete("target_fstat_failed", exc)
+        if (
+            not stat_module.S_ISDIR(current_target.st_mode)
+            or not source_identity_matches(current_target, target_stat)
+        ):
+            raise_rollback_incomplete("target_identity_changed")
+        try:
+            cleanup = run_command(
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    "--",
+                    f"/proc/self/fd/{target_fd}",
+                ],
+                cwd=repo,
+                pass_fds=(target_fd,),
+            )
+        except Exception as exc:
+            raise_rollback_incomplete("rollback_command_failed", exc)
+        returncode = getattr(cleanup, "returncode", None)
+        if not isinstance(returncode, int) or isinstance(returncode, bool) or returncode != 0:
+            raise_rollback_incomplete("rollback_command_failed")
+        try:
+            os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise_rollback_incomplete("target_path_stat_failed", exc)
+        raise_rollback_incomplete("rollback_target_still_exists")
+
     try:
         try:
             os.mkdir(target.name, 0o755, dir_fd=parent_fd)
@@ -18056,35 +18915,110 @@ def worktree_create_for_agent(
             )
         cp = run_command(["git", *args], cwd=operation_cwd)
         if cp.returncode != 0:
+            try:
+                registration = run_command(
+                    ["git", "worktree", "list", "--porcelain"], cwd=repo
+                )
+            except Exception:
+                worktree_registered = True
+            else:
+                if registration.returncode != 0 or not isinstance(
+                    registration.stdout, str
+                ):
+                    worktree_registered = True
+                else:
+                    target_text = str(target)
+                    worktree_registered = any(
+                        line.startswith("worktree ")
+                        and line[9:] == target_text
+                        for line in registration.stdout.splitlines()
+                    )
             raise AgentError("git worktree add failed")
-    finally:
+        worktree_registered = True
+        try:
+            final_target_stat = os.stat(
+                target.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+        except OSError as exc:
+            raise AgentError("headless_attestation_invalid") from exc
         if (
-            created_target
-            and target_stat is not None
-            and (cp is None or cp.returncode != 0)
+            target_stat is None
+            or not stat_module.S_ISDIR(final_target_stat.st_mode)
+            or not source_identity_matches(final_target_stat, target_stat)
         ):
+            raise AgentError("headless_attestation_invalid")
+        ensure_directory_chain_no_symlink(
+            target.parent, "worktree parent directories must be real directories"
+        )
+        resolved_target = target.resolve(strict=False)
+        if resolved_target != target or not path_is_within(resolved_target, repo):
+            raise AgentError("headless_attestation_invalid")
+        public_path = repo_relative_public_path(resolved_target, repo)
+        write_scope: dict[str, Any] = {
+            "state": "unavailable",
+            "raw_output": "not_returned",
+        }
+        git_metadata = resolved_target / ".git"
+        try:
+            metadata_stat = git_metadata.lstat()
+        except FileNotFoundError:
+            metadata_stat = None
+        except OSError as exc:
+            raise AgentError("headless_attestation_invalid") from exc
+        if metadata_stat is None or stat_module.S_ISLNK(metadata_stat.st_mode) or not (
+            stat_module.S_ISREG(metadata_stat.st_mode)
+            or stat_module.S_ISDIR(metadata_stat.st_mode)
+        ):
+            raise AgentError("headless_attestation_invalid")
+        try:
+            attestation = _headless_write_scope_store().create(
+                agent,
+                repo,
+                resolved_target,
+                base_ref=base_ref,
+            )
+        except HeadlessWriteScopeFailure as exc:
+            _raise_headless_scope_failure(exc)
+        write_scope = {
+            "state": "available",
+            "attestation_id": attestation.attestation_id,
+            "raw_output": "not_returned",
+        }
+        return {
+            "agent": agent,
+            "path": public_path or PATH_NOT_RETURNED,
+            "path_state": "set" if public_path else "not_returned",
+            "path_kind": "repo_relative" if public_path else "not_returned",
+            "base_ref": PATH_NOT_RETURNED if base_ref else None,
+            "base_ref_state": "set" if base_ref else "not_set",
+            "status": "created",
+            "write_scope": write_scope,
+            "raw_output": "not_returned",
+        }
+    except Exception:
+        if worktree_registered:
+            rollback_registered_worktree()
+        elif created_target:
+            if target_stat is None:
+                raise_rollback_incomplete("target_identity_unavailable")
             try:
                 current_target = os.stat(
                     target.name, dir_fd=parent_fd, follow_symlinks=False
                 )
-                if source_identity_matches(current_target, target_stat):
-                    os.rmdir(target.name, dir_fd=parent_fd)
-            except OSError:
+                if not source_identity_matches(current_target, target_stat):
+                    raise_rollback_incomplete("target_identity_changed")
+                os.rmdir(target.name, dir_fd=parent_fd)
+            except FileNotFoundError:
                 pass
+            except AgentError:
+                raise
+            except OSError as exc:
+                raise_rollback_incomplete("rollback_directory_remove_failed", exc)
+        raise
+    finally:
         if target_fd >= 0:
             os.close(target_fd)
         os.close(parent_fd)
-    public_path = repo_relative_public_path(resolved_target, repo)
-    return {
-        "agent": agent,
-        "path": public_path or PATH_NOT_RETURNED,
-        "path_state": "set" if public_path else "not_returned",
-        "path_kind": "repo_relative" if public_path else "not_returned",
-        "base_ref": PATH_NOT_RETURNED if base_ref else None,
-        "base_ref_state": "set" if base_ref else "not_set",
-        "status": "created",
-        "raw_output": "not_returned",
-    }
 
 
 def worktree_status(path: Any = None) -> dict[str, Any]:
@@ -23657,11 +24591,14 @@ def call_tool(
     args: dict[str, Any],
     *,
     principal_class: str | None = None,
+    runtime: MasterjetRuntime | None = None,
 ) -> dict[str, Any]:
     authority_class = principal_class or "arbeitsbiene"
     if name in _MASTERJET_ADMIN_TOOL_ROUTES:
         return _masterjet_admin_tool_call(name, args)
     if name in {tool["name"] for tool in hive_tool_definitions()}:
+        if name in HIVE_TEST_MUTATING_TOOL_NAMES and authority_class not in HIVE_PRINCIPAL_CLASSES:
+            raise AgentError("authority.scope_denied")
         return dict(call_hive_tool(name, args))
     if name == "fleet_overview":
         overview_format = str(args.get("format", "json"))
@@ -23718,7 +24655,14 @@ def call_tool(
     if name == "agent_spawn_offers":
         return agent_spawn_offers(int_arg(args, "required_slots", 1))
     if name == "dynamic_teamlead_start":
-        return dynamic_teamlead_start()
+        if type(runtime) is MasterjetRuntime:
+            return runtime.start_dynamic_teamlead()
+        return {
+            "schema_version": 1,
+            "status": "unavailable",
+            "reason": "dynamic_teamlead_runtime_unavailable",
+            "raw_output": "not_returned",
+        }
     if name == "agent_start":
         selected = agent_ids(str(args.get("agent", "both")))
         allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
@@ -36951,13 +37895,15 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_raw_log_writer.add_argument("path")
     p_raw_log_writer.add_argument("--max-bytes", type=int, default=MAX_RAW_LOG_BYTES)
 
-    add_hive_cli_parsers(sub)
+    add_hive_cli_parsers(sub, fleet_subparsers=fleet_sub)
 
     args = parser.parse_args(argv)
     try:
         if args.command == "raw-log-writer":
             return write_bounded_raw_log(Path(args.path), args.max_bytes)
         if args.command in {"hive", "selection-status", "reset-anchor-run"}:
+            return print_json(run_hive_cli(args))
+        if args.command == "fleet" and args.fleet_namespace == "test":
             return print_json(run_hive_cli(args))
         if args.command == "fleet":
             if hasattr(args, "masterjet_admin_operation"):
