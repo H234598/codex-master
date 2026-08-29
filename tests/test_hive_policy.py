@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":4,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":5,"schema_version":1} -->\n'
 )
 
 
@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 4
+    assert contract.generation == 5
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -198,6 +198,32 @@ def test_common_policy_requires_markdown_annotation_response_heading() -> None:
     assert "[[#<Annotation-ID>|<Annotation-ID>]]" not in raw_policy
 
 
+def test_common_policy_inherits_the_exact_surrounding_heading_for_inline_annotations() -> None:
+    policy_api = load_policy_api()
+    policy = " ".join(
+        policy_api.load_common_policy().common_bytes.decode("utf-8").split()
+    )
+
+    assert (
+        "Eine Inline-Annotation erbt exakt die umgebende Markdown-Überschrift"
+        in policy
+    )
+
+
+def test_common_policy_links_every_resolvable_additional_source_heading() -> None:
+    policy_api = load_policy_api()
+    policy = " ".join(
+        policy_api.load_common_policy().common_bytes.decode("utf-8").split()
+    )
+
+    assert (
+        "Betrifft eine Antwort mehrere Quellkapitel, enthält ihr Antworttext "
+        "zusätzlich normale Markdown-Links auf jede weitere eindeutig "
+        "auflösbare Quellüberschrift, soweit möglich"
+        in policy
+    )
+
+
 def test_common_policy_fails_closed_on_unresolved_or_conflicting_annotation_data() -> None:
     policy_api = load_policy_api()
     policy = " ".join(
@@ -235,8 +261,8 @@ def test_common_policy_links_section_answers_without_requiring_annotation_id() -
             "Annotation Marker bidirektional zu verlinken"
         ),
         (
-            "Die Antwort enthält genau einen eindeutig aufgelösten Markdown-Link "
-            "auf den Quellabschnitt oder seine Überschrift"
+            "Die Antwort enthält genau einen eindeutig aufgelösten normalen "
+            "Markdown-Link auf den primären Quellabschnitt oder seine Überschrift"
         ),
         (
             "Der Quellabschnitt enthält genau einen Rückverweis auf das konkrete "

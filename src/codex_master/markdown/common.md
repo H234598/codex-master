@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":4,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":5,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -62,13 +62,15 @@ Dokumentpfade serverweit.
 
 Jede direkte Antwort auf einen Dokumentabschnitt ist auch ohne Annotation
 Marker bidirektional zu verlinken. Die Antwort enthält genau einen eindeutig
-aufgelösten Markdown-Link auf den Quellabschnitt oder seine Überschrift. Der
-Quellabschnitt enthält genau einen Rückverweis auf das konkrete Antwortziel
-und die konkrete Antwortüberschrift. Eine vorhandene Annotation-ID ist bei
-einer reinen Abschnittsantwort ein optionaler zusätzlicher Anker; sie ist
-dafür nicht erforderlich. Bei einer direkten Antwort auf eine Annotation
-bleibt die Annotation-ID dagegen erforderlich; zusätzlich gelten die
-nachfolgenden exakten Annotation-Regeln.
+aufgelösten normalen Markdown-Link auf den primären Quellabschnitt oder seine
+Überschrift. Der Quellabschnitt enthält genau einen Rückverweis auf das
+konkrete Antwortziel und die konkrete Antwortüberschrift. Betrifft eine
+Antwort mehrere Quellkapitel, enthält ihr Antworttext zusätzlich normale
+Markdown-Links auf jede weitere eindeutig auflösbare Quellüberschrift, soweit
+möglich. Eine vorhandene Annotation-ID ist bei einer reinen Abschnittsantwort
+ein optionaler zusätzlicher Anker; sie ist dafür nicht erforderlich. Bei einer
+direkten Antwort auf eine Annotation bleibt die Annotation-ID dagegen
+erforderlich; zusätzlich gelten die nachfolgenden exakten Annotation-Regeln.
 
 Vor jeder Dokumentmutation einer Abschnittsantwort sind Quelldokument,
 Quellabschnitt, Quellüberschrift, Source-Link-Ziel, Antwortziel und
@@ -85,6 +87,9 @@ Eine beantwortete Annotation erhält ein eigenes Kapitel am Dokumentende. Die
 Antwortüberschrift muss exakt dieser Markdown-Form folgen:
 `## <exakte Annotation-Überschrift ohne finale ID> — [<Annotation-ID>](<eindeutiger Link auf referenzierten Annotationsabschnitt oder dessen Überschrift>)`.
 Die exakte Annotation-Überschrift steht ohne finale ID vor dem em dash `—`.
+Eine Inline-Annotation erbt exakt die umgebende Markdown-Überschrift; diese
+geerbte Überschrift ist ohne Umbenennung oder Kürzung als exakte
+Annotation-Überschrift zu verwenden.
 Die erforderliche Markdown-Selbstlink-Syntax ist ein normaler Markdown-Link.
 Die sichtbare ID bleibt unverändert und exakt erhalten. Für den
 Heading-Identifier gilt: kein Wikilink für den Heading-Identifier. Ziel zuerst

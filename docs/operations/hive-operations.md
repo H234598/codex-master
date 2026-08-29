@@ -131,11 +131,13 @@ caller supplies the operation callback.
 
 Every direct answer to a document section must be bidirectionally linked, even
 without an Annotation Marker. The answer contains exactly one uniquely
-resolved Markdown link to the source section or its heading. The source
-section contains exactly one backlink to the concrete answer target and answer
-heading. For a section-only answer, an existing Annotation ID is an optional
-additional anchor, not a prerequisite. A direct annotation answer still
-requires the Annotation ID.
+resolved normal Markdown link to the primary source section or its heading.
+The source section contains exactly one backlink to the concrete answer target
+and answer heading. If an answer concerns multiple source chapters, its answer
+text additionally contains normal Markdown links to every further uniquely
+resolvable source heading, wherever possible. For a section-only answer, an
+existing Annotation ID is an optional additional anchor, not a prerequisite. A
+direct annotation answer still requires the Annotation ID.
 
 Before mutating a section answer, uniquely resolve the source document, source
 section, source heading, source-link target, answer target, and answer heading.
@@ -170,6 +172,10 @@ bee, answer target, and answer heading:
 ```text
 Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: [[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]
 ```
+
+An inline annotation inherits exactly its surrounding Markdown heading. Use
+that inherited heading unchanged and unshortened as the exact annotation
+heading before the em dash.
 
 Before any document mutation, resolve Quellabschnitt,
 Source-Heading-Markdownziel, Annotation-ID, Antwortziel, and
