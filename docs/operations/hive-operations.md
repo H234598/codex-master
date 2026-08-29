@@ -209,3 +209,11 @@ profile reference. Verify this contract with the focused checks:
 ```sh
 pytest -q tests/test_hive_policy.py tests/test_fleet_markdown.py
 ```
+
+### OpenAI account stickiness and automatic reset gate
+
+The binding account-stickiness and automated reset gate are defined only in
+the `OpenAI-Account- und Context-Reset-Policy` section of
+`src/codex_master/markdown/common.md`. Apply them from the generator's
+materialized `AGENTS.md` or `.gemini/GEMINI.md` projection for the managed
+home; do not copy or locally restate the rules here.

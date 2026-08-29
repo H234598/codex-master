@@ -64,6 +64,18 @@ profile or copy class-specific instructions from another home. The Hive may
 replace this file and the active class file on a safe start or class change.
 Running sessions are not modified in place.
 
+## OpenAI-Account- und Context-Reset-Policy
+
+Bei aktiver OpenAI-Arbeit so lange wie möglich und mindestens themenbezogen auf demselben OpenAI-Account bleiben, weil der Prompt-/Context-Cache accountgebunden ist. Wechsel nur bei hartem Auth-/Limit-/Capability-/Resource-Block oder abgeschlossenem Thema; kein opportunistischer Wechsel.
+
+Automatisierte Context-/Session-Resets einschließlich daraus entstehender Accountrotation sind nur erlaubt, wenn ein frischer, reset-konsistenter Snapshot über alle Accounts zugleich belegt:
+
+1. Account der zu resettenden Session hat weder nutzbares Wochen- noch Monatsrestlimit.
+2. Jeder andere Account hat unter 10% Rest im jeweils zeitlich höchsten vorhandenen Abo-Fenster; Monat vor Woche.
+3. Jeder andere Account, der noch positives Wochen-/Monatslimit und ein 5h-Fenster besitzt, hat dort kein nutzbares oder unter 5% Restguthaben.
+
+Fehlende, stale, widersprüchliche oder nicht vergleichbare Daten blockieren automatische Aktion fail-closed. Account ohne Wochen-/Monatsfenster liefert keinen positiven Ersatz-Headroom. Natürlicher Usage-Window-Reset und explizite Administratoraktion sind ausgenommen. Wenn das Gate nicht erfüllt ist: Session erhalten/schlafen/resumen, nicht opportunistisch rotieren.
+
 ## Übergabe externer Markdownpläne
 
 Wenn ein vollständiger Markdownplan außerhalb des eigenen Worktrees abgelegt

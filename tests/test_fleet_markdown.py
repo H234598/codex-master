@@ -250,6 +250,41 @@ def test_both_provider_projections_carry_same_generation_six_policy_bytes() -> N
         assert projection.metadata.generation == contract.generation == 6
 
 
+def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> None:
+    contract = load_common_policy()
+    required_fragments = [
+        "Bei aktiver OpenAI-Arbeit so lange wie möglich und mindestens themenbezogen auf demselben OpenAI-Account bleiben".encode(
+            "utf-8"
+        ),
+        "Prompt-/Context-Cache accountgebunden ist".encode("utf-8"),
+        "kein opportunistischer Wechsel".encode("utf-8"),
+        "frischer, reset-konsistenter Snapshot über alle Accounts zugleich".encode(
+            "utf-8"
+        ),
+        "unter 10% Rest im jeweils zeitlich höchsten vorhandenen Abo-Fenster; Monat vor Woche".encode(
+            "utf-8"
+        ),
+        "Fehlende, stale, widersprüchliche oder nicht vergleichbare Daten blockieren automatische Aktion fail-closed".encode(
+            "utf-8"
+        ),
+        "Account ohne Wochen-/Monatsfenster liefert keinen positiven Ersatz-Headroom".encode(
+            "utf-8"
+        ),
+        "Session erhalten/schlafen/resumen, nicht opportunistisch rotieren".encode(
+            "utf-8"
+        ),
+    ]
+
+    for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+        projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
+        primary = projection.artifacts[projection.metadata.provider_artifact_name]
+
+        assert primary.startswith(contract.common_bytes)
+        for fragment in required_fragments:
+            assert fragment in primary
+        assert projection.metadata.generation == contract.generation == 6
+
+
 def test_both_provider_projections_carry_unencoded_local_file_link_contract() -> None:
     contract = load_common_policy()
     required_fragments = [
