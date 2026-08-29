@@ -108,3 +108,32 @@ def test_corrupt_record_is_never_used_as_evidence(tmp_path: Path) -> None:
     store.put(value)
 
     assert store.latest(value.repository_id, value.executor_fingerprint, value.test_id) == value
+
+
+def test_running_attempt_is_projected_then_cancelled_or_expired(tmp_path: Path) -> None:
+    store = StatusStore(tmp_path / "test-evidence" / "v1")
+    index = IndexV1.from_mapping(valid_index())
+    value = matching_receipt()
+    store.begin_attempt(
+        value.repository_id,
+        value.executor_fingerprint,
+        value.test_id,
+        "attempt-running",
+        started_monotonic_ns=10,
+        expires_monotonic_ns=100,
+    )
+
+    running = store.status(index, request(index.digest), now_monotonic_ns=50)
+    expired = store.status(index, request(index.digest), now_monotonic_ns=101)
+    store.cancel_attempt(
+        value.repository_id,
+        value.executor_fingerprint,
+        value.test_id,
+        "attempt-running",
+    )
+    cancelled = store.status(index, request(index.digest), now_monotonic_ns=50)
+
+    assert running["counts"]["running"] == 1
+    assert running["items"][0]["reason_code"] == "test.run_running"
+    assert expired["counts"]["unverified"] == 1
+    assert cancelled["counts"]["unverified"] == 1

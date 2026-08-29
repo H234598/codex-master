@@ -54,6 +54,12 @@ def test_runner_mints_passed_receipt_only_after_real_pytest_exit(tmp_path: Path)
     assert result.result == "passed"
     assert result.reason_code == "test.run_passed"
     assert store.latest("example", DIGEST_A, test_id) == result
+    assert (
+        store.active_attempt(
+            "example", DIGEST_A, test_id, now_monotonic_ns=result.finished_monotonic_ns
+        )
+        is None
+    )
     assert "stdout" not in result.public()
 
 

@@ -139,36 +139,52 @@ class TestEvidenceRunner:
         attempt_id = "attempt-" + secrets.token_hex(16)
         started_at = _utc_now()
         started_ns = time.monotonic_ns()
-        result, reason = self._execute(test)
-        finished_ns = time.monotonic_ns()
-        finished_at = _utc_now()
-        ttl = _TTL_SECONDS[test.cooldown_class] if result == "passed" else 0
-        receipt = EvidenceReceiptV1(
-            repository_id=context.repository_id,
-            index_digest=context.index_digest,
-            function_ids=context.function_ids,
-            test_id=context.test_id,
-            source_digest_set_digest=context.source_digest_set_digest,
-            test_digest=context.test_digest,
-            assertion_digest=context.assertion_digest,
-            dependency_digest_set_digest=context.dependency_digest_set_digest,
-            executor_fingerprint=context.executor_fingerprint,
-            boot_id_digest=context.boot_id_digest,
-            runner_version_digest=context.runner_version_digest,
-            environment_digest=context.environment_digest,
-            attempt_id=attempt_id,
-            started_at=started_at,
-            finished_at=finished_at,
+        self._store.begin_attempt(
+            context.repository_id,
+            context.executor_fingerprint,
+            context.test_id,
+            attempt_id,
             started_monotonic_ns=started_ns,
-            finished_monotonic_ns=finished_ns,
-            result=result,
-            reason_code=reason,
-            duration_ms=(finished_ns - started_ns) // 1_000_000,
-            cooldown_class=test.cooldown_class,
-            expires_monotonic_ns=finished_ns + ttl * 1_000_000_000,
+            expires_monotonic_ns=started_ns + test.timeout_seconds * 1_000_000_000,
         )
-        self._store.put(receipt)
-        return receipt
+        try:
+            result, reason = self._execute(test)
+            finished_ns = time.monotonic_ns()
+            finished_at = _utc_now()
+            ttl = _TTL_SECONDS[test.cooldown_class] if result == "passed" else 0
+            receipt = EvidenceReceiptV1(
+                repository_id=context.repository_id,
+                index_digest=context.index_digest,
+                function_ids=context.function_ids,
+                test_id=context.test_id,
+                source_digest_set_digest=context.source_digest_set_digest,
+                test_digest=context.test_digest,
+                assertion_digest=context.assertion_digest,
+                dependency_digest_set_digest=context.dependency_digest_set_digest,
+                executor_fingerprint=context.executor_fingerprint,
+                boot_id_digest=context.boot_id_digest,
+                runner_version_digest=context.runner_version_digest,
+                environment_digest=context.environment_digest,
+                attempt_id=attempt_id,
+                started_at=started_at,
+                finished_at=finished_at,
+                started_monotonic_ns=started_ns,
+                finished_monotonic_ns=finished_ns,
+                result=result,
+                reason_code=reason,
+                duration_ms=(finished_ns - started_ns) // 1_000_000,
+                cooldown_class=test.cooldown_class,
+                expires_monotonic_ns=finished_ns + ttl * 1_000_000_000,
+            )
+            self._store.put(receipt)
+            return receipt
+        finally:
+            self._store.cancel_attempt(
+                context.repository_id,
+                context.executor_fingerprint,
+                context.test_id,
+                attempt_id,
+            )
 
     def _execute(self, test: TestEntryV1) -> tuple[str, str]:
         if test.runner == "pytest":
