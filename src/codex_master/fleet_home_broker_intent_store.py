@@ -15,6 +15,7 @@ from typing import Protocol
 
 from codex_master.fleet_home_broker_intent import (
     MAX_BROKER_INTENT_BYTES,
+    BrokerIntentCode,
     BrokerIntentError,
     BrokerIntentV1,
     decode_broker_intent,
@@ -95,6 +96,8 @@ class _LinuxIntentStoreOperations(Protocol):
 
     def write_all(self, fd: int, payload: bytes) -> int | None: ...
 
+    def truncate(self, fd: int) -> None: ...
+
     def fsync(self, fd: int) -> None: ...
 
     def renameat2_noreplace(
@@ -139,16 +142,25 @@ def _valid_code(value: object) -> bool:
 
 def _validate_claim(value: object) -> BrokerIntentClaimBytes:
     if type(value) is not BrokerIntentClaimBytes:
-        raise ValueError("invalid_claim")
+        raise BrokerIntentError(BrokerIntentCode.INVALID_TYPE)
     try:
         valid_name = _valid_name(value.claim_name)
     except UnicodeEncodeError:
         valid_name = False
     if not valid_name or type(value.payload) is not bytes:
-        raise ValueError("invalid_claim")
+        raise BrokerIntentError(BrokerIntentCode.INVALID_TYPE)
     if type(value.source_identity) is not BrokerIntentFileIdentity:
-        raise ValueError("invalid_claim")
+        raise BrokerIntentError(BrokerIntentCode.INVALID_TYPE)
     return value
+
+
+def _public_operation_call(operations: object, method: str, *args: object) -> object:
+    try:
+        return getattr(operations, method)(*args)
+    except BrokerIntentError:
+        raise
+    except Exception:
+        raise BrokerIntentError(BrokerIntentCode.INVALID_FIELD)
 
 
 def _linux_fail(code: LinuxBrokerCode) -> None:
@@ -271,7 +283,6 @@ class LinuxBrokerIntentStore:
     _O_WRONLY = 0o1
     _O_CREAT = 0o100
     _O_EXCL = 0o200
-    _O_TRUNC = 0o1000
 
     def __init__(
         self,
@@ -502,8 +513,9 @@ class LinuxBrokerIntentStore:
         renamed = False
         terminal_name = f".terminal-{claim_name[1:]}"
         try:
-            fd, before = self._open_file(claim_name, self._O_WRONLY | self._O_TRUNC)
+            fd, before = self._open_file(claim_name, self._O_WRONLY)
             self._verify_parent()
+            _linux_call(self._operations.truncate, fd)
             self._write_and_sync(fd, payload)
             self._after_file_identity(fd, before)
             self._close(fd)
@@ -527,8 +539,18 @@ class LinuxBrokerIntentStore:
         self._retention_check(".quarantine-", MAX_QUARANTINED_INTENT_RECORDS)
         self._verify_parent()
         quarantine_name = f".quarantine-{code}-{claim_name[1:]}"
-        self._rename_and_sync(claim_name, quarantine_name)
-        self._verify_parent()
+        fd = None
+        try:
+            fd, before = self._open_file(claim_name, self._O_RDONLY)
+            self._after_file_identity(fd, before)
+            self._close(fd)
+            fd = None
+            self._verify_parent()
+            self._rename_and_sync(claim_name, quarantine_name)
+            self._verify_parent()
+        finally:
+            if fd is not None:
+                self._close(fd)
 
 
 def publish_broker_intent(
@@ -537,7 +559,9 @@ def publish_broker_intent(
     """Encode and publish one complete intent under its deterministic name."""
 
     payload = encode_broker_intent(intent)
-    operations.publish(payload, _final_name(intent))
+    result = _public_operation_call(operations, "publish", payload, _final_name(intent))
+    if result is not None:
+        raise BrokerIntentError(BrokerIntentCode.INVALID_TYPE)
 
 
 def claim_broker_intent(
@@ -545,7 +569,7 @@ def claim_broker_intent(
 ) -> ClaimedBrokerIntent | None:
     """Decode one atomically claimed intent or quarantine its invalid bytes."""
 
-    claim = operations.claim_next()
+    claim = _public_operation_call(operations, "claim_next")
     if claim is None:
         return None
     claim = _validate_claim(claim)
@@ -556,8 +580,12 @@ def claim_broker_intent(
         # malformed bytes and their contents never become an error string.
         code = error.code.value
         if not _valid_code(code):
-            raise ValueError("invalid_claim_code")
-        operations.quarantine(claim.claim_name, code)
+            raise BrokerIntentError(BrokerIntentCode.INVALID_FIELD)
+        result = _public_operation_call(
+            operations, "quarantine", claim.claim_name, code
+        )
+        if result is not None:
+            raise BrokerIntentError(BrokerIntentCode.INVALID_TYPE)
         return None
     return ClaimedBrokerIntent(intent, claim.claim_name, claim.source_identity)
 

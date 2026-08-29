@@ -9,7 +9,10 @@ import threading
 
 import pytest
 
+import codex_master.fleet_home_broker_intent_store as intent_store_module
 from codex_master.fleet_home_broker_intent import (
+    BrokerIntentCode,
+    BrokerIntentError,
     BrokerIntentOperation,
     BrokerIntentV1,
     canonical_intent_payload,
@@ -132,6 +135,8 @@ class FakeLinuxOperations:
             self.labels[name] = PARENT_IDENTITY.selinux_label
         elif getattr(how, "flags", 0) & 0o200:
             raise FileExistsError(errno.EEXIST, "exists")
+        if getattr(how, "flags", 0) & 0o1000:
+            self.files[name] = b""
         fd = self.next_fd
         self.next_fd += 1
         self.fd_names[fd] = name
@@ -189,6 +194,10 @@ class FakeLinuxOperations:
         if self.fsync_error is not None:
             raise self.fsync_error
 
+    def truncate(self, fd: int) -> None:
+        self.calls.append(("truncate", fd))
+        self.files[self.fd_names[fd]] = b""
+
     def renameat2_noreplace(self, parent_fd: int, old_name: str, new_name: str) -> None:
         self.calls.append(("renameat2_noreplace", parent_fd, old_name, new_name))
         if self.rename_error is not None:
@@ -205,6 +214,49 @@ class FakeLinuxOperations:
         self.calls.append(("close", fd))
         self.fd_names.pop(fd, None)
         self.open_flags.pop(fd, None)
+
+
+class AtomicClaimLinuxOperations(FakeLinuxOperations):
+    def __init__(self) -> None:
+        super().__init__()
+        self._state_lock = threading.Lock()
+        self._read_barrier = threading.Barrier(2)
+        self._fd_identities: dict[int, ObjectIdentity] = {}
+        self._fd_labels: dict[int, str] = {}
+
+    def openat2(self, parent_fd: int, name: str, how: object) -> PinnedFd:
+        with self._state_lock:
+            pinned = super().openat2(parent_fd, name, how)
+            self._fd_identities[pinned.fd] = pinned.identity
+            self._fd_labels[pinned.fd] = self.labels[name]
+            return pinned
+
+    def stat_fd(self, fd: int) -> ObjectIdentity:
+        if fd in self._fd_identities:
+            self.calls.append(("stat_fd", fd))
+            return self._fd_identities[fd]
+        return super().stat_fd(fd)
+
+    def selinux_label(self, fd: int) -> str:
+        if fd in self._fd_labels:
+            self.calls.append(("selinux_label", fd))
+            return self._fd_labels[fd]
+        return super().selinux_label(fd)
+
+    def read_all(self, fd: int) -> bytes:
+        with self._state_lock:
+            payload = super().read_all(fd)
+        self._read_barrier.wait(timeout=5)
+        return payload
+
+    def renameat2_noreplace(self, parent_fd: int, old_name: str, new_name: str) -> None:
+        with self._state_lock:
+            super().renameat2_noreplace(parent_fd, old_name, new_name)
+
+    def close(self, fd: int) -> None:
+        super().close(fd)
+        self._fd_identities.pop(fd, None)
+        self._fd_labels.pop(fd, None)
 
 
 def test_public_store_types_are_frozen_slotted_and_protocol_is_narrow() -> None:
@@ -280,33 +332,139 @@ def test_invalid_or_expired_claim_is_quarantined_without_retry() -> None:
     assert store.quarantines == [("claim-expired", "expired")]
 
 
-def test_two_consumers_have_exactly_one_claim_and_loser_does_not_mutate() -> None:
-    class OneShotStore(FakeStore):
-        def __init__(self) -> None:
-            super().__init__(
-                BrokerIntentClaimBytes(
-                    "claim-race", encode_broker_intent(INTENT), IDENTITY
-                )
-            )
-            self._lock = threading.Lock()
+def test_public_publish_maps_malformed_operation_return_to_stable_error() -> None:
+    class MalformedPublish(FakeStore):
+        def publish(self, payload: bytes, final_name: str) -> object:
+            return object()
 
-        def claim_next(self) -> BrokerIntentClaimBytes | None:
-            with self._lock:
-                return super().claim_next()
+    with pytest.raises(BrokerIntentError) as raised:
+        publish_broker_intent(MalformedPublish(), INTENT)
 
-    store = OneShotStore()
-    results: list[ClaimedBrokerIntent | None] = []
+    assert raised.value.code is BrokerIntentCode.INVALID_TYPE
 
-    def consume() -> None:
-        results.append(claim_broker_intent(store, now_unix_ms=1_700_000_001_000))
 
-    workers = [threading.Thread(target=consume) for _ in range(2)]
+def test_public_claim_maps_malformed_operation_return_to_stable_error() -> None:
+    class MalformedClaim(FakeStore):
+        def claim_next(self) -> object:
+            return object()
+
+    with pytest.raises(BrokerIntentError) as raised:
+        claim_broker_intent(MalformedClaim(), now_unix_ms=1_700_000_001_000)
+
+    assert raised.value.code is BrokerIntentCode.INVALID_TYPE
+
+
+def test_public_publish_maps_platform_error_without_leaking_details() -> None:
+    class BrokenPublish(FakeStore):
+        def publish(self, payload: bytes, final_name: str) -> None:
+            raise OSError(errno.EIO, "host-path-secret")
+
+    with pytest.raises(BrokerIntentError) as raised:
+        publish_broker_intent(BrokenPublish(), INTENT)
+
+    assert raised.value.code is BrokerIntentCode.INVALID_FIELD
+    assert str(raised.value) == BrokerIntentCode.INVALID_FIELD.value
+    assert "host-path-secret" not in str(raised.value)
+
+
+def test_public_claim_maps_linux_error_without_leaking_details() -> None:
+    class BrokenClaim(FakeStore):
+        def claim_next(self) -> None:
+            raise LinuxBrokerError(LinuxBrokerCode.IO_FAILURE)
+
+    with pytest.raises(BrokerIntentError) as raised:
+        claim_broker_intent(BrokenClaim(), now_unix_ms=1_700_000_001_000)
+
+    assert raised.value.code is BrokerIntentCode.INVALID_FIELD
+
+
+def test_public_quarantine_maps_operation_error_and_return_to_stable_errors() -> None:
+    expired = _intent(expires_at_unix_ms=1_700_000_001_000)
+
+    class BrokenQuarantine(FakeStore):
+        def quarantine(self, claim_name: str, code: str) -> None:
+            raise ValueError("quarantine-path-secret")
+
+    broken = BrokenQuarantine(
+        BrokerIntentClaimBytes("claim-expired", encode_broker_intent(expired), IDENTITY)
+    )
+    with pytest.raises(BrokerIntentError) as raised:
+        claim_broker_intent(broken, now_unix_ms=1_700_000_001_000)
+    assert raised.value.code is BrokerIntentCode.INVALID_FIELD
+    assert "quarantine-path-secret" not in str(raised.value)
+
+    class MalformedQuarantine(FakeStore):
+        def quarantine(self, claim_name: str, code: str) -> object:
+            return object()
+
+    malformed = MalformedQuarantine(
+        BrokerIntentClaimBytes("claim-expired", encode_broker_intent(expired), IDENTITY)
+    )
+    with pytest.raises(BrokerIntentError) as raised:
+        claim_broker_intent(malformed, now_unix_ms=1_700_000_001_000)
+    assert raised.value.code is BrokerIntentCode.INVALID_TYPE
+
+
+def test_public_claim_maps_unexpected_codec_category_to_stable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim = BrokerIntentClaimBytes("claim-expired", b"payload", IDENTITY)
+
+    class UnexpectedCode:
+        value = "not-a-stable-code"
+
+    def unexpected_decode(payload: bytes, *, now_unix_ms: int) -> BrokerIntentV1:
+        raise BrokerIntentError(UnexpectedCode())  # type: ignore[arg-type]
+
+    monkeypatch.setattr(intent_store_module, "decode_broker_intent", unexpected_decode)
+    with pytest.raises(BrokerIntentError) as raised:
+        claim_broker_intent(FakeStore(claim), now_unix_ms=1_700_000_001_000)
+
+    assert raised.value.code is BrokerIntentCode.INVALID_FIELD
+
+
+def test_two_linux_consumers_claim_shared_intent_once_atomically() -> None:
+    operations = AtomicClaimLinuxOperations()
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    payload = encode_broker_intent(INTENT)
+    operations.files[final_name] = payload
+    operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
+    adapters = [
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY),
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY),
+    ]
+    results: list[BrokerIntentClaimBytes | None] = [None, None]
+    errors: list[BaseException] = []
+
+    def consume(index: int) -> None:
+        try:
+            results[index] = adapters[index].claim_next()
+        except Exception as error:  # pragma: no cover - assertion below reports it
+            errors.append(error)
+
+    workers = [threading.Thread(target=consume, args=(index,)) for index in range(2)]
     for worker in workers:
         worker.start()
     for worker in workers:
-        worker.join()
+        worker.join(timeout=10)
+
+    assert not any(worker.is_alive() for worker in workers)
+    assert errors == []
     assert sorted(result is not None for result in results) == [False, True]
-    assert store.quarantines == []
+    winner = next(result for result in results if result is not None)
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    expected_identity = BrokerIntentFileIdentity(
+        8, 1001, 0o100600, 0, 0, 1, PARENT_IDENTITY.selinux_label
+    )
+    assert winner == BrokerIntentClaimBytes(claim_name, payload, expected_identity)
+    assert operations.files == {claim_name: payload}
+    assert final_name not in operations.files
+    assert [call for call in operations.calls if call[0] == "renameat2_noreplace"] == [
+        ("renameat2_noreplace", 7, final_name, claim_name)
+    ] * 2
 
 
 def test_linux_publish_uses_openat2_exclusive_write_fsync_and_noreplace_rename() -> (
@@ -469,6 +627,82 @@ def test_linux_claim_rejects_symlink_without_claiming() -> None:
     assert not any(call[0] == "renameat2_noreplace" for call in operations.calls)
 
 
+@pytest.mark.parametrize(
+    ("identity", "label"),
+    (
+        (ObjectIdentity(8, 1001, 0o120777, 0, 0, 1), PARENT_IDENTITY.selinux_label),
+        (ObjectIdentity(8, 1001, 0o100600, 0, 0, 2), PARENT_IDENTITY.selinux_label),
+        (ObjectIdentity(8, 1001, 0o100600, 1000, 0, 1), PARENT_IDENTITY.selinux_label),
+        (ObjectIdentity(8, 1001, 0o100666, 0, 0, 1), PARENT_IDENTITY.selinux_label),
+        (ObjectIdentity(8, 1001, 0o100600, 0, 0, 1), "system_u:object_r:tmp_t:s0"),
+    ),
+    ids=("symlink", "hardlink", "owner", "mode", "label"),
+)
+def test_linux_quarantine_rejects_invalid_identity_before_rename(
+    identity: ObjectIdentity, label: str
+) -> None:
+    operations = FakeLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    original = b"claimed-payload"
+    operations.files[claim_name] = original
+    operations.identities[claim_name] = identity
+    operations.labels[claim_name] = label
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.quarantine(claim_name, "invalid_field")
+
+    assert raised.value.code is LinuxBrokerCode.IDENTITY_MISMATCH
+    assert operations.files[claim_name] == original
+    assert any(call[0] == "openat2" for call in operations.calls)
+    assert not any(
+        call[0] in {"truncate", "write_all", "renameat2_noreplace"}
+        for call in operations.calls
+    )
+
+
+def test_linux_quarantine_binds_valid_claim_before_rename_and_closes_fd() -> None:
+    operations = FakeLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    operations.files[claim_name] = b"claimed-payload"
+    operations.identities[claim_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    adapter.quarantine(claim_name, "invalid_field")
+
+    quarantine_name = (
+        ".quarantine-invalid_field-claim-intent-00000000000000000007-"
+        "dddddddddddddddddddddddddddddddd.json"
+    )
+    assert operations.files == {quarantine_name: b"claimed-payload"}
+    names = [call[0] for call in operations.calls]
+    assert (
+        names.index("openat2")
+        < names.index("close")
+        < names.index("renameat2_noreplace")
+    )
+
+
+def test_linux_quarantine_rejects_valid_but_missing_claim_before_rename() -> None:
+    operations = FakeLinuxOperations()
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    claim_name = (
+        ".claim-intent-00000000000000000008-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json"
+    )
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.quarantine(claim_name, "invalid_field")
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    assert any(call[0] == "openat2" for call in operations.calls)
+    assert not any(call[0] == "renameat2_noreplace" for call in operations.calls)
+
+
 def test_linux_publish_fails_closed_on_parent_swap_short_write_fsync_and_rename_collision() -> (
     None
 ):
@@ -492,9 +726,7 @@ def test_linux_publish_fails_closed_on_parent_swap_short_write_fsync_and_rename_
         assert final_name not in operations.files
 
 
-def test_linux_terminal_and_quarantine_reject_unknown_claim_and_bound_retention() -> (
-    None
-):
+def test_linux_unknown_claim_names_are_rejected_before_adapter_mutation() -> None:
     operations = FakeLinuxOperations()
     adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
     with pytest.raises(LinuxBrokerError) as raised:
@@ -503,20 +735,48 @@ def test_linux_terminal_and_quarantine_reject_unknown_claim_and_bound_retention(
     with pytest.raises(LinuxBrokerError) as raised:
         adapter.quarantine("unknown", "invalid")
     assert raised.value.code is LinuxBrokerCode.UNSAFE_PATH
-    for index in range(130):
+    assert not any(
+        call[0] in {"openat2", "truncate", "write_all", "renameat2_noreplace"}
+        for call in operations.calls
+    )
+
+
+def test_linux_quarantine_retention_allows_128_then_rejects_129_without_mutation() -> (
+    None
+):
+    operations = FakeLinuxOperations()
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    for index in range(128):
         claim_name = f".claim-intent-{index:020d}-{'d' * 32}.json"
-        operations.files[claim_name] = encode_broker_intent(INTENT)
+        operations.files[claim_name] = b"claimed-payload"
         operations.identities[claim_name] = ObjectIdentity(
             8, 2000 + index, 0o100600, 0, 0, 1
         )
         operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
-        try:
-            adapter.quarantine(claim_name, "invalid_field")
-        except Exception:
-            break
+        adapter.quarantine(claim_name, "invalid_field")
+
     assert (
         len([name for name in operations.files if name.startswith(".quarantine-")])
-        <= 128
+        == 128
+    )
+    claim_name = (
+        ".claim-intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json"
+    )
+    operations.files[claim_name] = b"claimed-payload"
+    operations.identities[claim_name] = ObjectIdentity(8, 3000, 0o100600, 0, 0, 1)
+    operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
+    files_before = dict(operations.files)
+    calls_before = len(operations.calls)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.quarantine(claim_name, "invalid_field")
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    assert operations.files == files_before
+    assert [call[0] for call in operations.calls[calls_before:]] == ["list_names"]
+    assert not any(
+        call[0] == "renameat2_noreplace" for call in operations.calls[calls_before:]
     )
 
 
@@ -535,6 +795,15 @@ def test_linux_mark_terminal_writes_bounded_payload_then_retains_claim_atomicall
     adapter.mark_terminal(claim_name, terminal_payload)
     terminal_name = ".terminal-claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
     assert operations.files == {terminal_name: terminal_payload}
+    open_call = next(
+        call
+        for call in operations.calls
+        if call[0] == "openat2" and call[2] == claim_name
+    )
+    assert not (getattr(open_call[3], "flags") & 0o1000)
+    assert [call[0] for call in operations.calls].index("truncate") < [
+        call[0] for call in operations.calls
+    ].index("write_all")
 
 
 def test_linux_mark_terminal_truncates_before_retention_rename() -> None:
@@ -557,7 +826,43 @@ def test_linux_mark_terminal_truncates_before_retention_rename() -> None:
         for call in operations.calls
         if call[0] == "openat2" and call[2] == claim_name
     )
-    assert getattr(open_call[3], "flags") & 0o1000
+    assert not (getattr(open_call[3], "flags") & 0o1000)
+    assert [call[0] for call in operations.calls].count("truncate") == 1
+
+
+@pytest.mark.parametrize(
+    ("identity", "label"),
+    (
+        (ObjectIdentity(8, 1001, 0o120777, 0, 0, 1), PARENT_IDENTITY.selinux_label),
+        (ObjectIdentity(8, 1001, 0o100600, 0, 0, 2), PARENT_IDENTITY.selinux_label),
+        (ObjectIdentity(8, 1001, 0o100600, 1000, 0, 1), PARENT_IDENTITY.selinux_label),
+        (ObjectIdentity(8, 1001, 0o100666, 0, 0, 1), PARENT_IDENTITY.selinux_label),
+        (ObjectIdentity(8, 1001, 0o100600, 0, 0, 1), "system_u:object_r:tmp_t:s0"),
+    ),
+    ids=("symlink", "hardlink", "owner", "mode", "label"),
+)
+def test_linux_terminal_rejects_invalid_identity_before_mutation(
+    identity: ObjectIdentity, label: str
+) -> None:
+    operations = FakeLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    original = b"original-claim-payload"
+    operations.files[claim_name] = original
+    operations.identities[claim_name] = identity
+    operations.labels[claim_name] = label
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.mark_terminal(claim_name, b"done")
+
+    assert raised.value.code is LinuxBrokerCode.IDENTITY_MISMATCH
+    assert operations.files[claim_name] == original
+    assert not any(
+        call[0] in {"truncate", "write_all", "renameat2_noreplace"}
+        for call in operations.calls
+    )
 
 
 def test_linux_terminal_retention_allows_limit_then_fails_without_mutation() -> None:
