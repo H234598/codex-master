@@ -46,11 +46,14 @@ def _agent(
 def test_codex_projection_preserves_artifact_api_and_profile_path() -> None:
     agent = _agent()
     class_name = "AGENTS.class-worker.md"
-    expected_primary = _COMMON_BYTES + (
-        "\n\n## Active class profile\n\n"
-        f"Read `./{class_name}` before acting. "
-        "Only that class profile is active in this home.\n"
-    ).encode()
+    expected_primary = (
+        _COMMON_BYTES
+        + (
+            "\n\n## Active class profile\n\n"
+            f"Read `./{class_name}` before acting. "
+            "Only that class profile is active in this home.\n"
+        ).encode()
+    )
     expected_artifacts = {
         "AGENTS.md": expected_primary,
         class_name: (_MARKDOWN_ROOT / "classes" / "worker.md").read_bytes(),
@@ -67,9 +70,9 @@ def test_codex_projection_preserves_artifact_api_and_profile_path() -> None:
 def test_gemini_projection_preserves_provider_paths() -> None:
     agent = _agent(RunnerKind.GEMINI_CLI)
     class_name = "AGENTS.class-worker.md"
-    expected_primary = _COMMON_BYTES + (
-        f"\n\n## Active class profile\n\n@./{class_name}\n"
-    ).encode()
+    expected_primary = (
+        _COMMON_BYTES + (f"\n\n## Active class profile\n\n@./{class_name}\n").encode()
+    )
     expected_artifacts = {
         ".gemini/GEMINI.md": expected_primary,
         f".gemini/{class_name}": (
@@ -87,9 +90,7 @@ def test_providers_share_exact_common_prefix_and_only_reference_class_body() -> 
     class_name = b"AGENTS.class-worker.md"
     worker_body = (_MARKDOWN_ROOT / "classes" / "worker.md").read_bytes()
     codex = fleet_markdown.fleet_markdown_projection(_agent())
-    gemini = fleet_markdown.fleet_markdown_projection(
-        _agent(RunnerKind.GEMINI_CLI)
-    )
+    gemini = fleet_markdown.fleet_markdown_projection(_agent(RunnerKind.GEMINI_CLI))
 
     for projection in (codex, gemini):
         primary = projection.artifacts[projection.metadata.provider_artifact_name]
@@ -118,9 +119,7 @@ def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
 def test_provider_projection_digests_are_deterministic_and_distinct() -> None:
     codex_first = fleet_markdown.fleet_markdown_projection(_agent())
     codex_second = fleet_markdown.fleet_markdown_projection(_agent())
-    gemini = fleet_markdown.fleet_markdown_projection(
-        _agent(RunnerKind.GEMINI_CLI)
-    )
+    gemini = fleet_markdown.fleet_markdown_projection(_agent(RunnerKind.GEMINI_CLI))
 
     assert codex_first.metadata == codex_second.metadata
     assert dict(codex_first.artifacts) == dict(codex_second.artifacts)
@@ -144,7 +143,8 @@ def test_canonical_header_remains_first_in_both_provider_artifacts() -> None:
 
 def test_both_provider_projections_carry_same_annotation_response_policy() -> None:
     contract = load_common_policy()
-    required_line = (
+    required_inline_link = "[(A)](<Antwortziel>#<Antwortueberschrift>)".encode("utf-8")
+    obsolete_line = (
         "Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: "
         "[[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]"
     ).encode("utf-8")
@@ -157,12 +157,15 @@ def test_both_provider_projections_carry_same_annotation_response_policy() -> No
     for projection in projections:
         primary = projection.artifacts[projection.metadata.provider_artifact_name]
         assert primary.startswith(contract.common_bytes)
-        assert required_line in primary
+        assert required_inline_link in primary
+        assert obsolete_line not in primary
         assert projection.metadata.common_digest == contract.common_digest
         assert projection.metadata.generation == contract.generation == 7
 
 
-def test_both_provider_projections_carry_corrected_annotation_heading_and_guards() -> None:
+def test_both_provider_projections_carry_corrected_annotation_heading_and_guards() -> (
+    None
+):
     contract = load_common_policy()
     required_fragments = [
         (
@@ -191,7 +194,9 @@ def test_both_provider_projections_carry_corrected_annotation_heading_and_guards
         assert projection.metadata.common_digest == contract.common_digest
 
 
-def test_both_provider_projections_carry_identical_inline_and_multi_source_guards() -> None:
+def test_both_provider_projections_carry_identical_inline_and_multi_source_guards() -> (
+    None
+):
     contract = load_common_policy()
     required_fragments = [
         (
@@ -203,9 +208,7 @@ def test_both_provider_projections_carry_identical_inline_and_multi_source_guard
             "konfliktierenden ID-Link enthält"
         ).encode("utf-8"),
         "Andernfalls gilt fail-closed: keine Dokumentmutation".encode("utf-8"),
-        "niemals automatisch abschneiden, entfernen oder normalisieren".encode(
-            "utf-8"
-        ),
+        "niemals automatisch abschneiden, entfernen oder normalisieren".encode("utf-8"),
         (
             "Die Antwortüberschrift hängt ausschließlich den aktuellen verlinkten "
             "Annotation-Identifier am Ende an"
@@ -283,8 +286,6 @@ def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> N
         for fragment in required_fragments:
             assert fragment in primary
         assert projection.metadata.generation == contract.generation == 7
-
-
 def test_both_provider_projections_carry_side_effect_free_external_plan_handoff():
     contract = load_common_policy()
     required_fragments = [
@@ -338,16 +339,17 @@ def test_both_provider_projections_carry_unencoded_local_file_link_contract() ->
 def test_invalid_profile_falls_back_only_to_generic_class_projection(
     profile: str,
 ) -> None:
-    projection = fleet_markdown.fleet_markdown_projection(
-        _agent(skill_profile=profile)
-    )
+    projection = fleet_markdown.fleet_markdown_projection(_agent(skill_profile=profile))
 
     assert projection.metadata.class_profile == "generic"
     assert projection.metadata.class_artifact_name == "AGENTS.class-generic.md"
-    assert projection.artifacts["AGENTS.class-generic.md"] == (
-        _MARKDOWN_ROOT / "classes" / "generic.md"
-    ).read_bytes()
-    assert projection.metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
+    assert (
+        projection.artifacts["AGENTS.class-generic.md"]
+        == (_MARKDOWN_ROOT / "classes" / "generic.md").read_bytes()
+    )
+    assert (
+        projection.metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
+    )
 
 
 def test_profile_normalization_and_known_class_body_are_preserved() -> None:
@@ -356,9 +358,10 @@ def test_profile_normalization_and_known_class_body_are_preserved() -> None:
     )
 
     assert projection.metadata.class_profile == "worker"
-    assert projection.artifacts["AGENTS.class-worker.md"] == (
-        _MARKDOWN_ROOT / "classes" / "worker.md"
-    ).read_bytes()
+    assert (
+        projection.artifacts["AGENTS.class-worker.md"]
+        == (_MARKDOWN_ROOT / "classes" / "worker.md").read_bytes()
+    )
 
 
 def test_unknown_valid_profile_keeps_path_and_uses_existing_placeholder() -> None:

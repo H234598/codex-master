@@ -92,8 +92,7 @@ def test_missing_policy_file_fails_closed(tmp_path: Path) -> None:
         policy_api.load_common_policy(tmp_path / "missing.md")
 
 
-def test_projects_same_common_bytes_into_distinct_complete_provider_artifacts(
-) -> None:
+def test_projects_same_common_bytes_into_distinct_complete_provider_artifacts() -> None:
     policy_api = load_policy_api()
     contract = policy_api.load_common_policy()
 
@@ -116,8 +115,12 @@ def test_projects_same_common_bytes_into_distinct_complete_provider_artifacts(
     assert projection.codex.artifact_bytes == expected_codex
     assert projection.gemini.artifact_bytes == expected_gemini
     assert projection.codex.artifact_bytes != projection.gemini.artifact_bytes
-    assert projection.codex.artifact_digest == hashlib.sha256(expected_codex).hexdigest()
-    assert projection.gemini.artifact_digest == hashlib.sha256(expected_gemini).hexdigest()
+    assert (
+        projection.codex.artifact_digest == hashlib.sha256(expected_codex).hexdigest()
+    )
+    assert (
+        projection.gemini.artifact_digest == hashlib.sha256(expected_gemini).hexdigest()
+    )
 
 
 @pytest.mark.parametrize("profile", ["", "../worker", "Worker", "worker.md", "a" * 65])
@@ -202,20 +205,27 @@ def test_common_policy_contains_bidirectional_annotation_response_contract() -> 
         "Markdown-Selbstlink",
         "sichtbare ID bleibt unverändert",
         "genau eine idempotente",
-        "konkrete Biene",
         "konkrete Antwortüberschrift",
         "Retry",
         "data-annotation-note",
         "data-annotation-id",
         "Antworten, Erklärungen, ADRs und Fragen",
+        "verlinkte Antwort auf eine Annotation steht direkt hinter der konkreten Annotation",
+        "Genau ein Leerzeichen zwischen Annotation und Link",
+        "Link vor nachfolgender Interpunktion oder weiterem Text",
+        "keine separate `Beantwortung der Frage ...`-Zeile",
+        "<Annotation> (A). Hier weiterer Text.",
+        "(A) ist nur der Rückverweis",
+        "vollständige Antwort bleibt als eigenes Kapitel am Dokumentende",
+        "Antwortkapitel behält den eindeutigen normalen Markdown-Link zur Quellannotation oder Quellüberschrift",
     ]
 
     for meaning in required_meanings:
         assert meaning in policy
+    assert "[(A)](<Antwortziel>#<Antwortueberschrift>)" in raw_policy
     assert (
         "Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: "
-        "[[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]"
-        in raw_policy
+        "[[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]" not in raw_policy
     )
 
 
@@ -238,7 +248,9 @@ def test_common_policy_requires_markdown_annotation_response_heading() -> None:
     assert "[[#<Annotation-ID>|<Annotation-ID>]]" not in raw_policy
 
 
-def test_common_policy_fails_closed_for_conflicting_inline_annotation_headings() -> None:
+def test_common_policy_fails_closed_for_conflicting_inline_annotation_headings() -> (
+    None
+):
     policy_api = load_policy_api()
     policy = " ".join(
         policy_api.load_common_policy().common_bytes.decode("utf-8").split()
@@ -293,7 +305,9 @@ def test_common_policy_fails_closed_for_unresolved_multi_source_headings() -> No
     assert obsolete_qualification not in raw_policy
 
 
-def test_common_policy_fails_closed_on_unresolved_or_conflicting_annotation_data() -> None:
+def test_common_policy_fails_closed_on_unresolved_or_conflicting_annotation_data() -> (
+    None
+):
     policy_api = load_policy_api()
     policy = " ".join(
         policy_api.load_common_policy().common_bytes.decode("utf-8").split()

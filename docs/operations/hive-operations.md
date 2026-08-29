@@ -170,12 +170,19 @@ Keep the exact annotation heading before the literal em dash `—`; keep the
 visible identifier exact and unchanged. The heading identifier is a normal
 Markdown link, never an Obsidian wikilink. Resolve its target uniquely to the
 referenced annotation section or heading before writing. Add exactly one
-idempotent backlink to the cited source section, using concrete values for the
-bee, answer target, and answer heading:
+idempotent backlink to the cited source section.
 
-```text
-Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: [[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]
-```
+The source section receives exactly one idempotent inline backlink. The linked
+answer to an annotation appears directly after the concrete
+annotation. It is visibly exactly `(A)`; for example:
+`<Annotation> (A). Hier weiterer Text.` The canonical Markdown form of the
+visible link is `[(A)](<Antwortziel>#<Antwortueberschrift>)`. Keep exactly one
+space between annotation and link, and put the link before following
+punctuation or additional text. There is no separate `Beantwortung der Frage ...`
+line. `(A)` is only the backlink; the complete answer remains its own
+chapter at the end of the document. The answer chapter retains the unique
+normal Markdown link to the source annotation/source heading and the
+`data-annotation-id`.
 
 Use an inline annotation's surrounding Markdown heading unchanged as the base
 of the answer heading only when it contains neither a terminal annotation

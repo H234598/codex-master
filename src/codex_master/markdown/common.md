@@ -139,12 +139,17 @@ oder dessen Überschrift zeigen. Antworten, Erklärungen, ADRs und Fragen
 bleiben jeweils eigene Kapitel am Dokumentende und werden nicht zu einem
 Sammelkapitel oder Inline-Text zusammengezogen.
 
-Der zitierte Annotation-Quellabschnitt erhält genau eine idempotente
-Bidirektionszeile in exakt diesem Format:
-`Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: [[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]`.
-`<Biene>` muss durch die konkrete Biene, `<Antwortziel>` durch das konkrete
-Antwortziel und `<Antwortüberschrift>` durch die konkrete Antwortüberschrift
-ersetzt werden.
+Der Quellabschnitt erhält dafür genau eine idempotente Inline-Verknüpfung. Die
+verlinkte Antwort auf eine Annotation steht direkt hinter der konkreten
+Annotation. Sichtbar besteht sie exakt aus `(A)`; Beispiel:
+`<Annotation> (A). Hier weiterer Text.` Die kanonische Markdown-Form des
+sichtbaren Links ist `[(A)](<Antwortziel>#<Antwortueberschrift>)`. Genau ein
+Leerzeichen zwischen Annotation und Link; Link vor nachfolgender
+Interpunktion oder weiterem Text. Es gibt keine separate
+`Beantwortung der Frage ...`-Zeile mehr. (A) ist nur der Rückverweis; die
+vollständige Antwort bleibt als eigenes Kapitel am Dokumentende. Das
+Antwortkapitel behält den eindeutigen normalen Markdown-Link zur Quellannotation
+oder Quellüberschrift und die `data-annotation-id`.
 
 Vor jeder Dokumentmutation sind Quellabschnitt, Source-Heading-Markdownziel,
 Annotation-ID, Antwortziel und Antwortüberschrift eindeutig aufzulösen. Jede
