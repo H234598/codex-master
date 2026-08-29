@@ -54,7 +54,7 @@ _RESERVED_OPERATION_IDS: set[str] = set()
 _RESERVED_OPERATION_IDS_LOCK = threading.Lock()
 _OPERATION_ARTIFACT_RE = re.compile(
     r"\.fleet-home-v2-cutover-(?P<operation>[0-9a-f]{48})-"
-    r"(?P<agent>[a-z][a-z0-9-]{0,63})\.(?P<kind>stage|backup|rollback-v2|cleanup|journal\.json|plan\.json)\Z"
+    r"(?P<agent>[a-z][a-z0-9-]{0,63})\.(?P<kind>stage|backup|rollback-v2|cleanup(?:\.grave(?:\.poison)?)?|journal\.json|plan\.json)\Z"
 )
 
 
@@ -373,14 +373,29 @@ class LocalFleetHomeV2Filesystem:
             raise FleetHomeV2CutoverError("fleet_home_v2_stage_invalid") from exc
 
     @staticmethod
-    def _renameat2(parent_fd: int, source: str, target: str, flags: int) -> None:
+    def _renameat2(
+        source_parent_fd: int,
+        source: str,
+        target_parent_fd: int,
+        target: str,
+        flags: int,
+    ) -> None:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = getattr(libc, "renameat2", None)
         if renameat2 is None:
             raise FleetHomeV2CutoverError("fleet_home_v2_exchange_unavailable")
         renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
         renameat2.restype = ctypes.c_int
-        if renameat2(parent_fd, os.fsencode(source), parent_fd, os.fsencode(target), flags) != 0:
+        if (
+            renameat2(
+                source_parent_fd,
+                os.fsencode(source),
+                target_parent_fd,
+                os.fsencode(target),
+                flags,
+            )
+            != 0
+        ):
             current_errno = ctypes.get_errno()
             if current_errno in {errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL}:
                 raise FleetHomeV2CutoverError("fleet_home_v2_exchange_unavailable")
@@ -389,10 +404,19 @@ class LocalFleetHomeV2Filesystem:
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
 
     def exchange_at(self, parent_fd: int, source: str, target: str) -> None:
-        self._renameat2(parent_fd, source, target, 2)  # RENAME_EXCHANGE
+        self._renameat2(parent_fd, source, parent_fd, target, 2)  # RENAME_EXCHANGE
 
     def rename_noreplace_at(self, parent_fd: int, source: str, target: str) -> None:
-        self._renameat2(parent_fd, source, target, 1)  # RENAME_NOREPLACE
+        self._renameat2(parent_fd, source, parent_fd, target, 1)  # RENAME_NOREPLACE
+
+    def rename_noreplace_between_at(
+        self,
+        source_parent_fd: int,
+        source: str,
+        target_parent_fd: int,
+        target: str,
+    ) -> None:
+        self._renameat2(source_parent_fd, source, target_parent_fd, target, 1)  # RENAME_NOREPLACE
 
     @staticmethod
     def unlink_at(parent_fd: int, name: str) -> None:
@@ -402,45 +426,112 @@ class LocalFleetHomeV2Filesystem:
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
 
     def remove_tree_at(
-        self, parent_fd: int, name: str, expected: _FilesystemIdentity
+        self,
+        parent_fd: int,
+        name: str,
+        expected: _FilesystemIdentity,
+        grave_name: str,
+        uid: int,
+        gid: int,
     ) -> None:
-        directory_fd = self._open_dir_at(parent_fd, name)
+        grave_fd = -1
         try:
-            if not self._same_object(self.parent_identity(directory_fd), expected):
+            if not self._lstat_absent(parent_fd, f"{grave_name}.poison"):
                 raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
-            self._remove_tree_contents(directory_fd)
+            if self._lstat_absent(parent_fd, grave_name):
+                self.checkpoint("after-stage-remove")
+                if not self._same_object(self.identity_at(parent_fd, name), expected):
+                    raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+                grave_fd = self.mkdir_private_at(parent_fd, grave_name, uid, gid)
+                self.fsync_directory(parent_fd)
+                self.rename_noreplace_between_at(parent_fd, name, grave_fd, "root")
+                if not self._same_object(self.identity_at(grave_fd, "root"), expected):
+                    raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+                self.fsync_directory(grave_fd)
+                self.fsync_directory(parent_fd)
+            else:
+                grave_fd = self._open_dir_at(parent_fd, grave_name)
+                if not self._private_directory(self.parent_identity(grave_fd), uid, gid):
+                    raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+
+            if not self._lstat_absent(grave_fd, "root"):
+                directory_fd = self._open_dir_at(grave_fd, "root")
+                try:
+                    if not self._same_object(self.parent_identity(directory_fd), expected):
+                        raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+                    self._remove_tree_contents(directory_fd, grave_name, uid, gid)
+                finally:
+                    os.close(directory_fd)
+                if not self._same_object(self.identity_at(grave_fd, "root"), expected):
+                    raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+                os.rmdir("root", dir_fd=grave_fd)
+                self.checkpoint("after-cleanup-rmdir")
+                self.fsync_directory(grave_fd)
+            try:
+                if os.listdir(grave_fd):
+                    raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+            except OSError as exc:
+                raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
+        except FleetHomeV2CutoverError:
+            if grave_fd >= 0:
+                self._mark_grave_poison(parent_fd, grave_name, uid, gid)
+            raise
+        except OSError as exc:
+            raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
         finally:
-            os.close(directory_fd)
-        self.checkpoint("after-stage-remove")
+            if grave_fd >= 0:
+                os.close(grave_fd)
         try:
-            if not self._same_object(self.identity_at(parent_fd, name), expected):
-                raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
-            os.rmdir(name, dir_fd=parent_fd)
+            os.rmdir(grave_name, dir_fd=parent_fd)
+            self.fsync_directory(parent_fd)
         except OSError as exc:
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
 
-    def _remove_tree_contents(self, directory_fd: int) -> None:
+    def _mark_grave_poison(self, parent_fd: int, grave_name: str, uid: int, gid: int) -> None:
+        poison_name = f"{grave_name}.poison"
+        if self._lstat_absent(parent_fd, poison_name):
+            poison_fd = self.mkdir_private_at(parent_fd, poison_name, uid, gid)
+            os.close(poison_fd)
+            self.fsync_directory(parent_fd)
+
+    def _remove_tree_contents(
+        self, directory_fd: int, grave_name: str, uid: int, gid: int
+    ) -> None:
         try:
             names = os.listdir(directory_fd)
         except OSError as exc:
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
-        for name in names:
-            self.checkpoint("during-stage-remove")
-            current = self.identity_at(directory_fd, name)
-            if stat.S_ISDIR(current.mode):
-                child_fd = self._open_dir_at(directory_fd, name)
-                try:
-                    self._remove_tree_contents(child_fd)
-                finally:
-                    os.close(child_fd)
-                try:
-                    os.rmdir(name, dir_fd=directory_fd)
-                except OSError as exc:
-                    raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
-            elif stat.S_ISREG(current.mode) and current.nlink == 1:
-                self.unlink_at(directory_fd, name)
-            else:
-                raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+        grab_name = f"{grave_name}.{secrets.token_hex(16)}"
+        grab_fd = self.mkdir_private_at(directory_fd, grab_name, uid, gid)
+        try:
+            for name in names:
+                self.checkpoint("during-stage-remove")
+                current = self.identity_at(directory_fd, name)
+                self.rename_noreplace_between_at(directory_fd, name, grab_fd, name)
+                if not self._same_object(self.identity_at(grab_fd, name), current):
+                    raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+                if stat.S_ISDIR(current.mode):
+                    child_fd = self._open_dir_at(grab_fd, name)
+                    try:
+                        if not self._same_object(self.parent_identity(child_fd), current):
+                            raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+                        self._remove_tree_contents(child_fd, grave_name, uid, gid)
+                    finally:
+                        os.close(child_fd)
+                    try:
+                        os.rmdir(name, dir_fd=grab_fd)
+                    except OSError as exc:
+                        raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
+                elif stat.S_ISREG(current.mode) and current.nlink == 1:
+                    self.unlink_at(grab_fd, name)
+                else:
+                    raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+        finally:
+            os.close(grab_fd)
+        try:
+            os.rmdir(grab_name, dir_fd=directory_fd)
+        except OSError as exc:
+            raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required") from exc
 
     @staticmethod
     def _same_object(current: _FilesystemIdentity, expected: _FilesystemIdentity) -> bool:
@@ -1054,6 +1145,15 @@ class FleetHomeV2CutoverService:
                     self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
                 return self._finish_pre_active_cleanup(parent_fd, plan, target, names, journal, v2_identity)
             if (
+                state == "cleanup-quarantined"
+                and home == target.home_identity
+                and stage is None
+                and backup is None
+                and archive is None
+                and cleanup is None
+            ):
+                return self._finish_pre_active_cleanup(parent_fd, plan, target, names, journal, v2_identity)
+            if (
                 state == "cleanup-retired"
                 and home == target.home_identity
                 and stage is None
@@ -1077,13 +1177,29 @@ class FleetHomeV2CutoverService:
         journal: dict[str, object],
         v2_identity: _FilesystemIdentity,
     ) -> FleetHomeV2Result:
-        cleanup = self._optional_identity(parent_fd, names["cleanup"])
-        if cleanup is None or not self._same_object(cleanup, v2_identity):
-            raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
         self._require_quiescent(target, target.home_identity)
-        self._filesystem.remove_tree_at(parent_fd, names["cleanup"], v2_identity)
+        cleanup = self._optional_identity(parent_fd, names["cleanup"])
+        grave = self._optional_identity(parent_fd, names["grave"])
+        if cleanup is None and grave is None:
+            if self._journal_state(journal) != "cleanup-quarantined":
+                raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+        elif cleanup is not None and not self._same_object(cleanup, v2_identity):
+            raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+        else:
+            self._filesystem.remove_tree_at(
+                parent_fd,
+                names["cleanup"],
+                v2_identity,
+                names["grave"],
+                target.authority.owner_uid,
+                target.authority.owner_gid,
+            )
         self._filesystem.fsync_directory(parent_fd)
-        if not self._filesystem._lstat_absent(parent_fd, names["cleanup"]):
+        if (
+            not self._filesystem._lstat_absent(parent_fd, names["cleanup"])
+            or not self._filesystem._lstat_absent(parent_fd, names["grave"])
+            or not self._filesystem._lstat_absent(parent_fd, f"{names['grave']}.poison")
+        ):
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
         journal = self._advance_journal(journal, "cleanup-retired", v2_identity)
         self._store_journal(parent_fd, names["journal"], journal, self._filesystem.identity_at(parent_fd, names["journal"]))
@@ -1519,6 +1635,7 @@ class FleetHomeV2CutoverService:
             "backup": f"{stem}.backup",
             "archive": f"{stem}.rollback-v2",
             "cleanup": f"{stem}.cleanup",
+            "grave": f"{stem}.cleanup.grave",
             "journal": f"{stem}.journal.json",
             "plan": f"{stem}.plan.json",
             "lock": f".fleet-home-v2-cutover-{target.authority.agent_id}.lock",
@@ -1833,7 +1950,7 @@ class FleetHomeV2CutoverService:
             home = self._optional_identity(parent_fd, target.authority.home.name)
             return home != target.home_identity or any(
                 self._optional_identity(parent_fd, names[key]) is not None
-                for key in ("stage", "backup", "archive", "cleanup")
+                for key in ("stage", "backup", "archive", "cleanup", "grave")
             )
         except FleetHomeV2CutoverError:
             return True

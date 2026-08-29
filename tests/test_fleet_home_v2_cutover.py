@@ -57,6 +57,54 @@ class CrashFilesystem(LocalFleetHomeV2Filesystem):
             raise Crash(point)
 
 
+class RootCleanupSwapFilesystem(LocalFleetHomeV2Filesystem):
+    def __init__(self) -> None:
+        self._armed = False
+        self.foreign_identity: tuple[int, int] | None = None
+        self.swapped = False
+
+    def checkpoint(self, point: str) -> None:
+        if point == "after-stage-remove":
+            self._armed = True
+
+    def identity_at(self, parent_fd: int, name: str):  # type: ignore[override]
+        identity = super().identity_at(parent_fd, name)
+        if self._armed and not self.swapped and name.endswith(".cleanup"):
+            os.rename(name, f"{name}.bound-old", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            foreign = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            self.foreign_identity = (foreign.st_dev, foreign.st_ino)
+            self.swapped = True
+        return identity
+
+
+class NestedCleanupSwapFilesystem(LocalFleetHomeV2Filesystem):
+    def __init__(self) -> None:
+        self._armed = False
+        self.swapped = False
+
+    def checkpoint(self, point: str) -> None:
+        if point == "during-stage-remove":
+            self._armed = True
+
+    def identity_at(self, parent_fd: int, name: str):  # type: ignore[override]
+        identity = super().identity_at(parent_fd, name)
+        if self._armed and not self.swapped and name == "GEMINI.md":
+            os.rename(name, f"{name}.bound-old", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            sentinel_fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                os.write(sentinel_fd, b"foreign")
+            finally:
+                os.close(sentinel_fd)
+            self.swapped = True
+        return identity
+
+
 class NestedFsyncCrashFilesystem(CrashFilesystem):
     def __init__(self) -> None:
         super().__init__("after-stage-fsync")
@@ -661,6 +709,7 @@ def test_red_nested_canonical_gemini_directories_are_exactly_attested(tmp_path: 
         "after-stage-quarantine",
         "during-stage-remove",
         "after-stage-remove",
+        "after-cleanup-rmdir",
         "after-cleanup-retired",
         "after-cleanup-journal-retired",
         "after-cleanup-lock-retired",
@@ -681,6 +730,70 @@ def test_red_cleanup_crash_after_quarantine_remains_resumable(tmp_path: Path, po
     resumed, _port = _service((authority,))
     assert resumed.recover(plan)[0].state == "failed-retryable"
     assert resumed.apply(plan)[0].state == "cutover-complete"
+
+
+def test_red_cleanup_root_swap_preserves_foreign_tree_and_operation_binding(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, "g1")
+    _v1_home(authority)
+    staging, _port = _service((authority,), filesystem=CrashFilesystem("after-stage-fsync"))
+    plan = staging.plan(("g1",))
+    with pytest.raises(Crash, match="after-stage-fsync"):
+        staging.apply(plan)
+
+    filesystem = RootCleanupSwapFilesystem()
+    recovery, _port = _service((authority,), filesystem=filesystem)
+
+    result = recovery.recover(plan)[0]
+
+    assert filesystem.swapped
+    assert (result.state, result.code) == (
+        "recovery-required",
+        "fleet_home_v2_recovery_required",
+    )
+    assert filesystem.foreign_identity is not None
+    assert any(
+        (path.lstat().st_dev, path.lstat().st_ino) == filesystem.foreign_identity
+        for path in tmp_path.rglob("*")
+    )
+    assert list(tmp_path.glob("*.journal.json"))
+    assert (tmp_path / ".fleet-home-v2-cutover-g1.lock").exists()
+    assert list(tmp_path.glob("*.cleanup.bound-old"))
+    assert recovery.recover(plan)[0].state == "recovery-required"
+    assert any(
+        (path.lstat().st_dev, path.lstat().st_ino) == filesystem.foreign_identity
+        for path in tmp_path.rglob("*")
+    )
+
+
+def test_red_cleanup_nested_swap_never_deletes_foreign_sentinel_or_retires_binding(
+    tmp_path: Path,
+) -> None:
+    authority = _authority(tmp_path, "g1")
+    _v1_home(authority)
+    staging, _port = _service((authority,), filesystem=CrashFilesystem("after-stage-fsync"))
+    plan = staging.plan(("g1",))
+    with pytest.raises(Crash, match="after-stage-fsync"):
+        staging.apply(plan)
+
+    filesystem = NestedCleanupSwapFilesystem()
+    recovery, _port = _service((authority,), filesystem=filesystem)
+
+    result = recovery.recover(plan)[0]
+
+    assert filesystem.swapped
+    assert (result.state, result.code) == (
+        "recovery-required",
+        "fleet_home_v2_recovery_required",
+    )
+    assert any(
+        path.is_file() and path.read_bytes() == b"foreign" for path in tmp_path.rglob("*")
+    )
+    assert list(tmp_path.glob("*.journal.json"))
+    assert (tmp_path / ".fleet-home-v2-cutover-g1.lock").exists()
+    assert recovery.recover(plan)[0].state == "recovery-required"
+    assert any(
+        path.is_file() and path.read_bytes() == b"foreign" for path in tmp_path.rglob("*")
+    )
 
 
 def test_red_rolled_back_retires_home_for_new_cutover(tmp_path: Path) -> None:
