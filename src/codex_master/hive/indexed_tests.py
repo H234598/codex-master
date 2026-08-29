@@ -322,10 +322,59 @@ class TestIndexV1:
         return "sha256:" + hashlib.sha256(self.canonical_bytes()).hexdigest()
 
 
+def combine_test_indexes(*indexes: TestIndexV1) -> TestIndexV1:
+    """Merge language adapters into one repository authority."""
+    if not indexes or any(not isinstance(index, TestIndexV1) for index in indexes):
+        raise TestIndexError("test.index_invalid")
+    repository_ids = {index.repository_id for index in indexes}
+    generations = {index.generation for index in indexes}
+    if len(repository_ids) != 1 or len(generations) != 1:
+        raise TestIndexError("test.index_invalid")
+    functions = sorted(
+        (item for index in indexes for item in index.functions),
+        key=lambda item: item.function_id,
+    )
+    tests = sorted(
+        (item for index in indexes for item in index.tests),
+        key=lambda item: item.test_id,
+    )
+    gates = sorted(
+        (item for index in indexes for item in index.gates),
+        key=lambda item: item.gate_id,
+    )
+
+    def digest_rows(rows: list[str]) -> str:
+        return "sha256:" + hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+
+    versions = sorted({index.indexer_version for index in indexes})
+    version_digest = hashlib.sha256("\n".join(versions).encode()).hexdigest()[:16]
+    return TestIndexV1.from_mapping(
+        {
+            "schema_version": 1,
+            "generation": indexes[0].generation,
+            "repository_id": indexes[0].repository_id,
+            "indexer_version": f"combined-v1-{version_digest}",
+            "source_root_digest": digest_rows(
+                [f"{item.function_id}:{item.source_digest}" for item in functions]
+            ),
+            "test_root_digest": digest_rows(
+                [f"{item.test_id}:{item.test_digest}:{item.assertion_digest}" for item in tests]
+            ),
+            "dependency_policy_digest": digest_rows(
+                sorted(index.dependency_policy_digest for index in indexes)
+            ),
+            "functions": [item.public() for item in functions],
+            "tests": [item.public() for item in tests],
+            "gates": [item.public() for item in gates],
+        }
+    )
+
+
 __all__ = [
     "FunctionEntryV1",
     "GateEntryV1",
     "TestEntryV1",
     "TestIndexError",
     "TestIndexV1",
+    "combine_test_indexes",
 ]
