@@ -191,6 +191,55 @@ def test_both_provider_projections_carry_corrected_annotation_heading_and_guards
         assert projection.metadata.common_digest == contract.common_digest
 
 
+def test_both_provider_projections_carry_identical_inline_and_multi_source_guards() -> None:
+    contract = load_common_policy()
+    required_fragments = [
+        (
+            "Eine Inline-Annotation verwendet die umgebende Markdown-Überschrift "
+            "nur dann unverändert als Basisteil der Antwortüberschrift"
+        ).encode("utf-8"),
+        (
+            "weder einen terminalen Annotation-Identifier noch einen "
+            "konfliktierenden ID-Link enthält"
+        ).encode("utf-8"),
+        "Andernfalls gilt fail-closed: keine Dokumentmutation".encode("utf-8"),
+        "niemals automatisch abschneiden, entfernen oder normalisieren".encode(
+            "utf-8"
+        ),
+        (
+            "Die Antwortüberschrift hängt ausschließlich den aktuellen verlinkten "
+            "Annotation-Identifier am Ende an"
+        ).encode("utf-8"),
+        (
+            "Bei mehreren Quellkapiteln sind vor jeder Mutation alle tatsächlich "
+            "referenzierten Quellüberschriften eindeutig aufzulösen"
+        ).encode("utf-8"),
+        (
+            "Der Antworttext enthält für jede tatsächlich referenzierte "
+            "Quellüberschrift genau einen normalen Markdown-Link"
+        ).encode("utf-8"),
+        (
+            "Jeder jeweilige Quellabschnitt enthält genau einen idempotenten "
+            "Rückverweis auf dieselbe Antwort"
+        ).encode("utf-8"),
+        (
+            "Fehlt, ist mehrdeutig oder konfliktierend eine Quelle, wird die "
+            "gesamte Mehrquellenmutation fail-closed blockiert"
+        ).encode("utf-8"),
+        "weder Antwortkapitel noch irgendein Rückverweis".encode("utf-8"),
+    ]
+
+    for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+        projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
+        primary = projection.artifacts[projection.metadata.provider_artifact_name]
+        normalized_primary = b" ".join(primary.split())
+
+        assert primary[: len(contract.common_bytes)] == contract.common_bytes
+        for fragment in required_fragments:
+            assert fragment in normalized_primary
+        assert projection.metadata.common_digest == contract.common_digest
+
+
 def test_both_provider_projections_carry_same_generation_five_policy_bytes() -> None:
     contract = load_common_policy()
 

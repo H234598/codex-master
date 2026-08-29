@@ -64,13 +64,18 @@ Jede direkte Antwort auf einen Dokumentabschnitt ist auch ohne Annotation
 Marker bidirektional zu verlinken. Die Antwort enthält genau einen eindeutig
 aufgelösten normalen Markdown-Link auf den primären Quellabschnitt oder seine
 Überschrift. Der Quellabschnitt enthält genau einen Rückverweis auf das
-konkrete Antwortziel und die konkrete Antwortüberschrift. Betrifft eine
-Antwort mehrere Quellkapitel, enthält ihr Antworttext zusätzlich normale
-Markdown-Links auf jede weitere eindeutig auflösbare Quellüberschrift, soweit
-möglich. Eine vorhandene Annotation-ID ist bei einer reinen Abschnittsantwort
-ein optionaler zusätzlicher Anker; sie ist dafür nicht erforderlich. Bei einer
-direkten Antwort auf eine Annotation bleibt die Annotation-ID dagegen
-erforderlich; zusätzlich gelten die nachfolgenden exakten Annotation-Regeln.
+konkrete Antwortziel und die konkrete Antwortüberschrift. Bei mehreren
+Quellkapiteln sind vor jeder Mutation alle tatsächlich referenzierten
+Quellüberschriften eindeutig aufzulösen. Der Antworttext enthält für jede
+tatsächlich referenzierte Quellüberschrift genau einen normalen Markdown-Link.
+Jeder jeweilige Quellabschnitt enthält genau einen idempotenten Rückverweis auf
+dieselbe Antwort. Fehlt, ist mehrdeutig oder konfliktierend eine Quelle, wird
+die gesamte Mehrquellenmutation fail-closed blockiert: weder Antwortkapitel
+noch irgendein Rückverweis schreiben. Eine vorhandene Annotation-ID ist bei
+einer reinen Abschnittsantwort ein optionaler zusätzlicher Anker; sie ist dafür
+nicht erforderlich. Bei einer direkten Antwort auf eine Annotation bleibt die
+Annotation-ID dagegen erforderlich; zusätzlich gelten die nachfolgenden
+exakten Annotation-Regeln.
 
 Vor jeder Dokumentmutation einer Abschnittsantwort sind Quelldokument,
 Quellabschnitt, Quellüberschrift, Source-Link-Ziel, Antwortziel und
@@ -87,9 +92,12 @@ Eine beantwortete Annotation erhält ein eigenes Kapitel am Dokumentende. Die
 Antwortüberschrift muss exakt dieser Markdown-Form folgen:
 `## <exakte Annotation-Überschrift ohne finale ID> — [<Annotation-ID>](<eindeutiger Link auf referenzierten Annotationsabschnitt oder dessen Überschrift>)`.
 Die exakte Annotation-Überschrift steht ohne finale ID vor dem em dash `—`.
-Eine Inline-Annotation erbt exakt die umgebende Markdown-Überschrift; diese
-geerbte Überschrift ist ohne Umbenennung oder Kürzung als exakte
-Annotation-Überschrift zu verwenden.
+Eine Inline-Annotation verwendet die umgebende Markdown-Überschrift nur dann
+unverändert als Basisteil der Antwortüberschrift, wenn sie weder einen
+terminalen Annotation-Identifier noch einen konfliktierenden ID-Link enthält.
+Andernfalls gilt fail-closed: keine Dokumentmutation; die Überschrift niemals
+automatisch abschneiden, entfernen oder normalisieren. Die Antwortüberschrift
+hängt ausschließlich den aktuellen verlinkten Annotation-Identifier am Ende an.
 Die erforderliche Markdown-Selbstlink-Syntax ist ein normaler Markdown-Link.
 Die sichtbare ID bleibt unverändert und exakt erhalten. Für den
 Heading-Identifier gilt: kein Wikilink für den Heading-Identifier. Ziel zuerst

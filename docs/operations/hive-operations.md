@@ -133,11 +133,15 @@ Every direct answer to a document section must be bidirectionally linked, even
 without an Annotation Marker. The answer contains exactly one uniquely
 resolved normal Markdown link to the primary source section or its heading.
 The source section contains exactly one backlink to the concrete answer target
-and answer heading. If an answer concerns multiple source chapters, its answer
-text additionally contains normal Markdown links to every further uniquely
-resolvable source heading, wherever possible. For a section-only answer, an
-existing Annotation ID is an optional additional anchor, not a prerequisite. A
-direct annotation answer still requires the Annotation ID.
+and answer heading. For multiple source chapters, uniquely resolve every
+actually referenced source heading before any mutation. The answer text
+contains exactly one normal Markdown link for every actually referenced source
+heading. Each respective source section contains exactly one idempotent
+backlink to the same answer. If a source is missing, ambiguous, or conflicting,
+the entire multi-source mutation is fail-closed: write neither answer chapter
+nor any backlink. For a section-only answer, an existing Annotation ID is an
+optional additional anchor, not a prerequisite. A direct annotation answer
+still requires the Annotation ID.
 
 Before mutating a section answer, uniquely resolve the source document, source
 section, source heading, source-link target, answer target, and answer heading.
@@ -173,9 +177,11 @@ bee, answer target, and answer heading:
 Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: [[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]
 ```
 
-An inline annotation inherits exactly its surrounding Markdown heading. Use
-that inherited heading unchanged and unshortened as the exact annotation
-heading before the em dash.
+Use an inline annotation's surrounding Markdown heading unchanged as the base
+of the answer heading only when it contains neither a terminal annotation
+identifier nor a conflicting ID link. Otherwise fail closed: do not mutate the
+document and never automatically trim, remove, or normalize the heading. The
+answer heading appends only the current linked annotation identifier at its end.
 
 Before any document mutation, resolve Quellabschnitt,
 Source-Heading-Markdownziel, Annotation-ID, Antwortziel, and

@@ -198,30 +198,59 @@ def test_common_policy_requires_markdown_annotation_response_heading() -> None:
     assert "[[#<Annotation-ID>|<Annotation-ID>]]" not in raw_policy
 
 
-def test_common_policy_inherits_the_exact_surrounding_heading_for_inline_annotations() -> None:
+def test_common_policy_fails_closed_for_conflicting_inline_annotation_headings() -> None:
     policy_api = load_policy_api()
     policy = " ".join(
         policy_api.load_common_policy().common_bytes.decode("utf-8").split()
     )
 
-    assert (
-        "Eine Inline-Annotation erbt exakt die umgebende Markdown-Überschrift"
-        in policy
-    )
+    required_meanings = [
+        (
+            "Eine Inline-Annotation verwendet die umgebende Markdown-Überschrift "
+            "nur dann unverändert als Basisteil der Antwortüberschrift"
+        ),
+        "weder einen terminalen Annotation-Identifier noch einen konfliktierenden ID-Link enthält",
+        "Andernfalls gilt fail-closed: keine Dokumentmutation",
+        "niemals automatisch abschneiden, entfernen oder normalisieren",
+        (
+            "Die Antwortüberschrift hängt ausschließlich den aktuellen verlinkten "
+            "Annotation-Identifier am Ende an"
+        ),
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy
 
 
-def test_common_policy_links_every_resolvable_additional_source_heading() -> None:
+def test_common_policy_fails_closed_for_unresolved_multi_source_headings() -> None:
     policy_api = load_policy_api()
-    policy = " ".join(
-        policy_api.load_common_policy().common_bytes.decode("utf-8").split()
-    )
+    raw_policy = policy_api.load_common_policy().common_bytes.decode("utf-8")
+    policy = " ".join(raw_policy.split())
 
-    assert (
-        "Betrifft eine Antwort mehrere Quellkapitel, enthält ihr Antworttext "
-        "zusätzlich normale Markdown-Links auf jede weitere eindeutig "
-        "auflösbare Quellüberschrift, soweit möglich"
-        in policy
-    )
+    required_meanings = [
+        (
+            "Bei mehreren Quellkapiteln sind vor jeder Mutation alle tatsächlich "
+            "referenzierten Quellüberschriften eindeutig aufzulösen"
+        ),
+        (
+            "Der Antworttext enthält für jede tatsächlich referenzierte "
+            "Quellüberschrift genau einen normalen Markdown-Link"
+        ),
+        (
+            "Jeder jeweilige Quellabschnitt enthält genau einen idempotenten "
+            "Rückverweis auf dieselbe Antwort"
+        ),
+        (
+            "Fehlt, ist mehrdeutig oder konfliktierend eine Quelle, wird die "
+            "gesamte Mehrquellenmutation fail-closed blockiert"
+        ),
+        "weder Antwortkapitel noch irgendein Rückverweis",
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy
+    obsolete_qualification = "soweit" + " möglich"
+    assert obsolete_qualification not in raw_policy
 
 
 def test_common_policy_fails_closed_on_unresolved_or_conflicting_annotation_data() -> None:
