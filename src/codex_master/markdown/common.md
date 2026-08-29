@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":1,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":2,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -14,6 +14,19 @@ Wo Parallelbetrieb unmöglich ist, sichtbaren Ausfall akzeptieren und aus
 kanonischem Profil, Policy, Credentials und ResumeCapsule neu bauen oder
 starten. Einmalige Migration ist erlaubt, bleibt aber kein Reader, Writer,
 Router, Fallback oder Kompatibilitätspfad.
+
+## Hive-wide test policy
+
+Jede produktive Funktion braucht mindestens einen eindeutig zugeordneten,
+ausführbaren Test. Bei parametrisierten Tests oder Testmatrizen muss jede
+Funktion einen eigenen Fall besitzen. Bloße indirekte Ausführung ohne eine den
+Funktionsvertrag prüfende Assertion reicht nicht.
+
+Beim Prüfen gilt: so wenig Tests wie möglich, so viele wie nötig. Zuerst den
+kleinstmöglichen gezielten Test für die Funktion ausführen. Danach nur um
+betroffene Grenz-, Integrations- und Regressionstests erweitern. Vorgeschriebene
+Voll- und Release-Gates bleiben verbindlich und werden einmal am passenden Gate
+ausgeführt.
 
 ## Obsidian Annotation Marker
 
