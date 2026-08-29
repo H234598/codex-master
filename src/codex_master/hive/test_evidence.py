@@ -99,6 +99,20 @@ class EvidenceReceiptV1:
     cooldown_class: str
     expires_monotonic_ns: int
 
+    @classmethod
+    def from_mapping(cls, value: object) -> EvidenceReceiptV1:
+        if not isinstance(value, dict) or set(value) != set(cls.__dataclass_fields__):
+            raise TestEvidenceError("test.evidence_corrupt")
+        converted = dict(value)
+        function_ids = converted.get("function_ids")
+        if not isinstance(function_ids, (list, tuple)):
+            raise TestEvidenceError("test.evidence_corrupt")
+        converted["function_ids"] = tuple(function_ids)
+        try:
+            return cls(**converted)
+        except TypeError:
+            raise TestEvidenceError("test.evidence_corrupt") from None
+
     def __post_init__(self) -> None:
         EvidenceContextV1(
             self.repository_id,
