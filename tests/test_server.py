@@ -41062,5 +41062,56 @@ def test_targetless_teamlead_agent_start_keeps_a1_b1_legacy_forbidden() -> None:
     routing.assert_not_called()
     assert control.calls == 0
 
+
+def test_fleet_home_v2_cutover_adapter_dispatches_injected_offline_core() -> None:
+    from codex_master.fleet_home_v2_cutover import FleetHomeV2CutoverError
+
+    class OfflineCore:
+        def plan(self, targets: tuple[str, ...], *, operation_id: str) -> tuple[str, tuple[str, ...], str]:
+            return ("plan", targets, operation_id)
+
+        def apply(self, plan: object) -> tuple[str, object]:
+            return ("apply", plan)
+
+        def verify(self, plan: object) -> tuple[str, object]:
+            return ("verify", plan)
+
+        def recover(self, plan: object) -> tuple[str, object]:
+            return ("recover", plan)
+
+        def rollback(self, plan: object) -> tuple[str, object]:
+            return ("rollback", plan)
+
+    core = OfflineCore()
+    plan = server_module.fleet_home_v2_cutover_operation(
+        operation="plan",
+        service=core,
+        target_ids=("g1",),
+        operation_id="server-adapter-20260829",
+    )
+
+    assert plan == ("plan", ("g1",), "server-adapter-20260829")
+    for operation in ("apply", "verify", "recover", "rollback"):
+        assert server_module.fleet_home_v2_cutover_operation(
+            operation=operation,
+            service=core,
+            plan=plan,
+        ) == (operation, plan)
+
+    class SafetyFailure:
+        def apply(self, _plan: object) -> object:
+            raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
+
+    try:
+        server_module.fleet_home_v2_cutover_operation(
+            operation="apply",
+            service=SafetyFailure(),
+            plan=plan,
+        )
+    except AgentError as exc:
+        assert str(exc) == "fleet_home_v2_recovery_required"
+    else:
+        raise AssertionError("cutover safety error must not be replaced")
+
 if __name__ == "__main__":
     unittest.main()

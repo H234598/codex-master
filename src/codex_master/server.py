@@ -42895,6 +42895,45 @@ def _recover_g_series_migration_for_authorized_caller(
         return _g_migration_recover_locked(service, pool_root, paths, journal)
 
 
+def fleet_home_v2_cutover_operation(
+    *,
+    operation: str,
+    service: Any,
+    target_ids: tuple[str, ...] | None = None,
+    operation_id: str | None = None,
+    plan: Any = None,
+) -> Any:
+    """Dispatch one injected, Queen-owned offline V2 cutover operation.
+
+    This adapter deliberately creates no filesystem, provider, runner, or
+    process port.  The caller must inject an already-authorized core service.
+    """
+
+    from codex_master.fleet_home_v2_cutover import FleetHomeV2CutoverError
+
+    try:
+        if operation == "plan":
+            if (
+                not isinstance(target_ids, tuple)
+                or not all(isinstance(target, str) for target in target_ids)
+                or not isinstance(operation_id, str)
+                or plan is not None
+            ):
+                raise AgentError("fleet_home_v2_cutover_failed")
+            return service.plan(target_ids, operation_id=operation_id)
+        if operation in {"apply", "verify", "recover", "rollback"}:
+            if plan is None or target_ids is not None or operation_id is not None:
+                raise AgentError("fleet_home_v2_cutover_failed")
+            return getattr(service, operation)(plan)
+    except FleetHomeV2CutoverError as exc:
+        raise AgentError(exc.code) from None
+    except AgentError:
+        raise
+    except Exception as exc:
+        raise AgentError("fleet_home_v2_cutover_failed") from exc
+    raise AgentError("fleet_home_v2_cutover_failed")
+
+
 def main() -> int:
     if len(sys.argv) > 1:
         return main_cli(sys.argv[1:])
