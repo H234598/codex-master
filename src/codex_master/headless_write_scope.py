@@ -12,6 +12,7 @@ import contextvars
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -31,8 +32,15 @@ MAX_RECORDS = 256
 MAX_RECORD_SCAN = MAX_RECORDS * 4
 MAX_DECLARED_PATH_BYTES = 32 * 1024
 ATTESTATION_TTL_SECONDS = 60 * 60
-ATTESTATION_SCHEMA_VERSION = 1
+ATTESTATION_SCHEMA_VERSION = 2
+MAX_HISTORY_REFLOG_ENTRIES = 128
+MAX_HISTORY_REFLOG_BYTES = 64 * 1024
+MAX_INDEX_EVIDENCE_ENTRIES = 8192
+MAX_INDEX_EVIDENCE_BYTES = 32 * 1024
+MAX_GIT_METADATA_BYTES = 64 * 1024
+MAX_GIT_METADATA_FILE_BYTES = 16 * 1024
 _ATTESTATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_GIT_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{40,64}$")
 _UNMERGED_PORCELAIN_STATES = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
 
 
@@ -51,16 +59,25 @@ class ScopeAttestation:
     attestation_id: str
     agent_id: str
     repository_root: Path
+    repository_device: int
+    repository_inode: int
     worktree_path: Path
     worktree_device: int
     worktree_inode: int
     common_git_dir: Path
+    common_git_device: int
+    common_git_inode: int
     branch: str | None
     detached: bool
     baseline_commit: str
     requested_base_ref: str | None
     creation_generation: str
     created_at_utc: str
+    history_reflog_count: int
+    history_reflog_digest: str
+    history_reflog_anchor: str
+    index_flags: tuple[tuple[str, str], ...]
+    git_metadata_digest: str
     lifecycle: str
     assignment_id: str | None = None
     provider_generation: int | str | None = None
@@ -73,6 +90,8 @@ class ScopeBinding:
     agent_id: str
     assignment_id: str
     repository_root: Path
+    repository_device: int
+    repository_inode: int
     worktree_path: Path
     baseline_commit: str
     provider_generation: int | str
@@ -80,11 +99,18 @@ class ScopeBinding:
     worktree_device: int
     worktree_inode: int
     common_git_dir: Path
+    common_git_device: int
+    common_git_inode: int
     branch: str | None
     detached: bool
     requested_base_ref: str | None
     creation_generation: str
     created_at_utc: str
+    history_reflog_count: int
+    history_reflog_digest: str
+    history_reflog_anchor: str
+    index_flags: tuple[tuple[str, str], ...]
+    git_metadata_digest: str
 
 
 @dataclass(frozen=True)
@@ -100,7 +126,11 @@ GitRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 def _default_git_runner(
-    args: list[str], *, cwd: Path, timeout: float = 30
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: float = 30,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
@@ -109,6 +139,7 @@ def _default_git_runner(
         text=True,
         check=False,
         timeout=timeout,
+        env=dict(env) if env is not None else None,
     )
 
 
@@ -186,21 +217,36 @@ class HeadlessWriteScopeStore:
                     "worktree HEAD does not equal the requested baseline",
                     "recreate the worktree from the requested baseline",
                 )
-        info = worktree.stat()
+        history_evidence = self._capture_history_evidence(
+            worktree, worktree_identity["head"]
+        )
+        index_flags = self._capture_index_flags(worktree)
+        git_metadata_digest = self._capture_git_metadata_digest(worktree)
+        repository_info = repository.lstat()
+        info = worktree.lstat()
         attestation = ScopeAttestation(
             attestation_id=secrets.token_hex(16),
             agent_id=agent_id,
             repository_root=repository,
+            repository_device=int(repository_info.st_dev),
+            repository_inode=int(repository_info.st_ino),
             worktree_path=worktree,
             worktree_device=int(info.st_dev),
             worktree_inode=int(info.st_ino),
             common_git_dir=worktree_identity["common"],
+            common_git_device=worktree_identity["common_device"],
+            common_git_inode=worktree_identity["common_inode"],
             branch=worktree_identity["branch"],
             detached=worktree_identity["branch"] is None,
             baseline_commit=worktree_identity["head"],
             requested_base_ref=base_ref,
             creation_generation=secrets.token_hex(16),
             created_at_utc=datetime.now(timezone.utc).isoformat(),
+            history_reflog_count=history_evidence["count"],
+            history_reflog_digest=history_evidence["digest"],
+            history_reflog_anchor=history_evidence["anchor"],
+            index_flags=index_flags,
+            git_metadata_digest=git_metadata_digest,
             lifecycle="available",
         )
         with self._locked():
@@ -269,6 +315,8 @@ class HeadlessWriteScopeStore:
             agent_id=updated.agent_id,
             assignment_id=assignment_id,
             repository_root=updated.repository_root,
+            repository_device=updated.repository_device,
+            repository_inode=updated.repository_inode,
             worktree_path=updated.worktree_path,
             baseline_commit=updated.baseline_commit,
             provider_generation=provider_generation,
@@ -276,11 +324,18 @@ class HeadlessWriteScopeStore:
             worktree_device=updated.worktree_device,
             worktree_inode=updated.worktree_inode,
             common_git_dir=updated.common_git_dir,
+            common_git_device=updated.common_git_device,
+            common_git_inode=updated.common_git_inode,
             branch=updated.branch,
             detached=updated.detached,
             requested_base_ref=updated.requested_base_ref,
             creation_generation=updated.creation_generation,
             created_at_utc=updated.created_at_utc,
+            history_reflog_count=updated.history_reflog_count,
+            history_reflog_digest=updated.history_reflog_digest,
+            history_reflog_anchor=updated.history_reflog_anchor,
+            index_flags=updated.index_flags,
+            git_metadata_digest=updated.git_metadata_digest,
         )
 
     def revalidate(
@@ -469,8 +524,12 @@ class HeadlessWriteScopeStore:
             ) from exc
 
     def _ensure_state_dir(self) -> None:
+        created = False
         try:
-            self.state_root.mkdir(parents=True, exist_ok=True)
+            self.state_root.mkdir(parents=True, exist_ok=False)
+            created = True
+        except FileExistsError:
+            pass
         except OSError as exc:
             raise self._failure(
                 "headless_attestation_invalid",
@@ -497,7 +556,8 @@ class HeadlessWriteScopeStore:
                 break
             current = current.parent
         try:
-            os.chmod(self.state_root, 0o700)
+            if created:
+                os.chmod(self.state_root, 0o700)
             info = self.state_root.lstat()
         except OSError as exc:
             raise self._failure(
@@ -834,16 +894,25 @@ class HeadlessWriteScopeStore:
             "attestation_id": attestation.attestation_id,
             "agent_id": attestation.agent_id,
             "repository_root": str(attestation.repository_root),
+            "repository_device": attestation.repository_device,
+            "repository_inode": attestation.repository_inode,
             "worktree_path": str(attestation.worktree_path),
             "worktree_device": attestation.worktree_device,
             "worktree_inode": attestation.worktree_inode,
             "common_git_dir": str(attestation.common_git_dir),
+            "common_git_device": attestation.common_git_device,
+            "common_git_inode": attestation.common_git_inode,
             "branch": attestation.branch,
             "detached": attestation.detached,
             "baseline_commit": attestation.baseline_commit,
             "requested_base_ref": attestation.requested_base_ref,
             "creation_generation": attestation.creation_generation,
             "created_at_utc": attestation.created_at_utc,
+            "history_reflog_count": attestation.history_reflog_count,
+            "history_reflog_digest": attestation.history_reflog_digest,
+            "history_reflog_anchor": attestation.history_reflog_anchor,
+            "index_flags": [list(item) for item in attestation.index_flags],
+            "git_metadata_digest": attestation.git_metadata_digest,
             "lifecycle": attestation.lifecycle,
             "assignment_id": attestation.assignment_id,
             "provider_generation": attestation.provider_generation,
@@ -888,6 +957,8 @@ class HeadlessWriteScopeStore:
             common_git_dir = Path(record["common_git_dir"])
             if not repository_root.is_absolute() or not worktree_path.is_absolute() or not common_git_dir.is_absolute():
                 raise ValueError
+            repository_device = self._require_device(record["repository_device"])
+            repository_inode = self._require_inode(record["repository_inode"])
             worktree_device = record["worktree_device"]
             worktree_inode = record["worktree_inode"]
             if (
@@ -897,6 +968,8 @@ class HeadlessWriteScopeStore:
                 or worktree_inode <= 0
             ):
                 raise ValueError
+            common_git_device = self._require_device(record["common_git_device"])
+            common_git_inode = self._require_inode(record["common_git_inode"])
             detached = record["detached"]
             if type(detached) is not bool:
                 raise ValueError
@@ -922,20 +995,82 @@ class HeadlessWriteScopeStore:
                     char.isspace() for char in requested_base_ref
                 ) or "\x00" in requested_base_ref:
                     raise ValueError
+            history_reflog_count = record["history_reflog_count"]
+            if (
+                type(history_reflog_count) is not int
+                or history_reflog_count < 1
+                or history_reflog_count > MAX_HISTORY_REFLOG_ENTRIES
+            ):
+                raise ValueError
+            history_reflog_digest = record["history_reflog_digest"]
+            if (
+                not isinstance(history_reflog_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", history_reflog_digest) is None
+            ):
+                raise ValueError
+            history_reflog_anchor = self._require_text(
+                record["history_reflog_anchor"],
+                "history_reflog_anchor",
+                MAX_HISTORY_REFLOG_BYTES,
+            )
+            index_flags_raw = record["index_flags"]
+            if not isinstance(index_flags_raw, list):
+                raise ValueError
+            index_flags: list[tuple[str, str]] = []
+            seen_index_paths: set[str] = set()
+            serialized_index_size = 0
+            for item in index_flags_raw:
+                if (
+                    not isinstance(item, list)
+                    or len(item) != 2
+                    or not isinstance(item[0], str)
+                    or not isinstance(item[1], str)
+                    or len(item[1]) != 1
+                ):
+                    raise ValueError
+                index_path = self._require_text(item[0], "index path", MAX_PATH_CHARS)
+                if (
+                    index_path.startswith("/")
+                    or any(part in {"", ".", ".."} for part in index_path.split("/"))
+                    or index_path in seen_index_paths
+                ):
+                    raise ValueError
+                seen_index_paths.add(index_path)
+                serialized_index_size += len(index_path.encode("utf-8")) + 2
+                if serialized_index_size > MAX_INDEX_EVIDENCE_BYTES:
+                    raise ValueError
+                index_flags.append((index_path, item[1]))
+            if len(index_flags) > MAX_INDEX_EVIDENCE_ENTRIES:
+                raise ValueError
+            git_metadata_digest = record["git_metadata_digest"]
+            if (
+                not isinstance(git_metadata_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", git_metadata_digest) is None
+            ):
+                raise ValueError
             return ScopeAttestation(
                 attestation_id=attestation_id,
                 agent_id=agent_id,
                 repository_root=repository_root,
+                repository_device=repository_device,
+                repository_inode=repository_inode,
                 worktree_path=worktree_path,
                 worktree_device=worktree_device,
                 worktree_inode=worktree_inode,
                 common_git_dir=common_git_dir,
+                common_git_device=common_git_device,
+                common_git_inode=common_git_inode,
                 branch=branch,
                 detached=detached,
                 baseline_commit=self._require_text(record["baseline_commit"], "baseline_commit", 200),
                 requested_base_ref=requested_base_ref,
                 creation_generation=self._require_text(record["creation_generation"], "creation_generation", 100),
                 created_at_utc=self._require_text(record["created_at_utc"], "created_at_utc", 100),
+                history_reflog_count=history_reflog_count,
+                history_reflog_digest=history_reflog_digest,
+                history_reflog_anchor=history_reflog_anchor,
+                index_flags=tuple(index_flags),
+                git_metadata_digest=git_metadata_digest,
                 lifecycle=lifecycle,
                 assignment_id=assignment_id,
                 provider_generation=provider_generation,
@@ -955,6 +1090,14 @@ class HeadlessWriteScopeStore:
         if not common_path.is_absolute():
             common_path = cwd / common_path
         common = self._real_directory(common_path)
+        try:
+            common_info = common.lstat()
+        except OSError as exc:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git common directory identity could not be verified",
+                "recreate the worktree through Masterjet",
+            ) from exc
         head = self._git_output(cwd, ["rev-parse", "--verify", "HEAD^{commit}"])
         branch_result = self._git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd)
         branch: str | None
@@ -975,7 +1118,15 @@ class HeadlessWriteScopeStore:
                 "recreate the worktree through Masterjet",
             )
         status = self._git_status(cwd)
-        return {"top": top, "common": common, "head": head, "branch": branch, "status": status}
+        return {
+            "top": top,
+            "common": common,
+            "common_device": int(common_info.st_dev),
+            "common_inode": int(common_info.st_ino),
+            "head": head,
+            "branch": branch,
+            "status": status,
+        }
 
     def _git_status(self, cwd: Path) -> list[str]:
         output = self._git_output(
@@ -1045,15 +1196,53 @@ class HeadlessWriteScopeStore:
         return output.strip() if strip_output else output
 
     def _git(self, args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        for name in (
+            "GIT_CONFIG",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_GRAFT_FILE",
+            "GIT_SHALLOW_FILE",
+        ):
+            environment.pop(name, None)
+        environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_NOGLOBAL": "1",
+                "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                "GIT_CONFIG_VALUE_0": "false",
+                "GIT_CONFIG_KEY_1": "core.untrackedCache",
+                "GIT_CONFIG_VALUE_1": "false",
+            }
+        )
         try:
-            result = self.git_runner(["git", *args], cwd=cwd, timeout=30)
+            result = self.git_runner(
+                ["git", *args], cwd=cwd, timeout=30, env=environment
+            )
         except Exception as exc:
             raise self._failure(
                 "headless_write_attribution_unverified",
                 "Git verification could not be executed",
                 "repair the worktree Git state before retrying",
             ) from exc
-        if not isinstance(getattr(result, "returncode", None), int):
+        if not isinstance(getattr(result, "returncode", None), int) or isinstance(
+            result.returncode, bool
+        ):
             raise self._failure(
                 "headless_write_attribution_unverified",
                 "Git verification returned malformed process data",
@@ -1074,10 +1263,34 @@ class HeadlessWriteScopeStore:
         self._verify_worktree_identity(attestation)
 
     def _verify_repository_identity(self, attestation: ScopeAttestation) -> None:
+        try:
+            self._real_directory(attestation.repository_root.parent)
+            repository_info = attestation.repository_root.lstat()
+        except HeadlessWriteScopeFailure:
+            raise
+        except OSError as exc:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "repository filesystem identity could not be verified",
+                "create a fresh Masterjet worktree attestation",
+            ) from exc
+        if (
+            stat.S_ISLNK(repository_info.st_mode)
+            or not stat.S_ISDIR(repository_info.st_mode)
+            or repository_info.st_dev != attestation.repository_device
+            or repository_info.st_ino != attestation.repository_inode
+        ):
+            raise self._failure(
+                "headless_attestation_invalid",
+                "repository filesystem identity does not match the attestation",
+                "create a fresh Masterjet worktree attestation",
+            )
         repository_identity = self._git_identity(attestation.repository_root)
         if (
             repository_identity["top"] != attestation.repository_root
             or repository_identity["common"] != attestation.common_git_dir
+            or repository_identity["common_device"] != attestation.common_git_device
+            or repository_identity["common_inode"] != attestation.common_git_inode
         ):
             raise self._failure(
                 "headless_attestation_invalid",
@@ -1098,6 +1311,8 @@ class HeadlessWriteScopeStore:
             or binding.agent_id != attestation.agent_id
             or binding.assignment_id != attestation.assignment_id
             or binding.repository_root != attestation.repository_root
+            or binding.repository_device != attestation.repository_device
+            or binding.repository_inode != attestation.repository_inode
             or binding.worktree_path != attestation.worktree_path
             or binding.baseline_commit != attestation.baseline_commit
             or binding.provider_generation != attestation.provider_generation
@@ -1105,11 +1320,18 @@ class HeadlessWriteScopeStore:
             or binding.worktree_device != attestation.worktree_device
             or binding.worktree_inode != attestation.worktree_inode
             or binding.common_git_dir != attestation.common_git_dir
+            or binding.common_git_device != attestation.common_git_device
+            or binding.common_git_inode != attestation.common_git_inode
             or binding.branch != attestation.branch
             or binding.detached != attestation.detached
             or binding.requested_base_ref != attestation.requested_base_ref
             or binding.creation_generation != attestation.creation_generation
             or binding.created_at_utc != attestation.created_at_utc
+            or binding.history_reflog_count != attestation.history_reflog_count
+            or binding.history_reflog_digest != attestation.history_reflog_digest
+            or binding.history_reflog_anchor != attestation.history_reflog_anchor
+            or binding.index_flags != attestation.index_flags
+            or binding.git_metadata_digest != attestation.git_metadata_digest
             or (repository is not None and repository != attestation.repository_root)
         ):
             raise self._failure(
@@ -1126,7 +1348,8 @@ class HeadlessWriteScopeStore:
         self, attestation: ScopeAttestation, *, allow_descendant: bool = False
     ) -> dict[str, Any]:
         try:
-            info = attestation.worktree_path.stat()
+            self._real_directory(attestation.worktree_path.parent)
+            info = attestation.worktree_path.lstat()
         except OSError:
             raise self._failure(
                 "headless_attestation_invalid",
@@ -1147,6 +1370,8 @@ class HeadlessWriteScopeStore:
         if (
             current["top"] != attestation.worktree_path
             or current["common"] != attestation.common_git_dir
+            or current["common_device"] != attestation.common_git_device
+            or current["common_inode"] != attestation.common_git_inode
             or current["branch"] != attestation.branch
             or (current["branch"] is None) != attestation.detached
         ):
@@ -1155,6 +1380,12 @@ class HeadlessWriteScopeStore:
                 "attested Git identity changed",
                 "create a fresh Masterjet worktree attestation",
             )
+        self._verify_git_metadata(attestation)
+        self._verify_index_flags(attestation, allow_descendant=allow_descendant)
+        self._verify_history_evidence(
+            attestation,
+            current["head"],
+        )
         if not allow_descendant and current["head"] != attestation.baseline_commit:
             raise self._failure(
                 "headless_attestation_invalid",
@@ -1168,6 +1399,510 @@ class HeadlessWriteScopeStore:
                 current["head"],
             )
         return current
+
+    def _capture_history_evidence(self, cwd: Path, head: str) -> dict[str, Any]:
+        self._verify_history_overrides(cwd)
+        entries = self._git_reflog_entries(cwd)
+        if not entries or entries[0][0] != head:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git HEAD reflog evidence is missing or does not match HEAD",
+                "enable a local HEAD reflog and recreate the worktree attestation",
+            )
+        serialized = tuple(self._serialize_reflog_entry(entry) for entry in entries)
+        digest = hashlib.sha256("\n".join(serialized).encode("utf-8")).hexdigest()
+        return {
+            "count": len(serialized),
+            "digest": digest,
+            "anchor": serialized[0],
+        }
+
+    def _capture_index_flags(self, cwd: Path) -> tuple[tuple[str, str], ...]:
+        output = self._git_output(
+            cwd,
+            ["ls-files", "-v", "-z"],
+            max_bytes=MAX_GIT_OUTPUT_BYTES,
+            strip_output=False,
+        )
+        entries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        serialized_size = 0
+        for raw_entry in output.split("\x00"):
+            if not raw_entry:
+                continue
+            if len(raw_entry) < 3 or raw_entry[1] != " ":
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git index flag output is malformed",
+                    "repair the worktree Git index before retrying",
+                )
+            flag = raw_entry[0]
+            path = raw_entry[2:]
+            if (
+                not path
+                or path.startswith("/")
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                or path in seen
+            ):
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git index contains an ambiguous path",
+                    "repair the worktree Git index before retrying",
+                )
+            if flag != "H":
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git index uses a flag that can hide tracked changes",
+                    "clear assume-unchanged or skip-worktree flags before retrying",
+                )
+            seen.add(path)
+            serialized_size += len(path.encode("utf-8")) + 2
+            if (
+                len(entries) >= MAX_INDEX_EVIDENCE_ENTRIES
+                or serialized_size > MAX_INDEX_EVIDENCE_BYTES
+            ):
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git index flag evidence exceeds its bound",
+                    "use a smaller bounded worktree index before retrying",
+                )
+            entries.append((path, flag))
+        return tuple(entries)
+
+    def _verify_index_flags(
+        self, attestation: ScopeAttestation, *, allow_descendant: bool = False
+    ) -> None:
+        current = dict(self._capture_index_flags(attestation.worktree_path))
+        expected = dict(attestation.index_flags)
+        if not allow_descendant and current == expected:
+            return
+        if not allow_descendant or set(expected) != self._git_tree_paths(
+            attestation.worktree_path, attestation.baseline_commit
+        ):
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git index flag state changed after binding",
+                "restore the bound Git index flags and retry",
+            )
+        if any(
+            path in current and current[path] != flag
+            for path, flag in expected.items()
+        ):
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git index flag state changed after binding",
+                "restore the bound Git index flags and retry",
+            )
+
+    def _git_tree_paths(self, cwd: Path, commit: str) -> set[str]:
+        output = self._git_output(
+            cwd,
+            ["ls-tree", "-r", "-z", "--name-only", commit],
+            max_bytes=MAX_GIT_OUTPUT_BYTES,
+            strip_output=False,
+        )
+        paths: set[str] = set()
+        for path in output.split("\x00"):
+            if not path:
+                continue
+            if (
+                path.startswith("/")
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                or path in paths
+            ):
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git baseline tree contains an ambiguous path",
+                    "repair the attested Git baseline before retrying",
+                )
+            paths.add(path)
+            if len(paths) > MAX_INDEX_EVIDENCE_ENTRIES:
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git baseline tree exceeds its bounded index evidence",
+                    "use a smaller bounded worktree before retrying",
+                )
+        return paths
+
+    def _capture_git_metadata_digest(self, cwd: Path) -> str:
+        git_dir = self._real_directory(
+            self._git_path_output(cwd, ["rev-parse", "--git-dir"])
+        )
+        common_dir = self._real_directory(
+            self._git_path_output(cwd, ["rev-parse", "--git-common-dir"])
+        )
+        self._reject_local_config_includes(cwd)
+        fixed_files = (
+            ("gitdir/config", git_dir / "config"),
+            ("common/config", common_dir / "config"),
+            ("gitdir/config.worktree", git_dir / "config.worktree"),
+            ("common/config.worktree", common_dir / "config.worktree"),
+            ("gitdir/info/exclude", git_dir / "info" / "exclude"),
+            ("common/info/exclude", common_dir / "info" / "exclude"),
+            (
+                "gitdir/info/sparse-checkout",
+                git_dir / "info" / "sparse-checkout",
+            ),
+            (
+                "common/info/sparse-checkout",
+                common_dir / "info" / "sparse-checkout",
+            ),
+            ("gitdir/info/attributes", git_dir / "info" / "attributes"),
+            ("common/info/attributes", common_dir / "info" / "attributes"),
+        )
+        tokens: list[str] = []
+        total_bytes = 0
+        seen: set[Path] = set()
+        for label, path in fixed_files:
+            path = Path(os.path.abspath(path))
+            if path in seen:
+                continue
+            seen.add(path)
+            token, size = self._git_metadata_token(label, path)
+            total_bytes += size
+            if total_bytes > MAX_GIT_METADATA_BYTES:
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git metadata evidence exceeds its bound",
+                    "use bounded Git metadata before retrying",
+                )
+            tokens.append(token)
+        external_excludes = self._configured_external_excludes_file(cwd)
+        if external_excludes is not None and external_excludes not in seen:
+            token, size = self._git_metadata_token(
+                "external/core.excludesFile", external_excludes
+            )
+            total_bytes += size
+            if total_bytes > MAX_GIT_METADATA_BYTES:
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git metadata evidence exceeds its bound",
+                    "use bounded Git metadata before retrying",
+                )
+            tokens.append(token)
+        return hashlib.sha256("\n".join(tokens).encode("utf-8")).hexdigest()
+
+    def _reject_local_config_includes(self, cwd: Path) -> None:
+        result = self._git(
+            ["config", "--local", "--includes", "--get-regexp", "^include"],
+            cwd,
+        )
+        if result.returncode == 1:
+            return
+        if result.returncode != 0:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git local include configuration could not be verified",
+                "remove local Git include directives before retrying",
+            )
+        if self._bounded_output(
+            result.stdout, "Git local include configuration", max_bytes=4096
+        ).strip():
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git local include configuration can alter attribution",
+                "remove local Git include directives before retrying",
+            )
+
+    def _configured_external_excludes_file(self, cwd: Path) -> Path | None:
+        result = self._git(
+            ["config", "--local", "--get", "core.excludesFile"], cwd
+        )
+        if result.returncode == 1:
+            return None
+        if result.returncode != 0:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git excludes configuration could not be verified",
+                "repair the worktree Git configuration before retrying",
+            )
+        value = self._bounded_output(
+            result.stdout, "Git excludes configuration", max_bytes=MAX_PATH_CHARS
+        ).strip()
+        if not value or "\x00" in value or "\n" in value or "\r" in value:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git excludes configuration is malformed",
+                "repair the worktree Git configuration before retrying",
+            )
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = cwd / path
+        path = Path(os.path.abspath(path))
+        self._verify_metadata_parent_chain(path.parent)
+        return path
+
+    def _git_path_output(self, cwd: Path, args: list[str]) -> Path:
+        path = Path(self._git_output(cwd, args))
+        if not path.is_absolute():
+            path = cwd / path
+        return Path(os.path.abspath(path))
+
+    def _git_metadata_token(self, label: str, path: Path) -> tuple[str, int]:
+        self._verify_metadata_parent_chain(path.parent)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return f"{label}\0missing", len(label) + 8
+        except OSError as exc:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git metadata could not be inspected",
+                "repair the worktree Git metadata before retrying",
+            ) from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_size > MAX_GIT_METADATA_FILE_BYTES
+            or info.st_nlink != 1
+        ):
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git attribution metadata is not a bounded regular file",
+                "repair the worktree Git metadata before retrying",
+            )
+        fd = -1
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            opened = os.fstat(fd)
+            if (
+                opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino
+                or opened.st_uid != info.st_uid
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != stat.S_IMODE(info.st_mode)
+            ):
+                raise OSError("Git metadata changed while opening")
+            data = os.read(fd, MAX_GIT_METADATA_FILE_BYTES + 1)
+        except OSError as exc:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git metadata could not be read safely",
+                "repair the worktree Git metadata before retrying",
+            ) from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if len(data) > MAX_GIT_METADATA_FILE_BYTES:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git metadata evidence exceeds its bound",
+                "use bounded Git metadata before retrying",
+            )
+        digest = hashlib.sha256(data).hexdigest()
+        token = f"{label}\0{stat.S_IMODE(info.st_mode):o}\0{info.st_uid}\0{digest}"
+        return token, len(data) + len(token)
+
+    def _verify_metadata_parent_chain(self, path: Path) -> None:
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git metadata parent could not be inspected",
+                    "repair the worktree Git metadata before retrying",
+                ) from exc
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git metadata parent is not a real directory",
+                    "repair the worktree Git metadata before retrying",
+                )
+
+    def _verify_git_metadata(self, attestation: ScopeAttestation) -> None:
+        if re.fullmatch(r"[0-9a-f]{64}", attestation.git_metadata_digest) is None:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "persisted Git metadata evidence is malformed",
+                "create a fresh Masterjet worktree attestation",
+            )
+        if self._capture_git_metadata_digest(attestation.worktree_path) != (
+            attestation.git_metadata_digest
+        ):
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git attribution metadata changed after binding",
+                "restore the bound Git metadata and retry",
+            )
+
+    def _verify_history_evidence(
+        self, attestation: ScopeAttestation, current_head: str
+    ) -> None:
+        if (
+            type(attestation.history_reflog_count) is not int
+            or not 1 <= attestation.history_reflog_count <= MAX_HISTORY_REFLOG_ENTRIES
+            or re.fullmatch(r"[0-9a-f]{64}", attestation.history_reflog_digest)
+            is None
+            or not isinstance(attestation.history_reflog_anchor, str)
+        ):
+            raise self._failure(
+                "headless_attestation_invalid",
+                "persisted Git history evidence is malformed",
+                "create a fresh Masterjet worktree attestation",
+            )
+        self._verify_history_overrides(attestation.worktree_path)
+        entries = self._git_reflog_entries(attestation.worktree_path)
+        serialized = tuple(self._serialize_reflog_entry(entry) for entry in entries)
+        if not serialized or serialized[0].split("\x00", 1)[0] != current_head:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git HEAD reflog no longer matches the attested HEAD",
+                "restore the attested Git history and retry",
+            )
+        count = attestation.history_reflog_count
+        matching_offsets = [
+            offset
+            for offset, entry in enumerate(serialized)
+            if entry == attestation.history_reflog_anchor
+            and offset + count <= len(serialized)
+            and hashlib.sha256(
+                "\n".join(serialized[offset : offset + count]).encode("utf-8")
+            ).hexdigest()
+            == attestation.history_reflog_digest
+        ]
+        if len(matching_offsets) != 1:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git HEAD reflog evidence is missing, shortened, or replaced",
+                "restore the attested reflog history and retry",
+            )
+        binding_offset = matching_offsets[0]
+        for index in range(binding_offset):
+            old_head = serialized[index + 1].split("\x00", 1)[0]
+            new_head = serialized[index].split("\x00", 1)[0]
+            if old_head == new_head or not self._is_ancestor(
+                attestation.worktree_path, old_head, new_head
+            ):
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git history after binding is not an append-only descendant sequence",
+                    "restore append-only Git history from the attested baseline and retry",
+                )
+
+    def _git_reflog_entries(
+        self, cwd: Path
+    ) -> tuple[tuple[str, str], ...]:
+        output = self._git_output(
+            cwd,
+            [
+                "reflog",
+                "show",
+                "--format=%H%x00%gs",
+                f"--max-count={MAX_HISTORY_REFLOG_ENTRIES + 1}",
+                "HEAD",
+            ],
+            max_bytes=MAX_HISTORY_REFLOG_BYTES,
+            strip_output=False,
+        )
+        raw_entries = output.splitlines()
+        if not raw_entries or len(raw_entries) > MAX_HISTORY_REFLOG_ENTRIES:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git HEAD reflog evidence is missing or exceeds its bound",
+                "recreate the worktree with a bounded local HEAD reflog",
+            )
+        entries: list[tuple[str, str]] = []
+        serialized_size = 0
+        for raw_entry in raw_entries:
+            fields = raw_entry.split("\x00")
+            if len(fields) != 2:
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git HEAD reflog evidence is malformed",
+                    "repair the worktree Git reflog and retry",
+                )
+            oid, subject = fields
+            if (
+                _GIT_OBJECT_ID_RE.fullmatch(oid) is None
+                or "\x00" in subject
+            ):
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git HEAD reflog evidence is malformed",
+                    "repair the worktree Git reflog and retry",
+                )
+            serialized_size += len(raw_entry.encode("utf-8")) + 1
+            if serialized_size > MAX_HISTORY_REFLOG_BYTES:
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git HEAD reflog evidence exceeds its bound",
+                    "recreate the worktree with a bounded local HEAD reflog",
+                )
+            entries.append((oid, subject))
+        return tuple(entries)
+
+    def _verify_history_overrides(self, cwd: Path) -> None:
+        replace_refs = self._git(
+            ["for-each-ref", "--format=%(refname)", "refs/replace"], cwd
+        )
+        if replace_refs.returncode != 0:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git replacement references could not be verified",
+                "remove history replacement configuration and retry",
+            )
+        if self._bounded_output(
+            replace_refs.stdout, "Git replacement references", max_bytes=4096
+        ).strip():
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git replacement objects are active in the attested worktree",
+                "remove refs/replace entries before retrying",
+            )
+        git_dir = Path(self._git_output(cwd, ["rev-parse", "--git-dir"]))
+        common_dir = Path(
+            self._git_output(cwd, ["rev-parse", "--git-common-dir"])
+        )
+        if not git_dir.is_absolute():
+            git_dir = cwd / git_dir
+        if not common_dir.is_absolute():
+            common_dir = cwd / common_dir
+        fixed_overrides = (
+            git_dir / "refs" / "replace",
+            common_dir / "refs" / "replace",
+            git_dir / "info" / "grafts",
+            common_dir / "info" / "grafts",
+            git_dir / "shallow",
+            common_dir / "shallow",
+            git_dir / "objects" / "info" / "alternates",
+            common_dir / "objects" / "info" / "alternates",
+        )
+        seen: set[Path] = set()
+        for candidate in fixed_overrides:
+            candidate = Path(os.path.abspath(candidate))
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "Git history override metadata could not be inspected",
+                    "remove or repair the worktree Git metadata before retrying",
+                ) from exc
+            raise self._failure(
+                "headless_attestation_invalid",
+                "Git history override metadata is present",
+                "remove replacement, graft, shallow, or alternate-object metadata before retrying",
+            )
+
+    @staticmethod
+    def _serialize_reflog_entry(entry: tuple[str, str]) -> str:
+        return "\x00".join(entry)
+
+    def _is_ancestor(self, cwd: Path, old_head: str, new_head: str) -> bool:
+        result = self._git(
+            ["merge-base", "--is-ancestor", old_head, new_head], cwd
+        )
+        return result.returncode == 0
 
     def _verify_baseline_ancestor(
         self, cwd: Path, baseline: str, head: str
@@ -1413,6 +2148,18 @@ class HeadlessWriteScopeStore:
                     "create a fresh Masterjet worktree attestation",
                 )
         return path
+
+    @staticmethod
+    def _require_device(value: Any) -> int:
+        if type(value) is not int or value < 0:
+            raise ValueError
+        return value
+
+    @staticmethod
+    def _require_inode(value: Any) -> int:
+        if type(value) is not int or value <= 0:
+            raise ValueError
+        return value
 
     @staticmethod
     def _require_text(value: Any, field: str, maximum: int) -> str:

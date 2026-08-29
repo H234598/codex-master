@@ -333,6 +333,13 @@ G5_TMUX_SOCKET_RE = re.compile(r"g5-[0-9a-f]{20}")
 G5_NATIVE_RUNNER_META_KEY = "g5_native_runner"
 G5_SCOPE_UNIT_RE = re.compile(r"codex-master-resource-[a-f0-9]{32}\.scope")
 DEFAULT_HEADLESS_TIMEOUT_SECONDS = 600
+HEADLESS_ROLLBACK_DIR_NAME = "headless-write-scope-rollback"
+HEADLESS_ROLLBACK_SCHEMA_VERSION = 1
+MAX_HEADLESS_ROLLBACK_RECORDS = 32
+MAX_HEADLESS_ROLLBACK_RECORD_BYTES = 16 * 1024
+HEADLESS_ROLLBACK_RECORD_RE = re.compile(
+    r"^rollback-[0-9TZ-]+-[0-9a-f]{32}\.json$"
+)
 
 
 def agent_base_args(
@@ -13124,10 +13131,11 @@ def _run_headless_process(
                     )
                 except OSError as exc:
                     raise AgentError("headless_worktree_identity_changed") from exc
-                worktree_fd = open_real_directory_fd(
+                worktree_fd = open_directory_chain_no_follow_matching(
                     verified_worktree,
-                    "headless_worktree_identity_changed",
-                    expected_stat=expected_worktree_stat,
+                    expected_worktree_stat,
+                    error_text="headless_worktree_identity_changed",
+                    changed_text="headless_worktree_identity_changed",
                 )
                 opened_worktree_stat = os.fstat(worktree_fd)
                 if (
@@ -13453,7 +13461,7 @@ def _run_headless_process(
                 {
                     "agent": agent,
                     "backend": "headless_job",
-                    "state": terminal,
+                    "state": "failed" if write_scope_binding is not None else terminal,
                     "assignment_id": assignment_id,
                     "generation": gate.generation,
                     "returncode": finished_result.returncode
@@ -18220,10 +18228,427 @@ def normalize_git_branch_name(value: str) -> str:
     return value
 
 
+def _headless_rollback_directory(
+    *, create: bool
+) -> tuple[Path, os.stat_result] | None:
+    root = Path(STATE_ROOT).expanduser()
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    root = Path(os.path.abspath(root))
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        if not create:
+            return None
+        ensure_private_dir(root)
+        try:
+            root_stat = root.lstat()
+        except OSError as exc:
+            raise AgentError("headless_attestation_rollback_incomplete") from exc
+    except OSError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    if (
+        stat_module.S_ISLNK(root_stat.st_mode)
+        or not stat_module.S_ISDIR(root_stat.st_mode)
+        or root_stat.st_uid != os.getuid()
+        or stat_module.S_IMODE(root_stat.st_mode) != 0o700
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    directory = root / HEADLESS_ROLLBACK_DIR_NAME
+    try:
+        directory_stat = directory.lstat()
+    except FileNotFoundError:
+        if not create:
+            return None
+        try:
+            os.mkdir(directory, 0o700)
+            directory_stat = directory.lstat()
+        except FileExistsError:
+            try:
+                directory_stat = directory.lstat()
+            except OSError as exc:
+                raise AgentError("headless_attestation_rollback_incomplete") from exc
+        except OSError as exc:
+            raise AgentError("headless_attestation_rollback_incomplete") from exc
+    except OSError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    if (
+        stat_module.S_ISLNK(directory_stat.st_mode)
+        or not stat_module.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_uid != os.getuid()
+        or stat_module.S_IMODE(directory_stat.st_mode) != 0o700
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    return directory, directory_stat
+
+
+def _headless_rollback_directory_fd(*, create: bool) -> tuple[Path, int] | None:
+    resolved = _headless_rollback_directory(create=create)
+    if resolved is None:
+        return None
+    directory, expected_stat = resolved
+    try:
+        fd = open_directory_chain_no_follow_matching(
+            directory,
+            expected_stat,
+            error_text="headless_attestation_rollback_incomplete",
+            changed_text="headless_attestation_rollback_incomplete",
+        )
+    except AgentError:
+        raise
+    return directory, fd
+
+
+def _headless_rollback_record_names(directory_fd: int) -> list[str]:
+    names: list[str] = []
+    try:
+        with os.scandir(f"/proc/self/fd/{directory_fd}") as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_HEADLESS_ROLLBACK_RECORDS * 2:
+                    raise AgentError("headless_attestation_rollback_incomplete")
+                if not entry.name.startswith("rollback-"):
+                    continue
+                if HEADLESS_ROLLBACK_RECORD_RE.fullmatch(entry.name) is None:
+                    raise AgentError("headless_attestation_rollback_incomplete")
+                names.append(entry.name)
+                if len(names) > MAX_HEADLESS_ROLLBACK_RECORDS:
+                    raise AgentError("headless_attestation_rollback_incomplete")
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    return sorted(names)
+
+
+def _headless_verify_rollback_record_stat(
+    info: os.stat_result,
+) -> None:
+    if (
+        not stat_module.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat_module.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+        or info.st_size > MAX_HEADLESS_ROLLBACK_RECORD_BYTES
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+
+
+def _headless_read_rollback_record(
+    directory_fd: int, name: str
+) -> tuple[os.stat_result, dict[str, Any]]:
+    try:
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _headless_verify_rollback_record_stat(info)
+        fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+    except (OSError, AgentError) as exc:
+        if isinstance(exc, AgentError):
+            raise
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    try:
+        opened = os.fstat(fd)
+        if (
+            not source_identity_matches(opened, info)
+            or opened.st_uid != os.getuid()
+            or stat_module.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+        ):
+            raise AgentError("headless_attestation_rollback_incomplete")
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            raw = stream.read(MAX_HEADLESS_ROLLBACK_RECORD_BYTES + 1)
+        if len(raw) > MAX_HEADLESS_ROLLBACK_RECORD_BYTES:
+            raise AgentError("headless_attestation_rollback_incomplete")
+        latest = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _headless_verify_rollback_record_stat(latest)
+        if not source_identity_matches(latest, info):
+            raise AgentError("headless_attestation_rollback_incomplete")
+    except AgentError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    if not isinstance(payload, dict):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    return info, payload
+
+
+def _headless_rollback_record_payload(
+    agent: str,
+    repository: Path,
+    target: Path,
+    target_stat: os.stat_result | None,
+    parent_stat: os.stat_result | None,
+    *,
+    registered: bool,
+    reason: str,
+) -> bytes:
+    repository_stat: os.stat_result | None
+    try:
+        repository_stat = repository.lstat()
+    except OSError:
+        repository_stat = None
+    payload = {
+        "schema_version": HEADLESS_ROLLBACK_SCHEMA_VERSION,
+        "state": "pending",
+        "agent": agent,
+        "repository": str(repository),
+        "repository_device": (
+            int(repository_stat.st_dev) if repository_stat is not None else None
+        ),
+        "repository_inode": (
+            int(repository_stat.st_ino) if repository_stat is not None else None
+        ),
+        "target": str(target),
+        "target_device": int(target_stat.st_dev) if target_stat is not None else None,
+        "target_inode": int(target_stat.st_ino) if target_stat is not None else None,
+        "parent_device": int(parent_stat.st_dev) if parent_stat is not None else None,
+        "parent_inode": int(parent_stat.st_ino) if parent_stat is not None else None,
+        "registered": registered,
+        "reason": reason,
+        "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }
+    raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    if len(raw) > MAX_HEADLESS_ROLLBACK_RECORD_BYTES:
+        raise AgentError("headless_attestation_rollback_incomplete")
+    return raw
+
+
+def _persist_headless_rollback_state(
+    agent: str,
+    repository: Path,
+    target: Path,
+    target_stat: os.stat_result | None,
+    parent_stat: os.stat_result | None,
+    *,
+    registered: bool,
+    reason: str,
+) -> None:
+    directory_info = _headless_rollback_directory_fd(create=True)
+    if directory_info is None:
+        raise AgentError("headless_attestation_rollback_incomplete")
+    _directory, directory_fd = directory_info
+    try:
+        names = _headless_rollback_record_names(directory_fd)
+        if len(names) >= MAX_HEADLESS_ROLLBACK_RECORDS:
+            raise AgentError("headless_attestation_rollback_incomplete")
+        for existing_name in names:
+            _headless_read_rollback_record(directory_fd, existing_name)
+        raw = _headless_rollback_record_payload(
+            agent,
+            repository,
+            target,
+            target_stat,
+            parent_stat,
+            registered=registered,
+            reason=reason,
+        )
+        name = f"rollback-{now_id()}-{uuid.uuid4().hex}.json"
+        write_private_new_bytes(
+            Path(name), raw, mode=0o600, dir_fd=directory_fd
+        )
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _headless_verify_rollback_record_stat(info)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _headless_remove_rollback_record(directory_fd: int, name: str) -> None:
+    info, _payload = _headless_read_rollback_record(directory_fd, name)
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not source_identity_matches(current, info):
+            raise AgentError("headless_attestation_rollback_incomplete")
+        os.unlink(name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+
+
+def _headless_resume_rollback_payload(
+    directory_fd: int, name: str, payload: Mapping[str, Any]
+) -> None:
+    if (
+        payload.get("schema_version") != HEADLESS_ROLLBACK_SCHEMA_VERSION
+        or payload.get("state") != "pending"
+        or not isinstance(payload.get("agent"), str)
+        or not isinstance(payload.get("repository"), str)
+        or not isinstance(payload.get("target"), str)
+        or type(payload.get("registered")) is not bool
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    repository = Path(payload["repository"])
+    target = Path(payload["target"])
+    if (
+        not repository.is_absolute()
+        or not target.is_absolute()
+        or len(str(repository)) > MAX_PATH_TEXT
+        or len(str(target)) > MAX_PATH_TEXT
+        or any(part in {".", ".."} for part in repository.parts[1:])
+        or any(part in {".", ".."} for part in target.parts[1:])
+        or target == repository
+        or not directory_chain_is_real_no_symlink(repository)
+        or not directory_chain_is_real_no_symlink(target.parent)
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    try:
+        target.relative_to(repository)
+    except ValueError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    repository_device = payload.get("repository_device")
+    repository_inode = payload.get("repository_inode")
+    target_device = payload.get("target_device")
+    target_inode = payload.get("target_inode")
+    parent_device = payload.get("parent_device")
+    parent_inode = payload.get("parent_inode")
+    if any(
+        type(value) is not int or value < 0
+        for value in (repository_device, repository_inode, parent_device, parent_inode)
+    ) or any(
+        type(value) is not int or value <= 0
+        for value in (repository_inode, parent_inode)
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    target_identity_available = (
+        type(target_device) is int
+        and target_device >= 0
+        and type(target_inode) is int
+        and target_inode > 0
+    )
+    if (target_device is None) != (target_inode is None) or (
+        target_device is not None and not target_identity_available
+    ):
+        raise AgentError("headless_attestation_rollback_incomplete")
+    try:
+        repository_stat = repository.lstat()
+        if (
+            stat_module.S_ISLNK(repository_stat.st_mode)
+            or not stat_module.S_ISDIR(repository_stat.st_mode)
+            or repository_stat.st_dev != repository_device
+            or repository_stat.st_ino != repository_inode
+        ):
+            raise AgentError("headless_attestation_rollback_incomplete")
+        repository_fd = open_directory_chain_no_follow_matching(
+            repository,
+            repository_stat,
+            error_text="headless_attestation_rollback_incomplete",
+            changed_text="headless_attestation_rollback_incomplete",
+        )
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("headless_attestation_rollback_incomplete") from exc
+    target_fd = -1
+    parent_fd = -1
+    try:
+        try:
+            target_stat = target.lstat()
+        except FileNotFoundError:
+            if not payload["registered"]:
+                _headless_remove_rollback_record(directory_fd, name)
+                return
+            raise AgentError("headless_attestation_rollback_incomplete")
+        except OSError as exc:
+            raise AgentError("headless_attestation_rollback_incomplete") from exc
+        if not target_identity_available or (
+            stat_module.S_ISLNK(target_stat.st_mode)
+            or not stat_module.S_ISDIR(target_stat.st_mode)
+            or target_stat.st_dev != target_device
+            or target_stat.st_ino != target_inode
+        ):
+            raise AgentError("headless_attestation_rollback_incomplete")
+        target_fd = open_directory_chain_no_follow_matching(
+            target,
+            target_stat,
+            error_text="headless_attestation_rollback_incomplete",
+            changed_text="headless_attestation_rollback_incomplete",
+        )
+        parent = target.parent
+        try:
+            parent_stat = parent.lstat()
+        except OSError as exc:
+            raise AgentError("headless_attestation_rollback_incomplete") from exc
+        if (
+            stat_module.S_ISLNK(parent_stat.st_mode)
+            or not stat_module.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_dev != parent_device
+            or parent_stat.st_ino != parent_inode
+        ):
+            raise AgentError("headless_attestation_rollback_incomplete")
+        parent_fd = open_directory_chain_no_follow_matching(
+            parent,
+            parent_stat,
+            error_text="headless_attestation_rollback_incomplete",
+            changed_text="headless_attestation_rollback_incomplete",
+        )
+        if payload["registered"]:
+            cleanup = run_command(
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    "--",
+                    f"/proc/self/fd/{target_fd}",
+                ],
+                cwd=Path(f"/proc/self/fd/{repository_fd}"),
+                pass_fds=(repository_fd, target_fd),
+            )
+            returncode = getattr(cleanup, "returncode", None)
+            if not isinstance(returncode, int) or isinstance(returncode, bool) or returncode != 0:
+                raise AgentError("headless_attestation_rollback_incomplete")
+        else:
+            os.rmdir(target.name, dir_fd=parent_fd)
+        try:
+            os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            _headless_remove_rollback_record(directory_fd, name)
+            return
+        except OSError as exc:
+            raise AgentError("headless_attestation_rollback_incomplete") from exc
+        raise AgentError("headless_attestation_rollback_incomplete")
+    finally:
+        if target_fd >= 0:
+            os.close(target_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        os.close(repository_fd)
+
+
+def _resume_headless_rollback_records() -> list[str]:
+    directory_info = _headless_rollback_directory_fd(create=False)
+    if directory_info is None:
+        return []
+    _directory, directory_fd = directory_info
+    try:
+        names = _headless_rollback_record_names(directory_fd)
+        for name in names:
+            _info, payload = _headless_read_rollback_record(directory_fd, name)
+            _headless_resume_rollback_payload(directory_fd, name, payload)
+        return []
+    finally:
+        os.close(directory_fd)
+
+
 def worktree_create_for_agent(
     agent: str, path: Any = None, base_ref: Any = None
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("worktree_create_for_agent")
+    _resume_headless_rollback_records()
     agent = canonical_agent_id(agent)
     path = (
         bounded_text(path, field="path", max_chars=MAX_PATH_TEXT)
@@ -18279,18 +18704,59 @@ def worktree_create_for_agent(
     cp: subprocess.CompletedProcess[str] | None = None
     worktree_registered = False
 
+    def raise_rollback_incomplete(
+        reason: str, cause: BaseException | None = None
+    ) -> None:
+        try:
+            _persist_headless_rollback_state(
+                agent,
+                repo,
+                target,
+                target_stat,
+                parent_stat,
+                registered=worktree_registered,
+                reason=reason,
+            )
+        except Exception as exc:
+            raise AgentError(
+                "headless_attestation_rollback_incomplete",
+                {"recovery_state": "unavailable"},
+            ) from exc
+        error = AgentError(
+            "headless_attestation_rollback_incomplete",
+            {"recovery_state": "pending"},
+        )
+        if cause is None:
+            raise error
+        raise error from cause
+
     def rollback_registered_worktree() -> None:
-        if not worktree_registered or target_stat is None or target_fd < 0:
+        if not worktree_registered:
             return
+        if target_stat is None or target_fd < 0:
+            raise_rollback_incomplete("target_identity_unavailable")
+        try:
+            current_path = os.stat(
+                target.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+        except FileNotFoundError as exc:
+            raise_rollback_incomplete("target_path_missing", exc)
+        except OSError as exc:
+            raise_rollback_incomplete("target_path_stat_failed", exc)
+        if (
+            not stat_module.S_ISDIR(current_path.st_mode)
+            or not source_identity_matches(current_path, target_stat)
+        ):
+            raise_rollback_incomplete("target_path_identity_changed")
         try:
             current_target = os.fstat(target_fd)
-        except OSError:
-            return
+        except OSError as exc:
+            raise_rollback_incomplete("target_fstat_failed", exc)
         if (
             not stat_module.S_ISDIR(current_target.st_mode)
             or not source_identity_matches(current_target, target_stat)
         ):
-            return
+            raise_rollback_incomplete("target_identity_changed")
         try:
             cleanup = run_command(
                 [
@@ -18305,12 +18771,17 @@ def worktree_create_for_agent(
                 pass_fds=(target_fd,),
             )
         except Exception as exc:
-            raise AgentError("headless_attestation_rollback_failed") from exc
-        if cleanup.returncode != 0:
-            raise AgentError(
-                "headless_attestation_rollback_failed",
-                {"returncode": cleanup.returncode},
-            )
+            raise_rollback_incomplete("rollback_command_failed", exc)
+        returncode = getattr(cleanup, "returncode", None)
+        if not isinstance(returncode, int) or isinstance(returncode, bool) or returncode != 0:
+            raise_rollback_incomplete("rollback_command_failed")
+        try:
+            os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise_rollback_incomplete("target_path_stat_failed", exc)
+        raise_rollback_incomplete("rollback_target_still_exists")
 
     try:
         try:
@@ -18346,6 +18817,24 @@ def worktree_create_for_agent(
             )
         cp = run_command(["git", *args], cwd=operation_cwd)
         if cp.returncode != 0:
+            try:
+                registration = run_command(
+                    ["git", "worktree", "list", "--porcelain"], cwd=repo
+                )
+            except Exception:
+                worktree_registered = True
+            else:
+                if registration.returncode != 0 or not isinstance(
+                    registration.stdout, str
+                ):
+                    worktree_registered = True
+                else:
+                    target_text = str(target)
+                    worktree_registered = any(
+                        line.startswith("worktree ")
+                        and line[9:] == target_text
+                        for line in registration.stdout.splitlines()
+                    )
             raise AgentError("git worktree add failed")
         worktree_registered = True
         try:
@@ -18378,26 +18867,25 @@ def worktree_create_for_agent(
             metadata_stat = None
         except OSError as exc:
             raise AgentError("headless_attestation_invalid") from exc
-        if metadata_stat is not None:
-            if stat_module.S_ISLNK(metadata_stat.st_mode) or not (
-                stat_module.S_ISREG(metadata_stat.st_mode)
-                or stat_module.S_ISDIR(metadata_stat.st_mode)
-            ):
-                raise AgentError("headless_attestation_invalid")
-            try:
-                attestation = _headless_write_scope_store().create(
-                    agent,
-                    repo,
-                    resolved_target,
-                    base_ref=base_ref,
-                )
-            except HeadlessWriteScopeFailure as exc:
-                _raise_headless_scope_failure(exc)
-            write_scope = {
-                "state": "available",
-                "attestation_id": attestation.attestation_id,
-                "raw_output": "not_returned",
-            }
+        if metadata_stat is None or stat_module.S_ISLNK(metadata_stat.st_mode) or not (
+            stat_module.S_ISREG(metadata_stat.st_mode)
+            or stat_module.S_ISDIR(metadata_stat.st_mode)
+        ):
+            raise AgentError("headless_attestation_invalid")
+        try:
+            attestation = _headless_write_scope_store().create(
+                agent,
+                repo,
+                resolved_target,
+                base_ref=base_ref,
+            )
+        except HeadlessWriteScopeFailure as exc:
+            _raise_headless_scope_failure(exc)
+        write_scope = {
+            "state": "available",
+            "attestation_id": attestation.attestation_id,
+            "raw_output": "not_returned",
+        }
         return {
             "agent": agent,
             "path": public_path or PATH_NOT_RETURNED,
@@ -18412,15 +18900,22 @@ def worktree_create_for_agent(
     except Exception:
         if worktree_registered:
             rollback_registered_worktree()
-        elif created_target and target_stat is not None:
+        elif created_target:
+            if target_stat is None:
+                raise_rollback_incomplete("target_identity_unavailable")
             try:
                 current_target = os.stat(
                     target.name, dir_fd=parent_fd, follow_symlinks=False
                 )
-                if source_identity_matches(current_target, target_stat):
-                    os.rmdir(target.name, dir_fd=parent_fd)
-            except OSError:
+                if not source_identity_matches(current_target, target_stat):
+                    raise_rollback_incomplete("target_identity_changed")
+                os.rmdir(target.name, dir_fd=parent_fd)
+            except FileNotFoundError:
                 pass
+            except AgentError:
+                raise
+            except OSError as exc:
+                raise_rollback_incomplete("rollback_directory_remove_failed", exc)
         raise
     finally:
         if target_fd >= 0:
