@@ -122,19 +122,22 @@ def test_builder_excludes_protocol_declarations_and_indexes_async_class_tests(tm
         "from example import fetch\n\n"
         "class TestFetch:\n"
         "    async def test_fetch(self):\n"
-        "        assert await fetch() == 'ok'\n",
+        "        assert await fetch() == 'ok'\n\n"
+        "async def test_fetch_module():\n"
+        "    assert await fetch() == 'ok'\n",
         encoding="utf-8",
     )
     function_id = "python:src/example.py:fetch"
     test_id = "pytest:tests/test_example.py:TestFetch::test_fetch"
+    module_test_id = "pytest:tests/test_example.py:test_fetch_module"
 
     index = PythonTestIndexBuilder(tmp_path).build(
         repository_id="example",
         generation=1,
         source_paths=("src/example.py",),
         test_paths=("tests/test_example.py",),
-        bindings={function_id: (test_id,)},
+        bindings={function_id: (test_id, module_test_id)},
     )
 
     assert [item.function_id for item in index.functions] == [function_id]
-    assert [item.test_id for item in index.tests] == [test_id]
+    assert [item.test_id for item in index.tests] == sorted((test_id, module_test_id))
