@@ -6,6 +6,7 @@ import stat
 import pytest
 import yaml
 
+from codex_master import google_account_inventory
 from codex_master.google_account_inventory import GoogleAccountInventoryLoader
 from codex_master.google_inventory_store import (
     GoogleInventoryStore,
@@ -14,6 +15,11 @@ from codex_master.google_inventory_store import (
 
 
 SECRET = "AIza-private-project-secret"
+
+
+def test_public_store_uses_only_canonical_inventory_path() -> None:
+    store = GoogleInventoryStore()
+    assert store._path == google_account_inventory.DEFAULT_GOOGLE_ACCOUNT_INVENTORY_PATH
 
 
 def _legacy_document() -> dict[str, object]:
