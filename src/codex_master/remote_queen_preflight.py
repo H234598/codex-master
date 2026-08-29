@@ -1,5 +1,6 @@
 import hashlib
 import json
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
@@ -62,7 +63,10 @@ def _is_absolute_posix_path(value: object, *, user_home: bool) -> bool:
         return False
     if not value.startswith("/"):
         return False
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+    if any(
+        unicodedata.category(character).startswith("C")
+        for character in value
+    ):
         return False
     if user_home and value == "/":
         return False
@@ -422,6 +426,60 @@ def _preflight_payload(
     }
 
 
+def _preflight_digest(payload: dict[str, object]) -> str:
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _validated_preflight_payload(
+    preflight: RemoteQueenSshPreflightV1,
+) -> dict[str, object]:
+    try:
+        if (
+            not isinstance(preflight, RemoteQueenSshPreflightV1)
+            or preflight.schema_version != "RemoteQueenSshPreflightV1"
+            or not isinstance(preflight.ssh_target, SshTargetV1)
+            or not isinstance(preflight.host_key, ApprovedHostKeyV1)
+            or not isinstance(preflight.desired_generation, ManifestGenerationV1)
+            or not isinstance(preflight.host_facts, RemoteQueenHostFactsV1)
+            or not isinstance(preflight.package_plan, PackagePlanV1)
+        ):
+            _fail("RQ_E_PLAN_INCONSISTENT")
+        if preflight.host_key.host != preflight.ssh_target.host:
+            _fail("RQ_E_PLAN_INCONSISTENT")
+
+        ApprovedHostKeyV1(
+            host=preflight.host_key.host,
+            key_type=preflight.host_key.key_type,
+            sha256_fingerprint=preflight.host_key.sha256_fingerprint,
+        )
+        ManifestGenerationV1(
+            generation=preflight.desired_generation.generation,
+            sha256=preflight.desired_generation.sha256,
+        )
+        validated_host_facts = _parse_host_facts(
+            _host_facts_as_dict(preflight.host_facts),
+            preflight.ssh_target,
+        )
+        if validated_host_facts != preflight.host_facts:
+            _fail("RQ_E_PLAN_INCONSISTENT")
+        if package_plan_for(validated_host_facts.host_facts) != preflight.package_plan:
+            _fail("RQ_E_PLAN_INCONSISTENT")
+
+        payload = _preflight_payload(preflight)
+        if _preflight_digest(payload) != preflight.preflight_digest:
+            _fail("RQ_E_PLAN_INCONSISTENT")
+        return payload
+    except RemoteQueenBootstrapError:
+        raise
+    except Exception:
+        _fail("RQ_E_PLAN_INCONSISTENT")
+
+
 def collect_remote_queen_ssh_preflight(
     *,
     ssh_target: SshTargetV1,
@@ -486,12 +544,7 @@ def collect_remote_queen_ssh_preflight(
         preflight_digest="",
     )
     digest_payload = _preflight_payload(preflight)
-    canonical = json.dumps(
-        digest_payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    digest = _preflight_digest(digest_payload)
     return RemoteQueenSshPreflightV1(
         schema_version=preflight.schema_version,
         ssh_target=preflight.ssh_target,
@@ -506,8 +559,6 @@ def collect_remote_queen_ssh_preflight(
 def preflight_as_dict(
     preflight: RemoteQueenSshPreflightV1,
 ) -> dict[str, object]:
-    if not isinstance(preflight, RemoteQueenSshPreflightV1):
-        _fail("RQ_E_PLAN_INCONSISTENT")
-    payload = _preflight_payload(preflight)
+    payload = _validated_preflight_payload(preflight)
     payload["preflight_digest"] = preflight.preflight_digest
     return payload

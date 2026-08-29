@@ -1,6 +1,7 @@
 import ast
 import copy
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -332,6 +333,46 @@ def test_preflight_as_dict_is_flat_json_primitive_contract():
 
 
 @pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda preflight: replace(
+            preflight,
+            host_facts=replace(
+                preflight.host_facts,
+                free_bytes=preflight.host_facts.free_bytes + 1,
+            ),
+        ),
+        lambda preflight: replace(
+            preflight,
+            preflight_digest="sha256:" + "0" * 64,
+        ),
+    ],
+)
+def test_preflight_as_dict_rejects_stale_or_false_digest(mutate):
+    assert_domain_error(
+        lambda: preflight_as_dict(mutate(collect())),
+        "RQ_E_PLAN_INCONSISTENT",
+    )
+
+
+def test_preflight_as_dict_rejects_malformed_nested_contract():
+    preflight = collect()
+    malformed = replace(
+        preflight,
+        host_facts=replace(
+            preflight.host_facts,
+            network_paths=("remote-secret",),
+        ),
+    )
+
+    error = assert_domain_error(
+        lambda: preflight_as_dict(malformed),
+        "RQ_E_PLAN_INCONSISTENT",
+    )
+    assert "remote-secret" not in str(error)
+
+
+@pytest.mark.parametrize(
     "known_host_keys",
     [
         (),
@@ -459,6 +500,25 @@ def test_payload_rejects_malformed_scalar_fields(field, value):
     assert "secret" not in str(error)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("remote_home", "/home/queen\u0085suffix"),
+        ("shell", "/bin/bash\u202e"),
+    ],
+)
+def test_host_fact_paths_reject_unicode_control_characters(field, value):
+    payload = copy.deepcopy(HOST_FACTS_PAYLOAD)
+    payload[field] = value
+
+    assert_domain_error(
+        lambda: collect(
+            FakeSshOperations(result=_result(stdout=_json_bytes(payload)))
+        ),
+        "RQ_E_PLAN_INCONSISTENT",
+    )
+
+
 def test_payload_rejects_user_mismatch():
     payload = copy.deepcopy(HOST_FACTS_PAYLOAD)
     payload["remote_user"] = "other"
@@ -581,11 +641,14 @@ def _dotted_name(node):
     return None
 
 
-def test_no_runtime_effects():
-    production_paths = [
-        Path(__file__).parents[1] / "src/codex_master/remote_queen_ssh.py",
-        Path(__file__).parents[1] / "src/codex_master/remote_queen_preflight.py",
-    ]
+def _is_forbidden_import(module: str, forbidden_imports: set[str]) -> bool:
+    return any(
+        module == forbidden or module.startswith(forbidden + ".")
+        for forbidden in forbidden_imports
+    )
+
+
+def _assert_no_runtime_effects_source(source: str) -> None:
     forbidden_imports = {
         "subprocess",
         "socket",
@@ -615,33 +678,54 @@ def test_no_runtime_effects():
         "replace",
     }
 
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not _is_forbidden_import(alias.name, forbidden_imports)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            assert not _is_forbidden_import(module, forbidden_imports)
+        elif isinstance(node, ast.Call):
+            dotted = _dotted_name(node.func)
+            assert dotted not in forbidden_calls
+            assert dotted and dotted.rsplit(".", 1)[-1] not in {
+                "systemctl",
+                "dnf",
+                "apt",
+                "firewall",
+                "git",
+                "codex",
+                "mcp",
+                "syncthing",
+                "dbus",
+                "open",
+                "write_text",
+                "write_bytes",
+                "unlink",
+                "rename",
+                "replace",
+            }
+
+
+def test_no_runtime_effects():
+    production_paths = [
+        Path(__file__).parents[1] / "src/codex_master/remote_queen_ssh.py",
+        Path(__file__).parents[1] / "src/codex_master/remote_queen_preflight.py",
+    ]
+
     for path in production_paths:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    assert alias.name not in forbidden_imports
-            elif isinstance(node, ast.ImportFrom):
-                module = node.module or ""
-                assert module not in forbidden_imports
-                assert not module.startswith("asyncio.subprocess")
-            elif isinstance(node, ast.Call):
-                dotted = _dotted_name(node.func)
-                assert dotted not in forbidden_calls
-                assert dotted and dotted.rsplit(".", 1)[-1] not in {
-                    "systemctl",
-                    "dnf",
-                    "apt",
-                    "firewall",
-                    "git",
-                    "codex",
-                    "mcp",
-                    "syncthing",
-                    "dbus",
-                    "open",
-                    "write_text",
-                    "write_bytes",
-                    "unlink",
-                    "rename",
-                    "replace",
-                }
+        _assert_no_runtime_effects_source(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import urllib.request\nurllib.request.urlopen('https://example.test')",
+        "import socket.socket\nsocket.socket.socket()",
+        "from os.path import exists\nexists('/tmp/example')",
+    ],
+)
+def test_runtime_effect_gate_rejects_forbidden_import_submodules(source):
+    with pytest.raises(AssertionError):
+        _assert_no_runtime_effects_source(source)
