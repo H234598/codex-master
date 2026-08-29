@@ -7,6 +7,7 @@ import time
 import pytest
 
 from codex_master import google_account_manager_cli as cli
+from codex_master import server
 from codex_master.google_account_manager_cli import _load_quota_evidence, build_parser
 from codex_master.google_cloud_provisioner import GoogleCloudProvisionerError
 
@@ -409,3 +410,23 @@ def json_payload(*, remaining: int, observed_at: str, inventory_generation: int)
         f'"inventory_generation":{inventory_generation},'
         f'"inventory_fingerprint":"{INVENTORY_FINGERPRINT}"}}'
     )
+
+
+def test_masterjet_google_inventory_bypasses_legacy_cli_adapter(monkeypatch) -> None:
+    from test_admin_service import principal, service_at
+
+    service, _owners = service_at()
+    monkeypatch.setattr(
+        server,
+        "_MASTERJET_ADMIN_BINDING",
+        (service, principal("fleet.read")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run",
+        lambda _arguments: (_ for _ in ()).throw(AssertionError("legacy CLI used")),
+    )
+
+    result = server.call_validated_tool("fleet_google_inventory", {})
+
+    assert result["accounts"][0]["ref"] == "google-one"

@@ -40858,5 +40858,204 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(errors[0]["code"], "resource_monitor_rollback_state_failed")
 
+
+class MasterjetAdminAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from test_admin_service import principal, service_at
+
+        self.service, self.owners = service_at()
+        self.principal = principal(
+            "fleet.read",
+            "fleet.openai.write",
+            "fleet.google.oauth",
+            "fleet.google.provision",
+            "fleet.google.billing.bind",
+        )
+
+    def _binding(self, principal: Any | None = None) -> Any:
+        return patch.object(
+            server_module,
+            "_MASTERJET_ADMIN_BINDING",
+            (self.service, principal or self.principal),
+        )
+
+    def _cli(self, *arguments: str) -> tuple[int, dict[str, Any]]:
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            status = server_module._main_cli_impl(list(arguments))
+        return status, json.loads(output.getvalue())
+
+    def _mcp(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        reply = server_module.handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+        self.assertIsNotNone(reply)
+        assert reply is not None
+        result = reply["result"]
+        return {
+            "isError": result["isError"],
+            "payload": json.loads(result["content"][0]["text"]),
+        }
+
+    def test_fleet_google_inventory_cli_and_mcp_outputs_are_identical(self) -> None:
+        with self._binding():
+            status, cli = self._cli("fleet", "google", "inventory")
+            mcp = self._mcp("fleet_google_inventory", {})
+
+        self.assertEqual(status, 0)
+        self.assertFalse(mcp["isError"])
+        self.assertEqual(cli, mcp["payload"])
+        self.assertEqual(cli["accounts"][0]["ref"], "google-one")
+
+    def test_fleet_openai_list_cli_and_mcp_outputs_are_identical(self) -> None:
+        with self._binding():
+            status, cli = self._cli("fleet", "openai", "list")
+            mcp = self._mcp("fleet_openai_accounts", {})
+
+        self.assertEqual(status, 0)
+        self.assertFalse(mcp["isError"])
+        self.assertEqual(cli, mcp["payload"])
+        self.assertEqual(cli, {"accounts": [{"generation": 4, "ref": "openai-one"}]})
+
+    def test_fleet_operation_status_cli_and_mcp_outputs_are_identical(self) -> None:
+        arguments = {"account_ref": "google-one", "operation_id": "operation-one"}
+        with self._binding():
+            status, cli = self._cli(
+                "fleet",
+                "operation",
+                "status",
+                "--account-ref",
+                "google-one",
+                "--operation-id",
+                "operation-one",
+            )
+            mcp = self._mcp("fleet_operation_status", arguments)
+
+        self.assertEqual(status, 0)
+        self.assertFalse(mcp["isError"])
+        self.assertEqual(cli, mcp["payload"])
+        self.assertEqual(cli["id"], "operation-one")
+
+    def test_fleet_admin_denied_scope_is_same_problem_for_cli_and_mcp(self) -> None:
+        from test_admin_service import principal
+
+        with self._binding(principal()):
+            status, cli = self._cli("fleet", "google", "inventory")
+            mcp = self._mcp("fleet_google_inventory", {})
+
+        self.assertEqual(status, 1)
+        self.assertTrue(mcp["isError"])
+        for payload in (cli, mcp["payload"]):
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["code"], "authority.scope_denied")
+            self.assertEqual(
+                set(payload),
+                {
+                    "schema_version",
+                    "code",
+                    "severity",
+                    "title",
+                    "detail",
+                    "effect",
+                    "action",
+                    "retryable",
+                    "retry_after_seconds",
+                    "correlation_id",
+                    "occurred_at",
+                },
+            )
+        self.assertEqual(self.owners.google_manager.list_calls, 0)
+
+    def test_fleet_admin_unknown_operation_fails_before_service(self) -> None:
+        with self._binding():
+            mcp = self._mcp("fleet_unknown_operation", {})
+
+        self.assertTrue(mcp["isError"])
+        self.assertEqual(mcp["payload"], {"error": "unknown tool"})
+        self.assertEqual(self.owners.google_manager.list_calls, 0)
+        self.assertEqual(self.owners.openai_accounts.calls, 0)
+
+    def test_masterjet_control_binding_is_exact_and_one_shot(self) -> None:
+        with patch.object(server_module, "_MASTERJET_ADMIN_BINDING", None):
+            server_module.bind_masterjet_control_service(self.service, self.principal)
+            self.assertEqual(
+                server_module._MASTERJET_ADMIN_BINDING,
+                (self.service, self.principal),
+            )
+            with self.assertRaisesRegex(AgentError, "control.service_already_bound"):
+                server_module.bind_masterjet_control_service(
+                    self.service, self.principal
+                )
+
+    def test_fleet_admin_tools_are_scope_filtered_and_have_no_secret_input(
+        self,
+    ) -> None:
+        from test_admin_service import principal
+
+        with self._binding(principal("fleet.read")):
+            reply = server_module.handle_rpc(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            )
+        self.assertIsNotNone(reply)
+        assert reply is not None
+        tools = {tool["name"]: tool for tool in reply["result"]["tools"]}
+        self.assertIn("fleet_google_inventory", tools)
+        self.assertIn("fleet_openai_accounts", tools)
+        self.assertIn("fleet_operation_status", tools)
+        self.assertNotIn("fleet_google_provision_apply", tools)
+        forbidden = {
+            "access_token",
+            "auth_json",
+            "client_secret",
+            "cookie",
+            "password",
+            "refresh_token",
+            "secret",
+            "token",
+            "totp",
+        }
+        admin_names = {
+            "fleet_openai_accounts",
+            "fleet_openai_auth_plan",
+            "fleet_google_inventory",
+            "fleet_google_oauth_begin",
+            "fleet_google_provision_plan",
+            "fleet_google_provision_apply",
+            "fleet_google_billing_plan",
+            "fleet_google_billing_apply",
+            "fleet_operation_status",
+        }
+        all_tools = {tool["name"]: tool for tool in server_module.TOOLS}
+        for name in admin_names:
+            tool = all_tools[name]
+            if tool["name"] not in admin_names:
+                continue
+            properties = tool["inputSchema"].get("properties", {})
+            self.assertTrue(forbidden.isdisjoint(properties))
+
+    def test_fleet_google_provision_plan_preserves_generation_and_idempotency(
+        self,
+    ) -> None:
+        arguments = {
+            "account_ref": "google-one",
+            "expected_generation": 4,
+            "idempotency_key": "provision-one",
+        }
+        with self._binding():
+            result = server_module.call_validated_tool(
+                "fleet_google_provision_plan", arguments
+            )
+
+        self.assertEqual(result["account_ref"], "google-one")
+        self.assertEqual(result["inventory_generation"], 4)
+        self.assertEqual(self.owners.quota_collector.calls, 1)
+        self.assertEqual(self.owners.google_provisioner.plan_calls, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

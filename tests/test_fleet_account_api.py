@@ -1272,6 +1272,28 @@ def test_fleet_mutation_dispatch_requires_expected_generation(
         )
 
 
+def test_masterjet_openai_adapter_does_not_read_legacy_fleet_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_admin_service import principal, service_at
+
+    service, _owners = service_at()
+    monkeypatch.setattr(
+        server,
+        "_MASTERJET_ADMIN_BINDING",
+        (service, principal("fleet.read")),
+    )
+    monkeypatch.setattr(
+        server,
+        "fleet_account_list",
+        lambda: (_ for _ in ()).throw(AssertionError("legacy registry read")),
+    )
+
+    assert server.call_validated_tool("fleet_openai_accounts", {}) == {
+        "accounts": [{"ref": "openai-one", "generation": 4}]
+    }
+
+
 def test_fleet_account_probe_dispatch_rejects_non_string_model_before_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

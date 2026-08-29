@@ -36,7 +36,16 @@ import uuid
 from collections.abc import Collection
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Literal,
+    Mapping,
+    cast,
+)
 
 import yaml
 
@@ -279,6 +288,10 @@ from codex_master.selection.task_classification import (
 from codex_master.selection_service import SelectionRequest, SelectionService
 from codex_master.hive.types import TaskComplexity
 
+if TYPE_CHECKING:
+    from codex_master.admin_contracts import AdminPrincipalV1
+    from codex_master.admin_service import MasterjetControlService
+
 
 STATE_ROOT = Path(
     os.environ.get("CODEX_MASTER_MCP_STATE")
@@ -321,6 +334,8 @@ BASE_ARGS = [
 ]
 
 HEADLESS_JOBS = HeadlessJobRegistry()
+_MASTERJET_ADMIN_BINDING: tuple[MasterjetControlService, AdminPrincipalV1] | None = None
+_MASTERJET_ADMIN_BINDING_LOCK = threading.Lock()
 HEADLESS_META_KEY = "headless_job"
 G5_TMUX_SOCKET_META_KEY = "tmux_socket"
 G5_TMUX_SOCKET_RE = re.compile(r"g5-[0-9a-f]{20}")
@@ -1779,6 +1794,10 @@ class AgentError(RuntimeError):
             self.payload = payload
 
 
+class MasterjetAdminError(AgentError):
+    """Expose only the stable public admin problem contract."""
+
+
 class HeadlessWriteScopeError(AgentError):
     """Raised when headless writes lack an enforceable filesystem boundary."""
 
@@ -1851,6 +1870,8 @@ def _public_resource_snapshot(value: Any) -> dict[str, Any] | None:
 
 
 def public_error_payload(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, MasterjetAdminError):
+        return dict(exc.payload)
     payload: dict[str, Any] = {"error": safe_error_text(exc)}
     if isinstance(
         exc,
@@ -23570,6 +23591,8 @@ def call_tool(
     principal_class: str | None = None,
 ) -> dict[str, Any]:
     authority_class = principal_class or "arbeitsbiene"
+    if name in _MASTERJET_ADMIN_TOOL_ROUTES:
+        return _masterjet_admin_tool_call(name, args)
     if name in {tool["name"] for tool in hive_tool_definitions()}:
         return dict(call_hive_tool(name, args))
     if name == "fleet_overview":
@@ -33217,7 +33240,215 @@ def spawn_admission_lock() -> Any:
                 pass
 
 
+_MASTERJET_ADMIN_TOOL_SPECS = (
+    (
+        "fleet_openai_accounts",
+        "openai.accounts.list",
+        "fleet.read",
+        "List redacted OpenAI fleet accounts.",
+        (),
+        (),
+    ),
+    (
+        "fleet_openai_auth_plan",
+        "openai.auth.plan",
+        "fleet.openai.write",
+        "Plan OpenAI auth sync without accepting auth bytes.",
+        ("account_ref", "expected_generation", "idempotency_key"),
+        (),
+    ),
+    (
+        "fleet_google_inventory",
+        "google.accounts.list",
+        "fleet.read",
+        "List redacted Google accounts or projects.",
+        (),
+        ("account_ref",),
+    ),
+    (
+        "fleet_google_oauth_begin",
+        "google.oauth.begin",
+        "fleet.google.oauth",
+        "Begin browser OAuth without accepting OAuth codes.",
+        (
+            "account_ref",
+            "oauth_client_ref",
+            "redirect_uri",
+            "scope_profile",
+            "expected_generation",
+            "idempotency_key",
+        ),
+        (),
+    ),
+    (
+        "fleet_google_provision_plan",
+        "google.provision.plan",
+        "fleet.google.provision",
+        "Plan Google provisioning against fresh quota evidence.",
+        ("account_ref", "expected_generation", "idempotency_key"),
+        (),
+    ),
+    (
+        "fleet_google_provision_apply",
+        "google.provision.apply",
+        "fleet.google.provision",
+        "Apply one immutable Google provisioning plan.",
+        (
+            "account_ref",
+            "expected_generation",
+            "idempotency_key",
+            "plan_digest",
+        ),
+        (),
+    ),
+    (
+        "fleet_google_billing_plan",
+        "google.billing.plan",
+        "fleet.google.billing.bind",
+        "Plan one account-bound Google billing link.",
+        (
+            "account_ref",
+            "project_ref",
+            "billing_ref",
+            "expected_generation",
+            "idempotency_key",
+        ),
+        (),
+    ),
+    (
+        "fleet_google_billing_apply",
+        "google.billing.apply",
+        "fleet.google.billing.bind",
+        "Apply one immutable Google billing plan.",
+        (
+            "account_ref",
+            "project_ref",
+            "billing_ref",
+            "plan_id",
+            "expected_generation",
+            "idempotency_key",
+            "plan_digest",
+        ),
+        (),
+    ),
+    (
+        "fleet_operation_status",
+        "operations.get",
+        "fleet.read",
+        "Return one account-bound durable operation.",
+        ("account_ref", "operation_id"),
+        (),
+    ),
+)
+_MASTERJET_ADMIN_TOOL_ROUTES = MappingProxyType(
+    {
+        name: (operation, scope)
+        for name, operation, scope, *_rest in _MASTERJET_ADMIN_TOOL_SPECS
+    }
+)
+_MASTERJET_ADMIN_REQUEST_FIELDS = frozenset(
+    {"expected_generation", "idempotency_key", "plan_digest"}
+)
+
+
+def bind_masterjet_control_service(
+    service: MasterjetControlService,
+    principal: AdminPrincipalV1,
+) -> None:
+    """Bind one authenticated in-process admin service before serving requests."""
+
+    from codex_master.admin_contracts import AdminPrincipalV1
+    from codex_master.admin_service import MasterjetControlService
+
+    if (
+        type(service) is not MasterjetControlService
+        or type(principal) is not AdminPrincipalV1
+    ):
+        raise AgentError("control.service_unavailable")
+    global _MASTERJET_ADMIN_BINDING
+    with _MASTERJET_ADMIN_BINDING_LOCK:
+        if _MASTERJET_ADMIN_BINDING is not None:
+            raise AgentError("control.service_already_bound")
+        _MASTERJET_ADMIN_BINDING = (service, principal)
+
+
+def _masterjet_admin_tool_call(name: str, args: Mapping[str, object]) -> dict[str, Any]:
+    from codex_master.admin_contracts import AdminRequestV1, public_admin_result
+    from codex_master.admin_service import AdminServiceError
+
+    binding = _MASTERJET_ADMIN_BINDING
+    route = _MASTERJET_ADMIN_TOOL_ROUTES.get(name)
+    if binding is None or route is None:
+        raise AgentError("control.service_unavailable")
+    service, principal = binding
+    operation = route[0]
+    arguments = {
+        key: value
+        for key, value in args.items()
+        if key not in _MASTERJET_ADMIN_REQUEST_FIELDS
+    }
+    if name == "fleet_google_inventory" and "account_ref" in arguments:
+        operation = "google.projects.list"
+    request = AdminRequestV1(
+        operation,
+        arguments,
+        cast(int | None, args.get("expected_generation")),
+        cast(str | None, args.get("idempotency_key")),
+        cast(str | None, args.get("plan_digest")),
+    )
+    try:
+        return dict(service.handle(principal, request))
+    except AdminServiceError as exc:
+        raise MasterjetAdminError(
+            exc.problem.code, public_admin_result(exc.problem)
+        ) from None
+
+
+def _masterjet_visible_tools(
+    tools: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    binding = _MASTERJET_ADMIN_BINDING
+    scopes = frozenset() if binding is None else frozenset(binding[1].scopes)
+    return [
+        tool
+        for tool in tools
+        if tool["name"] not in _MASTERJET_ADMIN_TOOL_ROUTES
+        or _MASTERJET_ADMIN_TOOL_ROUTES[tool["name"]][1] in scopes
+    ]
+
+
+def _masterjet_admin_tool_definition(
+    name: str,
+    description: str,
+    required: tuple[str, ...],
+    optional: tuple[str, ...],
+) -> dict[str, Any]:
+    properties = {
+        field: (
+            {"type": "integer", "minimum": 0}
+            if field == "expected_generation"
+            else text_schema(2048 if field == "redirect_uri" else 128)
+        )
+        for field in (*required, *optional)
+    }
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        schema["required"] = list(required)
+    return {"name": name, "description": description, "inputSchema": schema}
+
+
+_MASTERJET_ADMIN_TOOLS = [
+    _masterjet_admin_tool_definition(name, description, required, optional)
+    for name, _operation, _scope, description, required, optional in _MASTERJET_ADMIN_TOOL_SPECS
+]
+
+
 TOOLS: list[dict[str, Any]] = [
+    *_MASTERJET_ADMIN_TOOLS,
     {
         "name": "agent_spawn_offers",
         "description": "Return short-lived, advisory spawn offers for currently admitted routes. Does not reserve capacity or return raw output.",
@@ -34626,7 +34857,7 @@ def handle_rpc(
                 if master_tool_access_status()["authorized"]
                 else []
             )
-        return reply(rpc_result(message_id, {"tools": tools}))
+        return reply(rpc_result(message_id, {"tools": _masterjet_visible_tools(tools)}))
     if method == "resources/list":
         return reply(rpc_result(message_id, {"resources": []}))
     if method == "prompts/list":
@@ -36227,6 +36458,59 @@ def _main_cli_impl(argv: list[str]) -> int:
 
     p_fleet = sub.add_parser("fleet")
     fleet_sub = p_fleet.add_subparsers(dest="fleet_namespace", required=True)
+    p_fleet_openai = fleet_sub.add_parser("openai")
+    openai_sub = p_fleet_openai.add_subparsers(
+        dest="fleet_openai_command", required=True
+    )
+    openai_sub.add_parser("list")
+    p_openai_auth_sync = openai_sub.add_parser("auth-sync")
+    p_openai_auth_sync.add_argument("--account-ref", required=True)
+    p_openai_auth_sync.add_argument("--expected-generation", type=int, required=True)
+    p_openai_auth_sync.add_argument("--idempotency-key", required=True)
+
+    p_fleet_google = fleet_sub.add_parser("google")
+    google_sub = p_fleet_google.add_subparsers(
+        dest="fleet_google_command", required=True
+    )
+    p_google_inventory = google_sub.add_parser("inventory")
+    p_google_inventory.add_argument("--account-ref")
+    p_google_oauth_begin = google_sub.add_parser("oauth-begin")
+    p_google_oauth_begin.add_argument("--account-ref", required=True)
+    p_google_oauth_begin.add_argument("--oauth-client-ref", required=True)
+    p_google_oauth_begin.add_argument("--redirect-uri", required=True)
+    p_google_oauth_begin.add_argument("--scope-profile", required=True)
+    p_google_oauth_begin.add_argument("--expected-generation", type=int, required=True)
+    p_google_oauth_begin.add_argument("--idempotency-key", required=True)
+
+    def add_google_plan_arguments(parser_obj: argparse.ArgumentParser) -> None:
+        parser_obj.add_argument("--account-ref", required=True)
+        parser_obj.add_argument("--expected-generation", type=int, required=True)
+        parser_obj.add_argument("--idempotency-key", required=True)
+
+    p_google_provision_plan = google_sub.add_parser("provision-plan")
+    add_google_plan_arguments(p_google_provision_plan)
+    p_google_provision_apply = google_sub.add_parser("provision-apply")
+    add_google_plan_arguments(p_google_provision_apply)
+    p_google_provision_apply.add_argument("--plan-digest", required=True)
+    p_google_billing_plan = google_sub.add_parser("billing-plan")
+    add_google_plan_arguments(p_google_billing_plan)
+    p_google_billing_plan.add_argument("--project-ref", required=True)
+    p_google_billing_plan.add_argument("--billing-ref", required=True)
+    p_google_billing_apply = google_sub.add_parser("billing-apply")
+    add_google_plan_arguments(p_google_billing_apply)
+    p_google_billing_apply.add_argument("--project-ref", required=True)
+    p_google_billing_apply.add_argument("--billing-ref", required=True)
+    p_google_billing_apply.add_argument("--plan-id", required=True)
+    p_google_billing_apply.add_argument("--plan-digest", required=True)
+
+    p_fleet_operation = fleet_sub.add_parser("operation")
+    operation_sub = p_fleet_operation.add_subparsers(
+        dest="fleet_operation_command", required=True
+    )
+    p_operation_status = operation_sub.add_parser("status")
+    p_operation_status.add_argument("--account-ref", required=True)
+    p_operation_status.add_argument("--operation-id", required=True)
+
     p_fleet_account = fleet_sub.add_parser("account")
     account_sub = p_fleet_account.add_subparsers(
         dest="fleet_account_command", required=True
@@ -36391,6 +36675,90 @@ def _main_cli_impl(argv: list[str]) -> int:
         if args.command in {"hive", "selection-status", "reset-anchor-run"}:
             return print_json(run_hive_cli(args))
         if args.command == "fleet":
+            if args.fleet_namespace == "openai":
+                if args.fleet_openai_command == "list":
+                    return print_json(call_validated_tool("fleet_openai_accounts", {}))
+                if args.fleet_openai_command == "auth-sync":
+                    return print_json(
+                        call_validated_tool(
+                            "fleet_openai_auth_plan",
+                            {
+                                "account_ref": args.account_ref,
+                                "expected_generation": args.expected_generation,
+                                "idempotency_key": args.idempotency_key,
+                            },
+                        )
+                    )
+            if args.fleet_namespace == "google":
+                if args.fleet_google_command == "inventory":
+                    return print_json(
+                        call_validated_tool(
+                            "fleet_google_inventory",
+                            {"account_ref": args.account_ref},
+                        )
+                    )
+                if args.fleet_google_command == "oauth-begin":
+                    return print_json(
+                        call_validated_tool(
+                            "fleet_google_oauth_begin",
+                            {
+                                "account_ref": args.account_ref,
+                                "oauth_client_ref": args.oauth_client_ref,
+                                "redirect_uri": args.redirect_uri,
+                                "scope_profile": args.scope_profile,
+                                "expected_generation": args.expected_generation,
+                                "idempotency_key": args.idempotency_key,
+                            },
+                        )
+                    )
+                common_google = {
+                    "account_ref": args.account_ref,
+                    "expected_generation": args.expected_generation,
+                    "idempotency_key": args.idempotency_key,
+                }
+                if args.fleet_google_command == "provision-plan":
+                    return print_json(
+                        call_validated_tool(
+                            "fleet_google_provision_plan", common_google
+                        )
+                    )
+                if args.fleet_google_command == "provision-apply":
+                    return print_json(
+                        call_validated_tool(
+                            "fleet_google_provision_apply",
+                            {**common_google, "plan_digest": args.plan_digest},
+                        )
+                    )
+                billing = {
+                    **common_google,
+                    "project_ref": args.project_ref,
+                    "billing_ref": args.billing_ref,
+                }
+                if args.fleet_google_command == "billing-plan":
+                    return print_json(
+                        call_validated_tool("fleet_google_billing_plan", billing)
+                    )
+                if args.fleet_google_command == "billing-apply":
+                    return print_json(
+                        call_validated_tool(
+                            "fleet_google_billing_apply",
+                            {
+                                **billing,
+                                "plan_id": args.plan_id,
+                                "plan_digest": args.plan_digest,
+                            },
+                        )
+                    )
+            if args.fleet_namespace == "operation":
+                return print_json(
+                    call_validated_tool(
+                        "fleet_operation_status",
+                        {
+                            "account_ref": args.account_ref,
+                            "operation_id": args.operation_id,
+                        },
+                    )
+                )
             if args.fleet_namespace == "account":
                 if args.fleet_account_command == "list":
                     return print_json(call_validated_tool("fleet_account_list", {}))
