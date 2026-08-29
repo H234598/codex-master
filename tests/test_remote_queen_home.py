@@ -152,6 +152,21 @@ def _absent_snapshot(manifest, **overrides):
     return QueenHomeSnapshotV1(**values)
 
 
+def _partial_active_absent_snapshot(manifest):
+    snapshot = _absent_snapshot(
+        manifest,
+        lease_active=False,
+        observed_lease_binding_digest=None,
+        observed_bus_cursor_sha256="sha256:" + "e" * 64,
+    )
+    object.__setattr__(
+        snapshot,
+        "active_topic_principal_id",
+        manifest.lease_binding.owner_principal_id,
+    )
+    return snapshot
+
+
 def _owned_snapshot(manifest, **overrides):
     values = dict(
         home=QueenHomeFactV1(
@@ -390,6 +405,35 @@ def test_resume_capsule_binds_authority_and_rejects_secret_schema_names():
     assert accepted_account.account_binding_sha256 == "sha256:" + "9" * 64
 
 
+def test_canonical_json_rejects_casefolded_sensitive_key_variants():
+    sensitive_keys = (
+        "Token",
+        "ToKen",
+        "ſECRET",
+        "Secret-Key",
+        "AUTH",
+        "Auth_Key",
+        "Authorization",
+        "Bearer",
+        "Bearer-Key",
+        "Bearer_Token",
+        "Client_Secret",
+        "PRIVATE_KEY",
+        "Private-Key",
+        "Body",
+        "Body_Key",
+        "Request_Body",
+        "Response-Body",
+    )
+
+    for key in sensitive_keys:
+        with pytest.raises(RemoteQueenBootstrapError) as caught:
+            canonical_json_bytes({"safe": {key: "redacted-value"}})
+        assert caught.value.code == "RQ_E_PLAN_INCONSISTENT"
+        assert str(caught.value) == "RQ_E_PLAN_INCONSISTENT"
+        assert "redacted-value" not in str(caught.value)
+
+
 def test_plan_matrix_and_port_exception_redaction():
     manifest = _manifest()
     absent = _absent_snapshot(manifest)
@@ -486,6 +530,41 @@ def test_plan_matrix_and_port_exception_redaction():
     )
 
 
+def test_absent_home_rejects_every_nonempty_active_topic_before_resume_checks():
+    manifest = _manifest()
+    snapshots = (
+        _absent_snapshot(
+            manifest,
+            active_topic_principal_id=manifest.lease_binding.owner_principal_id,
+            active_topic_home_path=manifest.home_path,
+            active_topic_lease_id=manifest.lease_binding.lease_id,
+            lease_active=False,
+            observed_lease_binding_digest=None,
+            observed_bus_cursor_sha256="sha256:" + "e" * 64,
+        ),
+        _absent_snapshot(
+            manifest,
+            active_topic_principal_id="foreign-principal",
+            active_topic_home_path="/home/foreign/.codex-agents/Queens/G18-foreign",
+            active_topic_lease_id="foreign-lease",
+            lease_active=False,
+            observed_lease_binding_digest=None,
+            observed_bus_cursor_sha256="sha256:" + "e" * 64,
+        ),
+        _partial_active_absent_snapshot(manifest),
+    )
+
+    for snapshot in snapshots:
+        operations = FakeOperations([snapshot])
+        _expect_code(
+            "RQ_E_BUS_TOPIC_CONFLICT",
+            plan_remote_queen_home,
+            manifest,
+            operations,
+        )
+        assert [call[0] for call in operations.calls] == ["inspect"]
+
+
 def test_apply_verify_rollback_call_contract_and_drift_gates():
     manifest = _manifest()
     before = _absent_snapshot(manifest)
@@ -575,27 +654,42 @@ def test_apply_verify_rollback_call_contract_and_drift_gates():
     )
 
 
+def _assert_allowed_imports(source):
+    tree = ast.parse(source)
+    allowed_imports = {"hashlib", "json", "re"}
+    allowed_import_from = {
+        "dataclasses": {"dataclass", "fields"},
+        "enum": {"Enum"},
+        "pathlib": {"PurePosixPath"},
+        "typing": {"Protocol"},
+        "codex_master.remote_queen_bootstrap": {
+            "ManifestGenerationV1",
+            "RemoteQueenBootstrapError",
+        },
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            assert all(alias.name in allowed_imports and alias.asname is None for alias in node.names)
+        if isinstance(node, ast.ImportFrom):
+            assert node.level == 0
+            assert node.module in allowed_import_from
+            assert all(
+                alias.name in allowed_import_from[node.module] and alias.asname is None
+                for alias in node.names
+            )
+
+
+def test_ast_import_gate_rejects_qualified_unapproved_project_importfrom():
+    source = "from codex_master.remote_queen_mcp import RemoteMcpFactV1"
+    with pytest.raises(AssertionError):
+        _assert_allowed_imports(source)
+
+
 def test_production_ast_has_only_allowed_dependencies_and_no_effect_calls():
     source_path = Path(__file__).parents[1] / "src" / "codex_master" / "remote_queen_home.py"
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
     forbidden = {
-        "os",
-        "subprocess",
-        "socket",
-        "ssl",
-        "http",
-        "urllib",
-        "asyncio",
-        "threading",
-        "multiprocessing",
-        "shutil",
-        "tempfile",
-        "requests",
-        "httpx",
-        "paramiko",
-        "fabric",
-        "anyio",
-        "trio",
         "open",
         "exec",
         "eval",
@@ -607,16 +701,12 @@ def test_production_ast_has_only_allowed_dependencies_and_no_effect_calls():
         "send",
         "receive",
     }
+    _assert_allowed_imports(source)
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            assert all(alias.name.split(".")[0] not in forbidden for alias in node.names)
-        if isinstance(node, ast.ImportFrom):
-            assert (node.module or "").split(".")[0] not in forbidden
-            if node.module == "codex_master.remote_queen_bootstrap":
-                assert {alias.name for alias in node.names} == {"ManifestGenerationV1", "RemoteQueenBootstrapError"}
         if isinstance(node, ast.Name):
             assert node.id not in forbidden
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             assert node.func.id not in forbidden
-    assert "codex_master.queen_runtime" not in source_path.read_text(encoding="utf-8")
-    assert "codex_master.worker_resume" not in source_path.read_text(encoding="utf-8")
+    assert "codex_master.remote_queen_mcp" not in source
+    assert "codex_master.queen_runtime" not in source
+    assert "codex_master.worker_resume" not in source

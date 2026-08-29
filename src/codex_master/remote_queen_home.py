@@ -273,10 +273,26 @@ class RemoteQueenHomeOperations(Protocol):
 
 _SECRET_FIELD_NAMES = (
     "token",
+    "accesstoken",
+    "refreshtoken",
+    "apitoken",
     "secret",
+    "clientsecret",
     "password",
     "cookie",
     "credential",
+    "auth",
+    "authtoken",
+    "authorization",
+    "authorizationheader",
+    "bearer",
+    "bearertoken",
+    "privatekey",
+    "privatekeydata",
+    "body",
+    "bodykey",
+    "requestbody",
+    "responsebody",
     "stdout",
     "stderr",
     "command",
@@ -396,6 +412,13 @@ def _valid_class_id(value: object) -> bool:
     return type(value) is str and value in ("generic", "queen", "g18-topic-queen")
 
 
+def _is_secret_field_name(value: str) -> bool:
+    normalized = value.casefold().replace("-", "").replace("_", "")
+    return normalized in _SECRET_FIELD_NAMES or (
+        normalized.endswith("key") and normalized[:-3] in _SECRET_FIELD_NAMES
+    )
+
+
 def _digest_payload(value: object) -> str:
     try:
         encoded = _json_bytes(_canonicalize(value))
@@ -438,7 +461,7 @@ def _canonicalize(value: object, omit_field: str | None = None) -> object:
     if type(value) is dict:
         result = {}
         for key, item in value.items():
-            if type(key) is not str or key in _SECRET_FIELD_NAMES:
+            if type(key) is not str or _is_secret_field_name(key):
                 _raise("RQ_E_PLAN_INCONSISTENT")
             result[key] = _canonicalize(item)
         return result
@@ -464,7 +487,7 @@ def _canonicalize(value: object, omit_field: str | None = None) -> object:
         _raise("RQ_E_PLAN_INCONSISTENT")
     result = {}
     for field in fields(value):
-        if field.name in _SECRET_FIELD_NAMES:
+        if _is_secret_field_name(field.name):
             _raise("RQ_E_PLAN_INCONSISTENT")
         if field.name == omit_field:
             continue
@@ -1009,6 +1032,10 @@ def _fully_owned(manifest: RemoteQueenHomeManifestV1, snapshot: QueenHomeSnapsho
 
 
 def _gate_snapshot(manifest: RemoteQueenHomeManifestV1, snapshot: QueenHomeSnapshotV1) -> None:
+    if type(snapshot) is QueenHomeSnapshotV1 and type(snapshot.home) is QueenHomeFactV1:
+        active = (snapshot.active_topic_principal_id, snapshot.active_topic_home_path, snapshot.active_topic_lease_id)
+        if snapshot.home.state is QueenHomeStateKindV1.ABSENT and any(item is not None for item in active):
+            _raise("RQ_E_BUS_TOPIC_CONFLICT")
     try:
         _validate_snapshot(snapshot)
     except RemoteQueenBootstrapError:
@@ -1065,10 +1092,6 @@ def plan_remote_queen_home(
 ) -> RemoteQueenHomePlanV1:
     _validate_manifest_input(manifest)
     snapshot = _inspect(operations, manifest, "RQ_E_RESUME_STALE")
-    try:
-        _validate_snapshot(snapshot)
-    except RemoteQueenBootstrapError:
-        _raise("RQ_E_FOREIGN_STATE")
     _gate_snapshot(manifest, snapshot)
     if _fully_absent(manifest, snapshot):
         return _make_plan(manifest, snapshot, QueenHomeActionV1.CREATE_HOME)
