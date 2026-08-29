@@ -113,7 +113,6 @@ def test_invalid_control_returns_exact_unavailable(control: object) -> None:
         {"schema_version": 1, "status": True, "raw_output": "not_returned"},
         {"schema_version": 1, "status": "started", "raw_output": None},
         {"schema_version": 1, "status": "started", "raw_output": "returned"},
-        {"schema_version": 2, "status": "started", "raw_output": "not_returned"},
         {"schema_version": 1, "status": "failed", "raw_output": "not_returned"},
         {
             "schema_version": 1,
@@ -149,6 +148,53 @@ def test_runtime_instances_hold_independent_controls_and_only_one_slot() -> None
     assert second_control.calls == 1
     with pytest.raises(FrozenInstanceError):
         first.dynamic_teamlead_control = None  # type: ignore[misc]
+
+
+def test_runtime_keeps_schema_v1_with_reason_code_in_v1_failure_family() -> None:
+    producer_result = {
+        "schema_version": 1,
+        "status": "started",
+        "raw_output": "not_returned",
+        "reason_code": "none",
+    }
+    control = RecordingControl(result=producer_result)
+    runtime = MasterjetRuntime(control)
+
+    first = runtime.start_dynamic_teamlead()
+    second = runtime.start_dynamic_teamlead()
+
+    assert first == UNAVAILABLE
+    assert second == UNAVAILABLE
+    assert first is not second
+    assert first is not producer_result
+    assert second is not producer_result
+    producer_result["reason_code"] = "private producer detail"
+    assert first == UNAVAILABLE
+    assert second == UNAVAILABLE
+    assert control.calls == 2
+
+
+def test_runtime_keeps_schema_v2_with_raw_output_in_v2_failure_family() -> None:
+    producer_result = {
+        "schema_version": 2,
+        "status": "started",
+        "raw_output": "not_returned",
+    }
+    control = RecordingControl(result=producer_result)
+    runtime = MasterjetRuntime(control)
+
+    first = runtime.start_dynamic_teamlead()
+    second = runtime.start_dynamic_teamlead()
+
+    assert first == V2_INVALID
+    assert second == V2_INVALID
+    assert first is not second
+    assert first is not producer_result
+    assert second is not producer_result
+    producer_result["raw_output"] = "private producer detail"
+    assert first == V2_INVALID
+    assert second == V2_INVALID
+    assert control.calls == 2
 
 
 @pytest.mark.parametrize(

@@ -16,10 +16,10 @@ def _unavailable() -> dict[str, int | str]:
 def _sparse_result(value: object) -> dict[str, int | str]:
     if type(value) is not dict:
         return _unavailable()
-    if "reason_code" in value or (
-        "schema_version" in value
-        and value.get("schema_version") != 1
-        and "raw_output" not in value
+    schema_version = value.get("schema_version")
+    if (type(schema_version) is int and schema_version == 2) or (
+        not (type(schema_version) is int and schema_version == 1)
+        and "reason_code" in value
     ):
         if any(type(key) is not str for key in value):
             return _v2_invalid()
