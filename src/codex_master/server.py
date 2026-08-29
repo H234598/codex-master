@@ -579,8 +579,14 @@ TEAMLEADER_TOOL_NAMES = frozenset(
         "hive_authority_check",
         "hive_admission_status",
         "agent_selection_status",
+        "hive_test_index_status",
+        "hive_test_plan",
+        "hive_test_run",
+        "hive_test_status",
+        "hive_test_invalidate",
     }
 )
+HIVE_TEST_MUTATING_TOOL_NAMES = frozenset({"hive_test_run", "hive_test_invalidate"})
 MAX_PAGED_OFFSET = 10_000_000
 PLUGIN_CACHE_ALLOWED_FILES = (
     ".app.json",
@@ -24500,6 +24506,8 @@ def call_tool(
 ) -> dict[str, Any]:
     authority_class = principal_class or "arbeitsbiene"
     if name in {tool["name"] for tool in hive_tool_definitions()}:
+        if name in HIVE_TEST_MUTATING_TOOL_NAMES and authority_class not in HIVE_PRINCIPAL_CLASSES:
+            raise AgentError("authority.scope_denied")
         return dict(call_hive_tool(name, args))
     if name == "fleet_overview":
         overview_format = str(args.get("format", "json"))
@@ -37318,13 +37326,15 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_raw_log_writer.add_argument("path")
     p_raw_log_writer.add_argument("--max-bytes", type=int, default=MAX_RAW_LOG_BYTES)
 
-    add_hive_cli_parsers(sub)
+    add_hive_cli_parsers(sub, fleet_subparsers=fleet_sub)
 
     args = parser.parse_args(argv)
     try:
         if args.command == "raw-log-writer":
             return write_bounded_raw_log(Path(args.path), args.max_bytes)
         if args.command in {"hive", "selection-status", "reset-anchor-run"}:
+            return print_json(run_hive_cli(args))
+        if args.command == "fleet" and args.fleet_namespace == "test":
             return print_json(run_hive_cli(args))
         if args.command == "fleet":
             if args.fleet_namespace == "account":

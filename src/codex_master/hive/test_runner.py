@@ -70,6 +70,18 @@ class TestEvidenceRunner:
     def runner_version_digest(self) -> str:
         return self._runner_version_digest
 
+    @property
+    def executor_fingerprint(self) -> str:
+        return self._executor_fingerprint
+
+    @property
+    def boot_id_digest(self) -> str:
+        return self._boot_id_digest
+
+    @property
+    def environment_digest(self) -> str:
+        return self._environment_digest
+
     def run(
         self,
         index: TestIndexV1,

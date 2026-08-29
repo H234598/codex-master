@@ -52,12 +52,29 @@ class PlannedTestV1:
     timeout_seconds: int
     gate_id: str | None
 
+    def public(self) -> dict[str, object]:
+        return {
+            "test_id": self.test_id,
+            "action": self.action,
+            "reason_code": self.reason_code,
+            "evidence_id": self.evidence_id,
+            "timeout_seconds": self.timeout_seconds,
+            "gate_id": self.gate_id,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class PlanResultV1:
     repository_id: str
     index_digest: str
     tests: tuple[PlannedTestV1, ...]
+
+    def public(self) -> dict[str, object]:
+        return {
+            "repository_id": self.repository_id,
+            "index_digest": self.index_digest,
+            "tests": [item.public() for item in self.tests],
+        }
 
 
 def evidence_context(
@@ -92,6 +109,7 @@ class TestPlanner:
         index: TestIndexV1,
         *,
         evidence: Mapping[str, EvidenceReceiptV1] | None = None,
+        revoked_evidence_ids: frozenset[str] = frozenset(),
         now_monotonic_ns: int,
         base_index: TestIndexV1 | None = None,
     ) -> PlanResultV1:
@@ -120,6 +138,10 @@ class TestPlanner:
                 evidence_context(request, index, test),
                 now_monotonic_ns=now_monotonic_ns,
                 mandatory_gate=test_id in gate_mandatory,
+                revoked=bool(
+                    receipts.get(test_id)
+                    and receipts[test_id].evidence_id in revoked_evidence_ids
+                ),
             )
             planned.append(
                 PlannedTestV1(
