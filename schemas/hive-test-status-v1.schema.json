@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-master.local/schemas/hive-test-status-v1.schema.json",
+  "title": "Hive Test Status V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "repository_id", "index_generation", "index_digest", "counts", "items"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "repository_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "index_generation": { "type": "integer", "minimum": 1 },
+    "index_digest": { "$ref": "#/$defs/digest" },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unverified", "running", "passed", "failed", "stale", "blocked"],
+      "properties": {
+        "unverified": { "$ref": "#/$defs/count" },
+        "running": { "$ref": "#/$defs/count" },
+        "passed": { "$ref": "#/$defs/count" },
+        "failed": { "$ref": "#/$defs/count" },
+        "stale": { "$ref": "#/$defs/count" },
+        "blocked": { "$ref": "#/$defs/count" }
+      }
+    },
+    "items": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "test_id",
+          "status",
+          "last_duration_ms",
+          "cooldown_class",
+          "reuse_eligible",
+          "remaining_cooldown_seconds",
+          "reason_code"
+        ],
+        "properties": {
+          "test_id": { "type": "string", "minLength": 1, "maxLength": 2048 },
+          "status": { "enum": ["unverified", "running", "passed", "failed", "stale", "blocked"] },
+          "last_duration_ms": {
+            "oneOf": [
+              { "type": "integer", "minimum": 0, "maximum": 86400000 },
+              { "type": "null" }
+            ]
+          },
+          "cooldown_class": { "enum": ["deterministic", "integration", "environmental", "external", "mandatory"] },
+          "reuse_eligible": { "type": "boolean" },
+          "remaining_cooldown_seconds": { "type": "integer", "minimum": 0, "maximum": 1800 },
+          "reason_code": { "type": "string", "minLength": 1, "maxLength": 128 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 100000 }
+  }
+}
