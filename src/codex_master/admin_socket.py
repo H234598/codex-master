@@ -606,6 +606,13 @@ def local_attestation_verifier(
 
     if type(attestation_key_fd) is not int or attestation_key_fd < 0:
         raise AdminSocketError(_problem("control.attestation_required"))
+    key_probe = bytearray()
+    try:
+        key_probe = _load_attestation_key(attestation_key_fd)
+    except _SocketFailure:
+        raise AdminSocketError(_problem("control.attestation_required")) from None
+    finally:
+        key_probe[:] = b"\0" * len(key_probe)
 
     def verify(pid: int, uid: int, gid: int, connection: socket.socket) -> bool:
         try:

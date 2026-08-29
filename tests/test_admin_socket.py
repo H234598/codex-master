@@ -409,31 +409,31 @@ def test_server_creates_owner_only_parent_and_socket(server: _RunningServer) -> 
 def test_usage_compatible_attestation_verifier_authenticates_connection(
     server: _RunningServer,
 ) -> None:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(2)
-        connection.connect(os.fspath(server.path))
-        pid, uid, gid = struct.unpack(
-            "3i",
-            connection.getsockopt(
-                socket.SOL_SOCKET,
-                socket.SO_PEERCRED,
-                struct.calcsize("3i"),
-            ),
-        )
-        verifier = getattr(admin_socket, "local_attestation_verifier")(
-            server.attestation_key_fd
-        )
+    verifier = local_attestation_verifier(server.attestation_key_fd)
+    for _attempt in range(2):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(os.fspath(server.path))
+            pid, uid, gid = struct.unpack(
+                "3i",
+                connection.getsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_PEERCRED,
+                    struct.calcsize("3i"),
+                ),
+            )
 
-        assert verifier(pid, uid, gid, connection) is True
+            assert verifier(pid, uid, gid, connection) is True
 
-        connection.sendall(
-            _wire_request(AdminRequestV1("hosts.list", {}, None, None, None))
-        )
-        connection.shutdown(socket.SHUT_WR)
-        reply = json.loads(_recv_line(connection))
+            connection.sendall(
+                _wire_request(AdminRequestV1("hosts.list", {}, None, None, None))
+            )
+            connection.shutdown(socket.SHUT_WR)
+            reply = json.loads(_recv_line(connection))
 
-    assert reply["ok"] is True
-    assert len(server.authorize_calls) == 1
+        assert reply["ok"] is True
+    assert len(server.authorize_calls) == 2
+    assert os.fstat(server.attestation_key_fd)
 
 
 def test_missing_attestation_key_fails_closed_before_request(
@@ -493,6 +493,64 @@ def test_invalid_attestation_key_fd_is_typed_and_redacted(
         assert raised.value.problem.code == "control.attestation_required"
         assert repr(raised.value) == "AdminSocketError('control.attestation_required')"
         assert "private-marker" not in str(raised.value)
+
+
+def test_usage_verifier_factory_rejects_closed_positive_key_fd(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "private-marker-closed-attestation.key"
+    path.write_bytes(b"private-marker-closed-attestation-key")
+    path.chmod(0o600)
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    os.close(fd)
+    before = _fd_count()
+
+    with pytest.raises(AdminSocketError) as raised:
+        local_attestation_verifier(fd)
+
+    assert raised.value.problem.code == "control.attestation_required"
+    assert repr(raised.value) == "AdminSocketError('control.attestation_required')"
+    assert "private-marker" not in str(raised.value)
+    assert _fd_count() == before
+
+
+@pytest.mark.parametrize("invalidity", ["write-only", "private-mode-drift"])
+def test_usage_verifier_factory_rejects_unreadable_or_drifting_key_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalidity: str,
+) -> None:
+    path = tmp_path / "private-marker-invalid-attestation.key"
+    path.write_bytes(b"private-marker-invalid-attestation-key")
+    path.chmod(0o600)
+    flags = os.O_WRONLY if invalidity == "write-only" else os.O_RDONLY
+    fd = os.open(path, flags | os.O_CLOEXEC | os.O_NOFOLLOW)
+    if invalidity == "private-mode-drift":
+        real_fstat = os.fstat
+        calls = 0
+
+        def drifting_fstat(candidate: int) -> os.stat_result:
+            nonlocal calls
+            metadata = real_fstat(candidate)
+            if candidate == fd:
+                calls += 1
+                if calls == 1:
+                    path.chmod(0o644)
+            return metadata
+
+        monkeypatch.setattr(admin_socket.os, "fstat", drifting_fstat)
+    before = _fd_count()
+    try:
+        with pytest.raises(AdminSocketError) as raised:
+            local_attestation_verifier(fd)
+
+        assert raised.value.problem.code == "control.attestation_required"
+        assert repr(raised.value) == "AdminSocketError('control.attestation_required')"
+        assert "private-marker" not in str(raised.value)
+        assert _fd_count() == before
+        assert os.fstat(fd)
+    finally:
+        os.close(fd)
 
 
 def test_wrong_attestation_key_sends_no_secret_fd(
@@ -642,6 +700,32 @@ def test_usage_verifier_rejects_connection_identity_swap(
         )
 
     assert server.ingress.put_calls == 0
+
+
+def test_usage_verifier_rereads_key_fd_after_factory_construction(
+    server: _RunningServer,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "drifting-attestation.key"
+    path.write_bytes(os.pread(server.attestation_key_fd, 4096, 0))
+    path.chmod(0o600)
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        verifier = local_attestation_verifier(fd)
+        path.chmod(0o644)
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(os.fspath(server.path))
+            assert (
+                verifier(os.getpid(), os.geteuid(), os.getegid(), connection) is False
+            )
+
+        assert os.fstat(fd)
+    finally:
+        os.close(fd)
+
+    assert server.authorize_calls == []
 
 
 def test_attestation_timeout_is_typed_and_redacted(
