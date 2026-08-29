@@ -44,6 +44,7 @@ def test_unit_passes_every_secret_only_as_a_systemd_credential() -> None:
         "admin-totp:/etc/codex-master-admin/admin-totp",
         "admin-attestation:/etc/codex-master-admin/admin-attestation",
         "admin-vault-key:/etc/codex-master-admin/admin-vault-key",
+        "admin-quota-evidence:/etc/codex-master-admin/admin-quota-evidence.json",
     ]
     assert "Environment" not in service
     assert "EnvironmentFile" not in service

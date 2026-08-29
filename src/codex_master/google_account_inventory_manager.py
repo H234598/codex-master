@@ -417,6 +417,19 @@ class GoogleAccountInventoryManager:
         )
 
     @classmethod
+    def from_systemd_state_directory(cls) -> GoogleAccountInventoryManager:
+        manager = cls.__new__(cls)
+        manager._initialize(
+            GoogleAccountInventoryLoader.from_systemd_state_directory().load,
+            monotonic_clock=time.monotonic,
+            operator_timestamp_utc=lambda: time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            ),
+            source_type=InventorySourceTypeV1.CANONICAL_YAML,
+        )
+        return manager
+
+    @classmethod
     def _for_test_loader(
         cls,
         document_loader: Callable[[], GoogleAccountInventoryDocumentV1],

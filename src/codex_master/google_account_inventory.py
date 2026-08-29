@@ -91,6 +91,27 @@ class GoogleAccountInventoryError(Exception):
         return f"GoogleAccountInventoryError({self.code!r})"
 
 
+def systemd_google_account_inventory_path() -> Path:
+    """Resolve the fixed inventory name inside systemd's private state directory."""
+
+    raw = os.environ.get("STATE_DIRECTORY")
+    if raw is None or not raw or ":" in raw:
+        raise GoogleAccountInventoryError("credential.inventory_unavailable")
+    root = Path(raw)
+    try:
+        metadata = os.lstat(root)
+    except OSError:
+        raise GoogleAccountInventoryError("credential.inventory_unavailable") from None
+    if (
+        not root.is_absolute()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise GoogleAccountInventoryError("credential.inventory_unavailable")
+    return root / DEFAULT_GOOGLE_ACCOUNT_INVENTORY_PATH.name
+
+
 _T = TypeVar("_T")
 
 
@@ -274,6 +295,12 @@ class GoogleAccountInventoryLoader:
 
     def __init__(self) -> None:
         self._path = DEFAULT_GOOGLE_ACCOUNT_INVENTORY_PATH
+
+    @classmethod
+    def from_systemd_state_directory(cls) -> GoogleAccountInventoryLoader:
+        loader = cls.__new__(cls)
+        loader._path = systemd_google_account_inventory_path()
+        return loader
 
     @classmethod
     def _for_test_path(cls, path: Path) -> GoogleAccountInventoryLoader:

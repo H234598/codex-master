@@ -483,7 +483,7 @@ class _AdminHandler(BaseHTTPRequestHandler):
 class AdminHttpServer(ThreadingHTTPServer):
     """Threaded HTTP origin with explicit private bind and auth authority."""
 
-    daemon_threads = False
+    daemon_threads = True
     block_on_close = False
     allow_reuse_address = True
 
@@ -543,7 +543,14 @@ class AdminHttpServer(ThreadingHTTPServer):
         self._active_handlers = 0
         self._accepting = True
         self._authorities_closed = False
+        self._serving = threading.Event()
         super().__init__(address, _AdminHandler)
+
+    def service_actions(self) -> None:
+        self._serving.set()
+
+    def wait_serving(self, timeout_seconds: float) -> bool:
+        return self._serving.wait(timeout_seconds)
 
     def get_request(self) -> tuple[socket.socket, object]:
         connection, client_address = super().get_request()

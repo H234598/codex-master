@@ -228,7 +228,7 @@ class AdminSocketServer:
                     target=self._serve,
                     args=(listener, stop),
                     name="masterjet-admin-socket",
-                    daemon=False,
+                    daemon=True,
                 )
                 self._listener = listener
                 self._stop = stop
@@ -263,21 +263,27 @@ class AdminSocketServer:
                 pass
         if thread is not None:
             thread.join(_SHUTDOWN_TIMEOUT_SECONDS)
-            if thread.is_alive():
-                raise AdminSocketError(_problem("control.socket_shutdown_incomplete"))
+        incomplete = thread is not None and thread.is_alive()
         with self._state_lock:
             if self._thread is thread:
-                self._remove_owned_socket()
-                self._close_parent()
+                self._unlink_owned_socket()
                 self._listener = None
-                self._active_connection = None
-                self._stop = None
-                self._thread = None
+                if not incomplete:
+                    self._socket_identity = None
+                    self._close_parent()
+                    self._active_connection = None
+                    self._stop = None
+                    self._thread = None
+        if incomplete:
+            raise AdminSocketError(_problem("control.socket_shutdown_incomplete"))
 
     def _remove_owned_socket(self) -> None:
+        self._unlink_owned_socket()
+        self._socket_identity = None
+
+    def _unlink_owned_socket(self) -> None:
         identity = self._socket_identity
         parent = self._parent
-        self._socket_identity = None
         if identity is None or parent is None:
             return
         try:

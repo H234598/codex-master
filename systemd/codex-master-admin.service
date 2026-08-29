@@ -21,6 +21,7 @@ LoadCredential=admin-bearer:/etc/codex-master-admin/admin-bearer
 LoadCredential=admin-totp:/etc/codex-master-admin/admin-totp
 LoadCredential=admin-attestation:/etc/codex-master-admin/admin-attestation
 LoadCredential=admin-vault-key:/etc/codex-master-admin/admin-vault-key
+LoadCredential=admin-quota-evidence:/etc/codex-master-admin/admin-quota-evidence.json
 ExecStart=/usr/bin/codex-master-admin
 Restart=on-failure
 RestartSec=5s

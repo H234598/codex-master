@@ -58,6 +58,15 @@ class GoogleInventoryStore:
         self._path = _inventory.DEFAULT_GOOGLE_ACCOUNT_INVENTORY_PATH
 
     @classmethod
+    def from_systemd_state_directory(cls) -> GoogleInventoryStore:
+        store = cls.__new__(cls)
+        try:
+            store._path = _inventory.systemd_google_account_inventory_path()
+        except _inventory.GoogleAccountInventoryError:
+            _raise("inventory.store_unavailable")
+        return store
+
+    @classmethod
     def _for_test_path(cls, path: Path) -> GoogleInventoryStore:
         store = cls.__new__(cls)
         store._path = path

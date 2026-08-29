@@ -1518,7 +1518,7 @@ def test_close_is_bounded_and_fail_closed_for_blocked_authorizer(
         assert worker.is_alive()
         assert getattr(adapter, "_thread") is worker
         assert getattr(adapter, "_parent") is not None
-        assert adapter.path.exists()
+        assert not adapter.path.exists()
 
         with pytest.raises(AdminSocketError, match="control.socket_invalid"):
             adapter.start()
@@ -1590,7 +1590,7 @@ def test_close_is_bounded_and_fail_closed_for_blocked_service_owner(
         assert worker.is_alive()
         assert getattr(adapter, "_thread") is worker
         assert getattr(adapter, "_socket_identity") is not None
-        assert adapter.path.exists()
+        assert not adapter.path.exists()
 
         with pytest.raises(AdminSocketError, match="control.socket_invalid"):
             adapter.start()

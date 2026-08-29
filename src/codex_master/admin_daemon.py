@@ -40,8 +40,11 @@ _KID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z", re.ASCII)
 class AdminDaemonStartupError(RuntimeError):
     """Stable failure before readiness was published."""
 
-    def __init__(self) -> None:
-        super().__init__("control.admin_startup_failed")
+    def __init__(self, failures: Sequence[str] = ()) -> None:
+        self.failures = tuple(failures)
+        detail = ";".join(self.failures)
+        message = "control.admin_startup_failed"
+        super().__init__(f"{message};{detail}" if detail else message)
 
 
 class AdminDaemonShutdownError(RuntimeError):
@@ -210,6 +213,7 @@ class RefreshingCloudflareAccessVerifier:
         max_token_age_seconds: int = 600,
         refresh_interval_seconds: float = JWKS_REFRESH_INTERVAL_SECONDS,
         refresh_timeout_seconds: float = JWKS_REFRESH_TIMEOUT_SECONDS,
+        unknown_kid_cooldown_seconds: float = 30.0,
     ) -> None:
         if (
             not callable(loader)
@@ -220,6 +224,9 @@ class RefreshingCloudflareAccessVerifier:
             or type(refresh_timeout_seconds) not in {int, float}
             or not math.isfinite(refresh_timeout_seconds)
             or refresh_timeout_seconds <= 0
+            or type(unknown_kid_cooldown_seconds) not in {int, float}
+            or not math.isfinite(unknown_kid_cooldown_seconds)
+            or unknown_kid_cooldown_seconds <= 0
         ):
             raise AdminAuthError("authority.configuration_invalid")
         current = _jwks_keys(initial_jwks)
@@ -241,6 +248,7 @@ class RefreshingCloudflareAccessVerifier:
         self._max_token_age_seconds = max_token_age_seconds
         self._refresh_interval = float(refresh_interval_seconds)
         self._refresh_timeout = float(refresh_timeout_seconds)
+        self._unknown_kid_cooldown = float(unknown_kid_cooldown_seconds)
         self._state_lock = threading.RLock()
         self._refresh_lock = threading.Lock()
         self._stop = threading.Event()
@@ -252,6 +260,8 @@ class RefreshingCloudflareAccessVerifier:
         self._current = current
         self._previous: tuple[dict[str, object], ...] = ()
         self._refreshed_at: float | None = None
+        self._generation = 0
+        self._unknown_kid_retry_after = 0.0
         self._closed = False
 
     def _candidate(
@@ -280,15 +290,39 @@ class RefreshingCloudflareAccessVerifier:
         with self._state_lock:
             verifier = self._verifier
             known_kids = verifier.jwks_kids
+            generation = self._generation
+            retry_after = self._unknown_kid_retry_after
         if (
             type(kid) is str
             and _KID.fullmatch(kid) is not None
             and kid not in known_kids
+            and time.monotonic() >= retry_after
         ):
-            self.refresh()
+            self._refresh_unknown_kid(generation)
             with self._state_lock:
                 verifier = self._verifier
         return verifier.verify(assertion)
+
+    def _refresh_unknown_kid(self, observed_generation: int) -> None:
+        deadline = time.monotonic() + self._refresh_timeout
+        if not self._refresh_lock.acquire(timeout=self._refresh_timeout):
+            return
+        try:
+            with self._state_lock:
+                now = time.monotonic()
+                if (
+                    self._closed
+                    or self._generation != observed_generation
+                    or now < self._unknown_kid_retry_after
+                ):
+                    return
+            self._refresh_locked(deadline)
+            with self._state_lock:
+                self._unknown_kid_retry_after = (
+                    time.monotonic() + self._unknown_kid_cooldown
+                )
+        finally:
+            self._refresh_lock.release()
 
     def _load(self) -> None:
         value: Mapping[str, object] | None = None
@@ -332,11 +366,16 @@ class RefreshingCloudflareAccessVerifier:
         if not self._refresh_lock.acquire(timeout=self._refresh_timeout):
             return False
         try:
+            return self._refresh_locked(deadline)
+        finally:
+            self._refresh_lock.release()
+
+    def _refresh_locked(self, deadline: float) -> bool:
+        try:
             with self._state_lock:
                 if self._closed:
                     return False
-            remaining = max(0.0, deadline - time.monotonic())
-            replacement = self._load_bounded(remaining)
+            replacement = self._load_bounded(max(0.0, deadline - time.monotonic()))
             if replacement is None:
                 return False
             replacement_keys = _jwks_keys(replacement)
@@ -358,11 +397,10 @@ class RefreshingCloudflareAccessVerifier:
                 self._previous = previous
                 self._current = replacement_keys
                 self._refreshed_at = float(refreshed_at)
+                self._generation += 1
             return True
         except Exception:
             return False
-        finally:
-            self._refresh_lock.release()
 
     def _periodic(self) -> None:
         while not self._stop.wait(self._refresh_interval):
@@ -375,7 +413,7 @@ class RefreshingCloudflareAccessVerifier:
             thread = threading.Thread(
                 target=self._periodic,
                 name="masterjet-admin-jwks-refresh",
-                daemon=False,
+                daemon=True,
             )
             self._periodic_thread = thread
             thread.start()
@@ -433,6 +471,8 @@ class _HttpAdapter(Protocol):
     service: MasterjetControlService
 
     def serve_forever(self, *, poll_interval: float = 0.5) -> None: ...
+
+    def wait_serving(self, timeout_seconds: float) -> bool: ...
 
     def shutdown(self) -> None: ...
 
@@ -492,10 +532,16 @@ class AdminDaemon:
         self._http_failure: BaseException | None = None
         self._started = False
         self._stopping = False
+        self._incomplete_resources: tuple[str, ...] = ()
 
     @property
     def ready(self) -> bool:
         return self._ready.is_set()
+
+    @property
+    def incomplete_resources(self) -> tuple[str, ...]:
+        with self._state_lock:
+            return self._incomplete_resources
 
     def wait_ready(self, timeout_seconds: float) -> bool:
         return self._ready.wait(timeout_seconds)
@@ -522,7 +568,7 @@ class AdminDaemon:
 
     def start(self) -> None:
         with self._state_lock:
-            if self._started or self._stopping:
+            if self._started or self._stopping or self._incomplete_resources:
                 raise AdminDaemonStartupError
         socket_adapter: _SocketAdapter | None = None
         http_adapter: _HttpAdapter | None = None
@@ -538,28 +584,36 @@ class AdminDaemon:
                 target=self._serve_http,
                 args=(http_adapter,),
                 name="masterjet-admin-http",
-                daemon=False,
+                daemon=True,
             )
             with self._state_lock:
                 self._socket = socket_adapter
                 self._http = http_adapter
                 self._http_thread = http_thread
             http_thread.start()
+            if not http_adapter.wait_serving(self._shutdown_timeout):
+                raise RuntimeError("control.http_serve_failed")
+            with self._state_lock:
+                if self._http_failure is not None or not http_thread.is_alive():
+                    raise RuntimeError("control.http_serve_failed")
             if self._jwks_refresher is not None:
                 self._jwks_refresher.start()
                 refresher_started = True
+            with self._state_lock:
+                if self._http_failure is not None or not http_thread.is_alive():
+                    raise RuntimeError("control.http_serve_failed")
             self._notifier("READY=1")
             with self._state_lock:
                 self._started = True
                 self._ready.set()
         except BaseException:
-            self._rollback_startup(
+            failures = self._rollback_startup(
                 socket_adapter,
                 http_adapter,
                 http_thread,
                 refresher_started=refresher_started,
             )
-            raise AdminDaemonStartupError from None
+            raise AdminDaemonStartupError(failures) from None
 
     def _rollback_startup(
         self,
@@ -568,36 +622,108 @@ class AdminDaemon:
         http_thread: threading.Thread | None,
         *,
         refresher_started: bool,
-    ) -> None:
-        if http_adapter is not None:
-            try:
-                if http_thread is not None and http_thread.is_alive():
-                    http_adapter.shutdown()
-                    http_thread.join(self._shutdown_timeout)
-                http_adapter.drain(0)
-                http_adapter.server_close()
-                http_adapter.close_authorities()
-            except BaseException:
-                pass
+    ) -> tuple[str, ...]:
+        deadline = time.monotonic() + self._shutdown_timeout
+        owners: list[tuple[str, Callable[[], None], str]] = []
         if socket_adapter is not None:
-            try:
-                socket_adapter.close()
-            except BaseException:
-                pass
-        if refresher_started and self._jwks_refresher is not None:
-            try:
-                self._jwks_refresher.close(self._shutdown_timeout)
-            except BaseException:
-                pass
+            owners.append(
+                ("socket", socket_adapter.close, "control.socket_shutdown_incomplete")
+            )
+        if http_adapter is not None:
+            owners.append(
+                (
+                    "http",
+                    lambda: self._close_http(http_adapter, http_thread, deadline),
+                    "control.http_shutdown_incomplete",
+                )
+            )
+        refresher = self._jwks_refresher
+        if refresher_started and refresher is not None:
+            owners.append(
+                (
+                    "jwks",
+                    lambda: refresher.close(max(0.0, deadline - time.monotonic())),
+                    "authority.jwks_shutdown_incomplete",
+                )
+            )
+        failures, incomplete = self._run_owner_cleanup(owners, deadline)
         with self._state_lock:
-            self._socket = None
-            self._http = None
-            self._http_thread = None
+            self._socket = socket_adapter if "socket" in incomplete else None
+            self._http = http_adapter if "http" in incomplete else None
+            self._http_thread = http_thread if "http" in incomplete else None
+            self._incomplete_resources = incomplete
             self._ready.clear()
+        return failures
+
+    def _close_http(
+        self,
+        http_adapter: _HttpAdapter,
+        http_thread: threading.Thread | None,
+        deadline: float,
+    ) -> None:
+        failures: list[str] = []
+        for action in (
+            http_adapter.shutdown,
+            lambda: self._join_http(http_thread, deadline),
+            lambda: http_adapter.drain(max(0.0, deadline - time.monotonic())),
+            http_adapter.server_close,
+            http_adapter.close_authorities,
+        ):
+            try:
+                action()
+            except BaseException as error:
+                failures.append(_failure_code(error))
+        if failures:
+            raise AdminDaemonShutdownError(tuple(dict.fromkeys(failures)))
+
+    @staticmethod
+    def _join_http(thread: threading.Thread | None, deadline: float) -> None:
+        if thread is None:
+            return
+        thread.join(max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            raise RuntimeError("control.http_shutdown_incomplete")
+
+    @staticmethod
+    def _run_owner_cleanup(
+        owners: Sequence[tuple[str, Callable[[], None], str]],
+        deadline: float,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        errors: dict[str, str] = {}
+        threads: list[tuple[str, threading.Thread, str]] = []
+
+        def invoke(name: str, action: Callable[[], None]) -> None:
+            try:
+                action()
+            except BaseException as error:
+                errors[name] = _failure_code(error)
+
+        for name, action, timeout_code in owners:
+            thread = threading.Thread(
+                target=invoke,
+                args=(name, action),
+                name=f"masterjet-admin-{name}-shutdown",
+                daemon=True,
+            )
+            threads.append((name, thread, timeout_code))
+            thread.start()
+        incomplete: list[str] = []
+        failures: list[str] = []
+        for name, thread, timeout_code in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                incomplete.append(name)
+                failures.append(timeout_code)
+            elif name in errors:
+                incomplete.append(name)
+                failures.append(errors[name])
+        return tuple(dict.fromkeys(failures)), tuple(incomplete)
 
     def stop(self) -> None:
         with self._state_lock:
-            if not self._started:
+            was_started = self._started
+            retrying = bool(self._incomplete_resources)
+            if not was_started and not retrying:
                 return
             if self._stopping:
                 raise AdminDaemonShutdownError(("control.admin_shutdown_incomplete",))
@@ -606,71 +732,55 @@ class AdminDaemon:
             http_adapter = self._http
             http_thread = self._http_thread
             self._ready.clear()
-        failures: list[str] = []
         deadline = time.monotonic() + self._shutdown_timeout
         try:
-            try:
-                self._notifier("STOPPING=1")
-            except BaseException as error:
-                failures.append(_failure_code(error))
-
-            http_shutdown_failure: list[BaseException] = []
-
-            def stop_http_admission() -> None:
-                assert http_adapter is not None
+            failures: list[str] = []
+            if was_started:
                 try:
-                    http_adapter.shutdown()
+                    self._notifier("STOPPING=1")
                 except BaseException as error:
-                    http_shutdown_failure.append(error)
+                    failures.append(_failure_code(error))
 
-            shutdown_thread: threading.Thread | None = None
-            if http_adapter is not None:
-                shutdown_thread = threading.Thread(
-                    target=stop_http_admission,
-                    name="masterjet-admin-http-shutdown",
-                    daemon=True,
-                )
-                shutdown_thread.start()
+            owners: list[tuple[str, Callable[[], None], str]] = []
             if socket_adapter is not None:
-                try:
-                    socket_adapter.close()
-                except BaseException as error:
-                    failures.append(_failure_code(error))
-            if shutdown_thread is not None:
-                shutdown_thread.join(max(0.0, deadline - time.monotonic()))
-                if shutdown_thread.is_alive():
-                    failures.append("control.http_shutdown_incomplete")
-                elif http_shutdown_failure:
-                    failures.append(_failure_code(http_shutdown_failure[0]))
-            if http_thread is not None:
-                http_thread.join(max(0.0, deadline - time.monotonic()))
-                if http_thread.is_alive():
-                    failures.append("control.http_shutdown_incomplete")
-            if (
-                http_adapter is not None
-                and "control.http_shutdown_incomplete" not in failures
+                owners.append(
+                    (
+                        "socket",
+                        socket_adapter.close,
+                        "control.socket_shutdown_incomplete",
+                    )
+                )
+            if http_adapter is not None:
+                owners.append(
+                    (
+                        "http",
+                        lambda: self._close_http(http_adapter, http_thread, deadline),
+                        "control.http_shutdown_incomplete",
+                    )
+                )
+            refresher = self._jwks_refresher
+            if refresher is not None and (
+                was_started or "jwks" in self._incomplete_resources
             ):
-                try:
-                    http_adapter.drain(max(0.0, deadline - time.monotonic()))
-                    http_adapter.server_close()
-                    http_adapter.close_authorities()
-                except BaseException as error:
-                    failures.append(_failure_code(error))
-            if self._jwks_refresher is not None:
-                try:
-                    self._jwks_refresher.close(max(0.0, deadline - time.monotonic()))
-                except BaseException as error:
-                    failures.append(_failure_code(error))
+                owners.append(
+                    (
+                        "jwks",
+                        lambda: refresher.close(max(0.0, deadline - time.monotonic())),
+                        "authority.jwks_shutdown_incomplete",
+                    )
+                )
+            owner_failures, incomplete = self._run_owner_cleanup(owners, deadline)
+            failures.extend(owner_failures)
             with self._state_lock:
-                if self._http_failure is not None:
+                if was_started and self._http_failure is not None:
                     failures.append(_failure_code(self._http_failure))
+                self._incomplete_resources = incomplete
+                self._socket = socket_adapter if "socket" in incomplete else None
+                self._http = http_adapter if "http" in incomplete else None
+                self._http_thread = http_thread if "http" in incomplete else None
+                self._started = False
             if failures:
                 raise AdminDaemonShutdownError(tuple(dict.fromkeys(failures)))
-            with self._state_lock:
-                self._socket = None
-                self._http = None
-                self._http_thread = None
-                self._started = False
         finally:
             with self._state_lock:
                 self._stopping = False
@@ -709,11 +819,22 @@ def _systemd_notify(message: str) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Fail closed until all real business-owner constructors can be composed."""
+    """Run the installed owner graph, emitting only stable code-only failures."""
 
-    del argv
-    sys.stderr.write("codex-master-admin: control.owner_composition_unavailable\n")
-    return os.EX_CONFIG
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
+    if arguments:
+        sys.stderr.write("codex-master-admin: control.admin_arguments_invalid\n")
+        return os.EX_USAGE
+    try:
+        from .admin_assembly import assemble_admin_runtime
+
+        runtime = assemble_admin_runtime()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        sys.stderr.write("codex-master-admin: control.admin_configuration_invalid\n")
+        return os.EX_CONFIG
+    return runtime.run()
 
 
 if __name__ == "__main__":
