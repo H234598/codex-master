@@ -16,6 +16,7 @@ from codex_master.hive import state as hive_state_module
 from codex_master.hive.state import HiveStateStore
 from codex_master.resource_monitor_r2c_contract import (
     CpuCountersV1,
+    HostResourceInputBackend,
     LegacyPressureV1,
     ResourceClocks,
     ResourceEvidenceStateV2,
@@ -41,6 +42,40 @@ NOW = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
 BOOT_ID = "123e4567-e89b-12d3-a456-426614174000"
 RESOURCE_EVIDENCE_V2_PATH = PurePosixPath("resources/resource-evidence-v2.json")
 THERMAL_POLICY_PATH = PurePosixPath("resources/thermal-policy-v1.json")
+
+
+def test_host_backend_constructor_requires_monotonic_clock() -> None:
+    backend = HostResourceInputBackend(monotonic_seconds=lambda: 1.0)
+    assert callable(backend._monotonic_seconds)
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        HostResourceInputBackend(monotonic_seconds=None)  # type: ignore[arg-type]
+
+
+def test_host_backend_reads_only_allowlisted_kernel_files() -> None:
+    backend = HostResourceInputBackend(monotonic_seconds=lambda: 1.0)
+    assert backend.read_private_kernel_bytes(Path("/proc/loadavg"), max_bytes=4096)
+    with pytest.raises(ResourceSnapshotError, match="^resource_monitor_unavailable$"):
+        backend.read_private_kernel_bytes(Path("/etc/hostname"), max_bytes=4096)
+
+
+def test_host_backend_rejects_noncanonical_sensors_invocation() -> None:
+    backend = HostResourceInputBackend(monotonic_seconds=lambda: 1.0)
+    with pytest.raises(ResourceSnapshotError, match="^temperature_monitor_unavailable$"):
+        backend.run_sensors_json(
+            argv=("/usr/bin/sensors", "--json"),
+            environment={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"},
+            stdin_closed=True,
+            timeout_seconds=2.0,
+            max_stdout_bytes=1024 * 1024,
+            max_stderr_bytes=64 * 1024,
+        )
+
+
+def test_resource_clocks_post_init_rejects_noncallables() -> None:
+    clocks = ResourceClocks(now_utc=lambda: NOW, monotonic_ns=lambda: 1)
+    assert clocks.now_utc() == NOW
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        ResourceClocks(now_utc=NOW, monotonic_ns=lambda: 1)  # type: ignore[arg-type]
 
 
 class FakeResourceBackend:
