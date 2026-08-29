@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":3,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":4,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -26,6 +26,9 @@ Beim Bauen gilt zuerst: so wenig Testcode, Fixtures, Mocks und
 Test-Infrastruktur wie möglich, aber genug für den echten Funktionsvertrag.
 Tests müssen tatsächlich ausgeführt werden. Manuelle Prüfung oder bloßes Lesen
 ersetzt keinen Testlauf.
+
+Die Regel minimiert Bauarbeit und die Zahl ausgeführter Tests. Sie erlaubt
+niemals, einen erforderlichen Testlauf durch Eigenprüfung zu ersetzen.
 
 Beim Auswählen und Ausführen gilt: so wenig Tests wie möglich, so viele wie
 nötig. Zuerst den kleinstmöglichen gezielten Test für die Funktion ausführen.

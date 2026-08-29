@@ -164,6 +164,8 @@ def test_common_policy_requires_function_tests_and_minimal_test_execution() -> N
         "Testcode, Fixtures, Mocks und Test-Infrastruktur",
         "Tests müssen tatsächlich ausgeführt werden",
         "Manuelle Prüfung oder bloßes Lesen ersetzt keinen Testlauf",
+        "minimiert Bauarbeit und die Zahl ausgeführter Tests",
+        "niemals, einen erforderlichen Testlauf durch Eigenprüfung zu ersetzen",
         "Zuerst den kleinstmöglichen gezielten Test für die Funktion ausführen",
         "nur bei unveränderten relevanten Inputs und noch gültigem Evidence-Reuse-Fenster",
         "Voll- und Release-Gates bleiben verbindlich",
