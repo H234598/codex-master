@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from codex_master import remote_queen_syncthing
 from codex_master.remote_queen_bootstrap import ManifestGenerationV1
 from codex_master.remote_queen_syncthing import (
     ALLOWED_GUI_LISTEN_ADDRESSES,
@@ -43,6 +44,13 @@ from codex_master.remote_queen_syncthing import (
     verify_remote_queen_syncthing_vault,
 )
 from codex_master.remote_queen_bootstrap import RemoteQueenBootstrapError
+
+
+def test_optional_string_validator_accepts_none_or_exact_string_only() -> None:
+    assert remote_queen_syncthing._validate_optional_string(None) is None
+    assert remote_queen_syncthing._validate_optional_string("value") is None
+    with pytest.raises(RemoteQueenBootstrapError):
+        remote_queen_syncthing._validate_optional_string(1)
 
 
 DESIRED_GENERATION = ManifestGenerationV1(
