@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy an external Markdown-plan path and notify the user."""
+"""Validate an external Markdown-plan path and notify the user."""
 
 from __future__ import annotations
 
@@ -33,11 +33,11 @@ NOMEN = [
 ]
 VERBEN = [
     "liegt bereit", "ist vorbereitet", "wurde übergeben", "wartet auf euch",
-    "ist nun einfügbar", "wurde für euch hinterlegt", "kann jetzt geöffnet werden",
+    "ist nun zugänglich", "wurde für euch hinterlegt", "kann jetzt geöffnet werden",
     "ist erfolgreich abgelegt", "steht zur Verwendung bereit", "ist griffbereit",
 ]
 AKTIONEN = [
-    "kopiert", "übertragen", "bereitgelegt", "hinterlegt", "in die Zwischenablage gelegt",
+    "bereitgestellt", "übergeben", "bereitgelegt", "hinterlegt", "zur Verwendung bereitgelegt",
     "für euch vorbereitet", "zur direkten Verwendung abgelegt", "sauber übergeben",
 ]
 EINLEITUNGEN = [
@@ -45,7 +45,7 @@ EINLEITUNGEN = [
     "Kleine Übergabe", "Für euch", "Zur Information", "Soeben",
     "Mit einer kurzen Meldung", "Aus dem Bienenstock", ]
 STATUS = [
-    "sofort nutzbar", "sicher erreichbar", "direkt einfügbar", "vollständig bereit",
+    "sofort nutzbar", "sicher erreichbar", "direkt verfügbar", "vollständig bereit",
     "für euch vorbereitet", "ohne weitere Bearbeitung verwendbar",
 ]
 ZWECKE = [
@@ -55,8 +55,8 @@ ZWECKE = [
 ]
 ZEITPUNKTE = ["soeben", "gerade", "direkt danach", "in diesem Moment", "ohne Verzögerung"]
 UEBERGABEN = [
-    "ohne Zusatztext", "als reiner Pfad", "direkt aus der Zwischenablage",
-    "für ein beliebiges Programm", "ohne Markdown-Verpackung", "in einfügbarer Form",
+    "ohne Zusatztext", "als reiner Pfad", "direkt über den Pfad",
+    "für ein beliebiges Programm", "ohne Markdown-Verpackung", "in klarer Form",
 ]
 ABSENDER = ["Der Bienenstock", "Masterjet", "Die Dokumentenbiene", "Die Hive-Verwaltung"]
 
@@ -72,9 +72,9 @@ GRUNDSAETZE = [
     "{anrede}: Der Pfad zu {dat} wurde {aktion}.",
     "{einleitung}, {anrede}: {poss} ist griffbereit.",
     "{anrede}, ich melde: {nom} {verb}.",
-    "{einleitung}: {nom} {verb}; der Pfad ist kopiert.",
+    "{einleitung}: {nom} {verb}; der Pfad steht bereit.",
     "{anrede}, die Übergabe ist erfolgt: {nom} {verb}.",
-    "{einleitung}, {anrede}: Ihr könnt {acc} direkt einfügen.",
+    "{einleitung}, {anrede}: Ihr könnt {acc} direkt öffnen.",
     "{anrede}, für euch wurde {acc} {aktion}.",
     "{einleitung}: Der Zugriff auf {acc} ist vorbereitet.",
     "{anrede}, {nom} wartet auf eure nächste Verwendung.",
@@ -84,12 +84,12 @@ GRUNDSAETZE = [
     "{anrede}, ich habe {acc} für euch abgelegt.",
     "{einleitung}, {anrede}: Der vollständige Pfad zu {dat} steht bereit.",
     "{anrede}, {nom} ist für die weitere Arbeit vorbereitet.",
-    "{einleitung}: Ihr findet {acc} jetzt in der Zwischenablage.",
+    "{einleitung}: Ihr findet {acc} jetzt ohne Zusatztext bereit.",
     "{anrede}, die Biene übergibt {acc} zur direkten Nutzung.",
     "{einleitung}, {anrede}: {poss} ist sauber hinterlegt.",
     "{anrede}, die Dokumentreferenz zu {dat} wurde {aktion}.",
     "{einleitung}: {nom} ist für euch zugänglich.",
-    "{anrede}, {acc} könnt ihr nun in ein Programm einfügen.",
+    "{anrede}, {acc} könnt ihr nun direkt öffnen.",
     "{einleitung}, {anrede}: Der externe Pfad zu {dat} wurde gesichert.",
     "{anrede}, {nom} steht nach dieser Übergabe bereit.",
     "{einleitung}: Ich habe {acc} für eure nächste Aktion vorbereitet.",
@@ -97,9 +97,9 @@ GRUNDSAETZE = [
     "{einleitung}, {anrede}: {nom} ist vollständig übergeben.",
     "{anrede}, der Pfad zu {dat} liegt nun in Reichweite.",
     "{einleitung}: {poss} wurde für die direkte Verwendung vorbereitet.",
-    "{anrede}, {acc} findet ihr ohne Markdown-Zusatz in der Zwischenablage.",
+    "{anrede}, {acc} findet ihr ohne Markdown-Zusatz bereit.",
     "{einleitung}, {anrede}: Die Übergabe von {acc} ist abgeschlossen.",
-    "{anrede}, {nom} kann jetzt aus der Zwischenablage eingefügt werden.",
+    "{anrede}, {nom} kann jetzt direkt geöffnet werden.",
     "{einleitung}: Der Weg zu {dat} ist für euch vorbereitet.",
     "{anrede}, {poss} wartet bereits auf den nächsten Schritt.",
     "{einleitung}, {anrede}: {acc} wurde für euch erreichbar gemacht.",
@@ -172,30 +172,6 @@ def notify(message: str) -> None:
         pass
 
 
-def copy_clipboard(value: str) -> str | None:
-    candidates = [
-        (["wl-copy"], "wayland"),
-        (["xclip", "-selection", "clipboard"], "xclip"),
-        (["xsel", "--clipboard", "--input"], "xsel"),
-    ]
-    for command, name in candidates:
-        if not shutil.which(command[0]):
-            continue
-        try:
-            subprocess.run(
-                command,
-                input=value.encode("utf-8"),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3,
-                check=True,
-            )
-            return name
-        except (OSError, subprocess.SubprocessError):
-            continue
-    return None
-
-
 def main() -> int:
     if len(sys.argv) != 2:
         print(f"Verwendung: {sys.argv[0]} /absoluter/pfad/plan.md", file=sys.stderr)
@@ -207,12 +183,7 @@ def main() -> int:
     if not path.is_absolute():  # defensive; resolve() should already ensure this
         print("Der Dokumentpfad muss absolut sein.", file=sys.stderr)
         return 2
-    clipboard = copy_clipboard(str(path))
-    if clipboard is None:
-        notify("Keine Zwischenablage verfügbar; der Pfad wurde nicht als kopiert gemeldet.")
-        print("Keine unterstützte Zwischenablage gefunden (wl-copy, xclip, xsel).", file=sys.stderr)
-        return 1
-    message = random_message()
+    message = f"{random_message()} Pfad: {path}"
     notify(message)
     print(str(path))
     return 0

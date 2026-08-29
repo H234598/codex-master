@@ -2,8 +2,8 @@
 
 Die 60 Nachrichtengrundsätze des Dokumentübergabe-Werkzeugs sind ein
 geeigneter Baustein für kurze, menschlich lesbare Statusmeldungen. Die
-Clipboard-Aktion bleibt dabei ausschließlich der Plan-/Dokumentübergabe
-vorbehalten.
+Bei der Plan-/Dokumentübergabe werden keinerlei Clipboard-Operationen
+ausgeführt.
 
 Sinnvolle abgewandelte Einsatzorte:
 

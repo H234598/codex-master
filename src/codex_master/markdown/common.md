@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":6,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":7,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -80,12 +80,15 @@ Fehlende, stale, widersprüchliche oder nicht vergleichbare Daten blockieren aut
 
 Wenn ein vollständiger Markdownplan außerhalb des eigenen Worktrees abgelegt
 wird, muss die Instanz anschließend `bin/codex-master-publish-plan-path`
-verwenden. Das Skript kopiert ausschließlich den absoluten Dateipfad ohne
-Zusatztext in die verfügbare Zwischenablage und zeigt eine variierende
-Desktop-Benachrichtigung an. Ist keine Zwischenablage verfügbar, muss der
-Fehler gemeldet werden; der Pfad darf nicht stillschweigend als erledigt
-gelten. Die Regel gilt für Vaults, `/Baupläne!` und alle anderen externen
-Dokumentpfade serverweit.
+verwenden. Bei jeder Dokument-/Planübergabe darf die Instanz die
+Zwischenablage weder automatisch lesen, entdecken, verwenden noch verändern;
+ein bereits vorhandener Zwischenablageinhalt bleibt unverändert. Das Werkzeug
+validiert die Datei und schreibt den validierten absoluten
+Markdown-Dateipfad exakt auf stdout. Danach zeigt es eine variierende sichtbare
+Desktop-Benachrichtigung, die den vollständigen absoluten Pfad enthalten muss.
+Die Benachrichtigung darf keine Aussage über Kopieren oder das Ablegen in die
+Zwischenablage enthalten. Die Regel gilt für Vaults, `/Baupläne!`, alle
+anderen externen Dokumentpfade serverweit und für zukünftige Client-Bridges.
 
 ## Bidirektionale Abschnitts- und Annotation-Antworten in Obsidian
 

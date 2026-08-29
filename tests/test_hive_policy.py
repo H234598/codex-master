@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":6,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":7,"schema_version":1} -->\n'
 )
 
 
@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 6
+    assert contract.generation == 7
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -382,3 +382,23 @@ def test_common_policy_fails_closed_and_reuses_links_for_section_answers() -> No
 
     for meaning in required_meanings:
         assert meaning in policy
+
+
+def test_common_policy_requires_side_effect_free_external_plan_handoff() -> None:
+    policy_api = load_policy_api()
+    raw_policy = policy_api.load_common_policy().common_bytes.decode("utf-8")
+    policy = " ".join(raw_policy.split())
+
+    required_meanings = [
+        "Zwischenablage weder automatisch lesen, entdecken, verwenden noch verändern",
+        "bereits vorhandener Zwischenablageinhalt bleibt unverändert",
+        "validierten absoluten Markdown-Dateipfad exakt auf stdout",
+        "variierende sichtbare Desktop-Benachrichtigung",
+        "vollständigen absoluten Pfad enthalten",
+        "keine Aussage über Kopieren oder das Ablegen in die Zwischenablage",
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy
+    for backend in ("wl-copy", "xclip", "xsel"):
+        assert backend not in raw_policy
