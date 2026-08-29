@@ -2,6 +2,7 @@ import ast
 import base64
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import multiprocessing
@@ -41063,12 +41064,12 @@ def test_targetless_teamlead_agent_start_keeps_a1_b1_legacy_forbidden() -> None:
     assert control.calls == 0
 
 
-def test_fleet_home_v2_cutover_adapter_dispatches_injected_offline_core() -> None:
+def test_fleet_home_v2_cutover_adapter_owns_product_ports_and_operation_id() -> None:
     from codex_master.fleet_home_v2_cutover import FleetHomeV2CutoverError
 
-    class OfflineCore:
-        def plan(self, targets: tuple[str, ...], *, operation_id: str) -> tuple[str, tuple[str, ...], str]:
-            return ("plan", targets, operation_id)
+    class ProductCore:
+        def plan(self, targets: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+            return ("plan", targets)
 
         def apply(self, plan: object) -> tuple[str, object]:
             return ("apply", plan)
@@ -41082,36 +41083,38 @@ def test_fleet_home_v2_cutover_adapter_dispatches_injected_offline_core() -> Non
         def rollback(self, plan: object) -> tuple[str, object]:
             return ("rollback", plan)
 
-    core = OfflineCore()
-    plan = server_module.fleet_home_v2_cutover_operation(
-        operation="plan",
-        service=core,
-        target_ids=("g1",),
-        operation_id="server-adapter-20260829",
-    )
+    core = ProductCore()
+    with patch.object(server_module, "_fleet_home_v2_product_service", return_value=core):
+        plan = server_module.fleet_home_v2_cutover_operation(
+            operation="plan",
+            target_ids=("g1",),
+        )
 
-    assert plan == ("plan", ("g1",), "server-adapter-20260829")
-    for operation in ("apply", "verify", "recover", "rollback"):
-        assert server_module.fleet_home_v2_cutover_operation(
-            operation=operation,
-            service=core,
-            plan=plan,
-        ) == (operation, plan)
+        assert plan == ("plan", ("g1",))
+        for operation in ("apply", "verify", "recover", "rollback"):
+            assert server_module.fleet_home_v2_cutover_operation(
+                operation=operation,
+                plan=plan,
+            ) == (operation, plan)
 
     class SafetyFailure:
         def apply(self, _plan: object) -> object:
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
 
-    try:
-        server_module.fleet_home_v2_cutover_operation(
-            operation="apply",
-            service=SafetyFailure(),
-            plan=plan,
-        )
-    except AgentError as exc:
-        assert str(exc) == "fleet_home_v2_recovery_required"
-    else:
-        raise AssertionError("cutover safety error must not be replaced")
+    with patch.object(server_module, "_fleet_home_v2_product_service", return_value=SafetyFailure()):
+        try:
+            server_module.fleet_home_v2_cutover_operation(
+                operation="apply",
+                plan=plan,
+            )
+        except AgentError as exc:
+            assert str(exc) == "fleet_home_v2_recovery_required"
+        else:
+            raise AssertionError("cutover safety error must not be replaced")
+
+    signature = inspect.signature(server_module.fleet_home_v2_cutover_operation)
+    assert "service" not in signature.parameters
+    assert "operation_id" not in signature.parameters
 
 if __name__ == "__main__":
     unittest.main()

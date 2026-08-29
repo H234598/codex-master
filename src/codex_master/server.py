@@ -41,6 +41,11 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
 import yaml
 
 from codex_master import __version__
+from codex_master.fleet_home_v2_cutover import (
+    FleetHomeV2AuthorityPort,
+    FleetHomeV2QuiescencePort,
+    LocalFleetHomeV2Filesystem,
+)
 from codex_master.fleet_registry import (
     AgentDescriptor,
     AuthKind,
@@ -42895,34 +42900,168 @@ def _recover_g_series_migration_for_authorized_caller(
         return _g_migration_recover_locked(service, pool_root, paths, journal)
 
 
+class _FleetHomeV2ServerAuthorityPort(FleetHomeV2AuthorityPort):
+    """Concrete registry/writer authority for Fleet Home V2 cutover."""
+
+    @staticmethod
+    def _process_generation(processes: list[dict[str, Any]] | None) -> str:
+        if processes is None:
+            return "process-observation-unavailable"
+        return hashlib.sha256(
+            json.dumps(processes, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _lease_generation(lease: Mapping[str, Any]) -> str:
+        lease_id = lease.get("lease_id")
+        return lease_id if isinstance(lease_id, str) else "none"
+
+    def snapshot(self) -> Any:
+        from codex_master.fleet_home_v2_cutover import (
+            FleetHomeV2Artifact,
+            FleetHomeV2Authority,
+            FleetHomeV2Inventory,
+            FleetHomeV2Policy,
+        )
+
+        service = current_fleet_service()
+        registry = service.registry_snapshot()
+        inventory = build_inventory(registry, AGENT_POOL_ROOT)
+        homes: dict[str, FleetHomeV2Authority] = {}
+        for agent_id, descriptor in inventory.agents.items():
+            with _fleet_artifact_builder(
+                descriptor.runner,
+                codex_executable=None,
+                gemini_executable=None,
+            ) as build_artifacts:
+                artifacts = build_artifacts(descriptor)
+                build_artifacts.validate()  # type: ignore[attr-defined]
+            marker = artifacts["marker"]
+            common_policy = marker["common_policy"]
+            lease = agent_lease_status(
+                agent_id,
+                initialize_state=False,
+                snapshot=inventory,
+            )
+            homes[agent_id] = FleetHomeV2Authority(
+                agent_id=agent_id,
+                prefix=descriptor.series_prefix,
+                provider=descriptor.provider.value,
+                runner=descriptor.runner.value,
+                model=descriptor.model,
+                home=descriptor.home,
+                registry_generation=registry.generation,
+                policy=FleetHomeV2Policy(
+                    schema_version=common_policy["schema_version"],
+                    generation=common_policy["generation"],
+                    digest=common_policy["digest"],
+                ),
+                owner_uid=os.geteuid(),
+                owner_gid=os.getegid(),
+                authority_generation=registry.generation,
+                lease_generation=self._lease_generation(lease),
+                process_generation=self._process_generation(pool_home_processes(descriptor.home)),
+                artifacts=tuple(
+                    FleetHomeV2Artifact(name, content, mode)
+                    for name, (content, mode) in sorted(artifacts["files"].items())
+                ),
+                runtime_skill_profile=marker.get(_FLEET_RUNTIME_SKILL_PROFILE_FIELD),
+            )
+        return FleetHomeV2Inventory(registry.generation, homes)
+
+
+class _FleetHomeV2ServerQuiescencePort(FleetHomeV2QuiescencePort):
+    """Fresh process, tmux, lease, and registry bound observation port."""
+
+    def __init__(self, authority_port: _FleetHomeV2ServerAuthorityPort) -> None:
+        self._authority_port = authority_port
+        self._generation = 0
+
+    def observe(self, authority: Any, home_identity: Any) -> Any:
+        from codex_master.fleet_home_v2_cutover import FleetHomeV2Quiescence
+
+        self._generation += 1
+        current = self._authority_port.snapshot().homes.get(authority.agent_id)
+        if current is None:
+            return FleetHomeV2Quiescence(
+                authority.agent_id,
+                home_identity,
+                authority.registry_generation,
+                authority.policy.generation,
+                authority.authority_generation,
+                authority.lease_generation,
+                authority.process_generation,
+                self._generation,
+                time.monotonic_ns(),
+                False,
+                "unknown",
+                False,
+                0,
+                0,
+            )
+        descriptor = build_inventory(current_fleet_service().registry_snapshot(), AGENT_POOL_ROOT).agents.get(
+            authority.agent_id
+        )
+        processes = pool_home_processes(authority.home)
+        tmux_state = _fleet_tmux_state(descriptor.session) if descriptor is not None else "unknown"
+        try:
+            actual_identity = LocalFleetHomeV2Filesystem.identity_from_stat(
+                authority.home.lstat()
+            )
+        except OSError:
+            actual_identity = home_identity
+        return FleetHomeV2Quiescence(
+            authority.agent_id,
+            actual_identity,
+            current.registry_generation,
+            current.policy.generation,
+            current.authority_generation,
+            current.lease_generation,
+            current.process_generation,
+            self._generation,
+            time.monotonic_ns(),
+            tmux_state == "stopped",
+            "none" if current.lease_generation == "none" else "active",
+            processes is not None,
+            0 if processes is not None and not processes else len(processes or ()),
+            0 if processes is not None and not processes else len(processes or ()),
+        )
+
+
+def _fleet_home_v2_product_service() -> Any:
+    """Build product ports internally; Queen supplies intent, never authority."""
+
+    from codex_master.fleet_home_v2_cutover import FleetHomeV2CutoverService
+
+    authority_port = _FleetHomeV2ServerAuthorityPort()
+    return FleetHomeV2CutoverService(
+        authority_port=authority_port,
+        quiescence_port=_FleetHomeV2ServerQuiescencePort(authority_port),
+    )
+
+
 def fleet_home_v2_cutover_operation(
     *,
     operation: str,
-    service: Any,
     target_ids: tuple[str, ...] | None = None,
-    operation_id: str | None = None,
     plan: Any = None,
 ) -> Any:
-    """Dispatch one injected, Queen-owned offline V2 cutover operation.
-
-    This adapter deliberately creates no filesystem, provider, runner, or
-    process port.  The caller must inject an already-authorized core service.
-    """
+    """Dispatch a product-owned V2 cutover operation from Queen intent only."""
 
     from codex_master.fleet_home_v2_cutover import FleetHomeV2CutoverError
 
     try:
+        service = _fleet_home_v2_product_service()
         if operation == "plan":
             if (
                 not isinstance(target_ids, tuple)
                 or not all(isinstance(target, str) for target in target_ids)
-                or not isinstance(operation_id, str)
                 or plan is not None
             ):
                 raise AgentError("fleet_home_v2_cutover_failed")
-            return service.plan(target_ids, operation_id=operation_id)
+            return service.plan(target_ids)
         if operation in {"apply", "verify", "recover", "rollback"}:
-            if plan is None or target_ids is not None or operation_id is not None:
+            if plan is None or target_ids is not None:
                 raise AgentError("fleet_home_v2_cutover_failed")
             return getattr(service, operation)(plan)
     except FleetHomeV2CutoverError as exc:
