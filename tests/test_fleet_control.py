@@ -45,6 +45,11 @@ def test_page_state_is_bounded_and_whitelisted() -> None:
     assert "/home/" not in repr(state)
 
 
+def test_account_secret_state_is_compatibility_view_of_auth_status() -> None:
+    account = parse_fleet_page(_accounts(), _series()).accounts[0]
+    assert account.secret_state == account.auth_status == "configured"
+
+
 def test_page_parser_rejects_generation_mismatch_without_private_payload() -> None:
     series = _series()
     series["generation"] = 5
