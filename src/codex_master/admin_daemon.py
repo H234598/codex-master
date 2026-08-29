@@ -531,6 +531,7 @@ class AdminDaemon:
         self._http_thread: threading.Thread | None = None
         self._http_failure: BaseException | None = None
         self._started = False
+        self._ready_published = False
         self._stopping = False
         self._incomplete_resources: tuple[str, ...] = ()
 
@@ -556,6 +557,18 @@ class AdminDaemon:
             with self._state_lock:
                 self._http_failure = error
             self.request_stop()
+            self._revoke_readiness()
+
+    def _revoke_readiness(self) -> None:
+        with self._state_lock:
+            published = self._ready_published
+            self._ready_published = False
+            self._ready.clear()
+        if published:
+            try:
+                self._notifier("STOPPING=1")
+            except Exception:
+                pass
 
     def _validate_socket(self, adapter: _SocketAdapter) -> None:
         bound_service = getattr(adapter, "service", getattr(adapter, "_service", None))
@@ -602,11 +615,16 @@ class AdminDaemon:
             with self._state_lock:
                 if self._http_failure is not None or not http_thread.is_alive():
                     raise RuntimeError("control.http_serve_failed")
+            with self._state_lock:
+                self._ready_published = True
             self._notifier("READY=1")
             with self._state_lock:
+                if self._http_failure is not None or not http_thread.is_alive():
+                    raise RuntimeError("control.http_serve_failed")
                 self._started = True
                 self._ready.set()
         except BaseException:
+            self._revoke_readiness()
             failures = self._rollback_startup(
                 socket_adapter,
                 http_adapter,
@@ -731,11 +749,13 @@ class AdminDaemon:
             socket_adapter = self._socket
             http_adapter = self._http
             http_thread = self._http_thread
+            notify_stopping = self._ready_published
+            self._ready_published = False
             self._ready.clear()
         deadline = time.monotonic() + self._shutdown_timeout
         try:
             failures: list[str] = []
-            if was_started:
+            if was_started and notify_stopping:
                 try:
                     self._notifier("STOPPING=1")
                 except BaseException as error:

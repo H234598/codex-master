@@ -323,7 +323,9 @@ class _Exchange:
         )
 
 
-def _manager(tmp_path: Path) -> GoogleAccountInventoryManager:
+def _manager(
+    tmp_path: Path, *, subject_one: str | None = "subject-one"
+) -> GoogleAccountInventoryManager:
     inventory = tmp_path / "inventory.yaml"
     inventory.write_text(
         yaml.safe_dump(
@@ -335,7 +337,7 @@ def _manager(tmp_path: Path) -> GoogleAccountInventoryManager:
                         "login_email": "one@example.test",
                         "recovery_email": None,
                         "label": None,
-                        "subject_id": "subject-one",
+                        "subject_id": subject_one,
                         "billing_accounts": [],
                         "projects": [],
                     },
@@ -511,6 +513,36 @@ def test_oauth_transaction_is_account_bound_and_code_is_consumed_once(
     with pytest.raises(GoogleOAuthSessionError, match="oauth.transaction_expired"):
         _complete(service, transaction, code="second-code")
     assert len(exchange.calls) == 1
+
+
+def test_first_subject_binding_rebases_active_client_generation(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path, subject_one=None)
+    inventory = tmp_path / "inventory.yaml"
+
+    class BindingWriter(_TokenWriter):
+        def store_refresh_token(self, *args, **kwargs):
+            receipt = super().store_refresh_token(*args, **kwargs)
+            document = yaml.safe_load(inventory.read_text(encoding="utf-8"))
+            document["google_accounts"][0]["subject_id"] = receipt.subject_id
+            inventory.write_text(yaml.safe_dump(document), encoding="utf-8")
+            inventory.chmod(0o600)
+            manager.reload(expected_generation=1)
+            return receipt
+
+    service, ingress, _exchange, _manager_instance = _service(
+        tmp_path, manager=manager, token_writer=BindingWriter()
+    )
+    _plan, _session, imported = _import_client(service, ingress)
+    transaction = _begin(service, imported.client_ref)
+
+    assert _complete(service, transaction).subject_bound is True
+    binding = service.default_oauth_client_binding(
+        "google-account-01", expected_generation=2
+    )
+    assert binding.availability is oauth_session.GoogleOAuthClientAvailabilityV1.AVAILABLE
+    assert binding.default_oauth_client_ref == imported.client_ref
 
 
 def test_oauth_begin_replays_same_receipt_after_restart_and_conflicts_on_rebind(
@@ -757,6 +789,23 @@ def test_default_oauth_client_binding_is_exact_account_scoped_and_redacted(
     rendered = repr((bound, missing))
     assert "private-client-secret" not in rendered
     assert "577074103233-clientpart" not in rendered
+
+
+def test_active_oauth_client_material_is_account_bound_and_redacted(
+    tmp_path: Path,
+) -> None:
+    service, ingress, _exchange, _manager_instance = _service(tmp_path)
+    _import_client(service, ingress)
+
+    material = service.active_oauth_client_material(
+        "google-account-01", expected_generation=1
+    )
+
+    assert material.client_id == "577074103233-clientpart.apps.googleusercontent.com"
+    assert material.client_secret == "private-client-secret"
+    assert material.token_uri == "https://oauth2.googleapis.com/token"
+    assert material.client_fingerprint.startswith("sha256:")
+    assert "private-client-secret" not in repr(material)
 
 
 def test_default_oauth_client_binding_disables_stale_or_revoked_projection(

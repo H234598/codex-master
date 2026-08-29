@@ -499,6 +499,14 @@ class GoogleOAuthClientBindingV1:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class GoogleOAuthClientMaterialV1:
+    client_id: str
+    client_secret: str
+    token_uri: str
+    client_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class GoogleOAuthTransactionV1:
     id: str
     account_ref: str
@@ -1410,7 +1418,7 @@ class GoogleOAuthControlService:
             raise GoogleOAuthSessionError("oauth.redirect_mismatch")
         return value
 
-    def _account_subject(self, account_ref: str, generation: int) -> str:
+    def _account_subject(self, account_ref: str, generation: int) -> str | None:
         try:
             snapshot = self._manager._snapshot_for_internal_use()
             if snapshot.generation != generation:
@@ -1421,6 +1429,8 @@ class GoogleOAuthControlService:
             raise
         except (GoogleAccountInventoryError, KeyError, AttributeError):
             raise GoogleOAuthSessionError("oauth.account_mismatch") from None
+        if subject_id is None:
+            return None
         if type(subject_id) is not str or not subject_id:
             raise GoogleOAuthSessionError("oauth.subject_mismatch")
         return subject_id
@@ -1490,6 +1500,39 @@ class GoogleOAuthControlService:
         return GoogleOAuthClientBindingV1(
             account_ref, expected_generation, None, availability
         )
+
+    def active_oauth_client_material(
+        self, account_ref: str, *, expected_generation: int
+    ) -> GoogleOAuthClientMaterialV1:
+        """Lease one exact active client into the installed authority graph."""
+
+        account_ref = self._ref(account_ref)
+        expected_generation = self._generation(expected_generation)
+        if self._account_subject(account_ref, expected_generation) is None:
+            raise GoogleOAuthSessionError("oauth.subject_mismatch")
+        with self._state.locked():
+            document = self._read_locked()
+            matches = [
+                cast(dict[str, object], item)
+                for item in cast(list[object], document["clients"])
+                if cast(dict[str, object], item)["account_ref"] == account_ref
+                and cast(dict[str, object], item)["state"] == "active"
+                and cast(dict[str, object], item)["inventory_generation"]
+                == expected_generation
+            ]
+            if len(matches) != 1:
+                raise GoogleOAuthSessionError("oauth.client_expired")
+            client, fingerprint = self._load_client(account_ref, matches[0])
+            if fingerprint != matches[0]["client_digest"]:
+                raise GoogleOAuthSessionError("oauth.client_expired")
+        material = GoogleOAuthClientMaterialV1(
+            cast(str, client["client_id"]),
+            cast(str, client["client_secret"]),
+            cast(str, client["token_uri"]),
+            fingerprint,
+        )
+        client.clear()
+        return material
 
     @staticmethod
     def _digest(*values: object) -> str:
@@ -2371,7 +2414,7 @@ class GoogleOAuthControlService:
             if not isinstance(result, GoogleOAuthCodeExchangeV1):
                 raise GoogleOAuthSessionError("oauth.exchange_failed")
             expected_subject = self._account_subject(account_ref, expected_generation)
-            if result.subject_id != expected_subject:
+            if expected_subject is not None and result.subject_id != expected_subject:
                 raise GoogleOAuthSessionError("oauth.subject_mismatch")
             with self._state.locked():
                 document = self._read_locked()
@@ -2437,6 +2480,7 @@ class GoogleOAuthControlService:
                 if record is None or record["state"] != "persisting":
                     raise GoogleOAuthSessionError("oauth.transaction_expired")
                 self._validate_token_receipt(record, token_receipt)
+                self._rebase_bound_client(document, record, token_receipt.subject_id)
                 self._mark_transaction_terminal(record, "succeeded")
                 try:
                     self._write_locked(document)
@@ -2505,6 +2549,7 @@ class GoogleOAuthControlService:
             self._validate_token_receipt(record, receipt)
             if record["effect_subject_id"] is None:
                 record["effect_subject_id"] = receipt.subject_id
+            self._rebase_bound_client(document, record, receipt.subject_id)
             self._mark_transaction_terminal(record, "succeeded")
             self._write_locked(document)
             return GoogleOAuthSessionReceipt(account_ref, True, True)
@@ -2553,6 +2598,22 @@ class GoogleOAuthControlService:
         if len(matches) != 1:
             raise GoogleOAuthSessionError("oauth.client_expired")
         return matches[0]
+
+    def _rebase_bound_client(
+        self,
+        document: Mapping[str, object],
+        record: Mapping[str, object],
+        subject_id: str,
+    ) -> None:
+        client_record = self._bound_active_client(document, record)
+        try:
+            snapshot = self._manager._snapshot_for_internal_use()
+            account = snapshot.by_account_ref[cast(str, record["account_ref"])]
+        except (GoogleAccountInventoryError, KeyError, AttributeError):
+            raise GoogleOAuthSessionError("oauth.account_mismatch") from None
+        if account.subject_id != subject_id:
+            raise GoogleOAuthSessionError("oauth.subject_mismatch")
+        client_record["inventory_generation"] = snapshot.generation
 
     def _lookup_token_receipt(
         self, record: Mapping[str, object]
