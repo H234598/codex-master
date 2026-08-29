@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.hive.test_index import TestIndexError as IndexError
-from codex_master.hive.test_index_builder import PythonTestIndexBuilder
+from codex_master.hive.indexed_tests import TestIndexError as IndexError
+from codex_master.hive.indexed_test_inventory import PythonTestIndexBuilder
 
 
 def write_project(root: Path, *, asserted: bool = True) -> dict[str, tuple[str, ...]]:
@@ -105,3 +105,36 @@ def test_builder_digest_changes_with_function_semantics(tmp_path: Path) -> None:
 
     assert before.source_root_digest != after.source_root_digest
     assert before.functions[1].source_digest != after.functions[1].source_digest
+
+
+def test_builder_excludes_protocol_declarations_and_indexes_async_class_tests(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src/example.py").write_text(
+        "from typing import Protocol\n\n"
+        "class Port(Protocol):\n"
+        "    async def fetch(self) -> str: ...\n\n"
+        "async def fetch() -> str:\n"
+        "    return 'ok'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests/test_example.py").write_text(
+        "from example import fetch\n\n"
+        "class TestFetch:\n"
+        "    async def test_fetch(self):\n"
+        "        assert await fetch() == 'ok'\n",
+        encoding="utf-8",
+    )
+    function_id = "python:src/example.py:fetch"
+    test_id = "pytest:tests/test_example.py:TestFetch::test_fetch"
+
+    index = PythonTestIndexBuilder(tmp_path).build(
+        repository_id="example",
+        generation=1,
+        source_paths=("src/example.py",),
+        test_paths=("tests/test_example.py",),
+        bindings={function_id: (test_id,)},
+    )
+
+    assert [item.function_id for item in index.functions] == [function_id]
+    assert [item.test_id for item in index.tests] == [test_id]

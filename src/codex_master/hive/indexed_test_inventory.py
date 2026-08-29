@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 import hashlib
 from pathlib import Path, PurePosixPath
 
-from codex_master.hive.test_index import TestIndexError, TestIndexV1
+from codex_master.hive.indexed_tests import TestIndexError, TestIndexV1
 
 
 _DEPENDENCY_POLICY = b"python-ast-v1:names,attributes,imports,module-bindings,static-calls"
@@ -42,11 +42,15 @@ def _ast_digest(node: ast.AST) -> str:
 class _FunctionVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.stack: list[str] = []
+        self.type_only_stack: list[bool] = []
         self.functions: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]] = []
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.stack.append(node.name)
+        bases = {getattr(base, "id", getattr(base, "attr", "")) for base in node.bases}
+        self.type_only_stack.append("Protocol" in bases)
         self.generic_visit(node)
+        self.type_only_stack.pop()
         self.stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -56,6 +60,9 @@ class _FunctionVisitor(ast.NodeVisitor):
         self._visit_function(node)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        decorators = {getattr(item, "id", getattr(item, "attr", "")) for item in node.decorator_list}
+        if (self.type_only_stack and self.type_only_stack[-1]) or decorators & {"overload", "abstractmethod"}:
+            return
         qualified = ".".join((*self.stack, node.name))
         self.functions.append((qualified, node))
         self.stack.append(node.name)

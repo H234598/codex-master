@@ -96,6 +96,11 @@ EXPECTED_RISKS = {
     "goddess_report_status": Risk.READ_ONLY,
     "goddess_report_run": Risk.MUTATING,
     "goddess_report_list": Risk.READ_ONLY,
+    "hive_test_index_status": Risk.READ_ONLY,
+    "hive_test_plan": Risk.READ_ONLY,
+    "hive_test_status": Risk.READ_ONLY,
+    "hive_test_run": Risk.MUTATING,
+    "hive_test_invalidate": Risk.MUTATING,
 }
 
 

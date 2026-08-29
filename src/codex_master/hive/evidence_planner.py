@@ -6,12 +6,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 
-from codex_master.hive.test_evidence import (
+from codex_master.hive.evidence_receipts import (
     EvidenceContextV1,
     EvidenceReceiptV1,
     evaluate_evidence_reuse,
 )
-from codex_master.hive.test_index import FunctionEntryV1, TestEntryV1, TestIndexV1
+from codex_master.hive.indexed_tests import FunctionEntryV1, TestEntryV1, TestIndexV1
 
 
 _PHASES = frozenset({"change", "branch", "merge", "release"})

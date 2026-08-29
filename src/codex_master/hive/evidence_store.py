@@ -8,9 +8,9 @@ from pathlib import Path, PurePosixPath
 import re
 
 from codex_master.hive.state import HiveStateError, HiveStateStore
-from codex_master.hive.test_evidence import EvidenceReceiptV1, evaluate_evidence_reuse
-from codex_master.hive.test_index import TestIndexV1
-from codex_master.hive.test_planner import PlanRequestV1, evidence_context
+from codex_master.hive.evidence_receipts import EvidenceReceiptV1, evaluate_evidence_reuse
+from codex_master.hive.indexed_tests import TestIndexV1
+from codex_master.hive.evidence_planner import PlanRequestV1, evidence_context
 
 
 _REPOSITORY_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")

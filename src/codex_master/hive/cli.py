@@ -13,7 +13,7 @@ from codex_master.hive.status import hive_doctor, hive_status, selection_status
 from codex_master.selection.reset_anchor import AnchorRecord, ResetAnchorPlanner
 
 if TYPE_CHECKING:
-    from codex_master.hive.test_service import HiveTestEvidenceService
+    from codex_master.hive.evidence_service import HiveTestEvidenceService
 
 
 def add_hive_cli_parsers(subparsers: object, *, fleet_subparsers: object | None = None) -> None:
@@ -78,7 +78,7 @@ def run_hive_cli(
         else args.get("hive_test_command")
     )
     if test_command is not None:
-        from codex_master.hive.test_service import build_local_test_service
+        from codex_master.hive.evidence_service import build_local_test_service
 
         service = test_service or build_local_test_service()
         if test_command in {"validate", "status"} and getattr(args, "hive_test_namespace", None) == "index":

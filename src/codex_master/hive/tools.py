@@ -6,7 +6,7 @@ from collections.abc import Mapping
 import time
 
 from codex_master.hive.status import godbee_status, hive_status, queen_list, selection_status
-from codex_master.hive.test_service import HiveTestEvidenceService, build_local_test_service
+from codex_master.hive.evidence_service import HiveTestEvidenceService, build_local_test_service
 
 
 _NAMES = (
@@ -23,8 +23,8 @@ _TEST_NAMES = (
 
 
 def _test_tool_definitions() -> list[dict[str, object]]:
-    digest = {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
-    text = {"type": "string", "minLength": 1, "maxLength": 2048}
+    digest = {"type": "string", "maxLength": 71}
+    text = {"type": "string", "maxLength": 2048}
     empty = {"type": "object", "additionalProperties": False, "properties": {}}
     return [
         {"name": "hive_test_index_status", "description": "Validate canonical Hive test index", "inputSchema": empty},
@@ -35,11 +35,11 @@ def _test_tool_definitions() -> list[dict[str, object]]:
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "changed_paths": {"type": "array", "maxItems": 4096, "uniqueItems": True, "items": text},
-                    "function_ids": {"type": "array", "maxItems": 4096, "uniqueItems": True, "items": text},
-                    "phase": {"enum": ["change", "branch", "merge", "release"]},
-                    "base_revision": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "target_revision": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "changed_paths": {"type": "array", "maxItems": 1000, "items": text},
+                    "function_ids": {"type": "array", "maxItems": 1000, "items": text},
+                    "phase": {"type": "string", "enum": ["change", "branch", "merge", "release"]},
+                    "base_revision": {"type": "string", "maxLength": 256},
+                    "target_revision": {"type": "string", "maxLength": 256},
                 },
             },
         },
@@ -138,7 +138,7 @@ def _required_text(args: Mapping[str, object], field: str) -> str:
 
 
 def _string_list(value: object, field: str) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple)) or len(value) > 4096:
+    if not isinstance(value, (list, tuple)) or len(value) > 1000:
         raise ValueError("test.index_invalid")
     values = tuple(value)
     if any(not isinstance(item, str) or not item or len(item) > 2048 for item in values):

@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import stat
+import json
 
-from codex_master.hive.test_evidence import evaluate_evidence_reuse
-from codex_master.hive.test_status_store import TestStatusStore as StatusStore
-from codex_master.hive.test_planner import evidence_context
+from codex_master.hive.evidence_receipts import evaluate_evidence_reuse
+from codex_master.hive.evidence_store import TestStatusStore as StatusStore
+from codex_master.hive.evidence_planner import evidence_context
 
 from test_hive_test_evidence import DIGEST_A, DIGEST_B, receipt
 from test_hive_test_index import IndexV1, valid_index
@@ -93,3 +94,17 @@ def test_status_projection_reports_only_bounded_metadata(tmp_path: Path) -> None
     assert status["items"][0]["reuse_eligible"] is True
     assert "stdout" not in str(status)
     assert str(tmp_path) not in str(status)
+
+
+def test_corrupt_record_is_never_used_as_evidence(tmp_path: Path) -> None:
+    store = StatusStore(tmp_path / "test-evidence" / "v1")
+    value = matching_receipt()
+    store.put(value)
+    state_file = next((tmp_path / "test-evidence" / "v1").rglob("*.json"))
+    document = json.loads(state_file.read_text())
+    document["receipts"].append({})
+    state_file.write_text(json.dumps(document), encoding="utf-8")
+
+    store.put(value)
+
+    assert store.latest(value.repository_id, value.executor_fingerprint, value.test_id) == value

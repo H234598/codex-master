@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from codex_master.hive.test_runner import TestEvidenceRunner as EvidenceRunner
-from codex_master.hive.test_service import HiveTestEvidenceService
-from codex_master.hive.test_status_store import TestStatusStore as StatusStore
+from codex_master.hive.evidence_runner import TestEvidenceRunner as EvidenceRunner
+from codex_master.hive.evidence_service import HiveTestEvidenceService
+from codex_master.hive.evidence_store import TestStatusStore as StatusStore
 
 from test_hive_test_evidence import DIGEST_A, DIGEST_B
 from test_hive_test_runner import project
