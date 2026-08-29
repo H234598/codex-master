@@ -163,7 +163,7 @@ def test_headless_assignment_keeps_prompt_and_secret_out_of_argv_and_metadata(
     argv = popen.call_args.args[0]
     assert "private prompt" not in argv
     assert "-p" not in argv
-    assert "--approval-mode=auto_edit" in argv
+    assert "--approval-mode=plan" in argv
     assert popen.call_args.kwargs["cwd"] == tmp_path / "d1"
     assert process.stdin.closed_value == b"private prompt"
     assert result["response"] == "answer"
@@ -177,6 +177,86 @@ def test_headless_assignment_keeps_prompt_and_secret_out_of_argv_and_metadata(
     assert fake_service.usage_records[-1]["gate_code"] == "gemini_limits_unknown"
     assert fake_service.event_records[-1]["gate_action"] == "allow"
     assert fake_service.event_records[-1]["gate_code"] == "gemini_limits_unknown"
+
+
+def test_run_headless_worker_without_binding_fails_closed(monkeypatch) -> None:
+    monkeypatch.setattr(server, "canonical_agent_id", lambda agent, **_kwargs: agent)
+    descriptor = SimpleNamespace(
+        model="gemini-3-flash-preview",
+        provider=server.Provider.GEMINI_API,
+        runner=server.RunnerKind.GEMINI_CLI,
+        account_id="gemini-project",
+        home=Path("/tmp/d1"),
+    )
+    service = Mock()
+    service.load.return_value = object()
+    service.read_secret.return_value = "secret"
+    monkeypatch.setattr(server, "current_fleet_service", lambda: service)
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(
+        server,
+        "_gemini_headless_gate",
+        lambda _agent: {
+            "action": "allow",
+            "diagnostic_code": "gemini_ready",
+            "account_id": "gemini-project",
+        },
+    )
+    monkeypatch.setattr(server, "_headless_marker", lambda _agent: {"state": "ready"})
+    monkeypatch.setattr(server, "status_agent", lambda *_args, **_kwargs: {"identity_guard": {"ok": True}})
+    monkeypatch.setattr(
+        server,
+        "_headless_admission_gate",
+        lambda _agent: SimpleNamespace(allowed=True, account_id="gemini-project", generation=4),
+    )
+    monkeypatch.setattr(server, "build_inventory", lambda *_args: SimpleNamespace(agents={"d1": descriptor}))
+    monkeypatch.setattr(server, "_headless_executable", lambda _descriptor: Path("/tmp/gemini"))
+    monkeypatch.setattr(server, "_ensure_gemini_headless_retry_policy", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "build_runner_plan",
+        lambda *_args: SimpleNamespace(unset_env=set(), env={}, secret_env_name="GEMINI_API_KEY", argv=("gemini",)),
+    )
+    monkeypatch.setattr(server, "_write_headless_marker", lambda *_args: None)
+    monkeypatch.setattr(server.subprocess, "Popen", Mock(side_effect=AssertionError("unbound worker launched")))
+
+    with pytest.raises(server.HeadlessWriteScopeError, match="headless_write_scope_unenforced"):
+        server._run_headless_process(
+            "d1",
+            "prompt",
+            {"state": "held", "held_by_this_server": True},
+            5,
+            role="arbeitsbiene",
+        )
+
+
+def test_run_headless_worker_without_binding_rejects_before_provider_lookup(monkeypatch) -> None:
+    provider_lookup = Mock(side_effect=RuntimeError("provider unavailable"))
+    monkeypatch.setattr(server, "current_fleet_service", provider_lookup)
+
+    with pytest.raises(server.HeadlessWriteScopeError, match="headless_write_scope_unenforced"):
+        server._run_headless_process(
+            "d1",
+            "prompt",
+            {"state": "held", "held_by_this_server": True},
+            5,
+            role="arbeitsbiene",
+        )
+
+    provider_lookup.assert_not_called()
+
+
+def test_run_headless_assignment_is_read_only_without_binding(monkeypatch) -> None:
+    run = Mock(return_value={"status": "completed"})
+    monkeypatch.setattr(server, "canonical_agent_id", lambda agent: agent)
+    monkeypatch.setattr(server, "_run_headless_process", run)
+
+    server.run_headless_assignment(
+        "d1", "prompt", {"state": "held", "held_by_this_server": True}, 5
+    )
+
+    assert run.call_args.kwargs["role"] == "exploriererin"
+    assert run.call_args.kwargs.get("write_scope_binding") is None
 
 
 def test_headless_exception_preserves_unknown_allow_gate_in_ledgers(
@@ -716,6 +796,7 @@ def test_headless_process_releases_preclaim_reservation_when_start_fails(
             "private prompt",
             {"state": "held", "held_by_this_server": True},
             5,
+            role="exploriererin",
             reservation=reservation,
             structured_gate=fake_service.gemini_headless_gate("d1").public(),
         )
@@ -751,6 +832,7 @@ def test_headless_process_releases_preclaim_reservation_on_prestart_validation_e
             "private prompt",
             {"state": "held", "held_by_this_server": True},
             5,
+            role="exploriererin",
             reservation=reservation,
             structured_gate=fake_service.gemini_headless_gate("d1").public(),
         )
@@ -1185,7 +1267,7 @@ def test_s5b_headless_runner_releases_bound_inflight_on_gate_and_lease_failures(
             "prompt",
             {"state": "pending", "held_by_this_server": True},
             5,
-            role="arbeitsbiene",
+            role="exploriererin",
             assignment_id="assignment-lease",
             headless_inflight_reservation={"reservation_id": "inflight-lease"},
             structured_gate={
@@ -1206,7 +1288,7 @@ def test_s5b_headless_runner_releases_bound_inflight_on_gate_and_lease_failures(
         "prompt",
         {"state": "held", "held_by_this_server": True},
         5,
-        role="arbeitsbiene",
+        role="exploriererin",
         assignment_id="assignment-gate",
         headless_inflight_reservation={"reservation_id": "inflight-gate"},
         structured_gate={
@@ -1244,7 +1326,7 @@ def test_s5b_headless_runner_releases_bound_inflight_on_gate_and_lease_failures(
             "prompt",
             {"state": "held", "held_by_this_server": True},
             5,
-            role="arbeitsbiene",
+            role="exploriererin",
             assignment_id="assignment-metadata",
             headless_inflight_reservation={"reservation_id": "inflight-metadata"},
             structured_gate={
@@ -1322,7 +1404,7 @@ def test_s5b_headless_runner_releases_bound_inflight_on_provider_start_and_rate_
             "prompt",
             {"state": "held", "held_by_this_server": True},
             5,
-            role="arbeitsbiene",
+            role="exploriererin",
             assignment_id="assignment-provider",
             headless_inflight_reservation={"reservation_id": "inflight-provider"},
             structured_gate={
@@ -1352,7 +1434,7 @@ def test_s5b_headless_runner_releases_bound_inflight_on_provider_start_and_rate_
             "prompt",
             {"state": "held", "held_by_this_server": True},
             5,
-            role="arbeitsbiene",
+            role="exploriererin",
             assignment_id="assignment-start",
             headless_inflight_reservation={"reservation_id": "inflight-start"},
             structured_gate={
@@ -1379,7 +1461,7 @@ def test_s5b_headless_runner_releases_bound_inflight_on_provider_start_and_rate_
             "prompt",
             {"state": "held", "held_by_this_server": True},
             5,
-            role="arbeitsbiene",
+            role="exploriererin",
             assignment_id="assignment-rate",
             headless_inflight_reservation={"reservation_id": "inflight-rate"},
             structured_gate={
@@ -1826,7 +1908,7 @@ def test_s5d_headless_terminal_result_releases_bound_inflight_once(
             "prompt",
             {"state": "held", "held_by_this_server": True},
             5,
-            role="arbeitsbiene",
+            role="exploriererin",
             assignment_id="assignment-terminal",
             headless_inflight_reservation={"reservation_id": "inflight-terminal"},
             structured_gate={
@@ -1845,7 +1927,7 @@ def test_s5d_headless_terminal_result_releases_bound_inflight_once(
                 "prompt",
                 {"state": "held", "held_by_this_server": True},
                 5,
-                role="arbeitsbiene",
+                role="exploriererin",
                 assignment_id="assignment-terminal",
                 headless_inflight_reservation={"reservation_id": "inflight-terminal"},
                 structured_gate={
@@ -1965,7 +2047,7 @@ def test_s5d_headless_recovery_releases_once_after_confirmed_process_end(monkeyp
             "prompt",
             {"state": "held", "held_by_this_server": True},
             5,
-            role="arbeitsbiene",
+            role="exploriererin",
             assignment_id="assignment-recovery",
             headless_inflight_reservation={"reservation_id": "inflight-recovery"},
             structured_gate={
@@ -2079,7 +2161,7 @@ def test_s5d_headless_recovery_keeps_inflight_when_process_end_is_unconfirmed(mo
             "prompt",
             {"state": "held", "held_by_this_server": True},
             5,
-            role="arbeitsbiene",
+            role="exploriererin",
             assignment_id="assignment-recovery-unconfirmed",
             headless_inflight_reservation={"reservation_id": "inflight-recovery-unconfirmed"},
             structured_gate={
@@ -2215,11 +2297,11 @@ def test_g8_b2_headless_terminal_account_limited_model_scope_uses_model_limited_
     monkeypatch.setattr(server.HEADLESS_JOBS, "request_cancel", lambda *_args, **_kwargs: {"status": "not_running"})
 
     result = server._run_headless_process(
-        "d1",
-        "prompt",
-        {"state": "held", "held_by_this_server": True},
-        5,
-        role="arbeitsbiene",
+            "d1",
+            "prompt",
+            {"state": "held", "held_by_this_server": True},
+            5,
+            role="exploriererin",
         assignment_id="assignment-model-limited",
         headless_inflight_reservation={"reservation_id": "inflight-model-limited"},
         structured_gate={"action": "allow", "diagnostic_code": "gemini_limits_unknown", "account_id": "gemini-project", "raw_output": "not_returned"},
@@ -2345,7 +2427,7 @@ def test_g8_b2_headless_terminal_account_limited_fallbacks_to_accountwide_path(
         "prompt",
         {"state": "held", "held_by_this_server": True},
         5,
-        role="arbeitsbiene",
+        role="exploriererin",
         assignment_id="assignment-account-limited",
         headless_inflight_reservation={"reservation_id": "inflight-account-limited"},
         structured_gate={"action": "allow", "diagnostic_code": "gemini_limits_unknown", "account_id": "gemini-project", "raw_output": "not_returned"},
@@ -2505,6 +2587,51 @@ def test_headless_write_assignment_fails_closed_before_claim_or_process(monkeypa
     claim.assert_not_called()
     record.assert_not_called()
     run.assert_not_called()
+
+
+def test_headless_write_assignment_rejects_write_paths_outside_scope_before_binding(
+    tmp_path: Path, monkeypatch
+) -> None:
+    descriptor = type(
+        "Descriptor",
+        (),
+        {"model": "gemini-3-flash-preview", "account_id": "gemini-project"},
+    )()
+    scope_store = Mock()
+    scope_store.has_available.return_value = True
+    scope_store.bind = Mock()
+    claim = Mock()
+
+    monkeypatch.setattr(server, "canonical_agent_id", lambda _agent: "i1")
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "skill_matches", lambda *_args: [])
+    monkeypatch.setattr(server, "assignment_prompt", lambda **_kwargs: "prompt")
+    monkeypatch.setattr(
+        server,
+        "_gemini_headless_gate",
+        lambda _agent: {
+            "action": "allow",
+            "diagnostic_code": "gemini_ready",
+            "account_id": "gemini-project",
+            "raw_output": "not_returned",
+        },
+    )
+    monkeypatch.setattr(server, "_headless_write_scope_store", lambda: scope_store)
+    monkeypatch.setattr(server, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(server, "_claim_agent_unlocked", claim)
+
+    with pytest.raises(server.AgentError, match="headless_write_scope_violation"):
+        server._assign_headless_agent(
+            "i1",
+            role="arbeitsbiene",
+            task="fix",
+            scope=["src"],
+            write_paths=["outside.py"],
+            timeout_seconds=5,
+        )
+
+    scope_store.bind.assert_not_called()
+    claim.assert_not_called()
 
 
 def test_headless_write_assignment_binds_attestation_before_claim_and_passes_worktree(
@@ -2669,8 +2796,106 @@ def test_worktree_create_rejects_target_swap_after_git_operation(
             "d1", path=".codex-master-worktrees/agent-d1"
         )
 
-    assert calls[-1][:3] == ["git", "worktree", "add"]
+    assert any(call[:3] == ["git", "worktree", "add"] for call in calls)
+    assert any(call[:4] == ["git", "worktree", "remove", "--force"] for call in calls)
     assert target.is_symlink()
+
+
+def test_worktree_create_rolls_back_own_worktree_when_attestation_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    for args in (
+        ("git", "init", "--quiet"),
+        ("git", "config", "user.email", "test@example.invalid"),
+        ("git", "config", "user.name", "Headless Test"),
+    ):
+        subprocess.run(args, cwd=repository, check=True, capture_output=True, text=True)
+    (repository / "README.md").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(
+        ("git", "add", "README.md"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ("git", "commit", "--quiet", "-m", "baseline"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    scope_store = Mock()
+    scope_store.create.side_effect = server.HeadlessWriteScopeFailure(
+        "headless_attestation_invalid", "attestation failed", "retry"
+    )
+    target = repository / ".codex-master-worktrees" / "agent-d1"
+    monkeypatch.setattr(server, "require_fleet_recovery_ready", lambda *_args: None)
+    monkeypatch.setattr(server, "canonical_agent_id", lambda value: value)
+    monkeypatch.setattr(server, "repo_root", lambda: repository)
+    monkeypatch.setattr(server, "_headless_write_scope_store", lambda: scope_store)
+
+    with pytest.raises(server.AgentError, match="headless_attestation_invalid"):
+        server.worktree_create_for_agent("d1", path=".codex-master-worktrees/agent-d1")
+
+    assert not target.exists()
+    worktrees = subprocess.run(
+        ("git", "worktree", "list", "--porcelain"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert str(target) not in worktrees
+
+
+def test_worktree_create_surfaces_registration_rollback_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    for args in (
+        ("git", "init", "--quiet"),
+        ("git", "config", "user.email", "test@example.invalid"),
+        ("git", "config", "user.name", "Headless Test"),
+    ):
+        subprocess.run(args, cwd=repository, check=True, capture_output=True, text=True)
+    (repository / "README.md").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(
+        ("git", "add", "README.md"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ("git", "commit", "--quiet", "-m", "baseline"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    scope_store = Mock()
+    scope_store.create.side_effect = server.HeadlessWriteScopeFailure(
+        "headless_attestation_invalid", "attestation failed", "retry"
+    )
+    real_run_command = server.run_command
+
+    def fail_rollback(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[:4] == ["git", "worktree", "remove", "--force"]:
+            return subprocess.CompletedProcess(args, 91, "", "rollback failed")
+        return real_run_command(args, **kwargs)
+
+    monkeypatch.setattr(server, "require_fleet_recovery_ready", lambda *_args: None)
+    monkeypatch.setattr(server, "canonical_agent_id", lambda value: value)
+    monkeypatch.setattr(server, "repo_root", lambda: repository)
+    monkeypatch.setattr(server, "run_command", fail_rollback)
+    monkeypatch.setattr(server, "_headless_write_scope_store", lambda: scope_store)
+
+    with pytest.raises(server.AgentError, match="headless_attestation_rollback_failed"):
+        server.worktree_create_for_agent("d1", path=".codex-master-worktrees/agent-d1")
 
 
 def test_headless_write_runner_revalidates_and_uses_attested_cwd(monkeypatch, tmp_path: Path) -> None:
@@ -2691,9 +2916,16 @@ def test_headless_write_runner_revalidates_and_uses_attested_cwd(monkeypatch, tm
     scope_store = Mock()
     scope_store.finalize.return_value = server.ScopeResult(True, "ok", 1, 1, 0)
     binding = SimpleNamespace(worktree_path=tmp_path / "attested-worktree")
+    binding.worktree_path.mkdir()
+    worktree_stat = binding.worktree_path.stat()
+    scope_store.revalidate.return_value = SimpleNamespace(
+        worktree_path=binding.worktree_path,
+        worktree_device=worktree_stat.st_dev,
+        worktree_inode=worktree_stat.st_ino,
+    )
     marker: dict[str, object] = {"state": "ready"}
     process = Mock(pid=None, stdin=io.BytesIO(b""), stdout=io.BytesIO(), stderr=io.BytesIO())
-    run_result = SimpleNamespace(
+    run_result = server.HeadlessProcessResult(
         returncode=0,
         stdout=b'{"type":"result","response":"ok","stats":{"input_tokens":1,"output_tokens":1}}\n',
         stderr=b"",
@@ -2705,7 +2937,6 @@ def test_headless_write_runner_revalidates_and_uses_attested_cwd(monkeypatch, tm
     plan = SimpleNamespace(
         unset_env=set(), env={}, secret_env_name="GEMINI_API_KEY", argv=("gemini",)
     )
-
     monkeypatch.setattr(server, "current_fleet_service", lambda: service)
     monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
     monkeypatch.setattr(server, "_headless_marker", lambda _agent: marker)
@@ -2720,7 +2951,12 @@ def test_headless_write_runner_revalidates_and_uses_attested_cwd(monkeypatch, tm
     monkeypatch.setattr(server, "_ensure_gemini_headless_retry_policy", lambda *_args: None)
     monkeypatch.setattr(server, "build_runner_plan", lambda *_args: plan)
     monkeypatch.setattr(server, "repo_root", lambda: tmp_path)
-    monkeypatch.setattr(server.subprocess, "Popen", Mock(return_value=process))
+    monkeypatch.setattr(
+        server,
+        "subprocess",
+        SimpleNamespace(Popen=Mock(return_value=process), PIPE=object()),
+    )
+    process.wait.return_value = 0
     monkeypatch.setattr(server, "run_bounded_process", lambda *_args, **_kwargs: run_result)
     monkeypatch.setattr(server.HEADLESS_JOBS, "register", lambda *_args: None)
     monkeypatch.setattr(server.HEADLESS_JOBS, "finish", lambda *_args: None)
@@ -2747,14 +2983,209 @@ def test_headless_write_runner_revalidates_and_uses_attested_cwd(monkeypatch, tm
     assert result["status"] == "completed"
     assert result["write_scope"]["code"] == "ok"
     assert process is server.subprocess.Popen.return_value
-    assert server.subprocess.Popen.call_args.kwargs["cwd"] == binding.worktree_path
+    run_cwd = server.subprocess.Popen.call_args.kwargs["cwd"]
+    assert str(run_cwd).startswith("/proc/self/fd/")
+    assert run_cwd != binding.worktree_path
     scope_store.revalidate.assert_called_once_with(
         binding, tmp_path, provider_generation=4
     )
     scope_store.finalize.assert_called_once_with(binding)
 
 
-def test_headless_write_scope_violation_cannot_report_completed(monkeypatch, tmp_path: Path) -> None:
+def test_headless_write_runner_rejects_worktree_path_swap_after_revalidation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    descriptor = SimpleNamespace(
+        model="gemini-3-flash-preview",
+        account_id="gemini-project",
+        provider=server.Provider.GEMINI_API,
+        runner=server.RunnerKind.GEMINI_CLI,
+        home=tmp_path / "managed-home",
+    )
+    service = Mock()
+    service.load.return_value = object()
+    service.read_secret.return_value = "secret"
+    original = tmp_path / "attested-worktree"
+    replacement = tmp_path / "replacement-worktree"
+    moved = tmp_path / "moved-worktree"
+    original.mkdir()
+    replacement.mkdir()
+    binding = SimpleNamespace(worktree_path=original)
+    scope_store = Mock()
+    scope_store.finalize.return_value = server.ScopeResult(True, "ok", 0, 0, 0)
+
+    def revalidate_and_swap(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        original.rename(moved)
+        original.symlink_to(replacement, target_is_directory=True)
+        return SimpleNamespace(worktree_path=original)
+
+    scope_store.revalidate.side_effect = revalidate_and_swap
+    plan = SimpleNamespace(
+        unset_env=set(), env={}, secret_env_name="GEMINI_API_KEY", argv=("gemini",)
+    )
+    monkeypatch.setattr(server, "current_fleet_service", lambda: service)
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "_headless_marker", lambda _agent: {"state": "ready"})
+    monkeypatch.setattr(server, "status_agent", lambda *_args, **_kwargs: {"identity_guard": {"ok": True}})
+    monkeypatch.setattr(
+        server,
+        "_headless_admission_gate",
+        lambda _agent: SimpleNamespace(allowed=True, account_id="gemini-project", generation=4),
+    )
+    monkeypatch.setattr(server, "build_inventory", lambda *_args: SimpleNamespace(agents={"d1": descriptor}))
+    monkeypatch.setattr(server, "_headless_executable", lambda _descriptor: tmp_path / "gemini")
+    monkeypatch.setattr(server, "_ensure_gemini_headless_retry_policy", lambda *_args: None)
+    monkeypatch.setattr(server, "build_runner_plan", lambda *_args: plan)
+    monkeypatch.setattr(server, "repo_root", lambda: tmp_path)
+    popen = Mock()
+    monkeypatch.setattr(server.subprocess, "Popen", popen)
+
+    with pytest.raises(server.AgentError, match="headless_worktree_identity_changed"):
+        server._run_headless_process(
+            "d1",
+            "prompt",
+            {"state": "held", "held_by_this_server": True},
+            5,
+            role="arbeitsbiene",
+            assignment_id="assignment-swap",
+            structured_gate={
+                "action": "allow",
+                "diagnostic_code": "gemini_ready",
+                "account_id": "gemini-project",
+                "raw_output": "not_returned",
+            },
+            write_scope_binding=binding,
+            write_scope_store=scope_store,
+            release_lease_on_completion=False,
+        )
+
+    popen.assert_not_called()
+    assert original.is_symlink()
+    scope_store.finalize.assert_called_once_with(binding)
+
+
+def test_headless_write_worktree_create_assign_runner_integration(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    for args in (
+        ("git", "init", "--quiet"),
+        ("git", "config", "user.email", "test@example.invalid"),
+        ("git", "config", "user.name", "Headless Test"),
+    ):
+        subprocess.run(args, cwd=repository, check=True, capture_output=True, text=True)
+    (repository / "README.md").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(
+        ("git", "add", "README.md"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ("git", "commit", "--quiet", "-m", "baseline"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    scope_store = server.HeadlessWriteScopeStore(tmp_path / "state")
+    descriptor = SimpleNamespace(
+        model="gemini-3-flash-preview",
+        account_id="gemini-project",
+        provider=server.Provider.GEMINI_API,
+        runner=server.RunnerKind.GEMINI_CLI,
+        home=tmp_path / "managed-home",
+    )
+    snapshot = _snapshot(tmp_path)
+    service = FakeService(snapshot)
+    gate = {
+        "action": "allow",
+        "diagnostic_code": "gemini_ready",
+        "account_id": "gemini-project",
+        "raw_output": "not_returned",
+    }
+    plan = SimpleNamespace(
+        unset_env=set(), env={}, secret_env_name="GEMINI_API_KEY", argv=("gemini",)
+    )
+    process = Mock(pid=None, stdin=io.BytesIO(), stdout=io.BytesIO(), stderr=io.BytesIO())
+    run_result = server.HeadlessProcessResult(
+        returncode=0,
+        stdout=b'{"type":"result","response":"ok","stats":{"input_tokens":1,"output_tokens":1}}\n',
+        stderr=b"",
+        stdout_truncated=False,
+        stderr_truncated=False,
+        timed_out=False,
+        cancelled=False,
+    )
+    marker: dict[str, object] = {"state": "ready"}
+    monkeypatch.setattr(server, "require_fleet_recovery_ready", lambda *_args: None)
+    monkeypatch.setattr(server, "repo_root", lambda: repository)
+    monkeypatch.setattr(server, "canonical_agent_id", lambda value: value)
+    monkeypatch.setattr(server, "_headless_write_scope_store", lambda: scope_store)
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "_gemini_headless_gate", lambda _agent: dict(gate))
+    monkeypatch.setattr(server, "status_agent", lambda *_args, **_kwargs: {"identity_guard": {"ok": True}})
+    monkeypatch.setattr(server, "skill_matches", lambda *_args: [])
+    monkeypatch.setattr(server, "assignment_prompt", lambda **_kwargs: "prompt")
+    monkeypatch.setattr(server, "current_fleet_service", lambda: service)
+    monkeypatch.setattr(
+        server,
+        "_headless_admission_gate",
+        lambda _agent: SimpleNamespace(allowed=True, account_id="gemini-project", generation=4),
+    )
+    monkeypatch.setattr(server, "require_spawn_capacity", lambda *_args, **_kwargs: {"allowed": True})
+    monkeypatch.setattr(server, "spawn_admission_lock", lambda: nullcontext())
+    monkeypatch.setattr(server, "reserve_headless_inflight", lambda *_args: {"reservation_id": "r1"})
+    monkeypatch.setattr(server, "agent_lifecycle_lock", lambda _agent: nullcontext())
+    monkeypatch.setattr(
+        server,
+        "_claim_agent_unlocked",
+        lambda _agent: {"status": "already_held", "lease": {"state": "held", "held_by_this_server": True}},
+    )
+    monkeypatch.setattr(server, "record_assignment", lambda _record: None)
+    monkeypatch.setattr(server, "_headless_marker", lambda _agent: marker)
+    monkeypatch.setattr(server, "_write_headless_marker", lambda _agent, value: marker.update(value))
+    monkeypatch.setattr(server, "_headless_executable", lambda _descriptor: Path("/bin/true"))
+    monkeypatch.setattr(server, "_ensure_gemini_headless_retry_policy", lambda *_args: None)
+    monkeypatch.setattr(server, "build_inventory", lambda *_args: SimpleNamespace(agents={"d1": descriptor}))
+    monkeypatch.setattr(server, "build_runner_plan", lambda *_args: plan)
+    created = server.worktree_create_for_agent(
+        "d1", path=".codex-master-worktrees/agent-d1"
+    )
+    monkeypatch.setattr(
+        server,
+        "subprocess",
+        SimpleNamespace(Popen=Mock(return_value=process), PIPE=object()),
+    )
+    monkeypatch.setattr(server, "run_bounded_process", lambda *_args, **_kwargs: run_result)
+    monkeypatch.setattr(server.HEADLESS_JOBS, "register", lambda *_args: None)
+    monkeypatch.setattr(server.HEADLESS_JOBS, "finish", lambda *_args: None)
+    monkeypatch.setattr(server.HEADLESS_JOBS, "request_cancel", lambda *_args, **_kwargs: {"status": "not_running"})
+    monkeypatch.setattr(server, "release_headless_inflight", lambda *_args: {"status": "released"})
+    monkeypatch.setattr(server, "release_agent", lambda *_args, **_kwargs: {"lease": {"state": "unclaimed"}})
+
+    result = server._assign_headless_agent(
+        "d1",
+        role="arbeitsbiene",
+        task="fix",
+        scope=["src"],
+        write_paths=["src/file.py"],
+        timeout_seconds=5,
+    )
+
+    assert created["write_scope"]["state"] == "available"
+    assert result["status"] == "completed"
+    assert result["write_scope"]["code"] == "ok"
+    attestation = scope_store.read(created["write_scope"]["attestation_id"])
+    assert attestation.lifecycle == "consumed"
+
+
+@pytest.mark.parametrize("runner_error", [False, True])
+def test_headless_write_scope_violation_cannot_report_completed(
+    monkeypatch, tmp_path: Path, runner_error: bool
+) -> None:
     descriptor = type(
         "Descriptor",
         (),
@@ -2774,9 +3205,16 @@ def test_headless_write_scope_violation_cannot_report_completed(monkeypatch, tmp
         False, "headless_write_scope_violation", 2, 1, 1
     )
     binding = SimpleNamespace(worktree_path=tmp_path / "attested-worktree")
+    binding.worktree_path.mkdir()
+    worktree_stat = binding.worktree_path.stat()
+    scope_store.revalidate.return_value = SimpleNamespace(
+        worktree_path=binding.worktree_path,
+        worktree_device=worktree_stat.st_dev,
+        worktree_inode=worktree_stat.st_ino,
+    )
     marker: dict[str, object] = {"state": "ready"}
     process = Mock(pid=None, stdin=io.BytesIO(b""), stdout=io.BytesIO(), stderr=io.BytesIO())
-    run_result = SimpleNamespace(
+    run_result = server.HeadlessProcessResult(
         returncode=0,
         stdout=b'{"type":"result","response":"unsafe","stats":{"input_tokens":1,"output_tokens":1}}\n',
         stderr=b"",
@@ -2784,10 +3222,12 @@ def test_headless_write_scope_violation_cannot_report_completed(monkeypatch, tmp
         stderr_truncated=False,
         timed_out=False,
         cancelled=False,
+        readers_alive=False,
     )
     plan = SimpleNamespace(
         unset_env=set(), env={}, secret_env_name="GEMINI_API_KEY", argv=("gemini",)
     )
+    finished: list[object] = []
 
     monkeypatch.setattr(server, "current_fleet_service", lambda: service)
     monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
@@ -2804,32 +3244,115 @@ def test_headless_write_scope_violation_cannot_report_completed(monkeypatch, tmp
     monkeypatch.setattr(server, "build_runner_plan", lambda *_args: plan)
     monkeypatch.setattr(server, "repo_root", lambda: tmp_path)
     monkeypatch.setattr(server.subprocess, "Popen", Mock(return_value=process))
-    monkeypatch.setattr(server, "run_bounded_process", lambda *_args, **_kwargs: run_result)
+    process.wait.return_value = 0
+    def run_or_fail(*_args: object, **_kwargs: object) -> object:
+        if runner_error:
+            raise RuntimeError("runner failed")
+        return run_result
+
+    monkeypatch.setattr(server, "run_bounded_process", run_or_fail)
     monkeypatch.setattr(server.HEADLESS_JOBS, "register", lambda *_args: None)
-    monkeypatch.setattr(server.HEADLESS_JOBS, "finish", lambda *_args: None)
+    monkeypatch.setattr(server.HEADLESS_JOBS, "finish", lambda _job, value: finished.append(value))
     monkeypatch.setattr(server, "_write_headless_marker", lambda _agent, value: marker.update(value))
 
-    result = server._run_headless_process(
-        "d1",
-        "prompt",
-        {"state": "held", "held_by_this_server": True},
-        5,
-        role="arbeitsbiene",
-        assignment_id="assignment-1",
-        structured_gate={
-            "action": "allow",
-            "diagnostic_code": "gemini_ready",
-            "account_id": "gemini-project",
-            "raw_output": "not_returned",
-        },
-        write_scope_binding=binding,
-        write_scope_store=scope_store,
-        release_lease_on_completion=False,
+    def call() -> dict[str, object]:
+        return server._run_headless_process(
+            "d1",
+            "prompt",
+            {"state": "held", "held_by_this_server": True},
+            5,
+            role="arbeitsbiene",
+            assignment_id="assignment-1",
+            structured_gate={
+                "action": "allow",
+                "diagnostic_code": "gemini_ready",
+                "account_id": "gemini-project",
+                "raw_output": "not_returned",
+            },
+            write_scope_binding=binding,
+            write_scope_store=scope_store,
+            release_lease_on_completion=False,
+        )
+    if runner_error:
+        with pytest.raises(server.AgentError, match="headless_write_scope_violation"):
+            call()
+    else:
+        result = call()
+        assert result["status"] == "failed"
+        assert result["error"]["kind"] == "headless_write_scope_violation"
+        assert result["response"] == ""
+        assert finished
+        assert finished[-1].returncode != 0
+    assert scope_store.finalize.called
+    assert service.record_gemini_event.call_args.kwargs["reason"] == (
+        "headless_write_scope_violation"
+    )
+    assert finished
+    assert finished[-1].returncode != 0
+
+
+def test_headless_scope_failure_wins_over_provider_service_failure(monkeypatch) -> None:
+    scope_store = Mock()
+    scope_store.finalize.return_value = server.ScopeResult(
+        False, "headless_write_scope_violation", 1, 0, 1
+    )
+    provider_failure = RuntimeError("provider service unavailable")
+    monkeypatch.setattr(
+        server, "current_fleet_service", Mock(side_effect=provider_failure)
     )
 
-    assert result["status"] == "failed"
-    assert result["error"]["kind"] == "headless_write_scope_violation"
-    assert result["response"] == ""
+    with pytest.raises(server.AgentError, match="headless_write_scope_violation"):
+        server._run_headless_process(
+            "d1",
+            "prompt",
+            {"state": "held", "held_by_this_server": True},
+            5,
+            role="arbeitsbiene",
+            assignment_id="assignment-provider-scope",
+            write_scope_binding=object(),
+            write_scope_store=scope_store,
+            release_lease_on_completion=False,
+        )
+
+    scope_store.finalize.assert_called_once()
+
+
+def test_headless_scope_failure_wins_when_gate_lookup_fails(monkeypatch) -> None:
+    descriptor = SimpleNamespace(
+        model="gemini-3-flash-preview",
+        account_id="gemini-project",
+        provider=server.Provider.GEMINI_API,
+        runner=server.RunnerKind.GEMINI_CLI,
+        home=Path("/tmp/managed-d1"),
+    )
+    service = Mock()
+    scope_store = Mock()
+    scope_store.finalize.return_value = server.ScopeResult(
+        False, "headless_write_scope_violation", 1, 0, 1
+    )
+    monkeypatch.setattr(server, "current_fleet_service", lambda: service)
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "_headless_marker", lambda _agent: {"state": "ready"})
+    monkeypatch.setattr(
+        server,
+        "_gemini_headless_gate",
+        Mock(side_effect=RuntimeError("provider gate unavailable")),
+    )
+
+    with pytest.raises(server.AgentError, match="headless_write_scope_violation"):
+        server._run_headless_process(
+            "d1",
+            "prompt",
+            {"state": "held", "held_by_this_server": True},
+            5,
+            role="arbeitsbiene",
+            assignment_id="assignment-gate-scope",
+            write_scope_binding=object(),
+            write_scope_store=scope_store,
+            release_lease_on_completion=False,
+        )
+
+    scope_store.finalize.assert_called_once()
 
 
 def test_gemini_bootstrap_plan_is_dry_and_secret_free() -> None:

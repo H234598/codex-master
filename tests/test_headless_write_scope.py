@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
+import threading
 
 import pytest
 
+import codex_master.headless_write_scope as headless_write_scope
 from codex_master.headless_write_scope import (
     HeadlessWriteScopeFailure,
     HeadlessWriteScopeStore,
@@ -190,6 +194,226 @@ def test_provider_generation_change_rejects_revalidation(tmp_path: Path) -> None
         store.revalidate(binding, repository, provider_generation=5)
 
 
+def test_revalidation_rejects_binding_worktree_tampering(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    alternate = tmp_path / "alternate-worktree"
+    _git(repository, "worktree", "add", "--quiet", "-b", "alternate", str(alternate))
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["src/new.py"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+
+    tampered = replace(binding, worktree_path=alternate)
+
+    with pytest.raises(HeadlessWriteScopeFailure, match="headless_attestation_invalid"):
+        store.revalidate(tampered, repository, provider_generation=4)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attestation_id", "0" * 32),
+        ("agent_id", "other-agent"),
+        ("assignment_id", "other-assignment"),
+        ("repository_root", Path("/tmp/other-repository")),
+        ("worktree_path", Path("/tmp/other-worktree")),
+        ("baseline_commit", "1" * 40),
+        ("provider_generation", 5),
+        ("declared_write_paths", (("other.py", False),)),
+    ],
+)
+def test_revalidation_rejects_every_binding_identity_field_tampering(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["src/new.py"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+
+    tampered = replace(binding, **{field: value})
+
+    with pytest.raises(HeadlessWriteScopeFailure):
+        store.revalidate(tampered, repository, provider_generation=4)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "worktree_device",
+        "worktree_inode",
+        "common_git_dir",
+        "branch",
+        "detached",
+        "requested_base_ref",
+        "creation_generation",
+        "created_at_utc",
+    ],
+)
+def test_revalidation_rejects_every_persisted_worktree_field_tampering(
+    tmp_path: Path, field: str
+) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["src/new.py"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+    replacements: dict[str, object] = {
+        "worktree_device": binding.worktree_device + 1,
+        "worktree_inode": binding.worktree_inode + 1,
+        "common_git_dir": binding.common_git_dir / "changed",
+        "branch": "changed-branch",
+        "detached": not binding.detached,
+        "requested_base_ref": "changed-ref",
+        "creation_generation": "changed-generation",
+        "created_at_utc": "2000-01-01T00:00:00+00:00",
+    }
+    tampered = replace(binding, **{field: replacements[field]})
+
+    with pytest.raises(HeadlessWriteScopeFailure):
+        store.revalidate(tampered, repository, provider_generation=4)
+
+
+def test_expired_available_attestation_is_not_bindable(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    attestation = store.create("a", repository, worktree, base_ref=None)
+    record_path = tmp_path / "state" / f"attestation-{attestation.attestation_id}.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["created_at_utc"] = "2000-01-01T00:00:00+00:00"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert store.has_available("a") is False
+    assert store.read(attestation.attestation_id).lifecycle == "consumed"
+
+
+def test_ttl_does_not_consume_bound_attestation(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    attestation = store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["src/new.py"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+    record_path = tmp_path / "state" / f"attestation-{attestation.attestation_id}.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["created_at_utc"] = "2000-01-01T00:00:00+00:00"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert store.read(binding.attestation_id).lifecycle == "bound"
+
+
+def test_cumulative_serialized_write_path_size_is_bounded(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    write_paths = [
+        f"p{index:03d}/" + "/".join("x" * 220 for _ in range(3))
+        for index in range(100)
+    ]
+
+    with pytest.raises(HeadlessWriteScopeFailure, match="headless_write_path_invalid"):
+        store.bind(
+            "a",
+            repository,
+            write_paths,
+            assignment_id="assignment-1",
+            provider_generation=4,
+        )
+
+
+def test_attestation_record_requires_private_single_link_owner_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    attestation = store.create("a", repository, worktree, base_ref=None)
+    record_path = tmp_path / "state" / f"attestation-{attestation.attestation_id}.json"
+
+    record_path.chmod(0o644)
+    with pytest.raises(HeadlessWriteScopeFailure, match="headless_attestation_invalid"):
+        store.read(attestation.attestation_id)
+
+    record_path.chmod(0o600)
+    hardlink = tmp_path / "state" / "attestation-hardlink.json"
+    os.link(record_path, hardlink)
+    with pytest.raises(HeadlessWriteScopeFailure, match="headless_attestation_invalid"):
+        store.read(attestation.attestation_id)
+
+    actual_owner = record_path.stat().st_uid
+    monkeypatch.setattr(headless_write_scope.os, "getuid", lambda: actual_owner + 1)
+    with pytest.raises(HeadlessWriteScopeFailure, match="headless_attestation_invalid"):
+        store.read(attestation.attestation_id)
+
+
+def test_attestation_lock_requires_private_single_link_owner_file(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    attestation = store.create("a", repository, worktree, base_ref=None)
+    lock_path = tmp_path / "state" / "store.lock"
+
+    lock_path.chmod(0o644)
+    with pytest.raises(HeadlessWriteScopeFailure, match="headless_attestation_invalid"):
+        store.read(attestation.attestation_id)
+
+    lock_path.chmod(0o600)
+    hardlink = tmp_path / "state" / "lock-hardlink"
+    os.link(lock_path, hardlink)
+    with pytest.raises(HeadlessWriteScopeFailure, match="headless_attestation_invalid"):
+        store.read(attestation.attestation_id)
+
+
+def test_attestation_state_permission_failure_is_not_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    attestation = store.create("a", repository, worktree, base_ref=None)
+
+    def deny_chmod(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("chmod denied")
+
+    monkeypatch.setattr(headless_write_scope.os, "chmod", deny_chmod)
+    with pytest.raises(HeadlessWriteScopeFailure, match="headless_attestation_invalid"):
+        store.read(attestation.attestation_id)
+
+
+def test_journal_record_listing_uses_pinned_directory_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    original_glob = Path.glob
+
+    def reject_path_listing(path: Path, pattern: str):
+        if path == store.state_root:
+            raise AssertionError("journal listing escaped its pinned directory fd")
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", reject_path_listing)
+
+    assert store.has_available("a") is True
+
+
 def test_repository_identity_change_rejects_binding(tmp_path: Path) -> None:
     repository, worktree = _repository(tmp_path)
     other_repository, _other_worktree = _repository(tmp_path / "other")
@@ -228,6 +452,128 @@ def test_out_of_scope_tracked_and_untracked_changes_fail_closed(tmp_path: Path) 
     assert result.changed_count == 2
     assert result.out_of_scope_count == 1
     assert store.read(binding.attestation_id).lifecycle == "consumed"
+
+
+def test_finalize_attributes_allowed_worker_commit(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["src/new.py"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+    (worktree / "src").mkdir()
+    (worktree / "src" / "new.py").write_text("committed\n", encoding="utf-8")
+    _git(worktree, "add", "src/new.py")
+    _git(worktree, "commit", "--quiet", "-m", "worker result")
+
+    result = store.finalize(binding)
+
+    assert result.ok is True
+    assert result.code == "ok"
+    assert result.changed_count == 1
+
+
+def test_finalize_attributes_both_paths_of_committed_rename(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["README.md", "RENAMED.md"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+    _git(worktree, "mv", "README.md", "RENAMED.md")
+    _git(worktree, "commit", "--quiet", "-m", "worker rename")
+
+    result = store.finalize(binding)
+
+    assert result.ok is True
+    assert result.changed_count == 2
+
+
+def test_finalize_attributes_both_paths_of_committed_copy(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["README.md", "COPIED.md"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+    subprocess.run(
+        ("cp", "README.md", "COPIED.md"),
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _git(worktree, "add", "COPIED.md")
+    _git(worktree, "commit", "--quiet", "-m", "worker copy")
+
+    result = store.finalize(binding)
+
+    assert result.ok is True
+    assert result.changed_count == 2
+
+
+def test_finalize_rejects_committed_out_of_scope_change_even_after_revert(
+    tmp_path: Path,
+) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["src/allowed.py"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+    (worktree / "outside.py").write_text("outside\n", encoding="utf-8")
+    _git(worktree, "add", "outside.py")
+    _git(worktree, "commit", "--quiet", "-m", "out of scope")
+    _git(worktree, "revert", "--quiet", "--no-edit", "HEAD")
+
+    result = store.finalize(binding)
+
+    assert result.ok is False
+    assert result.code == "headless_write_scope_violation"
+    assert result.out_of_scope_count == 1
+
+
+def test_finalize_rejects_history_rewrite_with_foreign_baseline(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["README.md"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+    tree = _git(worktree, "rev-parse", "HEAD^{tree}").strip()
+    unrelated = subprocess.run(
+        ["git", "commit-tree", tree, "-m", "foreign history"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _git(worktree, "reset", "--hard", unrelated)
+
+    result = store.finalize(binding)
+
+    assert result.ok is False
+    assert result.code == "headless_attestation_invalid"
 
 
 def test_rename_requires_attribution_of_both_paths(tmp_path: Path) -> None:
@@ -364,6 +710,35 @@ def test_finalize_rejects_unresolved_git_conflict_and_consumes_attestation(
     assert store.read(binding.attestation_id).lifecycle == "consumed"
 
 
+@pytest.mark.parametrize("conflict_code", ["DD", "AU", "UD", "UA", "DU", "AA", "UU"])
+def test_finalize_rejects_every_unmerged_porcelain_state(
+    tmp_path: Path, conflict_code: str
+) -> None:
+    repository, worktree = _repository(tmp_path)
+    real_store = HeadlessWriteScopeStore(tmp_path / "state")
+    real_store.create("a", repository, worktree, base_ref=None)
+    binding = real_store.bind(
+        "a",
+        repository,
+        ["README.md"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+
+    def conflict_status(
+        args: list[str], *, cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        if len(args) > 1 and args[1] == "status":
+            return subprocess.CompletedProcess(args, 0, f"{conflict_code} README.md\0", "")
+        return _git_process(args, cwd, timeout)
+
+    store = HeadlessWriteScopeStore(tmp_path / "state", git_runner=conflict_status)
+    result = store.finalize(binding)
+
+    assert result.ok is False
+    assert result.code == "headless_write_attribution_unverified"
+
+
 def _git_process(args: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
@@ -375,20 +750,132 @@ def _git_process(args: list[str], cwd: Path, timeout: float) -> subprocess.Compl
     )
 
 
-def test_second_unused_attestation_for_same_agent_is_ambiguous(tmp_path: Path) -> None:
+def test_second_active_attestation_for_same_agent_is_rejected(tmp_path: Path) -> None:
     repository, worktree = _repository(tmp_path)
     store = HeadlessWriteScopeStore(tmp_path / "state")
     store.create("a", repository, worktree, base_ref=None)
-    store.create("a", repository, worktree, base_ref=None)
 
-    with pytest.raises(HeadlessWriteScopeFailure, match="headless_attestation_ambiguous"):
+    with pytest.raises(HeadlessWriteScopeFailure, match="headless_attestation_active"):
+        store.create("a", repository, worktree, base_ref=None)
+
+
+def test_consumed_attestation_cannot_be_reused(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["README.md"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+    assert store.finalize(binding).ok is True
+
+    with pytest.raises(HeadlessWriteScopeFailure, match="headless_write_scope_unenforced"):
         store.bind(
             "a",
             repository,
-            ["src/new.py"],
-            assignment_id="assignment-1",
+            ["README.md"],
+            assignment_id="assignment-2",
             provider_generation=4,
         )
+
+
+def test_concurrent_bind_has_exactly_one_winner(tmp_path: Path) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    store.create("a", repository, worktree, base_ref=None)
+    barrier = threading.Barrier(2)
+    bindings: list[object] = []
+    failures: list[HeadlessWriteScopeFailure] = []
+
+    def bind(index: int) -> None:
+        barrier.wait()
+        try:
+            bindings.append(
+                store.bind(
+                    "a",
+                    repository,
+                    ["src/new.py"],
+                    assignment_id=f"assignment-{index}",
+                    provider_generation=4,
+                )
+            )
+        except HeadlessWriteScopeFailure as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=bind, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(bindings) == 1
+    assert len(failures) == 1
+    assert failures[0].code == "headless_write_scope_unenforced"
+
+
+def test_pruning_removes_old_terminal_records_but_keeps_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    for index in range(3):
+        store.create("a", repository, worktree, base_ref=None)
+        binding = store.bind(
+            "a",
+            repository,
+            ["README.md"],
+            assignment_id=f"assignment-{index}",
+            provider_generation=4,
+        )
+        assert store.finalize(binding).ok is True
+    available = store.create("a", repository, worktree, base_ref=None)
+    monkeypatch.setattr(headless_write_scope, "MAX_RECORDS", 2)
+
+    assert store.has_available("a") is True
+    assert store.read(available.attestation_id).lifecycle == "available"
+    assert len(list((tmp_path / "state").glob("attestation-*.json"))) == 2
+
+
+def test_create_prunes_terminal_records_before_new_record(tmp_path: Path, monkeypatch) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    monkeypatch.setattr(headless_write_scope, "MAX_RECORDS", 2)
+
+    for index in range(2):
+        store.create("a", repository, worktree, base_ref=None)
+        binding = store.bind(
+            "a",
+            repository,
+            ["README.md"],
+            assignment_id=f"assignment-{index}",
+            provider_generation=4,
+        )
+        assert store.finalize(binding).ok is True
+
+    store.create("a", repository, worktree, base_ref=None)
+
+    assert len(list((tmp_path / "state").glob("attestation-*.json"))) == 2
+
+
+def test_create_cleans_expired_available_record_before_pruning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository, worktree = _repository(tmp_path)
+    store = HeadlessWriteScopeStore(tmp_path / "state")
+    monkeypatch.setattr(headless_write_scope, "MAX_RECORDS", 1)
+    expired = store.create("a", repository, worktree, base_ref=None)
+    record_path = tmp_path / "state" / f"attestation-{expired.attestation_id}.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["created_at_utc"] = "2000-01-01T00:00:00+00:00"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    replacement = store.create("a", repository, worktree, base_ref=None)
+
+    assert replacement.attestation_id != expired.attestation_id
+    assert len(list((tmp_path / "state").glob("attestation-*.json"))) == 1
 
 
 def test_malformed_persisted_attestation_fails_closed(tmp_path: Path) -> None:

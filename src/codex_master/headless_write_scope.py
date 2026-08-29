@@ -8,7 +8,8 @@ access is injected so the boundary can be tested without a live MCP.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+import contextvars
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -18,7 +19,6 @@ import re
 import secrets
 import stat
 import subprocess
-import tempfile
 from typing import Any, Callable, Iterator, Mapping
 
 
@@ -28,8 +28,12 @@ MAX_DECLARED_PATHS = 100
 MAX_PATH_CHARS = 1000
 MAX_ASSIGNMENT_ID_CHARS = 200
 MAX_RECORDS = 256
+MAX_RECORD_SCAN = MAX_RECORDS * 4
+MAX_DECLARED_PATH_BYTES = 32 * 1024
+ATTESTATION_TTL_SECONDS = 60 * 60
 ATTESTATION_SCHEMA_VERSION = 1
 _ATTESTATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_UNMERGED_PORCELAIN_STATES = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
 
 
 class HeadlessWriteScopeFailure(RuntimeError):
@@ -73,6 +77,14 @@ class ScopeBinding:
     baseline_commit: str
     provider_generation: int | str
     declared_write_paths: tuple[tuple[str, bool], ...]
+    worktree_device: int
+    worktree_inode: int
+    common_git_dir: Path
+    branch: str | None
+    detached: bool
+    requested_base_ref: str | None
+    creation_generation: str
+    created_at_utc: str
 
 
 @dataclass(frozen=True)
@@ -114,6 +126,9 @@ class HeadlessWriteScopeStore:
             self.state_root = Path.cwd() / self.state_root
         self.state_root = Path(os.path.abspath(self.state_root))
         self.git_runner = git_runner or _default_git_runner
+        self._journal_state_fd: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+            "headless_write_scope_journal_state_fd", default=None
+        )
 
     def create(
         self,
@@ -189,6 +204,18 @@ class HeadlessWriteScopeStore:
             lifecycle="available",
         )
         with self._locked():
+            records = self._load_records_unlocked()
+            self._expire_available_unlocked(records)
+            self._prune_terminal_unlocked(records, max_records=MAX_RECORDS - 1)
+            if any(
+                item.agent_id == agent_id and item.lifecycle in {"available", "bound"}
+                for _path, item in records
+            ):
+                raise self._failure(
+                    "headless_attestation_active",
+                    "agent already has an active worktree attestation",
+                    "consume or release the existing attestation before creating another",
+                )
             self._write_unlocked(attestation)
         return attestation
 
@@ -246,6 +273,14 @@ class HeadlessWriteScopeStore:
             baseline_commit=updated.baseline_commit,
             provider_generation=provider_generation,
             declared_write_paths=declarations,
+            worktree_device=updated.worktree_device,
+            worktree_inode=updated.worktree_inode,
+            common_git_dir=updated.common_git_dir,
+            branch=updated.branch,
+            detached=updated.detached,
+            requested_base_ref=updated.requested_base_ref,
+            creation_generation=updated.creation_generation,
+            created_at_utc=updated.created_at_utc,
         )
 
     def revalidate(
@@ -254,7 +289,7 @@ class HeadlessWriteScopeStore:
         repository_root: Path,
         *,
         provider_generation: int | str,
-    ) -> None:
+    ) -> ScopeAttestation:
         self._require_generation(provider_generation)
         if provider_generation != binding.provider_generation:
             raise self._failure(
@@ -270,7 +305,11 @@ class HeadlessWriteScopeStore:
                     "attestation is stale, consumed, or bound to another assignment",
                     "create a fresh Masterjet worktree attestation",
                 )
-            self._verify_attestation(attestation, binding.agent_id, self._real_directory(repository_root))
+            self._verify_binding_identity(
+                attestation,
+                binding,
+                repository=self._real_directory(repository_root),
+            )
             self._verify_clean_worktree(attestation)
             checked = self._verify_declared_paths(
                 attestation.worktree_path, binding.declared_write_paths
@@ -281,6 +320,7 @@ class HeadlessWriteScopeStore:
                     "declared path filesystem type changed after binding",
                     "create a fresh Masterjet worktree attestation",
                 )
+            return attestation
 
     def finalize(self, binding: ScopeBinding) -> ScopeResult:
         result: ScopeResult | None = None
@@ -297,8 +337,9 @@ class HeadlessWriteScopeStore:
                         "attestation is stale, consumed, or bound to another assignment",
                         "create a fresh Masterjet worktree attestation",
                     )
-                self._verify_repository_identity(attestation)
-                self._verify_binding_identity(attestation, binding)
+                current = self._verify_binding_identity(
+                    attestation, binding, allow_descendant=True
+                )
                 checked = self._verify_declared_paths(
                     attestation.worktree_path, binding.declared_write_paths
                 )
@@ -308,7 +349,13 @@ class HeadlessWriteScopeStore:
                         "declared path filesystem type changed after binding",
                         "create a fresh Masterjet worktree attestation",
                     )
-                changed = self._git_status(attestation.worktree_path)
+                changed = self._git_history_paths(
+                    attestation.worktree_path,
+                    attestation.baseline_commit,
+                    current["head"],
+                )
+                changed.extend(self._git_status(attestation.worktree_path))
+                changed = list(dict.fromkeys(changed))
                 out_of_scope: list[str] = []
                 for path in changed:
                     declared = self._path_is_declared(
@@ -349,25 +396,97 @@ class HeadlessWriteScopeStore:
 
     def read(self, attestation_id: str) -> ScopeAttestation:
         with self._locked():
-            return self._read_unlocked(attestation_id)
+            attestation = self._read_unlocked(attestation_id)
+            if attestation.lifecycle == "available" and self._is_expired(attestation):
+                consumed = self._replace(attestation, lifecycle="consumed")
+                record = self._record(consumed)
+                record["terminal_code"] = "headless_attestation_expired"
+                self._write_record_unlocked(record)
+                return consumed
+            return attestation
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
         self._ensure_state_dir()
-        lock_path = self.state_root / "store.lock"
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            directory_fd = self._open_state_directory_fd(directory_flags)
+            self._verify_journal_directory_fd(directory_fd)
+            fd = os.open(
+                "store.lock",
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            self._verify_journal_regular_fd(fd, "attestation lock")
+        except (OSError, HeadlessWriteScopeFailure) as exc:
+            with_context_close(locals().get("fd", -1))
+            with_context_close(locals().get("directory_fd", -1))
+            if isinstance(exc, HeadlessWriteScopeFailure):
+                raise
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation journal lock is unsafe or unavailable",
+                "repair the Masterjet attestation store before retrying",
+            ) from exc
+        journal_token = self._journal_state_fd.set(directory_fd)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             yield
+        except OSError as exc:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation journal lock operation failed",
+                "repair the Masterjet attestation store before retrying",
+            ) from exc
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            with_context_close(fd)
+            self._journal_state_fd.reset(journal_token)
+            with_context_close(directory_fd)
+
+    def _open_state_directory_fd(self, flags: int) -> int:
+        fd = -1
+        try:
+            fd = os.open(self.state_root.anchor, flags)
+            for part in self.state_root.parts[1:]:
+                child_fd = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = child_fd
+            return fd
+        except OSError as exc:
+            if fd >= 0:
+                with_context_close(fd)
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation state directory is unsafe or unavailable",
+                "repair the Masterjet attestation store before retrying",
+            ) from exc
 
     def _ensure_state_dir(self) -> None:
-        self.state_root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.state_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation state directory could not be created",
+                "repair the Masterjet attestation store before retrying",
+            ) from exc
         current = self.state_root
         while current != current.parent:
-            info = current.lstat()
+            try:
+                info = current.lstat()
+            except OSError as exc:
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "attestation state directory is missing or unreadable",
+                    "repair the Masterjet attestation store before retrying",
+                ) from exc
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
                 raise self._failure(
                     "headless_attestation_invalid",
@@ -379,28 +498,179 @@ class HeadlessWriteScopeStore:
             current = current.parent
         try:
             os.chmod(self.state_root, 0o700)
-        except OSError:
-            pass
+            info = self.state_root.lstat()
+        except OSError as exc:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation state directory permissions could not be hardened",
+                "repair the Masterjet attestation store before retrying",
+            ) from exc
+        if (
+            info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+            or not stat.S_ISDIR(info.st_mode)
+        ):
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation state directory has unsafe ownership or mode",
+                "repair the Masterjet attestation store before retrying",
+            )
+
+    def _verify_journal_directory_fd(self, fd: int) -> None:
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation state directory could not be inspected",
+                "repair the Masterjet attestation store before retrying",
+            ) from exc
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation state directory has unsafe ownership or mode",
+                "repair the Masterjet attestation store before retrying",
+            )
+
+    def _verify_journal_regular_fd(self, fd: int, label: str) -> None:
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            raise self._failure(
+                "headless_attestation_invalid",
+                f"{label} could not be inspected",
+                "repair the Masterjet attestation store before retrying",
+            ) from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise self._failure(
+                "headless_attestation_invalid",
+                f"{label} has unsafe ownership, mode, type, or link count",
+                "repair the Masterjet attestation store before retrying",
+            )
 
     def _available(self, agent_id: str) -> list[ScopeAttestation]:
         with self._locked():
             return self._available_unlocked(agent_id)
 
     def _available_unlocked(self, agent_id: str) -> list[ScopeAttestation]:
-        records: list[ScopeAttestation] = []
-        paths = sorted(self.state_root.glob("attestation-*.json"))
-        if len(paths) > MAX_RECORDS:
+        loaded = self._load_records_unlocked()
+        self._expire_available_unlocked(loaded)
+        self._prune_terminal_unlocked(loaded)
+        records = [
+            attestation
+            for _path, attestation in loaded
+            if attestation.agent_id == agent_id and attestation.lifecycle == "available"
+        ]
+        return records
+
+    def _expire_available_unlocked(
+        self, records: list[tuple[Path, ScopeAttestation]]
+    ) -> None:
+        for index, (path, attestation) in enumerate(records):
+            if attestation.lifecycle != "available" or not self._is_expired(attestation):
+                continue
+            consumed = self._replace(attestation, lifecycle="consumed")
+            record = self._record(consumed)
+            record["terminal_code"] = "headless_attestation_expired"
+            self._write_record_unlocked(record)
+            records[index] = (path, consumed)
+
+    def _load_records_unlocked(self) -> list[tuple[Path, ScopeAttestation]]:
+        directory_fd = self._journal_state_fd.get()
+        if directory_fd is None:
             raise self._failure(
                 "headless_attestation_invalid",
-                "attestation store exceeds its bounded record limit",
-                "prune terminal attestations through Masterjet",
+                "attestation journal directory is not pinned",
+                "repair the Masterjet attestation store before retrying",
             )
-        for path in paths:
-            record = self._read_record_path(path)
-            attestation = self._from_record(record)
-            if attestation.agent_id == agent_id and attestation.lifecycle == "available":
-                records.append(attestation)
-        return records
+        try:
+            names = os.listdir(directory_fd)
+        except OSError as exc:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation records could not be listed",
+                "repair the Masterjet attestation store before retrying",
+            ) from exc
+        paths = sorted(
+            self.state_root / name
+            for name in names
+            if name.startswith("attestation-") and name.endswith(".json")
+        )
+        if len(paths) > MAX_RECORD_SCAN:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation store exceeds its bounded scan limit",
+                "remove malformed or excessive attestation records through Masterjet",
+            )
+        return [
+            (path, self._from_record(self._read_record_path(path))) for path in paths
+        ]
+
+    @staticmethod
+    def _is_expired(attestation: ScopeAttestation) -> bool:
+        try:
+            created = datetime.fromisoformat(attestation.created_at_utc)
+        except ValueError as exc:
+            raise HeadlessWriteScopeFailure(
+                "headless_attestation_invalid",
+                "attestation creation time is malformed",
+                "repair the Masterjet attestation store before retrying",
+            ) from exc
+        if created.tzinfo is None:
+            raise HeadlessWriteScopeFailure(
+                "headless_attestation_invalid",
+                "attestation creation time lacks a timezone",
+                "repair the Masterjet attestation store before retrying",
+            )
+        age = (datetime.now(timezone.utc) - created).total_seconds()
+        return age > ATTESTATION_TTL_SECONDS
+
+    def _prune_terminal_unlocked(
+        self,
+        records: list[tuple[Path, ScopeAttestation]],
+        *,
+        max_records: int | None = None,
+    ) -> None:
+        limit = MAX_RECORDS if max_records is None else max_records
+        excess = len(records) - limit
+        if excess <= 0:
+            return
+        terminal = sorted(
+            (
+                attestation.created_at_utc,
+                attestation.attestation_id,
+                path,
+            )
+            for path, attestation in records
+            if attestation.lifecycle == "consumed"
+        )
+        if len(terminal) < excess:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation store exceeds its bounded record limit without enough terminal records",
+                "consume terminal attestations before creating more worktrees",
+            )
+        for _created, _attestation_id, path in terminal[:excess]:
+            try:
+                directory_fd = self._journal_state_fd.get()
+                if directory_fd is None:
+                    raise OSError("journal directory is not pinned")
+                os.unlink(path.name, dir_fd=directory_fd)
+            except OSError as exc:
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "terminal attestation record could not be pruned",
+                    "repair the Masterjet attestation store before retrying",
+                ) from exc
 
     def _read_unlocked(self, attestation_id: str) -> ScopeAttestation:
         if not isinstance(attestation_id, str) or _ATTESTATION_ID_RE.fullmatch(attestation_id) is None:
@@ -429,40 +699,81 @@ class HeadlessWriteScopeStore:
                 "attestation record identifier is malformed",
                 "create a fresh Masterjet worktree attestation",
             )
-        fd, temporary = tempfile.mkstemp(prefix=".attestation-", suffix=".tmp", dir=self.state_root)
+        directory_fd = self._journal_state_fd.get()
+        if directory_fd is None:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation journal directory is not pinned",
+                "repair the Masterjet attestation store before retrying",
+        )
+        temporary_name = f".attestation-{secrets.token_hex(16)}.tmp"
+        fd = -1
         try:
+            fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
             os.fchmod(fd, 0o600)
+            self._verify_journal_regular_fd(fd, "temporary attestation record")
             with os.fdopen(fd, "wb") as stream:
                 fd = -1
                 stream.write(raw)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self._record_path(attestation_id))
-            directory_flags = (
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
+            os.replace(
+                temporary_name,
+                self._record_path(attestation_id).name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
             )
-            directory_fd = os.open(self.state_root, directory_flags)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            self._read_record_path(self._record_path(attestation_id))
+            os.fsync(directory_fd)
         finally:
             if fd >= 0:
                 os.close(fd)
-            with_context_unlink(temporary)
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise self._failure(
+                    "headless_attestation_invalid",
+                    "temporary attestation record could not be removed",
+                    "repair the Masterjet attestation store before retrying",
+                ) from exc
 
     def _read_record_path(self, path: Path) -> dict[str, Any]:
+        if path.parent != self.state_root or path.name == "":
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation record path is outside the pinned journal",
+                "repair the Masterjet attestation store before retrying",
+            )
+        directory_fd = self._journal_state_fd.get()
+        if directory_fd is None:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "attestation journal directory is not pinned",
+                "repair the Masterjet attestation store before retrying",
+            )
         try:
-            info = path.lstat()
+            info = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
         except OSError:
             raise self._failure(
                 "headless_attestation_invalid",
                 "attestation record is missing or unreadable",
                 "create a fresh Masterjet worktree attestation",
             )
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RECORD_BYTES:
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_size > MAX_RECORD_BYTES
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
             raise self._failure(
                 "headless_attestation_invalid",
                 "attestation record is not a bounded regular file",
@@ -470,9 +781,15 @@ class HeadlessWriteScopeStore:
             )
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
-            fd = os.open(path, flags)
+            fd = os.open(path.name, flags, dir_fd=directory_fd)
             opened = os.fstat(fd)
-            if opened.st_ino != info.st_ino or opened.st_dev != info.st_dev:
+            if (
+                opened.st_ino != info.st_ino
+                or opened.st_dev != info.st_dev
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_nlink != 1
+            ):
                 raise OSError("attestation record changed while opening")
             with os.fdopen(fd, "rb") as stream:
                 fd = -1
@@ -684,7 +1001,7 @@ class HeadlessWriteScopeStore:
                     "retry after repairing the worktree Git state",
                 )
             status = entry[:2]
-            if "U" in status:
+            if status in _UNMERGED_PORCELAIN_STATES:
                 raise self._failure(
                     "headless_write_attribution_unverified",
                     "Git reports an unresolved conflict state",
@@ -754,19 +1071,7 @@ class HeadlessWriteScopeStore:
                 "create a fresh Masterjet worktree attestation",
             )
         self._verify_repository_identity(attestation)
-        self._verify_binding_identity(
-            attestation,
-            ScopeBinding(
-                attestation.attestation_id,
-                attestation.agent_id,
-                attestation.assignment_id or "unbound",
-                attestation.repository_root,
-                attestation.worktree_path,
-                attestation.baseline_commit,
-                attestation.provider_generation or 0,
-                attestation.declared_write_paths,
-            ),
-        )
+        self._verify_worktree_identity(attestation)
 
     def _verify_repository_identity(self, attestation: ScopeAttestation) -> None:
         repository_identity = self._git_identity(attestation.repository_root)
@@ -781,8 +1086,45 @@ class HeadlessWriteScopeStore:
             )
 
     def _verify_binding_identity(
-        self, attestation: ScopeAttestation, binding: ScopeBinding
-    ) -> None:
+        self,
+        attestation: ScopeAttestation,
+        binding: ScopeBinding,
+        *,
+        repository: Path | None = None,
+        allow_descendant: bool = False,
+    ) -> dict[str, Any]:
+        if (
+            binding.attestation_id != attestation.attestation_id
+            or binding.agent_id != attestation.agent_id
+            or binding.assignment_id != attestation.assignment_id
+            or binding.repository_root != attestation.repository_root
+            or binding.worktree_path != attestation.worktree_path
+            or binding.baseline_commit != attestation.baseline_commit
+            or binding.provider_generation != attestation.provider_generation
+            or binding.declared_write_paths != attestation.declared_write_paths
+            or binding.worktree_device != attestation.worktree_device
+            or binding.worktree_inode != attestation.worktree_inode
+            or binding.common_git_dir != attestation.common_git_dir
+            or binding.branch != attestation.branch
+            or binding.detached != attestation.detached
+            or binding.requested_base_ref != attestation.requested_base_ref
+            or binding.creation_generation != attestation.creation_generation
+            or binding.created_at_utc != attestation.created_at_utc
+            or (repository is not None and repository != attestation.repository_root)
+        ):
+            raise self._failure(
+                "headless_attestation_invalid",
+                "persisted attestation and assignment binding differ",
+                "create a fresh assignment binding",
+            )
+        self._verify_repository_identity(attestation)
+        return self._verify_worktree_identity(
+            attestation, allow_descendant=allow_descendant
+        )
+
+    def _verify_worktree_identity(
+        self, attestation: ScopeAttestation, *, allow_descendant: bool = False
+    ) -> dict[str, Any]:
         try:
             info = attestation.worktree_path.stat()
         except OSError:
@@ -805,7 +1147,6 @@ class HeadlessWriteScopeStore:
         if (
             current["top"] != attestation.worktree_path
             or current["common"] != attestation.common_git_dir
-            or current["head"] != attestation.baseline_commit
             or current["branch"] != attestation.branch
             or (current["branch"] is None) != attestation.detached
         ):
@@ -814,12 +1155,102 @@ class HeadlessWriteScopeStore:
                 "attested Git identity changed",
                 "create a fresh Masterjet worktree attestation",
             )
-        if binding.declared_write_paths != attestation.declared_write_paths:
+        if not allow_descendant and current["head"] != attestation.baseline_commit:
             raise self._failure(
                 "headless_attestation_invalid",
-                "declared write binding changed",
-                "create a fresh assignment binding",
+                "attested Git HEAD changed before the headless process started",
+                "create a fresh Masterjet worktree attestation",
             )
+        if allow_descendant:
+            self._verify_baseline_ancestor(
+                attestation.worktree_path,
+                attestation.baseline_commit,
+                current["head"],
+            )
+        return current
+
+    def _verify_baseline_ancestor(
+        self, cwd: Path, baseline: str, head: str
+    ) -> None:
+        result = self._git(
+            ["merge-base", "--is-ancestor", baseline, head], cwd
+        )
+        if result.returncode != 0:
+            raise self._failure(
+                "headless_attestation_invalid",
+                "current Git history is not based on the attested baseline",
+                "restore the attested baseline ancestry and retry",
+            )
+
+    def _git_history_paths(self, cwd: Path, baseline: str, head: str) -> list[str]:
+        if baseline == head:
+            return []
+        commits = self._git_output(
+            cwd,
+            ["log", "--format=%H", "--reverse", f"{baseline}..{head}"],
+            max_bytes=MAX_GIT_OUTPUT_BYTES,
+        ).splitlines()
+        paths: list[str] = []
+        for commit in commits:
+            if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+                raise self._failure(
+                    "headless_write_attribution_unverified",
+                    "Git history contains a malformed commit identity",
+                    "repair the worktree Git history before retrying",
+                )
+            output = self._git_output(
+                cwd,
+                [
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-status",
+                    "-z",
+                    "-r",
+                    "--find-renames",
+                    "--find-copies-harder",
+                    "-m",
+                    commit,
+                ],
+                max_bytes=MAX_GIT_OUTPUT_BYTES,
+                strip_output=False,
+            )
+            fields = output.split("\0")
+            index = 0
+            while index < len(fields):
+                field = fields[index]
+                index += 1
+                if not field:
+                    continue
+                if "\t" in field:
+                    status, first_path = field.split("\t", 1)
+                else:
+                    status = field
+                    if index >= len(fields):
+                        raise self._failure(
+                            "headless_write_attribution_unverified",
+                            "Git history path output is incomplete",
+                            "repair the worktree Git history before retrying",
+                        )
+                    first_path = fields[index]
+                    index += 1
+                if not status or not first_path:
+                    raise self._failure(
+                        "headless_write_attribution_unverified",
+                        "Git history path output is malformed",
+                        "repair the worktree Git history before retrying",
+                    )
+                paths.append(first_path)
+                if status[0] in {"R", "C"}:
+                    if index >= len(fields) or not fields[index]:
+                        raise self._failure(
+                            "headless_write_attribution_unverified",
+                            "Git history rename/copy output is incomplete",
+                            "repair the worktree Git history before retrying",
+                        )
+                    paths.append(fields[index])
+                    index += 1
+        return paths
 
     def _verify_clean_worktree(self, attestation: ScopeAttestation) -> None:
         if self._git_status(attestation.worktree_path):
@@ -840,6 +1271,7 @@ class HeadlessWriteScopeStore:
             )
         normalized: list[tuple[str, bool]] = []
         seen: set[str] = set()
+        serialized_size = 0
         for raw in write_paths:
             if not isinstance(raw, str) or not raw or len(raw) > MAX_PATH_CHARS or "\x00" in raw:
                 raise self._failure(
@@ -861,6 +1293,13 @@ class HeadlessWriteScopeStore:
                     "declare explicit repository-relative write paths",
                 )
             normalized_path = PurePosixPath(*components).as_posix()
+            serialized_size += len(normalized_path.encode("utf-8")) + 1
+            if serialized_size > MAX_DECLARED_PATH_BYTES:
+                raise self._failure(
+                    "headless_write_path_invalid",
+                    "cumulative serialized headless write paths exceed their bound",
+                    "declare fewer or shorter repository-relative write paths",
+                )
             if normalized_path in seen:
                 raise self._failure(
                     "headless_write_path_invalid",
@@ -1006,37 +1445,21 @@ class HeadlessWriteScopeStore:
 
     @staticmethod
     def _replace(attestation: ScopeAttestation, **changes: Any) -> ScopeAttestation:
-        values: dict[str, Any] = {
-            "attestation_id": attestation.attestation_id,
-            "agent_id": attestation.agent_id,
-            "repository_root": attestation.repository_root,
-            "worktree_path": attestation.worktree_path,
-            "worktree_device": attestation.worktree_device,
-            "worktree_inode": attestation.worktree_inode,
-            "common_git_dir": attestation.common_git_dir,
-            "branch": attestation.branch,
-            "detached": attestation.detached,
-            "baseline_commit": attestation.baseline_commit,
-            "requested_base_ref": attestation.requested_base_ref,
-            "creation_generation": attestation.creation_generation,
-            "created_at_utc": attestation.created_at_utc,
-            "lifecycle": attestation.lifecycle,
-            "assignment_id": attestation.assignment_id,
-            "provider_generation": attestation.provider_generation,
-            "declared_write_paths": attestation.declared_write_paths,
-        }
-        values.update(changes)
-        return ScopeAttestation(**values)
+        return replace(attestation, **changes)
 
     @staticmethod
     def _failure(code: str, explanation: str, action: str) -> HeadlessWriteScopeFailure:
         return HeadlessWriteScopeFailure(code, explanation, action)
 
 
-def with_context_unlink(path: str) -> None:
+def with_context_close(fd: int) -> None:
+    if fd < 0:
+        return
     try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
+        os.close(fd)
+    except OSError as exc:
+        raise HeadlessWriteScopeFailure(
+            "headless_attestation_invalid",
+            "attestation journal descriptor could not be closed",
+            "repair the Masterjet attestation store before retrying",
+        ) from exc
