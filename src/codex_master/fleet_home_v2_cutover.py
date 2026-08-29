@@ -943,7 +943,7 @@ class FleetHomeV2CutoverService:
         if (
             _AGENT_ID_RE.fullmatch(authority.agent_id) is None or authority.home.name != authority.agent_id
             or authority.registry_generation != generation or authority.authority_generation <= 0
-            or authority.policy.schema_version != 2 or authority.policy.generation <= 0
+            or authority.policy.schema_version != 1 or authority.policy.generation <= 0
             or re.fullmatch(r"[0-9a-f]{64}", authority.policy.digest) is None
             or not authority.lease_generation or not authority.process_generation
             or type(authority.owner_uid) is not int or type(authority.owner_gid) is not int

@@ -41125,6 +41125,70 @@ def test_fleet_home_v2_cutover_adapter_owns_product_ports_and_operation_id() -> 
     assert signature.parameters["plan_handle"].annotation == "FleetHomeV2PlanHandle | None"
 
 
+def test_fleet_home_v2_product_authority_port_binds_common_policy_schema_one(
+    tmp_path: Path,
+) -> None:
+    from codex_master.fleet_home_v2_cutover import FleetHomeV2PlanHandle
+
+    pool = tmp_path / "pool"
+    pool.mkdir(mode=0o700)
+    home = pool / "g1"
+    home.mkdir(mode=0o700)
+    (home / server_module.FLEET_AGENT_MARKER_FILE).write_bytes(b"opaque V1 marker")
+    (home / "legacy").write_text("old\n", encoding="utf-8")
+
+    registry = server_module.FleetSnapshot(
+        schema_version=1,
+        generation=435,
+        accounts=(),
+        series=(
+            server_module.FleetSeries(
+                prefix="g",
+                display_name="Gemini",
+                count=1,
+                runner=server_module.RunnerKind.GEMINI_CLI,
+                provider=server_module.Provider.GEMINI_API,
+                model="gemini-test",
+                account_id=None,
+                enabled=True,
+            ),
+        ),
+    )
+    descriptor = server_module.build_inventory(registry, pool).agents["g1"]
+    executable = tmp_path / "gemini-native"
+    shutil.copyfile(sys.executable, executable)
+    executable.chmod(0o700)
+    artifacts = server_module._fleet_home_artifacts(descriptor, executable)
+    assert artifacts["marker"]["common_policy"]["schema_version"] == 1
+
+    @contextlib.contextmanager
+    def artifact_builder(*_args: Any, **_kwargs: Any) -> Iterator[Any]:
+        def build(candidate: server_module.AgentDescriptor) -> dict[str, Any]:
+            assert candidate == descriptor
+            return artifacts
+
+        build.validate = lambda: None  # type: ignore[attr-defined]
+        yield build
+
+    fake_fleet_service = SimpleNamespace(registry_snapshot=lambda: registry)
+    with (
+        patch.object(server_module, "current_fleet_service", return_value=fake_fleet_service),
+        patch.object(server_module, "AGENT_POOL_ROOT", pool),
+        patch.object(server_module, "agent_lease_status", return_value={"lease_id": "lease-435"}),
+        patch.object(server_module, "pool_home_processes", return_value=[]),
+        patch.object(server_module, "_fleet_artifact_builder", artifact_builder),
+    ):
+        authority = server_module._FleetHomeV2ServerAuthorityPort().snapshot().homes["g1"]
+        assert authority.policy.schema_version == 1
+        handle = server_module.fleet_home_v2_cutover_operation(
+            operation="plan",
+            target_ids=("g1",),
+        )
+
+    assert isinstance(handle, FleetHomeV2PlanHandle)
+    assert tuple(pool.glob("*.plan.json"))
+
+
 def test_fleet_home_v2_quiescence_propagates_unexpected_filesystem_programming_error() -> None:
     from codex_master.fleet_home_v2_cutover import (
         FleetHomeV2Authority,

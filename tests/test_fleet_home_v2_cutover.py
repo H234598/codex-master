@@ -204,7 +204,7 @@ class StageWriteCountingFilesystem(LocalFleetHomeV2Filesystem):
 
 def _authority(parent: Path, agent_id: str) -> FleetHomeV2Authority:
     prefix = agent_id.rstrip("0123456789")
-    policy = FleetHomeV2Policy(schema_version=2, generation=435, digest="a" * 64)
+    policy = FleetHomeV2Policy(schema_version=1, generation=435, digest="a" * 64)
     provider = b"# common policy\n"
     marker = {
         "schema_version": 2,
@@ -214,7 +214,7 @@ def _authority(parent: Path, agent_id: str) -> FleetHomeV2Authority:
         "runner": "gemini_cli",
         "provider": "gemini",
         "model": "gemini-test",
-        "common_policy": {"schema_version": 2, "generation": 435, "digest": "a" * 64},
+        "common_policy": {"schema_version": 1, "generation": 435, "digest": "a" * 64},
         "managed_files": [".gemini/GEMINI.md"],
         "files": {".gemini/GEMINI.md": hashlib.sha256(provider).hexdigest()},
     }
@@ -303,6 +303,129 @@ def _single_plan(tmp_path: Path, **service_kwargs: object):
     _v1_home(authority)
     service, port = _service((authority,), **service_kwargs)
     return authority, service, port, service.plan(("g1",))
+
+
+def test_plan_accepts_common_policy_schema_one(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, "g1")
+    authority = replace(
+        authority,
+        policy=replace(authority.policy, schema_version=1),
+    )
+    _v1_home(authority)
+    service, _port = _service((authority,))
+
+    handle = service.plan(("g1",))
+
+    assert isinstance(handle, FleetHomeV2PlanHandle)
+
+
+def test_plan_rejects_common_policy_schema_two(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, "g1")
+    marker = json.loads(
+        next(item.data for item in authority.artifacts if item.relative_path == MARKER_FILE)
+    )
+    marker["common_policy"]["schema_version"] = 2
+    authority = replace(
+        authority,
+        policy=replace(authority.policy, schema_version=2),
+        artifacts=tuple(
+            replace(item, data=(json.dumps(marker, sort_keys=True) + "\n").encode())
+            if item.relative_path == MARKER_FILE
+            else item
+            for item in authority.artifacts
+        ),
+    )
+    _v1_home(authority)
+    service, _port = _service((authority,))
+
+    with pytest.raises(FleetHomeV2CutoverError, match="fleet_home_v2_plan_invalid"):
+        service.plan(("g1",))
+
+
+@pytest.mark.parametrize("marker_schema_version", (1, 3))
+def test_marker_schema_remains_strictly_two(
+    tmp_path: Path, marker_schema_version: int
+) -> None:
+    authority = _authority(tmp_path, "g1")
+    marker = json.loads(
+        next(item.data for item in authority.artifacts if item.relative_path == MARKER_FILE)
+    )
+    marker["schema_version"] = marker_schema_version
+    authority = replace(
+        authority,
+        artifacts=tuple(
+            replace(item, data=(json.dumps(marker, sort_keys=True) + "\n").encode())
+            if item.relative_path == MARKER_FILE
+            else item
+            for item in authority.artifacts
+        ),
+    )
+    _v1_home(authority)
+    service, _port = _service((authority,))
+
+    with pytest.raises(FleetHomeV2CutoverError, match="fleet_home_v2_marker_invalid"):
+        service.plan(("g1",))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda authority: replace(
+            authority, policy=replace(authority.policy, generation=0)
+        ),
+        lambda authority: replace(
+            authority, policy=replace(authority.policy, digest="z" * 64)
+        ),
+        lambda authority: replace(authority, registry_generation=434),
+        lambda authority: replace(authority, authority_generation=0),
+        lambda authority: replace(authority, lease_generation=""),
+        lambda authority: replace(authority, process_generation=""),
+    ),
+)
+def test_authority_binding_keeps_generation_digest_and_evidence_checks_strict(
+    tmp_path: Path, mutation: object
+) -> None:
+    authority = mutation(_authority(tmp_path, "g1"))  # type: ignore[operator]
+    _v1_home(authority)
+    service, _port = _service((authority,))
+
+    with pytest.raises(FleetHomeV2CutoverError, match="fleet_home_v2_plan_invalid"):
+        service.plan(("g1",))
+
+
+def test_plan_rejects_artifact_digest_mismatch(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, "g1")
+    authority = replace(
+        authority,
+        artifacts=tuple(
+            replace(item, data=b"tampered\n")
+            if item.relative_path == ".gemini/GEMINI.md"
+            else item
+            for item in authority.artifacts
+        ),
+    )
+    _v1_home(authority)
+    service, _port = _service((authority,))
+
+    with pytest.raises(FleetHomeV2CutoverError, match="fleet_home_v2_marker_invalid"):
+        service.plan(("g1",))
+
+
+@pytest.mark.parametrize("directory", ("home", "parent"))
+def test_plan_rejects_non_private_source_directories(
+    tmp_path: Path, directory: str
+) -> None:
+    authority = _authority(tmp_path, "g1")
+    _v1_home(authority)
+    target = authority.home if directory == "home" else authority.home.parent
+    target.chmod(0o755)
+    service, _port = _service((authority,))
+
+    try:
+        with pytest.raises(FleetHomeV2CutoverError, match="fleet_home_v2_source_invalid"):
+            service.plan(("g1",))
+    finally:
+        target.chmod(0o700)
 
 
 def test_plan_internal_operation_id_g1_first_and_full_target_binding(tmp_path: Path) -> None:
