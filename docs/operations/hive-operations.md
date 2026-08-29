@@ -212,19 +212,8 @@ pytest -q tests/test_hive_policy.py tests/test_fleet_markdown.py
 
 ### OpenAI account stickiness and automatic reset gate
 
-For active OpenAI work, keep the same account for as long as possible and at
-least for the current topic: its prompt/context cache is account-bound. Change
-accounts only after a hard authentication, limit, capability, or resource
-block, or after the topic is complete; do not rotate opportunistically.
-
-An automated context/session reset, including resulting account rotation,
-requires one fresh, reset-consistent snapshot across every account. The
-resetting session must have no usable weekly or monthly remainder; every other
-account must have under 10% remaining in its highest available subscription
-window (month before week); and any other account with positive weekly/monthly
-limit plus a 5h window must have no usable 5h remainder or less than 5% there.
-Missing, stale, contradictory, or incomparable data blocks the automatic
-action. An account without a weekly/monthly window contributes no positive
-replacement headroom. Natural usage-window reset and an explicit administrator
-action are exceptions. When the gate is not met, preserve, sleep, or resume the
-session rather than rotating it.
+The binding account-stickiness and automated reset gate are defined only in
+the `OpenAI-Account- und Context-Reset-Policy` section of
+`src/codex_master/markdown/common.md`. Apply them from the generator's
+materialized `AGENTS.md` or `.gemini/GEMINI.md` projection for the managed
+home; do not copy or locally restate the rules here.
