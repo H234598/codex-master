@@ -13,6 +13,11 @@ from codex_master.google_cloud_provisioner import (
 )
 
 
+def test_google_cloud_provisioner_error_repr_contains_only_code() -> None:
+    error = GoogleCloudProvisionerError("provisioner.synthetic")
+    assert repr(error) == "GoogleCloudProvisionerError('provisioner.synthetic')"
+
+
 def _document() -> dict[str, object]:
     return {
         "schema_version": 2,
