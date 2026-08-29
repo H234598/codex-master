@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import unittest
 
+import codex_master.control_catalog as control_catalog
 from codex_master.control_catalog import (
     MAX_CATALOG_TOOLS,
     MAX_DESCRIPTOR_TEXT_CHARS,
@@ -102,6 +103,12 @@ EXPECTED_RISKS = {
     "hive_test_run": Risk.MUTATING,
     "hive_test_invalidate": Risk.MUTATING,
 }
+
+
+def test_field_description_defaults_and_rejects_non_text() -> None:
+    assert control_catalog._field_description({}, "field") == ""
+    with unittest.TestCase().assertRaisesRegex(SchemaError, "field description must be a string"):
+        control_catalog._field_description({"description": 1}, "field")
 
 
 def tool_fixture(
