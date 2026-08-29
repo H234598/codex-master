@@ -761,3 +761,88 @@ PYTHONPATH=src pytest \
   lebendem Worker, kein Restart über unvollständige Generation.
 - C1/I1/I2/I3/I4 bleiben geschlossen. `M1` bleibt entsprechend Ruling
   deferred.
+
+# Fixrunde 4/5 — 2026-08-29
+
+Scope blieb auf `src/codex_master/admin_socket.py` und
+`tests/test_admin_socket.py` begrenzt. Gegenstand waren ausschließlich I5 und
+M2 aus dem Re-Review nach `634dd22`; deferred M1 wurde nicht berührt.
+
+## I5 „Attestation vor Principal/Policy“
+
+### RED
+
+Bestehende Missing-/Wrong-Key-, malformed-Handshake-, Peer-Denial- und
+Lifecyclefälle erhielten einen seiteneffektbehafteten Principal-Callback.
+Zusätzlich belegt `_receive_frame`, dass vor erfolgreicher Attestation keine
+Application-Request-Verarbeitung beginnt. Host-Service und Secret-Ingress
+zählen ihre Owneraufrufe unabhängig.
+
+```bash
+PYTHONPATH=src pytest tests/test_admin_socket.py \
+  -k 'missing_attestation_key or wrong_attestation_key or \
+      invalid_attestation_key_fd or attestation_rejects_invalid_bounded_frames or \
+      usage_compatible_attestation or peer_authority or blocked_authorizer or \
+      close_finishes_active' -q
+```
+
+```text
+14 failed, 2 passed
+```
+
+Erstes erwartetes Failure: fehlender Key rief Principal einmal auf. Der
+RED-Sammellauf ließ nach frühem Assertion-Failure den absichtlich blockierten
+Non-Daemon-Authorizer-Worker stehen; der exakte pytest-Prozess wurde beendet.
+Spätere GREEN-Läufe hinterließen keinen pytest-Prozess.
+
+### GREEN
+
+`AdminSocketServer._handle()` führt jetzt
+`SO_PEERCRED → mutual attestation → principal → request frame/parse → service`
+aus. Missing Key, falscher Proof und malformed Handshake erreichen weder
+Principal/Policy, Application-Request-Verarbeitung, Service noch
+Secret-Ingress-Owner. Nach gültiger Attestation läuft Principal genau einmal.
+
+Die neue Reihenfolge machte eine Stream-Race sichtbar: direkt nach dem
+Serverproof konnte eine anschließende Peer-Denial-Antwort im selben `recvmsg()`
+landen. Der Attestation-Reader liest deshalb framegenau bis zum ersten
+Newline-Byte. Wireformat, Limits und Handshakezustände bleiben unverändert;
+kein Protokollfeld und kein Roundtrip kam hinzu. Blocked-Authorizer- und
+Close/Restart-Regression authentisieren nun zuerst und belegen danach
+unverändert bounded, fail-closed Shutdown.
+
+## M2 „Key-FD-Fehlercode“
+
+Server-, Client- und Usage-Verifier-Factory trennen Typ-/Negativprüfung von
+allgemeiner Socketkonfiguration. Typfremde und negative FDs liefern nun wie
+fehlende, geschlossene, unlesbare oder kryptografisch falsche Key-FDs nur den
+code-only Problemcode `control.attestation_required`. Repr und String spiegeln
+keinen übergebenen Marker.
+
+## Verifikation Fixrunde 4
+
+```bash
+PYTHONPATH=src pytest tests/test_admin_socket.py tests/test_admin_service.py -q
+ruff check src/codex_master/admin_socket.py tests/test_admin_socket.py
+ruff format --check src/codex_master/admin_socket.py tests/test_admin_socket.py
+mypy --follow-imports=skip --ignore-missing-imports \
+  src/codex_master/admin_socket.py src/codex_master/admin_service.py
+python -m compileall -q src/codex_master/admin_socket.py \
+  tests/test_admin_socket.py
+git diff --check
+```
+
+```text
+Task-9-/Service-Suite: 88 passed in 6.51s
+Ruff: All checks passed
+Ruff format: 2 files already formatted
+Mypy: Success: no issues found in 2 source files
+Compileall: exit 0
+git diff --check: exit 0
+```
+
+Kein zusätzlicher Vollsuite-Endloslauf: Fix ist auf zwei Dateien und zwei
+Reviewbefunde begrenzt; vorherige Fixrunde belegte 5876 grüne Tests mit nur den
+bekannten isoliert grünen `admission_runtime`-Deadline-Flakes. Ein begonnener
+Kontrolllauf wurde auf Koordinatoranweisung nach 3 % ohne Failure beendet. M1
+bleibt deferred und unverändert.
