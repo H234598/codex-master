@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
 import math
+from pathlib import Path, PurePosixPath
 import re
 import threading
 from types import MappingProxyType
@@ -16,11 +17,13 @@ import uuid
 
 from .google_account_inventory import GoogleAccountInventoryError
 from .google_account_inventory_manager import GoogleAccountInventoryManager
+from .hive.state import HiveStateError, HiveStateStore
 
 
 DEFAULT_BILLING_PLAN_TTL_SECONDS = 300
 MAX_BILLING_PLAN_TTL_SECONDS = 900
 MAX_BILLING_PLANS = 256
+_STATE_FILE = PurePosixPath("google-billing.json")
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
@@ -168,6 +171,7 @@ class GoogleBillingService:
         "_plans",
         "_plans_by_idempotency",
         "_receipts",
+        "_state",
     )
 
     def __init__(
@@ -176,6 +180,7 @@ class GoogleBillingService:
         credential_authority: GoogleBillingCredentialAuthority,
         *,
         clock: Callable[[], datetime] | None = None,
+        state_root: Path | None = None,
     ) -> None:
         if not isinstance(manager, GoogleAccountInventoryManager) or not callable(
             getattr(credential_authority, "lease_billing_effect", None)
@@ -188,6 +193,219 @@ class GoogleBillingService:
         self._plans: dict[str, GoogleBillingPlanV1] = {}
         self._plans_by_idempotency: dict[str, GoogleBillingPlanV1] = {}
         self._receipts: dict[str, GoogleBillingReceiptV1] = {}
+        self._state = None if state_root is None else HiveStateStore(state_root)
+        if self._state is not None:
+            self._restore_state()
+
+    @staticmethod
+    def _plan_document(plan: GoogleBillingPlanV1) -> dict[str, object]:
+        return {
+            "id": plan.id,
+            "account_ref": plan.account_ref,
+            "subject_id": plan.subject_id,
+            "inventory_generation": plan.inventory_generation,
+            "snapshot_fingerprint": plan.snapshot_fingerprint,
+            "project_ref": plan.project_ref,
+            "project_id": plan.project_id,
+            "billing_ref": plan.billing_ref,
+            "billing_account_id": plan.billing_account_id,
+            "digest": plan.digest,
+            "created_at": _wire_time(plan.created_at),
+            "expires_at": _wire_time(plan.expires_at),
+            "idempotency_key": plan.idempotency_key,
+        }
+
+    @staticmethod
+    def _stored_plan(value: object) -> GoogleBillingPlanV1:
+        fields = {
+            "id",
+            "account_ref",
+            "subject_id",
+            "inventory_generation",
+            "snapshot_fingerprint",
+            "project_ref",
+            "project_id",
+            "billing_ref",
+            "billing_account_id",
+            "digest",
+            "created_at",
+            "expires_at",
+            "idempotency_key",
+        }
+        if type(value) is not dict or set(value) != fields:
+            raise HiveStateError("invalid_google_billing_state")
+        try:
+            record = cast(dict[str, object], value)
+            created_at = datetime.fromisoformat(
+                cast(str, record["created_at"]).replace("Z", "+00:00")
+            ).astimezone(UTC)
+            expires_at = datetime.fromisoformat(
+                cast(str, record["expires_at"]).replace("Z", "+00:00")
+            ).astimezone(UTC)
+            plan = GoogleBillingPlanV1(
+                cast(str, record["id"]),
+                cast(str, record["account_ref"]),
+                cast(str, record["subject_id"]),
+                cast(int, record["inventory_generation"]),
+                cast(str, record["snapshot_fingerprint"]),
+                cast(str, record["project_ref"]),
+                cast(str, record["project_id"]),
+                cast(str, record["billing_ref"]),
+                cast(str, record["billing_account_id"]),
+                cast(str, record["digest"]),
+                created_at,
+                expires_at,
+                cast(str, record["idempotency_key"]),
+            )
+            for item in (
+                plan.id,
+                plan.account_ref,
+                plan.subject_id,
+                plan.project_ref,
+                plan.project_id,
+                plan.billing_ref,
+                plan.billing_account_id,
+                plan.idempotency_key,
+            ):
+                _token(item, "billing.persistence_invalid")
+            _generation(plan.inventory_generation)
+            if (
+                _DIGEST.fullmatch(plan.snapshot_fingerprint) is None
+                or _DIGEST.fullmatch(plan.digest) is None
+                or plan.expires_at <= plan.created_at
+                or plan.digest
+                != _plan_digest(
+                    _plan_binding(plan),
+                    created_at=plan.created_at,
+                    expires_at=plan.expires_at,
+                    idempotency_key=plan.idempotency_key,
+                )
+                or GoogleBillingService._plan_document(plan) != value
+            ):
+                raise ValueError
+            return plan
+        except (GoogleBillingError, KeyError, TypeError, ValueError):
+            raise HiveStateError("invalid_google_billing_state") from None
+
+    @staticmethod
+    def _receipt_document(receipt: GoogleBillingReceiptV1) -> dict[str, object]:
+        return dict(receipt.public_projection())
+
+    @staticmethod
+    def _stored_receipt(value: object) -> GoogleBillingReceiptV1:
+        fields = {
+            "plan_id",
+            "state",
+            "attempted",
+            "completed",
+            "failed",
+            "not_attempted",
+            "reason_code",
+        }
+        if type(value) is not dict or set(value) != fields:
+            raise HiveStateError("invalid_google_billing_state")
+        try:
+            record = cast(dict[str, object], value)
+            receipt = GoogleBillingReceiptV1(
+                cast(str, record["plan_id"]),
+                cast(str, record["state"]),
+                cast(int, record["attempted"]),
+                cast(int, record["completed"]),
+                cast(int, record["failed"]),
+                cast(int, record["not_attempted"]),
+                cast(str, record["reason_code"]),
+            )
+            if (
+                receipt.state != "succeeded"
+                or tuple(
+                    type(item) is int and item >= 0
+                    for item in (
+                        receipt.attempted,
+                        receipt.completed,
+                        receipt.failed,
+                        receipt.not_attempted,
+                    )
+                )
+                != (True, True, True, True)
+                or receipt.attempted != 1
+                or receipt.completed != 1
+                or receipt.failed != 0
+                or receipt.not_attempted != 0
+            ):
+                raise ValueError
+            _token(receipt.plan_id, "billing.persistence_invalid")
+            _token(receipt.reason_code, "billing.persistence_invalid")
+            return receipt
+        except (GoogleBillingError, KeyError, TypeError, ValueError):
+            raise HiveStateError("invalid_google_billing_state") from None
+
+    def _restore_state(self) -> None:
+        assert self._state is not None
+        with self._state.locked():
+            try:
+                document = dict(
+                    self._state.read_json_locked(_STATE_FILE, max_bytes=1024 * 1024)
+                )
+            except HiveStateError as error:
+                if error.args != ("state_not_found",):
+                    raise GoogleBillingError("billing.persistence_invalid") from None
+                document = {"schema_version": 1, "plans": [], "receipts": []}
+                self._state.replace_json_locked(_STATE_FILE, document)
+        if (
+            set(document) != {"schema_version", "plans", "receipts"}
+            or document.get("schema_version") != 1
+            or type(document.get("plans")) is not list
+            or type(document.get("receipts")) is not list
+            or len(cast(list[object], document["plans"])) > MAX_BILLING_PLANS
+            or len(cast(list[object], document["receipts"])) > MAX_BILLING_PLANS
+        ):
+            raise GoogleBillingError("billing.persistence_invalid")
+        try:
+            plans = tuple(
+                self._stored_plan(item)
+                for item in cast(list[object], document["plans"])
+            )
+            receipts = tuple(
+                self._stored_receipt(item)
+                for item in cast(list[object], document["receipts"])
+            )
+        except HiveStateError:
+            raise GoogleBillingError("billing.persistence_invalid") from None
+        if (
+            len({plan.id for plan in plans}) != len(plans)
+            or len({plan.idempotency_key for plan in plans}) != len(plans)
+            or len({receipt.plan_id for receipt in receipts}) != len(receipts)
+            or any(
+                receipt.plan_id not in {plan.id for plan in plans}
+                for receipt in receipts
+            )
+        ):
+            raise GoogleBillingError("billing.persistence_invalid")
+        self._plans = {plan.id: plan for plan in plans}
+        self._plans_by_idempotency = {plan.idempotency_key: plan for plan in plans}
+        self._receipts = {receipt.plan_id: receipt for receipt in receipts}
+
+    def _persist_state(self) -> None:
+        if self._state is None:
+            return
+        document = {
+            "schema_version": 1,
+            "plans": [
+                self._plan_document(plan)
+                for plan in sorted(self._plans.values(), key=lambda item: item.id)
+            ],
+            "receipts": [
+                self._receipt_document(receipt)
+                for receipt in sorted(
+                    self._receipts.values(), key=lambda item: item.plan_id
+                )
+            ],
+        }
+        try:
+            with self._state.locked():
+                self._state.replace_json_locked(_STATE_FILE, document)
+        except HiveStateError:
+            raise GoogleBillingError("billing.persistence_failed") from None
 
     def plan_billing_binding(
         self,
@@ -253,6 +471,7 @@ class GoogleBillingService:
             )
             self._plans[plan.id] = plan
             self._plans_by_idempotency[idempotency_key] = plan
+            self._persist_state()
             return plan
 
     def apply_billing_binding(
@@ -478,6 +697,7 @@ class GoogleBillingService:
         if self._plans_by_idempotency.get(plan.idempotency_key) is plan:
             self._plans_by_idempotency.pop(plan.idempotency_key, None)
         self._receipts.pop(plan.id, None)
+        self._persist_state()
 
     def _prune_expired(self, now: datetime) -> None:
         for plan in tuple(self._plans.values()):
@@ -525,6 +745,7 @@ class GoogleBillingService:
             reason_code=reason_code,
         )
         self._receipts[plan.id] = receipt
+        self._persist_state()
         return receipt
 
     def _now(self) -> datetime:

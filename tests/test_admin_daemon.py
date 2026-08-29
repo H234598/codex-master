@@ -36,7 +36,10 @@ from codex_master.admin_assembly import CredentialQuotaCollector, assemble_admin
 from codex_master.admin_http import AdminHttpServer
 from codex_master.admin_service import MasterjetControlService
 from codex_master.google_oauth_authorization import GoogleOAuthProfileIdV1
-from codex_master.google_oauth_session import GoogleOAuthClientMaterialV1
+from codex_master.google_oauth_session import (
+    GoogleOAuthClientMaterialV1,
+    GoogleOAuthSessionError,
+)
 
 
 ISSUER = "https://team.cloudflareaccess.com"
@@ -229,10 +232,10 @@ def test_http_failure_during_ready_notification_revokes_readiness(
             raise RuntimeError("control.http_serve_failed")
 
     def notify(message: str) -> None:
-        notifications.append(message)
         if message == "READY=1":
             fail.set()
             assert failed.wait(1)
+        notifications.append(message)
 
     daemon = AdminDaemon(
         service,
@@ -779,15 +782,25 @@ def _quota_evidence_payload(remaining: int) -> bytes:
     ).encode("ascii")
 
 
-def test_quota_collector_reloads_evidence_for_every_plan() -> None:
+def test_quota_collector_reloads_evidence_for_every_plan(tmp_path: Path) -> None:
     """N1 break: a daemon restart must not be required for fresher quota evidence."""
 
-    current = [_quota_evidence_payload(3)]
-    collector = CredentialQuotaCollector(lambda: current[0])
+    state_root = tmp_path / "quota-state"
+    collector = CredentialQuotaCollector(state_root, _quota_evidence_payload(3))
 
     assert collector.collect("google-one", expected_generation=4).remaining == 3
-    current[0] = _quota_evidence_payload(9)
+    collector.sync(
+        "google-one",
+        remaining=9,
+        observed_at="2026-08-29T20:01:00Z",
+        source="cloudresourcemanager",
+        inventory_fingerprint="sha256:" + "a" * 64,
+        expected_generation=4,
+        idempotency_key="quota-sync-one",
+    )
     assert collector.collect("google-one", expected_generation=4).remaining == 9
+    restarted = CredentialQuotaCollector(state_root, _quota_evidence_payload(3))
+    assert restarted.collect("google-one", expected_generation=4).remaining == 9
 
 
 def test_product_service_allows_oauth_client_import_for_new_google_account(
@@ -870,6 +883,23 @@ def test_first_oauth_token_binds_new_google_account_subject(
         "google-one",
         subject_id="subject-one",
         oauth_client_fingerprint="sha256:" + "b" * 64,
+        scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+    )
+    provisioner_refresh_token = bytearray(b"private-provisioner-refresh")
+    writer.store_refresh_token(
+        "oauth-token-effect-two",
+        account_ref="google-one",
+        subject_id="subject-one",
+        oauth_client_fingerprint="sha256:" + "b" * 64,
+        scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
+        scope_fingerprint="sha256:" + "d" * 64,
+        refresh_token=provisioner_refresh_token,
+    )
+    loaded_provisioner = writer.load_refresh_token(
+        "google-one",
+        subject_id="subject-one",
+        oauth_client_fingerprint="sha256:" + "b" * 64,
+        scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
     )
 
     accounts = service.handle(
@@ -879,8 +909,119 @@ def test_first_oauth_token_binds_new_google_account_subject(
     assert receipt.subject_id == "subject-one"
     assert refresh_token == bytearray(len(refresh_token))
     assert loaded == bytearray(b"private-refresh-token")
+    assert provisioner_refresh_token == bytearray(len(provisioner_refresh_token))
+    assert loaded_provisioner == bytearray(b"private-provisioner-refresh")
     assert accounts[0]["subject_bound"] is True
     loaded[:] = b"\0" * len(loaded)
+    loaded_provisioner[:] = b"\0" * len(loaded_provisioner)
+
+
+@pytest.mark.parametrize(
+    ("subject_id", "oauth_client_fingerprint"),
+    [
+        ("subject-two", "sha256:" + "b" * 64),
+        ("subject-one", "sha256:" + "e" * 64),
+    ],
+)
+def test_refresh_token_operation_rejects_changed_effect_binding(
+    service: MasterjetControlService,
+    subject_id: str,
+    oauth_client_fingerprint: str,
+) -> None:
+    principal = AdminPrincipalV1(
+        "local-operator", ("fleet.read", "fleet.google.oauth"), "unix-peer", True
+    )
+    service.handle(
+        principal,
+        AdminRequestV1(
+            "google.accounts.add",
+            {"account_ref": "google-one", "label": "Quiet Aurora"},
+            1,
+            "add-google-one",
+            None,
+        ),
+    )
+    writer = service._google_oauth._token_writer
+    writer.store_refresh_token(
+        "oauth-token-effect-one",
+        account_ref="google-one",
+        subject_id="subject-one",
+        oauth_client_fingerprint="sha256:" + "b" * 64,
+        scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
+        scope_fingerprint="sha256:" + "d" * 64,
+        refresh_token=bytearray(b"private-provisioner-refresh"),
+    )
+    replay_token = bytearray(b"different-private-refresh")
+
+    with pytest.raises(GoogleOAuthSessionError, match="oauth.operation_conflict"):
+        writer.store_refresh_token(
+            "oauth-token-effect-one",
+            account_ref="google-one",
+            subject_id=subject_id,
+            oauth_client_fingerprint=oauth_client_fingerprint,
+            scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
+            scope_fingerprint="sha256:" + "d" * 64,
+            refresh_token=replay_token,
+        )
+
+    assert replay_token == bytearray(len(replay_token))
+
+
+def test_refresh_token_vault_effect_reconciles_before_subject_binding(
+    service: MasterjetControlService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    principal = AdminPrincipalV1(
+        "local-operator", ("fleet.read", "fleet.google.oauth"), "unix-peer", True
+    )
+    service.handle(
+        principal,
+        AdminRequestV1(
+            "google.accounts.add",
+            {"account_ref": "google-one", "label": "Quiet Aurora"},
+            1,
+            "add-google-one",
+            None,
+        ),
+    )
+    writer = service._google_oauth._token_writer
+    vault_type = type(writer._vault)
+    real_store = vault_type.store_projection
+
+    def crash_after_vault(vault, *args, **kwargs):
+        real_store(vault, *args, **kwargs)
+        raise RuntimeError("simulated_crash")
+
+    monkeypatch.setattr(vault_type, "store_projection", crash_after_vault)
+    with pytest.raises(RuntimeError, match="simulated_crash"):
+        writer.store_refresh_token(
+            "oauth-token-effect-crash",
+            account_ref="google-one",
+            subject_id="subject-one",
+            oauth_client_fingerprint="sha256:" + "b" * 64,
+            scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
+            scope_fingerprint="sha256:" + "d" * 64,
+            refresh_token=bytearray(b"private-provisioner-refresh"),
+        )
+    before_reconcile = service.handle(
+        principal,
+        AdminRequestV1("google.accounts.list", {}, None, None, None),
+    )["accounts"]
+    assert before_reconcile[0]["subject_bound"] is False
+
+    recovered = writer.lookup_refresh_token_receipt(
+        "oauth-token-effect-crash",
+        account_ref="google-one",
+        scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
+        scope_fingerprint="sha256:" + "d" * 64,
+    )
+    accounts = service.handle(
+        principal,
+        AdminRequestV1("google.accounts.list", {}, None, None, None),
+    )["accounts"]
+
+    assert recovered is not None
+    assert recovered.subject_id == "subject-one"
+    assert accounts[0]["subject_bound"] is True
 
 
 def test_google_access_token_is_refreshed_one_shot_and_account_bound(
@@ -901,12 +1042,23 @@ def test_google_access_token_is_refreshed_one_shot_and_account_bound(
 
     class Tokens:
         def load_refresh_token(
-            self, account_ref, *, subject_id, oauth_client_fingerprint
+            self,
+            account_ref,
+            *,
+            subject_id,
+            oauth_client_fingerprint,
+            scope_profile,
         ):
-            assert (account_ref, subject_id, oauth_client_fingerprint) == (
+            assert (
+                account_ref,
+                subject_id,
+                oauth_client_fingerprint,
+                scope_profile,
+            ) == (
                 "google-one",
                 "subject-one",
                 "sha256:" + "a" * 64,
+                GoogleOAuthProfileIdV1.PROVISIONER,
             )
             return refresh_token
 
@@ -979,9 +1131,7 @@ def test_product_provisioner_uses_vaulted_access_token_authority(
     calls = []
 
     class AccessTokens:
-        def issue_access_token(
-            self, account_ref, subject_id, *, expected_generation
-        ):
+        def issue_access_token(self, account_ref, subject_id, *, expected_generation):
             calls.append((account_ref, subject_id, expected_generation))
             return "private-access-token"
 
@@ -1040,9 +1190,21 @@ def test_product_provisioner_uses_vaulted_access_token_authority(
         idempotency_key="provision-apply-one",
         plan_digest=plan.fingerprint,
     )
+    replayed_receipt = admin_assembly.GoogleProvisioner(
+        tmp_path / "state" / "google-provisioner",
+        service._google_manager,
+        service._google_provisioner._store,
+        AccessTokens(),
+    ).apply(
+        "google-one",
+        expected_generation=snapshot.generation,
+        idempotency_key="provision-apply-one",
+        plan_digest=plan.fingerprint,
+    )
 
     assert replayed == plan
     assert receipt == admin_assembly.ProvisionReceipt(0, 0)
+    assert replayed_receipt == receipt
     assert calls == [
         ("google-one", "subject-one", snapshot.generation),
         ("google-one", "subject-one", snapshot.generation),
@@ -1062,6 +1224,107 @@ def test_product_provisioner_uses_vaulted_access_token_authority(
             service._google_provisioner._store,
             AccessTokens(),
         )
+
+
+def test_product_provisioner_singleflights_same_apply_key(
+    service: MasterjetControlService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal = AdminPrincipalV1(
+        "local-operator", ("fleet.read", "fleet.google.oauth"), "unix-peer", True
+    )
+    service.handle(
+        principal,
+        AdminRequestV1(
+            "google.accounts.add",
+            {"account_ref": "google-one", "label": "Quiet Aurora"},
+            1,
+            "add-google-one",
+            None,
+        ),
+    )
+    service._google_oauth._token_writer.store_refresh_token(
+        "oauth-token-effect-one",
+        account_ref="google-one",
+        subject_id="subject-one",
+        oauth_client_fingerprint="sha256:" + "b" * 64,
+        scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
+        scope_fingerprint="sha256:" + "c" * 64,
+        refresh_token=bytearray(b"private-refresh-token"),
+    )
+    snapshot = service._google_manager._snapshot_for_internal_use()
+    service._google_provisioner._access_tokens = type(
+        "AccessTokens",
+        (),
+        {"issue_access_token": lambda _self, *_args, **_kwargs: "private-access-token"},
+    )()
+    monkeypatch.setattr(
+        admin_assembly.GoogleCloudApi, "search_projects", lambda _self: []
+    )
+    plan = service._google_provisioner.plan(
+        "google-one",
+        expected_generation=snapshot.generation,
+        idempotency_key="provision-plan-one",
+        quota_evidence=admin_assembly.GoogleQuotaEvidenceV1(
+            1,
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "cloudresourcemanager",
+            "google-one",
+            snapshot.generation,
+            snapshot.content_fingerprint,
+        ),
+    )
+    created = 0
+    create_lock = threading.Lock()
+    both_inside_create = threading.Event()
+    release_create = threading.Event()
+
+    class Api:
+        def subject_id(self):
+            return "subject-one"
+
+        def create_project(self, project_id, _project_name):
+            nonlocal created
+            with create_lock:
+                created += 1
+                if created == 2:
+                    both_inside_create.set()
+            release_create.wait(2)
+            return {"projectId": project_id, "name": "projects/200001"}
+
+        def enable_required_services(self, _project_number):
+            return {}
+
+        def list_keys(self, _project_number):
+            return []
+
+        def create_restricted_key(self, project_number, display_name):
+            return {
+                "name": f"projects/{project_number}/locations/global/keys/key-one",
+                "uid": "uid-one",
+                "keyString": "private-key-one",
+                "displayName": display_name,
+            }
+
+    api = Api()
+    monkeypatch.setattr(service._google_provisioner, "_api", lambda *_args: api)
+
+    def apply():
+        return service._google_provisioner.apply(
+            "google-one",
+            expected_generation=snapshot.generation,
+            idempotency_key="provision-apply-one",
+            plan_digest=plan.fingerprint,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(apply) for _ in range(2)]
+        both_inside_create.wait(0.5)
+        release_create.set()
+        receipts = [future.result(timeout=3) for future in futures]
+
+    assert created == 1
+    assert receipts == [admin_assembly.ProvisionReceipt(1, 1)] * 2
 
 
 def test_product_billing_uses_vaulted_access_token_authority(
@@ -1093,9 +1356,7 @@ def test_product_billing_uses_vaulted_access_token_authority(
     calls = []
 
     class AccessTokens:
-        def issue_access_token(
-            self, account_ref, subject_id, *, expected_generation
-        ):
+        def issue_access_token(self, account_ref, subject_id, *, expected_generation):
             calls.append((account_ref, subject_id, expected_generation))
             return "private-access-token"
 

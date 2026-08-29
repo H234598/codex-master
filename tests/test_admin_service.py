@@ -387,6 +387,7 @@ class GoogleOAuth:
 class QuotaCollector:
     def __init__(self) -> None:
         self.calls = 0
+        self.sync_calls: list[tuple[object, ...]] = []
 
     def collect(self, account_ref: str, *, expected_generation: int) -> PublicValue:
         self.calls += 1
@@ -397,6 +398,14 @@ class QuotaCollector:
                 "remaining": 3,
             }
         )
+
+    def sync(self, account_ref: str, **values: object) -> dict[str, object]:
+        self.sync_calls.append((account_ref, values))
+        return {
+            "account_ref": account_ref,
+            "remaining": values["remaining"],
+            "inventory_generation": values["expected_generation"],
+        }
 
 
 class GoogleProvisioner:
@@ -900,6 +909,53 @@ def test_provision_apply_requires_scope_and_step_up_before_owner() -> None:
         )
 
     assert owners.google_provisioner.apply_calls == 0
+
+
+def test_quota_evidence_sync_is_account_bound_step_up_command() -> None:
+    service, owners = service_at()
+    arguments = {
+        "account_ref": "google-one",
+        "remaining": "9",
+        "observed_at": "2026-08-30T00:01:00Z",
+        "source": "cloudresourcemanager",
+        "inventory_fingerprint": "sha256:" + "a" * 64,
+    }
+
+    with pytest.raises(AdminDenied, match="authority.step_up_required"):
+        command(
+            service,
+            "google.quota-evidence.sync",
+            arguments,
+            "fleet.google.provision",
+        )
+    result = command(
+        service,
+        "google.quota-evidence.sync",
+        arguments,
+        "fleet.google.provision",
+        step_up=True,
+    )
+
+    assert result == {
+        "account_ref": "google-one",
+        "remaining": 9,
+        "inventory_generation": 4,
+    }
+    assert owners.quota_collector is not None
+    assert owners.quota_collector.sync_calls == [
+        (
+            "google-one",
+            {
+                "remaining": 9,
+                "observed_at": "2026-08-30T00:01:00Z",
+                "source": "cloudresourcemanager",
+                "inventory_fingerprint": "sha256:" + "a" * 64,
+                "expected_generation": 4,
+                "idempotency_key": "request-one",
+            },
+        )
+    ]
+    assert owners.google_manager.get_calls == 1
 
 
 @pytest.mark.parametrize(

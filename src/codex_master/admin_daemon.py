@@ -524,6 +524,7 @@ class AdminDaemon:
         self._notifier = notifier or _systemd_notify
         self._shutdown_timeout = float(shutdown_timeout_seconds)
         self._state_lock = threading.RLock()
+        self._notification_lock = threading.Lock()
         self._ready = threading.Event()
         self._stop_requested = threading.Event()
         self._socket: _SocketAdapter | None = None
@@ -560,15 +561,16 @@ class AdminDaemon:
             self._revoke_readiness()
 
     def _revoke_readiness(self) -> None:
-        with self._state_lock:
-            published = self._ready_published
-            self._ready_published = False
-            self._ready.clear()
-        if published:
-            try:
-                self._notifier("STOPPING=1")
-            except Exception:
-                pass
+        with self._notification_lock:
+            with self._state_lock:
+                published = self._ready_published
+                self._ready_published = False
+                self._ready.clear()
+            if published:
+                try:
+                    self._notifier("STOPPING=1")
+                except Exception:
+                    pass
 
     def _validate_socket(self, adapter: _SocketAdapter) -> None:
         bound_service = getattr(adapter, "service", getattr(adapter, "_service", None))
@@ -615,9 +617,12 @@ class AdminDaemon:
             with self._state_lock:
                 if self._http_failure is not None or not http_thread.is_alive():
                     raise RuntimeError("control.http_serve_failed")
-            with self._state_lock:
-                self._ready_published = True
-            self._notifier("READY=1")
+            with self._notification_lock:
+                with self._state_lock:
+                    if self._http_failure is not None or not http_thread.is_alive():
+                        raise RuntimeError("control.http_serve_failed")
+                    self._ready_published = True
+                self._notifier("READY=1")
             with self._state_lock:
                 if self._http_failure is not None or not http_thread.is_alive():
                     raise RuntimeError("control.http_serve_failed")
@@ -757,7 +762,8 @@ class AdminDaemon:
             failures: list[str] = []
             if was_started and notify_stopping:
                 try:
-                    self._notifier("STOPPING=1")
+                    with self._notification_lock:
+                        self._notifier("STOPPING=1")
                 except BaseException as error:
                     failures.append(_failure_code(error))
 

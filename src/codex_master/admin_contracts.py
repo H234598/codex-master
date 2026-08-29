@@ -126,6 +126,19 @@ ADMIN_OPERATION_METADATA = MappingProxyType(
             requires_idempotency=True,
             generation_domain="google",
         ),
+        "google.quota-evidence.sync": AdminOperationMetadataV1(
+            "fleet.google.provision",
+            True,
+            (
+                "account_ref",
+                "remaining",
+                "observed_at",
+                "source",
+                "inventory_fingerprint",
+            ),
+            requires_idempotency=True,
+            generation_domain="google",
+        ),
         "google.provision.plan": AdminOperationMetadataV1(
             "fleet.google.provision",
             True,

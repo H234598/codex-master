@@ -26,6 +26,7 @@ from .google_account_inventory import GoogleAccountInventoryError
 from .google_account_inventory_manager import GoogleAccountInventoryManager
 from .google_cloud_api import GoogleCloudApi, GoogleCloudApiError
 from .google_oauth_authorization import (
+    GoogleOAuthAuthorizationError,
     GoogleOAuthOperationV1,
     GoogleOAuthProfileIdV1,
     google_oauth_scope_values_v1,
@@ -870,6 +871,18 @@ class GoogleOAuthControlService:
                     "terminal_at",
                 },
             )
+            try:
+                profile_id = GoogleOAuthProfileIdV1(cast(str, record["scope_profile"]))
+                profile_operation = (
+                    GoogleOAuthOperationV1.PROJECTS_SEARCH
+                    if profile_id is GoogleOAuthProfileIdV1.INVENTORY_READONLY
+                    else GoogleOAuthOperationV1.PROJECTS_CREATE
+                )
+                expected_scope_fingerprint = resolve_google_oauth_profile_v1(
+                    profile_id, profile_operation
+                ).scope_fingerprint
+            except (TypeError, ValueError, GoogleOAuthAuthorizationError):
+                raise HiveStateError("invalid_google_oauth_control_state") from None
             base = (
                 cls._stored_ref(record["id"])
                 and cls._stored_ref(record["account_ref"])
@@ -878,14 +891,9 @@ class GoogleOAuthControlService:
                 and cls._stored_generation(record["client_vault_generation"])
                 and type(record["redirect_uri"]) is str
                 and _REDIRECT.fullmatch(cast(str, record["redirect_uri"])) is not None
-                and record["scope_profile"]
-                == GoogleOAuthProfileIdV1.INVENTORY_READONLY.value
+                and record["scope_profile"] == profile_id.value
                 and cls._stored_digest(record["scope_fingerprint"])
-                and record["scope_fingerprint"]
-                == resolve_google_oauth_profile_v1(
-                    GoogleOAuthProfileIdV1.INVENTORY_READONLY,
-                    GoogleOAuthOperationV1.PROJECTS_SEARCH,
-                ).scope_fingerprint
+                and record["scope_fingerprint"] == expected_scope_fingerprint
                 and cls._stored_digest(record["state_digest"])
                 and cls._stored_generation(record["inventory_generation"])
                 and cls._stored_time(record["expires_at"])
@@ -2099,11 +2107,16 @@ class GoogleOAuthControlService:
 
     @staticmethod
     def _profile(profile_id: object):
-        if profile_id is not GoogleOAuthProfileIdV1.INVENTORY_READONLY:
+        if type(profile_id) is not GoogleOAuthProfileIdV1:
             raise GoogleOAuthSessionError("oauth.scope_mismatch")
         try:
             return resolve_google_oauth_profile_v1(
-                profile_id, GoogleOAuthOperationV1.PROJECTS_SEARCH
+                profile_id,
+                (
+                    GoogleOAuthOperationV1.PROJECTS_SEARCH
+                    if profile_id is GoogleOAuthProfileIdV1.INVENTORY_READONLY
+                    else GoogleOAuthOperationV1.PROJECTS_CREATE
+                ),
             )
         except Exception:
             raise GoogleOAuthSessionError("oauth.scope_mismatch") from None
@@ -2462,7 +2475,9 @@ class GoogleOAuthControlService:
                     account_ref=account_ref,
                     subject_id=result.subject_id,
                     oauth_client_fingerprint=client_digest,
-                    scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+                    scope_profile=GoogleOAuthProfileIdV1(
+                        cast(str, record["scope_profile"])
+                    ),
                     scope_fingerprint=cast(str, record["scope_fingerprint"]),
                     refresh_token=result.refresh_token,
                 )
@@ -2619,10 +2634,11 @@ class GoogleOAuthControlService:
         self, record: Mapping[str, object]
     ) -> GoogleOAuthTokenWriteReceiptV1 | None:
         try:
+            scope_profile = GoogleOAuthProfileIdV1(cast(str, record["scope_profile"]))
             return self._token_writer.lookup_refresh_token_receipt(
                 cast(str, record["token_operation_id"]),
                 account_ref=cast(str, record["account_ref"]),
-                scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+                scope_profile=scope_profile,
                 scope_fingerprint=cast(str, record["scope_fingerprint"]),
             )
         except GoogleOAuthSessionError:
@@ -2634,12 +2650,16 @@ class GoogleOAuthControlService:
         self, record: Mapping[str, object], receipt: object
     ) -> None:
         effect_subject_id = record["effect_subject_id"]
+        try:
+            scope_profile = GoogleOAuthProfileIdV1(cast(str, record["scope_profile"]))
+        except (TypeError, ValueError):
+            raise GoogleOAuthSessionError("oauth.token_write_failed") from None
         if not isinstance(receipt, GoogleOAuthTokenWriteReceiptV1) or any(
             (
                 receipt.operation_id != record["token_operation_id"],
                 receipt.account_ref != record["account_ref"],
                 receipt.oauth_client_fingerprint != record["client_digest"],
-                receipt.scope_profile is not GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+                receipt.scope_profile is not scope_profile,
                 receipt.scope_fingerprint != record["scope_fingerprint"],
                 not self._stored_ref(receipt.subject_id),
                 effect_subject_id is not None

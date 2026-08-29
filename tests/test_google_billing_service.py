@@ -453,6 +453,41 @@ def test_plan_idempotency_reuses_same_plan_and_rejects_changed_payload(
         )
 
 
+def test_plan_and_receipt_survive_service_restart(tmp_path) -> None:
+    manager = _manager(_inventory(tmp_path))
+    lease = FakeBillingLease()
+    authority = FakeCredentialAuthority(lease)
+    clock = Clock()
+    state_root = tmp_path / "billing-state"
+    first = GoogleBillingService(manager, authority, clock=clock, state_root=state_root)
+    plan = first.plan_billing_binding(
+        account_ref="google-one",
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="restart-one",
+    )
+
+    second = GoogleBillingService(
+        manager, authority, clock=clock, state_root=state_root
+    )
+    assert (
+        second.plan_billing_binding(
+            account_ref="google-one",
+            project_ref="the-hive-1",
+            billing_ref="billing-one",
+            expected_generation=1,
+            idempotency_key="restart-one",
+        )
+        == plan
+    )
+    receipt = _apply(second, plan)
+
+    third = GoogleBillingService(manager, authority, clock=clock, state_root=state_root)
+    assert _apply(third, plan) == receipt
+    assert len(lease.calls) == 1
+
+
 def test_apply_exposes_only_project_binding_lookup_and_create(tmp_path) -> None:
     service, _, api, _ = _service(tmp_path)
     plan = service.plan_billing_binding(

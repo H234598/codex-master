@@ -33340,6 +33340,12 @@ _MASTERJET_ADMIN_TOOL_SPECS = (
         None,
     ),
     (
+        "fleet_google_quota_evidence_sync",
+        "google.quota-evidence.sync",
+        "Persist fresh account-bound Google quota evidence.",
+        None,
+    ),
+    (
         "fleet_google_provision_apply",
         "google.provision.apply",
         "Apply one immutable Google provisioning plan.",
@@ -33385,6 +33391,7 @@ _MASTERJET_ADMIN_CLI_COMMANDS = MappingProxyType(
             "google.projects.list",
         ),
         ("google", "oauth-begin"): ("google.oauth.begin", None),
+        ("google", "quota-sync"): ("google.quota-evidence.sync", None),
         ("google", "provision-plan"): ("google.provision.plan", None),
         ("google", "provision-apply"): ("google.provision.apply", None),
         ("google", "billing-plan"): ("google.billing.plan", None),

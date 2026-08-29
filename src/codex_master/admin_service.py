@@ -81,6 +81,7 @@ _STEP_UP_OPERATIONS = frozenset(
         "google.oauth.begin",
         "google.oauth.complete",
         "google.oauth-client-import.apply",
+        "google.quota-evidence.sync",
         "google.provision.apply",
         "google.billing.apply",
     }
@@ -140,6 +141,8 @@ class AccountRegistryPort(Protocol):
 
 class QuotaCollectorPort(Protocol):
     def collect(self, account_ref: str, *, expected_generation: int) -> object: ...
+
+    def sync(self, account_ref: str, **values: object) -> Mapping[str, object]: ...
 
 
 class GoogleProvisionerPort(Protocol):
@@ -1084,6 +1087,35 @@ class MasterjetControlService:
             )
         )
 
+    def _google_quota_evidence_sync(
+        self,
+        _principal: AdminPrincipalV1,
+        request: AdminRequestV1,
+        *_values: object,
+    ) -> dict[str, object]:
+        collector = _required(self._quota_collector)
+        account_ref = cast(str, request.arguments["account_ref"])
+        self._google_manager.get_account(account_ref)
+        remaining_value = request.arguments["remaining"]
+        if (
+            type(remaining_value) is not str
+            or re.fullmatch(r"0|[1-9][0-9]{0,5}", remaining_value) is None
+        ):
+            raise _service_error("control.request_invalid")
+        return dict(
+            collector.sync(
+                account_ref,
+                remaining=int(remaining_value),
+                observed_at=cast(str, request.arguments["observed_at"]),
+                source=cast(str, request.arguments["source"]),
+                inventory_fingerprint=cast(
+                    str, request.arguments["inventory_fingerprint"]
+                ),
+                expected_generation=_generation(request),
+                idempotency_key=_idempotency(request),
+            )
+        )
+
     def _google_provision_apply(
         self,
         _principal: AdminPrincipalV1,
@@ -1170,6 +1202,7 @@ _COMMAND_HANDLERS: Mapping[str, Handler] = MappingProxyType(
         "google.oauth-client-import.plan": MasterjetControlService._google_oauth_client_plan,
         "google.oauth-client-import.apply": MasterjetControlService._google_oauth_client_apply,
         "google.inventory.refresh": MasterjetControlService._google_inventory_refresh,
+        "google.quota-evidence.sync": MasterjetControlService._google_quota_evidence_sync,
         "google.provision.plan": MasterjetControlService._google_provision_plan,
         "google.provision.apply": MasterjetControlService._google_provision_apply,
         "google.billing.plan": MasterjetControlService._google_billing_plan,

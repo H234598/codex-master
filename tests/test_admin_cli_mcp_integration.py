@@ -15,14 +15,14 @@ from test_admin_service import service_at
 
 
 @contextmanager
-def _admin_socket(tmp_path: Path) -> Iterator[tuple[Path, Path]]:
+def _admin_socket(tmp_path: Path) -> Iterator[tuple[Path, Path, object]]:
     credential_directory = tmp_path / "credentials"
     credential_directory.mkdir(mode=0o700)
     key_path = credential_directory / "masterjet-local-attestation-key"
     key_path.write_bytes(b"k" * 32)
     key_path.chmod(0o400)
     key_fd = os.open(key_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    service, _owners = service_at()
+    service, owners = service_at()
     principal = AdminPrincipalV1(
         "operator-one",
         (
@@ -43,7 +43,7 @@ def _admin_socket(tmp_path: Path) -> Iterator[tuple[Path, Path]]:
     )
     adapter.start()
     try:
-        yield adapter.path, credential_directory
+        yield adapter.path, credential_directory, owners
     finally:
         adapter.close()
         os.close(key_fd)
@@ -123,7 +123,7 @@ def _run_child(
 
 
 def test_real_cli_process_calls_attested_admin_socket(tmp_path: Path) -> None:
-    with _admin_socket(tmp_path) as (socket_path, credential_directory):
+    with _admin_socket(tmp_path) as (socket_path, credential_directory, _owners):
         completed = _run_child(
             [
                 sys.executable,
@@ -167,22 +167,88 @@ def test_real_mcp_stdio_process_calls_same_attested_admin_socket(
         "method": "tools/call",
         "params": {"name": "fleet_google_inventory", "arguments": {}},
     }
-    with _admin_socket(tmp_path) as (socket_path, credential_directory):
+    quota_request = {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "fleet_google_quota_evidence_sync",
+            "arguments": {
+                "account_ref": "google-one",
+                "remaining": "9",
+                "observed_at": "2026-08-30T00:01:00Z",
+                "source": "cloudresourcemanager",
+                "inventory_fingerprint": "sha256:" + "a" * 64,
+                "expected_generation": 4,
+                "idempotency_key": "quota-sync-mcp",
+            },
+        },
+    }
+    with _admin_socket(tmp_path) as (socket_path, credential_directory, owners):
         completed = _run_child(
             [sys.executable, "-m", "codex_master.server"],
             input_text="\n".join(
-                (json.dumps(list_request), json.dumps(call_request), "")
+                (
+                    json.dumps(list_request),
+                    json.dumps(call_request),
+                    json.dumps(quota_request),
+                    "",
+                )
             ),
             env=_subprocess_env(tmp_path, socket_path, credential_directory),
         )
 
     assert completed.returncode == 0, completed.stderr
-    listed, response = [json.loads(line) for line in completed.stdout.splitlines()]
+    listed, response, quota_response = [
+        json.loads(line) for line in completed.stdout.splitlines()
+    ]
     visible_names = {tool["name"] for tool in listed["result"]["tools"]}
     assert "fleet_google_inventory" in visible_names
     assert "fleet_openai_auth_plan" in visible_names
+    assert "fleet_google_quota_evidence_sync" in visible_names
     assert response["result"]["isError"] is False
     assert (
         json.loads(response["result"]["content"][0]["text"])["accounts"][0]["ref"]
         == "google-one"
     )
+    assert quota_response["result"]["isError"] is False
+    assert owners.quota_collector is not None
+    assert owners.quota_collector.sync_calls[-1][0] == "google-one"
+
+
+def test_real_cli_process_syncs_quota_evidence_without_restart(tmp_path: Path) -> None:
+    with _admin_socket(tmp_path) as (socket_path, credential_directory, owners):
+        completed = _run_child(
+            [
+                sys.executable,
+                "-m",
+                "codex_master.server",
+                "fleet",
+                "google",
+                "quota-sync",
+                "--account-ref",
+                "google-one",
+                "--remaining",
+                "9",
+                "--observed-at",
+                "2026-08-30T00:01:00Z",
+                "--source",
+                "cloudresourcemanager",
+                "--inventory-fingerprint",
+                "sha256:" + "a" * 64,
+                "--expected-generation",
+                "4",
+                "--idempotency-key",
+                "quota-sync-cli",
+            ],
+            env=_subprocess_env(tmp_path, socket_path, credential_directory),
+        )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "account_ref": "google-one",
+        "remaining": 9,
+        "inventory_generation": 4,
+    }
+    assert owners.quota_collector is not None
+    assert owners.quota_collector.sync_calls[-1][0] == "google-one"

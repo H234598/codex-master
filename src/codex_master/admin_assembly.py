@@ -6,12 +6,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
+import hmac
 import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import threading
 from typing import Any, Final, cast
 import urllib.parse
 import urllib.request
@@ -79,6 +81,7 @@ _TEAM_DOMAIN = re.compile(
     re.ASCII,
 )
 _ACCOUNT_DOCUMENT = PurePosixPath("account-registry.json")
+_QUOTA_DOCUMENT = PurePosixPath("google-quota-evidence.json")
 _TOKEN_RECEIPTS = PurePosixPath("google-token-receipts.json")
 _PROVISIONER_DOCUMENT = PurePosixPath("google-provisioner-plans.json")
 _INVENTORY_DOCUMENT = PurePosixPath("api-token.yaml")
@@ -583,17 +586,19 @@ class DurableAccountRegistry:
 
 
 class CredentialQuotaCollector:
-    def __init__(self, raw: bytes | Callable[[], bytes]) -> None:
-        if type(raw) is bytes:
-            self._source = lambda: raw
-        elif callable(raw):
-            self._source = raw
-        else:
-            raise AdminAssemblyError
-        self._evidence()
+    def __init__(self, state_root: Path, initial_raw: bytes) -> None:
+        self._state = HiveStateStore(state_root)
+        initial = self._document(initial_raw)
+        with self._state.locked():
+            try:
+                self._read_locked()
+            except HiveStateError as error:
+                if error.args != ("state_not_found",):
+                    raise AdminAssemblyError from None
+                self._state.replace_json_locked(_QUOTA_DOCUMENT, initial)
 
-    def _evidence(self) -> dict[str, GoogleQuotaEvidenceV1]:
-        raw = self._source()
+    @staticmethod
+    def _document(raw: bytes) -> dict[str, object]:
         if type(raw) is not bytes:
             raise AdminAssemblyError
         value = _parse_json(raw)
@@ -604,8 +609,55 @@ class CredentialQuotaCollector:
             or len(cast(list[object], value["accounts"])) > 4096
         ):
             raise AdminAssemblyError
+        document = {
+            "schema_version": 1,
+            "accounts": cast(list[object], value["accounts"]),
+            "receipts": [],
+        }
+        try:
+            CredentialQuotaCollector._evidence(document)
+        except HiveStateError:
+            raise AdminAssemblyError from None
+        return document
+
+    def _read_locked(self) -> dict[str, object]:
+        document = dict(
+            self._state.read_json_locked(_QUOTA_DOCUMENT, max_bytes=_QUOTA_MAX_BYTES)
+        )
+        if (
+            set(document) != {"schema_version", "accounts", "receipts"}
+            or document.get("schema_version") != 1
+            or type(document.get("accounts")) is not list
+            or len(cast(list[object], document["accounts"])) > 4096
+            or type(document.get("receipts")) is not list
+            or len(cast(list[object], document["receipts"])) > 4096
+        ):
+            raise HiveStateError("invalid_google_quota_evidence")
+        self._evidence(document)
+        for receipt in cast(list[object], document["receipts"]):
+            if (
+                type(receipt) is not dict
+                or set(receipt) != {"idempotency_key", "fingerprint", "result"}
+                or type(receipt.get("idempotency_key")) is not str
+                or _TOKEN.fullmatch(cast(str, receipt["idempotency_key"])) is None
+                or type(receipt.get("fingerprint")) is not str
+                or re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", cast(str, receipt["fingerprint"])
+                )
+                is None
+                or type(receipt.get("result")) is not dict
+                or set(cast(dict[str, object], receipt["result"]))
+                != {"account_ref", "remaining", "inventory_generation"}
+            ):
+                raise HiveStateError("invalid_google_quota_evidence")
+        return document
+
+    @staticmethod
+    def _evidence(
+        document: Mapping[str, object],
+    ) -> dict[str, GoogleQuotaEvidenceV1]:
         evidence: dict[str, GoogleQuotaEvidenceV1] = {}
-        for item in cast(list[object], value["accounts"]):
+        for item in cast(list[object], document["accounts"]):
             if type(item) is not dict or set(item) != {
                 "account_ref",
                 "remaining",
@@ -616,27 +668,133 @@ class CredentialQuotaCollector:
             }:
                 raise AdminAssemblyError
             record = cast(dict[str, object], item)
-            account_ref = _configured_token(record["account_ref"])
-            if account_ref in evidence:
-                raise AdminAssemblyError
             try:
+                account_ref = _configured_token(record["account_ref"])
+            except AdminAssemblyError:
+                raise HiveStateError("invalid_google_quota_evidence") from None
+            if account_ref in evidence:
+                raise HiveStateError("invalid_google_quota_evidence")
+            try:
+                remaining = record["remaining"]
+                generation = record["inventory_generation"]
+                observed_at = record["observed_at"]
+                source = record["source"]
+                fingerprint = record["inventory_fingerprint"]
+                if (
+                    type(remaining) is not int
+                    or remaining < 0
+                    or type(generation) is not int
+                    or generation < 1
+                    or type(observed_at) is not str
+                    or not observed_at
+                    or type(source) is not str
+                    or not source
+                    or type(fingerprint) is not str
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint) is None
+                ):
+                    raise ValueError
                 evidence[account_ref] = GoogleQuotaEvidenceV1(
-                    cast(int, record["remaining"]),
-                    cast(str, record["observed_at"]),
-                    cast(str, record["source"]),
+                    remaining,
+                    observed_at,
+                    source,
                     account_ref,
-                    cast(int, record["inventory_generation"]),
-                    cast(str, record["inventory_fingerprint"]),
+                    generation,
+                    fingerprint,
                 )
             except (TypeError, ValueError):
-                raise AdminAssemblyError from None
+                raise HiveStateError("invalid_google_quota_evidence") from None
         return evidence
 
     def collect(self, account_ref: str, *, expected_generation: int) -> object:
-        evidence = self._evidence().get(account_ref)
+        with self._state.locked():
+            evidence = self._evidence(self._read_locked()).get(account_ref)
         if evidence is None or evidence.inventory_generation != expected_generation:
             raise GoogleCloudProvisionerError("quota.evidence_invalid")
         return evidence
+
+    def sync(
+        self,
+        account_ref: str,
+        *,
+        remaining: int,
+        observed_at: str,
+        source: str,
+        inventory_fingerprint: str,
+        expected_generation: int,
+        idempotency_key: str,
+    ) -> Mapping[str, object]:
+        try:
+            account_ref = _configured_token(account_ref)
+            idempotency_key = _configured_token(idempotency_key)
+            if (
+                type(remaining) is not int
+                or remaining < 0
+                or type(expected_generation) is not int
+                or expected_generation < 1
+                or type(observed_at) is not str
+                or not observed_at
+                or type(source) is not str
+                or not source
+                or type(inventory_fingerprint) is not str
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", inventory_fingerprint) is None
+            ):
+                raise ValueError
+        except (AdminAssemblyError, ValueError):
+            raise GoogleCloudProvisionerError("quota.evidence_invalid") from None
+        record = {
+            "account_ref": account_ref,
+            "remaining": remaining,
+            "observed_at": observed_at,
+            "source": source,
+            "inventory_generation": expected_generation,
+            "inventory_fingerprint": inventory_fingerprint,
+        }
+        fingerprint = (
+            "sha256:"
+            + sha256(
+                json.dumps(record, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+        )
+        result = {
+            "account_ref": account_ref,
+            "remaining": remaining,
+            "inventory_generation": expected_generation,
+        }
+        with self._state.locked():
+            document = self._read_locked()
+            receipts = cast(list[object], document["receipts"])
+            prior = [
+                cast(dict[str, object], item)
+                for item in receipts
+                if type(item) is dict and item.get("idempotency_key") == idempotency_key
+            ]
+            if prior:
+                if len(prior) != 1 or prior[0].get("fingerprint") != fingerprint:
+                    raise GoogleCloudProvisionerError("quota.evidence_invalid")
+                return cast(dict[str, object], prior[0]["result"])
+            accounts = cast(list[object], document["accounts"])
+            accounts[:] = [
+                item
+                for item in accounts
+                if type(item) is not dict or item.get("account_ref") != account_ref
+            ]
+            accounts.append(record)
+            accounts.sort(
+                key=lambda item: cast(str, cast(dict[str, object], item)["account_ref"])
+            )
+            receipts.append(
+                {
+                    "idempotency_key": idempotency_key,
+                    "fingerprint": fingerprint,
+                    "result": result,
+                }
+            )
+            if len(receipts) > 4096:
+                del receipts[: len(receipts) - 4096]
+            self._state.replace_json_locked(_QUOTA_DOCUMENT, document)
+        return result
 
 
 class DurableGoogleTokenWriter:
@@ -654,6 +812,7 @@ class DurableGoogleTokenWriter:
         self._vault = vault
         self._store = store
         self._manager = manager
+        self._operation_lock = threading.RLock()
         with self._state.locked():
             try:
                 self._read_locked()
@@ -661,7 +820,7 @@ class DurableGoogleTokenWriter:
                 if error.args != ("state_not_found",):
                     raise
                 self._state.replace_json_locked(
-                    _TOKEN_RECEIPTS, {"schema_version": 1, "receipts": []}
+                    _TOKEN_RECEIPTS, {"schema_version": 2, "receipts": []}
                 )
 
     def _read_locked(self) -> dict[str, object]:
@@ -670,16 +829,30 @@ class DurableGoogleTokenWriter:
         )
         if (
             set(value) != {"schema_version", "receipts"}
-            or value.get("schema_version") != 1
+            or value.get("schema_version") != 2
             or type(value.get("receipts")) is not list
         ):
             raise HiveStateError("invalid_google_token_receipts")
         return value
 
     @staticmethod
-    def _receipt(value: Mapping[str, object]) -> GoogleOAuthTokenWriteReceiptV1:
+    def _record(
+        value: Mapping[str, object],
+    ) -> tuple[GoogleOAuthTokenWriteReceiptV1, str, int, str]:
         try:
-            return GoogleOAuthTokenWriteReceiptV1(
+            if set(value) != {
+                "operation_id",
+                "account_ref",
+                "subject_id",
+                "oauth_client_fingerprint",
+                "scope_profile",
+                "scope_fingerprint",
+                "state",
+                "vault_generation",
+                "refresh_token_digest",
+            }:
+                raise ValueError
+            receipt = GoogleOAuthTokenWriteReceiptV1(
                 cast(str, value["operation_id"]),
                 cast(str, value["account_ref"]),
                 cast(str, value["subject_id"]),
@@ -687,8 +860,60 @@ class DurableGoogleTokenWriter:
                 GoogleOAuthProfileIdV1(cast(str, value["scope_profile"])),
                 cast(str, value["scope_fingerprint"]),
             )
+            state = value["state"]
+            generation = value["vault_generation"]
+            token_digest = value["refresh_token_digest"]
+            if (
+                any(
+                    type(item) is not str or not item
+                    for item in (
+                        receipt.operation_id,
+                        receipt.account_ref,
+                        receipt.subject_id,
+                        receipt.oauth_client_fingerprint,
+                        receipt.scope_fingerprint,
+                    )
+                )
+                or state not in {"planned", "succeeded"}
+                or type(generation) is not int
+                or generation < 1
+                or type(token_digest) is not str
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", token_digest) is None
+            ):
+                raise ValueError
+            return receipt, cast(str, state), generation, token_digest
         except (KeyError, TypeError, ValueError):
             raise HiveStateError("invalid_google_token_receipts") from None
+
+    @staticmethod
+    def _same_request(
+        receipt: GoogleOAuthTokenWriteReceiptV1,
+        *,
+        account_ref: str,
+        scope_profile: GoogleOAuthProfileIdV1,
+        scope_fingerprint: str,
+    ) -> bool:
+        return (
+            receipt.account_ref == account_ref
+            and receipt.scope_profile is scope_profile
+            and receipt.scope_fingerprint == scope_fingerprint
+        )
+
+    def _operation_record_locked(
+        self, document: Mapping[str, object], operation_id: str
+    ) -> tuple[dict[str, object], GoogleOAuthTokenWriteReceiptV1, str, int, str] | None:
+        matches = []
+        for raw in cast(list[object], document["receipts"]):
+            if type(raw) is not dict:
+                raise HiveStateError("invalid_google_token_receipts")
+            receipt, state, generation, token_digest = self._record(
+                cast(dict[str, object], raw)
+            )
+            if receipt.operation_id == operation_id:
+                matches.append((raw, receipt, state, generation, token_digest))
+        if len(matches) > 1:
+            raise HiveStateError("invalid_google_token_receipts")
+        return matches[0] if matches else None
 
     def lookup_refresh_token_receipt(
         self,
@@ -698,22 +923,76 @@ class DurableGoogleTokenWriter:
         scope_profile: GoogleOAuthProfileIdV1,
         scope_fingerprint: str,
     ) -> GoogleOAuthTokenWriteReceiptV1 | None:
+        if type(scope_profile) is not GoogleOAuthProfileIdV1:
+            raise GoogleOAuthSessionError("oauth.scope_mismatch")
+        with self._operation_lock:
+            with self._state.locked():
+                document = self._read_locked()
+                record = self._operation_record_locked(document, operation_id)
+            if record is None:
+                return None
+            _, receipt, state, generation, token_digest = record
+            if not self._same_request(
+                receipt,
+                account_ref=account_ref,
+                scope_profile=scope_profile,
+                scope_fingerprint=scope_fingerprint,
+            ):
+                raise GoogleOAuthSessionError("oauth.operation_conflict")
+            if state == "succeeded":
+                return receipt
+            return self._reconcile_planned(receipt, generation, token_digest)
+
+    def _vault_ref(
+        self, account_ref: str, scope_profile: GoogleOAuthProfileIdV1
+    ) -> str:
+        account_digest = sha256(account_ref.encode("ascii")).hexdigest()
+        return f"google-refresh-{scope_profile.value}-{account_digest}"
+
+    def _vault_matches(
+        self,
+        receipt: GoogleOAuthTokenWriteReceiptV1,
+        generation: int,
+        token_digest: str,
+    ) -> bool:
+        vault_ref = self._vault_ref(receipt.account_ref, receipt.scope_profile)
+        if self._vault.projection_metadata(vault_ref) != ("active", generation):
+            return False
+        try:
+            lease = self._vault.lease(
+                vault_ref, expected_generation=generation, ttl_seconds=30
+            )
+            observed = "sha256:" + sha256(self._vault.consume_lease(lease)).hexdigest()
+        except CredentialVaultError:
+            return False
+        return hmac.compare_digest(observed, token_digest)
+
+    def _reconcile_planned(
+        self,
+        receipt: GoogleOAuthTokenWriteReceiptV1,
+        generation: int,
+        token_digest: str,
+    ) -> GoogleOAuthTokenWriteReceiptV1 | None:
+        if not self._vault_matches(receipt, generation, token_digest):
+            return None
+        self._validate_subject(receipt.account_ref, receipt.subject_id)
+        self._bind_subject(receipt.account_ref, receipt.subject_id)
         with self._state.locked():
             document = self._read_locked()
-            for raw in cast(list[object], document["receipts"]):
-                if type(raw) is not dict:
-                    raise HiveStateError("invalid_google_token_receipts")
-                receipt = self._receipt(cast(dict[str, object], raw))
-                if receipt.operation_id != operation_id:
-                    continue
-                if (
-                    receipt.account_ref != account_ref
-                    or receipt.scope_profile is not scope_profile
-                    or receipt.scope_fingerprint != scope_fingerprint
-                ):
-                    raise GoogleOAuthSessionError("oauth.operation_conflict")
-                return receipt
-        return None
+            current = self._operation_record_locked(document, receipt.operation_id)
+            if current is None:
+                raise HiveStateError("invalid_google_token_receipts")
+            raw, current_receipt, state, current_generation, current_digest = current
+            if (
+                current_receipt != receipt
+                or current_generation != generation
+                or not hmac.compare_digest(current_digest, token_digest)
+            ):
+                raise GoogleOAuthSessionError("oauth.operation_conflict")
+            if state == "planned":
+                raw["state"] = "succeeded"
+                self._state.replace_json_locked(_TOKEN_RECEIPTS, document)
+        return receipt
 
     def load_refresh_token(
         self,
@@ -721,6 +1000,7 @@ class DurableGoogleTokenWriter:
         *,
         subject_id: str,
         oauth_client_fingerprint: str,
+        scope_profile: GoogleOAuthProfileIdV1,
     ) -> bytearray:
         try:
             account = self._manager._snapshot_for_internal_use().by_account_ref[
@@ -733,7 +1013,10 @@ class DurableGoogleTokenWriter:
                 records = [
                     cast(dict[str, object], item)
                     for item in cast(list[object], document["receipts"])
-                    if type(item) is dict and item.get("account_ref") == account_ref
+                    if type(item) is dict
+                    and item.get("account_ref") == account_ref
+                    and item.get("scope_profile") == scope_profile.value
+                    and item.get("state") == "succeeded"
                 ]
                 if not records:
                     raise GoogleOAuthSessionError("oauth.token_unavailable")
@@ -746,9 +1029,8 @@ class DurableGoogleTokenWriter:
                 ):
                     raise GoogleOAuthSessionError("oauth.token_unavailable")
                 generation = cast(int, current["vault_generation"])
-            account_digest = sha256(account_ref.encode("ascii")).hexdigest()
             lease = self._vault.lease(
-                f"google-refresh-{account_digest}",
+                self._vault_ref(account_ref, scope_profile),
                 expected_generation=generation,
                 ttl_seconds=30,
             )
@@ -769,34 +1051,9 @@ class DurableGoogleTokenWriter:
         scope_fingerprint: str,
         refresh_token: bytearray,
     ) -> GoogleOAuthTokenWriteReceiptV1:
-        prior = self.lookup_refresh_token_receipt(
-            operation_id,
-            account_ref=account_ref,
-            scope_profile=scope_profile,
-            scope_fingerprint=scope_fingerprint,
-        )
-        if prior is not None:
-            refresh_token[:] = b"\0" * len(refresh_token)
-            return prior
-        if scope_profile is not GoogleOAuthProfileIdV1.INVENTORY_READONLY:
+        if type(scope_profile) is not GoogleOAuthProfileIdV1:
             refresh_token[:] = b"\0" * len(refresh_token)
             raise GoogleOAuthSessionError("oauth.scope_mismatch")
-        try:
-            self._bind_subject(account_ref, subject_id)
-        except GoogleOAuthSessionError:
-            refresh_token[:] = b"\0" * len(refresh_token)
-            raise
-        except Exception:
-            refresh_token[:] = b"\0" * len(refresh_token)
-            raise GoogleOAuthSessionError("oauth.token_write_failed") from None
-        account_digest = sha256(account_ref.encode("ascii")).hexdigest()
-        vault_ref = f"google-refresh-{account_digest}"
-        metadata = self._vault.projection_metadata(vault_ref)
-        generation = 1 if metadata is None else metadata[1] + 1
-        try:
-            self._vault.store_projection(vault_ref, generation, refresh_token)
-        finally:
-            refresh_token[:] = b"\0" * len(refresh_token)
         receipt = GoogleOAuthTokenWriteReceiptV1(
             operation_id,
             account_ref,
@@ -805,31 +1062,103 @@ class DurableGoogleTokenWriter:
             scope_profile,
             scope_fingerprint,
         )
-        with self._state.locked():
-            document = self._read_locked()
-            receipts = cast(list[object], document["receipts"])
-            if len(receipts) >= 4096:
-                del receipts[: len(receipts) - 4095]
-            receipts.append(
-                {
-                    "operation_id": receipt.operation_id,
-                    "account_ref": receipt.account_ref,
-                    "subject_id": receipt.subject_id,
-                    "oauth_client_fingerprint": receipt.oauth_client_fingerprint,
-                    "scope_profile": receipt.scope_profile.value,
-                    "scope_fingerprint": receipt.scope_fingerprint,
-                    "vault_generation": generation,
-                }
-            )
-            self._state.replace_json_locked(_TOKEN_RECEIPTS, document)
-        return receipt
+        token_digest = "sha256:" + sha256(refresh_token).hexdigest()
+        with self._operation_lock:
+            try:
+                prior = self.lookup_refresh_token_receipt(
+                    operation_id,
+                    account_ref=account_ref,
+                    scope_profile=scope_profile,
+                    scope_fingerprint=scope_fingerprint,
+                )
+                if prior is not None:
+                    if prior != receipt:
+                        raise GoogleOAuthSessionError("oauth.operation_conflict")
+                    return prior
+                self._validate_subject(account_ref, subject_id)
+                vault_ref = self._vault_ref(account_ref, scope_profile)
+                with self._state.locked():
+                    document = self._read_locked()
+                    current = self._operation_record_locked(document, operation_id)
+                    if current is not None:
+                        _, current_receipt, _, generation, current_digest = current
+                        if current_receipt != receipt or not hmac.compare_digest(
+                            current_digest, token_digest
+                        ):
+                            raise GoogleOAuthSessionError("oauth.operation_conflict")
+                    else:
+                        metadata = self._vault.projection_metadata(vault_ref)
+                        generation = 1 if metadata is None else metadata[1] + 1
+                        records = cast(list[object], document["receipts"])
+                        while len(records) >= 4096:
+                            removable = next(
+                                (
+                                    index
+                                    for index, raw in enumerate(records)
+                                    if type(raw) is dict
+                                    and raw.get("state") == "succeeded"
+                                ),
+                                None,
+                            )
+                            if removable is None:
+                                raise GoogleOAuthSessionError(
+                                    "oauth.token_write_failed"
+                                )
+                            del records[removable]
+                        records.append(
+                            {
+                                "operation_id": receipt.operation_id,
+                                "account_ref": receipt.account_ref,
+                                "subject_id": receipt.subject_id,
+                                "oauth_client_fingerprint": receipt.oauth_client_fingerprint,
+                                "scope_profile": receipt.scope_profile.value,
+                                "scope_fingerprint": receipt.scope_fingerprint,
+                                "state": "planned",
+                                "vault_generation": generation,
+                                "refresh_token_digest": token_digest,
+                            }
+                        )
+                        self._state.replace_json_locked(_TOKEN_RECEIPTS, document)
+                try:
+                    self._vault.store_projection(vault_ref, generation, refresh_token)
+                except CredentialVaultError:
+                    recovered = self.lookup_refresh_token_receipt(
+                        operation_id,
+                        account_ref=account_ref,
+                        scope_profile=scope_profile,
+                        scope_fingerprint=scope_fingerprint,
+                    )
+                    if recovered is not None:
+                        return recovered
+                    raise
+                recovered = self.lookup_refresh_token_receipt(
+                    operation_id,
+                    account_ref=account_ref,
+                    scope_profile=scope_profile,
+                    scope_fingerprint=scope_fingerprint,
+                )
+                if recovered is None:
+                    raise GoogleOAuthSessionError("oauth.token_write_failed")
+                return recovered
+            finally:
+                refresh_token[:] = b"\0" * len(refresh_token)
+
+    def _validate_subject(self, account_ref: str, subject_id: str) -> None:
+        snapshot = self._manager._snapshot_for_internal_use()
+        account = snapshot.by_account_ref.get(account_ref)
+        if account is None:
+            raise GoogleOAuthSessionError("oauth.account_mismatch")
+        if account.subject_id not in {None, subject_id} or any(
+            item.ref != account_ref and item.subject_id == subject_id
+            for item in snapshot.accounts
+        ):
+            raise GoogleOAuthSessionError("oauth.subject_mismatch")
 
     def _bind_subject(self, account_ref: str, subject_id: str) -> None:
         snapshot = self._manager._snapshot_for_internal_use()
-        try:
-            account = snapshot.by_account_ref[account_ref]
-        except KeyError:
-            raise GoogleOAuthSessionError("oauth.account_mismatch") from None
+        account = snapshot.by_account_ref.get(account_ref)
+        if account is None:
+            raise GoogleOAuthSessionError("oauth.account_mismatch")
         if account.subject_id == subject_id:
             return
         if account.subject_id is not None:
@@ -858,7 +1187,9 @@ class DurableGoogleTokenWriter:
 
         self._store.atomic_update(bind)
         self._manager.reload(expected_generation=snapshot.generation)
-        rebound = self._manager._snapshot_for_internal_use().by_account_ref.get(account_ref)
+        rebound = self._manager._snapshot_for_internal_use().by_account_ref.get(
+            account_ref
+        )
         if rebound is None or rebound.subject_id != subject_id:
             raise GoogleOAuthSessionError("oauth.subject_mismatch")
 
@@ -940,6 +1271,7 @@ class GoogleAccessTokenAuthority:
                 account_ref,
                 subject_id=subject_id,
                 oauth_client_fingerprint=client.client_fingerprint,
+                scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
             )
             if (
                 client.token_uri != "https://oauth2.googleapis.com/token"
@@ -1003,6 +1335,7 @@ class GoogleProvisioner:
         self._manager = manager
         self._store = store
         self._access_tokens = access_tokens
+        self._apply_lock = threading.RLock()
         with self._state.locked():
             try:
                 self._read_locked()
@@ -1011,7 +1344,7 @@ class GoogleProvisioner:
                     raise
                 self._state.replace_json_locked(
                     _PROVISIONER_DOCUMENT,
-                    {"schema_version": 1, "plans": [], "applies": []},
+                    {"schema_version": 2, "plans": [], "applies": []},
                 )
 
     def _read_locked(self) -> dict[str, object]:
@@ -1022,7 +1355,7 @@ class GoogleProvisioner:
         )
         if (
             set(document) != {"schema_version", "plans", "applies"}
-            or document.get("schema_version") != 1
+            or document.get("schema_version") != 2
             or type(document.get("plans")) is not list
             or type(document.get("applies")) is not list
         ):
@@ -1039,17 +1372,160 @@ class GoogleProvisioner:
         for item in cast(list[object], document["applies"]):
             if (
                 type(item) is not dict
-                or set(item) != {"idempotency_key", "plan_digest"}
+                or set(item)
+                != {
+                    "idempotency_key",
+                    "plan_digest",
+                    "account_ref",
+                    "expected_generation",
+                    "state",
+                    "receipt",
+                }
                 or type(item.get("idempotency_key")) is not str
                 or _TOKEN.fullmatch(cast(str, item["idempotency_key"])) is None
                 or type(item.get("plan_digest")) is not str
-                or re.fullmatch(
-                    r"sha256:[0-9a-f]{64}", cast(str, item["plan_digest"])
-                )
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", cast(str, item["plan_digest"]))
                 is None
+                or type(item.get("account_ref")) is not str
+                or not item.get("account_ref")
+                or type(item.get("expected_generation")) is not int
+                or cast(int, item["expected_generation"]) < 1
+                or item.get("state")
+                not in {"running", "succeeded", "partial", "unknown"}
+            ):
+                raise HiveStateError("invalid_google_provisioner_plans")
+            state = cast(str, item["state"])
+            receipt = item.get("receipt")
+            stored_receipt = self._stored_apply_receipt(receipt)
+            if (
+                (state in {"running", "unknown"} and receipt is not None)
+                or (
+                    state == "succeeded"
+                    and type(stored_receipt) is not ProvisionReceipt
+                )
+                or (
+                    state == "partial"
+                    and type(stored_receipt) is not ProvisionPartialReceipt
+                )
             ):
                 raise HiveStateError("invalid_google_provisioner_plans")
         return document
+
+    @staticmethod
+    def _apply_receipt_document(
+        receipt: ProvisionReceipt | ProvisionPartialReceipt,
+    ) -> dict[str, object]:
+        if type(receipt) is ProvisionReceipt:
+            return {
+                "kind": "succeeded",
+                "completed": receipt.completed,
+                "planned": receipt.planned,
+            }
+        if type(receipt) is ProvisionPartialReceipt:
+            return {
+                "kind": "partial",
+                "attempted": receipt.attempted,
+                "completed": receipt.completed,
+                "planned": receipt.planned,
+                "failed": receipt.failed,
+                "not_attempted": receipt.not_attempted,
+                "reason_code": receipt.reason_code,
+            }
+        raise TypeError("invalid provision receipt")
+
+    @staticmethod
+    def _stored_apply_receipt(
+        value: object,
+    ) -> ProvisionReceipt | ProvisionPartialReceipt | None:
+        if type(value) is not dict:
+            return None
+        if set(value) == {"kind", "completed", "planned"}:
+            completed = value.get("completed")
+            planned = value.get("planned")
+            if (
+                value.get("kind") != "succeeded"
+                or type(completed) is not int
+                or type(planned) is not int
+                or not 0 <= cast(int, completed) <= cast(int, planned)
+            ):
+                return None
+            return ProvisionReceipt(cast(int, completed), cast(int, planned))
+        if set(value) != {
+            "kind",
+            "attempted",
+            "completed",
+            "planned",
+            "failed",
+            "not_attempted",
+            "reason_code",
+        }:
+            return None
+        counts = tuple(
+            value.get(field)
+            for field in (
+                "attempted",
+                "completed",
+                "planned",
+                "failed",
+                "not_attempted",
+            )
+        )
+        if (
+            value.get("kind") != "partial"
+            or any(type(item) is not int or cast(int, item) < 0 for item in counts)
+            or type(value.get("reason_code")) is not str
+            or not value.get("reason_code")
+        ):
+            return None
+        return ProvisionPartialReceipt(
+            cast(int, value["attempted"]),
+            cast(int, value["completed"]),
+            cast(int, value["planned"]),
+            cast(int, value["failed"]),
+            cast(int, value["not_attempted"]),
+            cast(str, value["reason_code"]),
+        )
+
+    def _finish_apply(
+        self,
+        idempotency_key: str,
+        plan_digest: str,
+        receipt: ProvisionReceipt | ProvisionPartialReceipt,
+    ) -> None:
+        with self._state.locked():
+            document = self._read_locked()
+            matches = [
+                cast(dict[str, object], item)
+                for item in cast(list[object], document["applies"])
+                if type(item) is dict and item.get("idempotency_key") == idempotency_key
+            ]
+            if (
+                len(matches) != 1
+                or matches[0].get("plan_digest") != plan_digest
+                or matches[0].get("state") != "running"
+            ):
+                raise GoogleCloudProvisionerError("provisioner.confirmation_invalid")
+            matches[0]["state"] = (
+                "succeeded" if type(receipt) is ProvisionReceipt else "partial"
+            )
+            matches[0]["receipt"] = self._apply_receipt_document(receipt)
+            self._state.replace_json_locked(_PROVISIONER_DOCUMENT, document)
+
+    def _mark_apply_unknown(self, idempotency_key: str, plan_digest: str) -> None:
+        with self._state.locked():
+            document = self._read_locked()
+            matches = [
+                cast(dict[str, object], item)
+                for item in cast(list[object], document["applies"])
+                if type(item) is dict and item.get("idempotency_key") == idempotency_key
+            ]
+            if (
+                len(matches) == 1
+                and matches[0].get("plan_digest") == plan_digest
+                and matches[0].get("state") == "running"
+            ):
+                matches[0]["state"] = "unknown"
+                self._state.replace_json_locked(_PROVISIONER_DOCUMENT, document)
 
     @staticmethod
     def _plan_document(plan: FillToQuotaPlan) -> dict[str, object]:
@@ -1201,18 +1677,19 @@ class GoogleProvisioner:
                 "projects",
             )
         }
-        expected_fingerprint = "sha256:" + sha256(
-            json.dumps(
-                fingerprint_payload, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-        ).hexdigest()
+        expected_fingerprint = (
+            "sha256:"
+            + sha256(
+                json.dumps(
+                    fingerprint_payload, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+        )
         if (
             serialized != value
             or plan.quota_remaining != plan.quota_evidence.remaining
-            or plan.inventory_generation
-            != plan.quota_evidence.inventory_generation
-            or plan.inventory_fingerprint
-            != plan.quota_evidence.inventory_fingerprint
+            or plan.inventory_generation != plan.quota_evidence.inventory_generation
+            or plan.inventory_fingerprint != plan.quota_evidence.inventory_fingerprint
             or plan.fingerprint != expected_fingerprint
         ):
             raise HiveStateError("invalid_google_provisioner_plans")
@@ -1227,11 +1704,14 @@ class GoogleProvisioner:
         quota_evidence: object,
     ) -> str:
         if idempotency_key is None:
-            encoded = repr(
-                (account_ref, expected_generation, quota_evidence)
-            ).encode("utf-8")
+            encoded = repr((account_ref, expected_generation, quota_evidence)).encode(
+                "utf-8"
+            )
             return "automatic-" + sha256(encoded).hexdigest()
-        if type(idempotency_key) is not str or _TOKEN.fullmatch(idempotency_key) is None:
+        if (
+            type(idempotency_key) is not str
+            or _TOKEN.fullmatch(idempotency_key) is None
+        ):
             raise GoogleCloudProvisionerError("provisioner.confirmation_invalid")
         return idempotency_key
 
@@ -1348,66 +1828,98 @@ class GoogleProvisioner:
         idempotency_key: str,
         plan_digest: str,
     ) -> ProvisionReceipt | ProvisionPartialReceipt:
-        if type(idempotency_key) is not str or _TOKEN.fullmatch(idempotency_key) is None:
+        if (
+            type(idempotency_key) is not str
+            or _TOKEN.fullmatch(idempotency_key) is None
+        ):
             raise GoogleCloudProvisionerError("provisioner.confirmation_invalid")
-        with self._state.locked():
-            document = self._read_locked()
-            matches = []
-            for item in cast(list[object], document["plans"]):
-                if type(item) is not dict:
-                    raise HiveStateError("invalid_google_provisioner_plans")
-                raw_plan = item.get("plan")
-                if type(raw_plan) is dict and raw_plan.get("fingerprint") == plan_digest:
-                    matches.append(self._stored_plan(raw_plan))
-            plan = matches[0] if len(matches) == 1 else None
-            if (
-                plan is None
-                or plan.account_ref != account_ref
-                or plan.inventory_generation != expected_generation
-            ):
-                raise GoogleCloudProvisionerError(
-                    "provisioner.confirmation_invalid"
-                )
-            applies = cast(list[object], document["applies"])
-            prior = [
-                cast(dict[str, object], item)
-                for item in applies
-                if type(item) is dict and item.get("idempotency_key") == idempotency_key
-            ]
-            if prior and (
-                len(prior) != 1 or prior[0].get("plan_digest") != plan_digest
-            ):
-                raise GoogleCloudProvisionerError("provisioner.confirmation_invalid")
-            if not prior:
+        with self._apply_lock:
+            with self._state.locked():
+                document = self._read_locked()
+                matches = []
+                for item in cast(list[object], document["plans"]):
+                    if type(item) is not dict:
+                        raise HiveStateError("invalid_google_provisioner_plans")
+                    raw_plan = item.get("plan")
+                    if (
+                        type(raw_plan) is dict
+                        and raw_plan.get("fingerprint") == plan_digest
+                    ):
+                        matches.append(self._stored_plan(raw_plan))
+                plan = matches[0] if len(matches) == 1 else None
+                if (
+                    plan is None
+                    or plan.account_ref != account_ref
+                    or plan.inventory_generation != expected_generation
+                ):
+                    raise GoogleCloudProvisionerError(
+                        "provisioner.confirmation_invalid"
+                    )
+                applies = cast(list[object], document["applies"])
+                prior = [
+                    cast(dict[str, object], item)
+                    for item in applies
+                    if type(item) is dict
+                    and item.get("idempotency_key") == idempotency_key
+                ]
+                if prior:
+                    if (
+                        len(prior) != 1
+                        or prior[0].get("plan_digest") != plan_digest
+                        or prior[0].get("account_ref") != account_ref
+                        or prior[0].get("expected_generation") != expected_generation
+                    ):
+                        raise GoogleCloudProvisionerError(
+                            "provisioner.confirmation_invalid"
+                        )
+                    if prior[0].get("state") in {"succeeded", "partial"}:
+                        stored = self._stored_apply_receipt(prior[0].get("receipt"))
+                        if stored is None:
+                            raise HiveStateError("invalid_google_provisioner_plans")
+                        return stored
+                    raise GoogleCloudProvisionerError("provisioner.effect_unknown")
                 if len(applies) >= 4096:
                     raise GoogleCloudProvisionerError(
                         "provisioner.confirmation_invalid"
                     )
                 applies.append(
-                    {"idempotency_key": idempotency_key, "plan_digest": plan_digest}
+                    {
+                        "idempotency_key": idempotency_key,
+                        "plan_digest": plan_digest,
+                        "account_ref": account_ref,
+                        "expected_generation": expected_generation,
+                        "state": "running",
+                        "receipt": None,
+                    }
                 )
                 self._state.replace_json_locked(_PROVISIONER_DOCUMENT, document)
-        api = self._api(
-            account_ref, plan.expected_subject_id, expected_generation
-        )
-        try:
-            receipt = execute_fill_to_quota_plan(
-                plan,
-                api=api,
-                store=self._store,
-                confirmed_fingerprint=plan_digest,
-                now=lambda: datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                current_inventory=lambda: (
-                    self._manager._snapshot_for_internal_use().generation,
-                    self._manager._snapshot_for_internal_use().content_fingerprint,
-                ),
-            )
-            self._manager.reload(expected_generation=expected_generation)
+            try:
+                api = self._api(
+                    account_ref, plan.expected_subject_id, expected_generation
+                )
+                receipt = execute_fill_to_quota_plan(
+                    plan,
+                    api=api,
+                    store=self._store,
+                    confirmed_fingerprint=plan_digest,
+                    now=lambda: datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    current_inventory=lambda: (
+                        self._manager._snapshot_for_internal_use().generation,
+                        self._manager._snapshot_for_internal_use().content_fingerprint,
+                    ),
+                )
+                self._manager.reload(expected_generation=expected_generation)
+            except GoogleCloudProvisionerError as error:
+                if error.partial is not None:
+                    self._finish_apply(idempotency_key, plan_digest, error.partial)
+                    return error.partial
+                self._mark_apply_unknown(idempotency_key, plan_digest)
+                raise
+            except BaseException:
+                self._mark_apply_unknown(idempotency_key, plan_digest)
+                raise
+            self._finish_apply(idempotency_key, plan_digest, receipt)
             return receipt
-        except GoogleCloudProvisionerError as error:
-            if error.partial is not None:
-                return error.partial
-            raise
 
 
 class GoogleBillingLease:
@@ -1517,7 +2029,12 @@ class GoogleBillingAuthority:
                 subject_id,
                 expected_generation=snapshot.generation,
             )
-        except (GoogleAccountInventoryError, GoogleCloudApiError, KeyError, AttributeError):
+        except (
+            GoogleAccountInventoryError,
+            GoogleCloudApiError,
+            KeyError,
+            AttributeError,
+        ):
             raise GoogleCloudApiError("google.api_auth_failed")
         return GoogleBillingLease(account_ref, subject_id, token)
 
@@ -1706,7 +2223,8 @@ def assemble_admin_runtime() -> AdminRuntime:
             code_exchange=GoogleOAuthCodeExchange(),
         )
         quota = CredentialQuotaCollector(
-            lambda: credentials.read("admin-quota-evidence", _QUOTA_MAX_BYTES)
+            state_root / "google-quota-evidence",
+            credentials.read("admin-quota-evidence", _QUOTA_MAX_BYTES),
         )
         access_tokens = GoogleAccessTokenAuthority(google_oauth, token_writer)
         provisioner = GoogleProvisioner(
@@ -1716,7 +2234,9 @@ def assemble_admin_runtime() -> AdminRuntime:
             access_tokens,
         )
         billing = GoogleBillingService(
-            google_manager, GoogleBillingAuthority(google_manager, access_tokens)
+            google_manager,
+            GoogleBillingAuthority(google_manager, access_tokens),
+            state_root=state_root / "google-billing",
         )
 
         service = MasterjetControlService(

@@ -515,6 +515,39 @@ def test_oauth_transaction_is_account_bound_and_code_is_consumed_once(
     assert len(exchange.calls) == 1
 
 
+def test_provisioner_oauth_profile_is_stored_for_write_authority(
+    tmp_path: Path,
+) -> None:
+    token_writer = _TokenWriter()
+    service, ingress, _exchange, _manager_instance = _service(
+        tmp_path, token_writer=token_writer
+    )
+    _plan, _session, imported = _import_client(service, ingress)
+    transaction = service.begin_oauth_transaction(
+        "google-account-01",
+        oauth_client_ref=imported.client_ref,
+        redirect_uri="http://127.0.0.1:8765/callback",
+        scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
+        expected_generation=1,
+        idempotency_key="oauth-provisioner",
+        principal="operator-one",
+    )
+
+    assert "cloud-platform.read-only" not in transaction.authorization_url
+    assert "cloud-platform" in urllib.parse.unquote(transaction.authorization_url)
+    assert _complete(service, transaction).refresh_token_stored is True
+    assert token_writer.writes == [
+        (
+            "google-account-01",
+            GoogleOAuthProfileIdV1.PROVISIONER.value,
+            oauth_session.resolve_google_oauth_profile_v1(
+                GoogleOAuthProfileIdV1.PROVISIONER,
+                oauth_session.GoogleOAuthOperationV1.PROJECTS_CREATE,
+            ).scope_fingerprint,
+        )
+    ]
+
+
 def test_first_subject_binding_rebases_active_client_generation(
     tmp_path: Path,
 ) -> None:
@@ -541,7 +574,9 @@ def test_first_subject_binding_rebases_active_client_generation(
     binding = service.default_oauth_client_binding(
         "google-account-01", expected_generation=2
     )
-    assert binding.availability is oauth_session.GoogleOAuthClientAvailabilityV1.AVAILABLE
+    assert (
+        binding.availability is oauth_session.GoogleOAuthClientAvailabilityV1.AVAILABLE
+    )
     assert binding.default_oauth_client_ref == imported.client_ref
 
 
@@ -912,7 +947,7 @@ def test_default_oauth_client_binding_does_not_hide_programming_or_control_error
     assert interrupted.value is control_signal
 
 
-def test_provisioner_grant_is_rejected_before_any_transaction_or_token_write(
+def test_non_profile_grant_is_rejected_before_any_transaction_or_token_write(
     tmp_path: Path,
 ) -> None:
     service, ingress, _exchange, _manager_instance = _service(tmp_path)
@@ -923,7 +958,7 @@ def test_provisioner_grant_is_rejected_before_any_transaction_or_token_write(
             "google-account-01",
             oauth_client_ref=imported.client_ref,
             redirect_uri="http://127.0.0.1:8765/callback",
-            scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
+            scope_profile="provisioner",  # type: ignore[arg-type]
             expected_generation=1,
             idempotency_key="oauth-wrong-profile",
             principal="operator-one",
