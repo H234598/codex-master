@@ -132,6 +132,12 @@ from codex_master.fleet_headless import (
     MAX_HEADLESS_TIMEOUT_SECONDS,
     run_bounded_process,
 )
+from codex_master.headless_write_scope import (
+    HeadlessWriteScopeFailure,
+    HeadlessWriteScopeStore,
+    ScopeBinding,
+    ScopeResult,
+)
 from codex_master.fleet_recovery import (
     ArtifactDigest,
     EntryPhase,
@@ -12312,6 +12318,43 @@ def _headless_descriptor(
     return descriptor
 
 
+def _headless_write_scope_store() -> HeadlessWriteScopeStore:
+    """Return the durable write-boundary store for this server state root."""
+
+    ensure_state()
+    return HeadlessWriteScopeStore(
+        STATE_ROOT / "headless-write-scope",
+        git_runner=run_command,
+    )
+
+
+def _raise_headless_scope_failure(failure: HeadlessWriteScopeFailure) -> None:
+    if failure.code == "headless_write_scope_unenforced":
+        raise HeadlessWriteScopeError()
+    raise AgentError(
+        failure.code,
+        {
+            "code": failure.code,
+            "explanation": failure.explanation,
+            "action": failure.action,
+        },
+    )
+
+
+def _public_headless_scope_result(result: ScopeResult) -> dict[str, Any]:
+    """Expose counts and a stable code, never changed paths or filesystem paths."""
+
+    return {
+        "ok": result.ok,
+        "code": result.code,
+        "changed_count": result.changed_count,
+        "attributed_count": result.attributed_count,
+        "out_of_scope_count": result.out_of_scope_count,
+        "paths": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
 def _ollama_descriptor(
     agent: str, snapshot: InventorySnapshot | None = None
 ) -> AgentDescriptor | None:
@@ -12759,6 +12802,8 @@ def _run_headless_process(
     reservation: object | None = None,
     headless_inflight_reservation: object | None = None,
     structured_gate: Mapping[str, Any] | None = None,
+    write_scope_binding: ScopeBinding | None = None,
+    write_scope_store: HeadlessWriteScopeStore | None = None,
 ) -> dict[str, Any]:
     headless_inflight_reservation_id = (
         headless_inflight_reservation.get("reservation_id")
@@ -12767,6 +12812,8 @@ def _run_headless_process(
     )
     release_bound_headless_inflight_called = False
     terminal: str | None = None
+    scope_result: ScopeResult | None = None
+    active_write_scope_store = write_scope_store
 
     def release_bound_headless_inflight() -> None:
         nonlocal release_bound_headless_inflight_called
@@ -12799,9 +12846,31 @@ def _run_headless_process(
             with contextlib.suppress(Exception):
                 _write_headless_marker(agent, marker)
 
+    def consume_write_scope() -> ScopeResult | None:
+        """Consume binding once, including failures before process launch."""
+
+        nonlocal active_write_scope_store, scope_result
+        if write_scope_binding is None or scope_result is not None:
+            return scope_result
+        if active_write_scope_store is None:
+            try:
+                active_write_scope_store = _headless_write_scope_store()
+            except Exception as exc:
+                raise AgentError("headless_write_scope_unenforced") from exc
+        try:
+            scope_result = active_write_scope_store.finalize(write_scope_binding)
+        except HeadlessWriteScopeFailure as exc:
+            scope_result = ScopeResult(False, exc.code, 0, 0, 0)
+        except Exception:
+            scope_result = ScopeResult(
+                False, "headless_write_attribution_unverified", 0, 0, 0
+            )
+        return scope_result
+
     try:
         service = current_fleet_service()
     except Exception:
+        consume_write_scope()
         release_bound_headless_inflight()
         raise
     try:
@@ -12824,6 +12893,7 @@ def _run_headless_process(
         if marker.get("state") not in {"ready", "running"}:
             raise AgentError("headless_slot_not_ready")
     except Exception:
+        consume_write_scope()
         release_bound_headless_inflight()
         if reservation is not None:
             with contextlib.suppress(Exception):
@@ -12838,6 +12908,7 @@ def _run_headless_process(
         else dict(structured_gate)
     )
     if structured_gate.get("action") != "allow":
+        finished_scope = consume_write_scope()
         account_id = structured_gate.get("account_id")
         gate_code = structured_gate.get("diagnostic_code")
         with contextlib.suppress(Exception):
@@ -12871,20 +12942,39 @@ def _run_headless_process(
         if release_lease_on_completion:
             with contextlib.suppress(Exception):
                 release_agent(agent, force=True)
+        scope_error = (
+            {
+                "kind": finished_scope.code,
+                "retryable": False,
+                "changed_count": finished_scope.changed_count,
+                "out_of_scope_count": finished_scope.out_of_scope_count,
+            }
+            if finished_scope is not None and not finished_scope.ok
+            else None
+        )
         return {
             "agent": agent,
             "assignment_id": assignment_id,
-            "status": "deferred"
+            "status": "failed"
+            if scope_error is not None
+            else "deferred"
             if structured_gate.get("action") == "defer_until"
             else "failed",
             "model": descriptor.model,
             "response": "",
             "gate": structured_gate,
+            "error": scope_error,
+            "write_scope": (
+                _public_headless_scope_result(finished_scope)
+                if finished_scope is not None
+                else None
+            ),
             "raw_output": "not_returned",
         }
     gate_action = structured_gate.get("action")
     gate_code = structured_gate.get("diagnostic_code")
     if not isinstance(gate_action, str) or not isinstance(gate_code, str):
+        consume_write_scope()
         release_bound_headless_inflight()
         if reservation is not None:
             with contextlib.suppress(Exception):
@@ -12931,6 +13021,7 @@ def _run_headless_process(
         )
         assignment_id = assignment_id or f"{now_id()}-{agent}"
     except Exception:
+        consume_write_scope()
         release_bound_headless_inflight()
         if reservation is not None:
             with contextlib.suppress(Exception):
@@ -12957,6 +13048,20 @@ def _run_headless_process(
                 gate.account_id, expected_generation=gate.generation
             )
             child_env[plan.secret_env_name] = secret
+            run_cwd = descriptor.home
+            if write_scope_binding is not None:
+                active_write_scope_store = (
+                    active_write_scope_store or _headless_write_scope_store()
+                )
+                try:
+                    active_write_scope_store.revalidate(
+                        write_scope_binding,
+                        repo_root(),
+                        provider_generation=gate.generation,
+                    )
+                except HeadlessWriteScopeFailure as exc:
+                    _raise_headless_scope_failure(exc)
+                run_cwd = write_scope_binding.worktree_path
             try:
                 popen_env = dict(child_env)
                 process = subprocess.Popen(
@@ -12965,13 +13070,14 @@ def _run_headless_process(
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=popen_env,
-                    cwd=descriptor.home,
+                    cwd=run_cwd,
                     shell=False,
                     start_new_session=True,
                 )
             except (OSError, ValueError) as exc:
                 raise AgentError("headless_start_failed") from exc
         except Exception:
+            consume_write_scope()
             release_bound_headless_inflight()
             raise
         job = HeadlessJob(
@@ -13079,6 +13185,12 @@ def _run_headless_process(
                 else "failed"
             )
         )
+        if write_scope_binding is not None:
+            finished_scope = consume_write_scope()
+            if finished_scope is None:
+                raise AgentError("headless_write_scope_unenforced")
+            if not finished_scope.ok:
+                terminal = "failed"
         usage_status = (
             "rate_limited"
             if parsed.error is not None and parsed.error.kind == "account_limited"
@@ -13094,6 +13206,8 @@ def _run_headless_process(
             "stdout_truncated": result.stdout_truncated,
             "stderr_truncated": result.stderr_truncated,
         }
+        if scope_result is not None:
+            terminal_marker["write_scope"] = _public_headless_scope_result(scope_result)
         if isinstance(headless_inflight_reservation_id, str):
             terminal_marker["headless_inflight_reservation_id"] = (
                 headless_inflight_reservation_id
@@ -13146,12 +13260,26 @@ def _run_headless_process(
             "unknown_event_count": parsed.unknown_event_count,
             "error": (
                 {
-                    "kind": parsed.error.kind,
-                    "retryable": parsed.error.retryable,
-                    "status_code": parsed.error.status_code,
-                    "reset_at_utc": parsed.error.reset_at_utc,
+                    "kind": scope_result.code,
+                    "retryable": False,
+                    "changed_count": scope_result.changed_count,
+                    "out_of_scope_count": scope_result.out_of_scope_count,
                 }
-                if parsed.error is not None
+                if scope_result is not None and not scope_result.ok
+                else (
+                    {
+                        "kind": parsed.error.kind,
+                        "retryable": parsed.error.retryable,
+                        "status_code": parsed.error.status_code,
+                        "reset_at_utc": parsed.error.reset_at_utc,
+                    }
+                    if parsed.error is not None
+                    else None
+                )
+            ),
+            "write_scope": (
+                _public_headless_scope_result(scope_result)
+                if scope_result is not None
                 else None
             ),
             "raw_output": "not_returned",
@@ -13264,6 +13392,25 @@ def _run_headless_process(
                         },
                     )
                     release_bound_headless_inflight()
+        if write_scope_binding is not None and scope_result is None:
+            try:
+                scope_result = consume_write_scope()
+            except Exception:
+                scope_result = ScopeResult(
+                    False, "headless_write_attribution_unverified", 0, 0, 0
+                )
+            if not scope_result.ok:
+                terminal = "failed"
+                with contextlib.suppress(Exception):
+                    current_marker = _headless_marker(agent)
+                    current_marker.update(
+                        {
+                            "state": "failed",
+                            "assignment_id": assignment_id,
+                            "write_scope": _public_headless_scope_result(scope_result),
+                        }
+                    )
+                    _write_headless_marker(agent, current_marker)
         if release_lease_on_completion:
             with contextlib.suppress(Exception):
                 current_lease = agent_lease_status(agent)
@@ -13406,8 +13553,16 @@ def _assign_headless_agent(
         raise AgentError(
             "arbeitsbiene assignments require at least one explicit write path"
         )
+    write_scope_store: HeadlessWriteScopeStore | None = None
+    write_scope_binding: ScopeBinding | None = None
     if role == "arbeitsbiene":
-        raise HeadlessWriteScopeError()
+        write_scope_store = _headless_write_scope_store()
+        try:
+            available = write_scope_store.has_available(requested_agent)
+        except HeadlessWriteScopeFailure as exc:
+            _raise_headless_scope_failure(exc)
+        if not available:
+            raise HeadlessWriteScopeError()
     agent, descriptor, gate, routing_gate = _resolve_gemini_headless_route(
         requested_agent
     )
@@ -13454,20 +13609,49 @@ def _assign_headless_agent(
     ):
         raise AgentError("headless_gate_binding_changed")
     assignment_id = f"{now_id()}-{agent}"
-    with spawn_admission_lock():
-        require_spawn_capacity(1, agent=agent, task=task, role=role)
-        headless_inflight_reservation = reserve_headless_inflight(agent, assignment_id)
-        if headless_inflight_reservation is None:
-            raise AgentCapacityError(
-                "capacity unavailable",
-                {
-                    "error_code": "spawn_capacity_unavailable",
-                    "retryable": True,
-                    "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
-                    "reason_codes": ["session_metrics_unavailable"],
-                    "errors": spawn_error_details(["session_metrics_unavailable"]),
-                },
-            )
+    headless_inflight_reservation: dict[str, Any] | None = None
+    try:
+        with spawn_admission_lock():
+            require_spawn_capacity(1, agent=agent, task=task, role=role)
+            if role == "arbeitsbiene":
+                assert write_scope_store is not None
+                try:
+                    if agent != requested_agent and not write_scope_store.has_available(agent):
+                        raise HeadlessWriteScopeFailure(
+                            "headless_write_scope_unenforced",
+                            "headless writes lack isolated worktree and diff attribution",
+                            "use an isolated worktree or submit a read-only headless assignment",
+                        )
+                    snapshot = current_fleet_service().load()
+                    current_generation = getattr(snapshot, "generation", None)
+                    if current_generation is None:
+                        raise AgentError("headless_assignment_generation_invalid")
+                    write_scope_binding = write_scope_store.bind(
+                        agent,
+                        repo_root(),
+                        write_paths,
+                        assignment_id=assignment_id,
+                        provider_generation=current_generation,
+                    )
+                except HeadlessWriteScopeFailure as exc:
+                    _raise_headless_scope_failure(exc)
+            headless_inflight_reservation = reserve_headless_inflight(agent, assignment_id)
+            if headless_inflight_reservation is None:
+                raise AgentCapacityError(
+                    "capacity unavailable",
+                    {
+                        "error_code": "spawn_capacity_unavailable",
+                        "retryable": True,
+                        "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+                        "reason_codes": ["session_metrics_unavailable"],
+                        "errors": spawn_error_details(["session_metrics_unavailable"]),
+                    },
+                )
+    except Exception:
+        if write_scope_binding is not None and write_scope_store is not None:
+            with contextlib.suppress(Exception):
+                write_scope_store.finalize(write_scope_binding)
+        raise
     headless_inflight_reservation_id = (
         headless_inflight_reservation.get("reservation_id")
         if isinstance(headless_inflight_reservation, Mapping)
@@ -13510,6 +13694,15 @@ def _assign_headless_agent(
                     "write_policy": "read_only"
                     if role == "exploriererin"
                     else "explicit_paths_only",
+                    "write_scope": (
+                        {
+                            "state": "bound",
+                            "attestation_id": write_scope_binding.attestation_id,
+                            "raw_output": "not_returned",
+                        }
+                        if write_scope_binding is not None
+                        else None
+                    ),
                     "allow_subagents": allow_subagents,
                     "requires_search": requires_search,
                     "live_data": {
@@ -13528,6 +13721,9 @@ def _assign_headless_agent(
             marker.update({"state": "ready", "assignment_id": assignment_id})
             _write_headless_marker(agent, marker)
     except Exception:
+        if write_scope_binding is not None and write_scope_store is not None:
+            with contextlib.suppress(Exception):
+                write_scope_store.finalize(write_scope_binding)
         release_headless_inflight_claim()
         if release_on_completion:
             with contextlib.suppress(Exception):
@@ -13544,8 +13740,13 @@ def _assign_headless_agent(
             headless_inflight_reservation=headless_inflight_reservation,
             release_lease_on_completion=release_on_completion,
             structured_gate=gate,
+            write_scope_binding=write_scope_binding,
+            write_scope_store=write_scope_store,
         )
     except FleetRateLimitError as exc:
+        if write_scope_binding is not None and write_scope_store is not None:
+            with contextlib.suppress(Exception):
+                write_scope_store.finalize(write_scope_binding)
         result = {
             "agent": agent,
             "assignment_id": assignment_id,
@@ -13553,6 +13754,18 @@ def _assign_headless_agent(
             "model": descriptor.model,
             "response": "",
             "error": {"kind": exc.reason, "retryable": True},
+            "raw_output": "not_returned",
+        }
+    except Exception:
+        if write_scope_binding is not None and write_scope_store is not None:
+            with contextlib.suppress(Exception):
+                write_scope_store.finalize(write_scope_binding)
+        raise
+    result_write_scope = result.get("write_scope")
+    if result_write_scope is None and write_scope_binding is not None:
+        result_write_scope = {
+            "state": "bound",
+            "attestation_id": write_scope_binding.attestation_id,
             "raw_output": "not_returned",
         }
     result.update(
@@ -13566,6 +13779,7 @@ def _assign_headless_agent(
             "name": name or default_agentin_name(agent),
             "scope_count": len(scope),
             "write_path_count": len(write_paths),
+            "write_scope": result_write_scope,
             "prompt_chars": len(prompt),
             "result_tool": "agent_assignment_report",
             "prompt_output": "not_returned",
@@ -17985,7 +18199,55 @@ def worktree_create_for_agent(
         if target_fd >= 0:
             os.close(target_fd)
         os.close(parent_fd)
+    try:
+        final_target_stat = target.lstat()
+    except OSError as exc:
+        raise AgentError("headless_attestation_invalid") from exc
+    if (
+        target_stat is None
+        or stat_module.S_ISLNK(final_target_stat.st_mode)
+        or not stat_module.S_ISDIR(final_target_stat.st_mode)
+        or not source_identity_matches(final_target_stat, target_stat)
+    ):
+        raise AgentError("headless_attestation_invalid")
+    ensure_directory_chain_no_symlink(
+        target.parent, "worktree parent directories must be real directories"
+    )
+    resolved_target = target.resolve(strict=False)
+    if resolved_target != target or not path_is_within(resolved_target, repo):
+        raise AgentError("headless_attestation_invalid")
     public_path = repo_relative_public_path(resolved_target, repo)
+    write_scope: dict[str, Any] = {
+        "state": "unavailable",
+        "raw_output": "not_returned",
+    }
+    git_metadata = resolved_target / ".git"
+    try:
+        metadata_stat = git_metadata.lstat()
+    except FileNotFoundError:
+        metadata_stat = None
+    except OSError as exc:
+        raise AgentError("headless_attestation_invalid") from exc
+    if metadata_stat is not None:
+        if stat_module.S_ISLNK(metadata_stat.st_mode) or not (
+            stat_module.S_ISREG(metadata_stat.st_mode)
+            or stat_module.S_ISDIR(metadata_stat.st_mode)
+        ):
+            raise AgentError("headless_attestation_invalid")
+        try:
+            attestation = _headless_write_scope_store().create(
+                agent,
+                repo,
+                resolved_target,
+                base_ref=base_ref,
+            )
+        except HeadlessWriteScopeFailure as exc:
+            _raise_headless_scope_failure(exc)
+        write_scope = {
+            "state": "available",
+            "attestation_id": attestation.attestation_id,
+            "raw_output": "not_returned",
+        }
     return {
         "agent": agent,
         "path": public_path or PATH_NOT_RETURNED,
@@ -17994,6 +18256,7 @@ def worktree_create_for_agent(
         "base_ref": PATH_NOT_RETURNED if base_ref else None,
         "base_ref_state": "set" if base_ref else "not_set",
         "status": "created",
+        "write_scope": write_scope,
         "raw_output": "not_returned",
     }
 
