@@ -292,7 +292,9 @@ class MasterjetControlService:
         openai_accounts: OpenAIAccountsPort | None,
         openai_credentials: OpenAICredentialService | None,
         google_manager: GoogleAccountInventoryManager,
-        google_oauth: GoogleOAuthControlService | None,
+        google_oauth_factory: Callable[
+            [SecretIngressPort], GoogleOAuthControlService | None
+        ],
         quota_collector: QuotaCollectorPort | None,
         google_provisioner: GoogleProvisionerPort | None,
         google_billing: GoogleBillingService | None,
@@ -308,6 +310,8 @@ class MasterjetControlService:
             vault=secret_ingress_vault,
             clock=clock,
         )
+        ingress_port = cast(SecretIngressPort, ingress)
+        google_oauth = google_oauth_factory(ingress_port)
         return cls(
             operation_store=operation_store,
             openai_accounts=openai_accounts,
@@ -318,7 +322,7 @@ class MasterjetControlService:
             google_provisioner=google_provisioner,
             google_billing=google_billing,
             host_registry=host_registry,
-            secret_ingress=cast(SecretIngressPort, ingress),
+            secret_ingress=ingress_port,
         )
 
     def query(

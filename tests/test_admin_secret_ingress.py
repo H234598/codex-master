@@ -423,6 +423,12 @@ def test_apply_unknown_retries_same_durable_claim_then_commits(tmp_path) -> None
 
 def test_real_service_create_put_apply_uses_concrete_owner_one_shot(tmp_path) -> None:
     _service, owners = service_at()
+    composed_ingress: list[object] = []
+
+    def google_oauth_factory(ingress: object) -> object:
+        composed_ingress.append(ingress)
+        return owners.google_oauth
+
     service = MasterjetControlService.with_admin_secret_ingress(
         secret_ingress_state_root=tmp_path / "state",
         secret_ingress_vault=CredentialVault.for_test(
@@ -432,13 +438,15 @@ def test_real_service_create_put_apply_uses_concrete_owner_one_shot(tmp_path) ->
         openai_accounts=owners.openai_accounts,
         openai_credentials=owners.openai_credentials,
         google_manager=owners.google_manager,
-        google_oauth=owners.google_oauth,
+        google_oauth_factory=google_oauth_factory,
         quota_collector=owners.quota_collector,
         google_provisioner=owners.google_provisioner,
         google_billing=owners.google_billing,
         host_registry=owners.hosts,
         clock=lambda: 1_000.0,
     )
+    assert len(composed_ingress) == 1
+    assert type(composed_ingress[0]) is AdminSecretIngressOwner
     who = principal("fleet.secrets.ingress", step_up=True)
     created = command(
         service,
