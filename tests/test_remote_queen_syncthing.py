@@ -162,6 +162,33 @@ def snapshot_digest(snapshot):
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
+def synthetic_plan(manifest, before, *, before_digest, action):
+    payload = {
+        "schema_version": "RemoteQueenSyncthingVaultPlanV1",
+        "manifest": syncthing_vault_manifest_as_dict(manifest),
+        "before": snapshot_as_dict(before),
+        "before_digest": before_digest,
+        "action": action.value if action is not None else None,
+        "rollback": {
+            "remove_own_configuration": True,
+            "preserve_vault_data": True,
+        },
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return RemoteQueenSyncthingVaultPlanV1(
+        schema_version="RemoteQueenSyncthingVaultPlanV1",
+        manifest=manifest,
+        before=before,
+        before_digest=before_digest,
+        action=action,
+        remove_own_configuration_on_rollback=True,
+        preserve_vault_data_on_rollback=True,
+        plan_digest="sha256:" + hashlib.sha256(canonical).hexdigest(),
+    )
+
+
 class MemoryOperations:
     def __init__(self, snapshot, *, post_snapshot=None):
         self.snapshot = snapshot
@@ -487,6 +514,38 @@ def test_plan_owned_older_generation_replaces_without_delete_action():
     )
     assert plan.action is SyncthingVaultActionV1.REPLACE_OWNED_CONFIGURATION
     assert "delete" not in plan.action.value
+
+
+def test_plan_rejects_wrong_before_digest_without_operations():
+    manifest = build_manifest()
+    before = absent_snapshot()
+    operations = MemoryOperations(before)
+    assert_code(
+        lambda: synthetic_plan(
+            manifest,
+            before,
+            before_digest="sha256:" + "d" * 64,
+            action=SyncthingVaultActionV1.CREATE_CONFIGURATION,
+        ),
+        "RQ_E_PLAN_INCONSISTENT",
+    )
+    assert operations.calls == []
+
+
+def test_plan_rejects_semantically_wrong_action_without_operations():
+    manifest = build_manifest()
+    before = absent_snapshot()
+    operations = MemoryOperations(before)
+    assert_code(
+        lambda: synthetic_plan(
+            manifest,
+            before,
+            before_digest=snapshot_digest(before),
+            action=SyncthingVaultActionV1.REPLACE_OWNED_CONFIGURATION,
+        ),
+        "RQ_E_PLAN_INCONSISTENT",
+    )
+    assert operations.calls == []
 
 
 def test_plan_foreign_folder_blocks_before_configuration_call():
@@ -872,6 +931,41 @@ def test_rollback_restores_exact_prior_snapshot_and_preserves_vault_data():
         "inspect",
     ]
     assert operations.snapshot == plan.before
+
+
+def test_rollback_rejects_synthetic_noop_journal_without_operations():
+    manifest = build_manifest()
+    current = owned_snapshot(manifest)
+    operations = MemoryOperations(current)
+    plan = plan_remote_queen_syncthing_vault(
+        manifest=manifest, operations=operations
+    )
+    assert plan.action is None
+    journal = SyncthingVaultApplyJournalV1(
+        schema_version="SyncthingVaultApplyJournalV1",
+        generation=manifest.desired_generation.generation,
+        manifest_digest=manifest.manifest_digest,
+        plan_digest=plan.plan_digest,
+        prior=plan.before,
+        resulting_snapshot_digest=snapshot_digest(current),
+        preserve_vault_data=True,
+    )
+    request = SyncthingVaultRollbackRequestV1(
+        generation=manifest.desired_generation.generation,
+        manifest_digest=manifest.manifest_digest,
+        plan_digest=plan.plan_digest,
+    )
+    operations.calls.clear()
+    assert_code(
+        lambda: rollback_remote_queen_syncthing_vault(
+            plan=plan,
+            journal=journal,
+            request=request,
+            operations=operations,
+        ),
+        "RQ_E_ROLLBACK_DRIFT",
+    )
+    assert operations.calls == []
 
 
 def test_rollback_drift_does_not_call_configuration():

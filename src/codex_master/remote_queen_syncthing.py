@@ -667,7 +667,15 @@ def _validate_plan(plan: object) -> None:
     _validate_manifest(plan.manifest)
     _validate_snapshot(plan.before)
     _validate_digest(plan.before_digest)
+    if plan.before_digest != _snapshot_digest(plan.before):
+        raise _inconsistent()
     if plan.action is not None and type(plan.action) is not SyncthingVaultActionV1:
+        raise _inconsistent()
+    try:
+        expected_action = _classify_plan(plan.manifest, plan.before)
+    except RemoteQueenBootstrapError:
+        raise _inconsistent() from None
+    if plan.action is not expected_action:
         raise _inconsistent()
     if (
         plan.remove_own_configuration_on_rollback is not True
@@ -989,6 +997,8 @@ def rollback_remote_queen_syncthing_vault(
 ) -> SyncthingVaultRollbackResultV1:
     try:
         _validate_plan(plan)
+        if plan.action is None:
+            raise _rollback_drift()
         if type(request) is not SyncthingVaultRollbackRequestV1:
             raise _rollback_drift()
         _validate_request_match(
