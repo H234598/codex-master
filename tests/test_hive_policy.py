@@ -416,3 +416,120 @@ def test_common_policy_requires_side_effect_free_external_plan_handoff() -> None
         assert meaning in policy
     for backend in ("wl-copy", "xclip", "xsel"):
         assert backend not in raw_policy
+
+
+def test_annotation_response_fixture_inserts_one_inline_link_before_punctuation() -> (
+    None
+):
+    policy_api = load_policy_api()
+    fixture = """# Deployment plan
+
+## Quellabschnitt
+
+<mark data-annotation-id="frage-42">Muss die Freigabe dokumentiert werden?</mark>. Der Folgeabsatz bleibt erhalten.
+
+## Antwort auf Freigabe — [frage-42](#quellabschnitt)
+<!-- data-annotation-id="frage-42" -->
+
+Ja, die Freigabe wird im Änderungsprotokoll dokumentiert.
+"""
+
+    updated = policy_api.apply_annotation_response_fixture(
+        fixture,
+        annotation_id="frage-42",
+        answer_target="Deployment-Plan.md",
+        answer_heading="antwort-auf-freigabe",
+        source_heading="quellabschnitt",
+    )
+
+    backlink = "[(A)](Deployment-Plan.md#antwort-auf-freigabe)"
+    answer_chapter = "## Antwort auf Freigabe — [frage-42](#quellabschnitt)"
+    assert updated.count("(A)") == updated.count(backlink) == 1
+    assert (
+        '<mark data-annotation-id="frage-42">Muss die Freigabe dokumentiert '
+        f"werden?</mark> {backlink}. Der Folgeabsatz bleibt erhalten."
+    ) in updated
+    assert updated.count(answer_chapter) == 1
+    assert updated.rfind(answer_chapter) == updated.index(answer_chapter)
+    assert updated.rstrip().endswith(
+        "Ja, die Freigabe wird im Änderungsprotokoll dokumentiert."
+    )
+    answer_body = updated[updated.index(answer_chapter) :]
+    assert answer_body.count("[frage-42](#quellabschnitt)") == 1
+    assert '<!-- data-annotation-id="frage-42" -->' in updated
+
+
+def test_annotation_response_fixture_is_idempotent() -> None:
+    policy_api = load_policy_api()
+    fixture = """# Deployment plan
+
+## Quellabschnitt
+
+<mark data-annotation-id="frage-42">Muss die Freigabe dokumentiert werden?</mark>. Der Folgeabsatz bleibt erhalten.
+
+## Antwort auf Freigabe — [frage-42](#quellabschnitt)
+<!-- data-annotation-id="frage-42" -->
+
+Ja, die Freigabe wird im Änderungsprotokoll dokumentiert.
+"""
+
+    first = policy_api.apply_annotation_response_fixture(
+        fixture,
+        annotation_id="frage-42",
+        answer_target="Deployment-Plan.md",
+        answer_heading="antwort-auf-freigabe",
+        source_heading="quellabschnitt",
+    )
+    second = policy_api.apply_annotation_response_fixture(
+        first,
+        annotation_id="frage-42",
+        answer_target="Deployment-Plan.md",
+        answer_heading="antwort-auf-freigabe",
+        source_heading="quellabschnitt",
+    )
+
+    assert second == first
+
+
+@pytest.mark.parametrize(
+    "marker_count",
+    [0, 2],
+    ids=["missing_annotation_id", "ambiguous_annotation_id"],
+)
+def test_annotation_response_fixture_fails_closed_without_partial_mutation(
+    marker_count: int,
+) -> None:
+    policy_api = load_policy_api()
+    markers = "\n".join(
+        '<mark data-annotation-id="frage-42">Muss die Freigabe dokumentiert werden?</mark>.'
+        for _ in range(marker_count)
+    )
+    fixture = f"""# Deployment plan
+
+## Quellabschnitt
+
+{markers}
+
+## Antwort auf Freigabe — [frage-42](#quellabschnitt)
+<!-- data-annotation-id="frage-42" -->
+
+Ja, die Freigabe wird im Änderungsprotokoll dokumentiert.
+"""
+    original_fixture = fixture
+
+    with pytest.raises(
+        policy_api.CommonPolicyError,
+        match="annotation_response_annotation_id_unresolved",
+    ):
+        policy_api.apply_annotation_response_fixture(
+            fixture,
+            annotation_id="frage-42",
+            answer_target="Deployment-Plan.md",
+            answer_heading="antwort-auf-freigabe",
+            source_heading="quellabschnitt",
+        )
+
+    assert fixture.count("(A)") == 0
+    assert fixture is original_fixture
+    assert fixture == original_fixture
+    assert fixture.count('data-annotation-id="frage-42"') == marker_count + 1

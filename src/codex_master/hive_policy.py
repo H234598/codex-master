@@ -47,7 +47,10 @@ class CommonPolicyContract:
     def project(self, class_profile: str) -> CommonPolicyProjections:
         """Return complete Codex/Gemini common artifacts for one class reference."""
 
-        if not isinstance(class_profile, str) or _PROFILE_RE.fullmatch(class_profile) is None:
+        if (
+            not isinstance(class_profile, str)
+            or _PROFILE_RE.fullmatch(class_profile) is None
+        ):
             raise CommonPolicyError("common_policy_class_profile_invalid")
         class_file_name = f"AGENTS.class-{class_profile}.md"
         codex_bytes = self.common_bytes + (
@@ -121,6 +124,82 @@ def _parse_header(content: bytes) -> tuple[int, int]:
     if type(generation) is not int or generation <= 0:
         raise CommonPolicyError("common_policy_generation_invalid")
     return schema_version, generation
+
+
+def apply_annotation_response_fixture(
+    document: str,
+    *,
+    annotation_id: str,
+    answer_target: str,
+    answer_heading: str,
+    source_heading: str,
+) -> str:
+    """Apply the canonical annotation backlink to one strict Markdown fixture.
+
+    This is deliberately a narrow conformance check, not a general Markdown
+    parser. All fixture references are resolved before constructing the
+    returned document so an invalid annotation cannot produce a partial update.
+    """
+
+    values = (annotation_id, answer_target, answer_heading, source_heading)
+    if (
+        not isinstance(document, str)
+        or not document
+        or not all(
+            isinstance(value, str) and value and "\n" not in value for value in values
+        )
+    ):
+        raise CommonPolicyError("annotation_response_fixture_invalid")
+
+    annotation_pattern = re.compile(
+        rf'<mark data-annotation-id="{re.escape(annotation_id)}">[^<]+</mark>'
+    )
+    annotations = list(annotation_pattern.finditer(document))
+    if len(annotations) != 1:
+        raise CommonPolicyError("annotation_response_annotation_id_unresolved")
+
+    answer_chapter = f"## Antwort auf Freigabe — [{annotation_id}](#{source_heading})"
+    chapter_headers = list(re.finditer(r"^## .+$", document, re.MULTILINE))
+    source_headers = [
+        header
+        for header in chapter_headers
+        if header.group()[3:].casefold() == source_heading.casefold()
+    ]
+    answer_headers = [
+        header for header in chapter_headers if header.group() == answer_chapter
+    ]
+    if (
+        len(source_headers) != 1
+        or len(answer_headers) != 1
+        or chapter_headers[-1] != answer_headers[0]
+    ):
+        raise CommonPolicyError("annotation_response_fixture_invalid")
+
+    answer_section = document[answer_headers[0].start() :]
+    answer_annotation_id = f'<!-- data-annotation-id="{annotation_id}" -->'
+    if answer_section.count(answer_annotation_id) != 1:
+        raise CommonPolicyError("annotation_response_fixture_invalid")
+
+    backlink = f"[(A)]({answer_target}#{answer_heading})"
+    annotation = annotations[0]
+    direct_backlink = f" {backlink}"
+    backlink_count = document.count(backlink)
+    if backlink_count:
+        if backlink_count != 1 or not document.startswith(
+            direct_backlink, annotation.end()
+        ):
+            raise CommonPolicyError("annotation_response_fixture_invalid")
+        updated = document
+    else:
+        updated = (
+            document[: annotation.end()]
+            + direct_backlink
+            + document[annotation.end() :]
+        )
+
+    if updated.count("(A)") != 1 or updated.count(backlink) != 1:
+        raise CommonPolicyError("annotation_response_fixture_invalid")
+    return updated
 
 
 def load_common_policy(path: str | Path = COMMON_POLICY_PATH) -> CommonPolicyContract:
