@@ -12,10 +12,18 @@ import pytest
 
 from codex_master.fleet_control_release_v2 import (
     ControlReleaseSpecV2,
+    ControlReleaseV2Error,
     ReleasePayloadDigestV2,
     decode_control_release_v2,
     encode_control_release_v2,
 )
+
+
+def test_payload_digest_post_init_validates_role_and_digest() -> None:
+    payload = ReleasePayloadDigestV2("python_runtime", "a" * 64)
+    assert payload.role == "python_runtime"
+    with pytest.raises(ControlReleaseV2Error, match="invalid_control_release_v2"):
+        ReleasePayloadDigestV2("unknown", "a" * 64)
 
 
 ROLES = (
