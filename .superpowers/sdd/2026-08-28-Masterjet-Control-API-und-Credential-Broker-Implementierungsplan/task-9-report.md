@@ -846,3 +846,109 @@ Reviewbefunde begrenzt; vorherige Fixrunde belegte 5876 grüne Tests mit nur den
 bekannten isoliert grünen `admission_runtime`-Deadline-Flakes. Ein begonnener
 Kontrolllauf wurde auf Koordinatoranweisung nach 3 % ohne Failure beendet. M1
 bleibt deferred und unverändert.
+
+# Fixrunde 5/5 — 2026-08-29
+
+Scope blieb auf `src/codex_master/admin_socket.py` und
+`tests/test_admin_socket.py` begrenzt. Gegenstand war ausschließlich der nach
+Fixrunde 4 verbliebene offene Teil von M2: positive, bereits bei
+Factory-Erzeugung ungültige Key-FDs in `local_attestation_verifier()`.
+
+## M2 „Positive ungültige Key-FDs an der Verifier-Factory“
+
+### Root Cause und RED
+
+Die Factory prüfte bisher nur Typ und Negativwert. Geschlossene positive,
+write-only oder während des stabilen Ladevorgangs aus dem privaten Modus
+gedriftete FDs lieferten daher zunächst einen Callback. Erst ein späterer
+Callback-Aufruf lud das FD und reduzierte jeden Loaderfehler auf `False`.
+
+Vor Produktion wurden drei Factory-Construction-Fälle ergänzt: geschlossener
+positiver FD, write-only FD und Mode-Drift `0600 -> 0644` zwischen erstem und
+zweitem `fstat()`.
+
+```bash
+PYTHONPATH=src pytest tests/test_admin_socket.py \
+  -k 'usage_verifier_factory_rejects' -q
+```
+
+```text
+3 failed, 46 deselected
+Failed: DID NOT RAISE AdminSocketError
+```
+
+Alle Fälle verlangten denselben validierten, code-only Fehler
+`control.attestation_required`, redigierte `str`/`repr`, unveränderte
+FD-Anzahl und bei noch offenem FD erhaltene Caller-Ownership.
+
+### GREEN und Lifecycle
+
+`local_attestation_verifier()` lädt und validiert das geliehene FD nun einmal
+beim Factorybau über den bestehenden stabilen `_load_attestation_key()`.
+Loaderfehler werden dort zu `AdminSocketError(control.attestation_required)`
+projiziert. Der ausschließlich für diese Probe erzeugte `bytearray` wird im
+`finally` sofort überschrieben und weder gespeichert noch vom Callback
+geschlossen.
+
+Der Callback lädt das weiterhin geliehene FD bei jedem Handshake erneut.
+Dadurch kann derselbe Verifier wiederholt authentisieren; Drift nach dem
+Factorybau wird nicht durch einen langfristigen Secret-Snapshot verdeckt,
+sondern endet fail-closed mit `False`. Separate Regressionen belegen zwei
+erfolgreiche Handshakes derselben Factory, erhaltenes Borrowing und
+post-construction Mode-Drift vor Principal/Policy.
+
+```bash
+PYTHONPATH=src pytest tests/test_admin_socket.py \
+  -k 'usage_verifier_factory_rejects or usage_compatible_attestation or \
+      usage_verifier_rejects or usage_verifier_rereads' -q
+```
+
+```text
+6 passed, 44 deselected in 1.30s
+```
+
+Kein Wireformat, Handshakefeld, Roundtrip, Fehlercode oder öffentliche
+Callbacksignatur änderte sich.
+
+## Verifikation Fixrunde 5
+
+```bash
+PYTHONPATH=src pytest tests/test_admin_socket.py tests/test_admin_service.py \
+  tests/test_admin_secret_ingress.py -q
+ruff check src/codex_master/admin_socket.py tests/test_admin_socket.py
+ruff format --check src/codex_master/admin_socket.py tests/test_admin_socket.py
+PYTHONPATH=src mypy --follow-imports=skip --ignore-missing-imports \
+  src/codex_master/admin_socket.py src/codex_master/admin_service.py
+python -m compileall -q src/codex_master/admin_socket.py \
+  tests/test_admin_socket.py
+git diff --check
+```
+
+```text
+Task-9-/Service-/C5-Reserve-Port-Suite: 97 passed in 7.91s
+Ruff: All checks passed
+Ruff format: 2 files already formatted
+Mypy: Success: no issues found in 2 source files
+Compileall: exit 0
+git diff --check: exit 0
+```
+
+Auf Koordinatoranweisung war keine erneute Vollsuite nötig. Produkt- und
+Testfix sind Commit `4d20330` (`fix: validate socket attestation credential
+eagerly`). M1 bleibt separat deferred und unverändert.
+
+## Security Self-Review Fixrunde 5
+
+- Factoryfehler für positive ungültige FDs sind nun typed, code-only und
+  redigiert; FD-Wert, Pfad, Keybytes und fremder Exceptiontext werden nicht
+  gespiegelt.
+- Die Factory übernimmt keine FD-Ownership und dupliziert kein FD. Offene
+  Caller-FDs bleiben auf Erfolg und Fehler offen; geschlossene Eingänge
+  erzeugen keine neuen FDs und keinen Leak.
+- Probe-Keybytes leben nur im lokalen mutablen Buffer und werden auf Erfolg
+  sowie Fehler überschrieben. Der Closure-State enthält nur das geliehene FD,
+  keine langfristige immutable Secretkopie.
+- Jeder Callback validiert und liest erneut stabil per Offset 0. Wiederholte
+  Handshakes bleiben möglich; Drift nach Construction schlägt geschlossen
+  fehl und erreicht keinen Principal/Policy-Callback.
+- Frühere C1/I1/I2/I3/I4/I5 sowie frame-exaktes Lesen bleiben unverändert.
