@@ -112,6 +112,35 @@ class TestStatusStore:
             None,
         )
 
+    def snapshot(
+        self,
+        repository_id: str,
+        executor_fingerprint: str,
+        *,
+        now_monotonic_ns: int,
+    ) -> tuple[dict[str, EvidenceReceiptV1], frozenset[str], dict[str, dict[str, object]]]:
+        relative = self._relative(repository_id, executor_fingerprint)
+        with self._state.locked() as state:
+            document = self._load_locked(state, relative, repository_id, executor_fingerprint)
+        latest: dict[str, EvidenceReceiptV1] = {}
+        for raw in document["receipts"]:
+            try:
+                receipt = EvidenceReceiptV1.from_mapping(raw)
+            except (TypeError, ValueError):
+                continue
+            previous = latest.get(receipt.test_id)
+            if previous is None or (receipt.finished_monotonic_ns, receipt.attempt_id) > (
+                previous.finished_monotonic_ns,
+                previous.attempt_id,
+            ):
+                latest[receipt.test_id] = receipt
+        running = {
+            item["test_id"]: dict(item)
+            for item in document["running"]
+            if now_monotonic_ns < item["expires_monotonic_ns"]
+        }
+        return latest, frozenset(document["revoked"]), running
+
     def latest(
         self, repository_id: str, executor_fingerprint: str, test_id: str
     ) -> EvidenceReceiptV1 | None:
@@ -155,14 +184,14 @@ class TestStatusStore:
         *,
         now_monotonic_ns: int,
     ) -> dict[str, object]:
+        latest, revoked_ids, running_by_test = self.snapshot(
+            index.repository_id,
+            request.executor_fingerprint,
+            now_monotonic_ns=now_monotonic_ns,
+        )
         items: list[dict[str, object]] = []
         for test in index.tests:
-            running = self.active_attempt(
-                index.repository_id,
-                request.executor_fingerprint,
-                test.test_id,
-                now_monotonic_ns=now_monotonic_ns,
-            )
+            running = running_by_test.get(test.test_id)
             if running is not None:
                 items.append(
                     {
@@ -176,15 +205,8 @@ class TestStatusStore:
                     }
                 )
                 continue
-            receipt = self.latest(index.repository_id, request.executor_fingerprint, test.test_id)
-            revoked = bool(
-                receipt
-                and self.is_revoked(
-                    index.repository_id,
-                    request.executor_fingerprint,
-                    receipt.evidence_id,
-                )
-            )
+            receipt = latest.get(test.test_id)
+            revoked = bool(receipt and receipt.evidence_id in revoked_ids)
             decision = evaluate_evidence_reuse(
                 receipt,
                 evidence_context(request, index, test),

@@ -164,26 +164,10 @@ class HiveTestEvidenceService:
         }
 
     def plan(self, request: PlanRequestV1, *, now_monotonic_ns: int) -> PlanResultV1:
-        receipts = {
-            test.test_id: receipt
-            for test in self._index.tests
-            if (
-                receipt := self._store.latest(
-                    self._index.repository_id,
-                    self._runner.executor_fingerprint,
-                    test.test_id,
-                )
-            )
-            is not None
-        }
-        revoked = frozenset(
-            receipt.evidence_id
-            for receipt in receipts.values()
-            if self._store.is_revoked(
-                self._index.repository_id,
-                self._runner.executor_fingerprint,
-                receipt.evidence_id,
-            )
+        receipts, revoked, _ = self._store.snapshot(
+            self._index.repository_id,
+            self._runner.executor_fingerprint,
+            now_monotonic_ns=now_monotonic_ns,
         )
         return self._planner.plan(
             request,
