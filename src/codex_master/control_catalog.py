@@ -98,6 +98,9 @@ _READ_ONLY_TOOLS = {
     "agent_pool_status",
     "agent_doctor",
     "fleet_account_list",
+    "fleet_openai_accounts",
+    "fleet_google_inventory",
+    "fleet_operation_status",
     "fleet_gemini_bootstrap_plan",
     "fleet_series_list",
     "fleet_provider_models",
@@ -118,6 +121,9 @@ _READ_ONLY_TOOLS = {
     "fleet_status_compact",
     "goddess_report_status",
     "goddess_report_list",
+    "hive_test_index_status",
+    "hive_test_plan",
+    "hive_test_status",
 }
 _MUTATING_TOOLS = {
     "agent_claim",
@@ -138,10 +144,18 @@ _MUTATING_TOOLS = {
     "fleet_account_disable",
     "fleet_account_probe",
     "fleet_account_delete",
+    "fleet_openai_auth_plan",
+    "fleet_google_oauth_begin",
+    "fleet_google_provision_plan",
+    "fleet_google_provision_apply",
+    "fleet_google_billing_plan",
+    "fleet_google_billing_apply",
     "fleet_series_apply",
     "fleet_series_disable",
     "fleet_series_delete",
     "goddess_report_run",
+    "hive_test_run",
+    "hive_test_invalidate",
 }
 _BROAD_TOOLS = {
     "agent_start",

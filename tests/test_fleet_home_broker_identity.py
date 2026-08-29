@@ -9,6 +9,7 @@ from codex_master.fleet_home_broker_identity import (
     IdentityValidationError,
     ImportClosure,
     ImportClosureEntry,
+    canonical_import_closure,
 )
 
 MAX_GENERATION = 2**63 - 1
@@ -206,3 +207,33 @@ def test_import_closure_direct_constructor_blocks_invalid_entries(
 ) -> None:
     with pytest.raises(IdentityValidationError):
         ImportClosure(entries)  # type: ignore[arg-type]
+
+
+def test_broker_identity_post_init_revalidates_every_static_binding() -> None:
+    identity = _identity()
+
+    assert identity.__post_init__() is None
+    object.__setattr__(identity, "fencing_epoch", -1)
+    with pytest.raises(IdentityValidationError, match="fencing_epoch"):
+        identity.__post_init__()
+
+
+def test_import_closure_entry_post_init_rejects_a_mutated_noncanonical_path() -> None:
+    entry = ImportClosureEntry("codex_master/module.py", _digest("module"))
+
+    assert entry.__post_init__() is None
+    object.__setattr__(entry, "path", "../private.py")
+    with pytest.raises(IdentityValidationError, match="import path"):
+        entry.__post_init__()
+
+
+def test_canonical_import_closure_returns_the_sorted_digest_bound_factory_result() -> None:
+    closure = canonical_import_closure(
+        (
+            ImportClosureEntry("codex_master/z.py", _digest("z")),
+            ImportClosureEntry("codex_master/a.py", _digest("a")),
+        )
+    )
+
+    assert closure.paths == ("codex_master/a.py", "codex_master/z.py")
+    assert closure == ImportClosure.from_entries(closure.entries)

@@ -1,10 +1,18 @@
 import hashlib
 import importlib.util
 import json
+import pytest
 import re
 import stat
 import sys
 from pathlib import Path, PurePosixPath
+
+from codex_master.fleet_control_release_v2 import (
+    ControlReleaseSpecV2,
+    ReleasePayloadDigestV2,
+    decode_control_release_v2,
+    encode_control_release_v2,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -218,6 +226,35 @@ def test_manifest_payload_closure_and_e3_install_mapping_are_exact() -> None:
         manifest.gid,
         manifest.mode,
     ) == (MANIFEST_SOURCE, MANIFEST_TARGET, 0, 0, 0o644)
+
+
+def test_v1_decoder_rejects_v2_bytes_without_compatibility_fallback() -> None:
+    bootstrap_path = REPO_ROOT / "systemd/libexec/codex_master_bootstrap.py"
+    spec = importlib.util.spec_from_file_location("test_v1_bootstrap", bootstrap_path)
+    assert spec is not None and spec.loader is not None
+    bootstrap = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bootstrap
+    spec.loader.exec_module(bootstrap)
+
+    control_v2 = ControlReleaseSpecV2(
+        schema_version=2,
+        payload_version="0.10.5",
+        payloads=(
+            ReleasePayloadDigestV2("python_runtime", "a" * 64),
+            ReleasePayloadDigestV2("root_helpers", "b" * 64),
+            ReleasePayloadDigestV2("selinux_policy", "c" * 64),
+            ReleasePayloadDigestV2("systemd_units", "d" * 64),
+        ),
+        broker_protocol="CHPB/2",
+        system_bus_interface="org.codex_master.HomeBrokerControl2",
+        system_bus_method="StartDynamicTeamlead",
+        agent_unit_template="codex-master-agent@.service",
+        launcher_path="/usr/libexec/codex-master-agent-launcher",
+    )
+    v2_bytes = encode_control_release_v2(control_v2)
+    assert decode_control_release_v2(v2_bytes, "0.10.5") == control_v2
+    with pytest.raises(bootstrap.BootstrapError):
+        bootstrap.parse_manifest(v2_bytes)
 
 
 def test_install_plan_origin_is_derived_from_test_file() -> None:

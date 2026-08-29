@@ -3,7 +3,12 @@ import json
 
 import pytest
 
+import codex_master.fleet_home_broker_protocol as protocol
 from codex_master.fleet_home_broker_protocol import (
+    AgentStartClaim,
+    AgentStartEnvironmentProjection,
+    AgentStartEnvelope,
+    AgentStartExecutablePin,
     CANONICAL_AGENT_HOME,
     CHPB_PROTOCOL,
     MAX_CHPB_GENERATION,
@@ -47,6 +52,12 @@ from codex_master.fleet_home_broker_protocol import (
     validate_transaction_binding,
     validate_transaction_status,
 )
+from codex_master.fleet_control_release_v2 import (
+    ControlReleaseSpecV2,
+    ReleasePayloadDigestV2,
+    encode_control_release_v2,
+)
+from codex_master.fleet_home_broker_identity import BrokerIdentity
 
 
 AGENT = "bee_1"
@@ -150,6 +161,210 @@ def request(kind=ChpbMessageKind.ATTEST_HOME, request_id=REQUEST_ID, transaction
     return klass(CHPB_PROTOCOL, kind, request_id, transaction_id, expected())
 
 
+def release():
+    return ControlReleaseSpecV2(
+        2,
+        "0.10.5",
+        (
+            ReleasePayloadDigestV2("python_runtime", "a" * 64),
+            ReleasePayloadDigestV2("root_helpers", "b" * 64),
+            ReleasePayloadDigestV2("selinux_policy", "c" * 64),
+            ReleasePayloadDigestV2("systemd_units", "d" * 64),
+        ),
+        "CHPB/2",
+        "org.codex_master.HomeBrokerControl2",
+        "StartDynamicTeamlead",
+        "codex-master-agent@.service",
+        "/usr/libexec/codex-master-agent-launcher",
+    )
+
+
+def agent_start_envelope(**changes):
+    principal_value = principal()
+    expected_value = expected()
+    identity = BrokerIdentity(
+        AGENT,
+        3,
+        "c0,c1",
+        "slot-1",
+        7,
+        A,
+        "e" * 64,
+        4,
+    )
+    transaction_binding = TransactionBinding(
+        ChpbTransactionOperation.PROVISION,
+        T,
+        U,
+        principal_value,
+        policy(),
+    )
+    home_attestation = HomeAttestation(
+        transaction_binding,
+        CANONICAL_AGENT_HOME,
+        DirectoryIdentity(0, 1, 0o40700),
+        A,
+        "c0,c1",
+    )
+    value = AgentStartEnvelope(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.AGENT_START_ENVELOPE,
+        REQUEST_ID,
+        release(),
+        "0.10.5",
+        13,
+        principal_value,
+        expected_value,
+        "codex-master-agent@c0\\x2cc1.service",
+        identity,
+        AgentStartExecutablePin(
+            "/usr/libexec/codex-master-agent-launcher", "e" * 64
+        ),
+        AgentStartEnvironmentProjection(
+            (
+                ("CODEX_HOME", CANONICAL_AGENT_HOME),
+                ("GEMINI_CLI_HOME", CANONICAL_AGENT_HOME),
+                ("HOME", CANONICAL_AGENT_HOME),
+            )
+        ),
+        home_attestation,
+    )
+    return dataclasses.replace(value, **changes)
+
+
+def test_binding_doc_projects_operation_and_nested_bindings():
+    value = binding(ChpbTransactionOperation.REPLACE)
+
+    assert protocol._binding_doc(value) == {
+        "operation": "replace",
+        "policy": protocol._policy_doc(value.policy),
+        "principal": protocol._principal_doc(value.principal),
+        "store_uuid": U,
+        "transaction_id": T,
+    }
+
+
+def test_digest_requires_lowercase_hex_of_requested_size():
+    assert protocol._digest("f" * 32, 32) == "f" * 32
+    assert protocol._digest("e" * 64, 64) == "e" * 64
+
+    with pytest.raises(ChpbValidationError) as error:
+        protocol._digest("F" * 32, 32)
+    assert error.value.code is ChpbValidationCode.INVALID_FIELD
+
+
+def test_enum_requires_the_exact_enum_class():
+    assert protocol._enum(ChpbMessageKind.REPLY, ChpbMessageKind) is ChpbMessageKind.REPLY
+
+    with pytest.raises(ChpbValidationError) as error:
+        protocol._enum(BrokerResultCode.OK, ChpbMessageKind)
+    assert error.value.code is ChpbValidationCode.INVALID_TYPE
+
+
+def test_expectation_doc_projects_all_binding_expectations():
+    assert protocol._expectation_doc(expected()) == {
+        "agent_id": AGENT,
+        "fencing_epoch": 4,
+        "manifest_generation": 3,
+        "policy_generation": 7,
+        "projection_digest": A,
+        "unit_generation": 9,
+    }
+
+
+def test_observation_doc_serializes_enum_values_and_population_index():
+    assert protocol._observation_doc(
+        observation(BrokerObjectState.STAGING_PREFIX, BrokerRegistryState.OLD, 2)
+    ) == {
+        "object_state": "staging_prefix",
+        "population_index": 2,
+        "registry_state": "old",
+    }
+
+
+def test_policy_doc_projects_generation_and_digest():
+    assert protocol._policy_doc(policy()) == {
+        "policy_generation": 7,
+        "projection_digest": A,
+    }
+
+
+def test_principal_doc_projects_all_principal_identity_fields():
+    assert protocol._principal_doc(principal()) == {
+        "agent_id": AGENT,
+        "cgroup_dev": 0,
+        "cgroup_ino": 1,
+        "fencing_epoch": 4,
+        "invocation_id": INVOCATION,
+        "manifest_generation": 3,
+        "mcs_pair": "c0,c1",
+        "unit_generation": 9,
+    }
+
+
+def test_status_doc_projects_nested_status_and_optional_terminal_result():
+    value = TransactionStatus(
+        binding(),
+        B2aRecoveryPhase.COMMITTED,
+        BrokerCheckpoint.COMMITTED,
+        observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1),
+        1,
+        BrokerResultCode.COMMITTED,
+    )
+
+    assert protocol._status_doc(value) == {
+        "binding": protocol._binding_doc(value.binding),
+        "b2a_phase": "committed",
+        "checkpoint": "committed",
+        "observation": protocol._observation_doc(value.observation),
+        "population_total": 1,
+        "terminal_result": "committed",
+    }
+
+
+def test_validate_expectation_rejects_noncanonical_projection_digest():
+    with pytest.raises(ChpbValidationError) as error:
+        protocol._validate_expectation(expected(projection_digest="A" * 64))
+    assert error.value.code is ChpbValidationCode.INVALID_FIELD
+
+
+def test_validate_observation_rejects_population_above_protocol_limit():
+    with pytest.raises(ChpbValidationError) as error:
+        protocol._validate_observation(observation(index=257))
+    assert error.value.code is ChpbValidationCode.INVALID_FIELD
+
+
+def test_validate_policy_rejects_wrong_contract_type():
+    with pytest.raises(ChpbValidationError) as error:
+        protocol._validate_policy(expected())
+    assert error.value.code is ChpbValidationCode.INVALID_TYPE
+
+
+def test_b2a_phase_for_checkpoint_rejects_non_checkpoint_input():
+    with pytest.raises(ChpbValidationError) as error:
+        b2a_phase_for_checkpoint(B2aRecoveryPhase.COMMITTED)
+    assert error.value.code is ChpbValidationCode.INVALID_TYPE
+
+
+def test_encode_chpb_message_emits_canonical_utf8_json_with_newline():
+    value = request(ChpbMessageKind.PROVISION_HOME)
+
+    assert encode_chpb_message(value) == (
+        b'{"binding":{"operation":"provision","policy":{"policy_generation":7,'
+        b'"projection_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},'
+        b'"principal":{"agent_id":"bee_1","cgroup_dev":0,"cgroup_ino":1,'
+        b'"fencing_epoch":4,"invocation_id":"11111111111111111111111111111111",'
+        b'"manifest_generation":3,"mcs_pair":"c0,c1","unit_generation":9},'
+        b'"store_uuid":"33333333333333333333333333333333",'
+        b'"transaction_id":"22222222222222222222222222222222"},'
+        b'"expected":{"agent_id":"bee_1","fencing_epoch":4,"manifest_generation":3,'
+        b'"policy_generation":7,"projection_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+        b'"unit_generation":9},"kind":"provision_home","protocol":"CHPB/2",'
+        b'"request_id":"11111111111111111111111111111111",'
+        b'"transaction_id":"22222222222222222222222222222222"}\n'
+    )
+
+
 def test_public_contract_types_are_frozen_and_slotted():
     for klass in (
         PrincipalBinding,
@@ -240,7 +455,11 @@ def test_wire_contract_contains_no_list_field():
 
 def test_encode_each_message_variant_matches_golden_chpb2_bytes():
     for kind in ChpbMessageKind:
-        if kind is not ChpbMessageKind.REPLY:
+        if kind not in (
+            ChpbMessageKind.REPLY,
+            ChpbMessageKind.AGENT_START_CLAIM,
+            ChpbMessageKind.AGENT_START_ENVELOPE,
+        ):
             raw = encode_chpb_message(request(kind))
             assert raw.endswith(b"\n")
             assert raw == json.dumps(json.loads(raw), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
@@ -278,6 +497,103 @@ def test_reply_golden_bytes_and_roundtrips_cover_all_reply_variants():
         raw = encode_chpb_message(reply)
         assert decode_chpb_message(raw) == reply
         assert encode_chpb_message(decode_chpb_message(raw)) == raw
+
+
+def test_agent_start_contract_types_are_frozen_slotted_and_scalar_only():
+    claim = AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID)
+    envelope = agent_start_envelope()
+
+    for value in (claim, envelope, envelope.executable, envelope.environment):
+        klass = type(value)
+        assert dataclasses.is_dataclass(value)
+        assert klass.__dataclass_params__.frozen
+        assert hasattr(klass, "__slots__")
+        assert not hasattr(value, "__dict__")
+
+    assert tuple(field.name for field in dataclasses.fields(AgentStartClaim)) == (
+        "protocol",
+        "kind",
+        "request_id",
+    )
+    assert tuple(field.name for field in dataclasses.fields(AgentStartEnvelope)) == (
+        "protocol",
+        "kind",
+        "request_id",
+        "release",
+        "release_payload_version",
+        "snapshot_generation",
+        "principal",
+        "expected",
+        "unit_name",
+        "identity",
+        "executable",
+        "environment",
+        "attestation",
+    )
+
+
+def test_agent_start_claim_and_envelope_roundtrip_with_snapshot_generation():
+    claim = AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID)
+    envelope = agent_start_envelope()
+
+    claim_raw = encode_chpb_message(claim)
+    envelope_raw = encode_chpb_message(envelope)
+
+    assert b"[" not in claim_raw
+    assert type(json.loads(envelope_raw)["release"]) is str
+    assert decode_chpb_message(claim_raw) == claim
+    assert decode_chpb_message(envelope_raw) == envelope
+    assert decode_chpb_message(envelope_raw).snapshot_generation == 13
+    assert encode_chpb_message(decode_chpb_message(envelope_raw)) == envelope_raw
+    assert (
+        json.loads(envelope_raw)["release"]
+        == encode_control_release_v2(envelope.release).decode()
+    )
+
+
+@pytest.mark.parametrize(
+    "claim",
+    (
+        AgentStartClaim("CHPB/1", ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID),
+        AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.REPLY, REQUEST_ID),
+        AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, "A" * 32),
+        AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, "0" * 31),
+    ),
+)
+def test_agent_start_claim_rejects_schema_kind_and_correlation_drift(claim):
+    with pytest.raises(ChpbValidationError):
+        validate_chpb_message(claim)
+
+
+def test_agent_start_claim_rejects_unknown_wire_fields():
+    claim = AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID)
+    document = json.loads(encode_chpb_message(claim))
+    document["target"] = "teamleiterin"
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+    with pytest.raises(ChpbValidationError):
+        decode_chpb_message(raw)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"release_payload_version": "0.10.4"},
+        {"snapshot_generation": 0},
+        {"snapshot_generation": True},
+        {"unit_name": "codex-master-agent@c0-c1.service"},
+        {"executable": AgentStartExecutablePin("/tmp/agent", "e" * 64)},
+        {
+            "environment": AgentStartEnvironmentProjection(
+                (("OPENAI_API_KEY", "secret"),)
+            )
+        },
+        {"principal": principal(mcs_pair="c0,c2")},
+    ),
+)
+def test_agent_start_envelope_rejects_cross_binding_drift(changes):
+    with pytest.raises(ChpbValidationError):
+        validate_chpb_message(agent_start_envelope(**changes))
 
 
 def test_decode_rejects_unknown_missing_and_duplicate_fields():

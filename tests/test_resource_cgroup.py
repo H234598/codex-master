@@ -297,6 +297,30 @@ def test_systemd_user_cgroup_adapter_binds_runner_and_root_once(
     assert adapter._cgroup_root is bound_root
 
 
+def test_user_bus_available_converts_preflight_failure_to_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter = resource_cgroup.SystemdUserCgroupAdapter(
+        runner=_approved_provider_runner(monkeypatch, tmp_path)
+    )
+    monkeypatch.setattr(
+        resource_cgroup.SystemdUserCgroupAdapter,
+        "_user_bus_socket_present",
+        lambda _self: True,
+    )
+    assert adapter.user_bus_available() is True
+
+    def unavailable(_self: object) -> bool:
+        raise resource_cgroup.CgroupPreflightError("cgroup_preflight_failed")
+
+    monkeypatch.setattr(
+        resource_cgroup.SystemdUserCgroupAdapter,
+        "_user_bus_socket_present",
+        unavailable,
+    )
+    assert adapter.user_bus_available() is False
+
+
 def test_approved_runtime_provider_constructs_exact_adapter_internally(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

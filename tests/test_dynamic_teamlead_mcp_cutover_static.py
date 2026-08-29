@@ -118,17 +118,56 @@ def test_dynamic_teamlead_start_static_tool_contract_and_catalog_risk() -> None:
     assert "dynamic_teamlead_start" not in broad_tools
 
     call_tool = _function(server, "call_tool")
-    dynamic_returns = [
-        node.value
+    direct_consumer_calls = [
+        node
         for node in ast.walk(call_tool)
-        if isinstance(node, ast.Return)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-        and node.value.func.id == "dynamic_teamlead_start"
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "dynamic_teamlead_start"
     ]
-    assert len(dynamic_returns) == 1
-    assert dynamic_returns[0].args == []
-    assert dynamic_returns[0].keywords == []
+    assert direct_consumer_calls == []
+    assert not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "codex_master.dynamic_teamlead_start"
+        and any(alias.name == "dynamic_teamlead_start" for alias in node.names)
+        for node in server.body
+    )
+
+    runtime_dispatch = [
+        node
+        for node in ast.walk(call_tool)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "runtime"
+        and node.func.attr == "start_dynamic_teamlead"
+    ]
+    assert len(runtime_dispatch) == 1
+    assert not any(
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "runtime"
+        and node.attr == "dynamic_teamlead_control"
+        for node in ast.walk(call_tool)
+    )
+    assert not {
+        "DynamicTeamleadStartA3Port",
+        "RootOwnedDynamicTeamleadStartPort",
+        "dynamic_teamlead_control",
+    } & {
+        node.id for node in ast.walk(call_tool) if isinstance(node, ast.Name)
+    }
+
+    runtime_parameter = next(
+        (
+            parameter
+            for parameter in call_tool.args.kwonlyargs
+            if parameter.arg == "runtime"
+        ),
+        None,
+    )
+    assert runtime_parameter is not None
+    assert isinstance(runtime_parameter.annotation, ast.BinOp)
 
 
 def test_legacy_teamlead_exclusions_remain_before_start_side_effects() -> None:

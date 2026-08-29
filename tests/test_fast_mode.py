@@ -6,6 +6,7 @@ import os
 import stat
 import sys
 import types
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -726,3 +727,42 @@ def test_failed_enable_notification_is_attempted_once_and_keeps_mode(
 
     assert len(attempts) == 1
     assert fast_mode.active_mode("BW_Work") is not None
+
+
+def test_now_utc_requests_an_aware_utc_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = datetime(2026, 8, 29, 10, 30, tzinfo=timezone.utc)
+    requested: list[object] = []
+
+    class Clock:
+        @classmethod
+        def now(cls, zone: object) -> datetime:
+            requested.append(zone)
+            return expected
+
+    monkeypatch.setattr(fast_mode, "datetime", Clock)
+
+    assert fast_mode._now_utc() == expected
+    assert requested == [timezone.utc]
+
+
+def test_write_state_uses_a_creating_transaction_and_passes_its_parent_fd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    @contextmanager
+    def transaction(*, create: bool):
+        captured["create"] = create
+        yield 73
+
+    monkeypatch.setattr(fast_mode, "_state_transaction", transaction)
+    monkeypatch.setattr(
+        fast_mode,
+        "_write_state_to_parent",
+        lambda parent_fd, state: captured.update(parent_fd=parent_fd, state=state),
+    )
+    state = {"schema_version": 1, "modes": {}}
+
+    fast_mode._write_state(state)
+
+    assert captured == {"create": True, "parent_fd": 73, "state": state}

@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-master.local/schemas/hive-test-index-v1.schema.json",
+  "title": "Hive Test Index V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generation",
+    "repository_id",
+    "indexer_version",
+    "source_root_digest",
+    "test_root_digest",
+    "dependency_policy_digest",
+    "functions",
+    "tests",
+    "gates"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generation": { "type": "integer", "minimum": 1 },
+    "repository_id": { "$ref": "#/$defs/repository_id" },
+    "indexer_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "source_root_digest": { "$ref": "#/$defs/digest" },
+    "test_root_digest": { "$ref": "#/$defs/digest" },
+    "dependency_policy_digest": { "$ref": "#/$defs/digest" },
+    "functions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/function" }
+    },
+    "tests": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/test" }
+    },
+    "gates": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/gate" }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "repository_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+$"
+    },
+    "function_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(python|javascript|typescript):[^:]+:.+$"
+    },
+    "test_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^(pytest|node_test|repository_adapter):[^:]+:.+$"
+    },
+    "cooldown_class": {
+      "enum": ["deterministic", "integration", "environmental", "external", "mandatory"]
+    },
+    "function": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "function_id",
+        "language",
+        "path",
+        "qualified_name",
+        "source_digest",
+        "dependency_digest",
+        "test_ids",
+        "cooldown_class",
+        "risk",
+        "generated"
+      ],
+      "properties": {
+        "function_id": { "$ref": "#/$defs/function_id" },
+        "language": { "enum": ["python", "javascript", "typescript"] },
+        "path": { "$ref": "#/$defs/path" },
+        "qualified_name": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "source_digest": { "$ref": "#/$defs/digest" },
+        "dependency_digest": { "$ref": "#/$defs/digest" },
+        "test_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2048,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/test_id" }
+        },
+        "cooldown_class": { "$ref": "#/$defs/cooldown_class" },
+        "risk": { "enum": ["read_only", "mutating", "credential_boundary", "lifecycle", "release"] },
+        "generated": { "type": "boolean" }
+      }
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "test_id",
+        "runner",
+        "path",
+        "node_id",
+        "test_digest",
+        "assertion_digest",
+        "covers",
+        "kind",
+        "timeout_seconds",
+        "hermeticity",
+        "required_resources",
+        "cooldown_class"
+      ],
+      "properties": {
+        "test_id": { "$ref": "#/$defs/test_id" },
+        "runner": { "enum": ["pytest", "node_test", "repository_adapter"] },
+        "path": { "$ref": "#/$defs/path" },
+        "node_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "test_digest": { "$ref": "#/$defs/digest" },
+        "assertion_digest": { "$ref": "#/$defs/digest" },
+        "covers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2048,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/function_id" }
+        },
+        "kind": { "enum": ["unit", "boundary", "integration", "regression", "packaging", "external", "gate"] },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "hermeticity": { "enum": ["hermetic", "executor_bound", "external"] },
+        "required_resources": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "enum": ["network", "database", "browser", "gpu", "system_bus", "external_api"] }
+        },
+        "cooldown_class": { "$ref": "#/$defs/cooldown_class" }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gate_id", "phase", "test_ids", "cooldown_allowed", "required"],
+      "properties": {
+        "gate_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "phase": { "enum": ["change", "branch", "merge", "release"] },
+        "test_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100000,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/test_id" }
+        },
+        "cooldown_allowed": { "type": "boolean" },
+        "required": { "type": "boolean" }
+      }
+    }
+  }
+}

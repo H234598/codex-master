@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import re
 import stat
 from dataclasses import dataclass
 from threading import RLock
+from typing import NoReturn
 
 from codex_master.fleet_home_broker_protocol import MAX_CHPB_GENERATION
 from codex_master.fleet_home_broker_runtime import CredentialProjection
@@ -21,6 +23,9 @@ _BINDING_DOMAIN = b"codex-master/codex-usage-credential-binding/v1\x00"
 _PROFILE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _BINDING_ID_RE = re.compile(r"hmac-sha256:[0-9a-f]{64}\Z")
 _PROVIDER = "openai_chatgpt"
+_AUTH_FIELDS = frozenset({"OPENAI_API_KEY", "auth_mode", "last_refresh", "tokens"})
+_TOKEN_FIELDS = frozenset({"access_token", "account_id", "id_token", "refresh_token"})
+_ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _FILE_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 
@@ -47,7 +52,7 @@ class ProfileCredentialBinding:
         return repr(self)
 
 
-def _fail(code: str) -> None:
+def _fail(code: str) -> NoReturn:
     raise CredentialAuthorityError(code) from None
 
 
@@ -137,6 +142,98 @@ def _close(fd: int | None) -> None:
         os.close(fd)
     except OSError:
         pass
+
+
+def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            _fail("invalid_auth_json")
+        result[key] = value
+    return result
+
+
+def _reject_json_number(_value: str) -> NoReturn:
+    _fail("invalid_auth_json")
+
+
+def _auth_text(value: object, *, maximum: int) -> str:
+    if type(value) is not str or not value:
+        _fail("invalid_auth_json")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        _fail("invalid_auth_json")
+    if len(encoded) > maximum or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        _fail("invalid_auth_json")
+    return value
+
+
+def validate_openai_auth_json(
+    value: bytes | bytearray, *, expected_account_id: str
+) -> bytes:
+    """Validate account identity and return bounded canonical credential JSON."""
+
+    if (
+        type(value) not in {bytes, bytearray}
+        or not 1 <= len(value) <= MAX_AUTH_BYTES
+        or type(expected_account_id) is not str
+        or _ACCOUNT_ID_RE.fullmatch(expected_account_id) is None
+    ):
+        _fail("invalid_auth_json")
+    try:
+        document = json.loads(
+            value.decode("utf-8"),
+            object_pairs_hook=_json_object,
+            parse_constant=_reject_json_number,
+            parse_float=_reject_json_number,
+            parse_int=_reject_json_number,
+        )
+    except CredentialAuthorityError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        _fail("invalid_auth_json")
+    if (
+        type(document) is not dict
+        or not {"auth_mode", "tokens"}.issubset(document)
+        or not set(document).issubset(_AUTH_FIELDS)
+        or document["auth_mode"] not in {"chatgpt", "oauth"}
+        or type(document["tokens"]) is not dict
+    ):
+        _fail("invalid_auth_json")
+    tokens = document["tokens"]
+    if not {"access_token", "account_id"}.issubset(tokens) or not set(tokens).issubset(
+        _TOKEN_FIELDS
+    ):
+        _fail("invalid_auth_json")
+    account_id = _auth_text(tokens["account_id"], maximum=256)
+    if _ACCOUNT_ID_RE.fullmatch(account_id) is None:
+        _fail("invalid_auth_json")
+    _auth_text(tokens["access_token"], maximum=MAX_AUTH_BYTES)
+    for name in ("id_token", "refresh_token"):
+        if name in tokens:
+            _auth_text(tokens[name], maximum=MAX_AUTH_BYTES)
+    if "last_refresh" in document:
+        _auth_text(document["last_refresh"], maximum=128)
+    api_key = document.get("OPENAI_API_KEY")
+    if api_key is not None:
+        _auth_text(api_key, maximum=MAX_AUTH_BYTES)
+    if not hmac.compare_digest(account_id, expected_account_id):
+        _fail("credential_identity_mismatch")
+    canonical = (
+        json.dumps(
+            document,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+    if len(canonical) > MAX_AUTH_BYTES:
+        _fail("invalid_auth_json")
+    return canonical
 
 
 class CodexUsageCredentialAuthority:
@@ -404,4 +501,5 @@ __all__ = (
     "MAX_AUTH_BYTES",
     "MAX_BINDING_KEY_BYTES",
     "ProfileCredentialBinding",
+    "validate_openai_auth_json",
 )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import unittest
 
+import codex_master.control_catalog as control_catalog
 from codex_master.control_catalog import (
     MAX_CATALOG_TOOLS,
     MAX_DESCRIPTOR_TEXT_CHARS,
@@ -67,6 +68,9 @@ EXPECTED_RISKS = {
     "agent_pool_destroy_pool": Risk.DESTRUCTIVE,
     "agent_doctor": Risk.READ_ONLY,
     "fleet_account_list": Risk.READ_ONLY,
+    "fleet_openai_accounts": Risk.READ_ONLY,
+    "fleet_google_inventory": Risk.READ_ONLY,
+    "fleet_operation_status": Risk.READ_ONLY,
     "fleet_gemini_bootstrap_plan": Risk.READ_ONLY,
     "fleet_series_list": Risk.READ_ONLY,
     "fleet_account_upsert": Risk.MUTATING,
@@ -74,6 +78,12 @@ EXPECTED_RISKS = {
     "fleet_account_disable": Risk.MUTATING,
     "fleet_account_probe": Risk.MUTATING,
     "fleet_account_delete": Risk.MUTATING,
+    "fleet_openai_auth_plan": Risk.MUTATING,
+    "fleet_google_oauth_begin": Risk.MUTATING,
+    "fleet_google_provision_plan": Risk.MUTATING,
+    "fleet_google_provision_apply": Risk.MUTATING,
+    "fleet_google_billing_plan": Risk.MUTATING,
+    "fleet_google_billing_apply": Risk.MUTATING,
     "fleet_provider_models": Risk.READ_ONLY,
     "fleet_series_plan": Risk.READ_ONLY,
     "fleet_series_apply": Risk.MUTATING,
@@ -96,7 +106,18 @@ EXPECTED_RISKS = {
     "goddess_report_status": Risk.READ_ONLY,
     "goddess_report_run": Risk.MUTATING,
     "goddess_report_list": Risk.READ_ONLY,
+    "hive_test_index_status": Risk.READ_ONLY,
+    "hive_test_plan": Risk.READ_ONLY,
+    "hive_test_status": Risk.READ_ONLY,
+    "hive_test_run": Risk.MUTATING,
+    "hive_test_invalidate": Risk.MUTATING,
 }
+
+
+def test_field_description_defaults_and_rejects_non_text() -> None:
+    assert control_catalog._field_description({}, "field") == ""
+    with unittest.TestCase().assertRaisesRegex(SchemaError, "field description must be a string"):
+        control_catalog._field_description({"description": 1}, "field")
 
 
 def tool_fixture(

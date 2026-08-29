@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 import codex_master.google_account_inventory_manager as manager_module
+from codex_master.admin_contracts import AdminContractError
 from codex_master.google_account_inventory import GoogleAccountInventoryError
 from codex_master.google_account_inventory import GoogleAccountInventoryLoader
 from codex_master.google_account_inventory_manager import (
@@ -87,6 +88,93 @@ def fresh_document(
     return GoogleAccountInventoryLoader._for_test_path(path).load()
 
 
+def projection_document(
+    root: Path,
+    *,
+    private_marker: str,
+    public_overrides: dict[str, str] | None = None,
+) -> object:
+    if root.exists():
+        root = root / "inventory"
+    accounts = []
+    for number, account_ref, project_ref, label, subject_id in (
+        (
+            1,
+            "google-account-01",
+            "the-hive-1",
+            "Quiet account",
+            f"{private_marker}-subject-one",
+        ),
+        (2, "google-account-02", "the-hive-2", "Calm account", None),
+    ):
+        accounts.append(
+            {
+                "ref": account_ref,
+                "login_email": f"{private_marker}-{number}@example.test",
+                "recovery_email": f"{private_marker}-recovery-{number}@example.test",
+                "label": label,
+                "subject_id": subject_id,
+                "auth": {
+                    "access_token": f"{private_marker}-access-{number}",
+                    "refresh_token": f"{private_marker}-refresh-{number}",
+                    "cookies": [{"value": f"{private_marker}-cookie-{number}"}],
+                    "client_fingerprint": f"{private_marker}-fingerprint-{number}",
+                },
+                "billing_accounts": [
+                    {
+                        "ref": f"billing-{number:02d}",
+                        "billing_account_id": f"{private_marker}-billing-{number}",
+                        "label": f"Billing {number}",
+                    }
+                ],
+                "projects": [
+                    {
+                        "ref": project_ref,
+                        "billing_account_ref": f"billing-{number:02d}",
+                        "status": "active" if number == 1 else "blocked",
+                        "project_id": f"{private_marker}-project-{number}",
+                        "project_number": f"{private_marker}-number-{number}",
+                        "key_id": f"{private_marker}-key-{number}",
+                        "key_uid": f"{private_marker}-uid-{number}",
+                        "secret": f"{private_marker}-secret-{number}"
+                        if number == 1
+                        else None,
+                        "project_name": (
+                            "Quietglow Aurorabay"
+                            if number == 1
+                            else "Calmshore Fernhaven"
+                        ),
+                        "purpose": "hive" if number == 1 else "external",
+                        "key_name": (
+                            "Quietglow Aurorabay Key"
+                            if number == 1
+                            else "Calmshore Fernhaven Key"
+                        ),
+                    }
+                ],
+            }
+        )
+    for field, value in (public_overrides or {}).items():
+        if field in {"ref", "label"}:
+            accounts[0][field] = value
+        elif field == "billing_ref":
+            accounts[0]["billing_accounts"][0]["ref"] = value
+            accounts[0]["projects"][0]["billing_account_ref"] = value
+        else:
+            accounts[0]["projects"][0][field] = value
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    path = root / "api-token.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"schema_version": 2, "google_accounts": accounts}, sort_keys=False
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    return GoogleAccountInventoryLoader._for_test_path(path).load()
+
+
 class FakeMonotonic:
     def __init__(self) -> None:
         self.seconds = 0.0
@@ -119,6 +207,22 @@ def test_manager(*outcomes: object, **kwargs: object) -> GoogleAccountInventoryM
 
 
 test_manager.__test__ = False
+
+
+def test_reload_rejects_stale_expected_generation_before_publish(
+    tmp_path: Path,
+) -> None:
+    first = fresh_document(tmp_path / "first")
+    second = fresh_document(tmp_path / "second", key_id="000655")
+    manager = test_manager(first, second)
+    assert manager.reload().generation == 1
+
+    with pytest.raises(
+        GoogleAccountInventoryError, match="credential.generation_conflict"
+    ):
+        manager.reload(expected_generation=0)
+
+    assert manager.inventory_generation() == 1
 
 
 def issue_valid_lease(
@@ -395,6 +499,195 @@ def test_status_and_snapshot_public_projection_are_redacted_aggregates(
         "project_count",
         "active_project_count",
     }
+
+
+def test_admin_views_are_immutable_redacted_and_account_isolated(
+    tmp_path: Path,
+) -> None:
+    private_marker = "private-provider-marker"
+    manager = test_manager(projection_document(tmp_path, private_marker=private_marker))
+    manager.reload()
+
+    accounts = manager.list_accounts()
+    assert accounts == (
+        {
+            "ref": "google-account-01",
+            "label": "Quiet account",
+            "subject_bound": True,
+            "inventory_generation": 1,
+            "project_count": 1,
+            "billing_count": 1,
+        },
+        {
+            "ref": "google-account-02",
+            "label": "Calm account",
+            "subject_bound": False,
+            "inventory_generation": 1,
+            "project_count": 1,
+            "billing_count": 1,
+        },
+    )
+    assert manager.get_account("google-account-01") == accounts[0]
+    assert manager.list_projects("google-account-01") == (
+        {
+            "ref": "the-hive-1",
+            "project_name": "Quietglow Aurorabay",
+            "key_name": "Quietglow Aurorabay Key",
+            "purpose": "hive",
+            "billing_ref": "billing-01",
+            "status": "active",
+            "inventory_generation": 1,
+        },
+    )
+    assert manager.inventory_generation() == 1
+    assert private_marker not in repr(
+        (
+            accounts,
+            manager.get_account("google-account-01"),
+            manager.list_projects("google-account-01"),
+        )
+    )
+    with pytest.raises(TypeError):
+        accounts[0]["label"] = "changed"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "operation"),
+    [
+        ("ref", "/private/credential.json", "accounts"),
+        ("label", "private-login@example.test", "accounts"),
+        ("label", "RuntimeError: provider exploded", "accounts"),
+        ("label", "ＣＬＩＥＮＴＳＥＣＲＥＴ topvalue", "accounts"),
+        ("label", "client%5Fsecret=topvalue", "accounts"),
+        ("label", "client%255Fsecret=topvalue", "accounts"),
+        ("label", "failed%20at%20%2Fprivate%2Fauth.json", "accounts"),
+        ("project_name", "Secret Meadow", "projects"),
+        ("key_name", "cLiEnTsEcReT Meadow", "projects"),
+        ("billing_ref", "client%5Fsecret", "projects"),
+    ],
+)
+def test_admin_views_reject_private_smuggling_in_public_source_fields(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    operation: str,
+) -> None:
+    manager = test_manager(
+        projection_document(
+            tmp_path,
+            private_marker="private-source-marker",
+            public_overrides={field: value},
+        )
+    )
+    manager.reload()
+
+    with pytest.raises(AdminContractError) as caught:
+        if operation == "accounts":
+            manager.list_accounts()
+        else:
+            manager.list_projects("google-account-01")
+
+    assert caught.value.code == "control.response_private"
+    assert value not in repr(caught.value)
+
+
+def test_admin_views_keep_safe_unicode_label(tmp_path: Path) -> None:
+    manager = test_manager(
+        projection_document(
+            tmp_path,
+            private_marker="private-source-marker",
+            public_overrides={"label": "Café München"},
+        )
+    )
+    manager.reload()
+
+    assert manager.get_account("google-account-01")["label"] == "Café München"
+
+
+def test_admin_views_use_one_existing_snapshot_per_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_manager = test_manager(
+        projection_document(tmp_path / "first", private_marker="first-private")
+    )
+    second_manager = test_manager(
+        projection_document(tmp_path / "second-one", private_marker="second-private"),
+        projection_document(tmp_path / "second-two", private_marker="second-private"),
+    )
+    first_manager.reload()
+    second_manager.reload()
+    second_manager.reload()
+    first_snapshot = first_manager._snapshot_for_internal_use()
+    second_snapshot = second_manager._snapshot_for_internal_use()
+    assert second_snapshot.generation == 2
+
+    def reject_second_yaml_read() -> object:
+        raise AssertionError("admin view must not call inventory loader")
+
+    monkeypatch.setattr(first_manager, "_document_loader", reject_second_yaml_read)
+    generation_reads = (
+        lambda: first_manager.list_accounts()[0]["inventory_generation"],
+        lambda: first_manager.get_account("google-account-01")["inventory_generation"],
+        lambda: first_manager.list_projects("google-account-01")[0][
+            "inventory_generation"
+        ],
+        first_manager.inventory_generation,
+    )
+    for read_generation in generation_reads:
+        snapshots = iter((first_snapshot, second_snapshot))
+        monkeypatch.setattr(
+            first_manager, "_snapshot_for_internal_use", lambda: next(snapshots)
+        )
+        assert read_generation() == 1
+        assert next(snapshots) is second_snapshot
+
+
+def test_admin_views_fail_closed_for_unknown_and_duplicate_account_refs(
+    tmp_path: Path,
+) -> None:
+    private_marker = "private-error-marker"
+    manager = test_manager(
+        projection_document(tmp_path / "valid", private_marker=private_marker)
+    )
+    manager.reload()
+    for operation in (manager.get_account, manager.list_projects):
+        with pytest.raises(GoogleAccountInventoryError) as caught:
+            operation(private_marker)
+        assert caught.value.code == "credential.account_not_found"
+        assert private_marker not in repr(caught.value)
+
+    duplicate = tmp_path / "duplicate"
+    document = {
+        "schema_version": 1,
+        "google_accounts": [
+            {
+                "ref": "duplicate-account",
+                "login_email": "one@example.test",
+                "billing_accounts": [],
+                "projects": [],
+            },
+            {
+                "ref": "duplicate-account",
+                "login_email": "two@example.test",
+                "billing_accounts": [],
+                "projects": [],
+            },
+        ],
+    }
+    duplicate.mkdir(mode=0o700)
+    path = duplicate / "api-token.yaml"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    path.chmod(0o600)
+    loader = GoogleAccountInventoryLoader._for_test_path(path)
+    invalid_manager = test_manager(loader.load)
+    with pytest.raises(
+        GoogleAccountInventoryError, match="credential.inventory_reload_failed"
+    ):
+        invalid_manager.reload()
+    with pytest.raises(
+        GoogleAccountInventoryError, match="credential.inventory_snapshot_unavailable"
+    ):
+        invalid_manager.list_accounts()
 
 
 def test_startup_without_snapshot_is_fail_closed(tmp_path: Path) -> None:

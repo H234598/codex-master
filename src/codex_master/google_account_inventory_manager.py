@@ -12,6 +12,7 @@ from typing import Callable, Mapping
 import weakref
 
 from . import google_account_inventory as _inventory
+from .admin_contracts import public_admin_ref, public_admin_text
 from .google_account_inventory import GoogleAccountInventoryDocumentV1
 from .google_account_inventory import GoogleAccountInventoryError
 from .google_account_inventory import GoogleAccountInventoryLoader
@@ -416,6 +417,19 @@ class GoogleAccountInventoryManager:
         )
 
     @classmethod
+    def from_systemd_state_directory(cls) -> GoogleAccountInventoryManager:
+        manager = cls.__new__(cls)
+        manager._initialize(
+            GoogleAccountInventoryLoader.from_systemd_state_directory().load,
+            monotonic_clock=time.monotonic,
+            operator_timestamp_utc=lambda: time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            ),
+            source_type=InventorySourceTypeV1.CANONICAL_YAML,
+        )
+        return manager
+
+    @classmethod
     def _for_test_loader(
         cls,
         document_loader: Callable[[], GoogleAccountInventoryDocumentV1],
@@ -518,10 +532,18 @@ class GoogleAccountInventoryManager:
             source = None
             return _ReloadFailureV1("credential.inventory_reload_failed")
 
-    def reload(self) -> GoogleAccountInventoryStatusV1:
+    def reload(
+        self, *, expected_generation: int | None = None
+    ) -> GoogleAccountInventoryStatusV1:
         with self._lock:
             if self._state is InventoryManagerStateV1.CLOSED:
                 raise GoogleAccountInventoryError("credential.inventory_manager_closed")
+            if expected_generation is not None and (
+                type(expected_generation) is not int
+                or not 0 <= expected_generation <= MAX_INVENTORY_GENERATION
+                or expected_generation != self._generation
+            ):
+                raise GoogleAccountInventoryError("credential.generation_conflict")
             if self._generation >= MAX_INVENTORY_GENERATION:
                 self._block_after_reload_failure(
                     "credential.inventory_generation_exhausted"
@@ -553,6 +575,84 @@ class GoogleAccountInventoryManager:
                     "credential.inventory_snapshot_unavailable"
                 )
             return self._active.snapshot
+
+    @staticmethod
+    def _account_admin_projection(
+        account: GoogleAccountV1, generation: int
+    ) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "ref": public_admin_ref(account.ref),
+                "label": (
+                    None if account.label is None else public_admin_text(account.label)
+                ),
+                "subject_bound": account.subject_id is not None,
+                "inventory_generation": generation,
+                "project_count": len(account.projects),
+                "billing_count": len(account.billing_accounts),
+            }
+        )
+
+    @staticmethod
+    def _project_admin_projection(
+        project: GoogleProjectV1, generation: int
+    ) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "ref": public_admin_ref(project.ref),
+                "project_name": (
+                    None
+                    if project.project_name is None
+                    else public_admin_text(project.project_name)
+                ),
+                "key_name": (
+                    None
+                    if project.key_name is None
+                    else public_admin_text(project.key_name)
+                ),
+                "purpose": public_admin_text(project.purpose),
+                "billing_ref": (
+                    None
+                    if project.billing_account_ref is None
+                    else public_admin_ref(project.billing_account_ref)
+                ),
+                "status": public_admin_text(project.status),
+                "inventory_generation": generation,
+            }
+        )
+
+    def list_accounts(self) -> tuple[Mapping[str, object], ...]:
+        snapshot = self._snapshot_for_internal_use()
+        return tuple(
+            self._account_admin_projection(account, snapshot.generation)
+            for account in snapshot.accounts
+        )
+
+    def get_account(self, account_ref: str) -> Mapping[str, object]:
+        if not _valid_nonempty_string(account_ref):
+            raise GoogleAccountInventoryError("credential.account_not_found")
+        snapshot = self._snapshot_for_internal_use()
+        try:
+            account = snapshot.by_account_ref[account_ref]
+        except KeyError:
+            raise GoogleAccountInventoryError("credential.account_not_found") from None
+        return self._account_admin_projection(account, snapshot.generation)
+
+    def list_projects(self, account_ref: str) -> tuple[Mapping[str, object], ...]:
+        if not _valid_nonempty_string(account_ref):
+            raise GoogleAccountInventoryError("credential.account_not_found")
+        snapshot = self._snapshot_for_internal_use()
+        try:
+            account = snapshot.by_account_ref[account_ref]
+        except KeyError:
+            raise GoogleAccountInventoryError("credential.account_not_found") from None
+        return tuple(
+            self._project_admin_projection(project, snapshot.generation)
+            for project in account.projects
+        )
+
+    def inventory_generation(self) -> int:
+        return self._snapshot_for_internal_use().generation
 
     def _read_monotonic(self) -> float:
         try:

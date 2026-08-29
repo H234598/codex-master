@@ -289,3 +289,35 @@ def test_paused_admission_holds_scope_until_revalidation_or_expiry() -> None:
     assert resumed.state is AdmissionState.EXECUTING
     paused_again = store.transition(resumed.admission_id, AdmissionState.PAUSED, expected_revision=resumed.revision, now=NOW)
     assert store.expire(now=NOW + timedelta(seconds=DEFAULT_RESERVATION_TTL_SECONDS)) == (paused_again.advance(AdmissionState.EXPIRED, now=NOW + timedelta(seconds=DEFAULT_RESERVATION_TTL_SECONDS)),)
+
+
+def test_cancel_transitions_a_reserved_admission_with_its_expected_revision() -> None:
+    store = AdmissionStore()
+    reserved = store.reserve(admission("cancel"), now=NOW)
+
+    cancelled = store.cancel(
+        reserved.admission_id,
+        expected_revision=reserved.revision,
+        now=NOW,
+    )
+
+    assert (cancelled.state, cancelled.revision, cancelled.active) == (
+        AdmissionState.CANCELLED,
+        2,
+        False,
+    )
+    assert store.get(reserved.admission_id) == cancelled
+
+
+def test_file_records_snapshot_reloads_the_complete_immutable_record_set(tmp_path) -> None:
+    state_path = tmp_path / "admissions.json"
+    lock_path = tmp_path / "admission.lock"
+    writer = FileAdmissionStore(state_path, lock_path)
+    reserved = writer.reserve(admission("snapshot"), now=NOW)
+    reader = FileAdmissionStore(state_path, lock_path)
+
+    records = reader.records_snapshot()
+
+    assert records == (reserved,)
+    assert isinstance(records, tuple)
+    assert records[0].state is AdmissionState.RESERVED

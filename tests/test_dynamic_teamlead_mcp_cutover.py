@@ -1,5 +1,9 @@
 import importlib.util
 from pathlib import Path
+from unittest.mock import patch
+
+import codex_master.server as server_module
+from codex_master.masterjet_runtime import MasterjetRuntime
 
 
 MODULE_PATH = (
@@ -74,3 +78,113 @@ def test_a3_port_coordinates_prepares_then_executes_once(monkeypatch) -> None:
         ("prepare", launch),
         ("execute", runner),
     ]
+
+
+def test_call_tool_dispatches_dynamic_teamlead_through_injected_runtime() -> None:
+    class Control:
+        calls = 0
+
+        def start_dynamic_teamlead(self) -> dict[str, int | str]:
+            self.calls += 1
+            return {
+                "schema_version": 1,
+                "status": "started",
+                "raw_output": "not_returned",
+            }
+
+    control = Control()
+    with patch.object(
+        server_module,
+        "dynamic_teamlead_start",
+        side_effect=AssertionError("explicit runtime must use wrapper"),
+        create=True,
+    ):
+        result = server_module.call_tool(
+            "dynamic_teamlead_start",
+            {},
+            runtime=MasterjetRuntime(control),
+        )
+
+    assert result == {
+        "schema_version": 1,
+        "status": "started",
+        "raw_output": "not_returned",
+    }
+    assert control.calls == 1
+
+
+def test_call_tool_dynamic_teamlead_absent_or_invalid_runtime_is_unavailable() -> None:
+    class InvalidRuntime:
+        calls = 0
+
+        def start_dynamic_teamlead(self) -> dict[str, int | str]:
+            self.calls += 1
+            raise AssertionError("invalid runtime must not be called")
+
+    expected = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "reason": "dynamic_teamlead_runtime_unavailable",
+        "raw_output": "not_returned",
+    }
+    invalid = InvalidRuntime()
+
+    with patch.object(
+        server_module,
+        "dynamic_teamlead_start",
+        side_effect=AssertionError("unavailable path must not call old consumer"),
+        create=True,
+    ):
+        absent = server_module.call_tool("dynamic_teamlead_start", {})
+        rejected = server_module.call_tool(
+            "dynamic_teamlead_start", {}, runtime=invalid
+        )
+
+    assert absent == expected
+    assert rejected == expected
+    assert absent is not rejected
+    assert invalid.calls == 0
+
+
+def test_call_tool_ignores_runtime_for_other_tools() -> None:
+    class Control:
+        calls = 0
+
+        def start_dynamic_teamlead(self) -> dict[str, int | str]:
+            self.calls += 1
+            raise AssertionError("non-dynamic tool must ignore runtime")
+
+    control = Control()
+    with patch.object(
+        server_module,
+        "agent_spawn_offers",
+        return_value={"status": "ok"},
+    ):
+        result = server_module.call_tool(
+            "agent_spawn_offers",
+            {},
+            runtime=MasterjetRuntime(control),
+        )
+
+    assert result == {"status": "ok"}
+    assert control.calls == 0
+
+
+def test_call_tool_dynamic_teamlead_runtime_exception_stays_sparse() -> None:
+    class Control:
+        def start_dynamic_teamlead(self) -> dict[str, int | str]:
+            raise RuntimeError("private control detail")
+
+    result = server_module.call_tool(
+        "dynamic_teamlead_start",
+        {},
+        runtime=MasterjetRuntime(Control()),
+    )
+
+    assert result == {
+        "schema_version": 1,
+        "status": "unavailable",
+        "reason": "dynamic_teamlead_runtime_unavailable",
+        "raw_output": "not_returned",
+    }
+    assert "private control detail" not in str(result)

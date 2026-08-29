@@ -5,6 +5,7 @@ import copy
 import dataclasses
 from dataclasses import replace
 import gc
+import hashlib
 import inspect
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import socket
 import subprocess
 import sys
 from threading import Event, Thread
+from types import SimpleNamespace
 from typing import Callable
 import xml.etree.ElementTree as ET
 
@@ -24,9 +26,39 @@ import pytest
 import codex_master.fleet_root_system_bus as system_bus
 import codex_master.fleet_home_broker_runtime as runtime
 import codex_master.fleet_home_broker_system as broker_system
+import codex_master.dynamic_teamlead_a3_runner as runner
+from codex_master.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
+from codex_master.dynamic_teamlead_a3_runtime_provider import (
+    DynamicTeamleadA3RuntimeContext,
+)
+from codex_master.dynamic_teamlead_coordinator import DynamicTeamleadCoordinatorRequest
 from codex_master.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
 from codex_master.fleet_home_broker_identity import BrokerIdentity
+from codex_master.fleet_home_broker_client_seqpacket import (
+    SeqpacketBrokerClientOperations,
+)
 from codex_master.fleet_home_broker_protocol import PrincipalBinding
+from codex_master.fleet_home_broker_client import AttestedHome
+from codex_master.fleet_home_broker_protocol import (
+    B2aRecoveryPhase,
+    AttestHomeRequest,
+    BindingExpectation,
+    BrokerCheckpoint,
+    BrokerObservation,
+    BrokerObjectState,
+    BrokerRegistryState,
+    BrokerReply,
+    BrokerResultCode,
+    CANONICAL_AGENT_HOME,
+    ChpbMessageKind,
+    ChpbTransactionOperation,
+    DirectoryIdentity,
+    HomeAttestation,
+    PolicyBinding,
+    ProvisionHomeRequest,
+    TransactionBinding,
+    TransactionStatus,
+)
 from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     CredentialProjection,
@@ -42,6 +74,7 @@ from codex_master.fleet_registry import (
     RunnerKind,
     SecretState,
 )
+from codex_master.fleet_runners import DynamicTeamleadRunnerPlan
 from codex_master.fleet_root_runtime_host import (
     FleetRootRuntimeHost,
     FleetRootRuntimeHostError,
@@ -58,6 +91,7 @@ from codex_master.fleet_root_system_bus import (
     RootSystemBusError,
     RootSystemBusPeerAttestation,
     TrustedPrincipalGrantConsumer,
+    _RootDynamicTeamleadStartControl,
     _IssuedAttestation,
     _LinuxPeerOperations,
     _ProcObservation,
@@ -448,6 +482,33 @@ class R2AOperations:
             raise OSError("private close detail")
 
 
+class RecordingRunnerOperations:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[DynamicTeamleadRunnerPlan, object]] = []
+
+    def execute(
+        self, plan: DynamicTeamleadRunnerPlan, *, permit: object
+    ) -> None:
+        self.calls.append((plan, permit))
+        if self.error is not None:
+            raise self.error
+
+
+class BlockingRunnerOperations(RecordingRunnerOperations):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+
+    def execute(
+        self, plan: DynamicTeamleadRunnerPlan, *, permit: object
+    ) -> None:
+        self.calls.append((plan, permit))
+        self.entered.set()
+        assert self.release.wait(5)
+
+
 def reattest_operations() -> GrantOperations:
     operations = GrantOperations()
     operations.alive *= 2
@@ -455,6 +516,223 @@ def reattest_operations() -> GrantOperations:
     operations.stats *= 2
     operations.units *= 2
     return operations
+
+
+def runner_home(context: TrustedPrincipalGrantContext) -> AttestedHome:
+    binding = TransactionBinding(
+        ChpbTransactionOperation.PROVISION,
+        "c" * 32,
+        "b" * 32,
+        context.expected_principal,
+        PolicyBinding(
+            context.identity.policy_generation,
+            context.identity.projection_digest,
+        ),
+    )
+    attestation = HomeAttestation(
+        binding,
+        CANONICAL_AGENT_HOME,
+        DirectoryIdentity(17, 31, 0o40700),
+        "7" * 64,
+        binding.principal.mcs_pair,
+    )
+    status = TransactionStatus(
+        binding,
+        B2aRecoveryPhase.COMMITTED,
+        BrokerCheckpoint.COMMITTED,
+        BrokerObservation(
+            BrokerObjectState.FINAL_COMPLETE,
+            BrokerRegistryState.CURRENT,
+            1,
+        ),
+        1,
+        BrokerResultCode.COMMITTED,
+    )
+    reply = BrokerReply(
+        "CHPB/2",
+        ChpbMessageKind.REPLY,
+        "d" * 32,
+        BrokerResultCode.OK,
+        status,
+        attestation,
+    )
+    return AttestedHome(61, reply, attestation)
+
+
+def runner_plan(context: TrustedPrincipalGrantContext) -> DynamicTeamleadRunnerPlan:
+    return DynamicTeamleadRunnerPlan(
+        context.snapshot.runtime_principals[0],
+        context.expected_principal,
+        BindingExpectation(
+            context.expected_principal.agent_id,
+            context.expected_principal.manifest_generation,
+            context.expected_principal.unit_generation,
+            context.identity.policy_generation,
+            context.identity.projection_digest,
+            context.expected_principal.fencing_epoch,
+        ),
+        context.identity,
+        runner_home(context),
+    )
+
+
+def a3_runtime_context(
+    context: TrustedPrincipalGrantContext, release: BrokerReleaseSpec
+) -> DynamicTeamleadA3RuntimeContext:
+    expected = BindingExpectation(
+        context.expected_principal.agent_id,
+        context.expected_principal.manifest_generation,
+        context.expected_principal.unit_generation,
+        context.identity.policy_generation,
+        context.identity.projection_digest,
+        context.expected_principal.fencing_epoch,
+    )
+    binding = TransactionBinding(
+        ChpbTransactionOperation.PROVISION,
+        "b" * 32,
+        "b" * 32,
+        context.expected_principal,
+        PolicyBinding(
+            context.identity.policy_generation,
+            context.identity.projection_digest,
+        ),
+    )
+    request = DynamicTeamleadCoordinatorRequest(
+        context.snapshot,
+        context.selection,
+        context.profile_binding,
+        context.snapshot.runtime_principals[0],
+        context.expected_principal,
+        context.identity,
+        ProvisionHomeRequest(
+            "CHPB/2",
+            ChpbMessageKind.PROVISION_HOME,
+            "c" * 32,
+            "b" * 32,
+            expected,
+            binding,
+        ),
+        (),
+        AttestHomeRequest(
+            "CHPB/2",
+            ChpbMessageKind.ATTEST_HOME,
+            "d" * 32,
+            "b" * 32,
+            expected,
+        ),
+    )
+    return DynamicTeamleadA3RuntimeContext(context, request, release)
+
+
+class NoIoRegistryStore:
+    def __init__(self) -> None:
+        self.load_calls = 0
+        self.commit_calls = 0
+
+    def load(self) -> FleetSnapshotV2:
+        self.load_calls += 1
+        raise AssertionError("registry I/O is not part of composition issuance")
+
+    def commit_snapshot(
+        self, snapshot: FleetSnapshotV2, *, expected_generation: int
+    ) -> FleetSnapshotV2:
+        del snapshot, expected_generation
+        self.commit_calls += 1
+        raise AssertionError("registry I/O is not part of composition issuance")
+
+
+class NoIoBrokerExchange:
+    def __init__(self) -> None:
+        self.exchange_calls = 0
+
+    def exchange(self, request: object) -> object:
+        del request
+        self.exchange_calls += 1
+        raise AssertionError("broker I/O is not part of composition issuance")
+
+    def fstat(self, fd: int) -> object:
+        del fd
+        raise AssertionError("broker I/O is not part of composition issuance")
+
+    def close(self, fd: int) -> None:
+        del fd
+        raise AssertionError("broker I/O is not part of composition issuance")
+
+
+def composition_inputs(
+    consumer: TrustedPrincipalGrantConsumer, service: HomeBrokerControlService
+) -> tuple[
+    DynamicTeamleadA3RuntimeContext,
+    FleetV2RegistryOperations,
+    SeqpacketBrokerClientOperations,
+    NoIoRegistryStore,
+    NoIoBrokerExchange,
+]:
+    context = a3_runtime_context(consumer._context, service._release)
+    store = NoIoRegistryStore()
+    registry = FleetV2RegistryOperations(store, context.context.snapshot)
+    exchange = NoIoBrokerExchange()
+    broker = SeqpacketBrokerClientOperations(
+        exchange,
+        a3_context_identity=context,
+        release_identity=service._release,
+    )
+    return context, registry, broker, store, exchange
+
+
+def offline_runner_authority(
+    context: TrustedPrincipalGrantContext | None = None,
+) -> tuple[
+    FleetRootRuntimeHost,
+    TrustedPrincipalGrantConsumer,
+    HomeBrokerControlService,
+    TrustedPrincipalGrantContext,
+]:
+    context = context or trusted_context()
+    host = reconciled_host()
+    operations = GrantOperations()
+    operations.alive *= 3
+    operations.proc *= 3
+    operations.stats *= 3
+    operations.units *= 3
+    boundary = broker_system.BrokerSystemBoundary(R2AOperations())
+    consumer = TrustedPrincipalGrantConsumer(
+        context,
+        RecordingResolver(context.expected_principal),
+        RecordingProjectionProvider(),
+        boundary,
+        _operations=operations,
+        _credential_reader=lambda _sender: raw_credentials(),
+    )
+    service = object.__new__(HomeBrokerControlService)
+    object.__setattr__(service, "_host", host)
+    object.__setattr__(service, "_generation", GENERATION)
+    object.__setattr__(service, "_release", release_spec())
+    consumer._bind_service(service)
+    observation = _attest_peer(
+        ":1.1",
+        lambda _sender: raw_credentials(),
+        ScriptedOperations(),
+        service._release,
+    )
+    attestation = system_bus._issue_attestation(
+        ":1.1", observation, service._generation
+    )
+    ownership = host.begin_principal_or_agent()
+    consumer._consume_from_service(service, attestation, ownership)
+    return host, consumer, service, context
+
+
+@pytest.fixture
+def runner_authority():
+    authority = offline_runner_authority()
+    try:
+        yield authority
+    finally:
+        try:
+            authority[1].close()
+        except RootSystemBusError:
+            pass
 
 
 def _trusted_service(
@@ -661,6 +939,380 @@ def test_trusted_principal_grant_consumer_surface_is_narrow() -> None:
         "_operations",
         "_credential_reader",
     )
+
+
+def test_consumer_issues_one_bound_permit_executor_pair_and_executes_once(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    issue = getattr(consumer, "issue_dynamic_teamlead_runner")
+
+    permit, executor = issue(operations)
+    plan = runner_plan(context)
+
+    assert tuple(inspect.signature(issue).parameters) == ("operations",)
+    assert executor.execute_dynamic_teamlead_runner(plan) is None
+    assert operations.calls == [(plan, permit)]
+    reattestations = consumer._operations.calls.count("pidfd_open")
+    with pytest.raises(RootSystemBusError):
+        executor.execute_dynamic_teamlead_runner(plan)
+    with pytest.raises(RootSystemBusError):
+        issue(RecordingRunnerOperations())
+    assert operations.calls == [(plan, permit)]
+    assert consumer._operations.calls.count("pidfd_open") == reattestations
+
+
+def test_executor_exposes_root_binding_evidence_with_exact_identity_references(
+    runner_authority,
+) -> None:
+    _host, consumer, service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    record = consumer._runner_records[id(permit)]
+    evidence = getattr(executor, "binding_evidence", None)
+
+    assert evidence is not None
+    assert type(evidence) is getattr(
+        runner, "RootDynamicTeamleadRunnerBindingEvidence", None
+    )
+    assert record.evidence is evidence
+    assert evidence.executor_identity is executor
+    assert evidence.context_identity is context
+    assert evidence.context_identity is consumer._context
+    assert evidence.snapshot_identity is context.snapshot
+    assert evidence.snapshot_identity is consumer._context.snapshot
+    assert evidence.release_identity is service._release
+    assert not {
+        field.name
+        for field in dataclasses.fields(evidence)
+    } & {
+        "permit",
+        "receipt",
+        "fd",
+        "credential",
+        "consumer",
+        "ledger",
+        "callback",
+        "operations",
+    }
+
+    with pytest.raises(AttributeError):
+        executor.binding_evidence = evidence
+
+
+@pytest.mark.parametrize("identity", ("executor", "context", "snapshot", "release"))
+def test_executor_rejects_forged_binding_evidence_before_operation(
+    runner_authority,
+    identity: str,
+) -> None:
+    _host, consumer, service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    original = getattr(executor, "binding_evidence", None)
+    assert original is not None
+    forged = object.__new__(type(original))
+    values = {
+        "executor_identity": original.executor_identity,
+        "context_identity": original.context_identity,
+        "snapshot_identity": original.snapshot_identity,
+        "release_identity": original.release_identity,
+    }
+    values[identity + "_identity"] = object()
+    for name, value in values.items():
+        object.__setattr__(forged, name, value)
+    object.__setattr__(executor, "_binding_evidence", forged)
+
+    with pytest.raises(RootSystemBusError):
+        executor.execute_dynamic_teamlead_runner(runner_plan(context))
+
+    assert operations.calls == []
+    assert not consumer._runner_records[id(permit)].terminal
+
+
+@pytest.mark.parametrize("identity", ("executor", "context", "snapshot", "release"))
+def test_executor_rejects_other_bound_identity_before_operation(
+    runner_authority,
+    identity: str,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    _other_host, other_consumer, _other_service, _other_context = (
+        offline_runner_authority()
+    )
+    try:
+        _other_permit, other_executor = other_consumer.issue_dynamic_teamlead_runner(
+            RecordingRunnerOperations()
+        )
+        other_evidence = other_executor.binding_evidence
+        forged = object.__new__(type(other_evidence))
+        values = {
+            "executor_identity": executor,
+            "context_identity": consumer._context,
+            "snapshot_identity": consumer._context.snapshot,
+            "release_identity": consumer._bound_service._release,
+        }
+        values[identity + "_identity"] = getattr(
+            other_evidence, identity + "_identity"
+        )
+        for name, value in values.items():
+            object.__setattr__(forged, name, value)
+        object.__setattr__(executor, "_binding_evidence", forged)
+
+        with pytest.raises(RootSystemBusError):
+            executor.execute_dynamic_teamlead_runner(runner_plan(context))
+    finally:
+        other_consumer.close()
+
+    assert operations.calls == []
+    assert not consumer._runner_records[id(permit)].terminal
+
+
+def test_executor_rejects_stolen_binding_evidence_before_operation(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    _permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    _other_host, other_consumer, _other_service, _other_context = (
+        offline_runner_authority()
+    )
+    try:
+        _other_permit, other_executor = other_consumer.issue_dynamic_teamlead_runner(
+            RecordingRunnerOperations()
+        )
+        object.__setattr__(
+            executor,
+            "_binding_evidence",
+            getattr(other_executor, "binding_evidence", None),
+        )
+
+        with pytest.raises(RootSystemBusError):
+            executor.execute_dynamic_teamlead_runner(runner_plan(context))
+    finally:
+        other_consumer.close()
+
+    assert operations.calls == []
+
+
+@pytest.mark.parametrize("operations", (object(), SimpleNamespace(execute=None)))
+def test_consumer_rejects_non_runner_operations_before_issuance(
+    runner_authority,
+    operations: object,
+) -> None:
+    _host, consumer, _service, _context = runner_authority
+    reattestations = consumer._operations.calls.count("pidfd_open")
+
+    with pytest.raises(RootSystemBusError):
+        consumer.issue_dynamic_teamlead_runner(operations)
+
+    assert consumer._operations.calls.count("pidfd_open") == reattestations
+
+
+def test_reconstructed_and_transplanted_permit_never_reaches_operation(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    permit_type = type(permit)
+    forged = object.__new__(permit_type)
+    for slot in permit_type.__slots__:
+        object.__setattr__(forged, slot, getattr(permit, slot))
+    executor_type = type(executor)
+    forged_executor = object.__new__(executor_type)
+    for slot in executor_type.__slots__:
+        value = forged if slot == "_permit" else getattr(executor, slot)
+        object.__setattr__(forged_executor, slot, value)
+
+    with pytest.raises(RootSystemBusError):
+        forged_executor.execute_dynamic_teamlead_runner(runner_plan(context))
+
+    assert operations.calls == []
+    assert executor.execute_dynamic_teamlead_runner(runner_plan(context)) is None
+    assert len(operations.calls) == 1
+
+
+def test_permit_state_attachment_transplant_and_terminal_reset_fail_closed(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    original_reference = permit.opaque_reference
+
+    for name in ("_token", "_binding", "_used", "_state", "_permit_state"):
+        with pytest.raises(AttributeError):
+            object.__setattr__(permit, name, object())
+
+    object.__setattr__(permit, "principal_diagnostic", "forged-principal")
+    object.__setattr__(permit, "identity_diagnostic", "forged-identity")
+    object.__setattr__(permit, "release_diagnostic", "forged-release")
+    for name in ("snapshot_generation", "policy_generation", "root_generation"):
+        object.__setattr__(permit, name, 1)
+    assert executor.execute_dynamic_teamlead_runner(runner_plan(context)) is None
+    object.__setattr__(permit, "opaque_reference", object())
+    object.__setattr__(permit, "opaque_reference", original_reference)
+
+    with pytest.raises(RootSystemBusError):
+        executor.execute_dynamic_teamlead_runner(runner_plan(context))
+    assert len(operations.calls) == 1
+
+
+def test_importable_fake_authorities_cannot_construct_executor(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, _context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    executor_type = type(executor)
+
+    class FakeLedger:
+        def consume(self, *_args: object) -> bool:
+            return True
+
+    class FakeIssuer:
+        def issue(self, *_args: object) -> object:
+            return permit
+
+    class FakeGate:
+        def claim(self, *_args: object) -> bool:
+            return True
+
+    for authority in (FakeLedger(), FakeIssuer(), FakeGate()):
+        with pytest.raises(TypeError):
+            executor_type(permit, operations, authority)
+    assert operations.calls == []
+
+
+def test_same_permit_transplanted_to_second_executor_is_rejected(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    other = object.__new__(type(executor))
+    for slot in type(executor).__slots__:
+        object.__setattr__(other, slot, getattr(executor, slot))
+
+    with pytest.raises(RootSystemBusError):
+        other.execute_dynamic_teamlead_runner(runner_plan(context))
+    assert executor.execute_dynamic_teamlead_runner(runner_plan(context)) is None
+    assert operations.calls == [(runner_plan(context), permit)]
+
+
+def test_concurrent_calls_claim_once_before_operation(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = BlockingRunnerOperations()
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    plan = runner_plan(context)
+    results: list[object] = []
+
+    def execute() -> None:
+        try:
+            results.append(executor.execute_dynamic_teamlead_runner(plan))
+        except Exception as exc:
+            results.append(exc)
+
+    first = Thread(target=execute)
+    second = Thread(target=execute)
+    first.start()
+    assert operations.entered.wait(5)
+    second.start()
+    second.join(timeout=5)
+    operations.release.set()
+    first.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(operations.calls) == 1
+    assert operations.calls[0] == (plan, permit)
+    assert sum(result is None for result in results) == 1
+    assert sum(type(result) is RootSystemBusError for result in results) == 1
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ("release", "identity", "principal", "snapshot", "policy", "root_generation"),
+)
+def test_executor_rejects_canonical_binding_mismatch_before_operation(
+    runner_authority,
+    mismatch: str,
+) -> None:
+    host, consumer, service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    _permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    plan = runner_plan(context)
+
+    if mismatch == "release":
+        object.__setattr__(
+            service, "_release", replace(service._release, release_id="0.11.1")
+        )
+    elif mismatch == "identity":
+        object.__setattr__(
+            context.identity, "executable_fingerprint", "e" * 64
+        )
+    elif mismatch == "principal":
+        object.__setattr__(context.expected_principal, "cgroup_ino", 11)
+    elif mismatch == "snapshot":
+        object.__setattr__(context.snapshot, "generation", 14)
+    elif mismatch == "policy":
+        object.__setattr__(context.identity, "policy_generation", 10)
+    else:
+        object.__setattr__(host, "_host_generation", 2)
+
+    with pytest.raises(RootSystemBusError):
+        executor.execute_dynamic_teamlead_runner(plan)
+    assert operations.calls == []
+
+
+def test_operation_exception_is_terminal_and_never_retried(
+    runner_authority,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    failure = RuntimeError("private operation failure")
+    operations = RecordingRunnerOperations(failure)
+    _permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    plan = runner_plan(context)
+
+    with pytest.raises(RuntimeError) as caught:
+        executor.execute_dynamic_teamlead_runner(plan)
+    assert caught.value is failure
+    with pytest.raises(RootSystemBusError):
+        executor.execute_dynamic_teamlead_runner(plan)
+    assert len(operations.calls) == 1
+
+
+def test_runner_issuance_does_not_reuse_copy_or_claim_start_grant(
+    runner_authority,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _host, consumer, _service, context = runner_authority
+    operations = RecordingRunnerOperations()
+    start_claims = 0
+    start_issues = 0
+
+    def unexpected_claim(_state: object) -> bool:
+        nonlocal start_claims
+        start_claims += 1
+        return True
+
+    def unexpected_issue(_binding: object) -> object:
+        nonlocal start_issues
+        start_issues += 1
+        return object()
+
+    monkeypatch.setattr(runtime._StartGrantState, "claim", unexpected_claim)
+    monkeypatch.setattr(runtime, "_issue_start_grant", unexpected_issue)
+
+    permit, executor = consumer.issue_dynamic_teamlead_runner(operations)
+    assert type(permit.opaque_reference) is object
+    assert executor.execute_dynamic_teamlead_runner(runner_plan(context)) is None
+    assert start_claims == 0
+    assert start_issues == 0
+    assert len(operations.calls) == 1
 
 
 def test_trusted_consumer_composes_r2b_to_r2a_with_same_ownership_once(
@@ -2537,3 +3189,575 @@ def test_real_pidfd_proc_cgroup_systemd_selinux_negative_has_no_fd_leak() -> Non
         child.stdin.write(b"x")
         child.stdin.close()
         child.wait(timeout=5)
+
+
+def test_consumer_issues_ledger_owned_start_composition_without_runtime_effect(
+    runner_authority,
+) -> None:
+    _host, consumer, service, trusted = runner_authority
+    context, registry, broker, store, exchange = composition_inputs(consumer, service)
+    operations = RecordingRunnerOperations()
+
+    composition = consumer.issue_root_owned_dynamic_teamlead_start_composition(
+        context,
+        registry,
+        broker,
+        operations,
+    )
+    record = consumer._runner_records[id(composition.executor._permit)]
+
+    assert composition.request is context.request
+    assert composition.registry_operations is registry
+    assert composition.broker_operations is broker
+    assert composition.executor is record.executor
+    assert composition.evidence is record.evidence
+    assert composition.context_identity is context
+    assert composition.snapshot_identity is trusted.snapshot
+    assert composition.release_identity is service._release
+    assert record.composition is composition
+    assert composition.executor.binding_evidence is composition.evidence
+    assert store.load_calls == 0
+    assert store.commit_calls == 0
+    assert exchange.exchange_calls == 0
+    assert operations.calls == []
+
+
+def test_root_control_composes_issued_start_and_calls_builder_then_start_once(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_operations = reattest_operations()
+    consumer_operations.alive *= 2
+    consumer_operations.proc *= 2
+    consumer_operations.stats *= 2
+    consumer_operations.units *= 2
+    _host, _resolver, _provider, _operations, _boundary, consumer, service = (
+        _trusted_service(private_bus, operations=consumer_operations)
+    )
+    service._handle_start(":1.1")
+    context, registry, broker, store, exchange = composition_inputs(consumer, service)
+    runner_operations = RecordingRunnerOperations()
+    issued: list[object] = []
+    built: list[object] = []
+    started: list[object] = []
+    real_builder = system_bus.build_root_owned_dynamic_teamlead_start_port
+
+    def record_builder(composition: object) -> object:
+        issued.append(composition)
+        port = real_builder(composition)
+        built.append(port)
+        return port
+
+    def record_start(port: object) -> dict[str, int | str]:
+        started.append(port)
+        return {
+            "schema_version": 1,
+            "status": "started",
+            "raw_output": "not_returned",
+        }
+
+    monkeypatch.setattr(
+        system_bus,
+        "build_root_owned_dynamic_teamlead_start_port",
+        record_builder,
+    )
+    monkeypatch.setattr(system_bus, "dynamic_teamlead_start", record_start)
+    control = _RootDynamicTeamleadStartControl(
+        consumer,
+        context,
+        registry,
+        broker,
+        runner_operations,
+    )
+
+    try:
+        assert control.start_dynamic_teamlead() == {
+            "schema_version": 1,
+            "status": "started",
+            "raw_output": "not_returned",
+        }
+        assert len(issued) == len(built) == len(started) == 1
+        assert started[0] is built[0]
+        assert issued[0] is consumer._runner_records[
+            id(issued[0].executor._permit)
+        ].composition
+        assert store.load_calls == 0
+        assert store.commit_calls == 0
+        assert exchange.exchange_calls == 0
+        assert runner_operations.calls == []
+        assert all(
+            getattr(control, field) is None
+            for field in (
+                "_consumer",
+                "_context",
+                "_registry_operations",
+                "_broker_operations",
+                "_operations",
+            )
+        )
+    finally:
+        service.close()
+
+
+def test_root_control_rejects_transfer_before_and_after_original_burn(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_operations = reattest_operations()
+    consumer_operations.alive *= 2
+    consumer_operations.proc *= 2
+    consumer_operations.stats *= 2
+    consumer_operations.units *= 2
+    _host, _resolver, _provider, _operations, _boundary, consumer, service = (
+        _trusted_service(private_bus, operations=consumer_operations)
+    )
+    service._handle_start(":1.1")
+    context, registry, broker, _store, _exchange = composition_inputs(
+        consumer, service
+    )
+    runner_operations = RecordingRunnerOperations()
+    control = _RootDynamicTeamleadStartControl(
+        consumer,
+        context,
+        registry,
+        broker,
+        runner_operations,
+    )
+    transfers = (
+        copy.copy,
+        copy.deepcopy,
+        pickle.dumps,
+        lambda value: value.__reduce_ex__(4),
+    )
+    expected_started = {
+        "schema_version": 1,
+        "status": "started",
+        "raw_output": "not_returned",
+    }
+    expected_unavailable = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "reason": "dynamic_teamlead_runtime_unavailable",
+        "raw_output": "not_returned",
+    }
+    monkeypatch.setattr(
+        system_bus,
+        "dynamic_teamlead_start",
+        lambda _port: expected_started,
+    )
+
+    try:
+        for transfer in transfers:
+            with pytest.raises(TypeError):
+                transfer(control)
+        assert repr(control) == "<_RootDynamicTeamleadStartControl redacted>"
+        assert str(control) == repr(control)
+        assert control.start_dynamic_teamlead() == expected_started
+        assert all(
+            getattr(control, field) is None
+            for field in (
+                "_consumer",
+                "_context",
+                "_registry_operations",
+                "_broker_operations",
+                "_operations",
+            )
+        )
+        for transfer in transfers:
+            with pytest.raises(TypeError):
+                transfer(control)
+        assert control.start_dynamic_teamlead() == expected_unavailable
+    finally:
+        service.close()
+
+
+def test_root_sparse_normalizer_returns_fresh_canonical_result() -> None:
+    producer_result = {
+        "schema_version": 1,
+        "status": "started",
+        "raw_output": "not_returned",
+    }
+    expected = {
+        "schema_version": 1,
+        "status": "started",
+        "raw_output": "not_returned",
+    }
+
+    first = system_bus._normalize_dynamic_teamlead_result(producer_result)
+    second = system_bus._normalize_dynamic_teamlead_result(producer_result)
+
+    assert first == expected
+    assert second == expected
+    assert first is not second
+    assert first is not producer_result
+    assert second is not producer_result
+    producer_result["raw_output"] = "private detail"
+    assert first == expected
+    assert second == expected
+
+
+def test_private_control2_result_constructors_are_zero_argument_and_exact() -> None:
+    started = getattr(system_bus, "_started_dynamic_teamlead_control2_result", None)
+    unavailable = getattr(
+        system_bus, "_unavailable_dynamic_teamlead_control2_result", None
+    )
+    assert callable(started)
+    assert callable(unavailable)
+    assert inspect.signature(started).parameters == {}
+    assert inspect.signature(unavailable).parameters == {}
+    assert started() == (2, "started", "none")
+    result = unavailable()
+    assert type(result) is tuple
+    assert len(result) == 3
+    assert result[0] == 2
+    assert result[1] == "unavailable"
+    assert result[2] == "dynamic_teamlead_runtime_unavailable"
+    assert all(type(value) in (int, str) for value in result)
+
+
+def test_control2_result_codec_has_no_runtime_or_dbus_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def tripwire(*_args: object, **_kwargs: object) -> None:
+        calls.append("side_effect")
+        raise AssertionError("Control2 result codec must be pure")
+
+    for name in (
+        "dynamic_teamlead_start",
+        "build_root_owned_dynamic_teamlead_start_port",
+    ):
+        monkeypatch.setattr(system_bus, name, tripwire)
+    monkeypatch.setattr(system_bus.dbus, "SystemBus", tripwire)
+    monkeypatch.setattr(system_bus.dbus.service, "BusName", tripwire)
+    monkeypatch.setattr(system_bus, "TrustedPrincipalGrantConsumer", tripwire)
+    monkeypatch.setattr(system_bus, "FleetV2RegistryOperations", tripwire)
+    monkeypatch.setattr(system_bus, "SeqpacketBrokerClientOperations", tripwire)
+
+    assert system_bus._started_dynamic_teamlead_control2_result() == (
+        2,
+        "started",
+        "none",
+    )
+    assert system_bus._unavailable_dynamic_teamlead_control2_result() == (
+        2,
+        "unavailable",
+        "dynamic_teamlead_runtime_unavailable",
+    )
+    assert calls == []
+
+
+def test_control1_source_and_registration_surface_remain_p1_identical() -> None:
+    source_path = Path(system_bus.__file__)
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    service = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "HomeBrokerControlService"
+    )
+    service_source = ast.get_source_segment(source, service)
+    assert service_source is not None
+    assert hashlib.sha256((service_source + "\n").encode("utf-8")).hexdigest() == (
+        "049b3e859bc86893275be81b3ae2f922e3750fe1ec24e52539b6c86202ac33bf"
+    )
+    control1_lines = "".join(
+        line
+        for line in source.splitlines(keepends=True)
+        if line.startswith(("BUS_NAME =", "BUS_PATH =", "BUS_INTERFACE =", "BUS_METHOD ="))
+    )
+    assert hashlib.sha256(control1_lines.encode("utf-8")).hexdigest() == (
+        "d0400c6d843724d2abd44ae9f4d9737e038c88795a88044684bc7b0a0625b386"
+    )
+
+    method_decorators = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "dbus"
+        and node.func.value.attr == "service"
+        and node.func.attr == "method"
+    ]
+    bus_name_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "dbus"
+        and node.func.value.attr == "service"
+        and node.func.attr == "BusName"
+    ]
+    assert len(method_decorators) == 1
+    assert len(bus_name_calls) == 1
+    assert "HomeBrokerControl2" not in source
+    assert "serve_mcp" not in source
+
+
+@pytest.mark.parametrize("failure", ("issuer", "builder", "start"))
+def test_root_control_failure_is_sparse_terminal_and_drops_inputs(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    consumer_operations = reattest_operations()
+    consumer_operations.alive *= 2
+    consumer_operations.proc *= 2
+    consumer_operations.stats *= 2
+    consumer_operations.units *= 2
+    _host, _resolver, _provider, _operations, _boundary, consumer, service = (
+        _trusted_service(private_bus, operations=consumer_operations)
+    )
+    service._handle_start(":1.1")
+    context, registry, broker, _store, _exchange = composition_inputs(consumer, service)
+    runner_operations = RecordingRunnerOperations()
+    if failure == "issuer":
+        original_issue = TrustedPrincipalGrantConsumer.issue_root_owned_dynamic_teamlead_start_composition
+
+        def issue(
+            bound_consumer: TrustedPrincipalGrantConsumer,
+            *_args: object,
+            **_kwargs: object,
+        ) -> object:
+            if bound_consumer is consumer:
+                raise RuntimeError("issuer detail")
+            return original_issue(bound_consumer, *_args, **_kwargs)
+
+        monkeypatch.setattr(
+            TrustedPrincipalGrantConsumer,
+            "issue_root_owned_dynamic_teamlead_start_composition",
+            issue,
+        )
+    elif failure == "builder":
+
+        def build(_composition: object) -> object:
+            raise RuntimeError("builder detail")
+
+        monkeypatch.setattr(
+            system_bus,
+            "build_root_owned_dynamic_teamlead_start_port",
+            build,
+        )
+    else:
+
+        def start(_port: object) -> object:
+            raise RuntimeError("runner detail")
+
+        monkeypatch.setattr(system_bus, "dynamic_teamlead_start", start)
+    control = _RootDynamicTeamleadStartControl(
+        consumer,
+        context,
+        registry,
+        broker,
+        runner_operations,
+    )
+
+    try:
+        expected = {
+            "schema_version": 1,
+            "status": "unavailable",
+            "reason": "dynamic_teamlead_runtime_unavailable",
+            "raw_output": "not_returned",
+        }
+        assert control.start_dynamic_teamlead() == expected
+        assert control.start_dynamic_teamlead() == expected
+        assert all(
+            getattr(control, field) is None
+            for field in (
+                "_consumer",
+                "_context",
+                "_registry_operations",
+                "_broker_operations",
+                "_operations",
+            )
+        )
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "inactive",
+        "closed",
+        "missing_receipt",
+        "terminal_receipt",
+        "host_generation",
+        "ownership",
+        "cross_release",
+        "broker_release",
+        "occupied_runner",
+        "terminal_runner",
+    ),
+)
+def test_root_control_rejects_lifecycle_and_identity_gates_before_issuance(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    consumer_operations = reattest_operations()
+    consumer_operations.alive *= 2
+    consumer_operations.proc *= 2
+    consumer_operations.stats *= 2
+    consumer_operations.units *= 2
+    _host, _resolver, _provider, _operations, boundary, consumer, service = (
+        _trusted_service(private_bus, operations=consumer_operations)
+    )
+    service._handle_start(":1.1")
+    context, registry, broker, _store, exchange = composition_inputs(consumer, service)
+    runner_operations = RecordingRunnerOperations()
+    issue_calls = 0
+    original_issue = TrustedPrincipalGrantConsumer.issue_root_owned_dynamic_teamlead_start_composition
+
+    def record_issue(
+        bound_consumer: TrustedPrincipalGrantConsumer,
+        *_args: object,
+        **_kwargs: object,
+    ) -> object:
+        nonlocal issue_calls
+        issue_calls += 1
+        return original_issue(bound_consumer, *_args, **_kwargs)
+
+    monkeypatch.setattr(
+        TrustedPrincipalGrantConsumer,
+        "issue_root_owned_dynamic_teamlead_start_composition",
+        record_issue,
+    )
+    active = consumer._active_start
+    assert active is not None
+    receipt_record = boundary._receipts[id(active.receipt)]
+    original_ownership = active.ownership
+    runner_record = None
+    if mutation == "inactive":
+        service._active = False
+    elif mutation == "closed":
+        service._closed = True
+    elif mutation == "missing_receipt":
+        consumer._active_start = None
+    elif mutation == "terminal_receipt":
+        receipt_record.terminal = True
+    elif mutation == "host_generation":
+        service._host._host_generation += 1
+    elif mutation == "ownership":
+        ownership = object.__new__(RootRuntimeActivityOwnership)
+        object.__setattr__(ownership, "host_generation", original_ownership.host_generation)
+        object.__setattr__(ownership, "begin_epoch", original_ownership.begin_epoch)
+        object.__setattr__(active, "ownership", ownership)
+    elif mutation == "cross_release":
+        context = replace(context, release=replace(service._release))
+    elif mutation == "broker_release":
+        broker = SeqpacketBrokerClientOperations(
+            exchange,
+            a3_context_identity=context,
+            release_identity=replace(service._release),
+        )
+    else:
+        _permit, _executor = consumer.issue_dynamic_teamlead_runner(
+            RecordingRunnerOperations()
+        )
+        runner_record = consumer._runner_records[id(_permit)]
+        if mutation == "terminal_runner":
+            runner_record.terminal = True
+
+    monkeypatch.setattr(
+        system_bus,
+        "dynamic_teamlead_start",
+        lambda _port: {
+            "schema_version": 1,
+            "status": "started",
+            "raw_output": "not_returned",
+        },
+    )
+    control = _RootDynamicTeamleadStartControl(
+        consumer,
+        context,
+        registry,
+        broker,
+        runner_operations,
+    )
+
+    try:
+        assert control.start_dynamic_teamlead() == {
+            "schema_version": 1,
+            "status": "unavailable",
+            "reason": "dynamic_teamlead_runtime_unavailable",
+            "raw_output": "not_returned",
+        }
+        assert issue_calls == 0
+        assert runner_operations.calls == []
+    finally:
+        service._closed = False
+        service._active = True
+        consumer._active_start = active
+        object.__setattr__(active, "ownership", original_ownership)
+        receipt_record.terminal = False
+        if mutation == "host_generation":
+            service._host._host_generation -= 1
+        service.close()
+
+
+def test_second_start_composition_issuance_fails_for_same_active_record(
+    runner_authority,
+) -> None:
+    _host, consumer, service, _trusted = runner_authority
+    context, registry, broker, _store, _exchange = composition_inputs(consumer, service)
+    consumer.issue_root_owned_dynamic_teamlead_start_composition(
+        context,
+        registry,
+        broker,
+        RecordingRunnerOperations(),
+    )
+
+    with pytest.raises(RootSystemBusError):
+        consumer.issue_root_owned_dynamic_teamlead_start_composition(
+            context,
+            registry,
+            broker,
+            RecordingRunnerOperations(),
+        )
+
+
+@pytest.mark.parametrize("mismatch", ("context", "snapshot", "broker_context", "broker_release", "operations"))
+def test_composition_issuance_rejects_identity_or_operations_mismatch(
+    runner_authority,
+    mismatch: str,
+) -> None:
+    _host, consumer, service, _trusted = runner_authority
+    context, registry, broker, store, exchange = composition_inputs(consumer, service)
+    if mismatch == "context":
+        context = replace(context, context=replace(context.context))
+    elif mismatch == "snapshot":
+        foreign_snapshot = replace(context.context.snapshot)
+        registry = FleetV2RegistryOperations(NoIoRegistryStore(), foreign_snapshot)
+    elif mismatch == "broker_context":
+        broker = SeqpacketBrokerClientOperations(
+            exchange,
+            a3_context_identity=object(),
+            release_identity=service._release,
+        )
+    elif mismatch == "broker_release":
+        broker = SeqpacketBrokerClientOperations(
+            exchange,
+            a3_context_identity=context,
+            release_identity=replace(service._release),
+        )
+    else:
+        operations = object()
+
+    with pytest.raises(RootSystemBusError):
+        consumer.issue_root_owned_dynamic_teamlead_start_composition(
+            context,
+            registry,
+            broker,
+            operations if mismatch == "operations" else RecordingRunnerOperations(),
+        )
+
+    assert store.load_calls == 0
+    assert store.commit_calls == 0
+    assert exchange.exchange_calls == 0
