@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from codex_master.hive.indexed_test_inventory import PythonTestIndexBuilder
+from codex_master.hive.javascript_test_inventory import JavaScriptTestIndexBuilder
 from codex_master.hive.evidence_runner import TestEvidenceRunner as EvidenceRunner
 from codex_master.hive.evidence_store import TestStatusStore as StatusStore
 
@@ -89,3 +90,33 @@ def test_runner_rejects_unknown_test_without_starting_process(tmp_path: Path) ->
             "pytest:tests/test_example.py:test_missing",
             expected_index_digest=index.digest,
         )
+
+
+def test_runner_executes_one_exact_indexed_node_test(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src/example.mjs").write_text(
+        "export function add(left, right) { return left + right; }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests/test-example.mjs").write_text(
+        'import assert from "node:assert/strict";\n'
+        'import test from "node:test";\n'
+        'import { add } from "../src/example.mjs";\n'
+        'test("add contract", () => { assert.equal(add(1, 2), 3); });\n',
+        encoding="utf-8",
+    )
+    function_id = "javascript:src/example.mjs:add"
+    test_id = "node_test:tests/test-example.mjs:add contract"
+    index = JavaScriptTestIndexBuilder(tmp_path).build(
+        repository_id="example",
+        generation=1,
+        source_paths=("src/example.mjs",),
+        test_paths=("tests/test-example.mjs",),
+        bindings={function_id: (test_id,)},
+    )
+    store = StatusStore(tmp_path / ".state")
+
+    result = runner(tmp_path, store).run(index, test_id, expected_index_digest=index.digest)
+
+    assert (result.result, result.reason_code) == ("passed", "test.run_passed")

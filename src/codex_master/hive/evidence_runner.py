@@ -7,14 +7,16 @@ import importlib.metadata
 import os
 from pathlib import Path
 import platform
+import re
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
 import time
 
 from codex_master.hive.evidence_receipts import EvidenceReceiptV1
-from codex_master.hive.indexed_tests import TestIndexV1
+from codex_master.hive.indexed_tests import TestEntryV1, TestIndexV1
 from codex_master.hive.evidence_planner import PlanRequestV1, evidence_context
 from codex_master.hive.evidence_store import TestStatusStore
 
@@ -62,8 +64,24 @@ class TestEvidenceRunner:
             pytest_version = importlib.metadata.version("pytest")
         except importlib.metadata.PackageNotFoundError:
             pytest_version = "unavailable"
+        self._node_path = shutil.which("node")
+        node_version = "unavailable"
+        if self._node_path is not None:
+            try:
+                probe = subprocess.run(
+                    [self._node_path, "--version"],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+                if probe.returncode == 0 and len(probe.stdout) <= 128:
+                    node_version = probe.stdout.decode("ascii", errors="replace").strip()
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         self._runner_version_digest = _digest_text(
-            f"pytest:{pytest_version};python:{platform.python_version()}"
+            f"pytest:{pytest_version};python:{platform.python_version()};node:{node_version}"
         )
 
     @property
@@ -95,7 +113,7 @@ class TestEvidenceRunner:
         if test_id not in tests:
             raise ValueError("test.test_uncollectable")
         test = tests[test_id]
-        if test.runner != "pytest":
+        if test.runner not in {"pytest", "node_test"}:
             raise ValueError("test.run_blocked")
         target = (self._root / test.path).resolve(strict=True)
         try:
@@ -121,7 +139,7 @@ class TestEvidenceRunner:
         attempt_id = "attempt-" + secrets.token_hex(16)
         started_at = _utc_now()
         started_ns = time.monotonic_ns()
-        result, reason = self._execute(test.path, test.node_id, test.timeout_seconds)
+        result, reason = self._execute(test)
         finished_ns = time.monotonic_ns()
         finished_at = _utc_now()
         ttl = _TTL_SECONDS[test.cooldown_class] if result == "passed" else 0
@@ -152,8 +170,18 @@ class TestEvidenceRunner:
         self._store.put(receipt)
         return receipt
 
-    def _execute(self, path: str, node_id: str, timeout_seconds: int) -> tuple[str, str]:
-        argv = [sys.executable, "-m", "pytest", "-q", f"{path}::{node_id}"]
+    def _execute(self, test: TestEntryV1) -> tuple[str, str]:
+        if test.runner == "pytest":
+            argv = [sys.executable, "-m", "pytest", "-q", f"{test.path}::{test.node_id}"]
+        elif self._node_path is not None:
+            argv = [
+                self._node_path,
+                "--test",
+                f"--test-name-pattern=^{re.escape(test.node_id)}$",
+                test.path,
+            ]
+        else:
+            return "blocked", "test.run_blocked"
         environment = {
             "PATH": os.defpath,
             "PYTHONPATH": os.pathsep.join((str(self._root / "src"), str(self._root))),
@@ -173,7 +201,7 @@ class TestEvidenceRunner:
         except OSError:
             return "blocked", "test.run_blocked"
         try:
-            return_code = process.wait(timeout=timeout_seconds)
+            return_code = process.wait(timeout=test.timeout_seconds)
         except subprocess.TimeoutExpired:
             self._terminate_own_group(process)
             return "blocked", "test.run_timeout"
