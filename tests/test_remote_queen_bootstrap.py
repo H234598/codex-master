@@ -54,12 +54,12 @@ def test_parse_ssh_target_rejects_unsafe_targets(value):
             (
                 "ca-certificates",
                 "curl",
-                "dbus-python3",
                 "gcc",
                 "git",
                 "glib2-devel",
                 "pkgconf-pkg-config",
                 "python3",
+                "python3-dbus",
                 "python3-devel",
                 "python3-gobject",
                 "syncthing",
@@ -106,6 +106,9 @@ def test_package_plan_for_supported_hosts(
         expected = rb.DNF_PACKAGES if package_manager == "dnf" else rb.APT_PACKAGES
     assert package_plan.packages == expected
     assert package_plan.packages == tuple(sorted(set(package_plan.packages)))
+    if package_manager == "dnf":
+        assert package_plan.packages.count("python3-dbus") == 1
+        assert "dbus-python3" not in package_plan.packages
 
 
 @pytest.mark.parametrize(
@@ -126,6 +129,79 @@ def test_package_plan_for_rejects_unsupported_hosts(
         rb.package_plan_for(host_facts)
 
     assert exc_info.value.code == "RQ_E_HOST_UNSUPPORTED"
+
+
+@pytest.mark.parametrize(
+    "scope",
+    ["plan", {"plan": True}, {"plan"}, iter(("plan",)), None],
+)
+def test_queen_binding_rejects_non_sequence_scope(scope):
+    with pytest.raises(RemoteQueenBootstrapError) as exc_info:
+        rb.QueenBindingV1(
+            repo_id="codex-master",
+            topic_id="g18-vertex-overflow",
+            role="queen",
+            scope=scope,
+        )
+
+    assert exc_info.value.code == "RQ_E_PLAN_INCONSISTENT"
+
+
+def test_queen_binding_canonicalizes_list_scope_to_tuple():
+    binding = rb.QueenBindingV1(
+        repo_id="codex-master",
+        topic_id="g18-vertex-overflow",
+        role="queen",
+        scope=["plan", "exclusive-g18-files"],
+    )
+
+    assert binding.scope == ("plan", "exclusive-g18-files")
+
+
+@pytest.mark.parametrize("generation", ["", None, 1])
+def test_manifest_generation_rejects_empty_or_non_string_generation(generation):
+    with pytest.raises(RemoteQueenBootstrapError) as exc_info:
+        rb.ManifestGenerationV1(generation=generation, sha256="a" * 64)
+
+    assert exc_info.value.code == "RQ_E_PLAN_INCONSISTENT"
+
+
+@pytest.mark.parametrize(
+    "sha256",
+    ["a" * 63, "A" * 64, "sha256:" + "a" * 64, 1],
+)
+def test_manifest_generation_rejects_malformed_sha256(sha256):
+    with pytest.raises(RemoteQueenBootstrapError) as exc_info:
+        rb.ManifestGenerationV1(
+            generation="rq-bootstrap-2026-08-29",
+            sha256=sha256,
+        )
+
+    assert exc_info.value.code == "RQ_E_PLAN_INCONSISTENT"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("distribution_id", []),
+        ("distribution_version", None),
+        ("architecture", 1),
+        ("package_manager", {}),
+    ],
+)
+def test_package_plan_rejects_malformed_host_facts(field, value):
+    values = {
+        "distribution_id": "fedora",
+        "distribution_version": "41",
+        "architecture": "x86_64",
+        "package_manager": "dnf",
+    }
+    values[field] = value
+
+    with pytest.raises(RemoteQueenBootstrapError) as exc_info:
+        rb.package_plan_for(rb.HostFactsV1(**values))
+
+    assert exc_info.value.code == "RQ_E_PLAN_INCONSISTENT"
 
 
 OBJECT_IDS = (
@@ -151,9 +227,10 @@ def _object_states(generations, owners=None):
     )
 
 
-def _plan_for(states):
+def _plan_for(states, ssh_target=None):
     return rb.build_remote_queen_bootstrap_plan(
-        ssh_target=SshTargetV1(user="queen", host="host.example.net"),
+        ssh_target=ssh_target
+        or SshTargetV1(user="queen", host="host.example.net"),
         host_facts=rb.HostFactsV1(
             distribution_id="fedora",
             distribution_version="41",
@@ -172,6 +249,21 @@ def _plan_for(states):
             scope=("plan", "exclusive-g18-files"),
         ),
     )
+
+
+@pytest.mark.parametrize("object_id", [[], {}, None, ""])
+def test_build_plan_rejects_malformed_object_id(object_id):
+    states = list(_object_states({item: None for item in OBJECT_IDS}))
+    states[0] = rb.ManagedObjectStateV1(
+        object_id=object_id,
+        owner=None,
+        generation=None,
+    )
+
+    with pytest.raises(RemoteQueenBootstrapError) as exc_info:
+        _plan_for(tuple(states))
+
+    assert exc_info.value.code == "RQ_E_PLAN_INCONSISTENT"
 
 
 def test_build_plan_for_complete_state_has_no_steps():
@@ -263,19 +355,17 @@ def test_build_plan_rejects_foreign_owner():
     assert exc_info.value.code == "RQ_E_FOREIGN_STATE"
 
 
-def test_build_plan_digest_is_stable_and_has_canonical_shape():
+def test_build_plan_digest_matches_fixed_complete_host_vector():
     states = _object_states(
         {object_id: DESIRED_GENERATION for object_id in OBJECT_IDS},
         {object_id: "remote-queen-bootstrap" for object_id in OBJECT_IDS},
     )
 
-    first = _plan_for(states)
-    second = _plan_for(states)
+    plan = _plan_for(
+        states,
+        ssh_target=SshTargetV1(user="queen", host="example.test"),
+    )
 
-    assert first.plan_digest == second.plan_digest
-    assert first.plan_digest.startswith("sha256:")
-    assert len(first.plan_digest.removeprefix("sha256:")) == 64
-    assert all(
-        character in "0123456789abcdef"
-        for character in first.plan_digest.removeprefix("sha256:")
+    assert plan.plan_digest == (
+        "sha256:446e9456ee948ffc719d2db7c7d0dee960a54d8942ec19a52dae5a7bd2385659"
     )

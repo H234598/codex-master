@@ -33,6 +33,18 @@ class HostFactsV1:
     architecture: str
     package_manager: str
 
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str)
+            for value in (
+                self.distribution_id,
+                self.distribution_version,
+                self.architecture,
+                self.package_manager,
+            )
+        ):
+            raise RemoteQueenBootstrapError("RQ_E_PLAN_INCONSISTENT")
+
 
 @dataclass(frozen=True, slots=True)
 class PackagePlanV1:
@@ -43,12 +55,12 @@ class PackagePlanV1:
 DNF_PACKAGES = (
     "ca-certificates",
     "curl",
-    "dbus-python3",
     "gcc",
     "git",
     "glib2-devel",
     "pkgconf-pkg-config",
     "python3",
+    "python3-dbus",
     "python3-devel",
     "python3-gobject",
     "syncthing",
@@ -72,6 +84,8 @@ APT_PACKAGES = (
 
 
 def package_plan_for(host_facts: HostFactsV1) -> PackagePlanV1:
+    if not isinstance(host_facts, HostFactsV1):
+        raise RemoteQueenBootstrapError("RQ_E_PLAN_INCONSISTENT")
     if host_facts.package_manager == "dnf" and host_facts.distribution_id in {
         "fedora",
         "rhel",
@@ -92,6 +106,15 @@ class ManifestGenerationV1:
     generation: str
     sha256: str
 
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.generation, str)
+            or not self.generation
+            or not isinstance(self.sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.sha256) is None
+        ):
+            raise RemoteQueenBootstrapError("RQ_E_PLAN_INCONSISTENT")
+
 
 @dataclass(frozen=True, slots=True)
 class ManagedObjectStateV1:
@@ -108,10 +131,9 @@ class QueenBindingV1:
     scope: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        try:
-            scope = tuple(self.scope)
-        except TypeError as error:
-            raise RemoteQueenBootstrapError("RQ_E_PLAN_INCONSISTENT") from error
+        if not isinstance(self.scope, (tuple, list)):
+            raise RemoteQueenBootstrapError("RQ_E_PLAN_INCONSISTENT")
+        scope = tuple(self.scope)
         object.__setattr__(self, "scope", scope)
         if (
             not isinstance(self.repo_id, str)
@@ -266,6 +288,8 @@ def _validate_object_states(
     by_id: dict[str, ManagedObjectStateV1] = {}
     for state in states:
         if not isinstance(state, ManagedObjectStateV1):
+            raise _inconsistent_plan()
+        if not isinstance(state.object_id, str) or not state.object_id:
             raise _inconsistent_plan()
         if state.object_id not in _OBJECT_ID_SET or state.object_id in by_id:
             raise _inconsistent_plan()

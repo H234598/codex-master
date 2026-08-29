@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from codex_master.remote_queen_bootstrap_cli import main
 
 
@@ -25,14 +27,19 @@ def test_plan_cli_does_not_mutate_fixture_and_prints_canonical_plan(capsys):
     assert fixture.read_bytes() == before
 
 
-def test_plan_cli_rejects_dangerous_ssh_target(capsys):
+@pytest.mark.parametrize(
+    "target",
+    ["-oProxyCommand=x", "-h", "--help", "--ProxyCommand=x"],
+)
+def test_plan_cli_rejects_option_like_ssh_target(target, capsys):
     exit_code, captured = _run_plan(
-        "-oProxyCommand=x", FIXTURE_DIR / "host-empty.json", capsys
+        target, FIXTURE_DIR / "host-empty.json", capsys
     )
 
     assert exit_code == 2
     assert captured.out == ""
-    assert "RQ_E_SSH_TARGET_INVALID" in captured.err
+    assert captured.err == "RQ_E_SSH_TARGET_INVALID\n"
+    assert target not in captured.err
 
 
 def test_plan_cli_rejects_contradictory_fixture_without_mutation(capsys):
@@ -45,3 +52,16 @@ def test_plan_cli_rejects_contradictory_fixture_without_mutation(capsys):
     assert captured.out == ""
     assert "RQ_E_PLAN_INCONSISTENT" in captured.err
     assert fixture.read_bytes() == before
+
+
+def test_plan_cli_rejects_malformed_object_id_without_traceback(tmp_path, capsys):
+    payload = json.loads((FIXTURE_DIR / "host-empty.json").read_text(encoding="utf-8"))
+    payload["object_states"][0]["object_id"] = []
+    fixture = tmp_path / "malformed.json"
+    fixture.write_text(json.dumps(payload), encoding="utf-8")
+
+    exit_code, captured = _run_plan("queen@example.test", fixture, capsys)
+
+    assert exit_code == 2
+    assert captured.out == ""
+    assert captured.err == "RQ_E_PLAN_INCONSISTENT\n"

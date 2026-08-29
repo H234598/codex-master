@@ -18,9 +18,12 @@ from .remote_queen_bootstrap import (
 
 class _TargetTolerantArgumentParser(argparse.ArgumentParser):
     def _parse_optional(self, arg_string):
-        if arg_string.startswith("-") and not arg_string.startswith("--"):
-            if arg_string not in self._option_string_actions:
-                return None
+        option_string = arg_string.split("=", 1)[0]
+        if (
+            arg_string.startswith("-")
+            and option_string not in self._option_string_actions
+        ):
+            return None
         return super()._parse_optional(arg_string)
 
 
@@ -30,8 +33,12 @@ def build_parser(
     parser = _TargetTolerantArgumentParser(
         prog="python -m codex_master.remote_queen_bootstrap_cli"
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    plan_parser = subparsers.add_parser("plan")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        parser_class=_TargetTolerantArgumentParser,
+    )
+    plan_parser = subparsers.add_parser("plan", add_help=False)
     plan_parser.add_argument("ssh_target", metavar="SSH_TARGET")
     plan_parser.add_argument("--fixture", required=True, type=Path)
     return parser
