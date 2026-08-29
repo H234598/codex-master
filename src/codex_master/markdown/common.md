@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":2,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":3,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -22,11 +22,18 @@ ausführbaren Test. Bei parametrisierten Tests oder Testmatrizen muss jede
 Funktion einen eigenen Fall besitzen. Bloße indirekte Ausführung ohne eine den
 Funktionsvertrag prüfende Assertion reicht nicht.
 
-Beim Prüfen gilt: so wenig Tests wie möglich, so viele wie nötig. Zuerst den
-kleinstmöglichen gezielten Test für die Funktion ausführen. Danach nur um
-betroffene Grenz-, Integrations- und Regressionstests erweitern. Vorgeschriebene
-Voll- und Release-Gates bleiben verbindlich und werden einmal am passenden Gate
-ausgeführt.
+Beim Bauen gilt zuerst: so wenig Testcode, Fixtures, Mocks und
+Test-Infrastruktur wie möglich, aber genug für den echten Funktionsvertrag.
+Tests müssen tatsächlich ausgeführt werden. Manuelle Prüfung oder bloßes Lesen
+ersetzt keinen Testlauf.
+
+Beim Auswählen und Ausführen gilt: so wenig Tests wie möglich, so viele wie
+nötig. Zuerst den kleinstmöglichen gezielten Test für die Funktion ausführen.
+Danach nur um betroffene Grenz-, Integrations- und Regressionstests erweitern.
+Ein vorhandenes grünes Testergebnis darf nur bei unveränderten relevanten Inputs
+und noch gültigem Evidence-Reuse-Fenster wiederverwendet werden. Andernfalls den
+Test neu ausführen. Vorgeschriebene Voll- und Release-Gates bleiben verbindlich
+und werden einmal am passenden Gate ausgeführt.
 
 ## Obsidian Annotation Marker
 

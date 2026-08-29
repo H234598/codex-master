@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 2
+    assert contract.generation == 3
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -161,7 +161,11 @@ def test_common_policy_requires_function_tests_and_minimal_test_execution() -> N
         "Jede produktive Funktion braucht mindestens einen eindeutig zugeordneten, ausführbaren Test",
         "jede Funktion einen eigenen Fall besitzen",
         "so wenig Tests wie möglich, so viele wie nötig",
+        "Testcode, Fixtures, Mocks und Test-Infrastruktur",
+        "Tests müssen tatsächlich ausgeführt werden",
+        "Manuelle Prüfung oder bloßes Lesen ersetzt keinen Testlauf",
         "Zuerst den kleinstmöglichen gezielten Test für die Funktion ausführen",
+        "nur bei unveränderten relevanten Inputs und noch gültigem Evidence-Reuse-Fenster",
         "Voll- und Release-Gates bleiben verbindlich",
     ]
 
