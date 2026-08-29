@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import hashlib
 import re
 from types import MappingProxyType
 from typing import Never, cast
@@ -82,6 +83,19 @@ _ARGUMENT_FIELDS = {
         "plan_id",
     ),
 }
+_OPERATION_ALIASES = {
+    "openai.auth-sync.plan": "openai.auth.plan",
+    "openai.auth-sync.apply": "openai.auth.apply",
+}
+_PLAN_ID_ARGUMENT_OPERATIONS = frozenset(
+    {
+        "openai.auth.apply",
+        "secret.ingress.create",
+        "google.oauth-client-import.apply",
+        "google.provision.apply",
+        "google.billing.apply",
+    }
+)
 _REQUEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -111,6 +125,15 @@ _OPERATION_STATES = frozenset(
     {"planned", "queued", "running", "partial", "succeeded", "failed", "blocked"}
 )
 _PROBLEM_SEVERITIES = frozenset({"info", "warning", "error", "critical"})
+_PROBLEM_TEMPLATES = {
+    "control.step_up_required": (
+        "warning",
+        "Step-up required",
+        "Additional authentication is required.",
+        "Operation is paused.",
+        "Complete step-up authentication.",
+    )
+}
 
 
 class AdminContractError(ValueError):
@@ -238,19 +261,30 @@ def _mapping(value: object, *, private: bool = False) -> Mapping[str, object]:
 def _arguments(operation: str, value: object) -> Mapping[str, object]:
     arguments = _mapping(value)
     fields = _ARGUMENT_FIELDS[operation]
-    if set(arguments) != set(fields):
+    allowed = set(fields)
+    if operation in _PLAN_ID_ARGUMENT_OPERATIONS:
+        allowed.add("plan_id")
+    if set(arguments) - allowed or not set(fields) <= set(arguments):
         _invalid()
     result = {
         field: _text(arguments[field])
         if field == "redirect_uri"
         else _token(arguments[field])
-        for field in fields
+        for field in arguments
     }
     if operation == "secret.ingress.create" and result["credential_kind"] not in {
         "openai.auth-json",
         "google.oauth-client",
+        "google-oauth-code",
+        "openai_auth_json",
+        "google_oauth_client_json",
     }:
         _invalid()
+    if operation == "secret.ingress.create":
+        result["credential_kind"] = {
+            "openai_auth_json": "openai.auth-json",
+            "google_oauth_client_json": "google.oauth-client",
+        }.get(result["credential_kind"], result["credential_kind"])
     return MappingProxyType(result)
 
 
@@ -274,6 +308,7 @@ class AdminRequestV1:
 
     def __post_init__(self) -> None:
         operation = _token(self.operation)
+        operation = _OPERATION_ALIASES.get(operation, operation)
         if operation not in _OPERATIONS:
             _invalid()
         object.__setattr__(self, "operation", operation)
@@ -289,7 +324,16 @@ class AdminRequestV1:
             elif self.idempotency_key is not None:
                 _invalid()
             if operation in _DIGEST_OPERATIONS:
-                object.__setattr__(self, "plan_digest", _digest(self.plan_digest))
+                plan_id = self.arguments.get("plan_id")
+                digest = self.plan_digest
+                if digest is None and type(plan_id) is str:
+                    digest = (
+                        "sha256:"
+                        + hashlib.sha256(
+                            b"codex-master/usage-plan-id/v1\0" + plan_id.encode("ascii")
+                        ).hexdigest()
+                    )
+                object.__setattr__(self, "plan_digest", _digest(digest))
             elif self.plan_digest is not None:
                 _invalid()
         elif any(
@@ -390,8 +434,19 @@ class HiveProblemV1:
         if severity not in _PROBLEM_SEVERITIES:
             _private()
         object.__setattr__(self, "severity", severity)
-        for field in ("title", "detail", "effect", "action"):
-            object.__setattr__(self, field, _public_text(getattr(self, field)))
+        template = _PROBLEM_TEMPLATES.get(self.code)
+        if template is not None:
+            if (
+                self.severity,
+                self.title,
+                self.detail,
+                self.effect,
+                self.action,
+            ) != template:
+                _private()
+        else:
+            for field in ("title", "detail", "effect", "action"):
+                object.__setattr__(self, field, _public_text(getattr(self, field)))
         if type(self.retryable) is not bool:
             _private()
         if self.retry_after_seconds is not None:
@@ -414,9 +469,16 @@ def parse_admin_request(value: object) -> AdminRequestV1:
         _invalid()
     if request.get("schema_version") != 1:
         _invalid()
+    operation = cast(str, request.get("operation"))
+    operation = _OPERATION_ALIASES.get(operation, operation)
+    arguments = dict(cast(Mapping[str, object], request.get("arguments", {})))
+    if operation == "secret.ingress.create" and "credential_type" in arguments:
+        if "credential_kind" in arguments:
+            _invalid()
+        arguments["credential_kind"] = arguments.pop("credential_type")
     return AdminRequestV1(
-        cast(str, request.get("operation")),
-        cast(Mapping[str, object], request.get("arguments", {})),
+        operation,
+        arguments,
         cast(int | None, request.get("expected_generation")),
         cast(str | None, request.get("idempotency_key")),
         cast(str | None, request.get("plan_digest")),

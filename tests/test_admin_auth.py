@@ -65,6 +65,30 @@ def _token(private, **changes: object) -> str:
     )
 
 
+def _jwk(private, kid: str) -> dict[str, str]:
+    numbers = private.public_key().public_numbers()
+    return {
+        "kty": "RSA",
+        "kid": kid,
+        "use": "sig",
+        "alg": "RS256",
+        "n": _b64(numbers.n),
+        "e": _b64(numbers.e),
+    }
+
+
+def _key_token(private, kid: str) -> str:
+    claims = {
+        "iss": ISSUER,
+        "aud": [AUDIENCE],
+        "sub": "user-one",
+        "iat": NOW - 10,
+        "nbf": NOW - 10,
+        "exp": NOW + 120,
+    }
+    return jwt.encode(claims, private, algorithm="RS256", headers={"kid": kid})
+
+
 def _verifier(rsa_material) -> CloudflareAccessVerifier:
     _private, jwks = rsa_material
     return CloudflareAccessVerifier(
@@ -129,6 +153,35 @@ def test_cloudflare_jwks_can_be_loaded_and_rotated_from_private_fds(
         os.close(second_fd)
 
     assert verifier.verify(_token(private)).scopes == ("fleet.read",)
+
+
+def test_cloudflare_official_certs_document_and_two_key_lkg_rotation() -> None:
+    current = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    previous = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    document = {
+        "keys": [_jwk(current, "current"), _jwk(previous, "previous")],
+        "public_cert": "bounded metadata only",
+        "public_certs": {"current": "bounded metadata only"},
+    }
+    verifier = CloudflareAccessVerifier(
+        issuer=ISSUER,
+        audience=AUDIENCE,
+        jwks=document,
+        principal_resolver=lambda _subject, _claims: ("fleet.read",),
+        clock=lambda: NOW,
+    )
+
+    assert verifier.verify(_key_token(current, "current")).subject == "user-one"
+    assert verifier.verify(_key_token(previous, "previous")).subject == "user-one"
+    unknown = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with pytest.raises(AdminAuthError, match="authority.identity_invalid"):
+        verifier.verify(_key_token(unknown, "unknown"))
+    with pytest.raises(AdminAuthError, match="authority.configuration_invalid"):
+        verifier.replace_jwks({"keys": []})
+    assert verifier.verify(_key_token(current, "current")).subject == "user-one"
+    assert verifier.jwks_kids == ("current", "previous")
+    assert verifier.refresh_jwks(lambda: {"keys": []}) is False
+    assert verifier.jwks_kids == ("current", "previous")
 
 
 def test_header_presence_without_valid_signature_is_denied(rsa_material) -> None:
@@ -288,3 +341,22 @@ def test_totp_rejects_bad_code_without_consuming_counter(tmp_path) -> None:
     with pytest.raises(AdminAuthError, match="authority.step_up_invalid"):
         verifier.verify("user-one", "000000")
     assert verifier.verify("user-one", _totp(NOW // 30)) == NOW // 30
+
+
+def test_totp_replay_claim_survives_verifier_restart(tmp_path) -> None:
+    fd = _private_file(tmp_path, "totp", base64.b32encode(TOTP_SECRET))
+    state_path = tmp_path / "totp-replay.sqlite3"
+    try:
+        first = TotpStepUpVerifier.from_fd(
+            fd, clock=lambda: NOW, skew_steps=0, replay_state_path=state_path
+        )
+        assert first.verify("user-one", _totp(NOW // 30)) == NOW // 30
+        first.close()
+        second = TotpStepUpVerifier.from_fd(
+            fd, clock=lambda: NOW, skew_steps=0, replay_state_path=state_path
+        )
+    finally:
+        os.close(fd)
+    with pytest.raises(AdminAuthError, match="authority.step_up_replayed"):
+        second.verify("user-two", _totp(NOW // 30))
+    second.close()

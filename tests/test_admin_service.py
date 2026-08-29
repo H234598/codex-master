@@ -41,6 +41,7 @@ from codex_master.admin_service import (
     MasterjetControlService,
     OpenAIAccountSummaryV1,
     SecretIngressSessionV1,
+    SecretIngressCapabilityV1,
 )
 
 
@@ -415,6 +416,7 @@ class SecretIngress:
         self.resolve_calls = 0
         self.put_calls = 0
         self.last_put: tuple[str, object, str] | None = None
+        self.last_capability: object | None = None
 
     def create_session(self, **values: object) -> SecretIngressSessionV1:
         self.create_calls += 1
@@ -424,9 +426,14 @@ class SecretIngress:
 
     def resolve(self, session: object, **values: object) -> tuple[object, object]:
         self.resolve_calls += 1
-        assert session == "ingress-session"
+        self.last_capability = session
+        assert (
+            session == "ingress-session" or type(session) is SecretIngressCapabilityV1
+        )
         if values["credential_kind"] == "openai.auth-json":
             return "openai-plan", "openai-upload"
+        if values["credential_kind"] == "google-oauth-code":
+            return "oauth-transaction", bytearray(b"oauth-code")
         return "google-client-plan", "google-client-upload"
 
     def put_secret(
@@ -843,7 +850,7 @@ def test_openai_apply_resolves_bound_ingress_and_calls_owner_once() -> None:
             "fleet.google.oauth",
             None,
             {
-                "oauth_code": "oauth-code",
+                "ingress_session": "ingress-session",
                 "step_up": True,
                 "idempotency_key": None,
             },

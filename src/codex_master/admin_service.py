@@ -163,6 +163,26 @@ class SecretIngressSessionV1:
     state: str
 
 
+@dataclass(frozen=True, slots=True)
+class SecretIngressCapabilityV1:
+    """Non-secret, exact one-flow capability resolved by ingress owner."""
+
+    session_id: str
+    subject: str
+    account_ref: str
+    operation: str
+    credential_kind: str
+    plan_id: str | None
+    plan_digest: str
+    expected_generation: int
+    create_idempotency_key: str
+    upload_idempotency_key: str
+    apply_idempotency_key: str
+    session_generation: int
+    receipt_generation: int
+    expires_at: float
+
+
 class AdminServiceError(Exception):
     """Public code-only service failure carrying one validated problem."""
 
@@ -405,6 +425,7 @@ class MasterjetControlService:
             expected_generation=_generation(request),
             idempotency_key=_idempotency(request),
             plan_digest=_digest(request),
+            plan_id=request.arguments.get("plan_id"),
         )
         return _serialize_openai_receipt(credentials.apply_auth_sync(plan, upload))
 
@@ -451,24 +472,39 @@ class MasterjetControlService:
 
     def _google_oauth_complete(
         self,
-        _principal: AdminPrincipalV1,
+        principal: AdminPrincipalV1,
         request: AdminRequestV1,
-        _ingress_session: object | None,
+        ingress_session: object | None,
         oauth_code: str | None,
     ) -> dict[str, object]:
         owner = _required(self._google_oauth)
-        if type(oauth_code) is not str or not oauth_code:
+        if oauth_code is not None:
             raise _service_error("control.request_invalid")
-        return _serialize_oauth_receipt(
-            owner.complete_oauth_transaction(
-                cast(str, request.arguments["transaction_id"]),
-                code=oauth_code,
-                account_ref=cast(str, request.arguments["account_ref"]),
-                redirect_uri=cast(str, request.arguments["redirect_uri"]),
-                expected_generation=_generation(request),
-                state=cast(str, request.arguments["state"]),
-            )
+        ingress = _required(self._secret_ingress)
+        _plan, upload = ingress.resolve(
+            _capability(ingress_session),
+            principal=principal.subject,
+            account_ref=request.arguments["account_ref"],
+            credential_kind="google-oauth-code",
+            transaction_id=request.arguments["transaction_id"],
+            expected_generation=_generation(request),
         )
+        code, wipe = _oauth_code(upload)
+        try:
+            return _serialize_oauth_receipt(
+                owner.complete_oauth_transaction(
+                    cast(str, request.arguments["transaction_id"]),
+                    code=code,
+                    account_ref=cast(str, request.arguments["account_ref"]),
+                    redirect_uri=cast(str, request.arguments["redirect_uri"]),
+                    expected_generation=_generation(request),
+                    state=cast(str, request.arguments["state"]),
+                )
+            )
+        finally:
+            if wipe is not None:
+                wipe[:] = b"\0" * len(wipe)
+                wipe.clear()
 
     def _google_oauth_client_plan(
         self,
@@ -502,6 +538,7 @@ class MasterjetControlService:
             expected_generation=_generation(request),
             idempotency_key=_idempotency(request),
             plan_digest=_digest(request),
+            plan_id=request.arguments.get("plan_id"),
         )
         return _serialize_oauth_client_receipt(
             owner.apply_oauth_client_import(plan, upload)
@@ -698,6 +735,30 @@ def _secret_value(value: object) -> bytes | bytearray | memoryview:
             raise _service_error("control.request_invalid")
         return value
     raise _service_error("control.request_invalid")
+
+
+def _oauth_code(value: object) -> tuple[str, bytearray | None]:
+    raw: bytes | bytearray | memoryview
+    if type(value) is bytearray:
+        raw = value
+        wipe = value
+    elif type(value) is bytes:
+        raw = value
+        wipe = None
+    elif type(value) is memoryview and value.ndim == 1 and value.contiguous:
+        raw = value
+        wipe = None
+    else:
+        raise _service_error("control.request_invalid")
+    try:
+        if not 1 <= len(raw) <= 4096:
+            raise ValueError
+        code = bytes(raw).decode("ascii")
+        if any(ord(char) <= 0x20 or ord(char) >= 0x7F for char in code):
+            raise ValueError
+        return code, wipe
+    except (UnicodeError, ValueError):
+        raise _service_error("control.request_invalid") from None
 
 
 def _generation(request: AdminRequestV1) -> int:

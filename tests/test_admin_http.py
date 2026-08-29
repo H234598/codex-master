@@ -16,8 +16,17 @@ import pytest
 
 from codex_master.admin_auth import MasterjetBearerVerifier, TotpStepUpVerifier
 from codex_master.admin_contracts import AdminPrincipalV1, AdminRequestV1, HiveProblemV1
-from codex_master.admin_http import AdminHttpServer, MAX_ADMIN_JSON_BYTES
-from codex_master.admin_service import AdminDenied, AdminServiceError
+from codex_master.admin_http import (
+    AdminHttpServer,
+    AdminHttpShutdownError,
+    MAX_ADMIN_JSON_BYTES,
+)
+from codex_master.admin_service import (
+    AdminDenied,
+    AdminServiceError,
+    SecretIngressCapabilityV1,
+)
+from test_admin_service import service_at
 
 
 NOW = 2_000_000_000
@@ -47,9 +56,20 @@ class _Service:
         self.secrets: list[bytes] = []
         self.consumed: set[str] = set()
         self.raise_marker = False
+        self.capabilities: list[object] = []
 
-    def handle(self, principal: AdminPrincipalV1, request: AdminRequestV1):
+    def handle(
+        self,
+        principal: AdminPrincipalV1,
+        request: AdminRequestV1,
+        *,
+        ingress_session=None,
+        oauth_code=None,
+    ):
+        del oauth_code
         self.calls.append((principal, request))
+        if ingress_session is not None:
+            self.capabilities.append(ingress_session)
         if self.raise_marker:
             raise RuntimeError("private-exception-marker")
         if (
@@ -69,7 +89,10 @@ class _Service:
                 "account_ref": "google-one",
                 "state": "pending",
             }
-        return {"operation": request.operation, "step_up": principal.step_up}
+        return {
+            "operation": request.operation,
+            "step_up": principal.step_up,
+        }
 
     def put_secret(self, principal: AdminPrincipalV1, session_id: str, secret):
         if not principal.step_up:
@@ -168,6 +191,9 @@ def _headers(**changes: str) -> dict[str, str]:
         "X-Forwarded-Host": ORIGIN,
         "X-Forwarded-Proto": "https",
         "Content-Type": "application/json",
+        "X-Masterjet-Operation": "secret.ingress.put",
+        "X-Masterjet-Expected-Generation": "4",
+        "Idempotency-Key": "idem-upload",
     }
     result.update(changes)
     return result
@@ -288,7 +314,19 @@ def test_sensitive_request_returns_usage_compatible_authenticated_challenge(
         )
 
     assert status == 403
-    assert json.loads(payload)["code"] == "control.step_up_required"
+    assert json.loads(payload) == {
+        "schema_version": 1,
+        "code": "control.step_up_required",
+        "severity": "warning",
+        "title": "Step-up required",
+        "detail": "Additional authentication is required.",
+        "effect": "Operation is paused.",
+        "action": "Complete step-up authentication.",
+        "retryable": False,
+        "retry_after_seconds": None,
+        "correlation_id": json.loads(payload)["correlation_id"],
+        "occurred_at": json.loads(payload)["occurred_at"],
+    }
 
 
 def test_fresh_totp_is_bound_to_only_current_request(tmp_path) -> None:
@@ -316,7 +354,7 @@ def test_fresh_totp_is_bound_to_only_current_request(tmp_path) -> None:
         )
 
     assert status == 200
-    assert json.loads(payload)["step_up"] is True
+    assert json.loads(payload)["state"] == "succeeded"
     assert service.calls[0][0].step_up is True
     assert replay == 403
     assert json.loads(replay_payload)["code"] == "authority.step_up_replayed"
@@ -353,8 +391,122 @@ def test_secret_ingress_flow_grant_covers_only_put_and_matching_apply(tmp_path) 
     assert created == uploaded == applied == 200
     assert json.loads(create_payload)["id"] == "ingress-one"
     assert json.loads(upload_payload)["state"] == "consumed"
-    assert json.loads(apply_payload)["step_up"] is True
+    assert json.loads(apply_payload)["state"] == "succeeded"
     assert service.secrets == [_secret_payload()]
+
+
+def test_real_service_create_put_apply_receives_exact_one_shot_capability(
+    tmp_path,
+) -> None:
+    service, owners = service_at()
+    with _running_server(tmp_path, service=service) as (server, _service):
+        created, _out, _payload = _request(
+            server,
+            "POST",
+            "/admin/v1",
+            _secret_session_document(),
+            _headers(**{"X-Masterjet-Step-Up": _totp()}),
+        )
+        uploaded, _out, _payload = _request(
+            server,
+            "PUT",
+            "/admin/v1/secret-ingress-sessions/ingress-one",
+            _secret_payload(),
+            _headers(**{"Content-Type": "application/octet-stream"}),
+        )
+        applied, _out, _payload = _request(
+            server,
+            "POST",
+            "/admin/v1",
+            _document(
+                "google.oauth-client-import.apply",
+                {"account_ref": "google-one"},
+                expected_generation=4,
+                idempotency_key="idem-final",
+                plan_digest=DIGEST,
+            ),
+            _headers(),
+        )
+        replay, _out, _payload = _request(
+            server,
+            "POST",
+            "/admin/v1",
+            _document(
+                "google.oauth-client-import.apply",
+                {"account_ref": "google-one"},
+                expected_generation=4,
+                idempotency_key="idem-final",
+                plan_digest=DIGEST,
+            ),
+            _headers(),
+        )
+    assert (created, uploaded, applied) == (200, 200, 200)
+    assert replay == 403
+    assert owners.secret_ingress.resolve_calls == 1
+    capability = owners.secret_ingress.last_capability
+    assert type(capability) is SecretIngressCapabilityV1
+    assert capability.subject == "usage-service"
+    assert capability.account_ref == "google-one"
+    assert capability.operation == "google.oauth-client-import.apply"
+    assert capability.credential_kind == "google.oauth-client"
+    assert capability.plan_digest == DIGEST
+    assert capability.expected_generation == 4
+    assert capability.create_idempotency_key == "idem-session"
+    assert capability.upload_idempotency_key == "idem-upload"
+    assert capability.apply_idempotency_key == "idem-final"
+    assert capability.receipt_generation == 5
+
+
+def test_google_oauth_code_crosses_only_typed_raw_ingress_boundary(tmp_path) -> None:
+    service, owners = service_at()
+    session = _document(
+        "secret.ingress.create",
+        {
+            "account_ref": "google-one",
+            "credential_kind": "google-oauth-code",
+            "plan_id": "transaction-one",
+        },
+        expected_generation=4,
+        idempotency_key="idem-oauth-code",
+    )
+    with _running_server(tmp_path, service=service) as (server, _service):
+        created, _out, _payload = _request(
+            server,
+            "POST",
+            "/admin/v1",
+            session,
+            _headers(**{"X-Masterjet-Step-Up": _totp()}),
+        )
+        uploaded, _out, _payload = _request(
+            server,
+            "PUT",
+            "/admin/v1/secret-ingress-sessions/ingress-one",
+            b"oauth-code",
+            _headers(**{"Content-Type": "application/octet-stream"}),
+        )
+        completed, _out, payload = _request(
+            server,
+            "POST",
+            "/admin/v1",
+            _document(
+                "google.oauth.complete",
+                {
+                    "account_ref": "google-one",
+                    "transaction_id": "transaction-one",
+                    "redirect_uri": "http://127.0.0.1/callback",
+                    "state": "state-one",
+                },
+                expected_generation=4,
+            ),
+            _headers(),
+        )
+    assert (created, uploaded, completed) == (200, 200, 200)
+    assert b"oauth-code" not in payload
+    assert owners.google_oauth.calls == ["complete"]
+    capability = owners.secret_ingress.last_capability
+    assert type(capability) is SecretIngressCapabilityV1
+    assert capability.credential_kind == "google-oauth-code"
+    assert capability.operation == "google.oauth.complete"
 
 
 def test_secret_ingress_is_one_shot_with_gone_response(tmp_path) -> None:
@@ -463,6 +615,55 @@ def test_unknown_or_encoded_routes_are_rejected(tmp_path, target, expected) -> N
     assert status == expected
 
 
+def test_usage_percent_encoded_session_id_is_decoded_once(tmp_path) -> None:
+    with _running_server(tmp_path) as (server, service):
+        _request(
+            server,
+            "POST",
+            "/admin/v1",
+            _secret_session_document(),
+            _headers(**{"X-Masterjet-Step-Up": _totp()}),
+        )
+        service.calls.clear()
+        status, _out, _payload = _request(
+            server,
+            "PUT",
+            "/admin/v1/secret-ingress-sessions/ingress%3Aone",
+            b"secret",
+            _headers(**{"Content-Type": "application/octet-stream"}),
+        )
+    assert status != 404
+
+
+@pytest.mark.parametrize("suffix", ["bad%2Fpath", "bad%00", "bad%252Fpath"])
+def test_ingress_route_rejects_encoded_delimiters_and_double_encoding(
+    tmp_path, suffix
+) -> None:
+    with _running_server(tmp_path) as (server, _service):
+        status, _out, _payload = _request(
+            server,
+            "PUT",
+            "/admin/v1/secret-ingress-sessions/" + suffix,
+            b"secret",
+            _headers(**{"Content-Type": "application/octet-stream"}),
+        )
+    assert status == 404
+
+
+@pytest.mark.parametrize("method", ["HEAD", "OPTIONS", "TRACE"])
+def test_all_unsupported_methods_use_json_no_store_close(tmp_path, method) -> None:
+    with _running_server(tmp_path) as (server, _service):
+        status, headers, payload = _request(
+            server, method, "/admin/v1", b"", _headers()
+        )
+    assert status == 405
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Cache-Control"] == "no-store"
+    assert headers["Connection"] == "close"
+    if method != "HEAD":
+        assert json.loads(payload)["code"] == "control.route_not_found"
+
+
 def test_oversized_content_length_is_rejected_without_owner_call(tmp_path) -> None:
     with _running_server(tmp_path) as (server, service):
         status, _headers_out, payload = _request(
@@ -547,6 +748,44 @@ def test_owner_exception_is_sanitized(tmp_path) -> None:
     lowered = payload.lower()
     assert b"private-exception-marker" not in lowered
     assert b"traceback" not in lowered
+
+
+def test_shutdown_stops_admission_and_reports_blocked_handler(tmp_path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingService(_Service):
+        def handle(self, principal, request, **kwargs):
+            del principal, request, kwargs
+            entered.set()
+            release.wait(2)
+            return {"ok": True}
+
+    with _running_server(tmp_path, service=BlockingService()) as (server, _service):
+        result: list[int] = []
+
+        def call() -> None:
+            result.append(
+                _request(
+                    server,
+                    "POST",
+                    "/admin/v1",
+                    _document("google.accounts.list", {}),
+                    _headers(),
+                )[0]
+            )
+
+        worker = threading.Thread(target=call)
+        worker.start()
+        assert entered.wait(1)
+        with pytest.raises(AdminHttpShutdownError, match="shutdown_incomplete"):
+            server.drain(0)
+        with pytest.raises(AdminHttpShutdownError, match="shutdown_incomplete"):
+            server.close_authorities()
+        release.set()
+        worker.join(2)
+        server.drain(1)
+        assert result == [200]
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "8.8.8.8", "::"])

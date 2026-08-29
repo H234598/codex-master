@@ -10,7 +10,9 @@ import hmac
 import json
 import math
 import os
+from pathlib import Path
 import re
+import sqlite3
 import stat
 import threading
 import time
@@ -166,6 +168,22 @@ class CloudflareAccessVerifier:
     def replace_jwks_from_fd(self, jwks_fd: int) -> None:
         self.replace_jwks(_jwks_from_fd(jwks_fd))
 
+    @property
+    def jwks_kids(self) -> tuple[str, ...]:
+        """Expose redacted cache state for daemon refresh observability."""
+
+        return tuple(self._keys)
+
+    def refresh_jwks(self, loader: Callable[[], Mapping[str, object]]) -> bool:
+        """Refresh atomically; preserve last-known-good keys on failure."""
+
+        try:
+            replacement = _parse_jwks(loader(), self._algorithms)
+        except Exception:
+            return False
+        self._keys = replacement
+        return True
+
 
 class MasterjetBearerVerifier:
     """Verify an app-owned bearer loaded only through already-private FDs."""
@@ -208,10 +226,10 @@ class MasterjetBearerVerifier:
         credentials: list[bytearray] = []
         try:
             for fd in fds:
-                raw = bytearray(_read_private_fd(fd, maximum=_MAX_BEARER_BYTES))
+                raw = _read_private_fd(fd, maximum=_MAX_BEARER_BYTES)
                 while raw.endswith(b"\n"):
                     raw.pop()
-                _ascii_secret(raw.decode("ascii"), maximum=_MAX_BEARER_BYTES)
+                _ascii_secret_bytes(raw, maximum=_MAX_BEARER_BYTES)
                 credentials.append(raw)
             return cls(tuple(credentials), subject=subject, scopes=_scopes(scopes))
         except AdminAuthError:
@@ -223,20 +241,24 @@ class MasterjetBearerVerifier:
 
     def verify(self, bearer: str) -> AdminPrincipalV1:
         try:
-            candidate = _ascii_secret(bearer, maximum=_MAX_BEARER_BYTES).encode("ascii")
+            candidate = bytearray(bearer, "ascii")
+            _ascii_secret_bytes(candidate, maximum=_MAX_BEARER_BYTES)
         except AdminAuthError:
             raise AdminAuthError("authority.identity_invalid") from None
-        accepted = False
-        for credential in self._credentials:
-            accepted = hmac.compare_digest(candidate, credential) or accepted
-        if not accepted:
-            raise AdminAuthError("authority.identity_invalid")
-        return AdminPrincipalV1(
-            self._subject,
-            self._scopes,
-            "masterjet-bearer",
-            False,
-        )
+        try:
+            accepted = False
+            for credential in self._credentials:
+                accepted = hmac.compare_digest(candidate, credential) or accepted
+            if not accepted:
+                raise AdminAuthError("authority.identity_invalid")
+            return AdminPrincipalV1(
+                self._subject,
+                self._scopes,
+                "masterjet-bearer",
+                False,
+            )
+        finally:
+            _wipe(candidate)
 
     def close(self) -> None:
         _wipe_all(self._credentials)
@@ -248,7 +270,7 @@ class MasterjetBearerVerifier:
 class TotpStepUpVerifier:
     """RFC 6238 SHA-1 verifier with process-wide atomic counter replay defense."""
 
-    __slots__ = ("_clock", "_lock", "_secret", "_skew_steps", "_used")
+    __slots__ = ("_clock", "_db", "_lock", "_secret", "_skew_steps", "_used")
 
     def __init__(
         self,
@@ -256,6 +278,7 @@ class TotpStepUpVerifier:
         *,
         clock: Callable[[], float],
         skew_steps: int,
+        replay_state_path: Path | None = None,
     ) -> None:
         if not 16 <= len(secret) <= 128 or not callable(clock):
             raise AdminAuthError("authority.configuration_invalid")
@@ -266,6 +289,23 @@ class TotpStepUpVerifier:
         self._skew_steps = skew_steps
         self._lock = threading.Lock()
         self._used: set[int] = set()
+        self._db: sqlite3.Connection | None = None
+        if replay_state_path is not None:
+            try:
+                path = Path(replay_state_path)
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                self._db = sqlite3.connect(path, check_same_thread=False)
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute("PRAGMA synchronous=FULL")
+                self._db.execute(
+                    "CREATE TABLE IF NOT EXISTS consumed (counter INTEGER PRIMARY KEY)"
+                )
+                self._db.commit()
+                os.chmod(path, 0o600)
+            except Exception:
+                if self._db is not None:
+                    self._db.close()
+                raise AdminAuthError("authority.configuration_invalid") from None
 
     @classmethod
     def from_fd(
@@ -274,8 +314,9 @@ class TotpStepUpVerifier:
         *,
         clock: Callable[[], float] = time.time,
         skew_steps: int = 1,
+        replay_state_path: Path | None = None,
     ) -> TotpStepUpVerifier:
-        encoded = bytearray(_read_private_fd(fd, maximum=256))
+        encoded = _read_private_fd(fd, maximum=256)
         try:
             while encoded.endswith(b"\n"):
                 encoded.pop()
@@ -285,7 +326,12 @@ class TotpStepUpVerifier:
         finally:
             _wipe(encoded)
         try:
-            return cls(secret, clock=clock, skew_steps=skew_steps)
+            return cls(
+                secret,
+                clock=clock,
+                skew_steps=skew_steps,
+                replay_state_path=replay_state_path,
+            )
         except Exception:
             _wipe(secret)
             raise
@@ -312,17 +358,37 @@ class TotpStepUpVerifier:
             )
             if matched is None:
                 raise AdminAuthError("authority.step_up_invalid")
-            if matched in self._used:
-                raise AdminAuthError("authority.step_up_replayed")
-            self._used.add(matched)
             floor = counter - self._skew_steps - 2
-            self._used.intersection_update(item for item in self._used if item >= floor)
+            if self._db is None:
+                if matched in self._used:
+                    raise AdminAuthError("authority.step_up_replayed")
+                self._used.add(matched)
+                self._used.intersection_update(
+                    item for item in self._used if item >= floor
+                )
+            else:
+                try:
+                    self._db.execute("BEGIN IMMEDIATE")
+                    self._db.execute("DELETE FROM consumed WHERE counter < ?", (floor,))
+                    self._db.execute(
+                        "INSERT INTO consumed(counter) VALUES (?)", (matched,)
+                    )
+                    self._db.commit()
+                except sqlite3.IntegrityError:
+                    self._db.rollback()
+                    raise AdminAuthError("authority.step_up_replayed") from None
+                except Exception:
+                    self._db.rollback()
+                    raise AdminAuthError("authority.configuration_invalid") from None
             return matched
 
     def close(self) -> None:
         with self._lock:
             _wipe(self._secret)
             self._used.clear()
+            if self._db is not None:
+                self._db.close()
+                self._db = None
 
     def __repr__(self) -> str:
         return "TotpStepUpVerifier(<redacted>)"
@@ -332,8 +398,34 @@ def _parse_jwks(
     value: Mapping[str, object], algorithms: frozenset[str]
 ) -> Mapping[str, jwt.PyJWK]:
     try:
-        if not isinstance(value, Mapping) or set(value) != {"keys"}:
+        if (
+            not isinstance(value, Mapping)
+            or not set(value)
+            <= {
+                "keys",
+                "public_cert",
+                "public_certs",
+            }
+            or "keys" not in value
+        ):
             raise ValueError
+        if "public_cert" in value and (
+            type(value["public_cert"]) is not str
+            or len(value["public_cert"].encode("utf-8")) > MAX_CREDENTIAL_BYTES
+        ):
+            raise ValueError
+        if "public_certs" in value:
+            public_certs = value["public_certs"]
+            if type(public_certs) is not dict or len(public_certs) > _MAX_JWKS_KEYS:
+                raise ValueError
+            if any(
+                type(kid) is not str
+                or _KID.fullmatch(kid) is None
+                or type(cert) is not str
+                or len(cert.encode("utf-8")) > MAX_CREDENTIAL_BYTES
+                for kid, cert in public_certs.items()
+            ):
+                raise ValueError
         raw_keys = value["keys"]
         if type(raw_keys) is not list or not 1 <= len(raw_keys) <= _MAX_JWKS_KEYS:
             raise ValueError
@@ -452,6 +544,15 @@ def _ascii_secret(value: object, *, maximum: int) -> str:
     return value
 
 
+def _ascii_secret_bytes(value: bytearray, *, maximum: int) -> None:
+    if (
+        not value
+        or len(value) > maximum
+        or any(byte <= 0x20 or byte >= 0x7F for byte in value)
+    ):
+        raise AdminAuthError("authority.credential_invalid")
+
+
 def _now(clock: Callable[[], float]) -> float:
     value = clock()
     if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
@@ -459,7 +560,7 @@ def _now(clock: Callable[[], float]) -> float:
     return float(value)
 
 
-def _read_private_fd(fd: int, *, maximum: int) -> bytes:
+def _read_private_fd(fd: int, *, maximum: int) -> bytearray:
     try:
         if type(fd) is not int or fd < 0 or not hasattr(os, "pread"):
             raise ValueError
@@ -474,7 +575,9 @@ def _read_private_fd(fd: int, *, maximum: int) -> bytes:
             or not 1 <= before.st_size <= maximum
         ):
             raise ValueError
-        payload = os.pread(fd, maximum + 1, 0)
+        payload = bytearray(before.st_size)
+        view = memoryview(payload)
+        read = os.preadv(fd, (view,), 0)
         after = os.fstat(fd)
         stable = (
             before.st_dev,
@@ -491,7 +594,8 @@ def _read_private_fd(fd: int, *, maximum: int) -> bytes:
             after.st_nlink,
             after.st_size,
         )
-        if not stable or len(payload) != before.st_size:
+        if not stable or read != before.st_size:
+            _wipe(payload)
             raise ValueError
         return payload
     except Exception:
@@ -499,8 +603,10 @@ def _read_private_fd(fd: int, *, maximum: int) -> bytes:
 
 
 def _jwks_from_fd(fd: int) -> Mapping[str, object]:
+    raw: bytearray | None = None
     try:
-        value = json.loads(_read_private_fd(fd, maximum=MAX_CREDENTIAL_BYTES))
+        raw = _read_private_fd(fd, maximum=MAX_CREDENTIAL_BYTES)
+        value = json.loads(raw)
         if type(value) is not dict:
             raise ValueError
         return cast(dict[str, object], value)
@@ -508,6 +614,9 @@ def _jwks_from_fd(fd: int) -> Mapping[str, object]:
         raise
     except Exception:
         raise AdminAuthError("authority.credential_invalid") from None
+    finally:
+        if raw is not None:
+            _wipe(raw)
 
 
 def _totp(secret: bytearray, counter: int) -> str:
