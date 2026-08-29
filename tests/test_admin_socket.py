@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import stat
 from threading import Event, Thread, enumerate as enumerate_threads
+from time import monotonic
 from typing import Iterator
 
 import pytest
@@ -59,6 +60,19 @@ class _Hosts:
                 "host-agent",
             ),
         )
+
+
+class _BlockingHosts(_Hosts):
+    def __init__(self, entered: Event, release: Event) -> None:
+        super().__init__()
+        self.entered = entered
+        self.release = release
+
+    def list(self) -> tuple[ControlHostV1, ...]:
+        self.calls += 1
+        self.entered.set()
+        self.release.wait()
+        return _Hosts().list()
 
 
 class _SecretIngress:
@@ -474,6 +488,150 @@ def test_close_finishes_active_request_before_restart(tmp_path: Path) -> None:
 
     assert new_thread is not None
     assert not new_thread.is_alive()
+
+
+def test_close_is_bounded_and_fail_closed_for_blocked_authorizer(
+    tmp_path: Path,
+) -> None:
+    entered = Event()
+    release = Event()
+
+    def authorize(_peer: UnixPeerCredentials) -> AdminPrincipalV1:
+        entered.set()
+        release.wait()
+        return PRINCIPAL
+
+    adapter = AdminSocketServer(
+        tmp_path / "private" / "admin.sock",
+        _service(_SecretIngress()),
+        authorize,
+    )
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    close_errors: list[BaseException] = []
+    close_elapsed: list[float] = []
+
+    def close_once() -> None:
+        started = monotonic()
+        try:
+            adapter.close()
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            close_elapsed.append(monotonic() - started)
+
+    closer = Thread(target=close_once)
+    worker: Thread | None = None
+    try:
+        adapter.start()
+        worker = getattr(adapter, "_thread")
+        assert type(worker) is Thread
+        connection.connect(os.fspath(adapter.path))
+        assert entered.wait(1)
+
+        closer.start()
+        closer.join(1.5)
+
+        assert not closer.is_alive()
+        assert close_elapsed[0] < 1.5
+        assert len(close_errors) == 1
+        error = close_errors[0]
+        assert type(error) is AdminSocketError
+        assert error.problem.code == "control.socket_shutdown_incomplete"
+        assert repr(error) == "AdminSocketError('control.socket_shutdown_incomplete')"
+        assert worker.is_alive()
+        assert getattr(adapter, "_thread") is worker
+        assert getattr(adapter, "_parent") is not None
+        assert adapter.path.exists()
+
+        with pytest.raises(AdminSocketError, match="control.socket_invalid"):
+            adapter.start()
+
+        release.set()
+        adapter.close()
+
+        assert not worker.is_alive()
+        assert getattr(adapter, "_thread") is None
+        assert not adapter.path.exists()
+    finally:
+        release.set()
+        connection.close()
+        if closer.ident is not None:
+            closer.join(3)
+        adapter.close()
+
+
+def test_close_is_bounded_and_fail_closed_for_blocked_service_owner(
+    tmp_path: Path,
+) -> None:
+    entered = Event()
+    release = Event()
+    hosts = _BlockingHosts(entered, release)
+    adapter = AdminSocketServer(
+        tmp_path / "private" / "admin.sock",
+        _service(_SecretIngress(), hosts),
+        lambda _peer: PRINCIPAL,
+    )
+    client_errors: list[AdminSocketError] = []
+
+    def call_hosts() -> None:
+        try:
+            AdminSocketClient(adapter.path).call(
+                AdminRequestV1("hosts.list", {}, None, None, None)
+            )
+        except AdminSocketError as error:
+            client_errors.append(error)
+
+    close_errors: list[BaseException] = []
+
+    def close_once() -> None:
+        try:
+            adapter.close()
+        except BaseException as error:
+            close_errors.append(error)
+
+    client = Thread(target=call_hosts)
+    closer = Thread(target=close_once)
+    worker: Thread | None = None
+    try:
+        adapter.start()
+        worker = getattr(adapter, "_thread")
+        assert type(worker) is Thread
+        client.start()
+        assert entered.wait(1)
+
+        closer.start()
+        closer.join(1.5)
+
+        assert not closer.is_alive()
+        assert len(close_errors) == 1
+        error = close_errors[0]
+        assert type(error) is AdminSocketError
+        assert error.problem.code == "control.socket_shutdown_incomplete"
+        assert worker.is_alive()
+        assert getattr(adapter, "_thread") is worker
+        assert getattr(adapter, "_socket_identity") is not None
+        assert adapter.path.exists()
+
+        with pytest.raises(AdminSocketError, match="control.socket_invalid"):
+            adapter.start()
+
+        release.set()
+        adapter.close()
+        client.join(2)
+
+        assert hosts.calls == 1
+        assert not worker.is_alive()
+        assert not client.is_alive()
+        assert client_errors
+        assert getattr(adapter, "_thread") is None
+        assert not adapter.path.exists()
+    finally:
+        release.set()
+        if closer.ident is not None:
+            closer.join(3)
+        if client.ident is not None:
+            client.join(3)
+        adapter.close()
 
 
 def test_socket_rejects_more_than_one_jsonl_request(server: _RunningServer) -> None:

@@ -36,6 +36,7 @@ from .admin_service import (
 MAX_ADMIN_REQUEST_BYTES = 64 * 1024
 MAX_ADMIN_REPLY_BYTES = 1024 * 1024
 MAX_ADMIN_SECRET_BYTES = 1024 * 1024
+_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 
 _MAX_RIGHTS_FDS = 253
 _INT_BYTES = array("i").itemsize
@@ -244,7 +245,9 @@ class AdminSocketServer:
             except OSError:
                 pass
         if thread is not None:
-            thread.join()
+            thread.join(_SHUTDOWN_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                raise AdminSocketError(_problem("control.socket_shutdown_incomplete"))
         with self._state_lock:
             if self._thread is thread:
                 self._remove_owned_socket()
