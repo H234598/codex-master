@@ -3,11 +3,13 @@ from __future__ import annotations
 from array import array
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import hmac
 import json
 import os
 from pathlib import Path
 import socket
 import stat
+import struct
 from threading import Event, Thread, enumerate as enumerate_threads
 from time import monotonic
 from typing import Iterator
@@ -135,6 +137,7 @@ class _RunningServer:
     socket: AdminSocketServer
     service: MasterjetControlService
     ingress: _SecretIngress
+    attestation_key_fd: int
 
     @property
     def path(self) -> Path:
@@ -142,7 +145,19 @@ class _RunningServer:
 
 
 @pytest.fixture
-def server(tmp_path: Path) -> Iterator[_RunningServer]:
+def attestation_key_fd(tmp_path: Path) -> Iterator[int]:
+    path = tmp_path / "admin-attestation.key"
+    path.write_bytes(b"test-admin-attestation-key-value")
+    path.chmod(0o600)
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@pytest.fixture
+def server(tmp_path: Path, attestation_key_fd: int) -> Iterator[_RunningServer]:
     ingress = _SecretIngress()
     service = _service(ingress)
 
@@ -156,10 +171,11 @@ def server(tmp_path: Path) -> Iterator[_RunningServer]:
         tmp_path / "private" / "admin.sock",
         service,
         authorize,
+        attestation_key_fd=attestation_key_fd,
     )
     adapter.start()
     try:
-        yield _RunningServer(adapter, service, ingress)
+        yield _RunningServer(adapter, service, ingress, attestation_key_fd)
     finally:
         adapter.close()
 
@@ -201,11 +217,28 @@ def _secret_put_wire(session_id: str = "ingress-one") -> bytes:
 
 
 def _send_raw(
-    path: Path, payload: bytes, fds: tuple[int, ...] = ()
+    path: Path,
+    payload: bytes,
+    fds: tuple[int, ...] = (),
+    *,
+    attestation_key_fd: int | None = None,
 ) -> dict[str, object]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(5)
         connection.connect(os.fspath(path))
+        if attestation_key_fd is not None:
+            peer = struct.unpack(
+                "3i",
+                connection.getsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_PEERCRED,
+                    struct.calcsize("3i"),
+                ),
+            )
+            verifier = getattr(admin_socket, "local_attestation_verifier")(
+                attestation_key_fd
+            )
+            assert verifier(*peer, connection) is True
         if fds:
             rights = array("i", fds)
             sent = connection.sendmsg(
@@ -226,6 +259,71 @@ def _send_raw(
     value = json.loads(response)
     assert type(value) is dict
     return value
+
+
+def _client(server: _RunningServer) -> AdminSocketClient:
+    return AdminSocketClient(
+        server.path,
+        attestation_key_fd=server.attestation_key_fd,
+    )
+
+
+def _recv_line(connection: socket.socket, limit: int = 4096) -> bytes:
+    payload = bytearray()
+    while b"\n" not in payload:
+        chunk = connection.recv(limit + 1 - len(payload))
+        if not chunk:
+            raise AssertionError("connection closed before JSONL frame")
+        payload.extend(chunk)
+        if len(payload) > limit:
+            raise AssertionError("JSONL frame exceeded test limit")
+    assert payload.count(b"\n") == 1
+    assert payload[-1:] == b"\n"
+    return bytes(payload[:-1])
+
+
+def _test_attestation_transcript(
+    challenge: dict[str, object],
+    client_nonce: bytes,
+) -> bytes:
+    return (
+        b"codex-master/admin-socket/attestation/transcript\0"
+        + struct.pack(
+            "!BIII",
+            1,
+            challenge["server_pid"],
+            challenge["server_uid"],
+            challenge["server_gid"],
+        )
+        + bytes.fromhex(challenge["server_nonce"])
+        + client_nonce
+    )
+
+
+def _test_attestation_response(
+    challenge: dict[str, object],
+    key: bytes,
+    client_nonce: bytes,
+) -> bytes:
+    transcript = _test_attestation_transcript(challenge, client_nonce)
+    proof = hmac.digest(
+        key,
+        b"codex-master/admin-socket/attestation/client-proof\0" + transcript,
+        "sha256",
+    )
+    return (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "transport": "attestation.response",
+                "client_nonce": client_nonce.hex(),
+                "proof": proof.hex(),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        + b"\n"
+    )
 
 
 def _problem_code(reply: dict[str, object]) -> str:
@@ -264,6 +362,252 @@ def test_server_creates_owner_only_parent_and_socket(server: _RunningServer) -> 
     assert parent.st_uid == os.geteuid()
     assert endpoint.st_uid == os.geteuid()
     assert stat.S_ISSOCK(endpoint.st_mode)
+
+
+def test_usage_compatible_attestation_verifier_authenticates_connection(
+    server: _RunningServer,
+) -> None:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(2)
+        connection.connect(os.fspath(server.path))
+        pid, uid, gid = struct.unpack(
+            "3i",
+            connection.getsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_PEERCRED,
+                struct.calcsize("3i"),
+            ),
+        )
+        verifier = getattr(admin_socket, "local_attestation_verifier")(
+            server.attestation_key_fd
+        )
+
+        assert verifier(pid, uid, gid, connection) is True
+
+        connection.sendall(
+            _wire_request(AdminRequestV1("hosts.list", {}, None, None, None))
+        )
+        connection.shutdown(socket.SHUT_WR)
+        reply = json.loads(_recv_line(connection))
+
+    assert reply["ok"] is True
+
+
+def test_missing_attestation_key_fails_closed_before_request(tmp_path: Path) -> None:
+    hosts = _Hosts()
+    adapter = AdminSocketServer(
+        tmp_path / "private" / "admin.sock",
+        _service(_SecretIngress(), hosts),
+        lambda _peer: PRINCIPAL,
+    )
+    adapter.start()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(os.fspath(adapter.path))
+            reply = json.loads(_recv_line(connection))
+    finally:
+        adapter.close()
+
+    assert _problem_code(reply) == "control.attestation_required"
+    assert hosts.calls == 0
+
+
+def test_wrong_attestation_key_sends_no_secret_fd(
+    server: _RunningServer,
+    auth_fd: int,
+    tmp_path: Path,
+) -> None:
+    wrong_path = tmp_path / "wrong-attestation.key"
+    wrong_path.write_bytes(b"wrong-admin-attestation-key-value")
+    wrong_path.chmod(0o600)
+    wrong_fd = os.open(wrong_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        with pytest.raises(AdminSocketError, match="control.attestation_required"):
+            AdminSocketClient(
+                server.path,
+                attestation_key_fd=wrong_fd,
+            ).put_secret_fd("ingress-one", auth_fd)
+    finally:
+        os.close(wrong_fd)
+
+    assert server.ingress.put_calls == 0
+    assert os.fstat(auth_fd)
+
+
+def test_attestation_response_cannot_be_replayed_on_new_connection(
+    server: _RunningServer,
+) -> None:
+    key = os.pread(server.attestation_key_fd, 4096, 0)
+    client_nonce = bytes.fromhex("22" * 32)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as first:
+        first.settimeout(2)
+        first.connect(os.fspath(server.path))
+        first_challenge = json.loads(_recv_line(first))
+        response = _test_attestation_response(first_challenge, key, client_nonce)
+        first.sendall(response)
+        accepted = json.loads(_recv_line(first))
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as second:
+        second.settimeout(2)
+        second.connect(os.fspath(server.path))
+        second_challenge = json.loads(_recv_line(second))
+        second.sendall(response)
+        rejected = json.loads(_recv_line(second))
+
+    assert accepted["transport"] == "attestation.accepted"
+    assert first_challenge["server_nonce"] != second_challenge["server_nonce"]
+    assert _problem_code(rejected) == "control.attestation_required"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        b"not-json\n",
+        (
+            b'{"schema_version":1,"schema_version":1,'
+            b'"transport":"attestation.response"}\n'
+        ),
+        json.dumps(
+            {
+                "schema_version": 2,
+                "transport": "attestation.response",
+                "client_nonce": "00" * 32,
+                "proof": "00" * 32,
+            },
+            separators=(",", ":"),
+        ).encode("ascii")
+        + b"\n",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "transport": "attestation.response",
+                "client_nonce": "00",
+                "proof": "00" * 32,
+            },
+            separators=(",", ":"),
+        ).encode("ascii")
+        + b"\n",
+        b"{" + b"x" * 4096 + b"\n",
+    ],
+    ids=("malformed", "duplicate", "version", "nonce", "oversize"),
+)
+def test_attestation_rejects_invalid_bounded_frames(
+    server: _RunningServer,
+    response: bytes,
+) -> None:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(2)
+        connection.connect(os.fspath(server.path))
+        challenge = json.loads(_recv_line(connection))
+        assert challenge["transport"] == "attestation.challenge"
+        connection.sendall(response)
+        reply = json.loads(_recv_line(connection))
+
+    assert _problem_code(reply) == "control.attestation_required"
+
+
+def test_attestation_accepts_fragmented_frames(
+    server: _RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fragmented_send(connection: socket.socket, value: object) -> None:
+        frame = getattr(admin_socket, "_encode_json")(
+            value, admin_socket.MAX_ADMIN_ATTESTATION_BYTES
+        )
+        for byte in frame:
+            connection.sendall(bytes((byte,)))
+
+    monkeypatch.setattr(admin_socket, "_send_attestation_frame", fragmented_send)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(2)
+        connection.connect(os.fspath(server.path))
+        verifier = getattr(admin_socket, "local_attestation_verifier")(
+            server.attestation_key_fd
+        )
+        assert verifier(os.getpid(), os.geteuid(), os.getegid(), connection) is True
+
+
+def test_usage_verifier_rejects_connection_identity_swap(
+    server: _RunningServer,
+) -> None:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(2)
+        connection.connect(os.fspath(server.path))
+        verifier = getattr(admin_socket, "local_attestation_verifier")(
+            server.attestation_key_fd
+        )
+        assert (
+            verifier(
+                os.getpid() + 1,
+                os.geteuid(),
+                os.getegid(),
+                connection,
+            )
+            is False
+        )
+
+    assert server.ingress.put_calls == 0
+
+
+def test_attestation_timeout_is_typed_and_redacted(
+    tmp_path: Path,
+    attestation_key_fd: int,
+) -> None:
+    adapter = AdminSocketServer(
+        tmp_path / "private" / "admin.sock",
+        _service(_SecretIngress()),
+        lambda _peer: PRINCIPAL,
+        timeout_seconds=0.05,
+        attestation_key_fd=attestation_key_fd,
+    )
+    adapter.start()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(os.fspath(adapter.path))
+            assert json.loads(_recv_line(connection))["transport"] == (
+                "attestation.challenge"
+            )
+            connection.sendall(b'{"private-marker":')
+            reply = json.loads(_recv_line(connection))
+    finally:
+        adapter.close()
+
+    assert _problem_code(reply) == "control.attestation_required"
+    assert "private-marker" not in json.dumps(reply)
+
+
+def test_close_interrupts_partial_attestation(
+    tmp_path: Path,
+    attestation_key_fd: int,
+) -> None:
+    adapter = AdminSocketServer(
+        tmp_path / "private" / "admin.sock",
+        _service(_SecretIngress()),
+        lambda _peer: PRINCIPAL,
+        timeout_seconds=10,
+        attestation_key_fd=attestation_key_fd,
+    )
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    adapter.start()
+    worker = getattr(adapter, "_thread")
+    assert type(worker) is Thread
+    try:
+        connection.connect(os.fspath(adapter.path))
+        assert json.loads(_recv_line(connection))["transport"] == (
+            "attestation.challenge"
+        )
+        connection.sendall(b'{"schema_version":1')
+
+        adapter.close()
+
+        assert not worker.is_alive()
+        assert getattr(adapter, "_thread") is None
+    finally:
+        connection.close()
+        adapter.close()
 
 
 def test_server_rejects_parent_swap_between_pin_and_bind(
@@ -393,6 +737,7 @@ def test_socket_rejects_oversized_request(server: _RunningServer) -> None:
     reply = _send_raw(
         server.path,
         b"{" + b"x" * (MAX_ADMIN_REQUEST_BYTES + 1),
+        attestation_key_fd=server.attestation_key_fd,
     )
 
     assert _problem_code(reply) == "control.request_too_large"
@@ -402,9 +747,7 @@ def test_socket_rejects_oversized_request(server: _RunningServer) -> None:
 def test_socket_result_matches_direct_service(server: _RunningServer) -> None:
     request = AdminRequestV1("hosts.list", {}, None, None, None)
 
-    assert AdminSocketClient(server.path).call(request) == server.service.handle(
-        PRINCIPAL, request
-    )
+    assert _client(server).call(request) == server.service.handle(PRINCIPAL, request)
 
 
 def test_peer_authority_is_resolved_before_malformed_json(tmp_path: Path) -> None:
@@ -425,7 +768,10 @@ def test_peer_authority_is_resolved_before_malformed_json(tmp_path: Path) -> Non
     assert "private-peer-marker" not in json.dumps(reply)
 
 
-def test_close_finishes_active_request_before_restart(tmp_path: Path) -> None:
+def test_close_finishes_active_request_before_restart(
+    tmp_path: Path,
+    attestation_key_fd: int,
+) -> None:
     ingress = _SecretIngress()
     hosts = _Hosts()
     accepted = Event()
@@ -439,6 +785,7 @@ def test_close_finishes_active_request_before_restart(tmp_path: Path) -> None:
         _service(ingress, hosts),
         authorize,
         timeout_seconds=10,
+        attestation_key_fd=attestation_key_fd,
     )
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     old_thread: Thread | None = None
@@ -466,9 +813,10 @@ def test_close_finishes_active_request_before_restart(tmp_path: Path) -> None:
         except OSError:
             pass
 
-        assert AdminSocketClient(adapter.path).call(
-            AdminRequestV1("hosts.list", {}, None, None, None)
-        )
+        assert AdminSocketClient(
+            adapter.path,
+            attestation_key_fd=attestation_key_fd,
+        ).call(AdminRequestV1("hosts.list", {}, None, None, None))
         old_thread.join(1)
 
         assert hosts.calls == 1
@@ -562,6 +910,7 @@ def test_close_is_bounded_and_fail_closed_for_blocked_authorizer(
 
 def test_close_is_bounded_and_fail_closed_for_blocked_service_owner(
     tmp_path: Path,
+    attestation_key_fd: int,
 ) -> None:
     entered = Event()
     release = Event()
@@ -570,14 +919,16 @@ def test_close_is_bounded_and_fail_closed_for_blocked_service_owner(
         tmp_path / "private" / "admin.sock",
         _service(_SecretIngress(), hosts),
         lambda _peer: PRINCIPAL,
+        attestation_key_fd=attestation_key_fd,
     )
     client_errors: list[AdminSocketError] = []
 
     def call_hosts() -> None:
         try:
-            AdminSocketClient(adapter.path).call(
-                AdminRequestV1("hosts.list", {}, None, None, None)
-            )
+            AdminSocketClient(
+                adapter.path,
+                attestation_key_fd=attestation_key_fd,
+            ).call(AdminRequestV1("hosts.list", {}, None, None, None))
         except AdminSocketError as error:
             client_errors.append(error)
 
@@ -637,13 +988,21 @@ def test_close_is_bounded_and_fail_closed_for_blocked_service_owner(
 def test_socket_rejects_more_than_one_jsonl_request(server: _RunningServer) -> None:
     request = _wire_request(AdminRequestV1("hosts.list", {}, None, None, None))
 
-    reply = _send_raw(server.path, request + request)
+    reply = _send_raw(
+        server.path,
+        request + request,
+        attestation_key_fd=server.attestation_key_fd,
+    )
 
     assert _problem_code(reply) == "control.request_invalid"
 
 
 def test_local_secret_ingress_requires_received_fd(server: _RunningServer) -> None:
-    reply = _send_raw(server.path, _secret_put_wire())
+    reply = _send_raw(
+        server.path,
+        _secret_put_wire(),
+        attestation_key_fd=server.attestation_key_fd,
+    )
 
     assert _problem_code(reply) == "control.secret_fd_required"
     assert server.ingress.put_calls == 0
@@ -652,7 +1011,7 @@ def test_local_secret_ingress_requires_received_fd(server: _RunningServer) -> No
 def test_local_secret_ingress_consumes_received_fd(
     server: _RunningServer, auth_fd: int
 ) -> None:
-    receipt = AdminSocketClient(server.path).put_secret_fd("ingress-one", auth_fd)
+    receipt = _client(server).put_secret_fd("ingress-one", auth_fd)
 
     assert receipt.state == "consumed"
     assert server.ingress.received == b'{"access_token":"private-marker"}'
@@ -668,7 +1027,7 @@ def test_secret_put_reads_from_zero_without_changing_shared_offset(
     offset = len(expected) // 2
     os.lseek(auth_fd, offset, os.SEEK_SET)
 
-    receipt = AdminSocketClient(server.path).put_secret_fd("ingress-one", auth_fd)
+    receipt = _client(server).put_secret_fd("ingress-one", auth_fd)
 
     assert receipt.state == "consumed"
     assert server.ingress.received == expected
@@ -698,7 +1057,7 @@ def test_secret_put_ignores_shared_offset_moves(
     monkeypatch.setattr(admin_socket.os, "readv", moved_readv)
     monkeypatch.setattr(admin_socket.os, "preadv", moved_preadv)
 
-    receipt = AdminSocketClient(server.path).put_secret_fd("ingress-one", auth_fd)
+    receipt = _client(server).put_secret_fd("ingress-one", auth_fd)
 
     assert receipt.state == "consumed"
     assert server.ingress.received == expected
@@ -721,7 +1080,7 @@ def test_secret_put_requires_exactly_one_link(
             os.link(path, tmp_path / "second-link")
 
         with pytest.raises(AdminSocketError, match="control.secret_fd_invalid"):
-            AdminSocketClient(server.path).put_secret_fd("ingress-one", fd)
+            _client(server).put_secret_fd("ingress-one", fd)
     finally:
         os.close(fd)
 
@@ -762,7 +1121,7 @@ def test_secret_put_rejects_file_drift_after_first_snapshot(
     monkeypatch.setattr(admin_socket.os, "fstat", drifting_fstat)
     try:
         with pytest.raises(AdminSocketError, match="control.secret_fd_invalid"):
-            AdminSocketClient(server.path).put_secret_fd("ingress-one", fd)
+            _client(server).put_secret_fd("ingress-one", fd)
     finally:
         os.close(fd)
 
@@ -785,7 +1144,11 @@ def test_secret_put_rejects_json_secret_without_owner_call(
         + b"\n"
     )
 
-    reply = _send_raw(server.path, payload)
+    reply = _send_raw(
+        server.path,
+        payload,
+        attestation_key_fd=server.attestation_key_fd,
+    )
 
     assert _problem_code(reply) == "control.request_invalid"
     assert "cHJpdmF0ZS1tYXJrZXI" not in json.dumps(reply)
@@ -797,7 +1160,12 @@ def test_secret_put_requires_exactly_one_received_fd(
 ) -> None:
     before = _fd_count()
 
-    reply = _send_raw(server.path, _secret_put_wire(), (auth_fd, auth_fd))
+    reply = _send_raw(
+        server.path,
+        _secret_put_wire(),
+        (auth_fd, auth_fd),
+        attestation_key_fd=server.attestation_key_fd,
+    )
 
     assert _problem_code(reply) == "control.secret_fd_required"
     assert _fd_count() == before
@@ -812,7 +1180,7 @@ def test_secret_put_rejects_non_regular_fd_and_closes_duplicate(
         before = _fd_count()
 
         with pytest.raises(AdminSocketError, match="control.secret_fd_invalid"):
-            AdminSocketClient(server.path).put_secret_fd("ingress-one", read_fd)
+            _client(server).put_secret_fd("ingress-one", read_fd)
 
         assert _fd_count() == before
         assert os.fstat(read_fd)
@@ -838,7 +1206,7 @@ def test_received_fd_is_closed_when_cloexec_enforcement_fails(
     before = {int(item) for item in os.listdir("/proc/self/fd")}
 
     with pytest.raises(AdminSocketError, match="control.request_invalid"):
-        AdminSocketClient(server.path).put_secret_fd("ingress-one", auth_fd)
+        _client(server).put_secret_fd("ingress-one", auth_fd)
 
     after = {int(item) for item in os.listdir("/proc/self/fd")}
     leaked = after - before
@@ -871,6 +1239,7 @@ def test_all_multi_rights_fds_are_closed_when_first_cloexec_fails(
             server.path,
             _secret_put_wire(),
             (auth_fd, second_fd),
+            attestation_key_fd=server.attestation_key_fd,
         )
         after = {int(item) for item in os.listdir("/proc/self/fd")}
         leaked = after - before
@@ -956,7 +1325,7 @@ def test_secret_put_rejects_non_private_fd(
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         with pytest.raises(AdminSocketError, match="control.secret_fd_invalid"):
-            AdminSocketClient(server.path).put_secret_fd("ingress-one", fd)
+            _client(server).put_secret_fd("ingress-one", fd)
         assert os.fstat(fd)
     finally:
         os.close(fd)
@@ -974,7 +1343,7 @@ def test_secret_put_rejects_oversized_regular_fd(
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         with pytest.raises(AdminSocketError, match="control.secret_too_large"):
-            AdminSocketClient(server.path).put_secret_fd("ingress-one", fd)
+            _client(server).put_secret_fd("ingress-one", fd)
     finally:
         os.close(fd)
 
@@ -987,7 +1356,7 @@ def test_secret_owner_failure_is_typed_and_redacted(
     server.ingress.fail = True
 
     with pytest.raises(AdminSocketError) as caught:
-        AdminSocketClient(server.path).put_secret_fd("ingress-one", auth_fd)
+        _client(server).put_secret_fd("ingress-one", auth_fd)
 
     assert type(caught.value.problem) is HiveProblemV1
     assert caught.value.problem.code == "control.owner_unavailable"

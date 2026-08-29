@@ -7,10 +7,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import fcntl
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import stat
 import struct
@@ -36,8 +38,16 @@ from .admin_service import (
 MAX_ADMIN_REQUEST_BYTES = 64 * 1024
 MAX_ADMIN_REPLY_BYTES = 1024 * 1024
 MAX_ADMIN_SECRET_BYTES = 1024 * 1024
+MAX_ADMIN_ATTESTATION_BYTES = 2048
 _SHUTDOWN_TIMEOUT_SECONDS = 1.0
 
+_ATTESTATION_VERSION = 1
+_ATTESTATION_NONCE_BYTES = 32
+_ATTESTATION_KEY_MIN_BYTES = 32
+_ATTESTATION_KEY_MAX_BYTES = 1024
+_ATTESTATION_TRANSCRIPT_DOMAIN = b"codex-master/admin-socket/attestation/transcript\0"
+_ATTESTATION_CLIENT_DOMAIN = b"codex-master/admin-socket/attestation/client-proof\0"
+_ATTESTATION_SERVER_DOMAIN = b"codex-master/admin-socket/attestation/server-proof\0"
 _MAX_RIGHTS_FDS = 253
 _INT_BYTES = array("i").itemsize
 _RIGHTS_BYTES = socket.CMSG_SPACE(_MAX_RIGHTS_FDS * _INT_BYTES)
@@ -96,6 +106,7 @@ class UnixPeerCredentials:
         if (
             type(self.pid) is not int
             or self.pid <= 0
+            or self.pid > 2**32 - 1
             or type(self.uid) is not int
             or not 0 <= self.uid <= 2**32 - 1
             or type(self.gid) is not int
@@ -123,6 +134,7 @@ class AdminSocketServer:
         authorize_peer: PeerAuthorizer,
         *,
         timeout_seconds: float = 5.0,
+        attestation_key_fd: int | None = None,
     ) -> None:
         candidate = Path(path)
         if (
@@ -131,12 +143,17 @@ class AdminSocketServer:
             or not callable(authorize_peer)
             or type(timeout_seconds) not in {int, float}
             or not 0 < timeout_seconds <= 60
+            or (
+                attestation_key_fd is not None
+                and (type(attestation_key_fd) is not int or attestation_key_fd < 0)
+            )
         ):
             raise AdminSocketError(_problem("control.socket_invalid"))
         self.path = candidate
         self._service = service
         self._authorize_peer = authorize_peer
         self._timeout_seconds = float(timeout_seconds)
+        self._attestation_key_fd = attestation_key_fd
         self._state_lock = Lock()
         self._stop: Event | None = None
         self._listener: socket.socket | None = None
@@ -322,6 +339,7 @@ class AdminSocketServer:
         try:
             peer = _peer_credentials(connection)
             principal = self._principal(peer)
+            _server_attestation(connection, self._attestation_key_fd)
             payload, received_fds = _receive_frame(connection)
             value = _decode_json(payload)
             result = self._dispatch(principal, peer, value, received_fds)
@@ -421,6 +439,7 @@ class AdminSocketClient:
         *,
         timeout_seconds: float = 5.0,
         expected_server_uid: int | None = None,
+        attestation_key_fd: int | None = None,
     ) -> None:
         candidate = Path(path)
         if (
@@ -434,6 +453,10 @@ class AdminSocketClient:
                     or not 0 <= expected_server_uid <= 2**32 - 1
                 )
             )
+            or (
+                attestation_key_fd is not None
+                and (type(attestation_key_fd) is not int or attestation_key_fd < 0)
+            )
         ):
             raise AdminSocketError(_problem("control.socket_invalid"))
         self.path = candidate
@@ -441,6 +464,7 @@ class AdminSocketClient:
         self._expected_server_uid = (
             os.geteuid() if expected_server_uid is None else expected_server_uid
         )
+        self._attestation_key_fd = attestation_key_fd
 
     def call(self, request: AdminRequestV1) -> dict[str, object]:
         if type(request) is not AdminRequestV1:
@@ -484,7 +508,15 @@ class AdminSocketClient:
                 connection.set_inheritable(False)
                 connection.settimeout(self._timeout_seconds)
                 connection.connect(os.fspath(self.path))
-                self._verify_server(connection)
+                peer = self._verify_server(connection)
+                try:
+                    _client_attestation(
+                        connection,
+                        peer,
+                        self._attestation_key_fd,
+                    )
+                except _SocketFailure as error:
+                    raise AdminSocketError(_problem(error.code)) from None
                 if fd is None:
                     connection.sendall(payload)
                 else:
@@ -503,13 +535,288 @@ class AdminSocketClient:
         except BaseException:
             raise AdminSocketError(_problem("control.socket_unavailable")) from None
 
-    def _verify_server(self, connection: socket.socket) -> None:
+    def _verify_server(self, connection: socket.socket) -> UnixPeerCredentials:
         try:
             peer = _peer_credentials(connection)
         except _SocketFailure:
             raise AdminSocketError(_problem("authority.peer_denied")) from None
         if peer.uid != self._expected_server_uid:
             raise AdminSocketError(_problem("authority.peer_denied"))
+        return peer
+
+
+def local_attestation_verifier(
+    attestation_key_fd: int,
+) -> Callable[[int, int, int, socket.socket], bool]:
+    """Build Usage-compatible local transport verifier from a private key FD."""
+
+    if type(attestation_key_fd) is not int or attestation_key_fd < 0:
+        raise AdminSocketError(_problem("control.socket_invalid"))
+
+    def verify(pid: int, uid: int, gid: int, connection: socket.socket) -> bool:
+        try:
+            expected = UnixPeerCredentials(pid, uid, gid)
+            if _peer_credentials(connection) != expected:
+                return False
+            _client_attestation(connection, expected, attestation_key_fd)
+            return True
+        except Exception:
+            return False
+
+    return verify
+
+
+def _server_attestation(
+    connection: socket.socket,
+    attestation_key_fd: int | None,
+) -> None:
+    key = _load_attestation_key(attestation_key_fd)
+    try:
+        identity = UnixPeerCredentials(os.getpid(), os.geteuid(), os.getegid())
+        server_nonce = secrets.token_bytes(_ATTESTATION_NONCE_BYTES)
+        _send_attestation_frame(
+            connection,
+            {
+                "schema_version": _ATTESTATION_VERSION,
+                "transport": "attestation.challenge",
+                "server_nonce": server_nonce.hex(),
+                "server_pid": identity.pid,
+                "server_uid": identity.uid,
+                "server_gid": identity.gid,
+            },
+        )
+        response = _receive_attestation_frame(connection)
+        if set(response) != {
+            "schema_version",
+            "transport",
+            "client_nonce",
+            "proof",
+        } or not _attestation_header(response, "attestation.response"):
+            raise _SocketFailure("control.attestation_required")
+        client_nonce = _attestation_bytes(response.get("client_nonce"))
+        proof = _attestation_bytes(response.get("proof"))
+        transcript = _attestation_transcript(identity, server_nonce, client_nonce)
+        expected = hmac.digest(
+            key,
+            _ATTESTATION_CLIENT_DOMAIN + transcript,
+            "sha256",
+        )
+        if not hmac.compare_digest(proof, expected):
+            raise _SocketFailure("control.attestation_required")
+        accepted = hmac.digest(
+            key,
+            _ATTESTATION_SERVER_DOMAIN + transcript,
+            "sha256",
+        )
+        _send_attestation_frame(
+            connection,
+            {
+                "schema_version": _ATTESTATION_VERSION,
+                "transport": "attestation.accepted",
+                "proof": accepted.hex(),
+            },
+        )
+    except _SocketFailure:
+        raise _SocketFailure("control.attestation_required") from None
+    except Exception:
+        raise _SocketFailure("control.attestation_required") from None
+    finally:
+        key[:] = b"\0" * len(key)
+
+
+def _client_attestation(
+    connection: socket.socket,
+    expected_server: UnixPeerCredentials,
+    attestation_key_fd: int | None,
+) -> None:
+    key = _load_attestation_key(attestation_key_fd)
+    try:
+        challenge = _receive_attestation_frame(connection)
+        if set(challenge) != {
+            "schema_version",
+            "transport",
+            "server_nonce",
+            "server_pid",
+            "server_uid",
+            "server_gid",
+        } or not _attestation_header(challenge, "attestation.challenge"):
+            raise _SocketFailure("control.attestation_required")
+        identity = UnixPeerCredentials(
+            _attestation_uint(challenge.get("server_pid"), positive=True),
+            _attestation_uint(challenge.get("server_uid")),
+            _attestation_uint(challenge.get("server_gid")),
+        )
+        if identity != expected_server:
+            raise _SocketFailure("control.attestation_required")
+        server_nonce = _attestation_bytes(challenge.get("server_nonce"))
+        client_nonce = secrets.token_bytes(_ATTESTATION_NONCE_BYTES)
+        transcript = _attestation_transcript(identity, server_nonce, client_nonce)
+        proof = hmac.digest(
+            key,
+            _ATTESTATION_CLIENT_DOMAIN + transcript,
+            "sha256",
+        )
+        _send_attestation_frame(
+            connection,
+            {
+                "schema_version": _ATTESTATION_VERSION,
+                "transport": "attestation.response",
+                "client_nonce": client_nonce.hex(),
+                "proof": proof.hex(),
+            },
+        )
+        accepted = _receive_attestation_frame(connection)
+        if set(accepted) != {
+            "schema_version",
+            "transport",
+            "proof",
+        } or not _attestation_header(accepted, "attestation.accepted"):
+            raise _SocketFailure("control.attestation_required")
+        received_proof = _attestation_bytes(accepted.get("proof"))
+        expected_proof = hmac.digest(
+            key,
+            _ATTESTATION_SERVER_DOMAIN + transcript,
+            "sha256",
+        )
+        if not hmac.compare_digest(received_proof, expected_proof):
+            raise _SocketFailure("control.attestation_required")
+    except _SocketFailure:
+        raise
+    except Exception:
+        raise _SocketFailure("control.attestation_required") from None
+    finally:
+        key[:] = b"\0" * len(key)
+
+
+def _load_attestation_key(attestation_key_fd: int | None) -> bytearray:
+    key = bytearray()
+    try:
+        if attestation_key_fd is None:
+            raise ValueError
+        metadata = os.fstat(attestation_key_fd)
+        flags = fcntl.fcntl(attestation_key_fd, fcntl.F_GETFL)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_nlink != 1
+            or not _ATTESTATION_KEY_MIN_BYTES
+            <= metadata.st_size
+            <= _ATTESTATION_KEY_MAX_BYTES
+            or (hasattr(os, "O_PATH") and flags & os.O_PATH)
+            or flags & os.O_ACCMODE != os.O_RDONLY
+        ):
+            raise ValueError
+        key = bytearray(metadata.st_size)
+        view = memoryview(key)
+        try:
+            offset = 0
+            while offset < len(key):
+                count = os.preadv(attestation_key_fd, [view[offset:]], offset)
+                if count == 0:
+                    raise ValueError
+                offset += count
+        finally:
+            view.release()
+        if os.pread(attestation_key_fd, 1, metadata.st_size):
+            raise ValueError
+        if _secret_stat_binding(os.fstat(attestation_key_fd)) != _secret_stat_binding(
+            metadata
+        ):
+            raise ValueError
+        return key
+    except Exception:
+        key[:] = b"\0" * len(key)
+        raise _SocketFailure("control.attestation_required") from None
+
+
+def _send_attestation_frame(
+    connection: socket.socket,
+    value: dict[str, object],
+) -> None:
+    try:
+        connection.sendall(_encode_json(value, MAX_ADMIN_ATTESTATION_BYTES))
+    except Exception:
+        raise _SocketFailure("control.attestation_required") from None
+
+
+def _receive_attestation_frame(connection: socket.socket) -> dict[str, object]:
+    payload = bytearray()
+    received_fds: list[int] = []
+    cloexec = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
+    try:
+        while b"\n" not in payload:
+            remaining = MAX_ADMIN_ATTESTATION_BYTES + 1 - len(payload)
+            data, ancillary, flags, _address = connection.recvmsg(
+                max(1, remaining),
+                _RIGHTS_BYTES,
+                cloexec,
+            )
+            _collect_fds(ancillary, received_fds)
+            if received_fds or flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC):
+                raise _SocketFailure("control.attestation_required")
+            if not data:
+                raise _SocketFailure("control.attestation_required")
+            payload.extend(data)
+            if len(payload) > MAX_ADMIN_ATTESTATION_BYTES:
+                raise _SocketFailure("control.attestation_required")
+        if payload[-1:] != b"\n" or payload.count(b"\n") != 1 or len(payload) == 1:
+            raise _SocketFailure("control.attestation_required")
+        try:
+            return _decode_json(bytes(payload[:-1]))
+        except _SocketFailure:
+            raise _SocketFailure("control.attestation_required") from None
+    except _SocketFailure:
+        raise _SocketFailure("control.attestation_required") from None
+    except Exception:
+        raise _SocketFailure("control.attestation_required") from None
+    finally:
+        _close_fds(received_fds)
+
+
+def _attestation_header(value: dict[str, object], transport: str) -> bool:
+    return (
+        value.get("schema_version") == _ATTESTATION_VERSION
+        and type(value.get("schema_version")) is int
+        and value.get("transport") == transport
+        and type(value.get("transport")) is str
+    )
+
+
+def _attestation_bytes(value: object) -> bytes:
+    if (
+        type(value) is not str
+        or len(value) != _ATTESTATION_NONCE_BYTES * 2
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise _SocketFailure("control.attestation_required")
+    return bytes.fromhex(value)
+
+
+def _attestation_uint(value: object, *, positive: bool = False) -> int:
+    minimum = 1 if positive else 0
+    if type(value) is not int or not minimum <= value <= 2**32 - 1:
+        raise _SocketFailure("control.attestation_required")
+    return value
+
+
+def _attestation_transcript(
+    identity: UnixPeerCredentials,
+    server_nonce: bytes,
+    client_nonce: bytes,
+) -> bytes:
+    return (
+        _ATTESTATION_TRANSCRIPT_DOMAIN
+        + struct.pack(
+            "!BIII",
+            _ATTESTATION_VERSION,
+            identity.pid,
+            identity.uid,
+            identity.gid,
+        )
+        + server_nonce
+        + client_nonce
+    )
 
 
 def _prepare_parent(parent: Path) -> _PinnedParent:
@@ -890,6 +1197,7 @@ def _problem(code: str) -> HiveProblemV1:
 
 
 __all__ = (
+    "MAX_ADMIN_ATTESTATION_BYTES",
     "MAX_ADMIN_REQUEST_BYTES",
     "MAX_ADMIN_REPLY_BYTES",
     "MAX_ADMIN_SECRET_BYTES",
@@ -898,4 +1206,5 @@ __all__ = (
     "AdminSocketServer",
     "PeerAuthorizer",
     "UnixPeerCredentials",
+    "local_attestation_verifier",
 )
