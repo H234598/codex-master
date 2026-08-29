@@ -533,3 +533,80 @@ Ja, die Freigabe wird im Änderungsprotokoll dokumentiert.
     assert fixture is original_fixture
     assert fixture == original_fixture
     assert fixture.count('data-annotation-id="frage-42"') == marker_count + 1
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("annotation_id", "frage-42)"),
+        ("answer_target", "Deployment-Plan.md)"),
+        ("answer_heading", "antwort-auf-freigabe)"),
+        ("source_heading", "quellabschnitt)"),
+    ],
+)
+def test_annotation_response_fixture_rejects_markdown_control_characters(
+    field: str,
+    invalid_value: str,
+) -> None:
+    policy_api = load_policy_api()
+    values = {
+        "annotation_id": "frage-42",
+        "answer_target": "Deployment-Plan.md",
+        "answer_heading": "antwort-auf-freigabe",
+        "source_heading": "quellabschnitt",
+    }
+    values[field] = invalid_value
+    fixture = f"""# Deployment plan
+
+## {values["source_heading"].capitalize()}
+
+<mark data-annotation-id="{values["annotation_id"]}">Muss die Freigabe dokumentiert werden?</mark>. Der Folgeabsatz bleibt erhalten.
+
+## Antwort auf Freigabe — [{values["annotation_id"]}](#{values["source_heading"]})
+<!-- data-annotation-id="{values["annotation_id"]}" -->
+
+Ja, die Freigabe wird im Änderungsprotokoll dokumentiert.
+"""
+    original_fixture = fixture
+
+    with pytest.raises(
+        policy_api.CommonPolicyError,
+        match="annotation_response_fixture_invalid",
+    ):
+        policy_api.apply_annotation_response_fixture(fixture, **values)
+
+    assert fixture is original_fixture
+    assert fixture == original_fixture
+    assert fixture.count("(A)") == 0
+
+
+def test_annotation_response_fixture_rejects_fenced_code_before_mutation() -> None:
+    policy_api = load_policy_api()
+    fixture = """# Deployment plan
+
+## Quellabschnitt
+
+<mark data-annotation-id="frage-42">Muss die Freigabe dokumentiert werden?</mark>. Der Folgeabsatz bleibt erhalten.
+
+```markdown
+## Antwort auf Freigabe — [frage-42](#quellabschnitt)
+<!-- data-annotation-id="frage-42" -->
+```
+"""
+    original_fixture = fixture
+
+    with pytest.raises(
+        policy_api.CommonPolicyError,
+        match="annotation_response_fixture_invalid",
+    ):
+        policy_api.apply_annotation_response_fixture(
+            fixture,
+            annotation_id="frage-42",
+            answer_target="Deployment-Plan.md",
+            answer_heading="antwort-auf-freigabe",
+            source_heading="quellabschnitt",
+        )
+
+    assert fixture is original_fixture
+    assert fixture == original_fixture
+    assert fixture.count("(A)") == 0

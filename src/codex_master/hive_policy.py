@@ -16,6 +16,7 @@ _HEADER_PREFIX = b"<!-- codex-master-common-policy:"
 _HEADER_SUFFIX = b" -->"
 _HEADER_FIELDS = {"generation", "schema_version"}
 _PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
+_ANNOTATION_FIXTURE_TARGET_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.md\Z")
 
 
 class CommonPolicyError(ValueError):
@@ -145,9 +146,12 @@ def apply_annotation_response_fixture(
     if (
         not isinstance(document, str)
         or not document
-        or not all(
-            isinstance(value, str) and value and "\n" not in value for value in values
-        )
+        or any(not isinstance(value, str) for value in values)
+        or _PROFILE_RE.fullmatch(annotation_id) is None
+        or _ANNOTATION_FIXTURE_TARGET_RE.fullmatch(answer_target) is None
+        or _PROFILE_RE.fullmatch(answer_heading) is None
+        or _PROFILE_RE.fullmatch(source_heading) is None
+        or re.search(r"^[ ]{0,3}(?:`{3,}|~{3,})", document, re.MULTILINE) is not None
     ):
         raise CommonPolicyError("annotation_response_fixture_invalid")
 
