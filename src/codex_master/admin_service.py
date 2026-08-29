@@ -418,8 +418,10 @@ class MasterjetControlService:
             if result is None:
                 try:
                     ingress.rollback_upload(upload_claim)
-                except BaseException:
+                except Exception:
                     pass
+            if not isinstance(error, Exception):
+                raise
             owner_error = _owner_service_error(error)
             del error
             raise owner_error from None
@@ -458,7 +460,7 @@ class MasterjetControlService:
                 expected_generation=expected_generation,
                 idempotency_key=idempotency_key,
             )
-        except BaseException as error:
+        except Exception as error:
             owner_error = _owner_service_error(error)
             del error
             raise owner_error from None
@@ -524,7 +526,7 @@ class MasterjetControlService:
         ingress = _required(self._secret_ingress)
         try:
             ingress.rollback_upload(upload_claim)
-        except BaseException as error:
+        except Exception as error:
             owner_error = _owner_service_error(error)
             del error
             raise owner_error from None

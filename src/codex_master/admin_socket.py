@@ -459,10 +459,12 @@ class AdminSocketServer:
         except BaseException as error:
             try:
                 self._service.rollback_secret_upload(claim)
-            except BaseException:
+            except Exception:
                 pass
             from .admin_service import AdminServiceError
 
+            if not isinstance(error, Exception):
+                raise
             if isinstance(error, (_SocketFailure, AdminServiceError)):
                 raise
             raise _SocketFailure("control.secret_fd_invalid") from None
@@ -957,7 +959,7 @@ def _peer_credentials(connection: socket.socket) -> UnixPeerCredentials:
         if type(value) is not bytes or len(value) != _PEER_CREDENTIALS.size:
             raise ValueError
         return UnixPeerCredentials(*_PEER_CREDENTIALS.unpack(value))
-    except BaseException:
+    except Exception:
         raise _SocketFailure("authority.peer_denied") from None
 
 
@@ -993,9 +995,12 @@ def _receive_frame(connection: socket.socket) -> tuple[bytes, list[int]]:
     except _SocketFailure:
         _close_fds(received_fds)
         raise
-    except BaseException:
+    except Exception:
         _close_fds(received_fds)
         raise _SocketFailure("control.request_invalid") from None
+    except BaseException:
+        _close_fds(received_fds)
+        raise
 
 
 def _collect_fds(
@@ -1059,7 +1064,7 @@ def _drain_input(connection: socket.socket) -> None:
             if not data:
                 return
             remaining -= len(data)
-    except BaseException:
+    except Exception:
         pass
     finally:
         _close_fds(discarded_fds)
@@ -1247,7 +1252,7 @@ def _parse_problem(value: object) -> HiveProblemV1:
             correlation_id=cast(str, problem["correlation_id"]),
             occurred_at=timestamp,
         )
-    except BaseException:
+    except Exception:
         return _problem("control.response_invalid")
 
 

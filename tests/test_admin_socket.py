@@ -86,10 +86,15 @@ class _SecretIngress:
         self.received = b""
         self.buffer: bytearray | None = None
         self.fail = False
+        self.reserve_signal: BaseException | None = None
+        self.process_signal: BaseException | None = None
+        self.rollback_signal: BaseException | None = None
         self.claims: list[object] = []
         self.rollback_calls = 0
 
     def reserve_upload(self, session_id: str, **values: object) -> object:
+        if self.reserve_signal is not None:
+            raise self.reserve_signal
         claim = (session_id, dict(values))
         self.claims.append(claim)
         return claim
@@ -107,6 +112,8 @@ class _SecretIngress:
         self.received = bytes(secret)
         self.buffer = secret.obj if type(secret) is memoryview else secret
         assert principal == "operator-one"
+        if self.process_signal is not None:
+            raise self.process_signal
         if self.fail:
             raise RuntimeError("private-marker /home/operator/auth.json")
         return SecretIngressUploadReceiptV1(session_id, "openai-one", "consumed", 1)
@@ -116,6 +123,8 @@ class _SecretIngress:
 
     def rollback_upload(self, _claim: object) -> None:
         self.rollback_calls += 1
+        if self.rollback_signal is not None:
+            raise self.rollback_signal
 
     def create_session(self, **_values: object) -> SecretIngressSessionV1:
         raise AssertionError("not used")
@@ -417,6 +426,168 @@ def test_socket_json_codecs_do_not_normalize_process_signals(
 
     with pytest.raises(signal_type):
         call()
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("seam", ["getpeername", "getsockopt"])
+def test_peer_credentials_do_not_normalize_process_signals(
+    signal_type: type[BaseException], seam: str
+) -> None:
+    class _PeerSocket:
+        def getpeername(self) -> None:
+            if seam == "getpeername":
+                raise signal_type(23)
+
+        def getsockopt(self, *_args: object) -> bytes:
+            if seam == "getsockopt":
+                raise signal_type(23)
+            return struct.pack("3i", os.getpid(), os.geteuid(), os.getegid())
+
+    with pytest.raises(signal_type):
+        admin_socket._peer_credentials(_PeerSocket())
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+def test_receive_frame_closes_received_fds_without_normalizing_process_signals(
+    signal_type: type[BaseException],
+) -> None:
+    received_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    rights = array("i", [received_fd]).tobytes()
+
+    class _FrameSocket:
+        calls = 0
+
+        def recvmsg(self, *_args: object) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
+            self.calls += 1
+            if self.calls == 1:
+                return b"{", [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)], 0, None
+            raise signal_type(23)
+
+    try:
+        with pytest.raises(signal_type):
+            admin_socket._receive_frame(_FrameSocket())
+        with pytest.raises(OSError):
+            os.fstat(received_fd)
+    finally:
+        try:
+            os.close(received_fd)
+        except OSError:
+            pass
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("seam", ["reserve", "read", "put", "rollback"])
+def test_secret_upload_rolls_back_without_normalizing_process_signals(
+    tmp_path: Path,
+    auth_fd: int,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+    seam: str,
+) -> None:
+    ingress = _SecretIngress()
+    if seam == "reserve":
+        ingress.reserve_signal = signal_type(23)
+    elif seam == "read":
+        monkeypatch.setattr(
+            admin_socket.os,
+            "preadv",
+            lambda *_args: (_ for _ in ()).throw(signal_type(23)),
+        )
+    elif seam == "put":
+        ingress.process_signal = signal_type(23)
+    else:
+        ingress.fail = True
+        ingress.rollback_signal = signal_type(23)
+    adapter = AdminSocketServer(
+        tmp_path / "private" / "admin.sock",
+        _service(ingress),
+        lambda _peer: PRINCIPAL,
+    )
+    peer = UnixPeerCredentials(os.getpid(), os.geteuid(), os.getegid())
+
+    with pytest.raises(signal_type):
+        adapter._put_secret(
+            PRINCIPAL,
+            peer,
+            "ingress-one",
+            auth_fd,
+            expected_generation=0,
+            idempotency_key="socket-secret-put",
+        )
+
+    if seam == "reserve":
+        assert ingress.rollback_calls == 0
+        assert ingress.buffer is None
+    elif seam == "read":
+        assert ingress.rollback_calls == 1
+        assert ingress.buffer is None
+    else:
+        assert ingress.rollback_calls >= 1
+        assert ingress.buffer is not None
+        assert bytes(ingress.buffer) == b"\0" * len(ingress.buffer)
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+def test_drain_input_closes_received_fds_without_normalizing_process_signals(
+    signal_type: type[BaseException],
+) -> None:
+    received_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    rights = array("i", [received_fd]).tobytes()
+
+    class _DrainSocket:
+        calls = 0
+
+        def recvmsg(self, *_args: object) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
+            self.calls += 1
+            if self.calls == 1:
+                return b"x", [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)], 0, None
+            raise signal_type(23)
+
+    try:
+        with pytest.raises(signal_type):
+            admin_socket._drain_input(_DrainSocket())
+        with pytest.raises(OSError):
+            os.fstat(received_fd)
+    finally:
+        try:
+            os.close(received_fd)
+        except OSError:
+            pass
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+def test_problem_parser_does_not_normalize_process_signals(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+) -> None:
+    class _InterruptingDateTime:
+        @classmethod
+        def fromisoformat(cls, _value: str) -> datetime:
+            raise signal_type(23)
+
+        @classmethod
+        def now(cls, timezone: object) -> datetime:
+            return datetime.now(timezone)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(admin_socket, "datetime", _InterruptingDateTime)
+    problem = {
+        "schema_version": 1,
+        "code": "control.request_invalid",
+        "severity": "error",
+        "title": "Request failed",
+        "detail": "Request could not be completed",
+        "effect": "No action was started",
+        "action": "Review access and retry",
+        "retryable": False,
+        "retry_after_seconds": None,
+        "correlation_id": "corr-process-signal",
+        "occurred_at": "2026-08-29T12:00:00+00:00",
+    }
+
+    with pytest.raises(signal_type):
+        admin_socket._parse_problem(problem)
 
 
 def _recv_line(connection: socket.socket, limit: int = 4096) -> bytes:
