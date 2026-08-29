@@ -50,6 +50,11 @@ from typing import (
 import yaml
 
 from codex_master import __version__
+from codex_master.admin_contracts import (
+    ADMIN_OPERATION_CATALOG,
+    ADMIN_OPERATION_CATALOG_DIGEST,
+    ADMIN_OPERATION_METADATA,
+)
 from codex_master.fleet_registry import (
     AgentDescriptor,
     AuthKind,
@@ -291,6 +296,7 @@ from codex_master.hive.types import TaskComplexity
 if TYPE_CHECKING:
     from codex_master.admin_contracts import AdminPrincipalV1
     from codex_master.admin_service import MasterjetControlService
+    from codex_master.admin_socket import AdminSocketClient
 
 
 STATE_ROOT = Path(
@@ -336,6 +342,9 @@ BASE_ARGS = [
 HEADLESS_JOBS = HeadlessJobRegistry()
 _MASTERJET_ADMIN_BINDING: tuple[MasterjetControlService, AdminPrincipalV1] | None = None
 _MASTERJET_ADMIN_BINDING_LOCK = threading.Lock()
+_MASTERJET_ADMIN_SOCKET_CLIENT: AdminSocketClient | None = None
+_MASTERJET_ADMIN_SOCKET_KEY_FD: int | None = None
+_MASTERJET_ADMIN_ALLOWED_OPERATIONS: frozenset[str] = frozenset()
 HEADLESS_META_KEY = "headless_job"
 G5_TMUX_SOCKET_META_KEY = "tmux_socket"
 G5_TMUX_SOCKET_RE = re.compile(r"g5-[0-9a-f]{20}")
@@ -1069,9 +1078,11 @@ class ResourceEvidenceProjectionV2:
     gate_facts: ResourceEvidenceGateFactsV2
 
 
-_RESOURCE_GATE_RUNTIME: contextvars.ContextVar[ResourceGateRuntime | None] = contextvars.ContextVar(
-    "codex_master_resource_gate_runtime",
-    default=None,
+_RESOURCE_GATE_RUNTIME: contextvars.ContextVar[ResourceGateRuntime | None] = (
+    contextvars.ContextVar(
+        "codex_master_resource_gate_runtime",
+        default=None,
+    )
 )
 _RESOURCE_GATE_RUNTIME_TYPED_G5: contextvars.ContextVar[
     tuple[CgroupProfileV1, SystemdUserCgroupAdapter] | bool | None
@@ -1196,7 +1207,9 @@ def _call_with_resource_gate_composer(callback: Any) -> Any:
 def _read_resource_evidence_projection_v2(
     runtime: ResourceGateRuntime,
 ) -> ResourceEvidenceProjectionV2:
-    if not isinstance(runtime, ResourceGateRuntime) or not isinstance(runtime.state, HiveStateStore):
+    if not isinstance(runtime, ResourceGateRuntime) or not isinstance(
+        runtime.state, HiveStateStore
+    ):
         raise ResourceSnapshotError("resource_snapshot_invalid")
     now_utc = runtime.now_utc()
     if (
@@ -1228,7 +1241,8 @@ def _read_resource_evidence_projection_v2(
             if evidence.reason_codes != ("resource_ready",):
                 raise ResourceSnapshotError("resource_snapshot_invalid")
         elif not evidence.reason_codes or any(
-            reason not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
+            reason
+            not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
             for reason in evidence.reason_codes
         ):
             raise ResourceSnapshotError("resource_snapshot_invalid")
@@ -1264,11 +1278,19 @@ def _read_resource_operator_status() -> ResourceEvidenceOperatorViewV2:
             raise AgentError("resource_status_unavailable")
         try:
             return _read_resource_evidence_projection_v2(runtime).operator_status
-        except (ResourceSnapshotError, TypeError, ValueError, AttributeError, OverflowError):
+        except (
+            ResourceSnapshotError,
+            TypeError,
+            ValueError,
+            AttributeError,
+            OverflowError,
+        ):
             raise AgentError("resource_status_unavailable") from None
 
 
-def _resource_operator_document(status: ResourceEvidenceOperatorViewV2) -> dict[str, Any]:
+def _resource_operator_document(
+    status: ResourceEvidenceOperatorViewV2,
+) -> dict[str, Any]:
     if not isinstance(status, ResourceEvidenceOperatorViewV2):
         raise AgentError("resource_status_unavailable")
     if any(
@@ -3052,7 +3074,14 @@ def master_tool_access_status() -> dict[str, Any]:
             principal_class = "koenigin"
     authorized = principal_class is not None
     visible_tool_count = (
-        len(allowed_tool_names_for_principal_class(principal_class))
+        len(
+            {
+                tool["name"]
+                for tool in _masterjet_visible_tools(TOOLS)
+                if tool["name"]
+                in allowed_tool_names_for_principal_class(principal_class)
+            }
+        )
         if authorized
         else 0
     )
@@ -6611,7 +6640,9 @@ def _total_running_agent_count(
     return managed + active + unconfirmed + reservations
 
 
-def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
+def _resource_gate_snapshot(
+    *, running_agents_override: int | None = None
+) -> dict[str, Any]:
     """Project exactly one authorized V2 evidence read; never read host metrics here."""
 
     runtime = _RESOURCE_GATE_RUNTIME.get()
@@ -6687,13 +6718,20 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
         elif facts.state is ResourceEvidenceStateV2.PRESSURE:
             declared = list(facts.reason_codes)
             if not declared or any(
-                reason not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
+                reason
+                not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
                 for reason in declared
             ):
                 raise ValueError
         else:
             raise ValueError
-    except (ResourceSnapshotError, TypeError, ValueError, AttributeError, OverflowError):
+    except (
+        ResourceSnapshotError,
+        TypeError,
+        ValueError,
+        AttributeError,
+        OverflowError,
+    ):
         return {
             "ok": False,
             "_typed_hive_io_pressure": False,
@@ -6722,7 +6760,9 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
     }
 
 
-def system_resource_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
+def system_resource_snapshot(
+    *, running_agents_override: int | None = None
+) -> dict[str, Any]:
     """Return the V2-backed admission projection for the current G5 flow."""
 
     return _resource_gate_snapshot(running_agents_override=running_agents_override)
@@ -9376,10 +9416,12 @@ def _materialize_managed_codex_runtime_class(
                     "agent_class_materialization_invalid",
                 )
             else:
-                current_descriptor, _current_runtime_profile = _fleet_effective_runtime_descriptor(
-                    marker,
-                    descriptor,
-                    "agent_class_materialization_invalid",
+                current_descriptor, _current_runtime_profile = (
+                    _fleet_effective_runtime_descriptor(
+                        marker,
+                        descriptor,
+                        "agent_class_materialization_invalid",
+                    )
                 )
                 if marker.get("model") != descriptor.model:
                     raise AgentError("agent_class_materialization_invalid")
@@ -9420,12 +9462,14 @@ def _materialize_managed_codex_runtime_class(
                     descriptor,
                     "fleet_home_content_invalid",
                 ) as codex_runtime_symlinks:
-                    actual_files, actual_directories, actual_symlinks = _fleet_tree_entries(
-                        home_fd,
-                        "fleet_home_content_invalid",
-                        allow_gemini_runtime=True,
-                        opaque_runtime_directories=codex_runtime_directories,
-                        allowed_runtime_symlinks=codex_runtime_symlinks,
+                    actual_files, actual_directories, actual_symlinks = (
+                        _fleet_tree_entries(
+                            home_fd,
+                            "fleet_home_content_invalid",
+                            allow_gemini_runtime=True,
+                            opaque_runtime_directories=codex_runtime_directories,
+                            allowed_runtime_symlinks=codex_runtime_symlinks,
+                        )
                     )
                     runtime_regular_files = {
                         path
@@ -9450,10 +9494,14 @@ def _materialize_managed_codex_runtime_class(
                         {name: None for name in marker_files}
                     )
                     runtime_files = runtime_regular_files | set(actual_symlinks)
-                    runtime_directories = actual_directories & set(codex_runtime_directories)
+                    runtime_directories = actual_directories & set(
+                        codex_runtime_directories
+                    )
                     if (
-                        not (actual_files | set(actual_symlinks)) <= allowed_files | runtime_files
-                        or actual_directories != expected_directories | runtime_directories
+                        not (actual_files | set(actual_symlinks))
+                        <= allowed_files | runtime_files
+                        or actual_directories
+                        != expected_directories | runtime_directories
                     ):
                         raise AgentError("fleet_home_content_invalid")
                     _fleet_revalidate_symlink_snapshots(
@@ -9549,7 +9597,9 @@ def _materialize_managed_codex_runtime_class(
                             refreshed_config,
                             old_config_stat,
                         )
-                for name in sorted(desired_directories, key=lambda item: (len(Path(item).parts), item)):
+                for name in sorted(
+                    desired_directories, key=lambda item: (len(Path(item).parts), item)
+                ):
                     ensure_directory_at(home_fd, name)
                 for name, content in sorted(desired.items()):
                     old = projection.get(name)
@@ -9884,9 +9934,15 @@ def validate_codex_usage_routing_decision(
         raise AgentError("codex-usage routing schema is unsupported")
     decision = payload.get("decision")
     model = payload.get("model")
-    if not isinstance(decision, str) or decision not in CODEX_USAGE_DECISIONS or payload.get("role") != role:
+    if (
+        not isinstance(decision, str)
+        or decision not in CODEX_USAGE_DECISIONS
+        or payload.get("role") != role
+    ):
         raise AgentError("codex-usage routing decision is invalid")
-    if not isinstance(payload.get("account"), str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(payload["account"]):
+    if not isinstance(
+        payload.get("account"), str
+    ) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(payload["account"]):
         raise AgentError("codex-usage routing account is invalid")
     backend_account_id = bounded_text(
         payload.get("backend_account_id"),
@@ -9903,7 +9959,9 @@ def validate_codex_usage_routing_decision(
     }[decision]
     if model not in expected_models:
         raise AgentError("codex-usage routing model does not match decision")
-    selected_model = DEFAULT_AGENT_MODEL if model == CODEX_USAGE_LEGACY_MAIN_MODEL else model
+    selected_model = (
+        DEFAULT_AGENT_MODEL if model == CODEX_USAGE_LEGACY_MAIN_MODEL else model
+    )
     if decision == "credits" and payload.get("paid_overage_allowed") is not True:
         raise AgentError("codex-usage credits decision lacks explicit paid policy")
     if not isinstance(payload.get("paid_overage_allowed"), bool):
@@ -9915,7 +9973,9 @@ def validate_codex_usage_routing_decision(
         "role": role,
         "decision": decision,
         "model": selected_model,
-        "reason": bounded_text(payload.get("reason"), field="routing reason", max_chars=120),
+        "reason": bounded_text(
+            payload.get("reason"), field="routing reason", max_chars=120
+        ),
         "usage_state": bounded_text(
             payload.get("usage_state"), field="routing usage_state", max_chars=32
         ),
@@ -9969,7 +10029,12 @@ def validate_codex_usage_routing_decision(
             raise AgentError("codex-usage routing resets are invalid")
         for window, value in resets.items():
             parsed = parse_utc_timestamp(value)
-            if not isinstance(window, str) or not window or len(window) > 32 or parsed is None:
+            if (
+                not isinstance(window, str)
+                or not window
+                or len(window) > 32
+                or parsed is None
+            ):
                 raise AgentError("codex-usage routing resets are invalid")
             normalized_resets[window] = (parsed, value)
     if decision == "blocked" and normalized_resets:
@@ -9988,7 +10053,6 @@ def validate_codex_usage_routing_decision(
         if blocked_resets:
             result["blocked_until_utc"] = max(blocked_resets)[1]
     return result
-
 
 
 def resolve_runtime_agent_selection(
@@ -15302,7 +15366,11 @@ def ensure_emergency_queen(*, dry_run: bool = False) -> dict[str, Any] | None:
 
     state = emergency_queen_status()
     if state["state"] in {"running", "finishing", "next", "draining"}:
-        return {"status": "already_active", "state": state, "raw_output": "not_returned"}
+        return {
+            "status": "already_active",
+            "state": state,
+            "raw_output": "not_returned",
+        }
     if state["state"] != "requested":
         return {"status": "not_requested", "state": state, "raw_output": "not_returned"}
     candidates = _emergency_queen_agent_candidates()
@@ -33244,111 +33312,145 @@ _MASTERJET_ADMIN_TOOL_SPECS = (
     (
         "fleet_openai_accounts",
         "openai.accounts.list",
-        "fleet.read",
         "List redacted OpenAI fleet accounts.",
-        (),
-        (),
+        None,
     ),
     (
         "fleet_openai_auth_plan",
         "openai.auth.plan",
-        "fleet.openai.write",
         "Plan OpenAI auth sync without accepting auth bytes.",
-        ("account_ref", "expected_generation", "idempotency_key"),
-        (),
+        None,
     ),
     (
         "fleet_google_inventory",
         "google.accounts.list",
-        "fleet.read",
         "List redacted Google accounts or projects.",
-        (),
-        ("account_ref",),
+        "google.projects.list",
     ),
     (
         "fleet_google_oauth_begin",
         "google.oauth.begin",
-        "fleet.google.oauth",
         "Begin browser OAuth without accepting OAuth codes.",
-        (
-            "account_ref",
-            "oauth_client_ref",
-            "redirect_uri",
-            "scope_profile",
-            "expected_generation",
-            "idempotency_key",
-        ),
-        (),
+        None,
     ),
     (
         "fleet_google_provision_plan",
         "google.provision.plan",
-        "fleet.google.provision",
         "Plan Google provisioning against fresh quota evidence.",
-        ("account_ref", "expected_generation", "idempotency_key"),
-        (),
+        None,
     ),
     (
         "fleet_google_provision_apply",
         "google.provision.apply",
-        "fleet.google.provision",
         "Apply one immutable Google provisioning plan.",
-        (
-            "account_ref",
-            "expected_generation",
-            "idempotency_key",
-            "plan_digest",
-        ),
-        (),
+        None,
     ),
     (
         "fleet_google_billing_plan",
         "google.billing.plan",
-        "fleet.google.billing.bind",
         "Plan one account-bound Google billing link.",
-        (
-            "account_ref",
-            "project_ref",
-            "billing_ref",
-            "expected_generation",
-            "idempotency_key",
-        ),
-        (),
+        None,
     ),
     (
         "fleet_google_billing_apply",
         "google.billing.apply",
-        "fleet.google.billing.bind",
         "Apply one immutable Google billing plan.",
-        (
-            "account_ref",
-            "project_ref",
-            "billing_ref",
-            "plan_id",
-            "expected_generation",
-            "idempotency_key",
-            "plan_digest",
-        ),
-        (),
+        None,
     ),
     (
         "fleet_operation_status",
         "operations.get",
-        "fleet.read",
         "Return one account-bound durable operation.",
-        ("account_ref", "operation_id"),
-        (),
+        None,
     ),
 )
 _MASTERJET_ADMIN_TOOL_ROUTES = MappingProxyType(
     {
-        name: (operation, scope)
-        for name, operation, scope, *_rest in _MASTERJET_ADMIN_TOOL_SPECS
+        name: (operation, alternate_operation)
+        for name, operation, _description, alternate_operation in _MASTERJET_ADMIN_TOOL_SPECS
     }
 )
 _MASTERJET_ADMIN_REQUEST_FIELDS = frozenset(
     {"expected_generation", "idempotency_key", "plan_digest"}
 )
+_MASTERJET_ADMIN_CLI_COMMANDS = MappingProxyType(
+    {
+        ("openai", "list"): ("openai.accounts.list", None),
+        ("openai", "add"): ("openai.accounts.add", None),
+        ("openai", "auth-sync"): ("openai.auth.plan", None),
+        ("openai", "disable"): ("openai.accounts.disable", None),
+        ("google", "add"): ("google.accounts.add", None),
+        ("google", "inventory"): (
+            "google.accounts.list",
+            "google.projects.list",
+        ),
+        ("google", "oauth-begin"): ("google.oauth.begin", None),
+        ("google", "provision-plan"): ("google.provision.plan", None),
+        ("google", "provision-apply"): ("google.provision.apply", None),
+        ("google", "billing-plan"): ("google.billing.plan", None),
+        ("google", "billing-apply"): ("google.billing.apply", None),
+        ("operation", "status"): ("operations.get", None),
+    }
+)
+
+
+def _masterjet_admin_operation_fields(
+    operation: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    metadata = ADMIN_OPERATION_METADATA[operation]
+    required = list(metadata.argument_fields)
+    optional = list(metadata.optional_argument_fields)
+    if metadata.command:
+        required.append("expected_generation")
+    if metadata.requires_idempotency:
+        required.append("idempotency_key")
+    if metadata.requires_digest:
+        required.append("plan_digest")
+    return tuple(required), tuple(optional)
+
+
+def _add_masterjet_admin_cli_command(
+    subparsers: Any,
+    command: str,
+    operation: str,
+    alternate_operation: str | None,
+) -> None:
+    parser = subparsers.add_parser(command)
+    required, optional = _masterjet_admin_operation_fields(operation)
+    if alternate_operation is not None:
+        alternate_required, alternate_optional = _masterjet_admin_operation_fields(
+            alternate_operation
+        )
+        optional = tuple(
+            dict.fromkeys((*optional, *alternate_required, *alternate_optional))
+        )
+    for field in (*required, *optional):
+        parser.add_argument(
+            f"--{field.replace('_', '-')}",
+            type=int if field == "expected_generation" else str,
+            required=field in required,
+        )
+    parser.set_defaults(
+        masterjet_admin_operation=operation,
+        masterjet_admin_alternate_operation=alternate_operation,
+    )
+
+
+def _masterjet_admin_cli_call(args: argparse.Namespace) -> dict[str, Any]:
+    operation = cast(str, args.masterjet_admin_operation)
+    alternate_operation = cast(str | None, args.masterjet_admin_alternate_operation)
+    if (
+        alternate_operation is not None
+        and getattr(args, "account_ref", None) is not None
+    ):
+        operation = alternate_operation
+    required, optional = _masterjet_admin_operation_fields(operation)
+    arguments = {
+        field: value
+        for field in (*required, *optional)
+        if (value := getattr(args, field, None)) is not None
+    }
+    return _masterjet_admin_operation_call(operation, arguments)
 
 
 def bind_masterjet_control_service(
@@ -33372,57 +33474,191 @@ def bind_masterjet_control_service(
         _MASTERJET_ADMIN_BINDING = (service, principal)
 
 
-def _masterjet_admin_tool_call(name: str, args: Mapping[str, object]) -> dict[str, Any]:
-    from codex_master.admin_contracts import AdminRequestV1, public_admin_result
-    from codex_master.admin_service import AdminServiceError
+def _masterjet_admin_operation_call(
+    operation: str, args: Mapping[str, object]
+) -> dict[str, Any]:
+    from codex_master.admin_contracts import (
+        AdminContractError,
+        AdminRequestV1,
+        canonical_admin_problem,
+        public_admin_result,
+    )
 
     binding = _MASTERJET_ADMIN_BINDING
-    route = _MASTERJET_ADMIN_TOOL_ROUTES.get(name)
-    if binding is None or route is None:
+    client = _MASTERJET_ADMIN_SOCKET_CLIENT
+    if (
+        binding is None and client is None
+    ) or operation not in ADMIN_OPERATION_METADATA:
         raise AgentError("control.service_unavailable")
-    service, principal = binding
-    operation = route[0]
     arguments = {
         key: value
         for key, value in args.items()
         if key not in _MASTERJET_ADMIN_REQUEST_FIELDS
     }
-    if name == "fleet_google_inventory" and "account_ref" in arguments:
-        operation = "google.projects.list"
-    request = AdminRequestV1(
-        operation,
-        arguments,
-        cast(int | None, args.get("expected_generation")),
-        cast(str | None, args.get("idempotency_key")),
-        cast(str | None, args.get("plan_digest")),
-    )
     try:
-        return dict(service.handle(principal, request))
-    except AdminServiceError as exc:
+        request = AdminRequestV1(
+            operation,
+            arguments,
+            cast(int | None, args.get("expected_generation")),
+            cast(str | None, args.get("idempotency_key")),
+            cast(str | None, args.get("plan_digest")),
+        )
+    except AdminContractError as exc:
+        problem = canonical_admin_problem(exc.code)
+        raise MasterjetAdminError(problem.code, public_admin_result(problem)) from None
+    if binding is not None:
+        from codex_master.admin_service import AdminServiceError
+
+        try:
+            service, principal = binding
+            return dict(service.handle(principal, request))
+        except AdminServiceError as exc:
+            raise MasterjetAdminError(
+                exc.problem.code, public_admin_result(exc.problem)
+            ) from None
+    from codex_master.admin_socket import AdminSocketError
+
+    assert client is not None
+    try:
+        return dict(client.call(request))
+    except AdminSocketError as exc:
         raise MasterjetAdminError(
             exc.problem.code, public_admin_result(exc.problem)
         ) from None
+
+
+def _masterjet_admin_tool_call(name: str, args: Mapping[str, object]) -> dict[str, Any]:
+    route = _MASTERJET_ADMIN_TOOL_ROUTES.get(name)
+    if route is None:
+        raise AgentError("control.service_unavailable")
+    operation, alternate_operation = route
+    if alternate_operation is not None and "account_ref" in args:
+        operation = alternate_operation
+    return _masterjet_admin_operation_call(operation, args)
+
+
+def _masterjet_admin_capabilities(
+    result: Mapping[str, object],
+) -> frozenset[str]:
+    allowed = result.get("allowed")
+    if (
+        set(result)
+        != {"schema_version", "catalog_digest", "operation_count", "allowed"}
+        or result.get("schema_version") != 1
+        or result.get("catalog_digest") != ADMIN_OPERATION_CATALOG_DIGEST
+        or result.get("operation_count") != len(ADMIN_OPERATION_CATALOG)
+        or type(allowed) is not list
+        or len(allowed) != len(ADMIN_OPERATION_CATALOG)
+        or any(type(value) is not bool for value in cast(list[object], allowed))
+        or any(
+            permitted and ADMIN_OPERATION_METADATA[operation].scope is None
+            for operation, permitted in zip(
+                ADMIN_OPERATION_CATALOG, cast(list[bool], allowed), strict=True
+            )
+        )
+    ):
+        raise ValueError("invalid admin capabilities")
+    return frozenset(
+        operation
+        for operation, permitted in zip(
+            ADMIN_OPERATION_CATALOG, cast(list[bool], allowed), strict=True
+        )
+        if permitted and ADMIN_OPERATION_METADATA[operation].scope is not None
+    )
+
+
+def _connect_masterjet_admin_socket() -> bool:
+    """Bind one request process to the attested local admin socket."""
+
+    from codex_master.admin_socket import AdminSocketClient, AdminSocketError
+
+    from codex_master.admin_contracts import AdminRequestV1
+
+    global _MASTERJET_ADMIN_ALLOWED_OPERATIONS
+    global _MASTERJET_ADMIN_SOCKET_CLIENT, _MASTERJET_ADMIN_SOCKET_KEY_FD
+    if (
+        _MASTERJET_ADMIN_BINDING is not None
+        or _MASTERJET_ADMIN_SOCKET_CLIENT is not None
+    ):
+        return False
+    socket_path = Path(
+        os.environ.get("CODEX_MASTER_ADMIN_SOCKET", STATE_ROOT / "admin.sock")
+    ).expanduser()
+    credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    key_path = (
+        Path(credential_directory) / "masterjet-local-attestation-key"
+        if credential_directory
+        else STATE_ROOT / "credentials" / "masterjet-local-attestation-key"
+    )
+    key_fd = -1
+    try:
+        key_fd = os.open(
+            key_path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        client = AdminSocketClient(socket_path, attestation_key_fd=key_fd)
+        capability_result = client.call(
+            AdminRequestV1("control.operations.list", {}, None, None, None)
+        )
+        operations = _masterjet_admin_capabilities(capability_result)
+    except (AdminSocketError, OSError, ValueError):
+        if key_fd >= 0:
+            os.close(key_fd)
+        raise AgentError("control.service_unavailable") from None
+    _MASTERJET_ADMIN_SOCKET_KEY_FD = key_fd
+    _MASTERJET_ADMIN_SOCKET_CLIENT = client
+    _MASTERJET_ADMIN_ALLOWED_OPERATIONS = operations
+    return True
+
+
+def _disconnect_masterjet_admin_socket(created: bool) -> None:
+    if not created:
+        return
+    global _MASTERJET_ADMIN_ALLOWED_OPERATIONS
+    global _MASTERJET_ADMIN_SOCKET_CLIENT, _MASTERJET_ADMIN_SOCKET_KEY_FD
+    key_fd = _MASTERJET_ADMIN_SOCKET_KEY_FD
+    _MASTERJET_ADMIN_SOCKET_CLIENT = None
+    _MASTERJET_ADMIN_SOCKET_KEY_FD = None
+    _MASTERJET_ADMIN_ALLOWED_OPERATIONS = frozenset()
+    if key_fd is not None:
+        os.close(key_fd)
 
 
 def _masterjet_visible_tools(
     tools: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     binding = _MASTERJET_ADMIN_BINDING
-    scopes = frozenset() if binding is None else frozenset(binding[1].scopes)
+    if binding is None:
+        allowed_operations = _MASTERJET_ADMIN_ALLOWED_OPERATIONS
+    else:
+        scopes = frozenset(binding[1].scopes)
+        allowed_operations = frozenset(
+            operation
+            for operation, metadata in ADMIN_OPERATION_METADATA.items()
+            if metadata.scope in scopes
+        )
     return [
         tool
         for tool in tools
         if tool["name"] not in _MASTERJET_ADMIN_TOOL_ROUTES
-        or _MASTERJET_ADMIN_TOOL_ROUTES[tool["name"]][1] in scopes
+        or _MASTERJET_ADMIN_TOOL_ROUTES[tool["name"]][0] in allowed_operations
     ]
 
 
 def _masterjet_admin_tool_definition(
     name: str,
+    operation: str,
     description: str,
-    required: tuple[str, ...],
-    optional: tuple[str, ...],
+    alternate_operation: str | None,
 ) -> dict[str, Any]:
+    required, optional = _masterjet_admin_operation_fields(operation)
+    if alternate_operation is not None:
+        alternate_required, alternate_optional = _masterjet_admin_operation_fields(
+            alternate_operation
+        )
+        optional = tuple(
+            dict.fromkeys((*optional, *alternate_required, *alternate_optional))
+        )
     properties = {
         field: (
             {"type": "integer", "minimum": 0}
@@ -33442,8 +33678,8 @@ def _masterjet_admin_tool_definition(
 
 
 _MASTERJET_ADMIN_TOOLS = [
-    _masterjet_admin_tool_definition(name, description, required, optional)
-    for name, _operation, _scope, description, required, optional in _MASTERJET_ADMIN_TOOL_SPECS
+    _masterjet_admin_tool_definition(name, operation, description, alternate_operation)
+    for name, operation, description, alternate_operation in _MASTERJET_ADMIN_TOOL_SPECS
 ]
 
 
@@ -35302,9 +35538,15 @@ def serve_mcp() -> int:
     """Serve MCP with a startup inventory scoped to this server lifetime."""
 
     previous_inventory = swap_agent_inventory(None)
+    admin_socket_created = False
     try:
+        try:
+            admin_socket_created = _connect_masterjet_admin_socket()
+        except AgentError:
+            pass
         return _serve_mcp_impl()
     finally:
+        _disconnect_masterjet_admin_socket(admin_socket_created)
         swap_agent_inventory(previous_inventory)
 
 
@@ -35546,7 +35788,9 @@ def _fleet_overview_cli(argv: list[str]) -> int:
         return 1
 
 
-def _render_resource_operator_status(status: ResourceEvidenceOperatorViewV2, *, format: str) -> str:
+def _render_resource_operator_status(
+    status: ResourceEvidenceOperatorViewV2, *, format: str
+) -> str:
     if format not in {"compact", "json", "markdown"}:
         raise AgentError("resource_status_unavailable")
     document = _resource_operator_document(status)
@@ -36085,6 +36329,23 @@ def main_cli(argv: list[str]) -> int:
         finally:
             swap_agent_inventory(previous_inventory)
 
+    admin_socket_created = False
+    if (
+        len(argv) >= 2
+        and argv[0] == "fleet"
+        and argv[1]
+        in {
+            "openai",
+            "google",
+            "operation",
+        }
+    ):
+        try:
+            admin_socket_created = _connect_masterjet_admin_socket()
+        except AgentError as exc:
+            print_json(public_error_payload(exc))
+            return 1
+
     global _FLEET_STARTUP_ERROR
     previous_inventory = swap_agent_inventory(None)
     try:
@@ -36093,6 +36354,7 @@ def main_cli(argv: list[str]) -> int:
         _publish_startup_fleet_inventory()
         return _main_cli_impl(argv)
     finally:
+        _disconnect_masterjet_admin_socket(admin_socket_created)
         swap_agent_inventory(previous_inventory)
 
 
@@ -36462,54 +36724,40 @@ def _main_cli_impl(argv: list[str]) -> int:
     openai_sub = p_fleet_openai.add_subparsers(
         dest="fleet_openai_command", required=True
     )
-    openai_sub.add_parser("list")
-    p_openai_auth_sync = openai_sub.add_parser("auth-sync")
-    p_openai_auth_sync.add_argument("--account-ref", required=True)
-    p_openai_auth_sync.add_argument("--expected-generation", type=int, required=True)
-    p_openai_auth_sync.add_argument("--idempotency-key", required=True)
+    for (namespace, command), (
+        operation,
+        alternate_operation,
+    ) in _MASTERJET_ADMIN_CLI_COMMANDS.items():
+        if namespace == "openai":
+            _add_masterjet_admin_cli_command(
+                openai_sub, command, operation, alternate_operation
+            )
 
     p_fleet_google = fleet_sub.add_parser("google")
     google_sub = p_fleet_google.add_subparsers(
         dest="fleet_google_command", required=True
     )
-    p_google_inventory = google_sub.add_parser("inventory")
-    p_google_inventory.add_argument("--account-ref")
-    p_google_oauth_begin = google_sub.add_parser("oauth-begin")
-    p_google_oauth_begin.add_argument("--account-ref", required=True)
-    p_google_oauth_begin.add_argument("--oauth-client-ref", required=True)
-    p_google_oauth_begin.add_argument("--redirect-uri", required=True)
-    p_google_oauth_begin.add_argument("--scope-profile", required=True)
-    p_google_oauth_begin.add_argument("--expected-generation", type=int, required=True)
-    p_google_oauth_begin.add_argument("--idempotency-key", required=True)
-
-    def add_google_plan_arguments(parser_obj: argparse.ArgumentParser) -> None:
-        parser_obj.add_argument("--account-ref", required=True)
-        parser_obj.add_argument("--expected-generation", type=int, required=True)
-        parser_obj.add_argument("--idempotency-key", required=True)
-
-    p_google_provision_plan = google_sub.add_parser("provision-plan")
-    add_google_plan_arguments(p_google_provision_plan)
-    p_google_provision_apply = google_sub.add_parser("provision-apply")
-    add_google_plan_arguments(p_google_provision_apply)
-    p_google_provision_apply.add_argument("--plan-digest", required=True)
-    p_google_billing_plan = google_sub.add_parser("billing-plan")
-    add_google_plan_arguments(p_google_billing_plan)
-    p_google_billing_plan.add_argument("--project-ref", required=True)
-    p_google_billing_plan.add_argument("--billing-ref", required=True)
-    p_google_billing_apply = google_sub.add_parser("billing-apply")
-    add_google_plan_arguments(p_google_billing_apply)
-    p_google_billing_apply.add_argument("--project-ref", required=True)
-    p_google_billing_apply.add_argument("--billing-ref", required=True)
-    p_google_billing_apply.add_argument("--plan-id", required=True)
-    p_google_billing_apply.add_argument("--plan-digest", required=True)
+    for (namespace, command), (
+        operation,
+        alternate_operation,
+    ) in _MASTERJET_ADMIN_CLI_COMMANDS.items():
+        if namespace == "google":
+            _add_masterjet_admin_cli_command(
+                google_sub, command, operation, alternate_operation
+            )
 
     p_fleet_operation = fleet_sub.add_parser("operation")
     operation_sub = p_fleet_operation.add_subparsers(
         dest="fleet_operation_command", required=True
     )
-    p_operation_status = operation_sub.add_parser("status")
-    p_operation_status.add_argument("--account-ref", required=True)
-    p_operation_status.add_argument("--operation-id", required=True)
+    for (namespace, command), (
+        operation,
+        alternate_operation,
+    ) in _MASTERJET_ADMIN_CLI_COMMANDS.items():
+        if namespace == "operation":
+            _add_masterjet_admin_cli_command(
+                operation_sub, command, operation, alternate_operation
+            )
 
     p_fleet_account = fleet_sub.add_parser("account")
     account_sub = p_fleet_account.add_subparsers(
@@ -36675,90 +36923,8 @@ def _main_cli_impl(argv: list[str]) -> int:
         if args.command in {"hive", "selection-status", "reset-anchor-run"}:
             return print_json(run_hive_cli(args))
         if args.command == "fleet":
-            if args.fleet_namespace == "openai":
-                if args.fleet_openai_command == "list":
-                    return print_json(call_validated_tool("fleet_openai_accounts", {}))
-                if args.fleet_openai_command == "auth-sync":
-                    return print_json(
-                        call_validated_tool(
-                            "fleet_openai_auth_plan",
-                            {
-                                "account_ref": args.account_ref,
-                                "expected_generation": args.expected_generation,
-                                "idempotency_key": args.idempotency_key,
-                            },
-                        )
-                    )
-            if args.fleet_namespace == "google":
-                if args.fleet_google_command == "inventory":
-                    return print_json(
-                        call_validated_tool(
-                            "fleet_google_inventory",
-                            {"account_ref": args.account_ref},
-                        )
-                    )
-                if args.fleet_google_command == "oauth-begin":
-                    return print_json(
-                        call_validated_tool(
-                            "fleet_google_oauth_begin",
-                            {
-                                "account_ref": args.account_ref,
-                                "oauth_client_ref": args.oauth_client_ref,
-                                "redirect_uri": args.redirect_uri,
-                                "scope_profile": args.scope_profile,
-                                "expected_generation": args.expected_generation,
-                                "idempotency_key": args.idempotency_key,
-                            },
-                        )
-                    )
-                common_google = {
-                    "account_ref": args.account_ref,
-                    "expected_generation": args.expected_generation,
-                    "idempotency_key": args.idempotency_key,
-                }
-                if args.fleet_google_command == "provision-plan":
-                    return print_json(
-                        call_validated_tool(
-                            "fleet_google_provision_plan", common_google
-                        )
-                    )
-                if args.fleet_google_command == "provision-apply":
-                    return print_json(
-                        call_validated_tool(
-                            "fleet_google_provision_apply",
-                            {**common_google, "plan_digest": args.plan_digest},
-                        )
-                    )
-                billing = {
-                    **common_google,
-                    "project_ref": args.project_ref,
-                    "billing_ref": args.billing_ref,
-                }
-                if args.fleet_google_command == "billing-plan":
-                    return print_json(
-                        call_validated_tool("fleet_google_billing_plan", billing)
-                    )
-                if args.fleet_google_command == "billing-apply":
-                    return print_json(
-                        call_validated_tool(
-                            "fleet_google_billing_apply",
-                            {
-                                **billing,
-                                "plan_id": args.plan_id,
-                                "plan_digest": args.plan_digest,
-                            },
-                        )
-                    )
-            if args.fleet_namespace == "operation":
-                return print_json(
-                    call_validated_tool(
-                        "fleet_operation_status",
-                        {
-                            "account_ref": args.account_ref,
-                            "operation_id": args.operation_id,
-                        },
-                    )
-                )
+            if hasattr(args, "masterjet_admin_operation"):
+                return print_json(_masterjet_admin_cli_call(args))
             if args.fleet_namespace == "account":
                 if args.fleet_account_command == "list":
                     return print_json(call_validated_tool("fleet_account_list", {}))

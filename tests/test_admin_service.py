@@ -8,7 +8,7 @@ from threading import Lock
 import pytest
 import codex_master.admin_service as admin_service_module
 
-from codex_master.admin_contracts import AdminPrincipalV1, OperationV1
+from codex_master.admin_contracts import AdminPrincipalV1, AdminRequestV1, OperationV1
 from codex_master.admin_hosts import ControlHostV1
 from codex_master.admin_operations import AdminOperationPlan, AdminOperationStore
 from codex_master.google_account_inventory import GoogleAccountInventoryError
@@ -107,6 +107,9 @@ class OperationStore:
             operation,
         )
 
+    def lookup_plan(self, **_values: object) -> AdminOperationPlan | None:
+        return None
+
     def begin(self, operation_id: str, *, current_generation: int) -> OperationV1:
         return self.get(operation_id)
 
@@ -136,18 +139,69 @@ class OperationStore:
 class OpenAIAccounts:
     def __init__(self) -> None:
         self.calls = 0
+        self.generation = 4
 
     def list_accounts(self) -> tuple[OpenAIAccountSummaryV1, ...]:
         self.calls += 1
-        return (OpenAIAccountSummaryV1("openai-one", 4),)
+        return (OpenAIAccountSummaryV1("openai-one", self.generation),)
+
+
+class AccountRegistry:
+    def __init__(self) -> None:
+        self.generation = 4
+        self.calls: list[tuple[object, ...]] = []
+
+    def current_generation(self, provider: str) -> int:
+        self.calls.append(("generation", provider))
+        return self.generation
+
+    def add_account(
+        self,
+        provider: str,
+        account_ref: str,
+        label: str,
+        *,
+        expected_generation: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        self.calls.append(
+            (
+                "add",
+                provider,
+                account_ref,
+                label,
+                expected_generation,
+                idempotency_key,
+            )
+        )
+        self.generation += 1
+        return {"account": {"ref": account_ref, "generation": self.generation}}
+
+    def disable_account(
+        self,
+        provider: str,
+        account_ref: str,
+        *,
+        expected_generation: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        self.calls.append(
+            ("disable", provider, account_ref, expected_generation, idempotency_key)
+        )
+        self.generation += 1
+        return {"account": {"ref": account_ref, "generation": self.generation}}
 
 
 class OpenAICredentials:
     def __init__(self) -> None:
+        self.generation = 4
         self.plan_calls = 0
         self.apply_calls = 0
         self.last_plan: tuple[object, ...] | None = None
         self.resolve_error = False
+
+    def account_generation(self, _account_ref: str) -> int:
+        return self.generation
 
     def plan_auth_sync(
         self,
@@ -252,6 +306,7 @@ class GoogleManager:
 
 class GoogleOAuth:
     def __init__(self) -> None:
+        self.generation = 4
         self.calls: list[str] = []
         self.last_begin: tuple[str, dict[str, object]] | None = None
         self.bindings: dict[str, object] = {
@@ -262,6 +317,9 @@ class GoogleOAuth:
                 admin_service_module.GoogleOAuthClientAvailabilityV1.AVAILABLE,
             )
         }
+
+    def account_generation(self, _account_ref: str) -> int:
+        return self.generation
 
     def default_oauth_client_binding(
         self, account_ref: str, *, expected_generation: int
@@ -570,6 +628,7 @@ class SecretIngress:
 @dataclass
 class Owners:
     operation_store: OperationStore
+    account_registry: AccountRegistry
     openai_accounts: OpenAIAccounts
     openai_credentials: OpenAICredentials
     google_manager: GoogleManager
@@ -584,6 +643,7 @@ class Owners:
 def service_at() -> tuple[MasterjetControlService, Owners]:
     owners = Owners(
         OperationStore(),
+        AccountRegistry(),
         OpenAIAccounts(),
         OpenAICredentials(),
         GoogleManager(),
@@ -605,6 +665,7 @@ def service_at() -> tuple[MasterjetControlService, Owners]:
         google_billing=owners.google_billing,
         host_registry=owners.hosts,
         secret_ingress=owners.secret_ingress,
+        account_registry=owners.account_registry,
     )
     return service, owners
 
@@ -778,6 +839,46 @@ def test_operations_get_denies_cross_account_operation() -> None:
     assert owners.operation_store.calls == 1
 
 
+@pytest.mark.parametrize(
+    ("operation", "arguments", "scope", "expected_call"),
+    (
+        (
+            "openai.accounts.add",
+            {"account_ref": "openai-two", "label": "OpenAI Two"},
+            "fleet.openai.write",
+            ("add", "openai", "openai-two", "OpenAI Two", 4, "request-one"),
+        ),
+        (
+            "openai.accounts.disable",
+            {"account_ref": "openai-one"},
+            "fleet.openai.write",
+            ("disable", "openai", "openai-one", 4, "request-one"),
+        ),
+        (
+            "google.accounts.add",
+            {"account_ref": "google-two", "label": "Google Two"},
+            "fleet.google.oauth",
+            ("add", "google", "google-two", "Google Two", 4, "request-one"),
+        ),
+    ),
+)
+def test_account_commands_delegate_once_to_account_registry(
+    operation: str,
+    arguments: dict[str, object],
+    scope: str,
+    expected_call: tuple[object, ...],
+) -> None:
+    service, owners = service_at()
+
+    result = command(service, operation, arguments, scope)
+
+    assert result["account"]["ref"] == arguments["account_ref"]  # type: ignore[index]
+    assert owners.account_registry.calls == [
+        ("generation", operation.split(".", 1)[0]),
+        expected_call,
+    ]
+
+
 def test_provision_apply_requires_scope_and_step_up_before_owner() -> None:
     service, owners = service_at()
 
@@ -798,6 +899,187 @@ def test_provision_apply_requires_scope_and_step_up_before_owner() -> None:
             digest=DIGEST,
         )
 
+    assert owners.google_provisioner.apply_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments", "scope", "idempotency_key", "digest"),
+    (
+        (
+            "openai.accounts.add",
+            {"account_ref": "openai-two", "label": "OpenAI Two"},
+            "fleet.openai.write",
+            "idem",
+            None,
+        ),
+        (
+            "openai.accounts.disable",
+            {"account_ref": "openai-one"},
+            "fleet.openai.write",
+            "idem",
+            None,
+        ),
+        (
+            "google.accounts.add",
+            {"account_ref": "google-two", "label": "Google Two"},
+            "fleet.google.oauth",
+            "idem",
+            None,
+        ),
+        (
+            "openai.auth.plan",
+            {"account_ref": "openai-one"},
+            "fleet.openai.write",
+            "idem",
+            None,
+        ),
+        (
+            "openai.auth.apply",
+            {"account_ref": "openai-one"},
+            "fleet.secrets.ingress",
+            "idem",
+            DIGEST,
+        ),
+        (
+            "secret.ingress.create",
+            {"account_ref": "openai-one", "credential_kind": "openai.auth-json"},
+            "fleet.secrets.ingress",
+            "idem",
+            DIGEST,
+        ),
+        (
+            "google.oauth.begin",
+            {
+                "account_ref": "google-one",
+                "oauth_client_ref": "oauth-client-one",
+                "redirect_uri": "http://127.0.0.1/callback",
+                "scope_profile": "inventory",
+            },
+            "fleet.google.oauth",
+            "idem",
+            None,
+        ),
+        (
+            "google.oauth.complete",
+            {
+                "account_ref": "google-one",
+                "transaction_id": "transaction-one",
+                "redirect_uri": "http://127.0.0.1/callback",
+                "state": "state-one",
+            },
+            "fleet.google.oauth",
+            None,
+            None,
+        ),
+        (
+            "google.oauth-client-import.plan",
+            {"account_ref": "google-one"},
+            "fleet.google.oauth",
+            "idem",
+            None,
+        ),
+        (
+            "google.oauth-client-import.apply",
+            {"account_ref": "google-one"},
+            "fleet.google.oauth",
+            "idem",
+            DIGEST,
+        ),
+        (
+            "google.inventory.refresh",
+            {},
+            "fleet.google.inventory.refresh",
+            "idem",
+            None,
+        ),
+        (
+            "google.provision.plan",
+            {"account_ref": "google-one"},
+            "fleet.google.provision",
+            "idem",
+            None,
+        ),
+        (
+            "google.provision.apply",
+            {"account_ref": "google-one"},
+            "fleet.google.provision",
+            "idem",
+            DIGEST,
+        ),
+        (
+            "google.billing.plan",
+            {
+                "account_ref": "google-one",
+                "project_ref": "project-one",
+                "billing_ref": "billing-one",
+            },
+            "fleet.google.billing.bind",
+            "idem",
+            None,
+        ),
+        (
+            "google.billing.apply",
+            {
+                "account_ref": "google-one",
+                "project_ref": "project-one",
+                "billing_ref": "billing-one",
+                "plan_id": "plan-one",
+            },
+            "fleet.google.billing.bind",
+            "idem",
+            DIGEST,
+        ),
+    ),
+)
+def test_every_command_generation_cas_precedes_owner_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    arguments: dict[str, object],
+    scope: str,
+    idempotency_key: str | None,
+    digest: str | None,
+) -> None:
+    service, owners = service_at()
+    owners.openai_accounts.generation = 5
+    owners.openai_credentials.generation = 5
+    owners.google_manager.generation = 5
+    owners.google_oauth.generation = 5
+    owners.account_registry.generation = 5
+    owner_calls: list[str] = []
+
+    def owner_side_effect(*_values: object) -> dict[str, object]:
+        owner_calls.append(operation)
+        return {"unexpected": True}
+
+    handlers = dict(admin_service_module._COMMAND_HANDLERS)
+    handlers[operation] = owner_side_effect
+    monkeypatch.setattr(admin_service_module, "_COMMAND_HANDLERS", handlers)
+    request = AdminRequestV1(operation, arguments, 4, idempotency_key, digest)
+
+    with pytest.raises(AdminServiceError) as captured:
+        service.handle(principal(scope, step_up=True), request)
+
+    assert captured.value.problem.code == "credential.generation_conflict"
+    assert owner_calls == []
+
+
+def test_stale_google_provision_apply_never_calls_owner() -> None:
+    service, owners = service_at()
+    owners.google_manager.generation = 5
+    owners.account_registry.generation = 5
+
+    with pytest.raises(AdminServiceError) as captured:
+        command(
+            service,
+            "google.provision.apply",
+            {"account_ref": "google-one"},
+            "fleet.google.provision",
+            digest=DIGEST,
+            step_up=True,
+            generation=4,
+        )
+
+    assert captured.value.problem.code == "credential.generation_conflict"
     assert owners.google_provisioner.apply_calls == 0
 
 
@@ -1479,6 +1761,7 @@ def test_global_inventory_refresh_rejects_stale_generation_before_reload(
         )
 
     assert owners.google_manager.reload_calls == 0
+    assert not (tmp_path / "admin-operations" / "operations.json").exists()
 
 
 def test_global_inventory_refresh_owner_failure_replays_terminal_receipt(

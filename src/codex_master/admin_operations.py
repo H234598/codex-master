@@ -223,6 +223,39 @@ class AdminOperationStore:
             self._write_locked(records)
             return self._plan(record)
 
+    def lookup_plan(
+        self,
+        *,
+        kind: str,
+        generation: int,
+        key: str,
+        steps: tuple[str, ...],
+    ) -> AdminOperationPlan | None:
+        """Return a live idempotent plan without creating or pruning records."""
+
+        kind = self._token(kind)
+        generation = self._generation(generation)
+        key = self._token(key)
+        steps = self._steps(steps)
+        digest = self._plan_digest(kind, generation, steps)
+        now = self._now()
+        with self._locked_records() as records:
+            for record in records:
+                if record["idempotency_key"] != key or (
+                    record["state"] != "running"
+                    and self._parse_time(record["expires_at"]) <= now
+                ):
+                    continue
+                if (
+                    record["kind"] != kind
+                    or record["expected_generation"] != generation
+                    or tuple(step["name"] for step in record["steps"]) != steps
+                    or record["plan_digest"] != digest
+                ):
+                    raise AdminOperationError("control.idempotency_conflict")
+                return self._plan(record)
+        return None
+
     def begin(self, operation_id: str, *, current_generation: int) -> OperationV1:
         operation_id = self._token(operation_id)
         current_generation = self._generation(current_generation)

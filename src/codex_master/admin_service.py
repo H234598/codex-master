@@ -13,6 +13,9 @@ import urllib.parse
 import uuid
 
 from .admin_contracts import (
+    ADMIN_OPERATION_CATALOG,
+    ADMIN_OPERATION_CATALOG_DIGEST,
+    ADMIN_OPERATION_METADATA,
     AdminPrincipalV1,
     AdminRequestV1,
     HiveProblemV1,
@@ -57,28 +60,17 @@ from .openai_credential_service import (
 
 QUERY_SCOPES = MappingProxyType(
     {
-        "hosts.list": "fleet.host.read",
-        "openai.accounts.list": "fleet.read",
-        "google.accounts.list": "fleet.read",
-        "google.projects.list": "fleet.read",
-        "operations.get": "fleet.read",
+        operation: metadata.scope
+        for operation, metadata in ADMIN_OPERATION_METADATA.items()
+        if not metadata.command and metadata.scope is not None
     }
 )
 
 COMMAND_SCOPES = MappingProxyType(
     {
-        "openai.auth.plan": "fleet.openai.write",
-        "openai.auth.apply": "fleet.secrets.ingress",
-        "secret.ingress.create": "fleet.secrets.ingress",
-        "google.oauth.begin": "fleet.google.oauth",
-        "google.oauth.complete": "fleet.google.oauth",
-        "google.oauth-client-import.plan": "fleet.google.oauth",
-        "google.oauth-client-import.apply": "fleet.google.oauth",
-        "google.inventory.refresh": "fleet.google.inventory.refresh",
-        "google.provision.plan": "fleet.google.provision",
-        "google.provision.apply": "fleet.google.provision",
-        "google.billing.plan": "fleet.google.billing.bind",
-        "google.billing.apply": "fleet.google.billing.bind",
+        operation: metadata.scope
+        for operation, metadata in ADMIN_OPERATION_METADATA.items()
+        if metadata.command and metadata.scope is not None
     }
 )
 
@@ -121,6 +113,29 @@ _FORBIDDEN_ARGUMENT_KEYS = frozenset(
 
 class OpenAIAccountsPort(Protocol):
     def list_accounts(self) -> Sequence[OpenAIAccountSummaryV1]: ...
+
+
+class AccountRegistryPort(Protocol):
+    def current_generation(self, provider: str) -> int: ...
+
+    def add_account(
+        self,
+        provider: str,
+        account_ref: str,
+        label: str,
+        *,
+        expected_generation: int,
+        idempotency_key: str,
+    ) -> Mapping[str, object]: ...
+
+    def disable_account(
+        self,
+        provider: str,
+        account_ref: str,
+        *,
+        expected_generation: int,
+        idempotency_key: str,
+    ) -> Mapping[str, object]: ...
 
 
 class QuotaCollectorPort(Protocol):
@@ -295,6 +310,7 @@ class MasterjetControlService:
         google_billing: GoogleBillingService | None,
         host_registry: HostRegistry,
         secret_ingress: SecretIngressPort | None,
+        account_registry: AccountRegistryPort | None = None,
     ) -> None:
         self._operation_store = operation_store
         self._openai_accounts = openai_accounts
@@ -306,6 +322,7 @@ class MasterjetControlService:
         self._google_billing = google_billing
         self._host_registry = host_registry
         self._secret_ingress = secret_ingress
+        self._account_registry = account_registry
 
     @classmethod
     def with_admin_secret_ingress(
@@ -561,11 +578,30 @@ class MasterjetControlService:
             raise _service_error("control.request_invalid")
         _reject_secret_arguments(request.arguments)
         operation = request.operation
+        if operation == "control.operations.list":
+            return _public_mapping(
+                {
+                    "schema_version": 1,
+                    "catalog_digest": ADMIN_OPERATION_CATALOG_DIGEST,
+                    "operation_count": len(ADMIN_OPERATION_CATALOG),
+                    "allowed": [
+                        (metadata := ADMIN_OPERATION_METADATA[candidate]).scope
+                        is not None
+                        and metadata.scope in principal.scopes
+                        for candidate in ADMIN_OPERATION_CATALOG
+                    ],
+                }
+            )
         scope = QUERY_SCOPES.get(operation) or COMMAND_SCOPES.get(operation)
         if scope is None:
             raise _service_error("control.request_invalid")
         if scope not in principal.scopes:
             raise _denied("authority.scope_denied")
+        replay = self._durable_command_replay(request)
+        if replay is not None:
+            return replay
+        if operation in COMMAND_SCOPES:
+            self._assert_command_generation(request)
         if ingress_session is None and operation in _INGRESS_APPLY_KINDS:
             ingress_session = self._continued_secret_apply(principal, request)
             if ingress_session is not None:
@@ -585,6 +621,92 @@ class MasterjetControlService:
         else:
             return _public_mapping(result)
         raise owner_error from None
+
+    def _durable_command_replay(
+        self, request: AdminRequestV1
+    ) -> dict[str, object] | None:
+        if request.operation != "google.inventory.refresh":
+            return None
+        try:
+            plan = self._operation_store.lookup_plan(
+                kind="google.inventory.refresh",
+                generation=_generation(request),
+                key=_idempotency(request),
+                steps=("inventory.reload",),
+            )
+        except Exception as error:
+            raise _owner_service_error(error) from None
+        if plan is None or plan.operation.state == "planned":
+            return None
+        return public_admin_result(plan.operation)
+
+    def _assert_command_generation(self, request: AdminRequestV1) -> None:
+        expected = _generation(request)
+        try:
+            metadata = ADMIN_OPERATION_METADATA[request.operation]
+            domain = metadata.generation_domain
+            if domain in {
+                "account_registry.openai",
+                "account_registry.google",
+            }:
+                owner = _required(self._account_registry)
+                current = owner.current_generation(domain.rsplit(".", 1)[-1])
+            elif domain == "openai" or (
+                request.operation == "secret.ingress.create"
+                and request.arguments.get("credential_kind") == "openai.auth-json"
+            ):
+                account_ref = cast(str, request.arguments["account_ref"])
+                owner = _required(self._openai_credentials)
+                current = owner.account_generation(account_ref)
+            elif domain == "google_oauth" or (
+                request.operation == "secret.ingress.create"
+                and request.arguments.get("credential_kind") != "openai.auth-json"
+            ):
+                account_ref = cast(str, request.arguments["account_ref"])
+                owner = _required(self._google_oauth)
+                current = owner.account_generation(account_ref)
+            else:
+                current = self._google_manager.inventory_generation()
+        except AdminServiceError:
+            raise
+        except Exception as error:
+            raise _owner_service_error(error) from None
+        if type(current) is not int or current != expected:
+            raise _service_error("credential.generation_conflict")
+
+    def _account_add(
+        self,
+        _principal: AdminPrincipalV1,
+        request: AdminRequestV1,
+        *_values: object,
+    ) -> dict[str, object]:
+        owner = _required(self._account_registry)
+        provider = request.operation.split(".", 1)[0]
+        return dict(
+            owner.add_account(
+                provider,
+                cast(str, request.arguments["account_ref"]),
+                cast(str, request.arguments["label"]),
+                expected_generation=_generation(request),
+                idempotency_key=_idempotency(request),
+            )
+        )
+
+    def _account_disable(
+        self,
+        _principal: AdminPrincipalV1,
+        request: AdminRequestV1,
+        *_values: object,
+    ) -> dict[str, object]:
+        owner = _required(self._account_registry)
+        return dict(
+            owner.disable_account(
+                "openai",
+                cast(str, request.arguments["account_ref"]),
+                expected_generation=_generation(request),
+                idempotency_key=_idempotency(request),
+            )
+        )
 
     def _hosts_list(self, *_values: object) -> dict[str, object]:
         return {"hosts": [_serialize_host(item) for item in self._host_registry.list()]}
@@ -1032,6 +1154,9 @@ _QUERY_HANDLERS: Mapping[str, Handler] = MappingProxyType(
 )
 _COMMAND_HANDLERS: Mapping[str, Handler] = MappingProxyType(
     {
+        "openai.accounts.add": MasterjetControlService._account_add,
+        "openai.accounts.disable": MasterjetControlService._account_disable,
+        "google.accounts.add": MasterjetControlService._account_add,
         "openai.auth.plan": MasterjetControlService._openai_auth_plan,
         "openai.auth.apply": MasterjetControlService._openai_auth_apply,
         "secret.ingress.create": MasterjetControlService._secret_ingress_create,

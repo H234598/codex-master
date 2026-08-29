@@ -5,88 +5,180 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import hashlib
 import re
 from types import MappingProxyType
 from typing import Never, cast
 import unicodedata
 from urllib.parse import unquote
+import uuid
 
 
-_OPERATIONS = frozenset(
+@dataclass(frozen=True, slots=True)
+class AdminOperationMetadataV1:
+    scope: str | None
+    command: bool
+    argument_fields: tuple[str, ...]
+    optional_argument_fields: tuple[str, ...] = ()
+    text_argument_fields: tuple[str, ...] = ()
+    requires_idempotency: bool = False
+    requires_digest: bool = False
+    generation_domain: str | None = None
+
+
+ADMIN_OPERATION_METADATA = MappingProxyType(
     {
-        "openai.accounts.list",
-        "google.accounts.list",
-        "google.projects.list",
-        "hosts.list",
-        "operations.get",
-        "openai.auth.plan",
-        "openai.auth.apply",
-        "google.oauth.begin",
-        "secret.ingress.create",
-        "google.oauth.complete",
-        "google.oauth-client-import.plan",
-        "google.oauth-client-import.apply",
-        "google.inventory.refresh",
-        "google.provision.plan",
-        "google.provision.apply",
-        "google.billing.plan",
-        "google.billing.apply",
+        "control.operations.list": AdminOperationMetadataV1(None, False, ()),
+        "hosts.list": AdminOperationMetadataV1("fleet.host.read", False, ()),
+        "openai.accounts.list": AdminOperationMetadataV1("fleet.read", False, ()),
+        "google.accounts.list": AdminOperationMetadataV1("fleet.read", False, ()),
+        "google.projects.list": AdminOperationMetadataV1(
+            "fleet.read", False, ("account_ref",)
+        ),
+        "operations.get": AdminOperationMetadataV1(
+            "fleet.read", False, ("account_ref", "operation_id")
+        ),
+        "openai.accounts.add": AdminOperationMetadataV1(
+            "fleet.openai.write",
+            True,
+            ("account_ref", "label"),
+            text_argument_fields=("label",),
+            requires_idempotency=True,
+            generation_domain="account_registry.openai",
+        ),
+        "openai.accounts.disable": AdminOperationMetadataV1(
+            "fleet.openai.write",
+            True,
+            ("account_ref",),
+            requires_idempotency=True,
+            generation_domain="account_registry.openai",
+        ),
+        "google.accounts.add": AdminOperationMetadataV1(
+            "fleet.google.oauth",
+            True,
+            ("account_ref", "label"),
+            text_argument_fields=("label",),
+            requires_idempotency=True,
+            generation_domain="account_registry.google",
+        ),
+        "openai.auth.plan": AdminOperationMetadataV1(
+            "fleet.openai.write",
+            True,
+            ("account_ref",),
+            requires_idempotency=True,
+            generation_domain="openai",
+        ),
+        "openai.auth.apply": AdminOperationMetadataV1(
+            "fleet.secrets.ingress",
+            True,
+            ("account_ref",),
+            requires_idempotency=True,
+            requires_digest=True,
+            generation_domain="openai",
+        ),
+        "secret.ingress.create": AdminOperationMetadataV1(
+            "fleet.secrets.ingress",
+            True,
+            ("account_ref", "credential_kind"),
+            ("transaction_id",),
+            requires_idempotency=True,
+            requires_digest=True,
+            generation_domain="credential",
+        ),
+        "google.oauth.begin": AdminOperationMetadataV1(
+            "fleet.google.oauth",
+            True,
+            ("account_ref", "oauth_client_ref", "redirect_uri", "scope_profile"),
+            text_argument_fields=("redirect_uri",),
+            requires_idempotency=True,
+            generation_domain="google_oauth",
+        ),
+        "google.oauth.complete": AdminOperationMetadataV1(
+            "fleet.google.oauth",
+            True,
+            ("account_ref", "transaction_id", "redirect_uri", "state"),
+            text_argument_fields=("redirect_uri",),
+            generation_domain="google_oauth",
+        ),
+        "google.oauth-client-import.plan": AdminOperationMetadataV1(
+            "fleet.google.oauth",
+            True,
+            ("account_ref",),
+            requires_idempotency=True,
+            generation_domain="google_oauth",
+        ),
+        "google.oauth-client-import.apply": AdminOperationMetadataV1(
+            "fleet.google.oauth",
+            True,
+            ("account_ref",),
+            requires_idempotency=True,
+            requires_digest=True,
+            generation_domain="google_oauth",
+        ),
+        "google.inventory.refresh": AdminOperationMetadataV1(
+            "fleet.google.inventory.refresh",
+            True,
+            (),
+            requires_idempotency=True,
+            generation_domain="google",
+        ),
+        "google.provision.plan": AdminOperationMetadataV1(
+            "fleet.google.provision",
+            True,
+            ("account_ref",),
+            requires_idempotency=True,
+            generation_domain="google",
+        ),
+        "google.provision.apply": AdminOperationMetadataV1(
+            "fleet.google.provision",
+            True,
+            ("account_ref",),
+            requires_idempotency=True,
+            requires_digest=True,
+            generation_domain="google",
+        ),
+        "google.billing.plan": AdminOperationMetadataV1(
+            "fleet.google.billing.bind",
+            True,
+            ("account_ref", "project_ref", "billing_ref"),
+            requires_idempotency=True,
+            generation_domain="google",
+        ),
+        "google.billing.apply": AdminOperationMetadataV1(
+            "fleet.google.billing.bind",
+            True,
+            ("account_ref", "project_ref", "billing_ref", "plan_id"),
+            requires_idempotency=True,
+            requires_digest=True,
+            generation_domain="google",
+        ),
     }
 )
-_GLOBAL_LISTS = frozenset(
-    {"openai.accounts.list", "google.accounts.list", "hosts.list"}
+ADMIN_OPERATION_CATALOG = tuple(ADMIN_OPERATION_METADATA)
+ADMIN_OPERATION_CATALOG_DIGEST = hashlib.sha256(
+    "\0".join(ADMIN_OPERATION_CATALOG).encode("ascii")
+).hexdigest()
+_OPERATIONS = frozenset(ADMIN_OPERATION_METADATA)
+_QUERY_OPERATIONS = frozenset(
+    operation
+    for operation, metadata in ADMIN_OPERATION_METADATA.items()
+    if not metadata.command
 )
-_QUERY_OPERATIONS = _GLOBAL_LISTS | {"google.projects.list", "operations.get"}
 _COMMAND_OPERATIONS = _OPERATIONS - _QUERY_OPERATIONS
-_IDEMPOTENCY_OPERATIONS = _COMMAND_OPERATIONS - {"google.oauth.complete"}
-_DIGEST_OPERATIONS = frozenset(
-    {
-        "openai.auth.apply",
-        "secret.ingress.create",
-        "google.oauth-client-import.apply",
-        "google.provision.apply",
-        "google.billing.apply",
-    }
+_IDEMPOTENCY_OPERATIONS = frozenset(
+    operation
+    for operation, metadata in ADMIN_OPERATION_METADATA.items()
+    if metadata.requires_idempotency
 )
-_ARGUMENT_FIELDS = {
-    "hosts.list": (),
-    "openai.accounts.list": (),
-    "google.accounts.list": (),
-    "google.projects.list": ("account_ref",),
-    "operations.get": ("account_ref", "operation_id"),
-    "openai.auth.plan": ("account_ref",),
-    "openai.auth.apply": ("account_ref",),
-    "secret.ingress.create": ("account_ref", "credential_kind"),
-    "google.oauth.begin": (
-        "account_ref",
-        "oauth_client_ref",
-        "redirect_uri",
-        "scope_profile",
-    ),
-    "google.oauth.complete": (
-        "account_ref",
-        "transaction_id",
-        "redirect_uri",
-        "state",
-    ),
-    "google.oauth-client-import.plan": ("account_ref",),
-    "google.oauth-client-import.apply": ("account_ref",),
-    "google.inventory.refresh": (),
-    "google.provision.plan": ("account_ref",),
-    "google.provision.apply": ("account_ref",),
-    "google.billing.plan": ("account_ref", "project_ref", "billing_ref"),
-    "google.billing.apply": (
-        "account_ref",
-        "project_ref",
-        "billing_ref",
-        "plan_id",
-    ),
-}
+_DIGEST_OPERATIONS = frozenset(
+    operation
+    for operation, metadata in ADMIN_OPERATION_METADATA.items()
+    if metadata.requires_digest
+)
 _OPERATION_ALIASES = {
     "openai.auth-sync.plan": "openai.auth.plan",
     "openai.auth-sync.apply": "openai.auth.apply",
 }
-_PLAN_ID_ARGUMENT_OPERATIONS = frozenset({"google.billing.apply"})
 _REQUEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -251,17 +343,14 @@ def _mapping(value: object, *, private: bool = False) -> Mapping[str, object]:
 
 def _arguments(operation: str, value: object) -> Mapping[str, object]:
     arguments = _mapping(value)
-    fields = _ARGUMENT_FIELDS[operation]
-    allowed = set(fields)
-    if operation in _PLAN_ID_ARGUMENT_OPERATIONS:
-        allowed.add("plan_id")
-    if operation == "secret.ingress.create":
-        allowed.add("transaction_id")
+    metadata = ADMIN_OPERATION_METADATA[operation]
+    fields = metadata.argument_fields
+    allowed = set(fields) | set(metadata.optional_argument_fields)
     if set(arguments) - allowed or not set(fields) <= set(arguments):
         _invalid()
     result = {
         field: _text(arguments[field])
-        if field == "redirect_uri"
+        if field in metadata.text_argument_fields
         else _token(arguments[field])
         for field in arguments
     }
@@ -449,6 +538,23 @@ class HiveProblemV1:
             self, "correlation_id", _token(self.correlation_id, private=True)
         )
         object.__setattr__(self, "occurred_at", _utc_time(self.occurred_at))
+
+
+def canonical_admin_problem(code: str) -> HiveProblemV1:
+    """Build one redacted public problem for transport adapters."""
+
+    return HiveProblemV1(
+        code=code,
+        severity="error",
+        title="Request failed",
+        detail="Request could not be completed",
+        effect="No action was started",
+        action="Review access and retry",
+        retryable=False,
+        retry_after_seconds=None,
+        correlation_id="corr-" + uuid.uuid4().hex,
+        occurred_at=datetime.now(UTC),
+    )
 
 
 def parse_admin_request(value: object) -> AdminRequestV1:

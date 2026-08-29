@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from codex_master.admin_contracts import (
+    ADMIN_OPERATION_METADATA,
     AdminContractError,
     AdminPrincipalV1,
     AdminRequestV1,
@@ -62,6 +63,48 @@ def test_admin_request_rejects_unknown_operation() -> None:
         parse_admin_request(
             {"schema_version": 1, "operation": "google.provision.apply.v2"}
         )
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments", "scope"),
+    (
+        (
+            "openai.accounts.add",
+            {"account_ref": "openai-two", "label": "OpenAI Two"},
+            "fleet.openai.write",
+        ),
+        (
+            "openai.accounts.disable",
+            {"account_ref": "openai-one"},
+            "fleet.openai.write",
+        ),
+        (
+            "google.accounts.add",
+            {"account_ref": "google-two", "label": "Google Two"},
+            "fleet.google.oauth",
+        ),
+    ),
+)
+def test_account_commands_are_canonical_generation_checked_operations(
+    operation: str, arguments: dict[str, object], scope: str
+) -> None:
+    request = AdminRequestV1(operation, arguments, 4, "account-change", None)
+
+    assert request.operation == operation
+    assert request.arguments == arguments
+    assert ADMIN_OPERATION_METADATA[operation].scope == scope
+    assert ADMIN_OPERATION_METADATA[operation].command is True
+
+
+def test_operation_metadata_is_immutable_and_owns_scope_and_fields() -> None:
+    metadata = ADMIN_OPERATION_METADATA["google.provision.apply"]
+
+    assert metadata.scope == "fleet.google.provision"
+    assert metadata.argument_fields == ("account_ref",)
+    assert metadata.requires_idempotency is True
+    assert metadata.requires_digest is True
+    with pytest.raises(TypeError):
+        ADMIN_OPERATION_METADATA["google.provision.apply"] = metadata  # type: ignore[index]
 
 
 @pytest.mark.parametrize("value", [True, 2])

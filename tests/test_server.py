@@ -40922,6 +40922,97 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
         self.assertEqual(cli, mcp["payload"])
         self.assertEqual(cli, {"accounts": [{"generation": 4, "ref": "openai-one"}]})
 
+    def test_fleet_account_commands_use_canonical_cli_names(self) -> None:
+        commands = (
+            (
+                (
+                    "fleet",
+                    "openai",
+                    "add",
+                    "--account-ref",
+                    "openai-two",
+                    "--label",
+                    "OpenAI Two",
+                    "--expected-generation",
+                    "4",
+                    "--idempotency-key",
+                    "add-openai",
+                ),
+                "openai-two",
+            ),
+            (
+                (
+                    "fleet",
+                    "openai",
+                    "disable",
+                    "--account-ref",
+                    "openai-one",
+                    "--expected-generation",
+                    "5",
+                    "--idempotency-key",
+                    "disable-openai",
+                ),
+                "openai-one",
+            ),
+            (
+                (
+                    "fleet",
+                    "google",
+                    "add",
+                    "--account-ref",
+                    "google-two",
+                    "--label",
+                    "Google Two",
+                    "--expected-generation",
+                    "6",
+                    "--idempotency-key",
+                    "add-google",
+                ),
+                "google-two",
+            ),
+        )
+
+        with self._binding():
+            results = [
+                (self._cli(*arguments), account_ref)
+                for arguments, account_ref in commands
+            ]
+
+        for ((status, payload), account_ref) in results:
+            self.assertEqual(status, 0)
+            self.assertEqual(payload["account"]["ref"], account_ref)
+        self.assertEqual(
+            self.owners.account_registry.calls,
+            [
+                ("generation", "openai"),
+                (
+                    "add",
+                    "openai",
+                    "openai-two",
+                    "OpenAI Two",
+                    4,
+                    "add-openai",
+                ),
+                ("generation", "openai"),
+                (
+                    "disable",
+                    "openai",
+                    "openai-one",
+                    5,
+                    "disable-openai",
+                ),
+                ("generation", "google"),
+                (
+                    "add",
+                    "google",
+                    "google-two",
+                    "Google Two",
+                    6,
+                    "add-google",
+                ),
+            ],
+        )
+
     def test_fleet_operation_status_cli_and_mcp_outputs_are_identical(self) -> None:
         arguments = {"account_ref": "google-one", "operation_id": "operation-one"}
         with self._binding():
@@ -41004,10 +41095,22 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
         self.assertIsNotNone(reply)
         assert reply is not None
         tools = {tool["name"]: tool for tool in reply["result"]["tools"]}
-        self.assertIn("fleet_google_inventory", tools)
-        self.assertIn("fleet_openai_accounts", tools)
-        self.assertIn("fleet_operation_status", tools)
-        self.assertNotIn("fleet_google_provision_apply", tools)
+        self.assertEqual(len(tools), 79)
+        for allowed_name in {
+            "fleet_google_inventory",
+            "fleet_openai_accounts",
+            "fleet_operation_status",
+        }:
+            self.assertIn(allowed_name, tools)
+        for forbidden_name in {
+            "fleet_openai_auth_plan",
+            "fleet_google_oauth_begin",
+            "fleet_google_provision_plan",
+            "fleet_google_provision_apply",
+            "fleet_google_billing_plan",
+            "fleet_google_billing_apply",
+        }:
+            self.assertNotIn(forbidden_name, tools)
         forbidden = {
             "access_token",
             "auth_json",
@@ -41038,6 +41141,71 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
             properties = tool["inputSchema"].get("properties", {})
             self.assertTrue(forbidden.isdisjoint(properties))
 
+    def test_master_tool_status_reports_exact_scope_filtered_visible_count(self) -> None:
+        from test_admin_service import principal
+
+        with self._binding(principal("fleet.read")), patch.object(
+            server_module, "codex_home_context", return_value={"home_kind": "root"}
+        ), patch.object(
+            server_module, "managed_home_in_process_ancestry", return_value=False
+        ), patch.object(
+            server_module, "teamleader_principal_digest", return_value="digest-one"
+        ), patch.object(
+            server_module,
+            "read_hive_principals",
+            return_value={
+                "digest-one": {
+                    "class": "koenigin",
+                    "agent_id": None,
+                }
+            },
+        ):
+            status = server_module.master_tool_access_status()
+
+        self.assertTrue(status["authorized"])
+        self.assertEqual(status["visible_tool_count"], 79)
+
+    def test_admin_capability_catalog_rejects_wire_shape_downgrade(self) -> None:
+        from codex_master.admin_contracts import (
+            ADMIN_OPERATION_CATALOG,
+            ADMIN_OPERATION_CATALOG_DIGEST,
+            ADMIN_OPERATION_METADATA,
+        )
+
+        valid = {
+            "schema_version": 1,
+            "catalog_digest": ADMIN_OPERATION_CATALOG_DIGEST,
+            "operation_count": len(ADMIN_OPERATION_CATALOG),
+            "allowed": [
+                ADMIN_OPERATION_METADATA[operation].scope is not None
+                for operation in ADMIN_OPERATION_CATALOG
+            ],
+        }
+        invalid = (
+            {**valid, "schema_version": 2},
+            {**valid, "catalog_digest": "0" * 64},
+            {**valid, "operation_count": len(ADMIN_OPERATION_CATALOG) - 1},
+            {**valid, "allowed": valid["allowed"][:-1]},
+            {**valid, "allowed": [*valid["allowed"], False]},
+            {**valid, "allowed": [1, *valid["allowed"][1:]]},
+            {**valid, "allowed": [True, *valid["allowed"][1:]]},
+            {**valid, "unknown": False},
+        )
+
+        self.assertEqual(
+            server_module._masterjet_admin_capabilities(valid),
+            frozenset(
+                operation
+                for operation in ADMIN_OPERATION_CATALOG
+                if ADMIN_OPERATION_METADATA[operation].scope is not None
+            ),
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                ValueError, "invalid admin capabilities"
+            ):
+                server_module._masterjet_admin_capabilities(payload)
+
     def test_fleet_google_provision_plan_preserves_generation_and_idempotency(
         self,
     ) -> None:
@@ -41055,6 +41223,63 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
         self.assertEqual(result["inventory_generation"], 4)
         self.assertEqual(self.owners.quota_collector.calls, 1)
         self.assertEqual(self.owners.google_provisioner.plan_calls, 1)
+
+    def test_invalid_admin_contract_is_same_canonical_problem_for_cli_and_mcp(
+        self,
+    ) -> None:
+        with self._binding():
+            status, cli = self._cli(
+                "fleet", "google", "inventory", "--account-ref", "bad/ref"
+            )
+            mcp = self._mcp(
+                "fleet_google_inventory", {"account_ref": "bad/ref"}
+            )
+
+        self.assertEqual(status, 1)
+        self.assertTrue(mcp["isError"])
+        for payload in (cli, mcp["payload"]):
+            self.assertEqual(payload["code"], "control.request_invalid")
+            self.assertEqual(
+                set(payload),
+                {
+                    "schema_version",
+                    "code",
+                    "severity",
+                    "title",
+                    "detail",
+                    "effect",
+                    "action",
+                    "retryable",
+                    "retry_after_seconds",
+                    "correlation_id",
+                    "occurred_at",
+                },
+            )
+
+    def test_invalid_plan_digest_returns_canonical_problem_before_owner(self) -> None:
+        arguments = {
+            "account_ref": "google-one",
+            "expected_generation": 4,
+            "idempotency_key": "apply-one",
+            "plan_digest": "bad-digest",
+        }
+        with self._binding():
+            mcp = self._mcp("fleet_google_provision_apply", arguments)
+
+        self.assertTrue(mcp["isError"])
+        self.assertEqual(mcp["payload"]["code"], "control.request_invalid")
+        self.assertNotIn("error", mcp["payload"])
+        self.assertEqual(self.owners.google_provisioner.apply_calls, 0)
+
+    def test_admin_contract_process_signals_propagate(self) -> None:
+        from codex_master import admin_contracts
+
+        for signal in (KeyboardInterrupt(), SystemExit(9)):
+            with self.subTest(signal=type(signal).__name__), self._binding(), patch.object(
+                admin_contracts, "AdminRequestV1", side_effect=signal
+            ):
+                with self.assertRaises(type(signal)):
+                    server_module.call_validated_tool("fleet_google_inventory", {})
 
 
 if __name__ == "__main__":

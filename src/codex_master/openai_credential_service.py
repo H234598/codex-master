@@ -772,6 +772,14 @@ class OpenAICredentialService:
     def __repr__(self) -> str:
         return "OpenAICredentialService(<redacted>)"
 
+    def account_generation(self, account_ref: str) -> int:
+        """Read the credential owner's current account generation."""
+
+        self._ensure_current_process()
+        account_ref = _account_ref(account_ref)
+        with self._identity_source.guard(account_ref) as identity:
+            return identity.generation
+
     def plan_auth_sync(
         self,
         account_ref: str,

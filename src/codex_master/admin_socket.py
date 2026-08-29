@@ -17,7 +17,7 @@ import socket
 import stat
 import struct
 from threading import Event, Lock, Thread, current_thread
-from typing import cast
+from typing import TYPE_CHECKING, cast
 import uuid
 
 from .admin_contracts import (
@@ -28,11 +28,9 @@ from .admin_contracts import (
     parse_admin_request,
     public_admin_result,
 )
-from .admin_service import (
-    AdminServiceError,
-    MasterjetControlService,
-    SecretIngressUploadReceiptV1,
-)
+
+if TYPE_CHECKING:
+    from .admin_service import MasterjetControlService, SecretIngressUploadReceiptV1
 
 
 MAX_ADMIN_REQUEST_BYTES = 64 * 1024
@@ -136,6 +134,8 @@ class AdminSocketServer:
         timeout_seconds: float = 5.0,
         attestation_key_fd: int | None = None,
     ) -> None:
+        from .admin_service import MasterjetControlService
+
         candidate = Path(path)
         if (
             not candidate.is_absolute()
@@ -343,10 +343,16 @@ class AdminSocketServer:
             payload, received_fds = _receive_frame(connection)
             value = _decode_json(payload)
             result = self._dispatch(principal, peer, value, received_fds)
-        except AdminServiceError as error:
-            problem = error.problem
         except _SocketFailure as error:
             problem = _problem(error.code)
+        except Exception as error:
+            from .admin_service import AdminServiceError
+
+            problem = (
+                error.problem
+                if isinstance(error, AdminServiceError)
+                else _problem("control.internal_error")
+            )
         except BaseException:
             problem = _problem("control.internal_error")
         try:
@@ -456,6 +462,8 @@ class AdminSocketServer:
                 self._service.rollback_secret_upload(claim)
             except BaseException:
                 pass
+            from .admin_service import AdminServiceError
+
             if isinstance(error, (_SocketFailure, AdminServiceError)):
                 raise
             raise _SocketFailure("control.secret_fd_invalid") from None
@@ -516,6 +524,8 @@ class AdminSocketClient:
         expected_generation: int = 0,
         idempotency_key: str = "socket-secret-put",
     ) -> SecretIngressUploadReceiptV1:
+        from .admin_service import SecretIngressUploadReceiptV1
+
         if (
             type(session_id) is not str
             or _TOKEN.fullmatch(session_id) is None

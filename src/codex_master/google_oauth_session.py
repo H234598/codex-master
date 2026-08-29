@@ -574,6 +574,17 @@ class GoogleOAuthControlService:
     def __repr__(self) -> str:
         return "GoogleOAuthControlService(<redacted>)"
 
+    def account_generation(self, account_ref: str) -> int:
+        """Read current Inventory generation for one OAuth account."""
+
+        account_ref = self._ref(account_ref)
+        try:
+            snapshot = self._manager._snapshot_for_internal_use()
+            snapshot.by_account_ref[account_ref]
+        except (GoogleAccountInventoryError, KeyError, AttributeError):
+            raise GoogleOAuthSessionError("oauth.account_mismatch") from None
+        return cast(int, snapshot.generation)
+
     @staticmethod
     def _empty_document() -> dict[str, object]:
         return {
