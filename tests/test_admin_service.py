@@ -990,6 +990,46 @@ def test_openai_apply_resolves_bound_ingress_and_calls_owner_once() -> None:
     assert owners.openai_credentials.apply_calls == 1
 
 
+def test_post_effect_journal_failure_is_chained_behind_canonical_problem() -> None:
+    """Break caught: journal fault must not replace post-effect retry contract."""
+
+    service, owners = service_at()
+    journal_error = RuntimeError("private-journal-audit-marker")
+    effect_calls = 0
+
+    def fail_after_effect(*_args: object) -> None:
+        nonlocal effect_calls
+        effect_calls += 1
+        raise RuntimeError("private-post-effect-marker")
+
+    def fail_unknown_journal(resolution: SecretIngressResolutionV1) -> None:
+        resolution.upload.clear()
+        raise journal_error
+
+    owners.openai_credentials.apply_auth_sync = fail_after_effect  # type: ignore[method-assign]
+    owners.secret_ingress.mark_resolve_unknown = fail_unknown_journal  # type: ignore[method-assign]
+
+    with pytest.raises(AdminServiceError) as captured:
+        command(
+            service,
+            "openai.auth.apply",
+            {"account_ref": "openai-one"},
+            "fleet.secrets.ingress",
+            digest=DIGEST,
+            ingress_session="ingress-session",
+            step_up=True,
+        )
+
+    assert captured.value.problem.code == "control.owner_unavailable"
+    assert captured.value.problem.effect == "Action outcome is unknown"
+    assert captured.value.problem.action == (
+        "Retry the identical request to reconcile outcome"
+    )
+    assert captured.value.problem.retryable is True
+    assert captured.value.__cause__ is journal_error
+    assert effect_calls == 1
+
+
 def test_openai_plan_precondition_failure_rolls_back_and_wipes_resolution() -> None:
     """Break caught: failed plan lookup must not strand secret or owner claim."""
 

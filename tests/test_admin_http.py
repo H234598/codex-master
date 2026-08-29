@@ -785,8 +785,9 @@ def test_http_restart_reconciles_revoked_apply_without_reapplying_business(
     assert json.loads(payload)["state"] == "succeeded"
 
 
+@pytest.mark.parametrize("unknown_journal_fault", [False, True])
 def test_http_restart_recovers_openai_receipt_before_ingress_revoke(
-    tmp_path,
+    tmp_path, monkeypatch, unknown_journal_fault
 ) -> None:
     """Break caught: post-business fault must reconcile active unknown state."""
 
@@ -870,10 +871,26 @@ def test_http_restart_recovers_openai_receipt_before_ingress_revoke(
                 }
             ),
         )
+        real_write = AdminSecretIngressOwner._write_locked
+        journal_faults: list[str] = []
+
+        def fail_unknown_journal(owner, document):
+            if (
+                unknown_journal_fault
+                and document["sessions"][session_id]["state"] == "apply_unknown"
+            ):
+                journal_faults.append(session_id)
+                raise RuntimeError("fault while journaling unknown outcome")
+            return real_write(owner, document)
+
+        monkeypatch.setattr(
+            AdminSecretIngressOwner, "_write_locked", fail_unknown_journal
+        )
         ambiguous, _out, ambiguous_payload = _request(
             server, "POST", "/admin/v1", apply_body, _headers()
         )
 
+    monkeypatch.setattr(AdminSecretIngressOwner, "_write_locked", real_write)
     restarted_openai = make_openai_service(
         tmp_path / "openai", registered_backend="acct-one", identity_generation=2
     )
@@ -898,6 +915,7 @@ def test_http_restart_recovers_openai_receipt_before_ingress_revoke(
         == "Retry the identical request to reconcile outcome"
     )
     assert ambiguous_problem["retryable"] is True
+    assert journal_faults == ([session_id] if unknown_journal_fault else [])
     assert first_owner.apply_calls == 1
     assert restart_owner.apply_calls == 0
     assert ingress_vault.projection_metadata(session_id) == ("revoked", 3)
@@ -957,8 +975,9 @@ def test_google_oauth_code_crosses_only_typed_raw_ingress_boundary(tmp_path) -> 
     assert capability.operation == "google.oauth.complete"
 
 
+@pytest.mark.parametrize("unknown_journal_fault", [False, True])
 def test_google_client_http_restart_reconciles_durable_owner_receipt(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, unknown_journal_fault
 ) -> None:
     """Break caught: concrete Google receipt recovery must use public HTTP."""
 
@@ -1046,10 +1065,26 @@ def test_google_client_http_restart_reconciles_durable_owner_receipt(
                 }
             ),
         )
+        real_write = AdminSecretIngressOwner._write_locked
+        journal_faults: list[str] = []
+
+        def fail_unknown_journal(owner, document):
+            if (
+                unknown_journal_fault
+                and document["sessions"][session_id]["state"] == "apply_unknown"
+            ):
+                journal_faults.append(session_id)
+                raise RuntimeError("fault while journaling unknown outcome")
+            return real_write(owner, document)
+
+        monkeypatch.setattr(
+            AdminSecretIngressOwner, "_write_locked", fail_unknown_journal
+        )
         ambiguous, _out, ambiguous_payload = _request(
             server, "POST", "/admin/v1", apply_body, _headers()
         )
 
+    monkeypatch.setattr(AdminSecretIngressOwner, "_write_locked", real_write)
     monkeypatch.setattr(ingress, "acknowledge_oauth_client", real_ack)
     with _running_server(tmp_path, service=compose()) as (server, _service):
         reconciled, _out, payload = _request(
@@ -1065,6 +1100,7 @@ def test_google_client_http_restart_reconciles_durable_owner_receipt(
         == "Retry the identical request to reconcile outcome"
     )
     assert ambiguous_problem["retryable"] is True
+    assert journal_faults == ([session_id] if unknown_journal_fault else [])
     assert json.loads(payload)["account_ref"] == "google-account-01"
     google_state = json.loads(
         (tmp_path / "google" / "oauth-state" / "google-oauth-control.json").read_text()

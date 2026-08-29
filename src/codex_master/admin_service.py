@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 import re
 from types import MappingProxyType
-from typing import Any, Protocol, cast
+from typing import Any, Never, Protocol, cast
 import urllib.parse
 import uuid
 
@@ -674,13 +674,11 @@ class MasterjetControlService:
         try:
             result = credentials.apply_auth_sync(plan, authorized)
         except Exception:
-            ingress.mark_resolve_unknown(resolution)
-            raise _unknown_outcome_error() from None
+            _raise_unknown_outcome(ingress, resolution)
         try:
             ingress.commit_resolve(resolution)
         except Exception:
-            ingress.mark_resolve_unknown(resolution)
-            raise _unknown_outcome_error() from None
+            _raise_unknown_outcome(ingress, resolution)
         return _serialize_openai_receipt(result)
 
     def _secret_ingress_create(
@@ -821,8 +819,7 @@ class MasterjetControlService:
         try:
             result = owner.apply_oauth_client_import(plan, resolution)
         except Exception:
-            ingress.mark_resolve_unknown(resolution)
-            raise _unknown_outcome_error() from None
+            _raise_unknown_outcome(ingress, resolution)
         return _serialize_oauth_client_receipt(result)
 
     def _google_inventory_refresh(
@@ -1543,6 +1540,17 @@ def _unknown_outcome_error() -> AdminServiceError:
             retryable=True,
         )
     )
+
+
+def _raise_unknown_outcome(
+    ingress: SecretIngressPort, resolution: SecretIngressResolutionV1
+) -> Never:
+    error = _unknown_outcome_error()
+    try:
+        ingress.mark_resolve_unknown(resolution)
+    except Exception as journal_error:
+        raise error from journal_error
+    raise error
 
 
 def _denied(code: str) -> AdminDenied:
