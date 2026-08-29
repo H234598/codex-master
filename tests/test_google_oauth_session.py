@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -779,6 +780,87 @@ def test_default_oauth_client_binding_disables_stale_or_revoked_projection(
     assert stale.availability is oauth_session.GoogleOAuthClientAvailabilityV1.STALE
     assert revoked.default_oauth_client_ref is None
     assert revoked.availability is oauth_session.GoogleOAuthClientAvailabilityV1.REVOKED
+
+
+@pytest.mark.parametrize("fault_phase", ["enter", "exit"])
+def test_default_oauth_client_binding_degrades_journal_lock_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_phase: str
+) -> None:
+    service, ingress, _exchange, _manager_instance = _service(tmp_path)
+    _import_client(service, ingress)
+
+    @contextmanager
+    def unavailable_lock():
+        if fault_phase == "enter":
+            raise oauth_session.HiveStateError("state_lock_unavailable")
+        yield
+        raise oauth_session.HiveStateError("state_lock_unavailable")
+
+    monkeypatch.setattr(service._state, "locked", unavailable_lock)
+    binding = service.default_oauth_client_binding(
+        "google-account-01", expected_generation=1
+    )
+
+    assert binding.default_oauth_client_ref is None
+    assert (
+        binding.availability
+        is oauth_session.GoogleOAuthClientAvailabilityV1.UNAVAILABLE
+    )
+
+
+def test_default_oauth_client_binding_degrades_corrupt_journal_read(
+    tmp_path: Path,
+) -> None:
+    service, ingress, _exchange, _manager_instance = _service(tmp_path)
+    _import_client(service, ingress)
+    service._state.replace_json(oauth_session._CONTROL_DOCUMENT, {"schema_version": 3})
+    binding = service.default_oauth_client_binding(
+        "google-account-01", expected_generation=1
+    )
+
+    assert binding.default_oauth_client_ref is None
+    assert (
+        binding.availability
+        is oauth_session.GoogleOAuthClientAvailabilityV1.UNAVAILABLE
+    )
+
+
+def test_default_oauth_client_binding_does_not_hide_programming_or_control_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, ingress, _exchange, _manager_instance = _service(tmp_path)
+    _import_client(service, ingress)
+    programming_error = RuntimeError("programming-error-marker")
+
+    def broken_read() -> dict[str, object]:
+        raise programming_error
+
+    monkeypatch.setattr(service, "_read_locked", broken_read)
+    with pytest.raises(RuntimeError) as captured:
+        service.default_oauth_client_binding("google-account-01", expected_generation=1)
+    assert captured.value is programming_error
+
+    domain_error = GoogleOAuthSessionError("oauth.request_invalid")
+
+    def invalid_domain_read() -> dict[str, object]:
+        raise domain_error
+
+    monkeypatch.setattr(service, "_read_locked", invalid_domain_read)
+    with pytest.raises(GoogleOAuthSessionError) as invalid_domain:
+        service.default_oauth_client_binding("google-account-01", expected_generation=1)
+    assert invalid_domain.value is domain_error
+
+    control_signal = KeyboardInterrupt()
+
+    @contextmanager
+    def interrupted_lock():
+        raise control_signal
+        yield
+
+    monkeypatch.setattr(service._state, "locked", interrupted_lock)
+    with pytest.raises(KeyboardInterrupt) as interrupted:
+        service.default_oauth_client_binding("google-account-01", expected_generation=1)
+    assert interrupted.value is control_signal
 
 
 def test_provisioner_grant_is_rejected_before_any_transaction_or_token_write(

@@ -30,6 +30,7 @@ from codex_master.admin_service import (
 )
 from codex_master.credential_vault import CredentialVault
 from codex_master.admin_secret_ingress import AdminSecretIngressOwner
+from codex_master.hive.state import HiveStateError
 from test_admin_service import service_at
 from test_openai_credential_service import (
     auth_json,
@@ -1109,9 +1110,7 @@ def test_google_client_http_restart_reconciles_durable_owner_receipt(
     assert [record["state"] for record in google_state["imports"]] == ["succeeded"]
 
 
-def test_google_accounts_http_projects_real_bound_opaque_oauth_client_ref(
-    tmp_path,
-) -> None:
+def _real_google_list_service(tmp_path):
     google_root = tmp_path / "google-list"
     google_root.mkdir()
     google, ingress, _exchange, manager = make_google_service(google_root)
@@ -1129,6 +1128,13 @@ def test_google_accounts_http_projects_real_bound_opaque_oauth_client_ref(
         host_registry=owners.hosts,
         secret_ingress=owners.secret_ingress,
     )
+    return service, google, imported
+
+
+def test_google_accounts_http_projects_real_bound_opaque_oauth_client_ref(
+    tmp_path,
+) -> None:
+    service, _google, imported = _real_google_list_service(tmp_path)
 
     with _running_server(tmp_path, service=service) as (server, _service):
         status, _headers_out, payload = _request(
@@ -1161,6 +1167,39 @@ def test_google_accounts_http_projects_real_bound_opaque_oauth_client_ref(
     assert b"private-client-secret" not in lowered
     assert b"client_secret" not in lowered
     assert b"577074103233-clientpart" not in lowered
+
+
+@pytest.mark.parametrize("fault_phase", ["enter", "exit"])
+def test_google_accounts_http_degrades_oauth_journal_lock_fault(
+    tmp_path, monkeypatch, fault_phase
+) -> None:
+    service, google, _imported = _real_google_list_service(tmp_path)
+
+    @contextmanager
+    def unavailable_lock():
+        if fault_phase == "enter":
+            raise HiveStateError("state_lock_unavailable")
+        yield
+        raise HiveStateError("state_lock_unavailable")
+
+    monkeypatch.setattr(google._state, "locked", unavailable_lock)
+    with _running_server(tmp_path, service=service) as (server, _service):
+        status, _headers_out, payload = _request(
+            server,
+            "POST",
+            "/admin/v1",
+            _document("google.accounts.list", {}),
+            _headers(),
+        )
+
+    document = json.loads(payload)
+    account = next(
+        item for item in document["accounts"] if item["ref"] == "google-account-01"
+    )
+    assert status == 200
+    assert document["schema_version"] == 1
+    assert account["default_oauth_client_ref"] is None
+    assert account["oauth_client_availability"] == "unavailable"
 
 
 def test_secret_ingress_is_one_shot_with_gone_response(tmp_path) -> None:

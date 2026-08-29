@@ -1430,45 +1430,52 @@ class GoogleOAuthControlService:
             raise
         except (GoogleAccountInventoryError, KeyError, AttributeError):
             raise GoogleOAuthSessionError("oauth.account_mismatch") from None
-        with self._state.locked():
-            document = self._read_locked()
-            clients = cast(list[object], document["clients"])
-            active = [
-                cast(dict[str, object], item)
-                for item in clients
-                if cast(dict[str, object], item)["account_ref"] == account_ref
-                and cast(dict[str, object], item)["state"] == "active"
-            ]
-            if len(active) > 1:
-                availability = GoogleOAuthClientAvailabilityV1.AMBIGUOUS
-            elif not active:
-                availability = GoogleOAuthClientAvailabilityV1.MISSING
-            else:
-                record = active[0]
-                if record["inventory_generation"] != expected_generation:
-                    availability = GoogleOAuthClientAvailabilityV1.STALE
+        try:
+            with self._state.locked():
+                document = self._read_locked()
+                clients = cast(list[object], document["clients"])
+                active = [
+                    cast(dict[str, object], item)
+                    for item in clients
+                    if cast(dict[str, object], item)["account_ref"] == account_ref
+                    and cast(dict[str, object], item)["state"] == "active"
+                ]
+                if len(active) > 1:
+                    availability = GoogleOAuthClientAvailabilityV1.AMBIGUOUS
+                elif not active:
+                    availability = GoogleOAuthClientAvailabilityV1.MISSING
                 else:
-                    try:
-                        metadata = self._client_vault.projection_metadata(
-                            self._client_vault_ref(account_ref)
-                        )
-                    except CredentialVaultError:
-                        metadata = None
-                        availability = GoogleOAuthClientAvailabilityV1.UNAVAILABLE
+                    record = active[0]
+                    if record["inventory_generation"] != expected_generation:
+                        availability = GoogleOAuthClientAvailabilityV1.STALE
                     else:
-                        if metadata is None:
-                            availability = GoogleOAuthClientAvailabilityV1.MISSING
-                        elif metadata[0] == "revoked":
-                            availability = GoogleOAuthClientAvailabilityV1.REVOKED
-                        elif metadata[1] != record["vault_generation"]:
-                            availability = GoogleOAuthClientAvailabilityV1.STALE
-                        else:
-                            return GoogleOAuthClientBindingV1(
-                                account_ref,
-                                expected_generation,
-                                cast(str, record["id"]),
-                                GoogleOAuthClientAvailabilityV1.AVAILABLE,
+                        try:
+                            metadata = self._client_vault.projection_metadata(
+                                self._client_vault_ref(account_ref)
                             )
+                        except CredentialVaultError:
+                            metadata = None
+                            availability = GoogleOAuthClientAvailabilityV1.UNAVAILABLE
+                        else:
+                            if metadata is None:
+                                availability = GoogleOAuthClientAvailabilityV1.MISSING
+                            elif metadata[0] == "revoked":
+                                availability = GoogleOAuthClientAvailabilityV1.REVOKED
+                            elif metadata[1] != record["vault_generation"]:
+                                availability = GoogleOAuthClientAvailabilityV1.STALE
+                            else:
+                                return GoogleOAuthClientBindingV1(
+                                    account_ref,
+                                    expected_generation,
+                                    cast(str, record["id"]),
+                                    GoogleOAuthClientAvailabilityV1.AVAILABLE,
+                                )
+        except GoogleOAuthSessionError as error:
+            if error.code != "oauth.control_unavailable":
+                raise
+            availability = GoogleOAuthClientAvailabilityV1.UNAVAILABLE
+        except HiveStateError:
+            availability = GoogleOAuthClientAvailabilityV1.UNAVAILABLE
         return GoogleOAuthClientBindingV1(
             account_ref, expected_generation, None, availability
         )
