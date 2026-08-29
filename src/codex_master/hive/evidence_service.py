@@ -49,6 +49,32 @@ def load_test_index(repository_root: Path) -> TestIndexV1:
     return TestIndexV1.from_mapping(value)
 
 
+def probe_test_index(repository_root: Path | None = None) -> dict[str, object]:
+    try:
+        index = load_test_index((repository_root or Path.cwd()).resolve())
+    except ValueError as exc:
+        reason = str(exc)
+        if reason not in {"test.index_missing", "test.index_invalid", "test.function_unindexed", "test.test_uncollectable", "test.assertion_missing"}:
+            reason = "test.index_invalid"
+        return {
+            "schema_version": 1,
+            "valid": False,
+            "reason_code": reason,
+            "raw_output": "not_returned",
+        }
+    return {
+        "schema_version": 1,
+        "repository_id": index.repository_id,
+        "index_generation": index.generation,
+        "index_digest": index.digest,
+        "valid": True,
+        "function_count": len(index.functions),
+        "test_count": len(index.tests),
+        "gate_count": len(index.gates),
+        "raw_output": "not_returned",
+    }
+
+
 def build_local_test_service(
     repository_root: Path | None = None,
     state_root: Path | None = None,
@@ -187,4 +213,9 @@ class HiveTestEvidenceService:
         )
 
 
-__all__ = ["HiveTestEvidenceService", "build_local_test_service", "load_test_index"]
+__all__ = [
+    "HiveTestEvidenceService",
+    "build_local_test_service",
+    "load_test_index",
+    "probe_test_index",
+]

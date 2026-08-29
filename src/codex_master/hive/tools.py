@@ -6,7 +6,11 @@ from collections.abc import Mapping
 import time
 
 from codex_master.hive.status import godbee_status, hive_status, queen_list, selection_status
-from codex_master.hive.evidence_service import HiveTestEvidenceService, build_local_test_service
+from codex_master.hive.evidence_service import (
+    HiveTestEvidenceService,
+    build_local_test_service,
+    probe_test_index,
+)
 
 
 _NAMES = (
@@ -98,11 +102,11 @@ def call_hive_tool(
         return selection_status()
     if name in _NAMES:
         return {"state": "read_only_context_required", "raw_output": "not_returned"}
-    service = test_service or build_local_test_service()
     if name == "hive_test_index_status":
         if args:
             raise ValueError("hive_tool_arguments_not_allowed")
-        return service.index_status()
+        return test_service.index_status() if test_service is not None else probe_test_index()
+    service = test_service or build_local_test_service()
     if name == "hive_test_plan":
         request = service.request(
             changed_paths=_string_list(args.get("changed_paths", ()), "changed_paths"),

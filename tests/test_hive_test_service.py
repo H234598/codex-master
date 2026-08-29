@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from codex_master.hive.evidence_runner import TestEvidenceRunner as EvidenceRunner
-from codex_master.hive.evidence_service import HiveTestEvidenceService
+from codex_master.hive.evidence_service import HiveTestEvidenceService, probe_test_index
 from codex_master.hive.evidence_store import TestStatusStore as StatusStore
 
 from test_hive_test_evidence import DIGEST_A, DIGEST_B
@@ -58,3 +58,12 @@ def test_service_index_status_is_data_sparse(tmp_path: Path) -> None:
     assert status["function_count"] == 1
     assert status["test_count"] == 1
     assert "path" not in status
+
+
+def test_index_probe_reports_missing_index_as_typed_red_status(tmp_path: Path) -> None:
+    assert probe_test_index(tmp_path) == {
+        "schema_version": 1,
+        "valid": False,
+        "reason_code": "test.index_missing",
+        "raw_output": "not_returned",
+    }

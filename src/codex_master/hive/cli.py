@@ -78,11 +78,11 @@ def run_hive_cli(
         else args.get("hive_test_command")
     )
     if test_command is not None:
-        from codex_master.hive.evidence_service import build_local_test_service
+        from codex_master.hive.evidence_service import build_local_test_service, probe_test_index
 
-        service = test_service or build_local_test_service()
         if test_command in {"validate", "status"} and getattr(args, "hive_test_namespace", None) == "index":
-            return service.index_status()
+            return test_service.index_status() if test_service is not None else probe_test_index()
+        service = test_service or build_local_test_service()
         if test_command == "plan":
             request = service.request(
                 changed_paths=tuple(args.changed_path),
