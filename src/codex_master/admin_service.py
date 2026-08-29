@@ -139,15 +139,30 @@ class GoogleProvisionerPort(Protocol):
 class SecretIngressPort(Protocol):
     def create_session(self, **values: object) -> SecretIngressSessionV1: ...
 
+    def reserve_upload(self, session_id: str, **values: object) -> object: ...
+
     def put_secret(
         self,
         session_id: str,
         secret: bytes | bytearray | memoryview,
         *,
         principal: str,
-    ) -> SecretIngressSessionV1: ...
+        upload_claim: object,
+    ) -> SecretIngressUploadReceiptV1: ...
 
-    def resolve(self, session: object, **values: object) -> tuple[object, object]: ...
+    def commit_upload(
+        self, claim: object, receipt: SecretIngressUploadReceiptV1
+    ) -> None: ...
+
+    def rollback_upload(self, claim: object) -> None: ...
+
+    def reserve_resolve(self, session_id: str, **values: object) -> object: ...
+
+    def resolve(self, claim: object) -> SecretIngressResolutionV1: ...
+
+    def commit_resolve(self, resolution: SecretIngressResolutionV1) -> None: ...
+
+    def rollback_resolve(self, resolution: SecretIngressResolutionV1) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +176,35 @@ class SecretIngressSessionV1:
     id: str
     account_ref: str
     state: str
+
+
+@dataclass(frozen=True, slots=True)
+class SecretIngressUploadReceiptV1:
+    session_id: str
+    account_ref: str
+    state: str
+    generation: int
+
+
+@dataclass(slots=True, repr=False)
+class SecretIngressResolutionV1:
+    session_id: str
+    plan: object
+    upload: bytearray
+    claim: object
+
+    def __repr__(self) -> str:
+        return "SecretIngressResolutionV1(<redacted>)"
+
+
+class SecretIngressOwnerError(ValueError):
+    """Code-only concrete ingress-owner failure."""
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +294,8 @@ class MasterjetControlService:
         principal: AdminPrincipalV1,
         session_id: str,
         secret: bytes | bytearray | memoryview,
+        *,
+        upload_claim: object | None = None,
     ) -> dict[str, object]:
         """Consume one secret outside all JSON control request paths."""
 
@@ -262,20 +308,79 @@ class MasterjetControlService:
         if type(session_id) is not str or _SESSION_ID.fullmatch(session_id) is None:
             raise _service_error("control.request_invalid")
         secret = _secret_value(secret)
+        if upload_claim is None or type(upload_claim) in {bytes, bytearray, memoryview}:
+            raise _service_error("credential.upload_expired")
         ingress = _required(self._secret_ingress)
+        result: SecretIngressUploadReceiptV1 | None = None
         try:
             result = ingress.put_secret(
                 session_id,
                 secret,
                 principal=principal.subject,
+                upload_claim=upload_claim,
             )
+            ingress.commit_upload(upload_claim, result)
         except AdminServiceError:
             raise
+        except BaseException as error:
+            if result is None:
+                try:
+                    ingress.rollback_upload(upload_claim)
+                except BaseException:
+                    pass
+            owner_error = _owner_service_error(error)
+            del error
+            raise owner_error from None
+        return _public_mapping(_serialize_ingress_upload_receipt(result))
+
+    def reserve_secret_upload(
+        self,
+        principal: AdminPrincipalV1,
+        session_id: str,
+        *,
+        expected_generation: int,
+        idempotency_key: str,
+    ) -> object:
+        """Reserve one durable upload capability before reading secret bytes."""
+
+        if type(principal) is not AdminPrincipalV1:
+            raise _service_error("control.request_invalid")
+        if "fleet.secrets.ingress" not in principal.scopes:
+            raise _denied("authority.scope_denied")
+        if not principal.step_up:
+            raise _denied("authority.step_up_required")
+        if (
+            type(session_id) is not str
+            or _SESSION_ID.fullmatch(session_id) is None
+            or type(expected_generation) is not int
+            or not 0 <= expected_generation <= 2**63 - 1
+            or type(idempotency_key) is not str
+            or _SESSION_ID.fullmatch(idempotency_key) is None
+        ):
+            raise _service_error("control.request_invalid")
+        ingress = _required(self._secret_ingress)
+        try:
+            return ingress.reserve_upload(
+                session_id,
+                principal=principal.subject,
+                expected_generation=expected_generation,
+                idempotency_key=idempotency_key,
+            )
         except BaseException as error:
             owner_error = _owner_service_error(error)
             del error
             raise owner_error from None
-        return _public_mapping(_serialize_ingress_session(result))
+
+    def rollback_secret_upload(self, upload_claim: object) -> None:
+        """Release a reservation when body admission failed before mutation."""
+
+        ingress = _required(self._secret_ingress)
+        try:
+            ingress.rollback_upload(upload_claim)
+        except BaseException as error:
+            owner_error = _owner_service_error(error)
+            del error
+            raise owner_error from None
 
     def command(
         self,
@@ -417,17 +522,20 @@ class MasterjetControlService:
     ) -> dict[str, object]:
         credentials = _required(self._openai_credentials)
         ingress = _required(self._secret_ingress)
-        plan, upload = ingress.resolve(
-            _capability(ingress_session),
-            principal=principal.subject,
-            account_ref=request.arguments["account_ref"],
+        resolution = _reserve_ingress_resolution(
+            ingress,
+            principal,
+            request,
+            ingress_session,
             credential_kind="openai.auth-json",
-            expected_generation=_generation(request),
-            idempotency_key=_idempotency(request),
-            plan_digest=_digest(request),
-            plan_id=request.arguments.get("plan_id"),
         )
-        return _serialize_openai_receipt(credentials.apply_auth_sync(plan, upload))
+        try:
+            result = credentials.apply_auth_sync(resolution.plan, resolution.upload)
+        except Exception:
+            ingress.rollback_resolve(resolution)
+            raise
+        ingress.commit_resolve(resolution)
+        return _serialize_openai_receipt(result)
 
     def _secret_ingress_create(
         self,
@@ -444,6 +552,7 @@ class MasterjetControlService:
                 expected_generation=_generation(request),
                 idempotency_key=_idempotency(request),
                 plan_digest=_digest(request),
+                plan_id=request.arguments.get("plan_id"),
             )
         )
 
@@ -481,30 +590,28 @@ class MasterjetControlService:
         if oauth_code is not None:
             raise _service_error("control.request_invalid")
         ingress = _required(self._secret_ingress)
-        _plan, upload = ingress.resolve(
-            _capability(ingress_session),
-            principal=principal.subject,
-            account_ref=request.arguments["account_ref"],
+        resolution = _reserve_ingress_resolution(
+            ingress,
+            principal,
+            request,
+            ingress_session,
             credential_kind="google-oauth-code",
-            transaction_id=request.arguments["transaction_id"],
-            expected_generation=_generation(request),
         )
-        code, wipe = _oauth_code(upload)
+        code, _wipe_after = _oauth_code(resolution.upload)
         try:
-            return _serialize_oauth_receipt(
-                owner.complete_oauth_transaction(
-                    cast(str, request.arguments["transaction_id"]),
-                    code=code,
-                    account_ref=cast(str, request.arguments["account_ref"]),
-                    redirect_uri=cast(str, request.arguments["redirect_uri"]),
-                    expected_generation=_generation(request),
-                    state=cast(str, request.arguments["state"]),
-                )
+            result = owner.complete_oauth_transaction(
+                cast(str, request.arguments["transaction_id"]),
+                code=code,
+                account_ref=cast(str, request.arguments["account_ref"]),
+                redirect_uri=cast(str, request.arguments["redirect_uri"]),
+                expected_generation=_generation(request),
+                state=cast(str, request.arguments["state"]),
             )
-        finally:
-            if wipe is not None:
-                wipe[:] = b"\0" * len(wipe)
-                wipe.clear()
+        except Exception:
+            ingress.rollback_resolve(resolution)
+            raise
+        ingress.commit_resolve(resolution)
+        return _serialize_oauth_receipt(result)
 
     def _google_oauth_client_plan(
         self,
@@ -530,19 +637,20 @@ class MasterjetControlService:
     ) -> dict[str, object]:
         owner = _required(self._google_oauth)
         ingress = _required(self._secret_ingress)
-        plan, upload = ingress.resolve(
-            _capability(ingress_session),
-            principal=principal.subject,
-            account_ref=request.arguments["account_ref"],
+        resolution = _reserve_ingress_resolution(
+            ingress,
+            principal,
+            request,
+            ingress_session,
             credential_kind="google.oauth-client",
-            expected_generation=_generation(request),
-            idempotency_key=_idempotency(request),
-            plan_digest=_digest(request),
-            plan_id=request.arguments.get("plan_id"),
         )
-        return _serialize_oauth_client_receipt(
-            owner.apply_oauth_client_import(plan, upload)
-        )
+        try:
+            result = owner.apply_oauth_client_import(resolution.plan, resolution.upload)
+        except Exception:
+            ingress.rollback_resolve(resolution)
+            raise
+        ingress.commit_resolve(resolution)
+        return _serialize_oauth_client_receipt(result)
 
     def _google_inventory_refresh(
         self,
@@ -714,10 +822,63 @@ def _required(owner: Any | None) -> Any:
     return owner
 
 
-def _capability(value: object | None) -> object:
-    if value is None or type(value) in {bytes, bytearray, memoryview}:
+def _capability(value: object | None) -> SecretIngressCapabilityV1:
+    if type(value) is not SecretIngressCapabilityV1:
         raise _service_error("control.request_invalid")
     return value
+
+
+def _reserve_ingress_resolution(
+    ingress: SecretIngressPort,
+    principal: AdminPrincipalV1,
+    request: AdminRequestV1,
+    ingress_session: object | None,
+    *,
+    credential_kind: str,
+) -> SecretIngressResolutionV1:
+    capability = _capability(ingress_session)
+    account_ref = cast(str, request.arguments["account_ref"])
+    plan_id = request.arguments.get("plan_id")
+    apply_key = request.idempotency_key
+    if request.operation == "google.oauth.complete":
+        plan_id = request.arguments.get("transaction_id")
+        apply_key = cast(str, plan_id)
+    if (
+        capability.subject != principal.subject
+        or capability.account_ref != account_ref
+        or capability.operation != request.operation
+        or capability.credential_kind != credential_kind
+        or capability.plan_id != plan_id
+        or capability.expected_generation != _generation(request)
+        or capability.session_generation != _generation(request)
+        or capability.apply_idempotency_key != apply_key
+        or (
+            request.operation != "google.oauth.complete"
+            and capability.plan_digest != _digest(request)
+        )
+    ):
+        raise _service_error("credential.upload_expired")
+    claim = ingress.reserve_resolve(
+        capability.session_id,
+        capability=capability,
+        principal=principal.subject,
+        operation=request.operation,
+        account_ref=account_ref,
+        credential_kind=credential_kind,
+        plan_id=plan_id,
+        plan_digest=capability.plan_digest,
+        expected_generation=capability.expected_generation,
+        create_idempotency_key=capability.create_idempotency_key,
+        upload_idempotency_key=capability.upload_idempotency_key,
+        idempotency_key=capability.apply_idempotency_key,
+        session_generation=capability.session_generation,
+        receipt_generation=capability.receipt_generation,
+        expires_at=capability.expires_at,
+    )
+    resolution = ingress.resolve(claim)
+    if type(resolution) is not SecretIngressResolutionV1:
+        raise _service_error("control.response_private")
+    return resolution
 
 
 def _secret_value(value: object) -> bytes | bytearray | memoryview:
@@ -971,6 +1132,19 @@ def _serialize_ingress_session(value: SecretIngressSessionV1) -> dict[str, objec
     return {"id": value.id, "account_ref": value.account_ref, "state": value.state}
 
 
+def _serialize_ingress_upload_receipt(
+    value: SecretIngressUploadReceiptV1,
+) -> dict[str, object]:
+    if type(value) is not SecretIngressUploadReceiptV1:
+        raise _service_error("control.response_private")
+    return {
+        "session_id": value.session_id,
+        "account_ref": value.account_ref,
+        "state": value.state,
+        "generation": value.generation,
+    }
+
+
 def _serialize_oauth_transaction(value: GoogleOAuthTransactionV1) -> dict[str, object]:
     if type(value) is not GoogleOAuthTransactionV1:
         raise _service_error("control.response_private")
@@ -1104,6 +1278,7 @@ def _public_digest(value: object) -> str:
 
 
 _OWNER_ERROR_PREFIXES: tuple[tuple[type[BaseException], tuple[str, ...]], ...] = (
+    (SecretIngressOwnerError, ("control.", "credential.")),
     (AdminOperationError, ("control.",)),
     (HostRegistryError, ("control.",)),
     (OpenAICredentialError, ("control.", "credential.", "oauth.")),

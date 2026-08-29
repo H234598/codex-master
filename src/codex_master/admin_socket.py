@@ -31,7 +31,7 @@ from .admin_contracts import (
 from .admin_service import (
     AdminServiceError,
     MasterjetControlService,
-    SecretIngressSessionV1,
+    SecretIngressUploadReceiptV1,
 )
 
 
@@ -374,16 +374,37 @@ class AdminSocketServer:
         received_fds: list[int],
     ) -> dict[str, object]:
         if value.get("transport") == "secret.put":
-            if set(value) != {"schema_version", "transport", "session_id"}:
+            if set(value) != {
+                "schema_version",
+                "transport",
+                "session_id",
+                "expected_generation",
+                "idempotency_key",
+            }:
                 raise _SocketFailure("control.request_invalid")
             if value.get("schema_version") != 1:
                 raise _SocketFailure("control.request_invalid")
             if len(received_fds) != 1:
                 raise _SocketFailure("control.secret_fd_required")
             session_id = value.get("session_id")
-            if type(session_id) is not str:
+            generation = value.get("expected_generation")
+            idempotency_key = value.get("idempotency_key")
+            if (
+                type(session_id) is not str
+                or type(generation) is not int
+                or not 0 <= generation <= 2**63 - 1
+                or type(idempotency_key) is not str
+                or _TOKEN.fullmatch(idempotency_key) is None
+            ):
                 raise _SocketFailure("control.request_invalid")
-            return self._put_secret(principal, peer, session_id, received_fds[0])
+            return self._put_secret(
+                principal,
+                peer,
+                session_id,
+                received_fds[0],
+                expected_generation=generation,
+                idempotency_key=idempotency_key,
+            )
         if received_fds:
             raise _SocketFailure("control.secret_fd_unexpected")
         try:
@@ -398,7 +419,16 @@ class AdminSocketServer:
         peer: UnixPeerCredentials,
         session_id: str,
         fd: int,
+        *,
+        expected_generation: int,
+        idempotency_key: str,
     ) -> dict[str, object]:
+        claim = self._service.reserve_secret_upload(
+            principal,
+            session_id,
+            expected_generation=expected_generation,
+            idempotency_key=idempotency_key,
+        )
         snapshot = _validate_secret_fd(fd, peer)
         buffer = bytearray(snapshot.st_size + 1)
         view = memoryview(buffer)
@@ -416,12 +446,18 @@ class AdminSocketServer:
                 raise _SocketFailure("control.secret_fd_invalid")
             _recheck_secret_fd(fd, snapshot)
             secret = view[:used]
-            return self._service.put_secret(principal, session_id, secret)
+            return self._service.put_secret(
+                principal, session_id, secret, upload_claim=claim
+            )
         except _SocketFailure:
             raise
         except AdminServiceError:
             raise
         except BaseException:
+            try:
+                self._service.rollback_secret_upload(claim)
+            except BaseException:
+                pass
             raise _SocketFailure("control.secret_fd_invalid") from None
         finally:
             if secret is not None:
@@ -471,12 +507,23 @@ class AdminSocketClient:
             raise AdminSocketError(_problem("control.request_invalid"))
         return self._exchange(public_admin_result(request), None)
 
-    def put_secret_fd(self, session_id: str, fd: int) -> SecretIngressSessionV1:
+    def put_secret_fd(
+        self,
+        session_id: str,
+        fd: int,
+        *,
+        expected_generation: int = 0,
+        idempotency_key: str = "socket-secret-put",
+    ) -> SecretIngressUploadReceiptV1:
         if (
             type(session_id) is not str
             or _TOKEN.fullmatch(session_id) is None
             or type(fd) is not int
             or fd < 0
+            or type(expected_generation) is not int
+            or not 0 <= expected_generation <= 2**63 - 1
+            or type(idempotency_key) is not str
+            or _TOKEN.fullmatch(idempotency_key) is None
         ):
             raise AdminSocketError(_problem("control.request_invalid"))
         result = self._exchange(
@@ -484,19 +531,26 @@ class AdminSocketClient:
                 "schema_version": 1,
                 "transport": "secret.put",
                 "session_id": session_id,
+                "expected_generation": expected_generation,
+                "idempotency_key": idempotency_key,
             },
             fd,
         )
-        if set(result) != {"id", "account_ref", "state"} or any(
-            type(result.get(field)) is not str
-            or _TOKEN.fullmatch(cast(str, result[field])) is None
-            for field in ("id", "account_ref", "state")
+        if (
+            set(result) != {"session_id", "account_ref", "state", "generation"}
+            or any(
+                type(result.get(field)) is not str
+                or _TOKEN.fullmatch(cast(str, result[field])) is None
+                for field in ("session_id", "account_ref", "state")
+            )
+            or type(result.get("generation")) is not int
         ):
             raise AdminSocketError(_problem("control.response_invalid"))
-        return SecretIngressSessionV1(
-            cast(str, result["id"]),
+        return SecretIngressUploadReceiptV1(
+            cast(str, result["session_id"]),
             cast(str, result["account_ref"]),
             cast(str, result["state"]),
+            cast(int, result["generation"]),
         )
 
     def _exchange(

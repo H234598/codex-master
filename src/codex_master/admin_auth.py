@@ -10,9 +10,8 @@ import hmac
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
-import sqlite3
 import stat
 import threading
 import time
@@ -22,6 +21,7 @@ from typing import Final, cast
 import jwt
 
 from .admin_contracts import AdminPrincipalV1
+from .hive.state import HiveStateError, HiveStateStore
 
 
 MAX_ASSERTION_BYTES: Final[int] = 16_384
@@ -270,7 +270,7 @@ class MasterjetBearerVerifier:
 class TotpStepUpVerifier:
     """RFC 6238 SHA-1 verifier with process-wide atomic counter replay defense."""
 
-    __slots__ = ("_clock", "_db", "_lock", "_secret", "_skew_steps", "_used")
+    __slots__ = ("_clock", "_lock", "_replay", "_secret", "_skew_steps")
 
     def __init__(
         self,
@@ -278,7 +278,7 @@ class TotpStepUpVerifier:
         *,
         clock: Callable[[], float],
         skew_steps: int,
-        replay_state_path: Path | None = None,
+        replay_state_path: Path,
     ) -> None:
         if not 16 <= len(secret) <= 128 or not callable(clock):
             raise AdminAuthError("authority.configuration_invalid")
@@ -288,24 +288,15 @@ class TotpStepUpVerifier:
         self._clock = clock
         self._skew_steps = skew_steps
         self._lock = threading.Lock()
-        self._used: set[int] = set()
-        self._db: sqlite3.Connection | None = None
-        if replay_state_path is not None:
-            try:
-                path = Path(replay_state_path)
-                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                self._db = sqlite3.connect(path, check_same_thread=False)
-                self._db.execute("PRAGMA journal_mode=WAL")
-                self._db.execute("PRAGMA synchronous=FULL")
-                self._db.execute(
-                    "CREATE TABLE IF NOT EXISTS consumed (counter INTEGER PRIMARY KEY)"
-                )
-                self._db.commit()
-                os.chmod(path, 0o600)
-            except Exception:
-                if self._db is not None:
-                    self._db.close()
-                raise AdminAuthError("authority.configuration_invalid") from None
+        try:
+            if (
+                not isinstance(replay_state_path, Path)
+                or not replay_state_path.is_absolute()
+            ):
+                raise ValueError
+            self._replay = _TotpReplayState(replay_state_path)
+        except (HiveStateError, OSError, ValueError):
+            raise AdminAuthError("authority.configuration_invalid") from None
 
     @classmethod
     def from_fd(
@@ -326,6 +317,8 @@ class TotpStepUpVerifier:
         finally:
             _wipe(encoded)
         try:
+            if replay_state_path is None:
+                raise AdminAuthError("authority.configuration_invalid")
             return cls(
                 secret,
                 clock=clock,
@@ -359,39 +352,60 @@ class TotpStepUpVerifier:
             if matched is None:
                 raise AdminAuthError("authority.step_up_invalid")
             floor = counter - self._skew_steps - 2
-            if self._db is None:
-                if matched in self._used:
-                    raise AdminAuthError("authority.step_up_replayed")
-                self._used.add(matched)
-                self._used.intersection_update(
-                    item for item in self._used if item >= floor
-                )
-            else:
-                try:
-                    self._db.execute("BEGIN IMMEDIATE")
-                    self._db.execute("DELETE FROM consumed WHERE counter < ?", (floor,))
-                    self._db.execute(
-                        "INSERT INTO consumed(counter) VALUES (?)", (matched,)
-                    )
-                    self._db.commit()
-                except sqlite3.IntegrityError:
-                    self._db.rollback()
-                    raise AdminAuthError("authority.step_up_replayed") from None
-                except Exception:
-                    self._db.rollback()
-                    raise AdminAuthError("authority.configuration_invalid") from None
+            self._replay.claim(matched, floor=floor)
             return matched
 
     def close(self) -> None:
         with self._lock:
             _wipe(self._secret)
-            self._used.clear()
-            if self._db is not None:
-                self._db.close()
-                self._db = None
 
     def __repr__(self) -> str:
         return "TotpStepUpVerifier(<redacted>)"
+
+
+class _TotpReplayState:
+    _FILE = PurePosixPath("totp-replay.json")
+    _MAX_BYTES = 4096
+    _MAX_COUNTERS = 32
+
+    def __init__(self, root: Path) -> None:
+        self._state = HiveStateStore(root)
+
+    def claim(self, counter: int, *, floor: int) -> None:
+        try:
+            with self._state.locked():
+                try:
+                    document = self._state.read_json_locked(
+                        self._FILE, max_bytes=self._MAX_BYTES
+                    )
+                except HiveStateError as error:
+                    if error.args != ("state_not_found",):
+                        raise
+                    document = {"schema_version": 1, "counters": []}
+                if set(document) != {"schema_version", "counters"}:
+                    raise HiveStateError("invalid_state_document")
+                raw = document.get("counters")
+                if (
+                    document.get("schema_version") != 1
+                    or type(raw) is not list
+                    or len(raw) > self._MAX_COUNTERS
+                    or any(type(value) is not int or value < 0 for value in raw)
+                    or len(set(raw)) != len(raw)
+                ):
+                    raise HiveStateError("invalid_state_document")
+                counters = [value for value in raw if value >= floor]
+                if counter in counters:
+                    raise AdminAuthError("authority.step_up_replayed")
+                counters.append(counter)
+                counters = sorted(counters)[-self._MAX_COUNTERS :]
+                self._state.replace_json_locked(
+                    self._FILE,
+                    {"schema_version": 1, "counters": counters},
+                )
+        except AdminAuthError:
+            raise
+        except (HiveStateError, OSError):
+            raise AdminAuthError("authority.configuration_invalid") from None
 
 
 def _parse_jwks(
@@ -409,22 +423,17 @@ def _parse_jwks(
             or "keys" not in value
         ):
             raise ValueError
-        if "public_cert" in value and (
-            type(value["public_cert"]) is not str
-            or len(value["public_cert"].encode("utf-8")) > MAX_CREDENTIAL_BYTES
-        ):
-            raise ValueError
+        if "public_cert" in value:
+            _pem_record(value["public_cert"])
         if "public_certs" in value:
             public_certs = value["public_certs"]
-            if type(public_certs) is not dict or len(public_certs) > _MAX_JWKS_KEYS:
-                raise ValueError
-            if any(
-                type(kid) is not str
-                or _KID.fullmatch(kid) is None
-                or type(cert) is not str
-                or len(cert.encode("utf-8")) > MAX_CREDENTIAL_BYTES
-                for kid, cert in public_certs.items()
+            if (
+                type(public_certs) is not list
+                or not 1 <= len(public_certs) <= _MAX_JWKS_KEYS
             ):
+                raise ValueError
+            pem_kids = [_pem_record(record) for record in public_certs]
+            if len(set(pem_kids)) != len(pem_kids):
                 raise ValueError
         raw_keys = value["keys"]
         if type(raw_keys) is not list or not 1 <= len(raw_keys) <= _MAX_JWKS_KEYS:
@@ -451,6 +460,22 @@ def _parse_jwks(
         return MappingProxyType(keys)
     except Exception:
         raise AdminAuthError("authority.configuration_invalid") from None
+
+
+def _pem_record(value: object) -> str:
+    if type(value) is not dict or set(value) != {"kid", "cert"}:
+        raise ValueError
+    kid = value.get("kid")
+    cert = value.get("cert")
+    if (
+        type(kid) is not str
+        or _KID.fullmatch(kid) is None
+        or type(cert) is not str
+        or not cert
+        or len(cert.encode("utf-8")) > MAX_CREDENTIAL_BYTES
+    ):
+        raise ValueError
+    return kid
 
 
 def _claims(value: object) -> Mapping[str, object]:
@@ -561,8 +586,11 @@ def _now(clock: Callable[[], float]) -> float:
 
 
 def _read_private_fd(fd: int, *, maximum: int) -> bytearray:
+    payload = bytearray()
+    view: memoryview | None = None
+    accepted = False
     try:
-        if type(fd) is not int or fd < 0 or not hasattr(os, "pread"):
+        if type(fd) is not int or fd < 0 or not hasattr(os, "preadv"):
             raise ValueError
         before = os.fstat(fd)
         access_mode = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
@@ -595,18 +623,23 @@ def _read_private_fd(fd: int, *, maximum: int) -> bytearray:
             after.st_size,
         )
         if not stable or read != before.st_size:
-            _wipe(payload)
             raise ValueError
+        accepted = True
         return payload
     except Exception:
         raise AdminAuthError("authority.credential_invalid") from None
+    finally:
+        if view is not None:
+            view.release()
+        if not accepted:
+            _wipe(payload)
 
 
 def _jwks_from_fd(fd: int) -> Mapping[str, object]:
     raw: bytearray | None = None
     try:
         raw = _read_private_fd(fd, maximum=MAX_CREDENTIAL_BYTES)
-        value = json.loads(raw)
+        value = json.loads(raw, object_pairs_hook=_strict_json_object)
         if type(value) is not dict:
             raise ValueError
         return cast(dict[str, object], value)
@@ -617,6 +650,15 @@ def _jwks_from_fd(fd: int) -> Mapping[str, object]:
     finally:
         if raw is not None:
             _wipe(raw)
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
 
 
 def _totp(secret: bytearray, counter: int) -> str:

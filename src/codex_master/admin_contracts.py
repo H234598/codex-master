@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-import hashlib
 import re
 from types import MappingProxyType
 from typing import Never, cast
@@ -324,16 +323,7 @@ class AdminRequestV1:
             elif self.idempotency_key is not None:
                 _invalid()
             if operation in _DIGEST_OPERATIONS:
-                plan_id = self.arguments.get("plan_id")
-                digest = self.plan_digest
-                if digest is None and type(plan_id) is str:
-                    digest = (
-                        "sha256:"
-                        + hashlib.sha256(
-                            b"codex-master/usage-plan-id/v1\0" + plan_id.encode("ascii")
-                        ).hexdigest()
-                    )
-                object.__setattr__(self, "plan_digest", _digest(digest))
+                object.__setattr__(self, "plan_digest", _digest(self.plan_digest))
             elif self.plan_digest is not None:
                 _invalid()
         elif any(

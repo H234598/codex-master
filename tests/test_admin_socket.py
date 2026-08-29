@@ -27,6 +27,7 @@ from codex_master.admin_hosts import ControlHostV1
 from codex_master.admin_service import (
     MasterjetControlService,
     SecretIngressSessionV1,
+    SecretIngressUploadReceiptV1,
 )
 from codex_master.admin_socket import (
     MAX_ADMIN_REQUEST_BYTES,
@@ -84,6 +85,12 @@ class _SecretIngress:
         self.received = b""
         self.buffer: bytearray | None = None
         self.fail = False
+        self.claims: list[object] = []
+
+    def reserve_upload(self, session_id: str, **values: object) -> object:
+        claim = (session_id, dict(values))
+        self.claims.append(claim)
+        return claim
 
     def put_secret(
         self,
@@ -91,14 +98,22 @@ class _SecretIngress:
         secret: bytes | bytearray | memoryview,
         *,
         principal: str,
-    ) -> SecretIngressSessionV1:
+        upload_claim: object,
+    ) -> SecretIngressUploadReceiptV1:
+        assert upload_claim in self.claims
         self.put_calls += 1
         self.received = bytes(secret)
         self.buffer = secret.obj if type(secret) is memoryview else secret
         assert principal == "operator-one"
         if self.fail:
             raise RuntimeError("private-marker /home/operator/auth.json")
-        return SecretIngressSessionV1(session_id, "openai-one", "consumed")
+        return SecretIngressUploadReceiptV1(session_id, "openai-one", "consumed", 1)
+
+    def commit_upload(self, _claim: object, _receipt: object) -> None:
+        return None
+
+    def rollback_upload(self, _claim: object) -> None:
+        return None
 
     def create_session(self, **_values: object) -> SecretIngressSessionV1:
         raise AssertionError("not used")
@@ -221,6 +236,8 @@ def _secret_put_wire(session_id: str = "ingress-one") -> bytes:
                 "schema_version": 1,
                 "transport": "secret.put",
                 "session_id": session_id,
+                "expected_generation": 0,
+                "idempotency_key": "socket-secret-put",
             },
             separators=(",", ":"),
             sort_keys=True,

@@ -56,7 +56,10 @@ class _Service:
         self.secrets: list[bytes] = []
         self.consumed: set[str] = set()
         self.raise_marker = False
+        self.known_failure = False
         self.capabilities: list[object] = []
+        self.upload_reservations: list[tuple[str, str, int, str]] = []
+        self.upload_rollbacks: list[object] = []
 
     def handle(
         self,
@@ -72,6 +75,8 @@ class _Service:
             self.capabilities.append(ingress_session)
         if self.raise_marker:
             raise RuntimeError("private-exception-marker")
+        if self.known_failure:
+            raise AdminServiceError(_problem("control.owner_unavailable"))
         if (
             request.operation
             in {
@@ -88,20 +93,62 @@ class _Service:
                 "id": "ingress-one",
                 "account_ref": "google-one",
                 "state": "pending",
+                "plan_id": request.arguments.get("plan_id") or request.plan_digest,
+                "expires_at": "2033-05-18T03:35:20Z",
+                "expected_generation": request.expected_generation,
             }
         return {
             "operation": request.operation,
             "step_up": principal.step_up,
+            "state": "succeeded",
         }
 
-    def put_secret(self, principal: AdminPrincipalV1, session_id: str, secret):
+    def reserve_secret_upload(
+        self,
+        principal: AdminPrincipalV1,
+        session_id: str,
+        *,
+        expected_generation: int,
+        idempotency_key: str,
+    ):
         if not principal.step_up:
             raise AdminDenied(_problem("authority.step_up_required"))
         if session_id in self.consumed:
             raise AdminServiceError(_problem("credential.upload_expired"))
+        reservation = (
+            principal.subject,
+            session_id,
+            expected_generation,
+            idempotency_key,
+        )
+        self.upload_reservations.append(reservation)
+        return reservation
+
+    def rollback_secret_upload(self, upload_claim) -> None:
+        self.upload_rollbacks.append(upload_claim)
+
+    def put_secret(
+        self,
+        principal: AdminPrincipalV1,
+        session_id: str,
+        secret,
+        *,
+        upload_claim,
+    ):
+        if not principal.step_up:
+            raise AdminDenied(_problem("authority.step_up_required"))
+        if upload_claim not in self.upload_reservations:
+            raise AdminServiceError(_problem("credential.upload_expired"))
+        if session_id in self.consumed:
+            raise AdminServiceError(_problem("credential.upload_expired"))
         self.consumed.add(session_id)
         self.secrets.append(bytes(secret))
-        return {"id": session_id, "account_ref": "google-one", "state": "consumed"}
+        return {
+            "session_id": session_id,
+            "account_ref": "google-one",
+            "state": "consumed",
+            "generation": upload_claim[2] + 1,
+        }
 
 
 class _AccessVerifier:
@@ -158,7 +205,12 @@ def _running_server(
                 "fleet.secrets.ingress",
             ),
         )
-        totp = TotpStepUpVerifier.from_fd(totp_fd, clock=lambda: NOW, skew_steps=0)
+        totp = TotpStepUpVerifier.from_fd(
+            totp_fd,
+            clock=lambda: NOW,
+            skew_steps=0,
+            replay_state_path=tmp_path / "totp-replay-state",
+        )
     finally:
         os.close(bearer_fd)
         os.close(totp_fd)
@@ -395,6 +447,44 @@ def test_secret_ingress_flow_grant_covers_only_put_and_matching_apply(tmp_path) 
     assert service.secrets == [_secret_payload()]
 
 
+def test_known_apply_failure_rolls_back_flow_for_same_idempotent_retry(
+    tmp_path,
+) -> None:
+    service = _Service()
+    with _running_server(tmp_path, service=service) as (server, _service):
+        _request(
+            server,
+            "POST",
+            "/admin/v1",
+            _secret_session_document(),
+            _headers(**{"X-Masterjet-Step-Up": _totp()}),
+        )
+        _request(
+            server,
+            "PUT",
+            "/admin/v1/secret-ingress-sessions/ingress-one",
+            _secret_payload(),
+            _headers(**{"Content-Type": "application/octet-stream"}),
+        )
+        body = _document(
+            "google.oauth-client-import.apply",
+            {"account_ref": "google-one"},
+            expected_generation=4,
+            idempotency_key="idem-final",
+            plan_digest=DIGEST,
+        )
+        service.known_failure = True
+        failed, _out, _payload = _request(server, "POST", "/admin/v1", body, _headers())
+        service.known_failure = False
+        retried, _out, _payload = _request(
+            server, "POST", "/admin/v1", body, _headers()
+        )
+
+    assert failed == 503
+    assert retried == 200
+    assert len(service.capabilities) == 2
+
+
 def test_real_service_create_put_apply_receives_exact_one_shot_capability(
     tmp_path,
 ) -> None:
@@ -468,6 +558,7 @@ def test_google_oauth_code_crosses_only_typed_raw_ingress_boundary(tmp_path) -> 
         },
         expected_generation=4,
         idempotency_key="idem-oauth-code",
+        plan_digest=DIGEST,
     )
     with _running_server(tmp_path, service=service) as (server, _service):
         created, _out, _payload = _request(
@@ -664,6 +755,68 @@ def test_all_unsupported_methods_use_json_no_store_close(tmp_path, method) -> No
         assert json.loads(payload)["code"] == "control.route_not_found"
 
 
+def test_arbitrary_extension_method_uses_json_no_store_close(tmp_path) -> None:
+    with _running_server(tmp_path) as (server, _service):
+        status, headers, payload = _request(
+            server, "PROPFIND", "/admin/v1", b"", _headers()
+        )
+    assert status == 405
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Cache-Control"] == "no-store"
+    assert headers["Connection"] == "close"
+    assert json.loads(payload)["code"] == "control.route_not_found"
+
+
+def test_fresh_totp_cannot_upload_without_matching_flow_grant(tmp_path) -> None:
+    service = _Service()
+    with _running_server(tmp_path, service=service) as (server, _service):
+        status, _headers_out, payload = _request(
+            server,
+            "PUT",
+            "/admin/v1/secret-ingress-sessions/orphan-session",
+            b"secret-after-restart",
+            _headers(
+                **{
+                    "Content-Type": "application/octet-stream",
+                    "X-Masterjet-Step-Up": _totp(),
+                }
+            ),
+        )
+    assert status in {403, 410}
+    assert json.loads(payload)["code"] in {
+        "authority.step_up_required",
+        "credential.upload_expired",
+    }
+    assert service.secrets == []
+    assert service.upload_reservations == []
+
+
+def test_matching_flow_reserves_owner_before_raw_put(tmp_path) -> None:
+    service = _Service()
+    with _running_server(tmp_path, service=service) as (server, _service):
+        _request(
+            server,
+            "POST",
+            "/admin/v1",
+            _secret_session_document(),
+            _headers(**{"X-Masterjet-Step-Up": _totp()}),
+        )
+        status, _headers_out, payload = _request(
+            server,
+            "PUT",
+            "/admin/v1/secret-ingress-sessions/ingress-one",
+            b"secret",
+            _headers(**{"Content-Type": "application/octet-stream"}),
+        )
+
+    assert status == 200
+    assert service.upload_reservations == [
+        ("usage-service", "ingress-one", 4, "idem-upload")
+    ]
+    assert service.secrets == [b"secret"]
+    assert json.loads(payload)["generation"] == 5
+
+
 def test_oversized_content_length_is_rejected_without_owner_call(tmp_path) -> None:
     with _running_server(tmp_path) as (server, service):
         status, _headers_out, payload = _request(
@@ -750,6 +903,36 @@ def test_owner_exception_is_sanitized(tmp_path) -> None:
     assert b"traceback" not in lowered
 
 
+def test_raw_body_buffer_is_wiped_after_owner_exception(tmp_path) -> None:
+    held: list[bytearray] = []
+
+    class FailingPutService(_Service):
+        def put_secret(self, principal, session_id, secret, *, upload_claim):
+            del principal, session_id, upload_claim
+            held.append(secret)
+            raise AdminServiceError(_problem("control.owner_unavailable"))
+
+    with _running_server(tmp_path, service=FailingPutService()) as (server, _service):
+        _request(
+            server,
+            "POST",
+            "/admin/v1",
+            _secret_session_document(),
+            _headers(**{"X-Masterjet-Step-Up": _totp()}),
+        )
+        status, _out, payload = _request(
+            server,
+            "PUT",
+            "/admin/v1/secret-ingress-sessions/ingress-one",
+            b"private-marker",
+            _headers(**{"Content-Type": "application/octet-stream"}),
+        )
+
+    assert status == 503
+    assert b"private-marker" not in payload
+    assert held == [bytearray()]
+
+
 def test_shutdown_stops_admission_and_reports_blocked_handler(tmp_path) -> None:
     entered = threading.Event()
     release = threading.Event()
@@ -786,6 +969,43 @@ def test_shutdown_stops_admission_and_reports_blocked_handler(tmp_path) -> None:
         worker.join(2)
         server.drain(1)
         assert result == [200]
+
+
+def test_drain_observes_handler_claim_before_request_thread_start(
+    tmp_path, monkeypatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    real_start = threading.Thread.start
+
+    def blocked_start(thread: threading.Thread) -> None:
+        if (
+            thread.name.startswith("Thread-")
+            and thread is not threading.current_thread()
+        ):
+            entered.set()
+            assert release.wait(2)
+        real_start(thread)
+
+    with _running_server(tmp_path) as (server, _service):
+        monkeypatch.setattr(threading.Thread, "start", blocked_start)
+        client = threading.Thread(
+            target=lambda: _request(
+                server,
+                "GET",
+                "/admin/v1",
+                b"",
+                _headers(),
+            ),
+            name="request-client",
+        )
+        real_start(client)
+        assert entered.wait(1)
+        with pytest.raises(AdminHttpShutdownError, match="shutdown_incomplete"):
+            server.drain(0)
+        release.set()
+        client.join(2)
+        server.drain(1)
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "8.8.8.8", "::"])

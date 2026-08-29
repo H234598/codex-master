@@ -41,7 +41,9 @@ from codex_master.admin_service import (
     MasterjetControlService,
     OpenAIAccountSummaryV1,
     SecretIngressSessionV1,
+    SecretIngressUploadReceiptV1,
     SecretIngressCapabilityV1,
+    SecretIngressResolutionV1,
 )
 
 
@@ -167,7 +169,7 @@ class OpenAICredentials:
     def apply_auth_sync(self, plan: object, upload: object) -> AuthSyncReceiptV1:
         self.apply_calls += 1
         assert plan == "openai-plan"
-        assert upload == "openai-upload"
+        assert upload == bytearray(b"openai-upload")
         return AuthSyncReceiptV1("openai-one", 5, "a" * 64)
 
 
@@ -278,7 +280,7 @@ class GoogleOAuth:
     ) -> GoogleOAuthClientImportReceiptV1:
         self.calls.append("client-apply")
         assert plan == "google-client-plan"
-        assert ingress_session == "google-client-upload"
+        assert type(ingress_session) is bytearray and ingress_session
         return GoogleOAuthClientImportReceiptV1(
             "google-one", "client-one", "Quiet Client", 4, "a" * 64
         )
@@ -417,6 +419,11 @@ class SecretIngress:
         self.put_calls = 0
         self.last_put: tuple[str, object, str] | None = None
         self.last_capability: object | None = None
+        self.upload_claims: list[object] = []
+        self.upload_commits = 0
+        self.upload_rollbacks = 0
+        self.resolve_commits = 0
+        self.resolve_rollbacks = 0
 
     def create_session(self, **values: object) -> SecretIngressSessionV1:
         self.create_calls += 1
@@ -424,24 +431,57 @@ class SecretIngress:
             "ingress-one", str(values["account_ref"]), "authorized"
         )
 
-    def resolve(self, session: object, **values: object) -> tuple[object, object]:
+    def reserve_resolve(self, session_id: str, **values: object) -> object:
         self.resolve_calls += 1
-        self.last_capability = session
-        assert (
-            session == "ingress-session" or type(session) is SecretIngressCapabilityV1
+        self.last_capability = values.pop("capability", None)
+        return (session_id, dict(values))
+
+    def resolve(self, claim: object) -> SecretIngressResolutionV1:
+        session_id, values = claim
+        kind = values["credential_kind"]
+        if kind == "openai.auth-json":
+            return SecretIngressResolutionV1(
+                session_id, "openai-plan", bytearray(b"openai-upload"), claim
+            )
+        if kind == "google-oauth-code":
+            return SecretIngressResolutionV1(
+                session_id, "oauth-transaction", bytearray(b"oauth-code"), claim
+            )
+        return SecretIngressResolutionV1(
+            session_id, "google-client-plan", bytearray(b"google-client-upload"), claim
         )
-        if values["credential_kind"] == "openai.auth-json":
-            return "openai-plan", "openai-upload"
-        if values["credential_kind"] == "google-oauth-code":
-            return "oauth-transaction", bytearray(b"oauth-code")
-        return "google-client-plan", "google-client-upload"
+
+    def commit_resolve(self, resolution: SecretIngressResolutionV1) -> None:
+        self.resolve_commits += 1
+        resolution.upload.clear()
+
+    def rollback_resolve(self, resolution: SecretIngressResolutionV1) -> None:
+        self.resolve_rollbacks += 1
+        resolution.upload.clear()
+
+    def reserve_upload(self, session_id: str, **values: object) -> object:
+        claim = (session_id, dict(values))
+        self.upload_claims.append(claim)
+        return claim
 
     def put_secret(
-        self, session_id: str, secret: object, *, principal: str
-    ) -> SecretIngressSessionV1:
+        self,
+        session_id: str,
+        secret: object,
+        *,
+        principal: str,
+        upload_claim: object,
+    ) -> SecretIngressUploadReceiptV1:
+        assert upload_claim in self.upload_claims
         self.put_calls += 1
         self.last_put = (session_id, secret, principal)
-        return SecretIngressSessionV1(session_id, "openai-one", "consumed")
+        return SecretIngressUploadReceiptV1(session_id, "openai-one", "consumed", 5)
+
+    def commit_upload(self, _claim: object, _receipt: object) -> None:
+        self.upload_commits += 1
+
+    def rollback_upload(self, _claim: object) -> None:
+        self.upload_rollbacks += 1
 
 
 @dataclass
@@ -503,6 +543,34 @@ def command(
     generation: int = 4,
     idempotency_key: str | None = "request-one",
 ) -> dict[str, object]:
+    if ingress_session == "ingress-session":
+        account_ref = str(arguments["account_ref"])
+        credential_kind = {
+            "openai.auth.apply": "openai.auth-json",
+            "google.oauth.complete": "google-oauth-code",
+            "google.oauth-client-import.apply": "google.oauth-client",
+        }[operation]
+        plan_id = arguments.get("plan_id")
+        apply_key = idempotency_key
+        if operation == "google.oauth.complete":
+            plan_id = arguments["transaction_id"]
+            apply_key = str(plan_id)
+        ingress_session = SecretIngressCapabilityV1(
+            "ingress-one",
+            "operator-one",
+            account_ref,
+            operation,
+            credential_kind,
+            plan_id if type(plan_id) is str else None,
+            digest or DIGEST,
+            generation,
+            "request-one",
+            "idem-upload",
+            str(apply_key),
+            generation,
+            generation + 1,
+            1_120.0,
+        )
     return service.command(
         principal(scope, step_up=step_up),
         operation,
@@ -623,23 +691,47 @@ def test_raw_secret_field_is_rejected_before_ingress_or_credential_owner() -> No
 def test_put_secret_delegates_same_buffer_with_bound_principal() -> None:
     service, owners = service_at()
     secret = bytearray(b"private-marker")
+    who = principal("fleet.secrets.ingress", step_up=True)
+    claim = service.reserve_secret_upload(
+        who,
+        "ingress-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
 
     result = service.put_secret(
-        principal("fleet.secrets.ingress", step_up=True),
+        who,
         "ingress-one",
         secret,
+        upload_claim=claim,
     )
 
     assert result == {
-        "id": "ingress-one",
+        "session_id": "ingress-one",
         "account_ref": "openai-one",
         "state": "consumed",
+        "generation": 5,
     }
     assert owners.secret_ingress.put_calls == 1
     assert owners.secret_ingress.last_put is not None
     assert owners.secret_ingress.last_put[0] == "ingress-one"
     assert owners.secret_ingress.last_put[1] is secret
     assert owners.secret_ingress.last_put[2] == "operator-one"
+    assert owners.secret_ingress.upload_commits == 1
+
+
+def test_put_secret_without_owner_reservation_is_rejected_before_owner() -> None:
+    service, owners = service_at()
+
+    with pytest.raises(AdminServiceError, match="credential.upload_expired"):
+        service.put_secret(
+            principal("fleet.secrets.ingress", step_up=True),
+            "ingress-one",
+            bytearray(b"private-marker"),
+            upload_claim=None,
+        )
+
+    assert owners.secret_ingress.put_calls == 0
 
 
 def test_put_secret_requires_exact_scope_and_step_up_before_owner() -> None:
