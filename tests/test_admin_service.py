@@ -1211,7 +1211,7 @@ def test_command_dispatch_calls_only_the_selected_owner_once(
     assert sum(counts.values()) == 1
 
 
-class PrivateOwnerFailure(BaseException):
+class PrivateOwnerFailure(Exception):
     @property
     def code(self) -> str:
         raise RuntimeError("private-marker /private/root")
@@ -1236,6 +1236,59 @@ def test_owner_error_is_hive_problem_and_never_echoes_foreign_exception() -> Non
     assert "private-marker" not in rendered
     assert "/private/root" not in rendered
     assert captured.value.__context__ is None
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+def test_handle_propagates_owner_control_signal_unchanged(signal_type) -> None:
+    """Break caught: process-control signals must escape owner dispatch."""
+
+    service, owners = service_at()
+    signal = signal_type("stop-owner-dispatch")
+
+    def stop() -> tuple[dict[str, object], ...]:
+        raise signal
+
+    owners.google_manager.list_accounts = stop  # type: ignore[method-assign]
+
+    with pytest.raises(signal_type) as captured:
+        service.query(principal("fleet.read"), "google.accounts.list", {})
+
+    assert captured.value is signal
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+def test_post_effect_journal_control_signal_propagates_unchanged(signal_type) -> None:
+    """Break caught: post-effect journal signal must escape public handle."""
+
+    service, owners = service_at()
+    signal = signal_type("stop-post-effect-journal")
+    effect_calls = 0
+
+    def fail_after_effect(*_args: object) -> None:
+        nonlocal effect_calls
+        effect_calls += 1
+        raise RuntimeError("private-post-effect-marker")
+
+    def stop_unknown_journal(resolution: SecretIngressResolutionV1) -> None:
+        resolution.upload.clear()
+        raise signal
+
+    owners.openai_credentials.apply_auth_sync = fail_after_effect  # type: ignore[method-assign]
+    owners.secret_ingress.mark_resolve_unknown = stop_unknown_journal  # type: ignore[method-assign]
+
+    with pytest.raises(signal_type) as captured:
+        command(
+            service,
+            "openai.auth.apply",
+            {"account_ref": "openai-one"},
+            "fleet.secrets.ingress",
+            digest=DIGEST,
+            ingress_session="ingress-session",
+            step_up=True,
+        )
+
+    assert captured.value is signal
+    assert effect_calls == 1
 
 
 def test_concurrent_queries_delegate_exactly_once_per_request() -> None:

@@ -565,7 +565,7 @@ class MasterjetControlService:
             result = handler(self, principal, request, ingress_session, oauth_code)
         except AdminServiceError:
             raise
-        except BaseException as error:
+        except Exception as error:
             owner_error = _owner_service_error(error)
             del error
         else:
