@@ -16,6 +16,38 @@ def _unavailable() -> dict[str, int | str]:
 def _sparse_result(value: object) -> dict[str, int | str]:
     if type(value) is not dict:
         return _unavailable()
+    if "reason_code" in value or (
+        "schema_version" in value
+        and value.get("schema_version") != 1
+        and "raw_output" not in value
+    ):
+        if any(type(key) is not str for key in value):
+            return _v2_invalid()
+        if set(value) != {"schema_version", "status", "reason_code"}:
+            return _v2_invalid()
+        if (
+            type(value["schema_version"]) is not int
+            or value["schema_version"] != 2
+            or type(value["status"]) is not str
+            or type(value["reason_code"]) is not str
+        ):
+            return _v2_invalid()
+        if (value["status"], value["reason_code"]) == ("started", "none"):
+            return {
+                "schema_version": 2,
+                "status": "started",
+                "reason_code": "none",
+            }
+        if (value["status"], value["reason_code"]) == (
+            "unavailable",
+            "dynamic_teamlead_runtime_unavailable",
+        ):
+            return {
+                "schema_version": 2,
+                "status": "unavailable",
+                "reason_code": "dynamic_teamlead_runtime_unavailable",
+            }
+        return _v2_invalid()
     if any(type(key) is not str for key in value):
         return _unavailable()
     if type(value.get("schema_version")) is not int:
@@ -53,6 +85,14 @@ def _sparse_result(value: object) -> dict[str, int | str]:
             "raw_output": "not_returned",
         }
     return _unavailable()
+
+
+def _v2_invalid() -> dict[str, int | str]:
+    return {
+        "schema_version": 2,
+        "status": "unavailable",
+        "reason_code": "dynamic_teamlead_root_control_invalid",
+    }
 
 
 class DynamicTeamleadStartControl(Protocol):

@@ -18,6 +18,21 @@ STARTED = {
     "status": "started",
     "raw_output": "not_returned",
 }
+V2_STARTED = {
+    "schema_version": 2,
+    "status": "started",
+    "reason_code": "none",
+}
+V2_RUNTIME_UNAVAILABLE = {
+    "schema_version": 2,
+    "status": "unavailable",
+    "reason_code": "dynamic_teamlead_runtime_unavailable",
+}
+V2_INVALID = {
+    "schema_version": 2,
+    "status": "unavailable",
+    "reason_code": "dynamic_teamlead_root_control_invalid",
+}
 
 
 class RecordingControl:
@@ -134,3 +149,86 @@ def test_runtime_instances_hold_independent_controls_and_only_one_slot() -> None
     assert second_control.calls == 1
     with pytest.raises(FrozenInstanceError):
         first.dynamic_teamlead_control = None  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    (
+        (V2_STARTED, V2_STARTED),
+        (V2_RUNTIME_UNAVAILABLE, V2_RUNTIME_UNAVAILABLE),
+        (V2_INVALID, V2_INVALID),
+    ),
+)
+def test_runtime_normalizes_valid_v2_result_to_fresh_dict(
+    result: dict[str, int | str], expected: dict[str, int | str]
+) -> None:
+    producer_result = dict(result)
+    control = RecordingControl(result=producer_result)
+    runtime = MasterjetRuntime(control)
+
+    first = runtime.start_dynamic_teamlead()
+    second = runtime.start_dynamic_teamlead()
+
+    assert type(first) is dict
+    assert type(second) is dict
+    assert first == expected
+    assert second == expected
+    assert first is not second
+    assert first is not producer_result
+    assert second is not producer_result
+    producer_result["reason_code"] = "private producer detail"
+    assert first == expected
+    assert second == expected
+    assert control.calls == 2
+
+
+@pytest.mark.parametrize(
+    "result",
+    (
+        {"schema_version": 2, "status": "started"},
+        {"schema_version": 2, "reason_code": "none"},
+        {"status": "started", "reason_code": "none"},
+        {"schema_version": True, "status": "started", "reason_code": "none"},
+        {"schema_version": 2, "status": True, "reason_code": "none"},
+        {"schema_version": 2, "status": "started", "reason_code": True},
+        {"schema_version": 2, "status": "unknown", "reason_code": "none"},
+        {
+            "schema_version": 2,
+            "status": "started",
+            "reason_code": "unknown",
+        },
+        {
+            "schema_version": 2,
+            "status": "unavailable",
+            "reason_code": "none",
+        },
+        {
+            "schema_version": 2,
+            "status": "started",
+            "reason_code": "dynamic_teamlead_runtime_unavailable",
+        },
+        {
+            "schema_version": 2,
+            "status": "started",
+            "reason_code": "none",
+            "extra": "private detail",
+        },
+    ),
+)
+def test_runtime_normalizes_invalid_v2_result_without_detail(result: object) -> None:
+    producer_result = dict(result)  # type: ignore[arg-type]
+    control = RecordingControl(result=producer_result)
+    runtime = MasterjetRuntime(control)
+
+    first = runtime.start_dynamic_teamlead()
+    second = runtime.start_dynamic_teamlead()
+
+    assert first == V2_INVALID
+    assert second == V2_INVALID
+    assert first is not second
+    assert first is not producer_result
+    assert second is not producer_result
+    producer_result["reason_code"] = "private producer detail"
+    assert first == V2_INVALID
+    assert second == V2_INVALID
+    assert control.calls == 2
