@@ -35,6 +35,7 @@ from codex_master.admin_socket import (
     AdminSocketError,
     AdminSocketServer,
     UnixPeerCredentials,
+    local_attestation_verifier,
 )
 
 
@@ -137,6 +138,8 @@ class _RunningServer:
     socket: AdminSocketServer
     service: MasterjetControlService
     ingress: _SecretIngress
+    hosts: _Hosts
+    authorize_calls: list[UnixPeerCredentials]
     attestation_key_fd: int
 
     @property
@@ -159,9 +162,12 @@ def attestation_key_fd(tmp_path: Path) -> Iterator[int]:
 @pytest.fixture
 def server(tmp_path: Path, attestation_key_fd: int) -> Iterator[_RunningServer]:
     ingress = _SecretIngress()
-    service = _service(ingress)
+    hosts = _Hosts()
+    service = _service(ingress, hosts)
+    authorize_calls: list[UnixPeerCredentials] = []
 
     def authorize(peer: UnixPeerCredentials) -> AdminPrincipalV1:
+        authorize_calls.append(peer)
         assert peer.pid == os.getpid()
         assert peer.uid == os.getuid()
         assert peer.gid == os.getgid()
@@ -175,7 +181,14 @@ def server(tmp_path: Path, attestation_key_fd: int) -> Iterator[_RunningServer]:
     )
     adapter.start()
     try:
-        yield _RunningServer(adapter, service, ingress, attestation_key_fd)
+        yield _RunningServer(
+            adapter,
+            service,
+            ingress,
+            hosts,
+            authorize_calls,
+            attestation_key_fd,
+        )
     finally:
         adapter.close()
 
@@ -214,6 +227,18 @@ def _secret_put_wire(session_id: str = "ingress-one") -> bytes:
         ).encode("utf-8")
         + b"\n"
     )
+
+
+def _track_request_parsing(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    calls: list[bool] = []
+    receive_frame = getattr(admin_socket, "_receive_frame")
+
+    def track(connection: socket.socket) -> tuple[bytes, list[int]]:
+        calls.append(True)
+        return receive_frame(connection)
+
+    monkeypatch.setattr(admin_socket, "_receive_frame", track)
+    return calls
 
 
 def _send_raw(
@@ -391,14 +416,25 @@ def test_usage_compatible_attestation_verifier_authenticates_connection(
         reply = json.loads(_recv_line(connection))
 
     assert reply["ok"] is True
+    assert len(server.authorize_calls) == 1
 
 
-def test_missing_attestation_key_fails_closed_before_request(tmp_path: Path) -> None:
+def test_missing_attestation_key_fails_closed_before_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     hosts = _Hosts()
+    ingress = _SecretIngress()
+    authorize_calls: list[UnixPeerCredentials] = []
+    parse_calls = _track_request_parsing(monkeypatch)
+
+    def authorize(peer: UnixPeerCredentials) -> AdminPrincipalV1:
+        authorize_calls.append(peer)
+        return PRINCIPAL
+
     adapter = AdminSocketServer(
         tmp_path / "private" / "admin.sock",
-        _service(_SecretIngress(), hosts),
-        lambda _peer: PRINCIPAL,
+        _service(ingress, hosts),
+        authorize,
     )
     adapter.start()
     try:
@@ -410,14 +446,45 @@ def test_missing_attestation_key_fails_closed_before_request(tmp_path: Path) -> 
         adapter.close()
 
     assert _problem_code(reply) == "control.attestation_required"
+    assert authorize_calls == []
+    assert parse_calls == []
     assert hosts.calls == 0
+    assert ingress.put_calls == 0
+
+
+@pytest.mark.parametrize("invalid_fd", [-1, "private-marker"], ids=("negative", "type"))
+def test_invalid_attestation_key_fd_is_typed_and_redacted(
+    tmp_path: Path,
+    invalid_fd: object,
+) -> None:
+    constructors = (
+        lambda: AdminSocketServer(
+            tmp_path / "private" / "admin.sock",
+            _service(_SecretIngress()),
+            lambda _peer: PRINCIPAL,
+            attestation_key_fd=invalid_fd,  # type: ignore[arg-type]
+        ),
+        lambda: AdminSocketClient(
+            tmp_path / "private" / "admin.sock",
+            attestation_key_fd=invalid_fd,  # type: ignore[arg-type]
+        ),
+        lambda: local_attestation_verifier(invalid_fd),  # type: ignore[arg-type]
+    )
+    for constructor in constructors:
+        with pytest.raises(AdminSocketError) as raised:
+            constructor()
+        assert raised.value.problem.code == "control.attestation_required"
+        assert repr(raised.value) == "AdminSocketError('control.attestation_required')"
+        assert "private-marker" not in str(raised.value)
 
 
 def test_wrong_attestation_key_sends_no_secret_fd(
     server: _RunningServer,
     auth_fd: int,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    parse_calls = _track_request_parsing(monkeypatch)
     wrong_path = tmp_path / "wrong-attestation.key"
     wrong_path.write_bytes(b"wrong-admin-attestation-key-value")
     wrong_path.chmod(0o600)
@@ -431,6 +498,9 @@ def test_wrong_attestation_key_sends_no_secret_fd(
     finally:
         os.close(wrong_fd)
 
+    assert server.authorize_calls == []
+    assert parse_calls == []
+    assert server.hosts.calls == 0
     assert server.ingress.put_calls == 0
     assert os.fstat(auth_fd)
 
@@ -496,7 +566,9 @@ def test_attestation_response_cannot_be_replayed_on_new_connection(
 def test_attestation_rejects_invalid_bounded_frames(
     server: _RunningServer,
     response: bytes,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    parse_calls = _track_request_parsing(monkeypatch)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(2)
         connection.connect(os.fspath(server.path))
@@ -506,6 +578,10 @@ def test_attestation_rejects_invalid_bounded_frames(
         reply = json.loads(_recv_line(connection))
 
     assert _problem_code(reply) == "control.attestation_required"
+    assert server.authorize_calls == []
+    assert parse_calls == []
+    assert server.hosts.calls == 0
+    assert server.ingress.put_calls == 0
 
 
 def test_attestation_accepts_fragmented_frames(
@@ -750,17 +826,28 @@ def test_socket_result_matches_direct_service(server: _RunningServer) -> None:
     assert _client(server).call(request) == server.service.handle(PRINCIPAL, request)
 
 
-def test_peer_authority_is_resolved_before_malformed_json(tmp_path: Path) -> None:
+def test_peer_authority_is_resolved_after_attestation_before_malformed_json(
+    tmp_path: Path, attestation_key_fd: int
+) -> None:
     ingress = _SecretIngress()
     path = tmp_path / "private" / "admin.sock"
 
     def deny(_peer: UnixPeerCredentials) -> AdminPrincipalV1:
         raise RuntimeError("private-peer-marker")
 
-    adapter = AdminSocketServer(path, _service(ingress), deny)
+    adapter = AdminSocketServer(
+        path,
+        _service(ingress),
+        deny,
+        attestation_key_fd=attestation_key_fd,
+    )
     adapter.start()
     try:
-        reply = _send_raw(path, b"not-json\n")
+        reply = _send_raw(
+            path,
+            b"not-json\n",
+            attestation_key_fd=attestation_key_fd,
+        )
     finally:
         adapter.close()
 
@@ -795,6 +882,9 @@ def test_close_finishes_active_request_before_restart(
         old_thread = getattr(adapter, "_thread")
         assert type(old_thread) is Thread
         connection.connect(os.fspath(adapter.path))
+        assert local_attestation_verifier(attestation_key_fd)(
+            os.getpid(), os.geteuid(), os.getegid(), connection
+        )
         assert accepted.wait(1)
 
         closer = Thread(target=adapter.close)
@@ -840,6 +930,7 @@ def test_close_finishes_active_request_before_restart(
 
 def test_close_is_bounded_and_fail_closed_for_blocked_authorizer(
     tmp_path: Path,
+    attestation_key_fd: int,
 ) -> None:
     entered = Event()
     release = Event()
@@ -853,6 +944,7 @@ def test_close_is_bounded_and_fail_closed_for_blocked_authorizer(
         tmp_path / "private" / "admin.sock",
         _service(_SecretIngress()),
         authorize,
+        attestation_key_fd=attestation_key_fd,
     )
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     close_errors: list[BaseException] = []
@@ -874,6 +966,9 @@ def test_close_is_bounded_and_fail_closed_for_blocked_authorizer(
         worker = getattr(adapter, "_thread")
         assert type(worker) is Thread
         connection.connect(os.fspath(adapter.path))
+        assert local_attestation_verifier(attestation_key_fd)(
+            os.getpid(), os.geteuid(), os.getegid(), connection
+        )
         assert entered.wait(1)
 
         closer.start()

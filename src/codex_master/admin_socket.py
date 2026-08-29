@@ -143,12 +143,12 @@ class AdminSocketServer:
             or not callable(authorize_peer)
             or type(timeout_seconds) not in {int, float}
             or not 0 < timeout_seconds <= 60
-            or (
-                attestation_key_fd is not None
-                and (type(attestation_key_fd) is not int or attestation_key_fd < 0)
-            )
         ):
             raise AdminSocketError(_problem("control.socket_invalid"))
+        if attestation_key_fd is not None and (
+            type(attestation_key_fd) is not int or attestation_key_fd < 0
+        ):
+            raise AdminSocketError(_problem("control.attestation_required"))
         self.path = candidate
         self._service = service
         self._authorize_peer = authorize_peer
@@ -338,8 +338,8 @@ class AdminSocketServer:
         result: dict[str, object] | None = None
         try:
             peer = _peer_credentials(connection)
-            principal = self._principal(peer)
             _server_attestation(connection, self._attestation_key_fd)
+            principal = self._principal(peer)
             payload, received_fds = _receive_frame(connection)
             value = _decode_json(payload)
             result = self._dispatch(principal, peer, value, received_fds)
@@ -453,12 +453,12 @@ class AdminSocketClient:
                     or not 0 <= expected_server_uid <= 2**32 - 1
                 )
             )
-            or (
-                attestation_key_fd is not None
-                and (type(attestation_key_fd) is not int or attestation_key_fd < 0)
-            )
         ):
             raise AdminSocketError(_problem("control.socket_invalid"))
+        if attestation_key_fd is not None and (
+            type(attestation_key_fd) is not int or attestation_key_fd < 0
+        ):
+            raise AdminSocketError(_problem("control.attestation_required"))
         self.path = candidate
         self._timeout_seconds = float(timeout_seconds)
         self._expected_server_uid = (
@@ -551,7 +551,7 @@ def local_attestation_verifier(
     """Build Usage-compatible local transport verifier from a private key FD."""
 
     if type(attestation_key_fd) is not int or attestation_key_fd < 0:
-        raise AdminSocketError(_problem("control.socket_invalid"))
+        raise AdminSocketError(_problem("control.attestation_required"))
 
     def verify(pid: int, uid: int, gid: int, connection: socket.socket) -> bool:
         try:
@@ -746,9 +746,8 @@ def _receive_attestation_frame(connection: socket.socket) -> dict[str, object]:
     cloexec = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
     try:
         while b"\n" not in payload:
-            remaining = MAX_ADMIN_ATTESTATION_BYTES + 1 - len(payload)
             data, ancillary, flags, _address = connection.recvmsg(
-                max(1, remaining),
+                1,
                 _RIGHTS_BYTES,
                 cloexec,
             )
