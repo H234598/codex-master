@@ -105,7 +105,7 @@ def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
     primary = projection.artifacts[metadata.provider_artifact_name]
 
     assert metadata.schema_version == 1
-    assert metadata.generation == 5
+    assert metadata.generation == 6
     assert metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
     assert metadata.common_size == len(_COMMON_BYTES) <= MAX_COMMON_POLICY_BYTES
     assert metadata.provider_artifact_name == "AGENTS.md"
@@ -133,7 +133,7 @@ def test_provider_projection_digests_are_deterministic_and_distinct() -> None:
 
 def test_canonical_header_remains_first_in_both_provider_artifacts() -> None:
     expected_header = (
-        b'<!-- codex-master-common-policy:{"generation":5,"schema_version":1} -->'
+        b'<!-- codex-master-common-policy:{"generation":6,"schema_version":1} -->'
     )
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
@@ -159,7 +159,7 @@ def test_both_provider_projections_carry_same_annotation_response_policy() -> No
         assert primary.startswith(contract.common_bytes)
         assert required_line in primary
         assert projection.metadata.common_digest == contract.common_digest
-        assert projection.metadata.generation == contract.generation == 5
+        assert projection.metadata.generation == contract.generation == 6
 
 
 def test_both_provider_projections_carry_corrected_annotation_heading_and_guards() -> None:
@@ -240,14 +240,49 @@ def test_both_provider_projections_carry_identical_inline_and_multi_source_guard
         assert projection.metadata.common_digest == contract.common_digest
 
 
-def test_both_provider_projections_carry_same_generation_five_policy_bytes() -> None:
+def test_both_provider_projections_carry_same_generation_six_policy_bytes() -> None:
     contract = load_common_policy()
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
         projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
         primary = projection.artifacts[projection.metadata.provider_artifact_name]
         assert primary[: len(contract.common_bytes)] == contract.common_bytes
-        assert projection.metadata.generation == contract.generation == 5
+        assert projection.metadata.generation == contract.generation == 6
+
+
+def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> None:
+    contract = load_common_policy()
+    required_fragments = [
+        "Bei aktiver OpenAI-Arbeit so lange wie möglich und mindestens themenbezogen auf demselben OpenAI-Account bleiben".encode(
+            "utf-8"
+        ),
+        "Prompt-/Context-Cache accountgebunden ist".encode("utf-8"),
+        "kein opportunistischer Wechsel".encode("utf-8"),
+        "frischer, reset-konsistenter Snapshot über alle Accounts zugleich".encode(
+            "utf-8"
+        ),
+        "unter 10% Rest im jeweils zeitlich höchsten vorhandenen Abo-Fenster; Monat vor Woche".encode(
+            "utf-8"
+        ),
+        "Fehlende, stale, widersprüchliche oder nicht vergleichbare Daten blockieren automatische Aktion fail-closed".encode(
+            "utf-8"
+        ),
+        "Account ohne Wochen-/Monatsfenster liefert keinen positiven Ersatz-Headroom".encode(
+            "utf-8"
+        ),
+        "Session erhalten/schlafen/resumen, nicht opportunistisch rotieren".encode(
+            "utf-8"
+        ),
+    ]
+
+    for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+        projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
+        primary = projection.artifacts[projection.metadata.provider_artifact_name]
+
+        assert primary.startswith(contract.common_bytes)
+        for fragment in required_fragments:
+            assert fragment in primary
+        assert projection.metadata.generation == contract.generation == 6
 
 
 @pytest.mark.parametrize("profile", ["../../worker", "worker.md", "", "x" * 65])

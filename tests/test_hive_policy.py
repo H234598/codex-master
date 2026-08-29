@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 5
+    assert contract.generation == 6
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -145,6 +145,46 @@ def test_common_policy_contains_complete_no_transition_semantics() -> None:
         "kanonischem Profil, Policy, Credentials und ResumeCapsule",
         "Einmalige Migration ist erlaubt",
         "kein Reader, Writer, Router, Fallback oder Kompatibilitätspfad",
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy
+
+
+def test_common_policy_requires_openai_account_stickiness() -> None:
+    """Catches an opportunistic account switch that discards account-bound cache."""
+    policy_api = load_policy_api()
+    policy = " ".join(
+        policy_api.load_common_policy().common_bytes.decode("utf-8").split()
+    )
+
+    required_meanings = [
+        "Bei aktiver OpenAI-Arbeit so lange wie möglich und mindestens themenbezogen auf demselben OpenAI-Account bleiben",
+        "Prompt-/Context-Cache accountgebunden ist",
+        "Wechsel nur bei hartem Auth-/Limit-/Capability-/Resource-Block oder abgeschlossenem Thema",
+        "kein opportunistischer Wechsel",
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy
+
+
+def test_common_policy_fails_closed_for_automatic_context_resets() -> None:
+    """Catches an automatic reset or rotation without fresh cross-account evidence."""
+    policy_api = load_policy_api()
+    policy = " ".join(
+        policy_api.load_common_policy().common_bytes.decode("utf-8").split()
+    )
+
+    required_meanings = [
+        "frischer, reset-konsistenter Snapshot über alle Accounts zugleich",
+        "Account der zu resettenden Session hat weder nutzbares Wochen- noch Monatsrestlimit",
+        "Jeder andere Account hat unter 10% Rest im jeweils zeitlich höchsten vorhandenen Abo-Fenster; Monat vor Woche",
+        "noch positives Wochen-/Monatslimit und ein 5h-Fenster besitzt, hat dort kein nutzbares oder unter 5% Restguthaben",
+        "Fehlende, stale, widersprüchliche oder nicht vergleichbare Daten blockieren automatische Aktion fail-closed",
+        "Account ohne Wochen-/Monatsfenster liefert keinen positiven Ersatz-Headroom",
+        "Natürlicher Usage-Window-Reset und explizite Administratoraktion sind ausgenommen",
+        "Session erhalten/schlafen/resumen, nicht opportunistisch rotieren",
     ]
 
     for meaning in required_meanings:
