@@ -105,7 +105,7 @@ def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
     primary = projection.artifacts[metadata.provider_artifact_name]
 
     assert metadata.schema_version == 1
-    assert metadata.generation == 5
+    assert metadata.generation == 6
     assert metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
     assert metadata.common_size == len(_COMMON_BYTES) <= MAX_COMMON_POLICY_BYTES
     assert metadata.provider_artifact_name == "AGENTS.md"
@@ -133,7 +133,7 @@ def test_provider_projection_digests_are_deterministic_and_distinct() -> None:
 
 def test_canonical_header_remains_first_in_both_provider_artifacts() -> None:
     expected_header = (
-        b'<!-- codex-master-common-policy:{"generation":5,"schema_version":1} -->'
+        b'<!-- codex-master-common-policy:{"generation":6,"schema_version":1} -->'
     )
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
@@ -159,7 +159,7 @@ def test_both_provider_projections_carry_same_annotation_response_policy() -> No
         assert primary.startswith(contract.common_bytes)
         assert required_line in primary
         assert projection.metadata.common_digest == contract.common_digest
-        assert projection.metadata.generation == contract.generation == 5
+        assert projection.metadata.generation == contract.generation == 6
 
 
 def test_both_provider_projections_carry_corrected_annotation_heading_and_guards() -> None:
@@ -240,14 +240,35 @@ def test_both_provider_projections_carry_identical_inline_and_multi_source_guard
         assert projection.metadata.common_digest == contract.common_digest
 
 
-def test_both_provider_projections_carry_same_generation_five_policy_bytes() -> None:
+def test_both_provider_projections_carry_same_generation_six_policy_bytes() -> None:
     contract = load_common_policy()
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
         projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
         primary = projection.artifacts[projection.metadata.provider_artifact_name]
         assert primary[: len(contract.common_bytes)] == contract.common_bytes
-        assert projection.metadata.generation == contract.generation == 5
+        assert projection.metadata.generation == contract.generation == 6
+
+
+def test_both_provider_projections_carry_unencoded_local_file_link_contract() -> None:
+    contract = load_common_policy()
+    required_fragments = [
+        b"[[Projekte/PVE4/Datei mit Leerzeichen|Text]]",
+        b"[Text](<Projekte/PVE4/Datei mit Leerzeichen.md#Abschnitt>)",
+        b"[Text](</absoluter/Pfad/Datei mit Leerzeichen.md:42>)",
+        b"Never replace spaces in local filesystem link targets with `%20`",
+        b"Never use `file://` or `vscode://`",
+    ]
+
+    for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+        projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
+        primary = projection.artifacts[projection.metadata.provider_artifact_name]
+        normalized_primary = b" ".join(primary.split())
+
+        assert primary.startswith(contract.common_bytes)
+        for fragment in required_fragments:
+            assert fragment in normalized_primary
+        assert projection.metadata.common_digest == contract.common_digest
 
 
 @pytest.mark.parametrize("profile", ["../../worker", "worker.md", "", "x" * 65])

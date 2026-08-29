@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":5,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":6,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -39,6 +39,23 @@ use `data-annotation-id` to distinguish markers with the same text or line.
 
 Annotations are working instructions, not decoration. Do not remove them from
 the sidecar when updating the canonical source.
+
+## Obsidian and local file links
+
+Keep vault-internal links and clickable local response links distinct. Resolve
+the target before emitting either form.
+
+- In Obsidian documents, prefer an unencoded vault-relative wikilink:
+  `[[Projekte/PVE4/Datei mit Leerzeichen|Text]]`.
+- Where an Obsidian document requires a normal Markdown link, keep the
+  vault-relative path unencoded and enclose a target containing spaces in angle
+  brackets: `[Text](<Projekte/PVE4/Datei mit Leerzeichen.md#Abschnitt>)`.
+- In a Codex response, link a real local file with its raw absolute path and an
+  optional line number inside angle brackets:
+  `[Text](</absoluter/Pfad/Datei mit Leerzeichen.md:42>)`.
+- Never replace spaces in local filesystem link targets with `%20`. Never use
+  `file://` or `vscode://`. These restrictions apply to local file links, not
+  external HTTP(S) URLs.
 
 ## Context and scope
 

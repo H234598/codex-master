@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":5,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":6,"schema_version":1} -->\n'
 )
 
 
@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 5
+    assert contract.generation == 6
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
