@@ -43,6 +43,7 @@ import yaml
 from codex_master import __version__
 from codex_master.fleet_home_v2_cutover import (
     FleetHomeV2AuthorityPort,
+    FleetHomeV2CutoverError,
     FleetHomeV2PlanHandle,
     FleetHomeV2QuiescencePort,
     LocalFleetHomeV2Filesystem,
@@ -43047,7 +43048,7 @@ class _FleetHomeV2ServerQuiescencePort(FleetHomeV2QuiescencePort):
                 )
             finally:
                 os.close(parent_fd)
-        except Exception:
+        except FleetHomeV2CutoverError:
             actual_identity = None
         return FleetHomeV2Quiescence(
             authority.agent_id,

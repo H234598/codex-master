@@ -134,6 +134,26 @@ class ForeignNestedDeviceFilesystem(LocalFleetHomeV2Filesystem):
         return identity
 
 
+class StageWriteCountingFilesystem(LocalFleetHomeV2Filesystem):
+    def __init__(self) -> None:
+        self.stage_directories = 0
+        self.stage_files = 0
+        self._stage_inodes: set[int] = set()
+
+    def mkdir_private_at(self, parent_fd: int, name: str, uid: int, gid: int) -> int:
+        directory_fd = super().mkdir_private_at(parent_fd, name, uid, gid)
+        self.stage_directories += 1
+        self._stage_inodes.add(os.fstat(directory_fd).st_ino)
+        return directory_fd
+
+    def write_file_at(
+        self, parent_fd: int, name: str, data: bytes, mode: int, uid: int, gid: int
+    ) -> None:
+        if os.fstat(parent_fd).st_ino in self._stage_inodes:
+            self.stage_files += 1
+        super().write_file_at(parent_fd, name, data, mode, uid, gid)
+
+
 def _authority(parent: Path, agent_id: str) -> FleetHomeV2Authority:
     prefix = agent_id.rstrip("0123456789")
     policy = FleetHomeV2Policy(schema_version=2, generation=435, digest="a" * 64)
@@ -202,6 +222,32 @@ def _v1_home(authority: FleetHomeV2Authority) -> None:
     authority.home.mkdir(mode=0o700)
     (authority.home / MARKER_FILE).write_bytes(b"opaque V1 marker")
     (authority.home / "legacy").write_text("old\n")
+
+
+def _with_nested_gemini_artifacts(authority: FleetHomeV2Authority) -> FleetHomeV2Authority:
+    extra = (
+        FleetHomeV2Artifact(".gemini/policies/codex-master.toml", b"[policy]\n", 0o600),
+        FleetHomeV2Artifact(".gemini/skills/deep/SKILL.md", b"# portable skill\n", 0o600),
+    )
+    marker_item = next(item for item in authority.artifacts if item.relative_path == MARKER_FILE)
+    marker = json.loads(marker_item.data)
+    files = {
+        item.relative_path: hashlib.sha256(item.data).hexdigest()
+        for item in (*authority.artifacts, *extra)
+        if item.relative_path != MARKER_FILE
+    }
+    marker["managed_files"] = sorted(files)
+    marker["files"] = files
+    return replace(
+        authority,
+        artifacts=tuple(
+            replace(item, data=(json.dumps(marker, sort_keys=True) + "\n").encode())
+            if item.relative_path == MARKER_FILE
+            else item
+            for item in authority.artifacts
+        )
+        + extra,
+    )
 
 
 def _single_plan(tmp_path: Path, **service_kwargs: object):
@@ -275,8 +321,7 @@ def test_apply_rejects_caller_constructed_handle(tmp_path: Path) -> None:
     for authority in (g1, h1):
         _v1_home(authority)
     service, _port = _service((g1, h1))
-    plan = service.plan(("g1", "h1"))
-    forged = FleetHomeV2PlanHandle(plan.operation_id)
+    forged = FleetHomeV2PlanHandle("0" * 48)
 
     with pytest.raises(FleetHomeV2CutoverError, match="fleet_home_v2_plan_invalid"):
         service.apply(forged)
@@ -509,13 +554,15 @@ def test_red_per_home_lock_blocks_second_operation_before_stage_or_journal(tmp_p
     with pytest.raises(Crash, match="after-stage-fsync"):
         first.apply(first_plan)
 
-    second, _port = _service((authority,))
+    second_filesystem = StageWriteCountingFilesystem()
+    second, _port = _service((authority,), filesystem=second_filesystem)
     second_plan = second.plan(("g1",))
     result = second.apply(second_plan)[0]
     assert (result.state, result.code) == (
         "failed-terminal", "fleet_home_v2_operation_active"
     )
     assert len(list(tmp_path.glob("*.journal.json"))) == 1
+    assert (second_filesystem.stage_directories, second_filesystem.stage_files) == (0, 0)
 
 
 def test_red_journal_hash_chain_binds_v2_identity(tmp_path: Path) -> None:
@@ -554,3 +601,115 @@ def test_red_verify_after_possible_exchange_has_recovery_required_precedence(tmp
     assert (result.state, result.code) == (
         "recovery-required", "fleet_home_v2_recovery_required"
     )
+
+
+def test_red_restart_after_staged_recovers_from_durable_opaque_capability(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, "g1")
+    _v1_home(authority)
+    crashing, _port = _service((authority,), filesystem=CrashFilesystem("after-stage-fsync"))
+    plan = crashing.plan(("g1",))
+    with pytest.raises(Crash, match="after-stage-fsync"):
+        crashing.apply(plan)
+
+    restarted, _port = _service((authority,))
+    restored_handle = FleetHomeV2PlanHandle(plan.operation_id)
+    assert restarted.recover(restored_handle)[0].state == "failed-retryable"
+    assert restarted.apply(restored_handle)[0].state == "cutover-complete"
+
+
+def test_restart_handle_resolves_durable_plan_for_verify_and_rollback(tmp_path: Path) -> None:
+    authority, service, _port, plan = _single_plan(tmp_path)
+    assert service.apply(plan)[0].state == "cutover-complete"
+
+    restarted, _port = _service((authority,))
+    restored_handle = FleetHomeV2PlanHandle(plan.operation_id)
+    assert restarted.verify(restored_handle)[0].state == "cutover-complete"
+    assert restarted.rollback(restored_handle)[0].state == "rolled-back"
+
+
+def test_red_plan_lifecycle_releases_invalid_and_completed_operation_capacity(tmp_path: Path) -> None:
+    invalid_authority = _authority(tmp_path / "invalid", "g1")
+    _v1_home(invalid_authority)
+    invalid, _port = _service((invalid_authority,), entropy=RepeatedEntropy())
+    for _ in range(3):
+        with pytest.raises(FleetHomeV2CutoverError, match="fleet_home_v2_plan_invalid"):
+            invalid.plan(("unknown",))
+    assert invalid.plan(("g1",)).operation_id == "f" * 48
+
+    for index in range(129):
+        authority = _authority(tmp_path / f"completed-{index}", "g1")
+        _v1_home(authority)
+        service, _port = _service((authority,))
+        plan = service.plan(("g1",))
+        assert service.apply(plan)[0].state == "cutover-complete"
+
+
+def test_red_nested_canonical_gemini_directories_are_exactly_attested(tmp_path: Path) -> None:
+    authority = _with_nested_gemini_artifacts(_authority(tmp_path, "g1"))
+    _v1_home(authority)
+    service, _port = _service((authority,))
+
+    result = service.apply(service.plan(("g1",)))[0]
+
+    assert result.state == "cutover-complete"
+
+
+@pytest.mark.parametrize(
+    "point",
+    (
+        "before-stage-quarantine",
+        "after-stage-quarantine",
+        "during-stage-remove",
+        "after-stage-remove",
+        "after-cleanup-retired",
+        "after-cleanup-journal-retired",
+        "after-cleanup-lock-retired",
+    ),
+)
+def test_red_cleanup_crash_after_quarantine_remains_resumable(tmp_path: Path, point: str) -> None:
+    authority = _authority(tmp_path, "g1")
+    _v1_home(authority)
+    staging, _port = _service((authority,), filesystem=CrashFilesystem("after-stage-fsync"))
+    plan = staging.plan(("g1",))
+    with pytest.raises(Crash, match="after-stage-fsync"):
+        staging.apply(plan)
+
+    cleanup, _port = _service((authority,), filesystem=CrashFilesystem(point))
+    with pytest.raises(Crash, match=point):
+        cleanup.recover(plan)
+
+    resumed, _port = _service((authority,))
+    assert resumed.recover(plan)[0].state == "failed-retryable"
+    assert resumed.apply(plan)[0].state == "cutover-complete"
+
+
+def test_red_rolled_back_retires_home_for_new_cutover(tmp_path: Path) -> None:
+    authority, service, _port, plan = _single_plan(tmp_path)
+    assert service.apply(plan)[0].state == "cutover-complete"
+    assert service.rollback(plan)[0].state == "rolled-back"
+
+    fresh, _port = _service((authority,))
+    next_plan = fresh.plan(("g1",))
+    assert fresh.apply(next_plan)[0].state == "cutover-complete"
+
+
+def test_red_exact_agent_id_parsing_ignores_foreign_hyphenated_operation(tmp_path: Path) -> None:
+    g1 = _authority(tmp_path, "g1")
+    a_g1 = _authority(tmp_path, "a-g1")
+    g1_a = _authority(tmp_path, "g1-a")
+    _v1_home(g1)
+    _v1_home(a_g1)
+    _v1_home(g1_a)
+    foreign, _port = _service((g1, a_g1, g1_a), filesystem=CrashFilesystem("after-stage-fsync"))
+    foreign_plan = foreign.plan(("a-g1",))
+    with pytest.raises(Crash, match="after-stage-fsync"):
+        foreign.apply(foreign_plan)
+
+    filesystem = StageWriteCountingFilesystem()
+    g1_service, _port = _service((g1, a_g1, g1_a), filesystem=filesystem)
+    result = g1_service.apply(g1_service.plan(("g1",)))[0]
+
+    assert result.state == "cutover-complete"
+    assert (filesystem.stage_directories, filesystem.stage_files) != (0, 0)
+    g1_a_service, _port = _service((g1, a_g1, g1_a))
+    assert g1_a_service.apply(g1_a_service.plan(("g1-a",)))[0].state == "cutover-complete"

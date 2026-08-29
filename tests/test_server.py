@@ -41124,5 +41124,39 @@ def test_fleet_home_v2_cutover_adapter_owns_product_ports_and_operation_id() -> 
     assert "plan" not in signature.parameters
     assert signature.parameters["plan_handle"].annotation == "FleetHomeV2PlanHandle | None"
 
+
+def test_fleet_home_v2_quiescence_propagates_unexpected_filesystem_programming_error() -> None:
+    from codex_master.fleet_home_v2_cutover import (
+        FleetHomeV2Authority,
+        FleetHomeV2Policy,
+        LocalFleetHomeV2Filesystem,
+    )
+
+    authority = FleetHomeV2Authority(
+        agent_id="g1",
+        prefix="g",
+        provider="gemini",
+        runner="gemini_cli",
+        model="gemini-test",
+        home=Path("/unused/g1"),
+        registry_generation=1,
+        policy=FleetHomeV2Policy(2, 1, "a" * 64),
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+        authority_generation=1,
+        lease_generation="none",
+        process_generation="none",
+        artifacts=(),
+    )
+    authority_port = Mock()
+    authority_port.observe_current.return_value = (authority, SimpleNamespace(session="g1"), [])
+    quiescence = server_module._FleetHomeV2ServerQuiescencePort(authority_port)
+
+    with patch.object(server_module, "_fleet_tmux_state", return_value="stopped"), patch.object(
+        LocalFleetHomeV2Filesystem, "open_parent", side_effect=TypeError("programmer-bug")
+    ):
+        with unittest.TestCase().assertRaisesRegex(TypeError, "programmer-bug"):
+            quiescence.observe(authority, None)
+
 if __name__ == "__main__":
     unittest.main()
