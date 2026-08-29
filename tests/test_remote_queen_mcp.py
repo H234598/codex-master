@@ -351,6 +351,8 @@ def test_digest_changes_for_security_fields_and_sorted_equivalents_remain_equal(
         "https://masterjet.example.test:1/mcp",
         "https://masterjet.example.test:65535/mcp",
         "https://a-b.c3.example.test:8443/mcp",
+        "https://0x7f.example.test/mcp",
+        "https://2130706433.example.test/mcp",
     ],
 )
 def test_endpoint_parser_accepts_only_valid_https_dns_mcp_endpoints(endpoint):
@@ -406,6 +408,36 @@ def test_endpoint_parser_rejects_transport_path_and_secret_tricks(endpoint):
     ) == "RQ_E_PLAN_INCONSISTENT"
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "2130706433",
+        "127",
+        "127.1",
+        "127.0.1",
+        "127.0.0.1",
+        "0x7f000001",
+        "017700000001",
+        "0x7f.1",
+        "0177.0.0.1",
+        "0x7f.0.01",
+    ],
+)
+def test_endpoint_parser_rejects_legacy_numeric_ipv4_literals(host):
+    data = _vector()
+
+    assert _error_code(
+        build_remote_queen_mcp_manifest,
+        data["manifest"].desired_generation,
+        data["manifest"].catalog_generation,
+        f"https://{host}/mcp",
+        data["manifest"].principal,
+        data["manifest"].credentials,
+        data["manifest"].tools,
+        data["manifest"].admin_authority,
+    ) == "RQ_E_PLAN_INCONSISTENT"
+
+
 def test_secret_canaries_are_rejected_without_entering_repr_json_errors_or_digest():
     canary = "CANARY_PRIVATE_KEY_BEARER_COOKIE_HTTP_BODY"
     generation = _generation("capability", "2")
@@ -415,6 +447,53 @@ def test_secret_canaries_are_rejected_without_entering_repr_json_errors_or_diges
     assert canary not in str(caught.value)
     assert canary not in canonical_json_bytes({"redacted": "sha256:" + "a" * 64}).decode()
     assert canary not in canonical_digest(("redacted", "sha256:" + "a" * 64))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "token",
+        "SeCrEt",
+        "PASSWORD",
+        "CoOkIe",
+        "CrEdEnTiAl",
+        "AuTh",
+        "AUTHORIZATION",
+        "BeArEr",
+        "BeArEr_ToKeN",
+        "PrIvAtE-KeY",
+        "HtTp_BoDy",
+        "ReQuEsT-BoDy",
+        "AccessToken",
+        "AuthHeader",
+        "BearerToken",
+        "ClientSecret",
+        "PrivateKey",
+        "HttpBody",
+        "RequestBody",
+        "SetCookie",
+    ],
+)
+def test_canonical_json_rejects_casefolded_secret_keys_without_canary_leak(key):
+    canary = "CANARY_SECRET_AUTH_BODY_VALUE"
+
+    with pytest.raises(RemoteQueenBootstrapError) as caught:
+        canonical_json_bytes({key: canary})
+
+    assert caught.value.code == "RQ_E_PLAN_INCONSISTENT"
+    assert canary not in str(caught.value)
+    assert canary not in repr(caught.value)
+
+
+def test_canonical_json_rejects_nested_mixed_case_private_key_canary():
+    canary = "CANARY_NESTED_PRIVATE_KEY_VALUE"
+
+    with pytest.raises(RemoteQueenBootstrapError) as caught:
+        canonical_json_bytes({"safe": ({"PrIvAtE_KeY": canary},)})
+
+    assert caught.value.code == "RQ_E_PLAN_INCONSISTENT"
+    assert canary not in str(caught.value)
+    assert canary not in repr(caught.value)
 
 
 def test_catalog_scope_retry_and_admin_authority_rules_fail_closed():
@@ -480,6 +559,29 @@ def test_catalog_scope_retry_and_admin_authority_rules_fail_closed():
     assert "plan_digest" not in CanonicalMcpToolBindingV1.__dataclass_fields__
 
 
+def test_catalog_rejects_duplicate_admin_operation_across_tool_aliases():
+    data = _vector()
+    alias = CanonicalMcpToolBindingV1(
+        "admin_hosts_alias",
+        "sha256:" + "5" * 64,
+        ("admin.hosts.read",),
+        True,
+        McpRetryClassV1.READ_ONLY_ONCE,
+        "hosts.list",
+    )
+
+    assert _error_code(
+        build_remote_queen_mcp_manifest,
+        data["manifest"].desired_generation,
+        data["manifest"].catalog_generation,
+        data["manifest"].endpoint_url,
+        data["principal"],
+        data["credentials"],
+        (alias, *data["tools"]),
+        data["authority"],
+    ) == "RQ_E_MCP_SCOPE"
+
+
 def test_plan_matrix_absent_noop_and_owned_stale_are_deterministic():
     data = _vector()
     absent_ops = StaticOperations(data["before"])
@@ -498,6 +600,25 @@ def test_plan_matrix_absent_noop_and_owned_stale_are_deterministic():
     replace_plan = plan_remote_queen_mcp(data["manifest"], stale_ops)
     assert replace_plan.action is RemoteMcpActionV1.REPLACE_OWNED_CONFIGURATION
     assert replace_plan.remove_own_configuration_on_rollback is False
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"config_manifest_digest": "sha256:" + "5" * 64},
+        {"catalog_sha256": "sha256:" + "6" * 64},
+        {"tool_schema_digests": ("sha256:" + "7" * 64, "sha256:" + "3" * 64)},
+        {"principal_binding_digest": "sha256:" + "8" * 64},
+        {"credential_binding_digest": "sha256:" + "9" * 64},
+        {"admin_authority_digest": "sha256:" + "0" * 64},
+    ],
+)
+def test_plan_rejects_same_generation_configuration_digest_drift(changes):
+    data = _vector()
+    operations = StaticOperations(_desired_fact(data, **changes))
+
+    assert _error_code(plan_remote_queen_mcp, data["manifest"], operations) == "RQ_E_MCP_UNAVAILABLE"
+    assert operations.calls == [("inspect", data["manifest"].manifest_digest)]
 
 
 def test_plan_rejects_foreign_malformed_and_contradictory_facts_before_mutation():

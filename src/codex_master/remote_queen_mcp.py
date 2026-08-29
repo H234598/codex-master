@@ -439,6 +439,8 @@ def plan_remote_queen_mcp(
     if _fact_configuration_matches(fact, desired):
         _require_attestation(fact.attestation)
         return _make_plan(manifest, fact, None, False)
+    if fact.generation == desired.generation:
+        _unavailable()
     return _make_plan(
         manifest,
         fact,
@@ -675,7 +677,9 @@ def _validate_endpoint(value: object) -> None:
     ) is None:
         _inconsistent()
     labels = host.split(".")
-    if len(labels) == 4 and all(label.isdigit() for label in labels):
+    if len(labels) <= 4 and all(
+        re.fullmatch(r"(?:[0-9]+|0x[0-9a-f]+)", label) is not None for label in labels
+    ):
         _inconsistent()
 
 
@@ -818,9 +822,12 @@ def _validate_manifest_components(
         _scope()
     if principal_scopes != required_scopes:
         _scope()
-    tool_admin_operations = {
+    tool_admin_operation_names = tuple(
         tool.admin_operation for tool in tools if tool.admin_operation is not None
-    }
+    )
+    if len(tool_admin_operation_names) != len(set(tool_admin_operation_names)):
+        _scope()
+    tool_admin_operations = set(tool_admin_operation_names)
     authority_operations = set(admin_authority.operation_names)
     if not tool_admin_operations.issubset(authority_operations):
         _scope()
@@ -1136,6 +1143,37 @@ def _canonicalize(value: object, *, omit_field: str | None = None) -> object:
     _inconsistent()
 
 
+def _validate_mapping_key(value: object) -> None:
+    if type(value) is not str:
+        _inconsistent()
+    normalized = value.casefold().replace("-", "").replace("_", "").replace(" ", "")
+    if normalized in (
+        "accesstoken",
+        "auth",
+        "authheader",
+        "authentication",
+        "authorization",
+        "authorizationheader",
+        "bearer",
+        "bearerheader",
+        "bearertoken",
+        "body",
+        "clientsecret",
+        "cookie",
+        "credential",
+        "httpbody",
+        "password",
+        "privatekey",
+        "refreshtoken",
+        "requestbody",
+        "responsebody",
+        "secret",
+        "setcookie",
+        "token",
+    ):
+        _inconsistent()
+
+
 def _validate_domain_value(value: object) -> None:
     if value is None or type(value) is bool or type(value) is int or type(value) is str:
         return
@@ -1151,8 +1189,7 @@ def _validate_domain_value(value: object) -> None:
         return
     if type(value) is dict:
         for key, item in value.items():
-            if type(key) is not str:
-                _inconsistent()
+            _validate_mapping_key(key)
             _validate_domain_value(item)
         return
     if type(value) is ManifestGenerationV1:
