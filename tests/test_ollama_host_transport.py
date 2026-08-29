@@ -81,7 +81,12 @@ class FakeBroker:
 
     def exchange(self, request, *, timeout_seconds, max_response_bytes):
         self.calls.append((request, timeout_seconds, max_response_bytes))
-        status = {"plan": "planned", "apply": "running", "probe": "ready"}[
+        status = {
+            "plan": "planned",
+            "apply": "running",
+            "probe": "ready",
+            "stop": "stopped",
+        }[
             request.action
         ]
         digest = request.payload.plan_digest
@@ -177,6 +182,9 @@ class FakeLocalAdapter:
     def probe(self, running):
         self.calls.append(("probe", running))
         return OllamaReadinessStatus(True, (), True, True, True, ("provider-llama-small",))
+
+    def stop(self, running):
+        self.calls.append(("stop", running))
 
 
 def lease(host_ref: str, *, fence: int = FENCE, expires_at: float = 200.0):
@@ -277,6 +285,24 @@ def test_successful_apply_retry_returns_same_execution_without_second_effect():
 
     assert second is first
     assert [call[0].action for call in broker.calls] == ["plan", "apply"]
+
+
+@pytest.mark.parametrize("host_ref", (CONTROL_HOST_REF, "worker-west"))
+def test_stop_targets_only_execution_created_by_transport(host_ref):
+    placed = instance(host_ref)
+    transport, broker, local = transport_for(placed)
+    planned = transport.plan(placed, generation=MODEL_GENERATION)
+    execution = transport.apply(planned, current_fence=FENCE)
+
+    transport.stop(execution, current_fence=FENCE)
+    transport.stop(execution, current_fence=FENCE)
+
+    if host_ref == CONTROL_HOST_REF:
+        assert [call[0] for call in local.calls] == ["plan", "apply", "stop"]
+        assert broker.calls == []
+    else:
+        assert local.calls == []
+        assert [call[0].action for call in broker.calls] == ["plan", "apply", "stop"]
 
 
 def test_rotated_lease_gets_distinct_idempotency_binding_and_execution():

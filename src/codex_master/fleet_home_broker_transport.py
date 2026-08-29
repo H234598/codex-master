@@ -23,7 +23,7 @@ MAX_OPERATION_REQUEST_BYTES = 16 * 1024
 MAX_OPERATION_RESPONSE_BYTES = 64 * 1024
 OPERATION_TIMEOUT_SECONDS = 5.0
 _OPERATION_TYPE = "ollama.instance"
-_OPERATION_ACTIONS = ("plan", "apply", "probe")
+_OPERATION_ACTIONS = ("plan", "apply", "probe", "stop")
 
 
 @dataclass(frozen=True, slots=True)

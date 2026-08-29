@@ -31,6 +31,7 @@ from codex_master.ollama_runtime import (
     probe_instance_readiness,
     probe_ollama_host,
     start_local_instance,
+    stop_local_instance,
 )
 
 
@@ -172,6 +173,8 @@ class LocalOllamaHostAdapter(Protocol):
 
     def probe(self, running: object) -> OllamaReadinessStatus: ...
 
+    def stop(self, running: object) -> None: ...
+
 
 class Task3LocalOllamaHostAdapter:
     """Thin control-host adapter over Task 3's hardened local runtime."""
@@ -201,6 +204,9 @@ class Task3LocalOllamaHostAdapter:
     def probe(self, running: object) -> OllamaReadinessStatus:
         return probe_instance_readiness(running, runtime=self._runtime)  # type: ignore[arg-type]
 
+    def stop(self, running: object) -> None:
+        stop_local_instance(running, runtime=self._runtime)  # type: ignore[arg-type]
+
 
 class OllamaHostTransport:
     """Plan, apply, and probe one fixed Ollama operation on its selected host."""
@@ -213,6 +219,7 @@ class OllamaHostTransport:
         "_monotonic",
         "_apply_lock",
         "_applied",
+        "_stopped",
     )
 
     def __init__(
@@ -231,6 +238,7 @@ class OllamaHostTransport:
         self._monotonic = monotonic
         self._apply_lock = threading.RLock()
         self._applied: dict[str, OllamaHostExecution] = {}
+        self._stopped: set[str] = set()
 
     def plan(self, instance: OllamaInstanceV1, *, generation: int) -> OllamaHostPlan:
         current = self._load_registry()
@@ -354,6 +362,41 @@ class OllamaHostTransport:
             expected_status=("ready", "not_ready"),
         )
         return _readiness(document)
+
+    def stop(self, execution: OllamaHostExecution, *, current_fence: int) -> None:
+        with self._apply_lock:
+            if not _recorded(
+                _EXECUTION_RECORDS,
+                getattr(execution, "_provenance", b""),
+                execution,
+                _execution_state(execution)
+                if isinstance(execution, OllamaHostExecution)
+                else (),
+            ):
+                _fail("provider.instance_invalid")
+            instance, lease = self._revalidate(
+                execution.plan, current_fence=current_fence
+            )
+            key = execution.plan.idempotency_key
+            if key in self._stopped:
+                return
+            if execution.plan.host_ref == CONTROL_HOST_REF:
+                if execution._runtime_value is None:
+                    _fail("provider.instance_invalid")
+                try:
+                    self._local.stop(execution._runtime_value)
+                except OllamaRuntimeError as error:
+                    raise OllamaHostError(error.code) from None
+                except Exception:
+                    _fail("resource.host_unreachable")
+            else:
+                self._remote(
+                    "stop",
+                    lease,
+                    _bound_document(execution.plan, instance),
+                    expected_status="stopped",
+                )
+            self._stopped.add(key)
 
     def _load_registry(self) -> OllamaRegistryV1:
         try:
