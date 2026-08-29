@@ -29375,23 +29375,66 @@ google_accounts:
             tmp_path = Path(tmpdir)
             repo = tmp_path / "repo"
             checked_parent = repo / "checked-parent"
+            moved_parent = repo / "moved-parent"
             outside = tmp_path / "outside"
             repo.mkdir()
             checked_parent.mkdir()
             outside.mkdir()
+            for args in (
+                ("git", "init", "--quiet"),
+                ("git", "config", "user.email", "test@example.invalid"),
+                ("git", "config", "user.name", "Headless Test"),
+            ):
+                subprocess.run(args, cwd=repo, check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(
+                ("git", "add", "README.md"),
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ("git", "commit", "--quiet", "-m", "baseline"),
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             target = checked_parent / "agent-a"
             observed: list[Path] = []
             raced = [False]
 
             def race_before_git(args, **kwargs):
                 if args[:3] == ["git", "show-ref", "--verify"] and not raced[0]:
-                    checked_parent.rmdir()
+                    checked_parent.rename(moved_parent)
                     checked_parent.symlink_to(outside, target_is_directory=True)
                     raced[0] = True
-                    return subprocess.CompletedProcess(args, 1, "", "")
                 if args[:3] == ["git", "worktree", "add"]:
                     observed.append(Path(kwargs["cwd"]).resolve())
-                return subprocess.CompletedProcess(args, 0, "", "")
+                    result = subprocess.run(
+                        args,
+                        cwd=kwargs["cwd"],
+                        env=kwargs.get("env"),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=kwargs.get("timeout"),
+                        pass_fds=kwargs.get("pass_fds", ()),
+                    )
+                    checked_parent.unlink()
+                    moved_parent.rename(checked_parent)
+                    return result
+                return subprocess.run(
+                    args,
+                    cwd=kwargs["cwd"],
+                    env=kwargs.get("env"),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=kwargs.get("timeout"),
+                    pass_fds=kwargs.get("pass_fds", ()),
+                )
 
             mock_subprocess_run.side_effect = race_before_git
 
@@ -29401,7 +29444,12 @@ google_accounts:
         self.assertEqual(result["status"], "created")
         self.assertEqual(len(observed), 1)
         self.assertNotEqual(observed[0].parent, outside)
-        self.assertEqual(mock_subprocess_run.call_args.args[0], ["git", "worktree", "add", "-b", "agent-a", "."])
+        add_calls = [
+            call.args[0]
+            for call in mock_subprocess_run.call_args_list
+            if call.args and call.args[0][:3] == ["git", "worktree", "add"]
+        ]
+        self.assertEqual(add_calls, [["git", "worktree", "add", "-b", "agent-a", "."]])
 
     @patch("codex_master.server.run_command")
     def test_worktree_create_refuses_target_swap_before_git_call(self, mock_run_command) -> None:
@@ -29425,7 +29473,7 @@ google_accounts:
 
             with patch("codex_master.server.open_directory_no_follow_matching", side_effect=race_target_open):
                 with patch("codex_master.server.repo_root", return_value=repo):
-                    with self.assertRaisesRegex(AgentError, "worktree path must be a real directory"):
+                    with self.assertRaisesRegex(AgentError, "headless_attestation_rollback_incomplete"):
                         worktree_create_for_agent("a", path=str(target))
 
             target_is_symlink = target.is_symlink()
@@ -29457,10 +29505,41 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            mock_run_command.side_effect = [
-                subprocess.CompletedProcess(["git"], 1, "", ""),
-                subprocess.CompletedProcess(["git"], 0, "", ""),
-            ]
+            for args in (
+                ("git", "init", "--quiet"),
+                ("git", "config", "user.email", "test@example.invalid"),
+                ("git", "config", "user.name", "Headless Test"),
+            ):
+                subprocess.run(args, cwd=repo, check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(
+                ("git", "add", "README.md"),
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ("git", "commit", "--quiet", "-m", "baseline"),
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            def run_real_command(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    args,
+                    cwd=kwargs.get("cwd"),
+                    env=kwargs.get("env"),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=kwargs.get("timeout"),
+                    pass_fds=kwargs.get("pass_fds", ()),
+                )
+
+            mock_run_command.side_effect = run_real_command
 
             with patch("codex_master.server.repo_root", return_value=repo):
                 result = worktree_create_for_agent("a", path=relative)
@@ -29469,8 +29548,14 @@ google_accounts:
         self.assertEqual(result["path_state"], "set")
         self.assertEqual(result["path_kind"], "repo_relative")
         self.assertEqual(result["status"], "created")
-        self.assertEqual(mock_run_command.call_args_list[-1].args[0], ["git", "worktree", "add", "-b", "agent-a", "."])
-        self.assertRegex(str(mock_run_command.call_args_list[-1].kwargs["cwd"]), r"^/proc/self/fd/\d+$")
+        add_calls = [
+            call
+            for call in mock_run_command.call_args_list
+            if call.args and call.args[0][:3] == ["git", "worktree", "add"]
+        ]
+        self.assertEqual(len(add_calls), 1)
+        self.assertEqual(add_calls[0].args[0], ["git", "worktree", "add", "-b", "agent-a", "."])
+        self.assertRegex(str(add_calls[0].kwargs["cwd"]), r"^/proc/self/fd/\d+$")
         self.assertNotIn(str(repo), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.run_command")
@@ -29478,15 +29563,62 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            mock_run_command.return_value = subprocess.CompletedProcess(["git"], 0, "", "")
+            for args in (
+                ("git", "init", "--quiet"),
+                ("git", "config", "user.email", "test@example.invalid"),
+                ("git", "config", "user.name", "Headless Test"),
+            ):
+                subprocess.run(args, cwd=repo, check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(
+                ("git", "add", "README.md"),
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ("git", "commit", "--quiet", "-m", "baseline"),
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ("git", "branch", "origin/main"),
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            def run_real_command(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    args,
+                    cwd=kwargs.get("cwd"),
+                    env=kwargs.get("env"),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=kwargs.get("timeout"),
+                    pass_fds=kwargs.get("pass_fds", ()),
+                )
+
+            mock_run_command.side_effect = run_real_command
 
             with patch("codex_master.server.repo_root", return_value=repo):
                 result = worktree_create_for_agent("a", path=relative, base_ref="origin/main")
 
         self.assertEqual(result["base_ref"], "not_returned")
         self.assertEqual(result["base_ref_state"], "set")
-        self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", ".", "origin/main"])
-        self.assertRegex(str(mock_run_command.call_args.kwargs["cwd"]), r"^/proc/self/fd/\d+$")
+        add_calls = [
+            call
+            for call in mock_run_command.call_args_list
+            if call.args and call.args[0][:3] == ["git", "worktree", "add"]
+        ]
+        self.assertEqual(len(add_calls), 1)
+        self.assertEqual(add_calls[0].args[0], ["git", "worktree", "add", ".", "origin/main"])
+        self.assertRegex(str(add_calls[0].kwargs["cwd"]), r"^/proc/self/fd/\d+$")
         self.assertNotIn("origin/main", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.run_command")
@@ -29522,12 +29654,50 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            mock_run_command.return_value = subprocess.CompletedProcess(
-                ["git"],
-                128,
-                "",
-                f"SECRET_WORKTREE_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
+            for args in (
+                ("git", "init", "--quiet"),
+                ("git", "config", "user.email", "test@example.invalid"),
+                ("git", "config", "user.name", "Headless Test"),
+            ):
+                subprocess.run(args, cwd=repo, check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(
+                ("git", "add", "README.md"),
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
             )
+            subprocess.run(
+                ("git", "commit", "--quiet", "-m", "baseline"),
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            def fail_worktree_add(
+                args: list[str], **kwargs: Any
+            ) -> subprocess.CompletedProcess[str]:
+                if args[:3] == ["git", "worktree", "add"]:
+                    return subprocess.CompletedProcess(
+                        args,
+                        128,
+                        "",
+                        f"SECRET_WORKTREE_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
+                    )
+                return subprocess.run(
+                    args,
+                    cwd=kwargs.get("cwd"),
+                    env=kwargs.get("env"),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=kwargs.get("timeout"),
+                    pass_fds=kwargs.get("pass_fds", ()),
+                )
+
+            mock_run_command.side_effect = fail_worktree_add
 
             with patch("codex_master.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(AgentError, "git worktree add failed") as raised:

@@ -18612,7 +18612,10 @@ def _headless_resume_rollback_payload(
             if not isinstance(returncode, int) or isinstance(returncode, bool) or returncode != 0:
                 raise AgentError("headless_attestation_rollback_incomplete")
         else:
-            os.rmdir(target.name, dir_fd=parent_fd)
+            try:
+                os.rmdir(target.name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise AgentError("headless_attestation_rollback_incomplete") from exc
         try:
             os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:

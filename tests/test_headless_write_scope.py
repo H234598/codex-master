@@ -161,11 +161,62 @@ def test_git_verification_does_not_inherit_config_override_environment(
 
     store.create("a", repository, worktree, base_ref=None)
 
-    assert "GIT_CONFIG_GLOBAL" not in captured
-    assert "GIT_CONFIG_SYSTEM" not in captured
+    assert captured["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert captured["GIT_CONFIG_SYSTEM"] == os.devnull
     assert captured["GIT_CONFIG_NOGLOBAL"] == "1"
     assert captured["GIT_CONFIG_NOSYSTEM"] == "1"
     assert captured["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
+def test_global_excludes_file_cannot_hide_out_of_scope_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, worktree = _repository(tmp_path)
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    global_excludes = tmp_path / "global-excludes"
+    global_excludes.write_text("outside.py\n", encoding="utf-8")
+    (isolated_home / ".gitconfig").write_text(
+        f"[core]\n\texcludesFile = {global_excludes}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(isolated_home))
+    captured: dict[str, str] = {}
+
+    def recording_runner(
+        args: list[str],
+        *,
+        cwd: Path,
+        timeout: float,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if env is not None:
+            captured.update(env)
+        return _git_process(args, cwd, timeout, env=env)
+
+    store = HeadlessWriteScopeStore(
+        tmp_path / "state", git_runner=recording_runner
+    )
+    store.create("a", repository, worktree, base_ref=None)
+    binding = store.bind(
+        "a",
+        repository,
+        ["README.md"],
+        assignment_id="assignment-1",
+        provider_generation=4,
+    )
+    (worktree / "outside.py").write_text("hidden\n", encoding="utf-8")
+
+    result = store.finalize(binding)
+
+    assert result.ok is False
+    assert result.code in {
+        "headless_write_scope_violation",
+        "headless_attestation_invalid",
+        "headless_write_attribution_unverified",
+    }
+    assert captured["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert captured["GIT_CONFIG_SYSTEM"] == os.devnull
 
 
 def test_git_verification_rejects_boolean_returncode(tmp_path: Path) -> None:

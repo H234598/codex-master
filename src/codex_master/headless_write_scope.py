@@ -1219,6 +1219,8 @@ class HeadlessWriteScopeStore:
             environment.pop(name, None)
         environment.update(
             {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_NOGLOBAL": "1",
                 "GIT_NO_REPLACE_OBJECTS": "1",

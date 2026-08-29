@@ -2981,6 +2981,57 @@ def test_worktree_create_surfaces_registration_rollback_failure(
     assert list(recovery_dir.iterdir()) == []
 
 
+def test_rollback_resume_maps_rmdir_failure_and_retries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    target = repository / ".codex-master-worktrees" / "agent-d1"
+    target.parent.mkdir()
+    target.mkdir()
+    rollback_root = tmp_path / "state"
+    rollback_dir = rollback_root / server.HEADLESS_ROLLBACK_DIR_NAME
+    rollback_dir.mkdir(parents=True)
+    rollback_root.chmod(0o700)
+    rollback_dir.chmod(0o700)
+    raw = server._headless_rollback_record_payload(
+        "d1",
+        repository,
+        target,
+        target.stat(),
+        target.parent.stat(),
+        registered=False,
+        reason="test-rmdir-failure",
+    )
+    record = rollback_dir / ("rollback-20260829T000000Z-" + "a" * 32 + ".json")
+    record.write_bytes(raw)
+    record.chmod(0o600)
+    monkeypatch.setattr(server, "STATE_ROOT", rollback_root)
+    real_rmdir = server.os.rmdir
+    failed = False
+
+    def fail_once(name: str, *args: object, **kwargs: object) -> None:
+        nonlocal failed
+        if not failed and name == target.name and kwargs.get("dir_fd") is not None:
+            failed = True
+            raise OSError("injected rmdir failure")
+        real_rmdir(name, *args, **kwargs)
+
+    monkeypatch.setattr(server.os, "rmdir", fail_once)
+    with pytest.raises(
+        server.AgentError, match="headless_attestation_rollback_incomplete"
+    ):
+        server._resume_headless_rollback_records()
+
+    assert target.is_dir()
+    assert record.exists()
+
+    monkeypatch.setattr(server.os, "rmdir", real_rmdir)
+    assert server._resume_headless_rollback_records() == []
+    assert not target.exists()
+    assert not record.exists()
+
+
 @pytest.mark.parametrize("rollback_fault", ["fstat", "identity"])
 def test_worktree_create_surfaces_rollback_identity_failure(
     tmp_path: Path, monkeypatch, rollback_fault: str
