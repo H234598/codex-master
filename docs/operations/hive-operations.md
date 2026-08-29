@@ -137,17 +137,31 @@ suffix is authoritative; evaluate `data-annotation-note` and use
 the matching sidecar is absent, do not change the Obsidian source.
 
 Append each answer, explanation, ADR, or question as its own chapter at the
-end of the document. Preserve the exact annotation heading and end the answer
-heading with a self-link to the unchanged visible annotation ID. Add exactly
-one idempotent backlink to the cited source section, using concrete values for
-the bee, answer target, and answer heading:
+end of the document. The answer heading must use exactly this Markdown form:
+
+```text
+## <exakte Annotation-Überschrift ohne finale ID> — [<Annotation-ID>](<eindeutiger Link auf referenzierten Annotationsabschnitt oder dessen Überschrift>)
+```
+
+Keep the exact annotation heading before the literal em dash `—`; keep the
+visible identifier exact and unchanged. The heading identifier is a normal
+Markdown link, never an Obsidian wikilink. Resolve its target uniquely to the
+referenced annotation section or heading before writing. Add exactly one
+idempotent backlink to the cited source section, using concrete values for the
+bee, answer target, and answer heading:
 
 ```text
 Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: [[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]
 ```
 
-On retry, detect that exact annotation/target/heading backlink before writing;
-an existing line is reused, never duplicated.
+Before any document mutation, resolve Quellabschnitt,
+Source-Heading-Markdownziel, Annotation-ID, Antwortziel, and
+Antwortüberschrift uniquely. Jeder Wert muss genau einen Wert ergeben.
+Fehlende, mehrdeutige oder konfliktierende Daten erzwingen fail-closed: weder
+Quellzeile noch Antwortkapitel schreiben. Ein passender vorhandener
+Rückverweis wird wiederverwendet. Ein nichtpassender vorhandener Rückverweis
+ist ein Blocker, nie eine zweite Zeile. On retry, resolve and compare these
+values again before writing.
 
 ### Generator and provider projection
 

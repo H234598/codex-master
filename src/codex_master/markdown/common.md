@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":2,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":3,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -60,11 +60,16 @@ Dokumentpfade serverweit.
 
 ## Bidirektionale Annotation-Antworten in Obsidian
 
-Eine beantwortete Annotation erhält ein eigenes Kapitel am Dokumentende. Seine
-Überschrift übernimmt die exakte Annotation-Überschrift und
-endet mit einem Markdown-Selbstlink auf die Annotation-ID, zum Beispiel:
-`## <Annotation-Überschrift> [[#<Annotation-ID>|<Annotation-ID>]]`. Die
-sichtbare ID bleibt unverändert. Antworten, Erklärungen, ADRs und Fragen
+Eine beantwortete Annotation erhält ein eigenes Kapitel am Dokumentende. Die
+Antwortüberschrift muss exakt dieser Markdown-Form folgen:
+`## <exakte Annotation-Überschrift ohne finale ID> — [<Annotation-ID>](<eindeutiger Link auf referenzierten Annotationsabschnitt oder dessen Überschrift>)`.
+Die exakte Annotation-Überschrift steht ohne finale ID vor dem em dash `—`.
+Die erforderliche Markdown-Selbstlink-Syntax ist ein normaler Markdown-Link.
+Die sichtbare ID bleibt unverändert und exakt erhalten. Für den
+Heading-Identifier gilt: kein Wikilink für den Heading-Identifier. Ziel zuerst
+eindeutig auflösen;
+der Markdown-Link muss eindeutig auf den referenzierten Annotationsabschnitt
+oder dessen Überschrift zeigen. Antworten, Erklärungen, ADRs und Fragen
 bleiben jeweils eigene Kapitel am Dokumentende und werden nicht zu einem
 Sammelkapitel oder Inline-Text zusammengezogen.
 
@@ -73,9 +78,16 @@ Bidirektionszeile in exakt diesem Format:
 `Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: [[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]`.
 `<Biene>` muss durch die konkrete Biene, `<Antwortziel>` durch das konkrete
 Antwortziel und `<Antwortüberschrift>` durch die konkrete Antwortüberschrift
-ersetzt werden. Vor jedem Retry ist die bestehende Zeile anhand von Annotation,
-Ziel und Überschrift zu prüfen; existiert sie bereits, wird keine zweite Zeile
-angelegt.
+ersetzt werden.
+
+Vor jeder Dokumentmutation sind Quellabschnitt, Source-Heading-Markdownziel,
+Annotation-ID, Antwortziel und Antwortüberschrift eindeutig aufzulösen. Jede
+Auflösung muss genau einen Wert ergeben. Sind Daten fehlend, mehrdeutig oder
+konfliktierend, gilt fail-closed: Es wird weder die Quellzeile noch das
+Antwortkapitel geschrieben. Ein passender vorhandener Rückverweis wird wiederverwendet.
+Ein nichtpassender vorhandener Rückverweis ist ein Blocker,
+nie eine zweite Zeile. Vor jedem Retry sind Annotation, Quellziel, Antwortziel
+und Antwortüberschrift erneut gegen den vorhandenen Rückverweis zu prüfen.
 
 Vor jeder Änderung einer Obsidian-Quelldatei ist das passende Annotation
 Marker-Sidecar unter `.obsidian/plugins/annotation-marker/annotations/` zu

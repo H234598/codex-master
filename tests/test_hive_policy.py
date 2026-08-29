@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":2,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":3,"schema_version":1} -->\n'
 )
 
 
@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 2
+    assert contract.generation == 3
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -177,3 +177,47 @@ def test_common_policy_contains_bidirectional_annotation_response_contract() -> 
         "[[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]"
         in raw_policy
     )
+
+
+def test_common_policy_requires_markdown_annotation_response_heading() -> None:
+    policy_api = load_policy_api()
+    raw_policy = policy_api.load_common_policy().common_bytes.decode("utf-8")
+    heading_template = (
+        "## <exakte Annotation-Überschrift ohne finale ID> — "
+        "[<Annotation-ID>](<eindeutiger Link auf referenzierten "
+        "Annotationsabschnitt oder dessen Überschrift>)"
+    )
+
+    assert heading_template in raw_policy
+    for meaning in (
+        "sichtbare ID bleibt unverändert",
+        "kein Wikilink für den Heading-Identifier",
+        "Ziel zuerst eindeutig auflösen",
+    ):
+        assert meaning in " ".join(raw_policy.split())
+    assert "[[#<Annotation-ID>|<Annotation-ID>]]" not in raw_policy
+
+
+def test_common_policy_fails_closed_on_unresolved_or_conflicting_annotation_data() -> None:
+    policy_api = load_policy_api()
+    policy = " ".join(
+        policy_api.load_common_policy().common_bytes.decode("utf-8").split()
+    )
+
+    required_meanings = [
+        "Vor jeder Dokumentmutation",
+        "Quellabschnitt",
+        "Source-Heading-Markdownziel",
+        "Annotation-ID",
+        "Antwortziel",
+        "Antwortüberschrift",
+        "fehlend, mehrdeutig oder konfliktierend",
+        "fail-closed",
+        "weder die Quellzeile noch das Antwortkapitel",
+        "passender vorhandener Rückverweis wird wiederverwendet",
+        "nichtpassender vorhandener Rückverweis ist ein Blocker",
+        "nie eine zweite Zeile",
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy

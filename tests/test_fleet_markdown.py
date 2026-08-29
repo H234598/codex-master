@@ -105,7 +105,7 @@ def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
     primary = projection.artifacts[metadata.provider_artifact_name]
 
     assert metadata.schema_version == 1
-    assert metadata.generation == 2
+    assert metadata.generation == 3
     assert metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
     assert metadata.common_size == len(_COMMON_BYTES) <= MAX_COMMON_POLICY_BYTES
     assert metadata.provider_artifact_name == "AGENTS.md"
@@ -133,7 +133,7 @@ def test_provider_projection_digests_are_deterministic_and_distinct() -> None:
 
 def test_canonical_header_remains_first_in_both_provider_artifacts() -> None:
     expected_header = (
-        b'<!-- codex-master-common-policy:{"generation":2,"schema_version":1} -->'
+        b'<!-- codex-master-common-policy:{"generation":3,"schema_version":1} -->'
     )
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
@@ -159,7 +159,36 @@ def test_both_provider_projections_carry_same_annotation_response_policy() -> No
         assert primary.startswith(contract.common_bytes)
         assert required_line in primary
         assert projection.metadata.common_digest == contract.common_digest
-        assert projection.metadata.generation == contract.generation == 2
+        assert projection.metadata.generation == contract.generation == 3
+
+
+def test_both_provider_projections_carry_corrected_annotation_heading_and_guards() -> None:
+    contract = load_common_policy()
+    required_fragments = [
+        (
+            "## <exakte Annotation-Überschrift ohne finale ID> — "
+            "[<Annotation-ID>](<eindeutiger Link auf referenzierten "
+            "Annotationsabschnitt oder dessen Überschrift>)"
+        ).encode("utf-8"),
+        "sichtbare ID bleibt unverändert".encode("utf-8"),
+        "kein Wikilink für den Heading-Identifier".encode("utf-8"),
+        b"fail-closed",
+        "passender vorhandener Rückverweis wird wiederverwendet".encode("utf-8"),
+        "nichtpassender vorhandener Rückverweis ist ein Blocker".encode("utf-8"),
+        "nie eine zweite Zeile".encode("utf-8"),
+    ]
+
+    projections = [
+        fleet_markdown.fleet_markdown_projection(_agent()),
+        fleet_markdown.fleet_markdown_projection(_agent(RunnerKind.GEMINI_CLI)),
+    ]
+
+    for projection in projections:
+        primary = projection.artifacts[projection.metadata.provider_artifact_name]
+        assert primary.startswith(contract.common_bytes)
+        for fragment in required_fragments:
+            assert fragment in primary
+        assert projection.metadata.common_digest == contract.common_digest
 
 
 @pytest.mark.parametrize("profile", ["../../worker", "worker.md", "", "x" * 65])
