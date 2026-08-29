@@ -469,3 +469,24 @@ def test_resolution_has_no_filesystem_environment_clock_network_or_browser_side_
 
     assert profile.scope_fingerprint == EXPECTED_SCOPE_FINGERPRINT
     assert dict(os.environ) == before_environment
+
+
+def test_build_inventory_readonly_profile_reconstructs_the_closed_read_policy() -> None:
+    profile = policy._build_inventory_readonly_profile()
+
+    assert profile.profile_id is GoogleOAuthProfileIdV1.INVENTORY_READONLY
+    assert profile.minimal_scopes == EXPECTED_SCOPES
+    assert tuple(operation.value for operation in profile.allowed_operations) == EXPECTED_OPERATIONS
+
+
+def test_build_provisioner_profile_has_the_mutation_policy_and_fingerprint() -> None:
+    profile = policy._build_provisioner_profile()
+
+    assert profile.profile_id is GoogleOAuthProfileIdV1.PROVISIONER
+    assert profile.minimal_scopes == ("cloud-platform", "email", "openid")
+    assert GoogleOAuthOperationV1.PROJECTS_CREATE in profile.allowed_operations
+    assert profile.scope_fingerprint.startswith("sha256:")
+
+
+def test_restore_provisioner_profile_returns_the_canonical_singleton() -> None:
+    assert policy._restore_provisioner_profile() is policy._PROVISIONER_PROFILE
