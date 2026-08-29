@@ -666,7 +666,10 @@ class MasterjetControlService:
         except AdminServiceError:
             raise
         except Exception:
-            ingress.rollback_resolve(resolution)
+            if resolution.reconcile_only:
+                ingress.mark_resolve_unknown(resolution)
+            else:
+                ingress.rollback_resolve(resolution)
             raise
         try:
             result = credentials.apply_auth_sync(plan, authorized)
@@ -757,7 +760,10 @@ class MasterjetControlService:
                 state=cast(str, request.arguments["state"]),
             )
         except Exception:
-            ingress.rollback_resolve(resolution)
+            if resolution.reconcile_only:
+                ingress.mark_resolve_unknown(resolution)
+            else:
+                ingress.rollback_resolve(resolution)
             raise
         ingress.commit_resolve(resolution)
         return _serialize_oauth_receipt(result)
@@ -803,7 +809,10 @@ class MasterjetControlService:
                 result = owner.reconcile_oauth_client_import(plan, resolution)
                 return _serialize_oauth_client_receipt(result)
         except Exception:
-            ingress.rollback_resolve(resolution)
+            if resolution.reconcile_only:
+                ingress.mark_resolve_unknown(resolution)
+            else:
+                ingress.rollback_resolve(resolution)
             raise
         try:
             result = owner.apply_oauth_client_import(plan, resolution)

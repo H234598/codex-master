@@ -35,6 +35,10 @@ from test_openai_credential_service import (
     auth_json,
     make_service as make_openai_service,
 )
+from test_google_oauth_session import (
+    _client_json as google_client_json,
+    _service as make_google_service,
+)
 
 
 NOW = 2_000_000_000
@@ -781,6 +785,117 @@ def test_http_restart_reconciles_revoked_apply_without_reapplying_business(
     assert json.loads(payload)["state"] == "succeeded"
 
 
+def test_http_restart_recovers_openai_receipt_before_ingress_revoke(
+    tmp_path,
+) -> None:
+    """Break caught: post-business fault must reconcile active unknown state."""
+
+    _unused, owners = service_at()
+    openai = make_openai_service(
+        tmp_path / "openai", registered_backend="acct-one", identity_generation=2
+    )
+    plan = openai.plan_auth_sync(
+        "openai-one", expected_generation=2, idempotency_key="openai-plan"
+    )
+    ingress_vault_root = tmp_path / "ingress-vault"
+
+    class OpenAIOwner:
+        def __init__(self, owner, *, fail_after_apply: bool) -> None:
+            self.owner = owner
+            self.fail_after_apply = fail_after_apply
+            self.apply_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self.owner, name)
+
+        def apply_auth_sync(self, plan, upload):
+            self.apply_calls += 1
+            if not self.fail_after_apply:
+                raise AssertionError("business effect was reapplied")
+            self.owner.apply_auth_sync(plan, upload)
+            raise RuntimeError("fault after durable business receipt")
+
+    def compose(openai_owner):
+        return MasterjetControlService.with_admin_secret_ingress(
+            secret_ingress_state_root=tmp_path / "ingress-state",
+            secret_ingress_vault=CredentialVault.for_test(
+                ingress_vault_root, key=b"i" * 32, clock=lambda: 1_000.0
+            ),
+            operation_store=owners.operation_store,
+            openai_accounts=owners.openai_accounts,
+            openai_credentials=openai_owner,
+            google_manager=owners.google_manager,
+            google_oauth_factory=lambda _ingress: owners.google_oauth,
+            quota_collector=owners.quota_collector,
+            google_provisioner=owners.google_provisioner,
+            google_billing=owners.google_billing,
+            host_registry=owners.hosts,
+            clock=lambda: 1_000.0,
+        )
+
+    create_body = _document(
+        "secret.ingress.create",
+        {"account_ref": "openai-one", "credential_kind": "openai.auth-json"},
+        expected_generation=2,
+        idempotency_key="ingress-create",
+        plan_digest="sha256:" + plan.plan_digest,
+    )
+    apply_body = _document(
+        "openai.auth.apply",
+        {"account_ref": "openai-one"},
+        expected_generation=2,
+        idempotency_key="openai-plan",
+        plan_digest="sha256:" + plan.plan_digest,
+    )
+    first_owner = OpenAIOwner(openai, fail_after_apply=True)
+    with _running_server(tmp_path, service=compose(first_owner)) as (server, _service):
+        _created, _out, create_payload = _request(
+            server,
+            "POST",
+            "/admin/v1",
+            create_body,
+            _headers(**{"X-Masterjet-Step-Up": _totp()}),
+        )
+        session_id = json.loads(create_payload)["id"]
+        uploaded, _out, _payload = _request(
+            server,
+            "PUT",
+            f"/admin/v1/secret-ingress-sessions/{session_id}",
+            auth_json("acct-one"),
+            _headers(
+                **{
+                    "Content-Type": "application/octet-stream",
+                    "X-Masterjet-Expected-Generation": "2",
+                    "Idempotency-Key": "ingress-upload",
+                }
+            ),
+        )
+        ambiguous, _out, _payload = _request(
+            server, "POST", "/admin/v1", apply_body, _headers()
+        )
+
+    restarted_openai = make_openai_service(
+        tmp_path / "openai", registered_backend="acct-one", identity_generation=2
+    )
+    restart_owner = OpenAIOwner(restarted_openai, fail_after_apply=False)
+    with _running_server(tmp_path, service=compose(restart_owner)) as (
+        server,
+        _service,
+    ):
+        reconciled, _out, payload = _request(
+            server, "POST", "/admin/v1", apply_body, _headers()
+        )
+
+    ingress_vault = CredentialVault.for_test(
+        ingress_vault_root, key=b"i" * 32, clock=lambda: 1_000.0
+    )
+    assert (uploaded, ambiguous, reconciled) == (200, 503, 200)
+    assert first_owner.apply_calls == 1
+    assert restart_owner.apply_calls == 0
+    assert ingress_vault.projection_metadata(session_id) == ("revoked", 3)
+    assert json.loads(payload)["state"] == "succeeded"
+
+
 def test_google_oauth_code_crosses_only_typed_raw_ingress_boundary(tmp_path) -> None:
     service, owners = service_at()
     session = _document(
@@ -832,6 +947,114 @@ def test_google_oauth_code_crosses_only_typed_raw_ingress_boundary(tmp_path) -> 
     assert type(capability) is SecretIngressCapabilityV1
     assert capability.credential_kind == "google-oauth-code"
     assert capability.operation == "google.oauth.complete"
+
+
+def test_google_client_http_restart_reconciles_durable_owner_receipt(
+    tmp_path, monkeypatch
+) -> None:
+    """Break caught: concrete Google receipt recovery must use public HTTP."""
+
+    _unused, owners = service_at()
+    (tmp_path / "google").mkdir()
+    composed: dict[str, object] = {}
+
+    def compose():
+        def google_factory(ingress):
+            google, _unused_ingress, _exchange, manager = make_google_service(
+                tmp_path / "google", ingress=ingress
+            )
+            composed["ingress"] = ingress
+            composed["google"] = google
+            composed["manager"] = manager
+            return google
+
+        return MasterjetControlService.with_admin_secret_ingress(
+            secret_ingress_state_root=tmp_path / "google-ingress-state",
+            secret_ingress_vault=CredentialVault.for_test(
+                tmp_path / "google-ingress-vault",
+                key=b"g" * 32,
+                clock=lambda: 1_000.0,
+            ),
+            operation_store=owners.operation_store,
+            openai_accounts=owners.openai_accounts,
+            openai_credentials=owners.openai_credentials,
+            google_manager=owners.google_manager,
+            google_oauth_factory=google_factory,
+            quota_collector=owners.quota_collector,
+            google_provisioner=owners.google_provisioner,
+            google_billing=owners.google_billing,
+            host_registry=owners.hosts,
+            clock=lambda: 1_000.0,
+        )
+
+    service = compose()
+    google = composed["google"]
+    plan = google.plan_oauth_client_import(
+        "google-account-01", expected_generation=1, idempotency_key="google-plan"
+    )
+    create_body = _document(
+        "secret.ingress.create",
+        {
+            "account_ref": "google-account-01",
+            "credential_kind": "google.oauth-client",
+        },
+        expected_generation=1,
+        idempotency_key="google-ingress",
+        plan_digest=plan.plan_digest,
+    )
+    apply_body = _document(
+        "google.oauth-client-import.apply",
+        {"account_ref": "google-account-01"},
+        expected_generation=1,
+        idempotency_key="google-plan",
+        plan_digest=plan.plan_digest,
+    )
+    ingress = composed["ingress"]
+    real_ack = ingress.acknowledge_oauth_client
+
+    def fail_ack(*_args, **_kwargs):
+        raise RuntimeError("fault before ingress acknowledgement")
+
+    monkeypatch.setattr(ingress, "acknowledge_oauth_client", fail_ack)
+    with _running_server(tmp_path, service=service) as (server, _service):
+        _created, _out, create_payload = _request(
+            server,
+            "POST",
+            "/admin/v1",
+            create_body,
+            _headers(**{"X-Masterjet-Step-Up": _totp()}),
+        )
+        session_id = json.loads(create_payload)["id"]
+        uploaded, _out, _payload = _request(
+            server,
+            "PUT",
+            f"/admin/v1/secret-ingress-sessions/{session_id}",
+            google_client_json(),
+            _headers(
+                **{
+                    "Content-Type": "application/octet-stream",
+                    "X-Masterjet-Expected-Generation": "1",
+                    "Idempotency-Key": "google-upload",
+                }
+            ),
+        )
+        ambiguous, _out, ambiguous_payload = _request(
+            server, "POST", "/admin/v1", apply_body, _headers()
+        )
+
+    monkeypatch.setattr(ingress, "acknowledge_oauth_client", real_ack)
+    with _running_server(tmp_path, service=compose()) as (server, _service):
+        reconciled, _out, payload = _request(
+            server, "POST", "/admin/v1", apply_body, _headers()
+        )
+
+    assert (uploaded, ambiguous, reconciled) == (200, 410, 200)
+    assert json.loads(ambiguous_payload)["code"] == "credential.upload_expired"
+    assert json.loads(payload)["account_ref"] == "google-account-01"
+    google_state = json.loads(
+        (tmp_path / "google" / "oauth-state" / "google-oauth-control.json").read_text()
+    )
+    assert [record["state"] for record in google_state["imports"]] == ["succeeded"]
 
 
 def test_secret_ingress_is_one_shot_with_gone_response(tmp_path) -> None:

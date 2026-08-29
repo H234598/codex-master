@@ -26,6 +26,16 @@ from .hive.state import HiveStateError, HiveStateStore
 _STATE_FILE: Final[PurePosixPath] = PurePosixPath("secret-ingress.json")
 _MAX_STATE_BYTES: Final[int] = 2 * 1024 * 1024
 _MAX_SESSIONS: Final[int] = 4096
+_CAPACITY_STATES: Final[frozenset[str]] = frozenset(
+    {
+        "authorized",
+        "upload_reserved",
+        "upload_in_progress",
+        "upload_unknown",
+        "uploaded",
+        "resolve_reserved",
+    }
+)
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 _CLAIM = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
@@ -144,7 +154,10 @@ class AdminSecretIngressOwner:
                     raise AdminSecretIngressError("control.request_invalid")
                 record = cast(dict[str, object], existing)
             else:
-                if len(sessions) >= _MAX_SESSIONS:
+                active_sessions = sum(
+                    _consumes_capacity(value, now) for value in sessions.values()
+                )
+                if active_sessions >= _MAX_SESSIONS:
                     raise AdminSecretIngressError("control.owner_unavailable")
                 sessions[session_id] = record
                 self._write_locked(document)
@@ -170,9 +183,7 @@ class AdminSecretIngressOwner:
             expired = (
                 type(expires_at) in {int, float} and cast(float, expires_at) <= now
             )
-            if state == "resolved" or (
-                state in {"authorized", "upload_reserved"} and expired
-            ):
+            if state in {"authorized", "upload_reserved"} and expired:
                 sessions.pop(session_id)
                 removed = True
                 continue
@@ -196,9 +207,6 @@ class AdminSecretIngressOwner:
             try:
                 metadata = self._vault.projection_metadata(session_id)
                 if state in {"resolve_in_progress", "apply_unknown"}:
-                    if metadata == ("revoked", generation):
-                        sessions.pop(session_id)
-                        removed = True
                     continue
                 if metadata == ("active", generation):
                     self._vault.revoke_account(
@@ -427,12 +435,11 @@ class AdminSecretIngressOwner:
                 cast(str, record["session_id"])
             )
             state = cast(str, record["state"])
-            reconcile_only = state == "resolved" or metadata == (
-                "revoked",
-                generation,
-            )
-            if state in {"resolve_in_progress", "apply_unknown"} and not reconcile_only:
-                raise AdminSecretIngressError("control.owner_unavailable")
+            reconcile_only = state in {
+                "resolve_in_progress",
+                "apply_unknown",
+                "resolved",
+            } or metadata == ("revoked", generation)
             if state != "resolved" and metadata not in {
                 ("active", generation),
                 ("revoked", generation),
@@ -506,6 +513,14 @@ class AdminSecretIngressOwner:
         with self._state.locked():
             document = self._read_locked()
             record = self._record(document, session_id)
+            reconciliation = (
+                type(capability) is SecretIngressCapabilityV1
+                and capability.reconcile_only
+            )
+            if record["state"] in {"resolve_in_progress", "apply_unknown"} and not (
+                reconciliation
+            ):
+                raise AdminSecretIngressError("credential.upload_expired")
             if record["state"] in {"uploaded", "resolve_reserved"}:
                 self._live(record)
             if (
@@ -565,15 +580,18 @@ class AdminSecretIngressOwner:
                 or record["claim_id"] != claim.claim_id
             ):
                 raise AdminSecretIngressError("credential.upload_expired")
-            if record["state"] in {"resolve_reserved", "apply_unknown"}:
+            initial_state = record["state"]
+            if not claim.reconcile_only and initial_state != "resolve_reserved":
+                raise AdminSecretIngressError("credential.upload_expired")
+            if initial_state in {"resolve_reserved", "apply_unknown"}:
                 record["state"] = "resolve_in_progress"
                 self._write_locked(document)
             generation = cast(int, record["receipt_generation"])
         if claim.reconcile_only:
-            if self._projection_metadata_or_error(claim.session_id) != (
-                "revoked",
-                generation,
-            ):
+            if self._projection_metadata_or_error(claim.session_id) not in {
+                ("active", generation),
+                ("revoked", generation),
+            }:
                 raise AdminSecretIngressError("control.owner_unavailable")
             return SecretIngressResolutionV1(claim.session_id, bytearray(), claim, True)
         try:
@@ -827,7 +845,6 @@ class AdminSecretIngressOwner:
             set(value) != {"schema_version", "sessions"}
             or value.get("schema_version") != 1
             or type(value.get("sessions")) is not dict
-            or len(cast(dict[object, object], value["sessions"])) > _MAX_SESSIONS
         ):
             raise AdminSecretIngressError("control.owner_unavailable")
         return {
@@ -940,6 +957,20 @@ def _now(clock: Callable[[], float]) -> float:
     if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
         raise AdminSecretIngressError("control.owner_unavailable")
     return float(value)
+
+
+def _consumes_capacity(value: object, now: float) -> bool:
+    if type(value) is not dict:
+        return False
+    state = value.get("state")
+    if state in _CAPACITY_STATES:
+        return True
+    expires_at = value.get("expires_at")
+    return (
+        state == "resolve_in_progress"
+        and type(expires_at) in {int, float}
+        and cast(float, expires_at) > now
+    )
 
 
 def _secret_view(value: object) -> memoryview:

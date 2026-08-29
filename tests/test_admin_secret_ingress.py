@@ -315,10 +315,10 @@ def test_uploaded_session_reconstructs_exact_public_continuation_after_restart(
         )
 
 
-def test_apply_unknown_continuation_requires_revoked_vault_evidence(
-    tmp_path,
+def test_apply_unknown_continuation_allows_only_exact_receipt_reconciliation(
+    tmp_path, monkeypatch
 ) -> None:
-    """Break caught: unknown business outcome must never become blind retry."""
+    """Break caught: active unknown must query receipt without exposing secret."""
 
     owner = _owner(tmp_path)
     session = _session(owner)
@@ -350,21 +350,8 @@ def test_apply_unknown_continuation_requires_revoked_vault_evidence(
     resolution = owner.resolve(owner.reserve_resolve(session.id, **values))
     owner.mark_resolve_unknown(resolution)
 
-    with pytest.raises(AdminSecretIngressError, match="control.owner_unavailable"):
-        _owner(tmp_path).continue_resolve(
-            principal="operator-one",
-            operation="google.oauth-client-import.apply",
-            account_ref="google-one",
-            transaction_id=None,
-            plan_digest=DIGEST,
-            expected_generation=4,
-            idempotency_key="idem-apply",
-        )
-
-    owner._vault.revoke_account(  # noqa: SLF001 - exact reconciliation evidence
-        session.id, expected_generation=receipt.generation
-    )
-    capability = _owner(tmp_path).continue_resolve(
+    restarted = _owner(tmp_path)
+    capability = restarted.continue_resolve(
         principal="operator-one",
         operation="google.oauth-client-import.apply",
         account_ref="google-one",
@@ -374,12 +361,43 @@ def test_apply_unknown_continuation_requires_revoked_vault_evidence(
         idempotency_key="idem-apply",
     )
     assert capability.reconcile_only is True
+    resolution = restarted.resolve(
+        restarted.reserve_resolve(session.id, capability=capability)
+    )
+    assert resolution.reconcile_only is True
+    assert resolution.upload == bytearray()
+
+    variants = (
+        {"principal": "operator-two"},
+        {"expected_generation": 5},
+        {"plan_digest": "sha256:" + "b" * 64},
+        {"idempotency_key": "idem-forged"},
+    )
+    exact = {
+        "principal": "operator-one",
+        "operation": "google.oauth-client-import.apply",
+        "account_ref": "google-one",
+        "transaction_id": None,
+        "plan_digest": DIGEST,
+        "expected_generation": 4,
+        "idempotency_key": "idem-apply",
+    }
+    for changes in variants:
+        with pytest.raises(AdminSecretIngressError, match="credential.upload_expired"):
+            restarted.continue_resolve(**(exact | changes))
+    monkeypatch.setattr(
+        CredentialVault,
+        "projection_metadata",
+        lambda _vault, _session_id: ("active", receipt.generation + 1),
+    )
+    with pytest.raises(AdminSecretIngressError, match="control.owner_unavailable"):
+        restarted.continue_resolve(**exact)
 
 
-def test_prune_reclaims_expired_reserved_and_evidence_resolved_unknown(
+def test_tombstones_do_not_consume_active_capacity_or_reopen_create_key(
     tmp_path, monkeypatch
 ) -> None:
-    """Break caught: safely classifiable stale sessions must not exhaust cap."""
+    """Break caught: pruning must retain terminal and unknown authority."""
 
     now = [1_000.0]
     owner = _owner(tmp_path, clock=lambda: now[0])
@@ -436,19 +454,11 @@ def test_prune_reclaims_expired_reserved_and_evidence_resolved_unknown(
     )
     owner.mark_resolve_unknown(resolution)
     now[0] = 1_121.0
-    with pytest.raises(AdminSecretIngressError, match="control.owner_unavailable"):
-        owner.create_session(
-            principal="operator-one",
-            account_ref="google-two",
-            credential_kind="google.oauth-client",
-            expected_generation=4,
-            idempotency_key="idem-blocked",
-            plan_digest=DIGEST,
-        )
     owner._vault.revoke_account(  # noqa: SLF001 - exact pruning evidence
         session.id, expected_generation=receipt.generation
     )
-    replacement = _owner(unknown_root, clock=lambda: now[0]).create_session(
+    restarted = _owner(unknown_root, clock=lambda: now[0])
+    replacement = restarted.create_session(
         principal="operator-one",
         account_ref="google-two",
         credential_kind="google.oauth-client",
@@ -457,6 +467,111 @@ def test_prune_reclaims_expired_reserved_and_evidence_resolved_unknown(
         plan_digest=DIGEST,
     )
     assert replacement.account_ref == "google-two"
+    capability = restarted.continue_resolve(
+        principal="operator-one",
+        operation="google.oauth-client-import.apply",
+        account_ref="google-one",
+        transaction_id=None,
+        plan_digest=DIGEST,
+        expected_generation=4,
+        idempotency_key="idem-apply",
+    )
+    assert capability.reconcile_only is True
+
+    restarted.commit_resolve(
+        restarted.resolve(restarted.reserve_resolve(session.id, capability=capability))
+    )
+    replay = restarted.create_session(
+        principal="operator-one",
+        account_ref="google-one",
+        credential_kind="google.oauth-client",
+        expected_generation=4,
+        idempotency_key="idem-create",
+        plan_digest=DIGEST,
+    )
+    assert replay.state == "resolved"
+    with pytest.raises(AdminSecretIngressError, match="credential.upload_expired"):
+        restarted.reserve_upload(
+            replay.id,
+            principal="operator-one",
+            expected_generation=4,
+            idempotency_key="replacement-body",
+        )
+
+
+def test_expired_resolve_in_progress_tombstone_survives_revoked_vault(
+    tmp_path, monkeypatch
+) -> None:
+    """Break caught: crash evidence must outlive TTL and capacity reclamation."""
+
+    now = [1_000.0]
+    owner = _owner(tmp_path, clock=lambda: now[0])
+    monkeypatch.setattr(ingress_module, "_MAX_SESSIONS", 1)
+    session = _session(owner)
+    upload = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    receipt = owner.put_secret(
+        session.id,
+        bytearray(b"oauth-client-json"),
+        principal="operator-one",
+        upload_claim=upload,
+    )
+    owner.commit_upload(upload, receipt)
+    resolution = owner.resolve(
+        owner.reserve_resolve(
+            session.id,
+            principal="operator-one",
+            operation="google.oauth-client-import.apply",
+            account_ref="google-one",
+            credential_kind="google.oauth-client",
+            plan_digest=DIGEST,
+            expected_generation=4,
+            create_idempotency_key="idem-create",
+            upload_idempotency_key="idem-upload",
+            idempotency_key="idem-apply",
+            receipt_generation=receipt.generation,
+        )
+    )
+    resolution.upload[:] = b"\0" * len(resolution.upload)
+    resolution.upload.clear()
+    with pytest.raises(AdminSecretIngressError, match="control.owner_unavailable"):
+        owner.create_session(
+            principal="operator-one",
+            account_ref="google-two",
+            credential_kind="google.oauth-client",
+            expected_generation=4,
+            idempotency_key="blocked-while-active",
+            plan_digest=DIGEST,
+        )
+    owner._vault.revoke_account(  # noqa: SLF001 - exact crash evidence
+        session.id, expected_generation=receipt.generation
+    )
+    now[0] = 1_121.0
+    restarted = _owner(tmp_path, clock=lambda: now[0])
+    replacement = restarted.create_session(
+        principal="operator-one",
+        account_ref="google-two",
+        credential_kind="google.oauth-client",
+        expected_generation=4,
+        idempotency_key="new-active-session",
+        plan_digest=DIGEST,
+    )
+    capability = restarted.continue_resolve(
+        principal="operator-one",
+        operation="google.oauth-client-import.apply",
+        account_ref="google-one",
+        transaction_id=None,
+        plan_digest=DIGEST,
+        expected_generation=4,
+        idempotency_key="idem-apply",
+    )
+
+    assert replacement.account_ref == "google-two"
+    assert capability.reconcile_only is True
 
 
 def test_concrete_owner_persists_exact_one_shot_capability_across_restart(
@@ -622,7 +737,7 @@ def test_resolve_commit_reconciles_revoked_vault_after_journal_failure(
         )
 
 
-def test_apply_unknown_retries_same_durable_claim_then_commits(tmp_path) -> None:
+def test_apply_unknown_rejects_direct_secret_retry_after_restart(tmp_path) -> None:
     owner = _owner(tmp_path)
     session = _session(owner)
     upload = owner.reserve_upload(
@@ -655,21 +770,8 @@ def test_apply_unknown_retries_same_durable_claim_then_commits(tmp_path) -> None
     owner.mark_resolve_unknown(first)
 
     restarted = _owner(tmp_path)
-    assert restarted.reserve_resolve(session.id, **values) == claim
-    retry = restarted.resolve(claim)
-    assert restarted.read_oauth_client(
-        retry,
-        account_ref="google-one",
-        expected_generation=4,
-        plan_digest=DIGEST,
-    ) == bytearray(b"oauth-client-json")
-    restarted.acknowledge_oauth_client(
-        retry,
-        account_ref="google-one",
-        expected_generation=4,
-        plan_digest=DIGEST,
-        ack_operation_id=DIGEST,
-    )
+    with pytest.raises(AdminSecretIngressError, match="credential.upload_expired"):
+        restarted.reserve_resolve(session.id, **values)
 
 
 def test_real_service_create_put_apply_uses_concrete_owner_one_shot(tmp_path) -> None:
