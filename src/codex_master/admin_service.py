@@ -675,8 +675,12 @@ class MasterjetControlService:
             result = credentials.apply_auth_sync(plan, authorized)
         except Exception:
             ingress.mark_resolve_unknown(resolution)
-            raise
-        ingress.commit_resolve(resolution)
+            raise _unknown_outcome_error() from None
+        try:
+            ingress.commit_resolve(resolution)
+        except Exception:
+            ingress.mark_resolve_unknown(resolution)
+            raise _unknown_outcome_error() from None
         return _serialize_openai_receipt(result)
 
     def _secret_ingress_create(
@@ -818,7 +822,7 @@ class MasterjetControlService:
             result = owner.apply_oauth_client_import(plan, resolution)
         except Exception:
             ingress.mark_resolve_unknown(resolution)
-            raise
+            raise _unknown_outcome_error() from None
         return _serialize_oauth_client_receipt(result)
 
     def _google_inventory_refresh(
@@ -1505,15 +1509,21 @@ def _owner_service_error(error: BaseException) -> AdminServiceError:
     return AdminServiceError(_problem(code, effect=effect))
 
 
-def _problem(code: str, *, effect: str = "No action was started") -> HiveProblemV1:
+def _problem(
+    code: str,
+    *,
+    effect: str = "No action was started",
+    action: str = "Review access and retry",
+    retryable: bool = False,
+) -> HiveProblemV1:
     return HiveProblemV1(
         code=code,
         severity="error",
         title="Request failed",
         detail="Request could not be completed",
         effect=effect,
-        action="Review access and retry",
-        retryable=False,
+        action=action,
+        retryable=retryable,
         retry_after_seconds=None,
         correlation_id="corr-" + uuid.uuid4().hex,
         occurred_at=datetime.now(UTC),
@@ -1522,6 +1532,17 @@ def _problem(code: str, *, effect: str = "No action was started") -> HiveProblem
 
 def _service_error(code: str) -> AdminServiceError:
     return AdminServiceError(_problem(code))
+
+
+def _unknown_outcome_error() -> AdminServiceError:
+    return AdminServiceError(
+        _problem(
+            "control.owner_unavailable",
+            effect="Action outcome is unknown",
+            action="Retry the identical request to reconcile outcome",
+            retryable=True,
+        )
+    )
 
 
 def _denied(code: str) -> AdminDenied:

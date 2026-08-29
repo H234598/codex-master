@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
+import json
 import math
 from pathlib import Path, PurePosixPath
 import re
@@ -854,8 +855,19 @@ class AdminSecretIngressOwner:
 
     def _write_locked(self, value: Mapping[str, object]) -> None:
         try:
-            self._state.replace_json_locked(_STATE_FILE, value)
-        except HiveStateError:
+            encoded = (
+                json.dumps(
+                    value,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            if len(encoded) > _MAX_STATE_BYTES:
+                raise HiveStateError("state_oversize")
+            self._state.replace_json_locked(_STATE_FILE, value, encoded=encoded)
+        except (HiveStateError, TypeError, ValueError, RecursionError):
             raise AdminSecretIngressError("control.owner_unavailable") from None
 
     def _record(
@@ -967,7 +979,7 @@ def _consumes_capacity(value: object, now: float) -> bool:
         return True
     expires_at = value.get("expires_at")
     return (
-        state == "resolve_in_progress"
+        state in {"resolve_in_progress", "apply_unknown"}
         and type(expires_at) in {int, float}
         and cast(float, expires_at) > now
     )

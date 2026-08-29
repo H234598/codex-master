@@ -453,6 +453,15 @@ def test_tombstones_do_not_consume_active_capacity_or_reopen_create_key(
         )
     )
     owner.mark_resolve_unknown(resolution)
+    with pytest.raises(AdminSecretIngressError, match="control.owner_unavailable"):
+        owner.create_session(
+            principal="operator-one",
+            account_ref="google-two",
+            credential_kind="google.oauth-client",
+            expected_generation=4,
+            idempotency_key="blocked-by-live-unknown",
+            plan_digest=DIGEST,
+        )
     now[0] = 1_121.0
     owner._vault.revoke_account(  # noqa: SLF001 - exact pruning evidence
         session.id, expected_generation=receipt.generation
@@ -497,6 +506,41 @@ def test_tombstones_do_not_consume_active_capacity_or_reopen_create_key(
             expected_generation=4,
             idempotency_key="replacement-body",
         )
+
+
+def test_owner_write_cap_matches_read_cap_without_replacing_readable_state(
+    tmp_path, monkeypatch
+) -> None:
+    """Break caught: owner must not publish state its own reader rejects."""
+
+    owner = _owner(tmp_path)
+    first = _session(owner)
+    state_path = tmp_path / "state" / "secret-ingress.json"
+    readable = state_path.read_bytes()
+    monkeypatch.setattr(ingress_module, "_MAX_STATE_BYTES", len(readable))
+
+    with pytest.raises(AdminSecretIngressError, match="control.owner_unavailable"):
+        owner.create_session(
+            principal="operator-one",
+            account_ref="google-two",
+            credential_kind="google.oauth-client",
+            expected_generation=4,
+            idempotency_key="state-cap-overflow",
+            plan_digest=DIGEST,
+        )
+
+    assert state_path.read_bytes() == readable
+    assert (
+        _owner(tmp_path).create_session(
+            principal="operator-one",
+            account_ref="google-one",
+            credential_kind="google.oauth-client",
+            expected_generation=4,
+            idempotency_key="idem-create",
+            plan_digest=DIGEST,
+        )
+        == first
+    )
 
 
 def test_expired_resolve_in_progress_tombstone_survives_revoked_vault(

@@ -870,7 +870,7 @@ def test_http_restart_recovers_openai_receipt_before_ingress_revoke(
                 }
             ),
         )
-        ambiguous, _out, _payload = _request(
+        ambiguous, _out, ambiguous_payload = _request(
             server, "POST", "/admin/v1", apply_body, _headers()
         )
 
@@ -890,6 +890,14 @@ def test_http_restart_recovers_openai_receipt_before_ingress_revoke(
         ingress_vault_root, key=b"i" * 32, clock=lambda: 1_000.0
     )
     assert (uploaded, ambiguous, reconciled) == (200, 503, 200)
+    ambiguous_problem = json.loads(ambiguous_payload)
+    assert ambiguous_problem["code"] == "control.owner_unavailable"
+    assert ambiguous_problem["effect"] == "Action outcome is unknown"
+    assert (
+        ambiguous_problem["action"]
+        == "Retry the identical request to reconcile outcome"
+    )
+    assert ambiguous_problem["retryable"] is True
     assert first_owner.apply_calls == 1
     assert restart_owner.apply_calls == 0
     assert ingress_vault.projection_metadata(session_id) == ("revoked", 3)
@@ -1048,8 +1056,15 @@ def test_google_client_http_restart_reconciles_durable_owner_receipt(
             server, "POST", "/admin/v1", apply_body, _headers()
         )
 
-    assert (uploaded, ambiguous, reconciled) == (200, 410, 200)
-    assert json.loads(ambiguous_payload)["code"] == "credential.upload_expired"
+    assert (uploaded, ambiguous, reconciled) == (200, 503, 200)
+    ambiguous_problem = json.loads(ambiguous_payload)
+    assert ambiguous_problem["code"] == "control.owner_unavailable"
+    assert ambiguous_problem["effect"] == "Action outcome is unknown"
+    assert (
+        ambiguous_problem["action"]
+        == "Retry the identical request to reconcile outcome"
+    )
+    assert ambiguous_problem["retryable"] is True
     assert json.loads(payload)["account_ref"] == "google-account-01"
     google_state = json.loads(
         (tmp_path / "google" / "oauth-state" / "google-oauth-control.json").read_text()
