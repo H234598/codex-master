@@ -6,6 +6,7 @@ import errno
 import hashlib
 import inspect
 import threading
+import traceback
 
 import pytest
 
@@ -365,6 +366,20 @@ def test_public_publish_maps_platform_error_without_leaking_details() -> None:
     assert raised.value.code is BrokerIntentCode.INVALID_FIELD
     assert str(raised.value) == BrokerIntentCode.INVALID_FIELD.value
     assert "host-path-secret" not in str(raised.value)
+
+
+def test_public_publish_clears_operation_error_context() -> None:
+    class BrokenPublish(FakeStore):
+        def publish(self, payload: bytes, final_name: str) -> None:
+            raise OSError(errno.EIO, "context-operation-secret")
+
+    with pytest.raises(BrokerIntentError) as caught:
+        publish_broker_intent(BrokenPublish(), INTENT)
+
+    assert caught.value.__context__ is None
+    assert "context-operation-secret" not in "".join(
+        traceback.format_exception(caught.value)
+    )
 
 
 def test_public_claim_maps_linux_error_without_leaking_details() -> None:

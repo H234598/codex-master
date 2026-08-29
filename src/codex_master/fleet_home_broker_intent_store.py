@@ -160,7 +160,8 @@ def _public_operation_call(operations: object, method: str, *args: object) -> ob
     except BrokerIntentError:
         raise
     except Exception:
-        raise BrokerIntentError(BrokerIntentCode.INVALID_FIELD)
+        normalized = BrokerIntentError(BrokerIntentCode.INVALID_FIELD)
+    raise normalized
 
 
 def _linux_fail(code: LinuxBrokerCode) -> None:
