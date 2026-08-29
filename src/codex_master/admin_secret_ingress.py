@@ -334,7 +334,7 @@ class AdminSecretIngressOwner:
                 existing = self._vault.projection_metadata(claim.session_id)
                 if existing != ("active", generation):
                     self._vault.store_projection(claim.session_id, generation, raw)
-            except BaseException:
+            except Exception:
                 existing = self._projection_metadata_or_unknown(claim)
                 if existing != ("active", generation):
                     if existing is None:

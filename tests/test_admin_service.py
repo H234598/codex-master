@@ -1138,6 +1138,39 @@ def test_put_secret_delegates_same_buffer_with_bound_principal() -> None:
     assert owners.secret_ingress.upload_commits == 1
 
 
+def test_put_secret_preserves_primary_signal_over_rollback_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, owners = service_at()
+    who = principal("fleet.secrets.ingress", step_up=True)
+    claim = service.reserve_secret_upload(
+        who,
+        "ingress-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    monkeypatch.setattr(
+        owners.secret_ingress,
+        "put_secret",
+        lambda *_args, **_values: (_ for _ in ()).throw(
+            KeyboardInterrupt("primary")
+        ),
+    )
+    monkeypatch.setattr(
+        owners.secret_ingress,
+        "rollback_upload",
+        lambda _claim: (_ for _ in ()).throw(SystemExit("cleanup")),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="primary"):
+        service.put_secret(
+            who,
+            "ingress-one",
+            bytearray(b"private-marker"),
+            upload_claim=claim,
+        )
+
+
 def test_put_secret_without_owner_reservation_is_rejected_before_owner() -> None:
     service, owners = service_at()
 

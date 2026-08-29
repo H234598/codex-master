@@ -358,9 +358,14 @@ class AdminSocketServer:
                 _send_reply(connection, result=result, problem=problem)
             except Exception:
                 pass
-        finally:
-            _drain_input(connection)
-            _close_fds(received_fds)
+        except BaseException:
+            try:
+                _cleanup_connection(connection, received_fds)
+            except BaseException:
+                pass
+            raise
+        else:
+            _cleanup_connection(connection, received_fds)
 
     def _principal(self, peer: UnixPeerCredentials) -> AdminPrincipalV1:
         try:
@@ -439,6 +444,7 @@ class AdminSocketServer:
         secret: memoryview | None = None
         used = 0
         eof = False
+        delegated = False
         try:
             snapshot = _validate_secret_fd(fd, peer)
             buffer = bytearray(snapshot.st_size + 1)
@@ -453,14 +459,17 @@ class AdminSocketServer:
                 raise _SocketFailure("control.secret_fd_invalid")
             _recheck_secret_fd(fd, snapshot)
             secret = view[:used]
+            delegated = True
             return self._service.put_secret(
                 principal, session_id, secret, upload_claim=claim
             )
         except BaseException as error:
-            try:
-                self._service.rollback_secret_upload(claim)
-            except Exception:
-                pass
+            if not delegated:
+                try:
+                    self._service.rollback_secret_upload(claim)
+                except BaseException:
+                    if isinstance(error, Exception):
+                        raise
             from .admin_service import AdminServiceError
 
             if not isinstance(error, Exception):
@@ -1041,12 +1050,33 @@ def _collect_fds(
 
 
 def _close_fds(fds: list[int]) -> None:
+    failure: BaseException | None = None
     while fds:
         fd = fds.pop()
         try:
             os.close(fd)
         except OSError:
             pass
+        except BaseException as error:
+            if failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
+
+
+def _cleanup_connection(connection: socket.socket, received_fds: list[int]) -> None:
+    failure: BaseException | None = None
+    try:
+        _drain_input(connection)
+    except BaseException as error:
+        failure = error
+    try:
+        _close_fds(received_fds)
+    except BaseException:
+        if failure is None:
+            raise
+    if failure is not None:
+        raise failure
 
 
 def _drain_input(connection: socket.socket) -> None:

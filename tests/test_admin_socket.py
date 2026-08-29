@@ -523,9 +523,115 @@ def test_secret_upload_rolls_back_without_normalizing_process_signals(
         assert ingress.rollback_calls == 1
         assert ingress.buffer is None
     else:
-        assert ingress.rollback_calls >= 1
+        assert ingress.rollback_calls == 1
         assert ingress.buffer is not None
         assert bytes(ingress.buffer) == b"\0" * len(ingress.buffer)
+
+
+def test_handle_preserves_primary_process_signal_when_cleanup_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ingress = _SecretIngress()
+    adapter = AdminSocketServer(
+        tmp_path / "private" / "admin.sock",
+        _service(ingress),
+        lambda _peer: PRINCIPAL,
+    )
+    received_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    peer = UnixPeerCredentials(os.getpid(), os.geteuid(), os.getegid())
+    monkeypatch.setattr(admin_socket, "_peer_credentials", lambda _socket: peer)
+    monkeypatch.setattr(admin_socket, "_server_attestation", lambda *_args: None)
+    monkeypatch.setattr(
+        admin_socket,
+        "_receive_frame",
+        lambda _socket: (b"{}", [received_fd]),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_dispatch",
+        lambda *_args: (_ for _ in ()).throw(KeyboardInterrupt("primary")),
+    )
+    monkeypatch.setattr(
+        admin_socket,
+        "_drain_input",
+        lambda _socket: (_ for _ in ()).throw(SystemExit("cleanup")),
+    )
+
+    try:
+        with pytest.raises(KeyboardInterrupt, match="primary"):
+            adapter._handle(object())  # type: ignore[arg-type]
+        with pytest.raises(OSError):
+            os.fstat(received_fd)
+    finally:
+        try:
+            os.close(received_fd)
+        except OSError:
+            pass
+        os.close(write_fd)
+
+
+def test_close_fds_continues_after_process_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_fd, first_write_fd = os.pipe2(os.O_CLOEXEC)
+    second_fd, second_write_fd = os.pipe2(os.O_CLOEXEC)
+    real_close = os.close
+    interrupted = False
+
+    def interrupt_once(fd: int) -> None:
+        nonlocal interrupted
+        real_close(fd)
+        if fd == first_fd and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("primary")
+
+    monkeypatch.setattr(admin_socket.os, "close", interrupt_once)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="primary"):
+            admin_socket._close_fds([second_fd, first_fd])
+        with pytest.raises(OSError):
+            os.fstat(first_fd)
+        with pytest.raises(OSError):
+            os.fstat(second_fd)
+    finally:
+        monkeypatch.setattr(admin_socket.os, "close", real_close)
+        for fd in (first_fd, second_fd, first_write_fd, second_write_fd):
+            try:
+                real_close(fd)
+            except OSError:
+                pass
+
+
+def test_secret_upload_preserves_primary_signal_over_rollback_signal(
+    tmp_path: Path,
+    auth_fd: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ingress = _SecretIngress()
+    ingress.rollback_signal = SystemExit("cleanup")
+    monkeypatch.setattr(
+        admin_socket.os,
+        "preadv",
+        lambda *_args: (_ for _ in ()).throw(KeyboardInterrupt("primary")),
+    )
+    adapter = AdminSocketServer(
+        tmp_path / "private" / "admin.sock",
+        _service(ingress),
+        lambda _peer: PRINCIPAL,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="primary"):
+        adapter._put_secret(
+            PRINCIPAL,
+            UnixPeerCredentials(os.getpid(), os.geteuid(), os.getegid()),
+            "ingress-one",
+            auth_fd,
+            expected_generation=0,
+            idempotency_key="socket-secret-put",
+        )
+
+    assert ingress.rollback_calls == 1
 
 
 @pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])

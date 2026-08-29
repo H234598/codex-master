@@ -162,6 +162,35 @@ def test_upload_reconciles_vault_success_when_store_reports_failure(
     assert receipt.generation == 5
 
 
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+def test_upload_does_not_normalize_vault_process_signals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+) -> None:
+    owner = _owner(tmp_path)
+    session = _session(owner)
+    claim = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    monkeypatch.setattr(
+        CredentialVault,
+        "store_projection",
+        lambda *_args, **_values: (_ for _ in ()).throw(signal_type("primary")),
+    )
+
+    with pytest.raises(signal_type, match="primary"):
+        owner.put_secret(
+            session.id,
+            bytearray(b"oauth-client-json"),
+            principal="operator-one",
+            upload_claim=claim,
+        )
+
+
 def test_upload_commit_failure_is_reconciled_after_restart(
     tmp_path, monkeypatch
 ) -> None:
