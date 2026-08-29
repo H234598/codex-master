@@ -1152,9 +1152,7 @@ def test_put_secret_preserves_primary_signal_over_rollback_signal(
     monkeypatch.setattr(
         owners.secret_ingress,
         "put_secret",
-        lambda *_args, **_values: (_ for _ in ()).throw(
-            KeyboardInterrupt("primary")
-        ),
+        lambda *_args, **_values: (_ for _ in ()).throw(KeyboardInterrupt("primary")),
     )
     monkeypatch.setattr(
         owners.secret_ingress,

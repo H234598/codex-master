@@ -457,7 +457,9 @@ def test_receive_frame_closes_received_fds_without_normalizing_process_signals(
     class _FrameSocket:
         calls = 0
 
-        def recvmsg(self, *_args: object) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
+        def recvmsg(
+            self, *_args: object
+        ) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
             self.calls += 1
             if self.calls == 1:
                 return b"{", [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)], 0, None
@@ -488,7 +490,9 @@ def test_fd_cleanup_does_not_replace_primary_process_signal(
     class _InterruptingSocket:
         calls = 0
 
-        def recvmsg(self, *_args: object) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
+        def recvmsg(
+            self, *_args: object
+        ) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
             self.calls += 1
             if self.calls == 1:
                 return b"x", [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)], 0, None
@@ -685,7 +689,9 @@ def test_drain_input_closes_received_fds_without_normalizing_process_signals(
     class _DrainSocket:
         calls = 0
 
-        def recvmsg(self, *_args: object) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
+        def recvmsg(
+            self, *_args: object
+        ) -> tuple[bytes, list[tuple[int, int, bytes]], int, None]:
             self.calls += 1
             if self.calls == 1:
                 return b"x", [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)], 0, None
