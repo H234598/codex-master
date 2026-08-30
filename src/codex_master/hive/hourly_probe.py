@@ -390,7 +390,6 @@ def _atomic_write(path: Path, payload: Mapping[str, object]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        temporary = Path()
         directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory_descriptor)
@@ -401,11 +400,6 @@ def _atomic_write(path: Path, payload: Mapping[str, object]) -> None:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if temporary.name:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
 
 
 def _run_json(command: Path, *arguments: str) -> tuple[dict[str, Any], bool]:

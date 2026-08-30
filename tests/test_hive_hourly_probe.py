@@ -237,6 +237,32 @@ def test_spawn_gate_reads_only_private_state_and_never_creates_missing_state(
     assert result["reason_code"] == "probe_invalid"
 
 
+def test_atomic_write_never_unlinks_a_foreign_temp_swapped_before_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "hive-hourly-health.json"
+    foreign_contents = b"foreign-probe-state-sentinel\x00preserve"
+    displaced_private: Path | None = None
+    foreign_temporary: Path | None = None
+
+    def fail_after_swapping_temporary(source: Path, _destination: Path) -> None:
+        nonlocal displaced_private, foreign_temporary
+        displaced_private = source.with_name(f"{source.name}.private")
+        source.rename(displaced_private)
+        source.write_bytes(foreign_contents)
+        foreign_temporary = source
+        raise OSError(errno.EIO, "controlled replace failure")
+
+    monkeypatch.setattr(hourly_probe_module.os, "replace", fail_after_swapping_temporary)
+
+    with pytest.raises(ValueError, match="probe_state_write_failed"):
+        hourly_probe_module._atomic_write(state_file, green_probe(NOW.isoformat()))
+
+    assert displaced_private is not None and displaced_private.is_file()
+    assert foreign_temporary is not None
+    assert foreign_temporary.read_bytes() == foreign_contents
+
+
 def test_run_probe_persists_only_one_schema_v2_health_record(tmp_path: Path) -> None:
     state_directory = tmp_path / "state"
     layout = runtime_layout(tmp_path)
