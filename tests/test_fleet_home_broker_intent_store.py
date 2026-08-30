@@ -84,9 +84,15 @@ PARENT_IDENTITY = BrokerIntentFileIdentity(
 
 
 class FakeStore:
-    def __init__(self, claim: BrokerIntentClaimBytes | None = None) -> None:
+    def __init__(
+        self,
+        claim: BrokerIntentClaimBytes | None = None,
+        *,
+        recovery: BrokerIntentClaimBytes | None = None,
+    ) -> None:
         self.published: list[tuple[bytes, str]] = []
         self.claims = [claim] if claim is not None else []
+        self.recoveries = [recovery] if recovery is not None else []
         self.terminals: list[tuple[str, bytes]] = []
         self.quarantines: list[tuple[str, str]] = []
 
@@ -98,11 +104,19 @@ class FakeStore:
             return None
         return self.claims.pop(0)
 
+    def recover_next(self) -> BrokerIntentClaimBytes | None:
+        if not self.recoveries:
+            return None
+        return self.recoveries.pop(0)
+
     def mark_terminal(self, claim_name: str, payload: bytes) -> None:
         self.terminals.append((claim_name, payload))
 
     def quarantine(self, claim_name: str, code: str) -> None:
         self.quarantines.append((claim_name, code))
+
+    def release_claim(self, claim_name: str) -> None:
+        return None
 
 
 class FakeLinuxOperations:
@@ -123,6 +137,8 @@ class FakeLinuxOperations:
         self.stat_sequences: dict[str, list[ObjectIdentity]] = {}
         self.parent_stat_sequence: list[ObjectIdentity] = []
         self.pinned_identity_overrides: dict[str, ObjectIdentity] = {}
+        self.locked_fds: dict[int, tuple[int, int]] = {}
+        self._locked_identities: set[tuple[int, int]] = set()
 
     def openat2(self, parent_fd: int, name: str, how: object) -> PinnedFd:
         self.calls.append(("openat2", parent_fd, name, how))
@@ -210,11 +226,35 @@ class FakeLinuxOperations:
         self.files[new_name] = self.files.pop(old_name)
         self.identities[new_name] = self.identities.pop(old_name)
         self.labels[new_name] = self.labels.pop(old_name)
+        for fd, name in self.fd_names.items():
+            if name == old_name:
+                self.fd_names[fd] = new_name
+
+    def lock_exclusive_nonblocking(self, fd: int) -> None:
+        self.calls.append(("lock_exclusive_nonblocking", fd))
+        pinned = getattr(self, "_fd_identities", None)
+        identity = (
+            pinned[fd]
+            if type(pinned) is dict and fd in pinned
+            else self.identities[self.fd_names[fd]]
+        )
+        key = (identity.dev, identity.ino)
+        if key in self._locked_identities:
+            raise BlockingIOError(errno.EAGAIN, "leased")
+        self._locked_identities.add(key)
+        self.locked_fds[fd] = key
 
     def close(self, fd: int) -> None:
         self.calls.append(("close", fd))
+        key = self.locked_fds.pop(fd, None)
+        if key is not None:
+            self._locked_identities.remove(key)
         self.fd_names.pop(fd, None)
         self.open_flags.pop(fd, None)
+
+    def crash(self) -> None:
+        for fd in tuple(self.locked_fds):
+            self.close(fd)
 
 
 class AtomicClaimLinuxOperations(FakeLinuxOperations):
@@ -260,6 +300,49 @@ class AtomicClaimLinuxOperations(FakeLinuxOperations):
         self._fd_labels.pop(fd, None)
 
 
+class AtomicRecoveryLinuxOperations(FakeLinuxOperations):
+    """Shared fake directory where FDs remain pinned across a rename."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._state_lock = threading.Lock()
+        self._fd_identities: dict[int, ObjectIdentity] = {}
+        self._fd_labels: dict[int, str] = {}
+
+    def openat2(self, parent_fd: int, name: str, how: object) -> PinnedFd:
+        with self._state_lock:
+            pinned = super().openat2(parent_fd, name, how)
+            self._fd_identities[pinned.fd] = pinned.identity
+            self._fd_labels[pinned.fd] = self.labels[name]
+            return pinned
+
+    def stat_fd(self, fd: int) -> ObjectIdentity:
+        if fd in self._fd_identities:
+            self.calls.append(("stat_fd", fd))
+            return self._fd_identities[fd]
+        return super().stat_fd(fd)
+
+    def selinux_label(self, fd: int) -> str:
+        if fd in self._fd_labels:
+            self.calls.append(("selinux_label", fd))
+            return self._fd_labels[fd]
+        return super().selinux_label(fd)
+
+    def lock_exclusive_nonblocking(self, fd: int) -> None:
+        with self._state_lock:
+            super().lock_exclusive_nonblocking(fd)
+
+    def renameat2_noreplace(self, parent_fd: int, old_name: str, new_name: str) -> None:
+        with self._state_lock:
+            super().renameat2_noreplace(parent_fd, old_name, new_name)
+
+    def close(self, fd: int) -> None:
+        with self._state_lock:
+            super().close(fd)
+            self._fd_identities.pop(fd, None)
+            self._fd_labels.pop(fd, None)
+
+
 def test_public_store_types_are_frozen_slotted_and_protocol_is_narrow() -> None:
     for type_ in (
         BrokerIntentFileIdentity,
@@ -281,6 +364,9 @@ def test_public_store_types_are_frozen_slotted_and_protocol_is_narrow() -> None:
         inspect.signature(BrokerIntentStoreOperations.claim_next).parameters
     ) == ("self",)
     assert tuple(
+        inspect.signature(BrokerIntentStoreOperations.recover_next).parameters
+    ) == ("self",)
+    assert tuple(
         inspect.signature(BrokerIntentStoreOperations.mark_terminal).parameters
     ) == (
         "self",
@@ -294,6 +380,9 @@ def test_public_store_types_are_frozen_slotted_and_protocol_is_narrow() -> None:
         "claim_name",
         "code",
     )
+    assert tuple(
+        inspect.signature(BrokerIntentStoreOperations.release_claim).parameters
+    ) == ("self", "claim_name")
 
 
 def test_publish_encodes_once_and_uses_safe_nonce_bound_final_name() -> None:
@@ -479,7 +568,212 @@ def test_two_linux_consumers_claim_shared_intent_once_atomically() -> None:
     assert final_name not in operations.files
     assert [call for call in operations.calls if call[0] == "renameat2_noreplace"] == [
         ("renameat2_noreplace", 7, final_name, claim_name)
-    ] * 2
+    ]
+
+
+def test_linux_recovery_takes_a_crashed_claim_with_a_new_store_and_retains_one_lease() -> (
+    None
+):
+    operations = AtomicRecoveryLinuxOperations()
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    payload = encode_broker_intent(INTENT)
+    operations.files[final_name] = payload
+    operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
+
+    crashed_store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    claimed = crashed_store.claim_next()
+    assert claimed is not None
+    assert claimed.claim_name == ".claim-" + final_name
+    assert len(operations.locked_fds) == 1
+
+    operations.crash()
+    recovered_store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    recovered = recovered_store.recover_next()
+
+    assert recovered is not None
+    assert recovered.claim_name == ".recover-" + final_name
+    assert recovered.payload == payload
+    assert recovered.source_identity == BrokerIntentFileIdentity(
+        8, 1001, 0o100600, 0, 0, 1, PARENT_IDENTITY.selinux_label
+    )
+    assert getattr(recovered, "recovered") is True
+    assert operations.files == {recovered.claim_name: payload}
+    assert len(operations.locked_fds) == 1
+
+
+def test_linux_recovery_reclaims_recovered_orphans_without_starving_later_claims() -> (
+    None
+):
+    operations = AtomicRecoveryLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    payload = encode_broker_intent(INTENT)
+    operations.files[claim_name] = payload
+    operations.identities[claim_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
+
+    first = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).recover_next()
+    assert first is not None
+    assert first.claim_name == ".recover-" + claim_name[7:]
+    operations.crash()
+
+    second = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).recover_next()
+    assert second is not None
+    assert second.claim_name == first.claim_name
+    assert second.recovered is True
+    operations.crash()
+
+    recoverers = [
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY),
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY),
+    ]
+    start = threading.Barrier(3)
+    results: list[BrokerIntentClaimBytes | None] = [None, None]
+
+    def resume(index: int) -> None:
+        start.wait()
+        results[index] = recoverers[index].recover_next()
+
+    workers = [threading.Thread(target=resume, args=(index,)) for index in range(2)]
+    for worker in workers:
+        worker.start()
+    start.wait()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert not any(worker.is_alive() for worker in workers)
+    assert sorted(result is not None for result in results) == [False, True]
+    assert next(result for result in results if result is not None) == second
+
+    operations = AtomicRecoveryLinuxOperations()
+    live_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    orphan_name = (
+        ".recover-intent-00000000000000000008-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json"
+    )
+    operations.files[live_name] = payload
+    operations.files[orphan_name] = payload
+    operations.identities[live_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.identities[orphan_name] = ObjectIdentity(8, 1002, 0o100600, 0, 0, 1)
+    operations.labels[live_name] = PARENT_IDENTITY.selinux_label
+    operations.labels[orphan_name] = PARENT_IDENTITY.selinux_label
+    active_store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    active = active_store.recover_next()
+    assert active is not None
+    assert active.claim_name == ".recover-" + live_name[7:]
+
+    later = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).recover_next()
+    assert later is not None
+    assert later.claim_name == orphan_name
+    assert active_store.recover_next() is None
+
+
+def test_linux_recovery_does_not_overtake_a_live_normal_claim() -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    operations.files[final_name] = encode_broker_intent(INTENT)
+    operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
+
+    active_store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    active_claim = active_store.claim_next()
+    assert active_claim is not None
+
+    recovering_store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    assert recovering_store.recover_next() is None
+    assert operations.files == {active_claim.claim_name: encode_broker_intent(INTENT)}
+
+    active_store.mark_terminal(active_claim.claim_name, b'{"result":"succeeded"}\n')
+    assert operations.locked_fds == {}
+
+
+def test_two_linux_recoverers_take_one_crashed_claim_atomically() -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    payload = encode_broker_intent(INTENT)
+    operations.files[claim_name] = payload
+    operations.identities[claim_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
+    stores = [
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY),
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY),
+    ]
+    start = threading.Barrier(3)
+    results: list[BrokerIntentClaimBytes | None] = [None, None]
+    errors: list[BaseException] = []
+
+    def recover(index: int) -> None:
+        try:
+            start.wait()
+            results[index] = stores[index].recover_next()
+        except BaseException as error:  # pragma: no cover - reported below
+            errors.append(error)
+
+    workers = [threading.Thread(target=recover, args=(index,)) for index in range(2)]
+    for worker in workers:
+        worker.start()
+    start.wait()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert not any(worker.is_alive() for worker in workers)
+    assert errors == []
+    assert sorted(result is not None for result in results) == [False, True]
+    winner = next(result for result in results if result is not None)
+    assert (
+        winner.claim_name
+        == ".recover-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    assert operations.files == {winner.claim_name: payload}
+    assert len(operations.locked_fds) == 1
+
+
+def test_linux_terminal_failure_releases_the_claim_lease() -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    operations.files[final_name] = encode_broker_intent(INTENT)
+    operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
+    store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    claim = store.claim_next()
+    assert claim is not None
+    operations.write_error = OSError(errno.EIO, "write failure")
+
+    with pytest.raises(LinuxBrokerError):
+        store.mark_terminal(claim.claim_name, b'{"result":"succeeded"}\n')
+
+    assert operations.locked_fds == {}
+
+
+def test_linux_terminal_or_quarantine_validation_failure_releases_the_claim_lease() -> (
+    None
+):
+    for operation in ("terminal", "quarantine"):
+        operations = AtomicRecoveryLinuxOperations()
+        final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+        operations.files[final_name] = encode_broker_intent(INTENT)
+        operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+        operations.labels[final_name] = PARENT_IDENTITY.selinux_label
+        store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+        claim = store.claim_next()
+        assert claim is not None
+
+        if operation == "terminal":
+            operations.files.update(
+                {f".terminal-retained-{index}": b"x" for index in range(128)}
+            )
+            with pytest.raises(LinuxBrokerError):
+                store.mark_terminal(claim.claim_name, b'{"result":"succeeded"}\n')
+        else:
+            with pytest.raises(LinuxBrokerError):
+                store.quarantine(claim.claim_name, "not a valid code")
+
+        assert operations.locked_fds == {}
 
 
 def test_linux_publish_uses_openat2_exclusive_write_fsync_and_noreplace_rename() -> (

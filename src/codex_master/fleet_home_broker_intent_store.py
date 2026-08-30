@@ -33,6 +33,7 @@ MAX_INTENT_STORE_NAME_BYTES = 256
 MAX_INTENT_STORE_CODE_BYTES = 64
 MAX_TERMINAL_INTENT_RECORDS = 128
 MAX_QUARANTINED_INTENT_RECORDS = 128
+MAX_PENDING_INTENT_RECORDS = 128
 INTENT_FILE_MODE = 0o100600
 INTENT_PARENT_MODE = 0o40700
 INTENT_SELINUX_LABEL = "system_u:object_r:codex_master_home_broker_state_t:s0"
@@ -45,6 +46,10 @@ _INTENT_NAME = re.compile(
 )
 _CLAIM_NAME = re.compile(
     r"\.claim-intent-[0-9]{20}-[A-Za-z0-9][A-Za-z0-9_.:@+\-]{0,255}\.json\Z",
+    re.ASCII,
+)
+_RECOVERED_CLAIM_NAME = re.compile(
+    r"\.recover-intent-[0-9]{20}-[A-Za-z0-9][A-Za-z0-9_.:@+\-]{0,255}\.json\Z",
     re.ASCII,
 )
 
@@ -69,6 +74,7 @@ class BrokerIntentClaimBytes:
     claim_name: str
     payload: bytes
     source_identity: BrokerIntentFileIdentity
+    recovered: bool = False
 
 
 class BrokerIntentStoreOperations(Protocol):
@@ -76,9 +82,13 @@ class BrokerIntentStoreOperations(Protocol):
 
     def claim_next(self) -> BrokerIntentClaimBytes | None: ...
 
+    def recover_next(self) -> BrokerIntentClaimBytes | None: ...
+
     def mark_terminal(self, claim_name: str, payload: bytes) -> None: ...
 
     def quarantine(self, claim_name: str, code: str) -> None: ...
+
+    def release_claim(self, claim_name: str) -> None: ...
 
 
 class _LinuxIntentStoreOperations(Protocol):
@@ -103,6 +113,8 @@ class _LinuxIntentStoreOperations(Protocol):
     def renameat2_noreplace(
         self, parent_fd: int, old_name: str, new_name: str
     ) -> None: ...
+
+    def lock_exclusive_nonblocking(self, fd: int) -> None: ...
 
     def unlinkat(self, parent_fd: int, name: str) -> None: ...
 
@@ -150,6 +162,8 @@ def _validate_claim(value: object) -> BrokerIntentClaimBytes:
     if not valid_name or type(value.payload) is not bytes:
         raise BrokerIntentError(BrokerIntentCode.INVALID_TYPE)
     if type(value.source_identity) is not BrokerIntentFileIdentity:
+        raise BrokerIntentError(BrokerIntentCode.INVALID_TYPE)
+    if type(value.recovered) is not bool:
         raise BrokerIntentError(BrokerIntentCode.INVALID_TYPE)
     return value
 
@@ -282,6 +296,7 @@ class LinuxBrokerIntentStore:
 
     _O_RDONLY = 0o0
     _O_WRONLY = 0o1
+    _O_RDWR = 0o2
     _O_CREAT = 0o100
     _O_EXCL = 0o200
 
@@ -301,6 +316,7 @@ class LinuxBrokerIntentStore:
         self._parent_fd = parent_fd
         self._expected_parent_identity = expected_parent_identity
         self._selinux_label = selinux_label
+        self._leases: dict[str, tuple[int, BrokerIntentFileIdentity]] = {}
         self._verify_parent()
 
     def _verify_parent(self) -> BrokerIntentFileIdentity:
@@ -412,6 +428,30 @@ class LinuxBrokerIntentStore:
         _linux_call(self._operations.fsync, self._parent_fd)
         return True
 
+    def _try_lock_claim(self, fd: int) -> bool:
+        """Acquire one inode-bound lease without waiting for another broker."""
+
+        try:
+            self._operations.lock_exclusive_nonblocking(fd)
+        except LinuxBrokerError:
+            raise
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                return False
+            if error.errno in (errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP):
+                _linux_fail(LinuxBrokerCode.UNSUPPORTED_PLATFORM)
+            if error.errno == errno.ELOOP:
+                _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
+            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        except Exception:
+            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        return True
+
+    def _release_lease(self, claim_name: str) -> None:
+        lease = self._leases.pop(claim_name, None)
+        if lease is not None:
+            self._close(lease[0])
+
     def _cleanup_temp(self, name: str) -> None:
         try:
             self._operations.unlinkat(self._parent_fd, name)
@@ -447,45 +487,99 @@ class LinuxBrokerIntentStore:
             if not renamed:
                 self._cleanup_temp(staging_name)
 
-    def _candidate_names(self) -> tuple[str, ...]:
+    def _candidate_names(self, expression: re.Pattern[str]) -> tuple[str, ...]:
         names = _linux_call(self._operations.list_names, self._parent_fd)
         if type(names) is not tuple:
             _linux_fail(LinuxBrokerCode.IO_FAILURE)
-        return tuple(
+        candidates = tuple(
             sorted(
                 name
                 for name in names
-                if type(name) is str and _INTENT_NAME.fullmatch(name)
+                if type(name) is str and expression.fullmatch(name)
             )
         )
+        if len(candidates) > MAX_PENDING_INTENT_RECORDS:
+            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        return candidates
+
+    def _recovery_candidate_names(self) -> tuple[str, ...]:
+        names = _linux_call(self._operations.list_names, self._parent_fd)
+        if type(names) is not tuple:
+            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        candidates = tuple(
+            sorted(
+                name
+                for name in names
+                if type(name) is str
+                and (
+                    _CLAIM_NAME.fullmatch(name) or _RECOVERED_CLAIM_NAME.fullmatch(name)
+                )
+            )
+        )
+        if len(candidates) > MAX_PENDING_INTENT_RECORDS:
+            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        return candidates
+
+    def _claim_candidate(
+        self,
+        name: str,
+        claim_name: str,
+        *,
+        recovered: bool,
+        rename_claim: bool,
+    ) -> BrokerIntentClaimBytes | None:
+        fd = None
+        try:
+            fd, before = self._open_file(name, self._O_RDWR)
+            payload = _linux_call(self._operations.read_all, fd)
+            if type(payload) is not bytes or len(payload) > MAX_BROKER_INTENT_BYTES:
+                _linux_fail(LinuxBrokerCode.IO_FAILURE)
+            self._after_file_identity(fd, before)
+            if not self._try_lock_claim(fd):
+                return None
+            self._verify_parent()
+            if rename_claim:
+                if not self._claim_rename_and_sync(name, claim_name):
+                    return None
+            self._verify_parent()
+            self._leases[claim_name] = (fd, before)
+            fd = None
+            return BrokerIntentClaimBytes(claim_name, payload, before, recovered)
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.EEXIST):
+                return None
+            raise
+        finally:
+            if fd is not None:
+                self._close(fd)
 
     def claim_next(self) -> BrokerIntentClaimBytes | None:
         """Read and atomically claim the oldest visible intent."""
 
         self._verify_parent()
-        for name in self._candidate_names():
-            fd = None
-            try:
-                fd, before = self._open_file(name, self._O_RDONLY)
-                payload = _linux_call(self._operations.read_all, fd)
-                if type(payload) is not bytes or len(payload) > MAX_BROKER_INTENT_BYTES:
-                    _linux_fail(LinuxBrokerCode.IO_FAILURE)
-                self._after_file_identity(fd, before)
-                self._close(fd)
-                fd = None
-                claim_name = f".claim-{name}"
-                self._verify_parent()
-                if not self._claim_rename_and_sync(name, claim_name):
-                    return None
-                self._verify_parent()
-                return BrokerIntentClaimBytes(claim_name, payload, before)
-            except OSError as error:
-                if error.errno in (errno.ENOENT, errno.EEXIST):
-                    return None
-                raise
-            finally:
-                if fd is not None:
-                    self._close(fd)
+        for name in self._candidate_names(_INTENT_NAME):
+            return self._claim_candidate(
+                name,
+                f".claim-{name}",
+                recovered=False,
+                rename_claim=True,
+            )
+        return None
+
+    def recover_next(self) -> BrokerIntentClaimBytes | None:
+        """Atomically take one crashed claim after acquiring its inode lease."""
+
+        self._verify_parent()
+        for name in self._recovery_candidate_names():
+            claim_name = f".recover-{name[7:]}" if _CLAIM_NAME.fullmatch(name) else name
+            claimed = self._claim_candidate(
+                name,
+                claim_name,
+                recovered=True,
+                rename_claim=claim_name != name,
+            )
+            if claimed is not None:
+                return claimed
         return None
 
     def _retention_check(self, prefix: str, maximum: int) -> None:
@@ -499,59 +593,81 @@ class LinuxBrokerIntentStore:
             _linux_fail(LinuxBrokerCode.IO_FAILURE)
 
     def _claim_name(self, claim_name: object) -> str:
-        if type(claim_name) is not str or _CLAIM_NAME.fullmatch(claim_name) is None:
+        if type(claim_name) is not str or not (
+            _CLAIM_NAME.fullmatch(claim_name)
+            or _RECOVERED_CLAIM_NAME.fullmatch(claim_name)
+        ):
             _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
         return claim_name
+
+    def _claim_fd(
+        self, claim_name: str, flags: int
+    ) -> tuple[int, BrokerIntentFileIdentity, bool]:
+        lease = self._leases.get(claim_name)
+        if lease is not None:
+            fd, identity = lease
+            self._after_file_identity(fd, identity)
+            return fd, identity, True
+        fd, identity = self._open_file(claim_name, flags)
+        return fd, identity, False
+
+    def release_claim(self, claim_name: str) -> None:
+        """Release a live normal or recovery lease without path cleanup."""
+
+        claim_name = self._claim_name(claim_name)
+        self._release_lease(claim_name)
 
     def mark_terminal(self, claim_name: str, payload: bytes) -> None:
         """Overwrite a claimed file with bounded terminal bytes and retain it."""
 
         claim_name = self._claim_name(claim_name)
-        self._payload(payload)
-        self._retention_check(".terminal-", MAX_TERMINAL_INTENT_RECORDS)
-        self._verify_parent()
         fd = None
-        renamed = False
+        leased = False
         terminal_name = f".terminal-{claim_name[1:]}"
         try:
-            fd, before = self._open_file(claim_name, self._O_WRONLY)
+            self._payload(payload)
+            self._retention_check(".terminal-", MAX_TERMINAL_INTENT_RECORDS)
+            self._verify_parent()
+            fd, before, leased = self._claim_fd(claim_name, self._O_WRONLY)
             self._verify_parent()
             _linux_call(self._operations.truncate, fd)
             self._write_and_sync(fd, payload)
             self._after_file_identity(fd, before)
-            self._close(fd)
-            fd = None
+            if not leased:
+                self._close(fd)
+                fd = None
             self._verify_parent()
             self._rename_and_sync(claim_name, terminal_name)
-            renamed = True
             self._verify_parent()
         finally:
-            if fd is not None:
+            if fd is not None and not leased:
                 self._close(fd)
-            if not renamed:
-                pass
+            self._release_lease(claim_name)
 
     def quarantine(self, claim_name: str, code: str) -> None:
         """Move one claimed file to bounded, code-labelled quarantine."""
 
         claim_name = self._claim_name(claim_name)
-        if not _valid_code(code):
-            _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
-        self._retention_check(".quarantine-", MAX_QUARANTINED_INTENT_RECORDS)
-        self._verify_parent()
-        quarantine_name = f".quarantine-{code}-{claim_name[1:]}"
         fd = None
+        leased = False
         try:
-            fd, before = self._open_file(claim_name, self._O_RDONLY)
+            if not _valid_code(code):
+                _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
+            self._retention_check(".quarantine-", MAX_QUARANTINED_INTENT_RECORDS)
+            self._verify_parent()
+            quarantine_name = f".quarantine-{code}-{claim_name[1:]}"
+            fd, before, leased = self._claim_fd(claim_name, self._O_RDONLY)
             self._after_file_identity(fd, before)
-            self._close(fd)
-            fd = None
+            if not leased:
+                self._close(fd)
+                fd = None
             self._verify_parent()
             self._rename_and_sync(claim_name, quarantine_name)
             self._verify_parent()
         finally:
-            if fd is not None:
+            if fd is not None and not leased:
                 self._close(fd)
+            self._release_lease(claim_name)
 
 
 def publish_broker_intent(
@@ -570,10 +686,30 @@ def claim_broker_intent(
 ) -> ClaimedBrokerIntent | None:
     """Decode one atomically claimed intent or quarantine its invalid bytes."""
 
-    claim = _public_operation_call(operations, "claim_next")
+    return _decode_claim(operations, "claim_next", False, now_unix_ms=now_unix_ms)
+
+
+def recover_broker_intent(
+    operations: BrokerIntentStoreOperations, *, now_unix_ms: int
+) -> ClaimedBrokerIntent | None:
+    """Decode one atomically recovered orphan claim or quarantine its bytes."""
+
+    return _decode_claim(operations, "recover_next", True, now_unix_ms=now_unix_ms)
+
+
+def _decode_claim(
+    operations: BrokerIntentStoreOperations,
+    method: str,
+    recovered: bool,
+    *,
+    now_unix_ms: int,
+) -> ClaimedBrokerIntent | None:
+    claim = _public_operation_call(operations, method)
     if claim is None:
         return None
     claim = _validate_claim(claim)
+    if claim.recovered is not recovered:
+        raise BrokerIntentError(BrokerIntentCode.INVALID_FIELD)
     try:
         intent = decode_broker_intent(claim.payload, now_unix_ms=now_unix_ms)
     except BrokerIntentError as error:
@@ -588,7 +724,9 @@ def claim_broker_intent(
         if result is not None:
             raise BrokerIntentError(BrokerIntentCode.INVALID_TYPE)
         return None
-    return ClaimedBrokerIntent(intent, claim.claim_name, claim.source_identity)
+    return ClaimedBrokerIntent(
+        intent, claim.claim_name, claim.source_identity, claim.recovered
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -596,6 +734,7 @@ class ClaimedBrokerIntent:
     intent: BrokerIntentV1
     claim_name: str
     source_identity: BrokerIntentFileIdentity
+    recovered: bool = False
 
 
 __all__ = [
@@ -605,4 +744,5 @@ __all__ = [
     "ClaimedBrokerIntent",
     "claim_broker_intent",
     "publish_broker_intent",
+    "recover_broker_intent",
 ]

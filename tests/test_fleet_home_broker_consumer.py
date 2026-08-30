@@ -34,8 +34,11 @@ from codex_master.fleet_home_broker_intent import (
 from codex_master.fleet_home_broker_intent_store import (
     BrokerIntentClaimBytes,
     BrokerIntentFileIdentity,
+    LinuxBrokerIntentStore,
     claim_broker_intent,
 )
+from codex_master.fleet_home_broker_identity_contract import ObjectIdentity
+from codex_master.fleet_home_broker_linux_contract import PinnedFd
 from codex_master.fleet_home_broker_protocol import (
     BrokerCheckpoint,
     BrokerObjectState,
@@ -57,6 +60,12 @@ from codex_master.fleet_home_broker_transport import BrokerTransportResponse
 
 class EmptyStore:
     def claim_next(self):
+        return None
+
+    def recover_next(self):
+        return None
+
+    def release_claim(self, claim_name):
         return None
 
 
@@ -220,19 +229,27 @@ class FakeStore:
         self,
         claims: list[BrokerIntentClaimBytes] | None = None,
         *,
+        recoveries: list[BrokerIntentClaimBytes] | None = None,
         terminal_error: Exception | None = None,
         terminal_result: object | None = None,
     ) -> None:
         self.claims = list(claims or ())
+        self.recoveries = list(recoveries or ())
         self.terminal_error = terminal_error
         self.terminal_result = terminal_result
         self.terminals: list[tuple[str, bytes]] = []
         self.quarantines: list[tuple[str, str]] = []
+        self.releases: list[str] = []
 
     def claim_next(self) -> BrokerIntentClaimBytes | None:
         if not self.claims:
             return None
         return self.claims.pop(0)
+
+    def recover_next(self) -> BrokerIntentClaimBytes | None:
+        if not self.recoveries:
+            return None
+        return self.recoveries.pop(0)
 
     def mark_terminal(self, claim_name: str, payload: bytes) -> object | None:
         if self.terminal_error is not None:
@@ -242,6 +259,9 @@ class FakeStore:
 
     def quarantine(self, claim_name: str, code: str) -> None:
         self.quarantines.append((claim_name, code))
+
+    def release_claim(self, claim_name: str) -> None:
+        self.releases.append(claim_name)
 
 
 class AtomicFakeStore(FakeStore):
@@ -315,12 +335,74 @@ class FailingExecution:
         self.closed.append(fd)
 
 
+class RecoveryStateExecution:
+    """State fake for the future execution composition, not a WAL fake."""
+
+    def __init__(
+        self,
+        intent: BrokerIntentV1,
+        *,
+        checkpoint: BrokerCheckpoint | None,
+        evidence: str = "attested",
+        effect_count: int = 0,
+    ) -> None:
+        self.intent = intent
+        self.checkpoint = checkpoint
+        self.evidence = evidence
+        self.effect_count = effect_count
+        self.execute_attempts = 0
+        self.resume_calls: list[tuple[object, ...]] = []
+        self.started_transaction_ids: list[str] = []
+        self.closed: list[int] = []
+
+    def execute_intent(
+        self, intent: BrokerIntentV1, plan: OfflineBrokerPlan
+    ) -> BrokerTransportResponse:
+        self.execute_attempts += 1
+        raise AssertionError("recovered claims must not execute as fresh intents")
+
+    def resume_intent(
+        self, intent: BrokerIntentV1, plan: OfflineBrokerPlan, context: object
+    ) -> BrokerTransportResponse:
+        self.resume_calls.append((intent, plan, context))
+        if self.evidence != "attested":
+            return _response(intent, result=BrokerResultCode.BLOCKED_DRIFT)
+        assert getattr(context, "transaction_id") == intent.transaction_id
+        expected = {
+            BrokerIntentOperation.PROVISION: BrokerObservation(
+                BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 0
+            ),
+            BrokerIntentOperation.REPLACE: BrokerObservation(
+                BrokerObjectState.REPLACEMENT_ORIGINAL,
+                BrokerRegistryState.NOT_APPLICABLE,
+                0,
+            ),
+            BrokerIntentOperation.DEPROVISION: BrokerObservation(
+                BrokerObjectState.FINAL_COMPLETE,
+                BrokerRegistryState.NOT_APPLICABLE,
+                0,
+            ),
+        }[intent.operation]
+        assert getattr(context, "initial_observation") == expected
+        if self.checkpoint is None:
+            self.started_transaction_ids.append(intent.transaction_id)
+            self.effect_count += 1
+        return _response(intent)
+
+    def execute(self, command: object) -> BrokerTransportResponse:
+        raise AssertionError("consumer must not invoke dispatch execute")
+
+    def close(self, fd: int) -> None:
+        self.closed.append(fd)
+
+
 def test_public_results_and_errors_are_frozen_typed_and_value_free() -> None:
     assert consumer.__all__ == (
         "BrokerExecutionComposition",
         "BrokerIntentConsumeCode",
         "BrokerIntentConsumeResult",
         "BrokerIntentConsumerError",
+        "BrokerIntentResumeContext",
         "BrokerIntentResolver",
         "consume_one_broker_intent",
     )
@@ -350,6 +432,13 @@ def test_public_results_and_errors_are_frozen_typed_and_value_free() -> None:
     assert tuple(
         inspect.signature(BrokerExecutionComposition.execute_intent).parameters
     ) == ("self", "intent", "plan")
+    assert tuple(
+        inspect.signature(BrokerExecutionComposition.resume_intent).parameters
+    ) == ("self", "intent", "plan", "context")
+    context_type = getattr(consumer, "BrokerIntentResumeContext")
+    assert dataclasses.is_dataclass(context_type)
+    assert context_type.__dataclass_params__.frozen
+    assert hasattr(context_type, "__slots__")
 
 
 def test_execution_composition_reuses_existing_dispatch_close_contract() -> None:
@@ -729,6 +818,298 @@ def test_restart_after_atomic_claim_cannot_reexecute_transaction_or_request() ->
     assert store.terminals == []
 
 
+def test_fresh_linux_store_and_consumer_resume_a_crashed_atomic_claim_once() -> None:
+    class SharedLinuxIntentFiles:
+        def __init__(self, name: str, payload: bytes) -> None:
+            self.files = {name: payload}
+            self.identities = {name: ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)}
+            self.labels = {
+                name: "system_u:object_r:codex_master_home_broker_state_t:s0"
+            }
+            self.parent = ObjectIdentity(8, 100, 0o40700, 0, 0, 2)
+            self.parent_label = "system_u:object_r:codex_master_home_broker_state_t:s0"
+            self.next_fd = 10
+            self.fd_names: dict[int, str] = {}
+            self.fd_identities: dict[int, ObjectIdentity] = {}
+            self.fd_labels: dict[int, str] = {}
+            self.fd_flags: dict[int, int] = {}
+            self.locked_fds: dict[int, tuple[int, int]] = {}
+            self.locked_identities: set[tuple[int, int]] = set()
+
+        def openat2(self, parent_fd: int, name: str, how: object) -> PinnedFd:
+            if name not in self.files:
+                raise FileNotFoundError
+            fd = self.next_fd
+            self.next_fd += 1
+            self.fd_names[fd] = name
+            self.fd_identities[fd] = self.identities[name]
+            self.fd_labels[fd] = self.labels[name]
+            self.fd_flags[fd] = getattr(how, "flags")
+            return PinnedFd(fd, self.fd_identities[fd])
+
+        def stat_fd(self, fd: int) -> ObjectIdentity:
+            return self.parent if fd == 7 else self.fd_identities[fd]
+
+        def selinux_label(self, fd: int) -> str:
+            return self.parent_label if fd == 7 else self.fd_labels[fd]
+
+        def list_names(self, parent_fd: int) -> tuple[str, ...]:
+            return tuple(sorted(self.files))
+
+        def read_all(self, fd: int) -> bytes:
+            return self.files[self.fd_names[fd]]
+
+        def write_all(self, fd: int, payload: bytes) -> None:
+            self.files[self.fd_names[fd]] = payload
+
+        def truncate(self, fd: int) -> None:
+            self.files[self.fd_names[fd]] = b""
+
+        def fsync(self, fd: int) -> None:
+            return None
+
+        def renameat2_noreplace(
+            self, parent_fd: int, old_name: str, new_name: str
+        ) -> None:
+            if new_name in self.files:
+                raise FileExistsError
+            self.files[new_name] = self.files.pop(old_name)
+            self.identities[new_name] = self.identities.pop(old_name)
+            self.labels[new_name] = self.labels.pop(old_name)
+            for fd, name in self.fd_names.items():
+                if name == old_name:
+                    self.fd_names[fd] = new_name
+
+        def lock_exclusive_nonblocking(self, fd: int) -> None:
+            identity = self.fd_identities[fd]
+            key = (identity.dev, identity.ino)
+            if key in self.locked_identities:
+                raise BlockingIOError
+            self.locked_identities.add(key)
+            self.locked_fds[fd] = key
+
+        def unlinkat(self, parent_fd: int, name: str) -> None:
+            self.files.pop(name, None)
+            self.identities.pop(name, None)
+            self.labels.pop(name, None)
+
+        def close(self, fd: int) -> None:
+            key = self.locked_fds.pop(fd, None)
+            if key is not None:
+                self.locked_identities.remove(key)
+            self.fd_names.pop(fd, None)
+            self.fd_identities.pop(fd, None)
+            self.fd_labels.pop(fd, None)
+            self.fd_flags.pop(fd, None)
+
+        def crash(self) -> None:
+            for fd in tuple(self.locked_fds):
+                self.close(fd)
+
+    class LocalResolver:
+        def __init__(self, plan: OfflineBrokerPlan) -> None:
+            self.plan = plan
+            self.intents: list[BrokerIntentV1] = []
+
+        def resolve_plan(self, intent: BrokerIntentV1) -> OfflineBrokerPlan:
+            self.intents.append(intent)
+            return self.plan
+
+    class LocalResumeExecution:
+        def __init__(self) -> None:
+            self.resume_calls: list[
+                tuple[BrokerIntentV1, OfflineBrokerPlan, object]
+            ] = []
+            self.execute_calls = 0
+            self.effects = 0
+
+        def execute_intent(
+            self, intent: BrokerIntentV1, plan: OfflineBrokerPlan
+        ) -> BrokerTransportResponse:
+            self.execute_calls += 1
+            raise AssertionError("recovered claims must not use fresh execution")
+
+        def resume_intent(
+            self, intent: BrokerIntentV1, plan: OfflineBrokerPlan, context: object
+        ) -> BrokerTransportResponse:
+            self.resume_calls.append((intent, plan, context))
+            assert getattr(context, "transaction_id") == intent.transaction_id
+            self.effects += 1
+            return _response(intent)
+
+        def execute(self, command: object) -> BrokerTransportResponse:
+            raise AssertionError("consumer must not invoke dispatch execute")
+
+        def close(self, fd: int) -> None:
+            raise AssertionError("successful recovery must not close response FDs")
+
+    intent = _intent()
+    final_name = "intent-00000000000000000007-" + intent.nonce + ".json"
+    operations = SharedLinuxIntentFiles(final_name, encode_broker_intent(intent))
+    parent_identity = BrokerIntentFileIdentity(
+        8, 100, 0o40700, 0, 0, 2, operations.parent_label
+    )
+    crashed_store = LinuxBrokerIntentStore(operations, 7, parent_identity)
+    claimed = crashed_store.claim_next()
+    assert claimed is not None
+    assert claimed.claim_name == ".claim-" + final_name
+    operations.crash()
+
+    recovered_store = LinuxBrokerIntentStore(operations, 7, parent_identity)
+    resolver = LocalResolver(_plan(intent))
+    execution = LocalResumeExecution()
+    result = consume_one_broker_intent(
+        recovered_store,
+        resolver,
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.SUCCEEDED
+    assert resolver.intents == [intent]
+    assert execution.execute_calls == 0
+    assert len(execution.resume_calls) == 1
+    resumed_intent, resumed_plan, context = execution.resume_calls[0]
+    assert resumed_intent == intent
+    assert resumed_plan is resolver.plan
+    assert getattr(context, "transaction_id") == intent.transaction_id
+    assert execution.effects == 1
+    assert operations.files == {
+        ".terminal-recover-intent-00000000000000000007-"
+        + intent.nonce
+        + ".json": b'{"result":"succeeded"}\n'
+    }
+    assert operations.locked_fds == {}
+
+
+def test_recovered_claim_resumes_the_same_intent_transaction_after_crash_before_wal() -> (
+    None
+):
+    assert "recovered" in BrokerIntentClaimBytes.__dataclass_fields__
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".recover-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+        recovered=True,
+    )
+    store = FakeStore(recoveries=[claim])
+    resolver = FakeResolver(_plan(intent))
+    execution = RecoveryStateExecution(intent, checkpoint=None)
+
+    result = consume_one_broker_intent(
+        store,
+        resolver,
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.SUCCEEDED
+    assert resolver.intents == [intent]
+    assert execution.execute_attempts == 0
+    assert len(execution.resume_calls) == 1
+    resumed_intent, resumed_plan, context = execution.resume_calls[0]
+    assert resumed_intent == intent
+    assert resumed_plan is resolver.plan
+    assert getattr(context, "transaction_id") == intent.transaction_id
+    assert execution.started_transaction_ids == [intent.transaction_id]
+    assert execution.effect_count == 1
+    assert store.terminals == [(claim.claim_name, b'{"result":"succeeded"}\n')]
+    assert store.releases == [claim.claim_name]
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    (*BrokerCheckpoint, "after_execution_before_terminal"),
+    ids=lambda checkpoint: (
+        checkpoint.value if type(checkpoint) is BrokerCheckpoint else checkpoint
+    ),
+)
+def test_recovered_claim_resumes_each_recorded_checkpoint_without_a_second_effect(
+    checkpoint: BrokerCheckpoint | str,
+) -> None:
+    assert "recovered" in BrokerIntentClaimBytes.__dataclass_fields__
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".recover-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+        recovered=True,
+    )
+    store = FakeStore(recoveries=[claim])
+    execution = RecoveryStateExecution(intent, checkpoint=checkpoint, effect_count=1)
+
+    result = consume_one_broker_intent(
+        store,
+        FakeResolver(_plan(intent)),
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.SUCCEEDED
+    assert execution.execute_attempts == 0
+    assert len(execution.resume_calls) == 1
+    assert execution.started_transaction_ids == []
+    assert execution.effect_count == 1
+    assert store.terminals == [(claim.claim_name, b'{"result":"succeeded"}\n')]
+
+
+@pytest.mark.parametrize("evidence", ("missing", "contradictory"))
+def test_recovered_claim_with_missing_or_contradictory_evidence_is_terminal_blocked_drift(
+    evidence: str,
+) -> None:
+    assert "recovered" in BrokerIntentClaimBytes.__dataclass_fields__
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".recover-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+        recovered=True,
+    )
+    store = FakeStore(recoveries=[claim])
+    execution = RecoveryStateExecution(intent, checkpoint=None, evidence=evidence)
+
+    result = consume_one_broker_intent(
+        store,
+        FakeResolver(_plan(intent)),
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.BLOCKED_DRIFT
+    assert execution.execute_attempts == 0
+    assert len(execution.resume_calls) == 1
+    assert execution.started_transaction_ids == []
+    assert execution.effect_count == 0
+    assert store.terminals == [(claim.claim_name, b'{"result":"blocked_drift"}\n')]
+    assert store.releases == [claim.claim_name]
+
+
+def test_recovered_claim_releases_its_lease_when_terminalization_fails() -> None:
+    assert "recovered" in BrokerIntentClaimBytes.__dataclass_fields__
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".recover-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+        recovered=True,
+    )
+    store = FakeStore(
+        recoveries=[claim], terminal_error=OSError("terminal write unavailable")
+    )
+
+    with pytest.raises(BrokerIntentConsumerError) as caught:
+        consume_one_broker_intent(
+            store,
+            FakeResolver(_plan(intent)),
+            RecoveryStateExecution(intent, checkpoint=None),
+            now_unix_ms=intent.created_at_unix_ms + 1,
+        )
+
+    assert caught.value.code is BrokerIntentConsumeCode.TERMINAL_WRITE_FAILED
+    assert store.releases == [claim.claim_name]
+
+
 def test_wrong_reply_type_is_terminal_execution_failure_without_restart_retry() -> None:
     intent = _intent()
     claim = BrokerIntentClaimBytes(
@@ -931,8 +1312,11 @@ def test_mismatched_reply_request_id_is_terminal_execution_failure() -> None:
     (
         ((73, 73, -1, True, "bad", 74), [73, 74]),
         ([75, 75, True, "bad"], [75]),
+        ({76, 76, -1, True, "bad", 77}, [76, 77]),
+        (frozenset((78, 78, -1, True, "bad", 79)), [78, 79]),
+        ({"fd": 80}, []),
     ),
-    ids=("invalid_entries", "invalid_container"),
+    ids=("tuple", "list", "set", "frozenset", "other_container"),
 )
 def test_rejected_response_closes_unique_valid_fds_without_masking_terminalization(
     fds: object, expected_closed: list[int]

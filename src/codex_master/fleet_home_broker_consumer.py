@@ -12,9 +12,13 @@ from codex_master.fleet_home_broker_intent import BrokerIntentV1
 from codex_master.fleet_home_broker_intent_store import (
     BrokerIntentStoreOperations,
     claim_broker_intent,
+    recover_broker_intent,
 )
 from codex_master.fleet_home_broker_protocol import (
+    BrokerObservation,
+    BrokerObjectState,
     BrokerReply,
+    BrokerRegistryState,
     BrokerResultCode,
     ChpbTransactionOperation,
     validate_chpb_message,
@@ -30,6 +34,7 @@ class BrokerIntentConsumeCode(str, Enum):
     RESOLVER_DRIFT = "resolver_drift"
     RESOLUTION_FAILED = "resolution_failed"
     EXECUTION_FAILED = "execution_failed"
+    BLOCKED_DRIFT = "blocked_drift"
     TERMINAL_WRITE_FAILED = "terminal_write_failed"
     INVALID_RESULT = "invalid_result"
 
@@ -55,6 +60,21 @@ class BrokerIntentConsumeResult:
             raise BrokerIntentConsumerError(BrokerIntentConsumeCode.INVALID_RESULT)
 
 
+@dataclass(frozen=True, slots=True)
+class BrokerIntentResumeContext:
+    """The exact fresh-state fact a recovery implementation must attest."""
+
+    transaction_id: str
+    initial_observation: BrokerObservation
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.transaction_id) is not str
+            or type(self.initial_observation) is not BrokerObservation
+        ):
+            raise BrokerIntentConsumerError(BrokerIntentConsumeCode.INVALID_RESULT)
+
+
 class BrokerIntentResolver(Protocol):
     def resolve_plan(self, intent: BrokerIntentV1) -> OfflineBrokerPlan: ...
 
@@ -64,12 +84,20 @@ class BrokerExecutionComposition(BrokerDispatchOperations, Protocol):
         self, intent: BrokerIntentV1, plan: OfflineBrokerPlan
     ) -> BrokerTransportResponse: ...
 
+    def resume_intent(
+        self,
+        intent: BrokerIntentV1,
+        plan: OfflineBrokerPlan,
+        context: BrokerIntentResumeContext,
+    ) -> BrokerTransportResponse: ...
+
 
 _TERMINAL_PAYLOADS = {
     BrokerIntentConsumeCode.SUCCEEDED: b'{"result":"succeeded"}\n',
     BrokerIntentConsumeCode.RESOLVER_DRIFT: b'{"result":"resolver_drift"}\n',
     BrokerIntentConsumeCode.RESOLUTION_FAILED: b'{"result":"resolution_failed"}\n',
     BrokerIntentConsumeCode.EXECUTION_FAILED: b'{"result":"execution_failed"}\n',
+    BrokerIntentConsumeCode.BLOCKED_DRIFT: b'{"result":"blocked_drift"}\n',
 }
 
 
@@ -112,28 +140,25 @@ def _mark_terminal(
         raise BrokerIntentConsumerError(BrokerIntentConsumeCode.TERMINAL_WRITE_FAILED)
 
 
-def _valid_execution_response(response: object, intent: BrokerIntentV1) -> bool:
+def _execution_result(
+    response: object, intent: BrokerIntentV1, *, recovered: bool
+) -> BrokerIntentConsumeCode | None:
     if type(response) is not BrokerTransportResponse or type(response.fds) is not tuple:
-        return False
+        return None
     if response.fds:
-        return False
+        return None
     try:
         reply = validate_chpb_message(response.reply)
         if type(reply) is not BrokerReply or reply.request_id != intent.request_id:
-            return False
+            return None
         status = reply.transaction
-        if (
-            reply.result is not BrokerResultCode.COMMITTED
-            or status is None
-            or status.terminal_result is not BrokerResultCode.COMMITTED
-        ):
-            return False
+        if status is None or status.binding.transaction_id != intent.transaction_id:
+            return None
         binding = status.binding
         principal = binding.principal
         policy = binding.policy
-        return (
+        if not (
             binding.operation is ChpbTransactionOperation(intent.operation.value)
-            and binding.transaction_id == intent.transaction_id
             and binding.store_uuid == intent.store_uuid
             and principal.agent_id == intent.agent_id
             and principal.manifest_generation == intent.manifest_generation
@@ -142,20 +167,35 @@ def _valid_execution_response(response: object, intent: BrokerIntentV1) -> bool:
             and principal.fencing_epoch == intent.fencing_epoch
             and policy.policy_generation == intent.policy_generation
             and policy.projection_digest == intent.projection_digest
-        )
+        ):
+            return None
+        if (
+            reply.result is BrokerResultCode.COMMITTED
+            and status.terminal_result is BrokerResultCode.COMMITTED
+        ):
+            return BrokerIntentConsumeCode.SUCCEEDED
+        if (
+            recovered
+            and reply.result is BrokerResultCode.BLOCKED_DRIFT
+            and status.terminal_result is BrokerResultCode.BLOCKED_DRIFT
+        ):
+            return BrokerIntentConsumeCode.BLOCKED_DRIFT
+        return None
     except Exception:
-        return False
+        return None
 
 
 def _response_fds(response: object) -> tuple[int, ...]:
     try:
         fds = response.fds
-        if type(fds) not in (tuple, list):
+        if type(fds) not in (tuple, list, set, frozenset):
             return ()
         valid = []
         for fd in fds:
             if type(fd) is int and fd >= 0 and fd not in valid:
                 valid.append(fd)
+        if type(fds) in (set, frozenset):
+            valid.sort()
         return tuple(valid)
     except Exception:
         return ()
@@ -171,6 +211,40 @@ def _close_response_fds(
             pass
 
 
+def _resume_context(intent: BrokerIntentV1) -> BrokerIntentResumeContext:
+    observations = {
+        ChpbTransactionOperation.PROVISION: BrokerObservation(
+            BrokerObjectState.ABSENT,
+            BrokerRegistryState.NOT_APPLICABLE,
+            0,
+        ),
+        ChpbTransactionOperation.REPLACE: BrokerObservation(
+            BrokerObjectState.REPLACEMENT_ORIGINAL,
+            BrokerRegistryState.NOT_APPLICABLE,
+            0,
+        ),
+        ChpbTransactionOperation.DEPROVISION: BrokerObservation(
+            BrokerObjectState.FINAL_COMPLETE,
+            BrokerRegistryState.NOT_APPLICABLE,
+            0,
+        ),
+    }
+    try:
+        operation = ChpbTransactionOperation(intent.operation.value)
+        return BrokerIntentResumeContext(intent.transaction_id, observations[operation])
+    except Exception:
+        raise BrokerIntentConsumerError(
+            BrokerIntentConsumeCode.INVALID_RESULT
+        ) from None
+
+
+def _release_claim(store: BrokerIntentStoreOperations, claim_name: str) -> None:
+    try:
+        store.release_claim(claim_name)
+    except Exception:
+        pass
+
+
 def consume_one_broker_intent(
     store: BrokerIntentStoreOperations,
     resolver: BrokerIntentResolver,
@@ -182,39 +256,54 @@ def consume_one_broker_intent(
 
     claimed = claim_broker_intent(store, now_unix_ms=now_unix_ms)
     if claimed is None:
+        claimed = recover_broker_intent(store, now_unix_ms=now_unix_ms)
+    if claimed is None:
         return BrokerIntentConsumeResult(BrokerIntentConsumeCode.EMPTY)
-    resolution_failed = False
     try:
-        plan = resolver.resolve_plan(claimed.intent)
-    except Exception:
-        resolution_failed = True
-        plan = None
-    if resolution_failed:
-        _mark_terminal(
-            store, claimed.claim_name, BrokerIntentConsumeCode.RESOLUTION_FAILED
-        )
-        return BrokerIntentConsumeResult(BrokerIntentConsumeCode.RESOLUTION_FAILED)
-    if not _plan_matches_intent(plan, claimed.intent):
-        _mark_terminal(
-            store, claimed.claim_name, BrokerIntentConsumeCode.RESOLVER_DRIFT
-        )
-        return BrokerIntentConsumeResult(BrokerIntentConsumeCode.RESOLVER_DRIFT)
-    execution_failed = False
-    response = None
-    try:
-        response = execution.execute_intent(claimed.intent, plan)
-        if not _valid_execution_response(response, claimed.intent):
+        resolution_failed = False
+        try:
+            plan = resolver.resolve_plan(claimed.intent)
+        except Exception:
+            resolution_failed = True
+            plan = None
+        if resolution_failed:
+            _mark_terminal(
+                store, claimed.claim_name, BrokerIntentConsumeCode.RESOLUTION_FAILED
+            )
+            return BrokerIntentConsumeResult(BrokerIntentConsumeCode.RESOLUTION_FAILED)
+        if not _plan_matches_intent(plan, claimed.intent):
+            _mark_terminal(
+                store, claimed.claim_name, BrokerIntentConsumeCode.RESOLVER_DRIFT
+            )
+            return BrokerIntentConsumeResult(BrokerIntentConsumeCode.RESOLVER_DRIFT)
+        execution_failed = False
+        response = None
+        outcome = None
+        try:
+            if claimed.recovered:
+                response = execution.resume_intent(
+                    claimed.intent, plan, _resume_context(claimed.intent)
+                )
+            else:
+                response = execution.execute_intent(claimed.intent, plan)
+            outcome = _execution_result(
+                response, claimed.intent, recovered=claimed.recovered
+            )
+            if outcome is None:
+                execution_failed = True
+        except Exception:
             execution_failed = True
-    except Exception:
-        execution_failed = True
-    if execution_failed:
-        _close_response_fds(execution, response)
-        _mark_terminal(
-            store, claimed.claim_name, BrokerIntentConsumeCode.EXECUTION_FAILED
-        )
-        return BrokerIntentConsumeResult(BrokerIntentConsumeCode.EXECUTION_FAILED)
-    _mark_terminal(store, claimed.claim_name, BrokerIntentConsumeCode.SUCCEEDED)
-    return BrokerIntentConsumeResult(BrokerIntentConsumeCode.SUCCEEDED)
+        if execution_failed:
+            _close_response_fds(execution, response)
+            _mark_terminal(
+                store, claimed.claim_name, BrokerIntentConsumeCode.EXECUTION_FAILED
+            )
+            return BrokerIntentConsumeResult(BrokerIntentConsumeCode.EXECUTION_FAILED)
+        assert outcome is not None
+        _mark_terminal(store, claimed.claim_name, outcome)
+        return BrokerIntentConsumeResult(outcome)
+    finally:
+        _release_claim(store, claimed.claim_name)
 
 
 __all__ = (
@@ -222,6 +311,7 @@ __all__ = (
     "BrokerIntentConsumeCode",
     "BrokerIntentConsumeResult",
     "BrokerIntentConsumerError",
+    "BrokerIntentResumeContext",
     "BrokerIntentResolver",
     "consume_one_broker_intent",
 )
