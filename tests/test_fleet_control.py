@@ -6,6 +6,8 @@ from codex_master.fleet_control import (
     FleetControlError,
     account_secret_args,
     account_upsert_args,
+    ollama_instance_plan_args,
+    parse_ollama_page,
     parse_fleet_page,
     series_apply_args,
     series_plan_args,
@@ -107,3 +109,89 @@ def test_series_builder_enforces_provider_runner_account_contract() -> None:
             model="model", account_id=None, enabled=True,
             expected_generation=4, confirmed_remove_ids=[],
         )
+
+
+def _ollama_models_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "model_count": 1,
+        "models": [
+            {
+                "ref": "llama-small",
+                "provider_model_id": "provider/llama-small",
+                "installed": True,
+                "hive_enabled": True,
+                "simple_only": True,
+                "capabilities": ["chat", "tools"],
+                "evidence_at_utc": "2026-08-30T12:00:00Z",
+            }
+        ],
+    }
+
+
+def _ollama_instances_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "generation": 7,
+        "instance_count": 1,
+        "instances": [
+            {
+                "ref": "quiet-runner",
+                "label": "Quiet Runner",
+                "host_ref": "control-host",
+                "selected_model_refs": ["llama-small"],
+                "allowed_cpus": "4-7",
+                "cpu_quota_percent": 350,
+                "cpu_weight": 40,
+                "lifecycle_state": "running",
+                "readiness_state": "ready",
+                "path_state": "configured_private",
+            }
+        ],
+    }
+
+
+def test_ollama_page_keeps_models_and_instances_separate() -> None:
+    state = parse_ollama_page(
+        _ollama_models_payload(), _ollama_instances_payload()
+    )
+
+    assert state.models[0].model_ref == "llama-small"
+    assert state.models[0].capabilities == ("chat", "tools")
+    assert state.instances[0].selected_model_refs == ("llama-small",)
+    assert "/usr/bin" not in repr(state)
+
+
+def test_ollama_page_discards_unknown_rows_with_bounded_error_counts() -> None:
+    models = _ollama_models_payload()
+    instances = _ollama_instances_payload()
+    models["models"] = [*models["models"], {"ref": "/private/model"}]  # type: ignore[index]
+    instances["instances"] = [*instances["instances"], {"ref": "broken"}]  # type: ignore[index]
+
+    state = parse_ollama_page(models, instances)
+
+    assert len(state.models) == 1
+    assert len(state.instances) == 1
+    assert state.rejected_model_count == 1
+    assert state.rejected_instance_count == 1
+
+
+def test_ollama_instance_args_preserve_exact_cpu_profile() -> None:
+    args = ollama_instance_plan_args(
+        ref="quiet-runner",
+        label="Quiet Runner",
+        host_ref="control-host",
+        ollama_executable="/usr/bin/ollama",
+        models_directory="/srv/ollama/models",
+        selected_model_refs=("llama-small", "qwen-small"),
+        allowed_cpus="4-7",
+        cpu_quota_percent=350,
+        cpu_weight=40,
+        expected_generation=7,
+        idempotency_key="request-one",
+    )
+
+    assert args["selected_model_refs"] == ["llama-small", "qwen-small"]
+    assert args["allowed_cpus"] == "4-7"
+    assert args["cpu_quota_percent"] == 350
+    assert args["cpu_weight"] == 40

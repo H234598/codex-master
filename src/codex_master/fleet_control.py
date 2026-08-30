@@ -14,9 +14,13 @@ MAX_SECRET_CHARS = 16 * 1024
 MAX_MODEL_CHARS = 200
 MAX_LABEL_CHARS = 120
 MAX_ID_CHARS = 64
+MAX_OLLAMA_MODELS = 256
+MAX_OLLAMA_INSTANCES = 64
 _ACCOUNT_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _PREFIX_RE = re.compile(r"[a-z]\Z")
 _ERROR_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_CONTROL_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_CPUSET_RE = re.compile(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*\Z")
 
 
 class FleetControlError(ValueError):
@@ -68,6 +72,41 @@ class FleetPageState:
         object.__setattr__(self, "error_code", _error(self.error_code))
 
 
+@dataclass(frozen=True, slots=True)
+class OllamaModelRow:
+    model_ref: str
+    provider_model_id: str
+    installed: bool
+    hive_enabled: bool
+    simple_only: bool
+    capabilities: tuple[str, ...]
+    evidence_at_utc: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaInstanceRow:
+    instance_ref: str
+    label: str
+    host_ref: str
+    selected_model_refs: tuple[str, ...]
+    allowed_cpus: str
+    cpu_quota_percent: int
+    cpu_weight: int
+    lifecycle_state: str
+    readiness_state: str
+    path_state: str
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaPageState:
+    generation: int
+    models: tuple[OllamaModelRow, ...]
+    instances: tuple[OllamaInstanceRow, ...]
+    rejected_model_count: int = 0
+    rejected_instance_count: int = 0
+    error_code: str | None = None
+
+
 def _mapping(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise FleetControlError("invalid_fleet_payload")
@@ -107,6 +146,23 @@ def _generation(payload: Mapping[str, object]) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise FleetControlError("invalid_fleet_generation")
     return value
+
+
+def _positive_integer(value: object, code: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 10000:
+        raise FleetControlError(code)
+    return value
+
+
+def _token_tuple(value: object, *, maximum: int, code: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= maximum:
+        raise FleetControlError(code)
+    result = tuple(
+        _text(item, maximum=MAX_MODEL_CHARS, code=code) for item in value
+    )
+    if len(set(result)) != len(result):
+        raise FleetControlError(code)
+    return result
 
 
 def _rows(payload: Mapping[str, object], key: str, maximum: int) -> list[Mapping[str, object]]:
@@ -196,6 +252,102 @@ def parse_fleet_page(accounts_payload: object, series_payload: object) -> FleetP
         except FleetControlError:
             continue
     return FleetPageState(generation, tuple(account_rows), tuple(series_rows))
+
+
+def parse_ollama_page(
+    models_payload: object, instances_payload: object
+) -> OllamaPageState:
+    models_raw = _mapping(models_payload)
+    instances_raw = _mapping(instances_payload)
+    generation = _generation(instances_raw)
+    model_rows: list[OllamaModelRow] = []
+    model_items = _rows(models_raw, "models", MAX_OLLAMA_MODELS)
+    rejected_models = min(MAX_OLLAMA_MODELS, len(models_raw.get("models", []))) - len(model_items) if isinstance(models_raw.get("models", []), list) else 0
+    for item in model_items:
+        try:
+            capabilities = _token_tuple(
+                item.get("capabilities"), maximum=16, code="invalid_ollama_model"
+            )
+            model_rows.append(
+                OllamaModelRow(
+                    _text(item.get("ref"), maximum=128, code="invalid_ollama_model"),
+                    _text(
+                        item.get("provider_model_id"),
+                        maximum=MAX_MODEL_CHARS,
+                        code="invalid_ollama_model",
+                    ),
+                    _bool(item.get("installed"), "invalid_ollama_model"),
+                    _bool(item.get("hive_enabled"), "invalid_ollama_model"),
+                    _bool(item.get("simple_only"), "invalid_ollama_model"),
+                    capabilities,
+                    _optional_text(
+                        item.get("evidence_at_utc"),
+                        maximum=40,
+                        code="invalid_ollama_model",
+                    ),
+                )
+            )
+        except FleetControlError:
+            rejected_models += 1
+    instance_rows: list[OllamaInstanceRow] = []
+    instance_items = _rows(instances_raw, "instances", MAX_OLLAMA_INSTANCES)
+    rejected_instances = min(MAX_OLLAMA_INSTANCES, len(instances_raw.get("instances", []))) - len(instance_items) if isinstance(instances_raw.get("instances", []), list) else 0
+    for item in instance_items:
+        try:
+            allowed_cpus = _text(
+                item.get("allowed_cpus"), maximum=256, code="invalid_ollama_instance"
+            )
+            if _CPUSET_RE.fullmatch(allowed_cpus) is None:
+                raise FleetControlError("invalid_ollama_instance")
+            instance_rows.append(
+                OllamaInstanceRow(
+                    _text(item.get("ref"), maximum=128, code="invalid_ollama_instance"),
+                    _text(
+                        item.get("label"),
+                        maximum=MAX_LABEL_CHARS,
+                        code="invalid_ollama_instance",
+                    ),
+                    _text(
+                        item.get("host_ref"), maximum=128, code="invalid_ollama_instance"
+                    ),
+                    _token_tuple(
+                        item.get("selected_model_refs"),
+                        maximum=64,
+                        code="invalid_ollama_instance",
+                    ),
+                    allowed_cpus,
+                    _positive_integer(
+                        item.get("cpu_quota_percent"), "invalid_ollama_instance"
+                    ),
+                    _positive_integer(
+                        item.get("cpu_weight"), "invalid_ollama_instance"
+                    ),
+                    _text(
+                        item.get("lifecycle_state"),
+                        maximum=32,
+                        code="invalid_ollama_instance",
+                    ),
+                    _text(
+                        item.get("readiness_state"),
+                        maximum=32,
+                        code="invalid_ollama_instance",
+                    ),
+                    _text(
+                        item.get("path_state"),
+                        maximum=32,
+                        code="invalid_ollama_instance",
+                    ),
+                )
+            )
+        except FleetControlError:
+            rejected_instances += 1
+    return OllamaPageState(
+        generation,
+        tuple(model_rows),
+        tuple(instance_rows),
+        rejected_models,
+        rejected_instances,
+    )
 
 
 def _expected_generation(value: object) -> int:
@@ -292,3 +444,65 @@ def series_apply_args(
         account_id=account_id, enabled=enabled, expected_generation=expected_generation,
         confirmed_remove_ids=confirmed_remove_ids,
     )
+
+
+def ollama_instance_plan_args(
+    *,
+    ref: str,
+    label: str,
+    host_ref: str,
+    ollama_executable: str,
+    models_directory: str,
+    selected_model_refs: list[str] | tuple[str, ...],
+    allowed_cpus: str,
+    cpu_quota_percent: int,
+    cpu_weight: int,
+    expected_generation: int,
+    idempotency_key: str,
+) -> dict[str, object]:
+    ref = _text(ref, maximum=128, code="invalid_ollama_instance")
+    host_ref = _text(host_ref, maximum=128, code="invalid_ollama_instance")
+    idempotency_key = _text(
+        idempotency_key, maximum=128, code="invalid_ollama_instance"
+    )
+    allowed_cpus = _text(
+        allowed_cpus, maximum=256, code="invalid_ollama_instance"
+    )
+    if (
+        _CONTROL_TOKEN_RE.fullmatch(ref) is None
+        or _CONTROL_TOKEN_RE.fullmatch(host_ref) is None
+        or _CONTROL_TOKEN_RE.fullmatch(idempotency_key) is None
+        or _CPUSET_RE.fullmatch(allowed_cpus) is None
+    ):
+        raise FleetControlError("invalid_ollama_instance")
+    executable = _text(
+        ollama_executable, maximum=1024, code="invalid_ollama_instance"
+    )
+    model_root = _text(
+        models_directory, maximum=1024, code="invalid_ollama_instance"
+    )
+    if not executable.startswith("/") or not model_root.startswith("/"):
+        raise FleetControlError("invalid_ollama_instance")
+    return {
+        "ref": ref,
+        "label": _text(
+            label, maximum=MAX_LABEL_CHARS, code="invalid_ollama_instance"
+        ),
+        "host_ref": host_ref,
+        "ollama_executable": executable,
+        "models_directory": model_root,
+        "selected_model_refs": list(
+            _token_tuple(
+                selected_model_refs,
+                maximum=64,
+                code="invalid_ollama_instance",
+            )
+        ),
+        "allowed_cpus": allowed_cpus,
+        "cpu_quota_percent": _positive_integer(
+            cpu_quota_percent, "invalid_ollama_instance"
+        ),
+        "cpu_weight": _positive_integer(cpu_weight, "invalid_ollama_instance"),
+        "expected_generation": _expected_generation(expected_generation),
+        "idempotency_key": idempotency_key,
+    }
