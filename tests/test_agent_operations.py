@@ -190,6 +190,21 @@ def test_queue_limit_is_1024_records(tmp_path: Path) -> None:
         store.enqueue(operation_request(key="request-over-limit"))
 
 
+def test_enqueue_idempotent_retry_at_capacity_returns_existing_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import codex_master.agent_operations as operations
+
+    monkeypatch.setattr(operations, "MAX_AGENT_OPERATION_RECORDS", 2)
+    store = store_at(tmp_path)
+    first = store.enqueue(operation_request(key="request-one"))
+    store.enqueue(operation_request(key="request-two"))
+
+    assert store.enqueue(operation_request(key="request-one")) == first
+    with pytest.raises(AgentOperationError, match="host.operation_limit"):
+        store.enqueue(operation_request(key="request-three"))
+
+
 def test_poll_no_work_and_monotone_epoch(tmp_path: Path) -> None:
     store = store_at(tmp_path)
 
@@ -253,6 +268,67 @@ def test_repeated_completion_is_idempotent_but_conflict_is_rejected(
         store.complete(principal(), conflict)
 
     assert store.get(lease.operation_id) == completed
+
+
+def test_terminal_completion_replay_validates_original_lease_fences(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    lease = lease_one(store)
+    receipt = receipt_for(lease)
+    completed = store.complete(principal(), receipt)
+    forged = AgentReceiptV1(
+        receipt.operation_id,
+        "lease-forged",
+        receipt.lease_epoch,
+        receipt.attempt,
+        receipt.plan_digest,
+        receipt.arguments_digest,
+        receipt.state,
+        receipt.reason_codes,
+        receipt.result_digest,
+        receipt.result,
+    )
+
+    with pytest.raises(AgentOperationError, match="host.identity_mismatch"):
+        store.complete(principal("worker-two"), receipt)
+    with pytest.raises(AgentOperationError, match="host.lease_stale"):
+        store.complete(principal(), forged)
+
+    assert store.get(lease.operation_id) == completed
+
+
+def test_completion_after_durable_lease_deadline_is_stale(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    lease = lease_one(store)
+    before = store.get(lease.operation_id)
+    clock.advance(seconds=31)
+
+    with pytest.raises(AgentOperationError, match="host.lease_stale"):
+        store.complete(principal(), receipt_for(lease))
+
+    assert store.get(lease.operation_id) == before
+
+
+def test_receipt_result_kind_action_must_match_operation_before_mutation(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    lease = lease_one(store)
+    before = store.get(lease.operation_id)
+    mismatched_result = AgentResultV1(
+        "ollama.instance",
+        "probe",
+        {"ready": True, "instance_ref": "ollama-main"},
+    )
+
+    with pytest.raises(AgentOperationError, match="host.result_mismatch"):
+        store.complete(principal(), receipt_for(lease, result=mismatched_result))
+
+    assert store.get(lease.operation_id) == before
 
 
 def test_master_restart_recovers_queued_and_leased_operations(tmp_path: Path) -> None:

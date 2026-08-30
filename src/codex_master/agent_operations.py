@@ -306,8 +306,6 @@ class AgentOperationStore:
         with self._state.locked():
             document = self._read_locked()
             records = document["operations"]
-            if len(records) >= MAX_AGENT_OPERATION_RECORDS:
-                _raise("host.operation_limit")
             arguments = cast(dict[str, object], _public_json(request.arguments))
             arguments_digest = _canonical_digest(arguments)
             for record in records:
@@ -322,6 +320,8 @@ class AgentOperationStore:
                 ):
                     _raise("host.idempotency_conflict")
                 return self._view(record)
+            if len(records) >= MAX_AGENT_OPERATION_RECORDS:
+                _raise("host.operation_limit")
             record: dict[str, Any] = {
                 "operation_id": self._new_operation_id(records),
                 "key": request.key,
@@ -414,13 +414,22 @@ class AgentOperationStore:
             record = self._find(document["operations"], receipt.operation_id)
             existing = record["completion"]
             if record["state"] in _TERMINAL_STATES:
+                if type(record["lease"]) is not dict:
+                    _raise("host.lease_stale")
+                self._validate_receipt_fences(
+                    principal, receipt, record, record["lease"], check_deadline=False
+                )
+                if record["state"] != receipt.state:
+                    _raise("host.completion_conflict")
                 if existing == self._completion_doc(receipt):
                     return self._view(record)
                 _raise("host.completion_conflict")
             if record["state"] != "leased" or type(record["lease"]) is not dict:
                 _raise("host.lease_stale")
             lease = record["lease"]
-            self._validate_receipt_fences(principal, receipt, record, lease)
+            self._validate_receipt_fences(
+                principal, receipt, record, lease, check_deadline=True
+            )
             record["state"] = receipt.state
             record["completion"] = self._completion_doc(receipt)
             self._write_locked(document)
@@ -637,6 +646,8 @@ class AgentOperationStore:
         receipt: AgentReceiptV1,
         record: Mapping[str, Any],
         lease: Mapping[str, object],
+        *,
+        check_deadline: bool,
     ) -> None:
         if principal.host_ref != lease["host_ref"]:
             _raise("host.identity_mismatch")
@@ -652,6 +663,10 @@ class AgentOperationStore:
             _raise("host.plan_digest_mismatch")
         if receipt.arguments_digest != record["arguments_digest"]:
             _raise("host.arguments_digest_mismatch")
+        if receipt.result.kind != record["kind"] or receipt.result.action != record["action"]:
+            _raise("host.result_mismatch")
+        if check_deadline and _parse_time(lease["deadline"]) <= self._now():
+            _raise("host.lease_stale")
 
     @staticmethod
     def _completion_doc(receipt: AgentReceiptV1) -> dict[str, object]:
