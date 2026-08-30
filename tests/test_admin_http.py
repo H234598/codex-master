@@ -411,6 +411,21 @@ def test_documented_rest_queries_bind_exact_operation(
     )
 
 
+def test_documented_rest_response_keeps_exact_service_contract(tmp_path) -> None:
+    class ContractService(_Service):
+        def handle(self, principal, request, **_kwargs):
+            self.calls.append((principal, request))
+            return {"accounts": []}
+
+    with _running_server(tmp_path, service=ContractService()) as (server, _service):
+        status, _headers_out, payload = _request(
+            server, "GET", "/admin/v1/google/accounts", b"", _headers()
+        )
+
+    assert status == 200
+    assert json.loads(payload) == {"schema_version": 1, "accounts": []}
+
+
 @pytest.mark.parametrize(
     ("target", "operation", "arguments", "extra"),
     [
@@ -546,7 +561,7 @@ def test_documented_rest_commands_bind_route_identity(
         )
 
     assert status == 200
-    assert json.loads(payload)["operation"] == operation
+    assert json.loads(payload)["schema_version"] == 1
     assert service.calls[0][1] == AdminRequestV1(
         operation,
         arguments,

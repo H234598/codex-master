@@ -567,7 +567,8 @@ class _AdminHandler(BaseHTTPRequestHandler):
     def _wire_result(
         self, request: AdminRequestV1, result: Mapping[str, object]
     ) -> dict[str, object]:
-        return {"schema_version": 1, "operation": request.operation, **result}
+        del request
+        return {"schema_version": 1, **result}
 
     def _reply_auth_error(self, error: AdminAuthError) -> None:
         status = 401 if error.code == "authority.identity_invalid" else 403
