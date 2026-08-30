@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import runpy
+import errno
 from datetime import UTC, datetime
 from pathlib import Path
 import stat
@@ -14,12 +15,12 @@ from codex_master.hive import hourly_probe as hourly_probe_module
 from codex_master.hive.hourly_probe import (
     DETERMINISTIC_PROBE_HOURS_UTC,
     MAX_PROBE_AGE_SECONDS,
-    build_hive_probe_alarm,
     evaluate,
     probe_spawn_gate,
     read_probe_gate,
     run_probe,
 )
+from codex_master.runtime_layout import RuntimeLayout
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,11 +29,26 @@ NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 
 def green_probe(checked_at: str) -> dict[str, object]:
     return {
+        "schema_version": 2,
         "functional": True,
-        "checks": {"namespace": True, "plugin": True, "hive_runtime": True, "hive_doctor": True},
-        "alarm": None,
+        "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True},
         "checked_at": checked_at,
-        "commands": {"namespace": True, "plugin": True, "hive_status": True, "hive_doctor": True},
+        "commands": {"runtime_status": True, "hive_status": True, "hive_doctor": True},
+    }
+
+
+def green_runtime_status() -> dict[str, object]:
+    return {
+        "ok": True,
+        "metadata": {"ok": True, "reason_code": "ok"},
+        "mcp_surface": {
+            "ok": True,
+            "initialize": True,
+            "tools_list": True,
+            "tool_count": 1,
+            "reason_code": "ok",
+        },
+        "raw_output": "not_returned",
     }
 
 
@@ -55,26 +71,47 @@ def green_hive_runtime() -> dict[str, object]:
     }
 
 
-def test_probe_evaluation_is_fail_closed_and_emits_hive_wide_alarm_without_secrets() -> None:
-    marker = "local-secret-path-account-token"
+def runtime_layout(tmp_path: Path) -> RuntimeLayout:
+    root = tmp_path / "codex-master-runtime"
+    root.mkdir(mode=0o700)
+
+    def write(relative: str, content: str, mode: int = 0o644) -> None:
+        path = root / relative
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        path.chmod(mode)
+
+    write("bin/codex-master-mcp", "#!/bin/sh\nexit 0\n", 0o755)
+    write("bin/codex-master-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
+    write(
+        ".codex-plugin/plugin.json",
+        json.dumps({"name": "codex-master", "version": "0", "skills": "./skills/", "mcpServers": "./.mcp.json", "apps": "./.app.json", "hooks": "./hooks/hooks.json"}),
+    )
+    write(".mcp.json", json.dumps({"mcpServers": {"codex-master-mcp": {"command": "./bin/codex-master-mcp", "args": []}}}))
+    write(".app.json", json.dumps({"apps": {"codex-master": {}}}))
+    write("hooks/hooks.json", json.dumps({"hooks": {}}))
+    write("skills/codex-master-fleet/SKILL.md", "---\nname: codex-master-fleet\n---\n")
+    write("codex-hive.json", "{}")
+    write("codex-agent-classes.json", "{}")
+    for path in root.rglob("*"):
+        if path.is_dir():
+            path.chmod(0o700)
+    return RuntimeLayout.from_runtime_root(root)
+
+
+def test_probe_evaluation_is_fail_closed_for_runtime_status_and_hive_evidence() -> None:
     result = evaluate(
-        {"ok": True, "namespace_ready": True},
-        {"ok": True},
-        {"mode": "shadow", "authority": "fail_closed", "state": marker},
+        {"ok": False},
+        {"mode": "shadow", "authority": "fail_closed", "state": "not_configured"},
         {"healthy": True, "checks": {"authority": "fail_closed", "repository": "not_configured", "state": "not_configured"}},
     )
 
     assert result["functional"] is False
     assert result["checks"] == {
-        "namespace": True,
-        "plugin": True,
+        "runtime_layout": False,
         "hive_runtime": False,
         "hive_doctor": False,
     }
-    assert result["alarm"]["scope"] == "hive"
-    assert result["alarm"]["route"] == ["queen-codex-master", "active_queen", "native_recovery_queen"]
-    assert result["alarm"]["token_telemetry"] == "unknown"
-    assert marker not in json.dumps(result, sort_keys=True)
 
 
 def test_probe_evaluation_requires_all_canonical_hive_evidence_fields() -> None:
@@ -86,14 +123,12 @@ def test_probe_evaluation_requires_all_canonical_hive_evidence_fields() -> None:
     for missing in base:
         hive = {key: value for key, value in base.items() if key != missing}
         result = evaluate(
-            {"ok": True, "namespace_ready": True},
-            {"ok": True},
+            green_runtime_status(),
             hive,
             doctor,
         )
         assert result["functional"] is False
         assert result["checks"]["hive_runtime"] is False
-        assert result["alarm"]["scope"] == "hive"
 
 
 def test_probe_evaluation_rejects_unknown_canonical_hive_evidence_states() -> None:
@@ -105,18 +140,15 @@ def test_probe_evaluation_rejects_unknown_canonical_hive_evidence_states() -> No
 
     for field in ("authority", "repository", "principal", "state", "pilot"):
         result = evaluate(
-            {"ok": True, "namespace_ready": True},
-            {"ok": True},
+            green_runtime_status(),
             {**base, field: "unexpected"},
             doctor,
         )
         assert result["functional"] is False
         assert result["checks"]["hive_runtime"] is False
-        assert result["alarm"]["scope"] == "hive"
 
     result = evaluate(
-        {"ok": True, "namespace_ready": True},
-        {"ok": True},
+        green_runtime_status(),
         {**base, "unexpected": "field"},
         doctor,
     )
@@ -124,29 +156,19 @@ def test_probe_evaluation_rejects_unknown_canonical_hive_evidence_states() -> No
     assert result["checks"]["hive_runtime"] is False
 
 
-def test_probe_alarm_is_bounded_and_data_sparse() -> None:
-    alarm = build_hive_probe_alarm(("hive_runtime_unavailable", "hive_doctor_unavailable"))
-    assert alarm == {
-        "schema_version": 1,
-        "scope": "hive",
-        "event": "hourly_probe_failed",
-        "reason_codes": ["hive_runtime_unavailable", "hive_doctor_unavailable"],
-        "route": ["queen-codex-master", "active_queen", "native_recovery_queen"],
-        "token_telemetry": "unknown",
-        "raw_output": "not_returned",
-    }
-
-
 def test_probe_has_exactly_eight_deterministic_utc_slots() -> None:
     assert DETERMINISTIC_PROBE_HOURS_UTC == (0, 3, 6, 9, 12, 15, 18, 21)
     assert len(DETERMINISTIC_PROBE_HOURS_UTC) == 8
 
 
-def test_spawn_gate_rejects_red_missing_stale_and_ambiguous_probe_records() -> None:
+def test_spawn_gate_accepts_only_a_fresh_complete_green_v2_record() -> None:
     fresh = green_probe(NOW.isoformat())
     assert probe_spawn_gate(fresh, now=NOW)["allowed"] is True
     assert probe_spawn_gate({"functional": True}, now=NOW)["reason_code"] == "probe_ambiguous"
     assert probe_spawn_gate({**fresh, "functional": False}, now=NOW)["reason_code"] == "probe_red"
+    assert probe_spawn_gate({**fresh, "checks": {"runtime_layout": True, "hive_runtime": True}}, now=NOW)["allowed"] is False
+    assert probe_spawn_gate({**fresh, "schema_version": 1}, now=NOW)["allowed"] is False
+    assert probe_spawn_gate({**fresh, "commands": {**fresh["commands"], "runtime_status": False}}, now=NOW)["allowed"] is False
     stale = NOW.replace(hour=0).isoformat()
     assert probe_spawn_gate(green_probe(stale), now=NOW)["reason_code"] == "probe_stale"
     assert MAX_PROBE_AGE_SECONDS == 4 * 60 * 60
@@ -166,14 +188,12 @@ def test_spawn_gate_reads_only_private_state_and_never_creates_missing_state(tmp
     assert result["reason_code"] == "probe_invalid"
 
 
-def test_run_probe_persists_bounded_health_and_replaces_stale_alarm(tmp_path: Path) -> None:
+def test_run_probe_persists_only_one_schema_v2_health_record(tmp_path: Path) -> None:
     state_directory = tmp_path / "state"
-    command = tmp_path / "repo" / "bin" / "codex-master-mcp"
-    command.parent.mkdir(parents=True)
+    layout = runtime_layout(tmp_path)
     calls: list[tuple[str, ...]] = []
     green = {
-        "namespace-status": ({"ok": True, "namespace_ready": True}, True),
-        "plugin-status": ({"ok": True}, True),
+        "hive runtime-status": (green_runtime_status(), True),
         "hive status": (
             green_hive_runtime(),
             True,
@@ -189,49 +209,37 @@ def test_run_probe_persists_bounded_health_and_replaces_stale_alarm(tmp_path: Pa
         return green[" ".join(arguments)]
 
     result = run_probe(
-        repository=tmp_path / "repo",
-        command=command,
+        layout=layout,
         state_directory=state_directory,
         now=lambda: NOW,
         runner=runner,
     )
     assert result["functional"] is True
-    assert calls == [("namespace-status",), ("plugin-status",), ("hive", "status"), ("hive", "doctor")]
+    assert result["schema_version"] == 2
+    assert calls == [("hive", "runtime-status"), ("hive", "status"), ("hive", "doctor")]
     assert read_probe_gate(state_file=state_directory / "hive-hourly-health.json", now=NOW)["allowed"] is True
-    assert (state_directory / "hive-functional").is_file()
-    assert (state_directory / "hive-functional").read_text(encoding="utf-8") == NOW.isoformat() + "\n"
+    assert not (state_directory / "hive-functional").exists()
+    assert not (state_directory / "hive-hourly-alarm.json").exists()
 
     def red_runner(_command: Path, *arguments: str) -> tuple[dict[str, object], bool]:
-        if arguments == ("namespace-status",):
-            return {"ok": False, "namespace_ready": False}, True
+        if arguments == ("hive", "runtime-status"):
+            return {"ok": False}, True
         return green[" ".join(arguments)]
 
     result = run_probe(
-        repository=tmp_path / "repo",
-        command=command,
+        layout=layout,
         state_directory=state_directory,
         now=lambda: NOW,
         runner=red_runner,
     )
     assert result["functional"] is False
-    assert (state_directory / "hive-hourly-alarm.json").is_file()
     assert not (state_directory / "hive-functional").exists()
+    assert not (state_directory / "hive-hourly-alarm.json").exists()
 
 
-def test_tracked_probe_source_and_timer_contract_are_installable() -> None:
-    source = ROOT / "systemd" / "libexec" / "codex_master_hive_hourly_probe.py"
+def test_hourly_probe_unit_runs_only_the_runtime_image_entrypoint() -> None:
     timer = ROOT / "systemd" / "user" / "codex-master-hive-hourly-probe.timer"
     service = ROOT / "systemd" / "user" / "codex-master-hive-hourly-probe.service"
-    assert source.is_file() and not source.is_symlink()
-    assert stat.S_IMODE(source.stat().st_mode) == 0o755
-    index = subprocess.run(
-        ["git", "ls-files", "-s", "systemd/libexec/codex_master_hive_hourly_probe.py"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert index.stdout.startswith("100755 ")
     timer_text = timer.read_text(encoding="utf-8")
     service_text = service.read_text(encoding="utf-8")
     assert "OnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00" in timer_text
@@ -241,17 +249,11 @@ def test_tracked_probe_source_and_timer_contract_are_installable() -> None:
     assert "%h/codex-master/bin/codex-master-mcp" not in service_text
     assert "%h/codex-master/codex-agent-classes.json" not in service_text
     assert "%h/codex-master/codex-hive.json" not in service_text
-    assert (
-        "BindReadOnlyPaths=%h/.local/libexec/"
-        "codex_master_hive_hourly_probe.py:%h/.local/libexec/"
-        "codex_master_hive_hourly_probe.py:norbind"
-    ) in service_text
-    assert (
-        "%h/.local/lib/codex-master-hive-probe:%h/.local/lib/"
-        "codex-master-hive-probe:norbind"
-    ) in service_text
+    assert "%h/.local/lib/codex-master-runtime:%h/.local/lib/codex-master-runtime:norbind" in service_text
     assert "BindPaths=%h/.local/state/codex-master-mcp:%h/.local/state/codex-master-mcp:norbind" in service_text
-    assert "ExecStart=%h/.local/libexec/codex_master_hive_hourly_probe.py --json" in service_text
+    assert "ExecStart=%h/.local/lib/codex-master-runtime/bin/codex-master-hive-hourly-probe --json" in service_text
+    assert "libexec" not in service_text
+    assert "codex-master-hive-probe" not in service_text
 
 
 def test_hourly_probe_direct_entrypoint_requires_json_mode(
@@ -260,20 +262,19 @@ def test_hourly_probe_direct_entrypoint_requires_json_mode(
     monkeypatch.setattr(
         hourly_probe_module,
         "run_probe",
-        lambda: {"functional": True, "checks": {"hive_runtime": True}, "alarm": None},
+        lambda: {"functional": True, "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True}},
     )
 
     assert hourly_probe_module.main(["--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {
-        "alarm": None,
-        "checks": {"hive_runtime": True},
+        "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True},
         "functional": True,
     }
     assert hourly_probe_module.main([]) == 2
     assert capsys.readouterr().out == ""
 
 
-def test_probe_cold_installer_materializes_an_autonomous_regular_host_tree(
+def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
@@ -285,7 +286,8 @@ def test_probe_cold_installer_materializes_an_autonomous_regular_host_tree(
         text=True,
     )
     assert installed.returncode == 0, installed.stderr
-    entrypoint = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
+    runtime_root = home / ".local" / "lib" / "codex-master-runtime"
+    entrypoint = runtime_root / "bin" / "codex-master-hive-hourly-probe"
     entrypoint_stat = entrypoint.lstat()
     assert stat.S_ISREG(entrypoint_stat.st_mode)
     assert not entrypoint.is_symlink()
@@ -294,25 +296,39 @@ def test_probe_cold_installer_materializes_an_autonomous_regular_host_tree(
     assert stat.S_IMODE(
         (home / ".config" / "systemd" / "user" / "codex-master-hive-hourly-probe.service").stat().st_mode
     ) == 0o644
-    install_root = home / ".local" / "lib" / "codex-master-hive-probe"
-    installed_cli = install_root / "bin" / "codex-master-mcp"
-    installed_source = install_root / "src" / "codex_master" / "hive" / "hourly_probe.py"
+    installed_cli = runtime_root / "bin" / "codex-master-mcp"
+    installed_source = runtime_root / "src" / "codex_master" / "hive" / "hourly_probe.py"
     for path, mode in (
         (installed_cli, 0o755),
         (installed_source, 0o644),
-        (install_root / "codex-hive.json", 0o644),
-        (install_root / "codex-agent-classes.json", 0o644),
+        (runtime_root / ".codex-plugin" / "plugin.json", 0o644),
+        (runtime_root / ".mcp.json", 0o644),
+        (runtime_root / ".app.json", 0o644),
+        (runtime_root / "hooks" / "hooks.json", 0o644),
+        (runtime_root / "skills" / "codex-master-fleet" / "SKILL.md", 0o644),
+        (runtime_root / "codex-hive.json", 0o644),
+        (runtime_root / "codex-agent-classes.json", 0o644),
     ):
         item = path.lstat()
         assert stat.S_ISREG(item.st_mode)
         assert not path.is_symlink()
         assert stat.S_IMODE(item.st_mode) == mode
-    assert not any(path.is_symlink() for path in install_root.rglob("*"))
+    assert not any(path.is_symlink() for path in runtime_root.rglob("*"))
+    assert stat.S_IMODE(runtime_root.lstat().st_mode) == 0o700
+    for path in runtime_root.rglob("*"):
+        item = path.lstat()
+        if stat.S_ISDIR(item.st_mode):
+            assert stat.S_IMODE(item.st_mode) == 0o700
+        else:
+            assert stat.S_ISREG(item.st_mode)
+            assert item.st_nlink == 1
+    assert not (home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py").exists()
+    assert not (home / ".local" / "lib" / "codex-master-hive-probe").exists()
+    assert not (home / ".local" / "bin" / "codex-master-mcp").exists()
 
     environment = {
         "HOME": str(home),
         "PATH": "/usr/bin:/bin",
-        "CODEX_MASTER_MCP_STATE": str(home / ".local" / "state" / "codex-master-mcp"),
     }
     completed = subprocess.run(
         [entrypoint, "--json"],
@@ -323,12 +339,24 @@ def test_probe_cold_installer_materializes_an_autonomous_regular_host_tree(
         cwd=tmp_path,
     )
     assert completed.returncode in {0, 1}, completed.stderr
-    assert set(json.loads(completed.stdout)) == {"alarm", "checks", "functional"}
+    assert set(json.loads(completed.stdout)) == {"checks", "functional"}
+    runtime_status = subprocess.run(
+        [installed_cli, "hive", "runtime-status"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=tmp_path,
+    )
+    assert runtime_status.returncode == 0, runtime_status.stderr
+    assert json.loads(runtime_status.stdout)["ok"] is True
     health = home / ".local" / "state" / "codex-master-mcp" / "hive-hourly-health.json"
     health_stat = health.lstat()
     assert stat.S_ISREG(health_stat.st_mode)
     assert not health.is_symlink()
     assert stat.S_IMODE(health_stat.st_mode) == 0o600
+    assert json.loads(health.read_text(encoding="utf-8"))["checks"]["runtime_layout"] is True
+    assert not list(runtime_root.rglob("__pycache__"))
 
 
 def test_installer_source_reader_is_no_follow_descriptor_bounded(tmp_path: Path) -> None:
@@ -352,15 +380,119 @@ def test_installer_source_reader_is_no_follow_descriptor_bounded(tmp_path: Path)
     )
 
 
+def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    observed: list[tuple[str, ...]] = []
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.append(tuple(command))
+        diagnostic = command[-1]
+        payload: dict[str, object] = {"status": "ready"}
+        if diagnostic == "runtime-status":
+            payload = {"ok": True}
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(installer["subprocess"], "run", run)
+    installer["_validate_runtime_image_stage"](stage=stage, home=tmp_path / "home")
+
+    entrypoint = str(stage / "bin" / "codex-master-mcp")
+    assert observed == [
+        (entrypoint, "hive", "runtime-status"),
+        (entrypoint, "hive", "status"),
+        (entrypoint, "hive", "doctor"),
+    ]
+
+
+def test_runtime_image_publish_failure_leaves_the_previous_complete_image_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
+    install_error = installer["InstallError"]
+    library = tmp_path / "lib"
+    library.mkdir(mode=0o700)
+    target = library / "codex-master-runtime"
+    target.mkdir(mode=0o700)
+    (target / "old-complete-image").write_text("old\n", encoding="utf-8")
+    stage = library / ".codex-master-runtime.stage.test"
+    stage.mkdir(mode=0o700)
+    (stage / "new-complete-image").write_text("new\n", encoding="utf-8")
+
+    def renameat2(*_args: object) -> int:
+        return -1
+
+    class FailedExchange:
+        pass
+
+    failed_exchange = FailedExchange()
+    failed_exchange.renameat2 = renameat2  # type: ignore[attr-defined]
+    monkeypatch.setattr(installer["ctypes"], "CDLL", lambda *_args, **_kwargs: failed_exchange)
+    monkeypatch.setattr(installer["ctypes"], "get_errno", lambda: errno.EIO)
+
+    with pytest.raises(install_error, match="install_swap_failed"):
+        installer["_publish_runtime_image"](stage=stage, target=target)
+
+    assert (target / "old-complete-image").read_text(encoding="utf-8") == "old\n"
+    assert not (target / "new-complete-image").exists()
+    assert (stage / "new-complete-image").read_text(encoding="utf-8") == "new\n"
+
+
+def test_runtime_image_build_failure_never_publishes_a_partial_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
+    install_error = installer["InstallError"]
+    library = tmp_path / "lib"
+    library.mkdir(mode=0o700)
+    target = library / "codex-master-runtime"
+    target.mkdir(mode=0o700)
+    (target / "old-complete-image").write_text("old\n", encoding="utf-8")
+    stage = library / ".codex-master-runtime.stage.test"
+    stage.mkdir(mode=0o700)
+
+    def fail_copy(*_args: object, **_kwargs: object) -> None:
+        raise install_error("install_source_untrusted")
+
+    monkeypatch.setitem(installer["_build_runtime_image"].__globals__, "_install_regular", fail_copy)
+    with pytest.raises(install_error, match="install_source_untrusted"):
+        installer["_build_runtime_image"](repository=ROOT, stage=stage)
+
+    assert (target / "old-complete-image").read_text(encoding="utf-8") == "old\n"
+    assert not (target / "new-complete-image").exists()
+    assert stage.is_dir()
+    assert not (stage / "new-complete-image").exists()
+
+
+def test_runtime_image_publish_exchange_exposes_only_complete_directory_generations(
+    tmp_path: Path,
+) -> None:
+    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
+    library = tmp_path / "lib"
+    library.mkdir(mode=0o700)
+    target = library / "codex-master-runtime"
+    target.mkdir(mode=0o700)
+    (target / "old-complete-image").write_text("old\n", encoding="utf-8")
+    stage = library / ".codex-master-runtime.stage.test"
+    stage.mkdir(mode=0o700)
+    (stage / "new-complete-image").write_text("new\n", encoding="utf-8")
+
+    installer["_publish_runtime_image"](stage=stage, target=target)
+
+    assert (target / "new-complete-image").read_text(encoding="utf-8") == "new\n"
+    assert not (target / "old-complete-image").exists()
+    assert not stage.exists()
+
+
 def test_probe_capacity_guard_serializes_the_health_record_publication(
     tmp_path: Path,
 ) -> None:
     state_directory = tmp_path / "state"
-    command = tmp_path / "repository" / "bin" / "codex-master-mcp"
-    command.parent.mkdir(parents=True)
+    layout = runtime_layout(tmp_path)
     healthy = {
-        "namespace-status": ({"ok": True, "namespace_ready": True}, True),
-        "plugin-status": ({"ok": True}, True),
+        "hive runtime-status": (green_runtime_status(), True),
         "hive status": (green_hive_runtime(), True),
         "hive doctor": (
             {"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}},
@@ -372,8 +504,7 @@ def test_probe_capacity_guard_serializes_the_health_record_publication(
         return healthy[" ".join(arguments)]
 
     run_probe(
-        repository=tmp_path / "repository",
-        command=command,
+        layout=layout,
         state_directory=state_directory,
         now=lambda: NOW,
         runner=green_runner,
@@ -384,8 +515,7 @@ def test_probe_capacity_guard_serializes_the_health_record_publication(
     def publish_red() -> None:
         writer_started.set()
         run_probe(
-            repository=tmp_path / "repository",
-            command=command,
+            layout=layout,
             state_directory=state_directory,
             now=lambda: NOW,
             runner=lambda _command, *_arguments: ({}, False),
@@ -409,11 +539,9 @@ def test_probe_capacity_guard_preserves_body_exceptions(
     tmp_path: Path, error_type: type[Exception]
 ) -> None:
     state_directory = tmp_path / "state"
-    command = tmp_path / "repository" / "bin" / "codex-master-mcp"
-    command.parent.mkdir(parents=True)
+    layout = runtime_layout(tmp_path)
     healthy = {
-        "namespace-status": ({"ok": True, "namespace_ready": True}, True),
-        "plugin-status": ({"ok": True}, True),
+        "hive runtime-status": (green_runtime_status(), True),
         "hive status": (green_hive_runtime(), True),
         "hive doctor": (
             {"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}},
@@ -421,8 +549,7 @@ def test_probe_capacity_guard_preserves_body_exceptions(
         ),
     }
     run_probe(
-        repository=tmp_path / "repository",
-        command=command,
+        layout=layout,
         state_directory=state_directory,
         now=lambda: NOW,
         runner=lambda _command, *arguments: healthy[" ".join(arguments)],

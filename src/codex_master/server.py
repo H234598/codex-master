@@ -487,7 +487,6 @@ MASTER_FLEET_HOME_V2_CUTOVER_RESULT_CODES = frozenset(
         "fleet_home_v2_target_not_quiescent",
     }
 )
-DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
 CONTROL_CENTER_ENV_KEYS = frozenset(
     {
         "DISPLAY",
@@ -2185,8 +2184,22 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def repo_wrapper_path() -> Path:
-    return repo_root() / "bin" / "codex-master-mcp"
+def _runtime_layout() -> Any:
+    from codex_master.runtime_layout import LayoutError, RuntimeLayout
+
+    try:
+        return RuntimeLayout.from_module_path(Path(__file__))
+    except LayoutError as exc:
+        raise AgentError("runtime_layout_unavailable") from exc
+
+
+def _runtime_mcp_entrypoint() -> Path:
+    return _runtime_layout().mcp_entrypoint
+
+
+def runtime_mcp_entrypoint() -> Path:
+    """Return the sole MCP command permitted for interactive integration."""
+    return _runtime_mcp_entrypoint()
 
 
 def normalized_compare_path(path: Path) -> Path:
@@ -2692,8 +2705,10 @@ def restore_mcp_startup_timeout_snapshot(snapshot: dict[str, Any]) -> None:
 
 def codex_client_mcp_config_status(
     config_path: Path | None = None,
-    command_path: Path = DEFAULT_INSTALL_PATH,
+    command_path: Path | None = None,
 ) -> dict[str, Any]:
+    if command_path is None:
+        command_path = _runtime_mcp_entrypoint()
     path = config_path or codex_config_path()
     path = path.expanduser()
     if not path.is_absolute():
@@ -2708,7 +2723,7 @@ def codex_client_mcp_config_status(
         "server": MCP_SERVER_NAME,
         "server_declared": False,
         "command_configured": False,
-        "command_matches_install_path": False,
+        "command_matches_runtime_entrypoint": False,
         "startup_timeout_sec": None,
         "startup_timeout_ok": False,
         "startup_timeout_recommended_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
@@ -2782,7 +2797,7 @@ def codex_client_mcp_config_status(
         {
             "server_declared": True,
             "command_configured": command_configured,
-            "command_matches_install_path": command_matches,
+            "command_matches_runtime_entrypoint": command_matches,
             "startup_timeout_sec": startup_timeout_sec,
             "startup_timeout_ok": startup_timeout_ok,
             "default_tools_approval_mode": default_tools_approval_mode,
@@ -10937,26 +10952,9 @@ def raw_log_retention_status() -> dict[str, Any]:
 
 
 def raw_log_writer_command(raw_log: Path) -> str:
-    wrapper = repo_wrapper_path()
-    if wrapper.exists() and os.access(wrapper, os.X_OK):
-        argv = [
-            str(wrapper),
-            "raw-log-writer",
-            str(raw_log),
-            "--max-bytes",
-            str(MAX_RAW_LOG_BYTES),
-        ]
-    else:
-        argv = [
-            sys.executable,
-            "-m",
-            "codex_master.server",
-            "raw-log-writer",
-            str(raw_log),
-            "--max-bytes",
-            str(MAX_RAW_LOG_BYTES),
-        ]
-    return shlex.join(argv)
+    return shlex.join(
+        [str(_runtime_mcp_entrypoint()), "raw-log-writer", str(raw_log), "--max-bytes", str(MAX_RAW_LOG_BYTES)]
+    )
 
 
 def read_proc_environ(pid_dir: Path) -> dict[str, str] | None:
@@ -19300,221 +19298,6 @@ def worktree_status(path: Any = None) -> dict[str, Any]:
         os.close(target_fd)
 
 
-def normalize_install_path(path: Path) -> Path:
-    normalized = path.expanduser()
-    if not normalized.is_absolute():
-        normalized = Path.cwd() / normalized
-    return normalized.absolute()
-
-
-def repo_worktree_safety() -> dict[str, Any]:
-    cp = run_command(["git", "status", "--porcelain=v1"], cwd=repo_root())
-    if cp.returncode != 0:
-        return {
-            "name": "installed_source_worktree_state",
-            "ok": False,
-            "status": "unknown",
-            "severity": "warning",
-            "raw_output": "not_returned",
-        }
-    lines = [line for line in cp.stdout.splitlines() if line]
-    untracked_count = sum(1 for line in lines if line.startswith("??"))
-    tracked_change_count = len(lines) - untracked_count
-    clean = not lines
-    return {
-        "name": "installed_source_worktree_state",
-        "ok": True,
-        "status": "clean" if clean else "dirty",
-        "severity": "info" if clean else "warning",
-        "tracked_change_count": tracked_change_count,
-        "untracked_count": untracked_count,
-        "raw_output": "not_returned",
-    }
-
-
-def installed_source_worktree_state(
-    installed_target: Path | None, wrapper: Path
-) -> dict[str, Any]:
-    if installed_target != wrapper:
-        return {
-            "name": "installed_source_worktree_state",
-            "ok": True,
-            "status": "not_applicable",
-            "severity": "info",
-            "raw_output": "not_returned",
-        }
-    return repo_worktree_safety()
-
-
-def open_real_directory_fd(
-    path: Path,
-    error_text: str,
-    *,
-    expected_stat: os.stat_result | None = None,
-) -> int:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise AgentError(error_text) from exc
-    try:
-        current = os.fstat(fd)
-        if not stat_module.S_ISDIR(current.st_mode) or (
-            expected_stat is not None
-            and not source_identity_matches(current, expected_stat)
-        ):
-            raise AgentError(error_text)
-        return fd
-    except Exception:
-        os.close(fd)
-        raise
-
-
-def replace_install_symlink(
-    install_path: Path,
-    wrapper: Path,
-    *,
-    expected_parent_stat: os.stat_result | None = None,
-    expected_existing_stat: os.stat_result | None = None,
-    target_text: str | None = None,
-) -> None:
-    tmp_name = f".{install_path.name}.tmp.{now_id()}.{uuid.uuid4().hex}"
-    parent_fd = -1
-    tmp_created = False
-    try:
-        parent_fd = open_real_directory_fd(
-            install_path.parent,
-            "could_not_write_install_symlink",
-            expected_stat=expected_parent_stat,
-        )
-        os.symlink(
-            str(wrapper) if target_text is None else target_text,
-            tmp_name,
-            dir_fd=parent_fd,
-        )
-        tmp_created = True
-        try:
-            current = os.lstat(install_path.name, dir_fd=parent_fd)
-        except FileNotFoundError:
-            current = None
-        except OSError as exc:
-            raise AgentError("install path could not be inspected") from exc
-        if expected_existing_stat is None:
-            if current is not None:
-                raise AgentError("install path changed after validation")
-        elif current is None or not source_identity_matches(
-            current, expected_existing_stat
-        ):
-            raise AgentError("install path changed after validation")
-        os.replace(
-            tmp_name, install_path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
-        )
-        tmp_created = False
-    except OSError as exc:
-        raise AgentError("could_not_write_install_symlink") from exc
-    finally:
-        if tmp_created and parent_fd >= 0:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_name, dir_fd=parent_fd)
-        if parent_fd >= 0:
-            os.close(parent_fd)
-
-
-def restore_install_symlink(
-    install_path: Path,
-    wrapper: Path,
-    *,
-    previous_target_text: str | None,
-    expected_parent_stat: os.stat_result,
-) -> None:
-    try:
-        current_stat = os.lstat(install_path)
-        current_target_text = os.readlink(install_path)
-    except OSError as exc:
-        raise AgentError("install path changed after mutation") from exc
-    if current_target_text != str(wrapper):
-        raise AgentError("install path changed after mutation")
-    if previous_target_text is None:
-        status = remove_install_symlink_if_repo_wrapper(
-            install_path,
-            wrapper,
-            expected_parent_stat=expected_parent_stat,
-        )
-        if status not in {"removed", "missing"}:
-            raise AgentError("install path changed after mutation")
-        return
-    replace_install_symlink(
-        install_path,
-        wrapper,
-        expected_parent_stat=expected_parent_stat,
-        expected_existing_stat=current_stat,
-        target_text=previous_target_text,
-    )
-
-
-def remove_install_symlink_if_repo_wrapper(
-    install_path: Path,
-    wrapper: Path,
-    *,
-    expected_parent_stat: os.stat_result | None = None,
-) -> str:
-    parent_fd = -1
-    try:
-        parent_fd = open_real_directory_fd(
-            install_path.parent,
-            "could_not_remove_install_symlink",
-            expected_stat=expected_parent_stat,
-        )
-        try:
-            current = os.lstat(install_path.name, dir_fd=parent_fd)
-        except FileNotFoundError:
-            return "missing"
-        except OSError as exc:
-            raise AgentError("could_not_remove_install_symlink") from exc
-        if not stat_module.S_ISLNK(current.st_mode):
-            return "left_in_place_not_repo_wrapper"
-        try:
-            target_text = os.readlink(install_path.name, dir_fd=parent_fd)
-        except OSError as exc:
-            raise AgentError("could_not_remove_install_symlink") from exc
-        target = Path(target_text)
-        resolved_target = resolve_path_no_throw(
-            target if target.is_absolute() else install_path.parent / target
-        )
-        if resolved_target != wrapper:
-            return "left_in_place_not_repo_wrapper"
-        try:
-            latest = os.lstat(install_path.name, dir_fd=parent_fd)
-        except FileNotFoundError:
-            return "missing"
-        except OSError as exc:
-            raise AgentError("could_not_remove_install_symlink") from exc
-        if not source_identity_with_snapshot_matches(
-            latest, current
-        ) or not stat_module.S_ISLNK(latest.st_mode):
-            return "left_in_place_not_repo_wrapper"
-        try:
-            latest_target_text = os.readlink(install_path.name, dir_fd=parent_fd)
-        except OSError as exc:
-            raise AgentError("could_not_remove_install_symlink") from exc
-        if latest_target_text != target_text:
-            return "left_in_place_not_repo_wrapper"
-        try:
-            os.unlink(install_path.name, dir_fd=parent_fd)
-        except FileNotFoundError:
-            return "missing"
-        except OSError as exc:
-            raise AgentError("could_not_remove_install_symlink") from exc
-        return "removed"
-    finally:
-        if parent_fd >= 0:
-            os.close(parent_fd)
-
-
 def ensure_real_parent(path: Path, error_text: str) -> os.stat_result:
     try:
         parent_stat = path.parent.lstat()
@@ -20930,6 +20713,7 @@ def plugin_mcp_manifest_status(root: Path | None = None) -> dict[str, Any]:
 
 
 def master_plugin_status() -> dict[str, Any]:
+    entrypoint = _runtime_mcp_entrypoint()
     root = repo_root()
     manifest = root / ".codex-plugin" / "plugin.json"
     app_manifest = root / ".app.json"
@@ -20937,10 +20721,10 @@ def master_plugin_status() -> dict[str, Any]:
     mcp_manifest_declaration = plugin_declares_mcp_manifest(root)
     mcp_manifest_status = plugin_mcp_manifest_status(root)
     app_bridge = master_app_bridge_status()
-    mcp_registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
-    startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
+    mcp_registration = check_mcp_registration(entrypoint)
+    startup_self_test = mcp_command_startup_self_test(entrypoint)
     cache_status = plugin_cache_status(root)
-    client_config = codex_client_mcp_config_status(command_path=DEFAULT_INSTALL_PATH)
+    client_config = codex_client_mcp_config_status(command_path=entrypoint)
     return {
         "ok": (
             bool(app_bridge.get("ok"))
@@ -20964,12 +20748,6 @@ def master_plugin_status() -> dict[str, Any]:
         "mcp_registration": mcp_registration,
         "client_config": client_config,
         "startup_self_test": startup_self_test,
-        "installed_source_worktree_state": installed_source_worktree_state(
-            resolve_path_no_throw(DEFAULT_INSTALL_PATH)
-            if DEFAULT_INSTALL_PATH.is_symlink()
-            else None,
-            repo_wrapper_path(),
-        ),
         "codex_home_context": codex_home_context(),
         "raw_output": "not_returned",
     }
@@ -22801,7 +22579,7 @@ def master_watchdog_status(
 
 
 def master_timeout_policy() -> dict[str, Any]:
-    client_config = codex_client_mcp_config_status(command_path=DEFAULT_INSTALL_PATH)
+    client_config = codex_client_mcp_config_status(command_path=_runtime_mcp_entrypoint())
     startup_timeout = {
         "scope": "codex_cli_mcp_server_startup",
         "configured_seconds": client_config.get("startup_timeout_sec"),
@@ -22894,14 +22672,15 @@ def master_timeout_policy() -> dict[str, Any]:
 
 
 def master_namespace_status() -> dict[str, Any]:
-    registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
-    startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
+    entrypoint = _runtime_mcp_entrypoint()
+    registration = check_mcp_registration(entrypoint)
+    startup_self_test = mcp_command_startup_self_test(entrypoint)
     tools_list_self_test = mcp_command_tools_list_self_test(
-        DEFAULT_INSTALL_PATH,
+        entrypoint,
         required_tools=("agent_assignment_report",),
     )
     cache_status = plugin_cache_status(repo_root())
-    client_config = codex_client_mcp_config_status(command_path=DEFAULT_INSTALL_PATH)
+    client_config = codex_client_mcp_config_status(command_path=entrypoint)
     home_context = codex_home_context()
     tool_names = {tool["name"] for tool in TOOLS if isinstance(tool.get("name"), str)}
     local_tool_contract = {
@@ -23014,10 +22793,12 @@ def mcp_startup_timeout_seconds(output: str) -> int | None:
 
 
 def check_mcp_registration(
-    command_path: Path = DEFAULT_INSTALL_PATH,
+    command_path: Path | None = None,
     *,
     include_command: bool = False,
 ) -> dict[str, Any]:
+    if command_path is None:
+        command_path = _runtime_mcp_entrypoint()
     codex_path = shutil.which("codex")
     if not codex_path:
         return {
@@ -23068,48 +22849,16 @@ def check_mcp_registration(
 
 def doctor() -> dict[str, Any]:
     ensure_state()
-    wrapper = repo_wrapper_path()
-    install_path = DEFAULT_INSTALL_PATH
-    installed_target = None
-    installed_target_state = "not_symlink"
-    if install_path.is_symlink():
-        resolved_install_path = resolve_path_no_throw(install_path)
-        installed_target_state = (
-            "unreadable"
-            if resolved_install_path is None
-            else "matching_repo_wrapper"
-            if resolved_install_path == wrapper
-            else "different"
-        )
-        installed_target = (
-            PATH_NOT_RETURNED if resolved_install_path else "<unreadable>"
-        )
-    else:
-        resolved_install_path = None
+    install_path = _runtime_mcp_entrypoint()
     checks: list[dict[str, Any]] = [
         {"name": "tmux_available", "ok": shutil.which("tmux") is not None},
         {"name": "codex_available", "ok": shutil.which("codex") is not None},
         {
-            "name": "repo_wrapper_exists",
-            "ok": wrapper.exists(),
+            "name": "runtime_mcp_entrypoint",
+            "ok": is_regular_executable_no_symlink(install_path),
             "path": PATH_NOT_RETURNED,
             "path_state": "set",
         },
-        {
-            "name": "repo_wrapper_executable",
-            "ok": os.access(wrapper, os.X_OK),
-            "path": PATH_NOT_RETURNED,
-            "path_state": "set",
-        },
-        {
-            "name": "installed_symlink",
-            "ok": install_path.is_symlink() and resolved_install_path == wrapper,
-            "path": PATH_NOT_RETURNED,
-            "path_state": "set",
-            "target": installed_target,
-            "target_state": installed_target_state,
-        },
-        installed_source_worktree_state(resolved_install_path, wrapper),
         {
             "name": "mcp_startup_self_test",
             **mcp_command_startup_self_test(install_path),
@@ -23244,10 +22993,11 @@ def fleet_desktop_entry_bytes(install_path: Path) -> bytes:
 
 def launch_control_center_detached(
     *,
-    command_path: Path = DEFAULT_INSTALL_PATH,
+    command_path: Path | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     require_teamleader_tool_access()
+    command_path = command_path or _runtime_mcp_entrypoint()
     fleet_desktop_entry_bytes(command_path)
     source = os.environ if environ is None else environ
     child_env = {
@@ -23715,71 +23465,24 @@ def restore_removed_fleet_desktop_entry(snapshot: dict[str, Any]) -> None:
 def _install_enrolled_unlocked(
     register: bool = True,
     force: bool = False,
-    install_path: Path = DEFAULT_INSTALL_PATH,
     sync_plugin_cache: bool = True,
     install_desktop: bool = False,
 ) -> dict[str, Any]:
-    wrapper = repo_wrapper_path()
-    if not path_present_no_follow(wrapper):
-        raise AgentError("repo wrapper missing")
-    if not is_regular_executable_no_symlink(wrapper):
-        raise AgentError("repo wrapper is not executable")
+    entrypoint = _runtime_mcp_entrypoint()
+    if not path_present_no_follow(entrypoint):
+        raise AgentError("runtime MCP entrypoint missing")
+    if not is_regular_executable_no_symlink(entrypoint):
+        raise AgentError("runtime MCP entrypoint is not executable")
     startup_self_test: dict[str, Any] = {
         "requested": register,
         "status": "skipped",
         "raw_output": "not_returned",
     }
     if register:
-        wrapper_self_test = mcp_command_startup_self_test(wrapper)
-        if not wrapper_self_test["ok"]:
-            raise AgentError("repo wrapper failed MCP startup self-test")
+        entrypoint_self_test = mcp_command_startup_self_test(entrypoint)
+        if not entrypoint_self_test["ok"]:
+            raise AgentError("runtime MCP entrypoint failed MCP startup self-test")
     ensure_applet_action_key()
-
-    install_path = normalize_install_path(install_path)
-    expected_parent_stat = ensure_real_parent(
-        install_path,
-        "install parent directories must be real directories",
-    )
-    try:
-        previous_install_stat = install_path.lstat()
-    except FileNotFoundError:
-        previous_install_stat = None
-    except OSError as exc:
-        raise AgentError("install path could not be inspected") from exc
-    previous_install_present = previous_install_stat is not None
-    previous_install_target_text: str | None = None
-    if previous_install_stat is not None and stat_module.S_ISLNK(
-        previous_install_stat.st_mode
-    ):
-        try:
-            previous_install_target_text = os.readlink(install_path)
-        except OSError as exc:
-            raise AgentError("install path could not be inspected") from exc
-    if previous_install_stat is not None:
-        resolved_install_path = (
-            resolve_path_no_throw(install_path)
-            if stat_module.S_ISLNK(previous_install_stat.st_mode)
-            else None
-        )
-        if (
-            stat_module.S_ISLNK(previous_install_stat.st_mode)
-            and resolved_install_path == wrapper
-        ):
-            symlink_status = "already_installed"
-        elif force and stat_module.S_ISLNK(previous_install_stat.st_mode):
-            symlink_status = "replaced"
-        else:
-            raise AgentError("install path exists and is not this wrapper symlink")
-    else:
-        symlink_status = "created"
-
-    if symlink_status != "already_installed":
-        replace_install_symlink(
-            install_path,
-            wrapper,
-            expected_parent_stat=expected_parent_stat,
-            expected_existing_stat=previous_install_stat,
-        )
 
     plugin_cache_install: dict[str, Any] = {
         "requested": False,
@@ -23803,14 +23506,14 @@ def _install_enrolled_unlocked(
         if install_desktop:
             try:
                 desktop_install, _ = install_fleet_desktop_entry(
-                    install_path,
+                    entrypoint,
                     snapshot_sink=desktop_snapshot,
                 )
             except AgentError as exc:
                 if str(exc) != "desktop command path is invalid":
                     raise
                 stale_entry, _ = remove_fleet_desktop_entry(
-                    install_path,
+                    entrypoint,
                     snapshot_sink=desktop_snapshot,
                 )
                 desktop_install = {
@@ -23822,11 +23525,11 @@ def _install_enrolled_unlocked(
         if register:
             startup_self_test = {
                 "requested": True,
-                **mcp_command_startup_self_test(install_path),
+                **mcp_command_startup_self_test(entrypoint),
             }
             if not startup_self_test["ok"]:
-                raise AgentError("install path failed MCP startup self-test")
-            current = check_mcp_registration(install_path, include_command=True)
+                raise AgentError("runtime MCP entrypoint failed MCP startup self-test")
+            current = check_mcp_registration(entrypoint, include_command=True)
             if current.get("lookup_status") == "unavailable":
                 raise AgentError("MCP server registration could not be inspected")
             startup_timeout_config = None
@@ -23855,7 +23558,7 @@ def _install_enrolled_unlocked(
                         "MCP server is registered with a different command; rerun install with --force"
                     )
                 add = run_command(
-                    ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_path)]
+                    ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(entrypoint)]
                 )
                 if add.returncode != 0:
                     raise AgentError("codex mcp add failed")
@@ -23870,7 +23573,7 @@ def _install_enrolled_unlocked(
                 )
             else:
                 client_config = codex_client_mcp_config_status(
-                    command_path=install_path
+                    command_path=entrypoint
                 )
                 if not client_config.get("startup_timeout_ok") or not client_config.get(
                     "default_tools_approval_mode_ok"
@@ -23922,19 +23625,6 @@ def _install_enrolled_unlocked(
                 rollback_fleet_desktop_snapshot(desktop_snapshot)
             except Exception as restore_exc:
                 desktop_restore_error = restore_exc
-        rollback_install = symlink_status != "already_installed" and (
-            not previous_install_present or previous_install_target_text is not None
-        )
-        if rollback_install:
-            try:
-                restore_install_symlink(
-                    install_path,
-                    wrapper,
-                    previous_target_text=previous_install_target_text,
-                    expected_parent_stat=expected_parent_stat,
-                )
-            except Exception as restore_exc:
-                raise AgentError("could_not_restore_install_symlink") from restore_exc
         if mcp_restore_error is not None:
             raise AgentError(
                 "could_not_restore_mcp_registration"
@@ -23948,12 +23638,8 @@ def _install_enrolled_unlocked(
         raise
     return {
         "ok": True,
-        "install_path": PATH_NOT_RETURNED,
-        "install_path_state": "set",
-        "install_path_kind": "configured_install_path",
-        "target": PATH_NOT_RETURNED,
-        "target_state": "repo_wrapper",
-        "symlink": symlink_status,
+        "runtime_entrypoint": PATH_NOT_RETURNED,
+        "runtime_entrypoint_state": "set",
         "startup_self_test": startup_self_test,
         "mcp": registration,
         "plugin_cache_install": plugin_cache_install,
@@ -23965,7 +23651,6 @@ def _install_enrolled_unlocked(
 def _install_unlocked(
     register: bool = True,
     force: bool = False,
-    install_path: Path = DEFAULT_INSTALL_PATH,
     sync_plugin_cache: bool = True,
     install_desktop: bool = False,
 ) -> dict[str, Any]:
@@ -23977,7 +23662,6 @@ def _install_unlocked(
         return _install_enrolled_unlocked(
             register=register,
             force=force,
-            install_path=install_path,
             sync_plugin_cache=sync_plugin_cache,
             install_desktop=install_desktop,
         )
@@ -23995,7 +23679,6 @@ def _install_unlocked(
 def install(
     register: bool = True,
     force: bool = False,
-    install_path: Path = DEFAULT_INSTALL_PATH,
     sync_plugin_cache: bool = True,
     install_desktop: bool = False,
 ) -> dict[str, Any]:
@@ -24003,7 +23686,6 @@ def install(
         return _install_unlocked(
             register=register,
             force=force,
-            install_path=install_path,
             sync_plugin_cache=sync_plugin_cache,
             install_desktop=install_desktop,
         )
@@ -24011,51 +23693,23 @@ def install(
 
 def _uninstall_unlocked(
     unregister: bool = True,
-    remove_symlink: bool = False,
-    install_path: Path = DEFAULT_INSTALL_PATH,
     remove_desktop: bool = False,
 ) -> dict[str, Any]:
-    install_path = normalize_install_path(install_path)
+    entrypoint = _runtime_mcp_entrypoint()
     mcp_status = "skipped"
-    symlink_status = "skipped"
-    expected_parent_stat: os.stat_result | None = None
-    wrapper: Path | None = None
-    symlink_removed = False
     registration_removed = False
     desktop_removal: dict[str, Any] = {"requested": remove_desktop, "status": "skipped"}
     desktop_snapshot: dict[str, Any] | None = (
         {"changed": False} if remove_desktop else None
     )
-    if remove_symlink:
-        wrapper = repo_wrapper_path()
-        try:
-            install_path.parent.lstat()
-        except FileNotFoundError:
-            symlink_status = "missing"
-        except OSError as exc:
-            raise AgentError(
-                "install parent directories must be real directories"
-            ) from exc
-        else:
-            expected_parent_stat = ensure_real_parent(
-                install_path,
-                "install parent directories must be real directories",
-            )
-            symlink_status = remove_install_symlink_if_repo_wrapper(
-                install_path,
-                wrapper,
-                expected_parent_stat=expected_parent_stat,
-            )
-            symlink_removed = symlink_status == "removed"
-
     try:
         if remove_desktop:
             desktop_removal, _ = remove_fleet_desktop_entry(
-                install_path,
+                entrypoint,
                 snapshot_sink=desktop_snapshot,
             )
         if unregister:
-            current = check_mcp_registration(install_path)
+            current = check_mcp_registration(entrypoint)
             if current.get("lookup_status") == "unavailable":
                 raise AgentError("MCP server registration could not be inspected")
             if current.get("registered"):
@@ -24074,29 +23728,17 @@ def _uninstall_unlocked(
             revoked = revoke_current_teamleader()
             teamleader_status = "removed" if revoked["changed"] else "not_registered"
     except BaseException:
-        symlink_restore_error: Exception | None = None
         desktop_restore_error: Exception | None = None
         if desktop_snapshot is not None:
             try:
                 rollback_fleet_desktop_snapshot(desktop_snapshot)
             except Exception as restore_exc:
                 desktop_restore_error = restore_exc
-        if symlink_removed and wrapper is not None and expected_parent_stat is not None:
-            try:
-                if install_path.exists() or install_path.is_symlink():
-                    raise AgentError("install path changed before symlink restore")
-                replace_install_symlink(
-                    install_path,
-                    wrapper,
-                    expected_parent_stat=expected_parent_stat,
-                )
-            except Exception as restore_exc:
-                symlink_restore_error = restore_exc
         registration_restore_error: Exception | None = None
         if registration_removed:
             try:
                 restore = run_command(
-                    ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_path)]
+                    ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(entrypoint)]
                 )
                 if restore.returncode != 0:
                     raise AgentError("codex mcp add failed")
@@ -24106,10 +23748,6 @@ def _uninstall_unlocked(
             raise AgentError(
                 "could_not_restore_mcp_registration"
             ) from registration_restore_error
-        if symlink_restore_error is not None:
-            raise AgentError(
-                "could_not_restore_install_symlink"
-            ) from symlink_restore_error
         if desktop_restore_error is not None:
             raise AgentError(
                 "could_not_restore_desktop_entry"
@@ -24119,7 +23757,6 @@ def _uninstall_unlocked(
     return {
         "ok": True,
         "mcp": mcp_status,
-        "symlink": symlink_status,
         "teamleader": teamleader_status,
         "desktop_entry": desktop_removal,
         "raw_output": "not_returned",
@@ -24128,15 +23765,11 @@ def _uninstall_unlocked(
 
 def uninstall(
     unregister: bool = True,
-    remove_symlink: bool = False,
-    install_path: Path = DEFAULT_INSTALL_PATH,
     remove_desktop: bool = False,
 ) -> dict[str, Any]:
     with install_lock():
         return _uninstall_unlocked(
             unregister=unregister,
-            remove_symlink=remove_symlink,
-            install_path=install_path,
             remove_desktop=remove_desktop,
         )
 
@@ -25929,7 +25562,7 @@ def fleet_minimal_config(agent: AgentDescriptor) -> tuple[str, str]:
             [
                 "",
                 f"[mcp_servers.{MCP_SERVER_NAME}]",
-                f"command = {json.dumps(str(DEFAULT_INSTALL_PATH))}",
+                f"command = {json.dumps(str(_runtime_mcp_entrypoint()))}",
                 f"startup_timeout_sec = {RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}",
                 f"default_tools_approval_mode = {json.dumps(MCP_DEFAULT_TOOLS_APPROVAL_MODE)}",
             ]
@@ -37676,12 +37309,9 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_install.add_argument("--no-register", action="store_true")
     p_install.add_argument("--no-plugin-cache", action="store_true")
     p_install.add_argument("--force", action="store_true")
-    p_install.add_argument("--path", default=str(DEFAULT_INSTALL_PATH))
 
     p_uninstall = sub.add_parser("uninstall")
     p_uninstall.add_argument("--keep-registration", action="store_true")
-    p_uninstall.add_argument("--remove-symlink", action="store_true")
-    p_uninstall.add_argument("--path", default=str(DEFAULT_INSTALL_PATH))
 
     sub.add_parser("doctor")
     sub.add_parser("tools")
@@ -38380,7 +38010,6 @@ def _main_cli_impl(argv: list[str]) -> int:
                 install(
                     register=not args.no_register,
                     force=args.force,
-                    install_path=Path(args.path),
                     sync_plugin_cache=not args.no_plugin_cache,
                     install_desktop=True,
                 )
@@ -38389,9 +38018,7 @@ def _main_cli_impl(argv: list[str]) -> int:
             return print_json(
                 uninstall(
                     unregister=not args.keep_registration,
-                    remove_symlink=args.remove_symlink,
-                    install_path=Path(args.path),
-                    remove_desktop=args.remove_symlink,
+                    remove_desktop=False,
                 )
             )
         if args.command == "doctor":

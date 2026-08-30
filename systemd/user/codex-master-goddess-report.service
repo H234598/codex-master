@@ -27,4 +27,4 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 UMask=0077
-ExecStart=%h/.local/bin/codex-master-mcp goddess report run
+ExecStart=%h/.local/lib/codex-master-runtime/bin/codex-master-mcp goddess report run

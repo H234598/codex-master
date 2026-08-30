@@ -28,4 +28,4 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 UMask=0077
-ExecStart=%h/.local/bin/codex-master-mcp watchdog active --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet
+ExecStart=%h/.local/lib/codex-master-runtime/bin/codex-master-mcp watchdog active --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet

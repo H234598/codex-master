@@ -5,4 +5,4 @@ script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
 runtime_root="$(cd -- "$(dirname -- "${script_path}")/.." && pwd)"
 export PYTHONPATH="${runtime_root}/src"
 export PYTHONDONTWRITEBYTECODE=1
-exec python3 -m codex_master.server "$@"
+exec python3 -m codex_master.hive.hourly_probe "$@"

@@ -58,3 +58,23 @@ def test_cli_status_and_doctor_accept_the_same_canonical_runtime_evidence() -> N
     assert status["mode"] == doctor["mode"] == "shadow"
     assert status["mutation_performed"] is False
     assert doctor["mutation_performed"] is False
+
+
+def test_runtime_status_is_a_dedicated_hive_cli_command() -> None:
+    try:
+        args = parser().parse_args(["hive", "runtime-status"])
+    except SystemExit:
+        command = None
+    else:
+        command = args.hive_command
+
+    assert command == "runtime-status"
+
+
+def test_runtime_status_returns_only_the_autonomous_contract() -> None:
+    try:
+        result = run_hive_cli({"hive_command": "runtime-status"})
+    except ValueError:
+        result = {}
+
+    assert set(result) == {"ok", "metadata", "mcp_surface", "raw_output"}

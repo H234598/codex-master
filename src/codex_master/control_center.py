@@ -36,6 +36,7 @@ from codex_master.server import (
     assert_install_context_allows_master_registration,
     public_error_payload,
     require_teamleader_tool_access,
+    runtime_mcp_entrypoint,
     teamleader_tool_catalog,
 )
 
@@ -353,7 +354,7 @@ class SubprocessToolDispatcher:
         argv: list[str] | None = None,
         timeout_seconds: float | None = None,
     ) -> None:
-        self._argv = list(argv) if argv is not None else [str(Path.home() / ".local/bin/codex-master-mcp")]
+        self._argv = list(argv) if argv is not None else [str(runtime_mcp_entrypoint())]
         self._timeout_seconds = timeout_seconds
         self._instance_id = f"control-center-{secrets.token_hex(16)}"
         self._lock = threading.Lock()

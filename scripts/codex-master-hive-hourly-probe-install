@@ -1,22 +1,44 @@
 #!/usr/bin/python3
-"""Install the Hive hourly probe without activating any user units."""
+"""Materialize one complete, private Runtime Image without activating units."""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 
 
-_ENTRYPOINT_NAME = "codex_master_hive_hourly_probe.py"
-_INSTALL_ROOT_NAME = "codex-master-hive-probe"
+_RUNTIME_ROOT_NAME = "codex-master-runtime"
 _MAX_SOURCE_BYTES = 2 * 1024 * 1024
+_MAX_STAGE_DIAGNOSTIC_BYTES = 256 * 1024
 _UNIT_NAMES = (
     "codex-master-hive-hourly-probe.service",
     "codex-master-hive-hourly-probe.timer",
+)
+# This is the sole product Runtime Image definition. Recursive entries carry
+# complete product trees; no Probe-specific mirror is maintained.
+_RUNTIME_IMAGE_FILES = (
+    ("bin/codex-master-mcp", "bin/codex-master-mcp", 0o755),
+    ("bin/codex-master-hive-hourly-probe", "bin/codex-master-hive-hourly-probe", 0o755),
+    (".codex-plugin/plugin.json", ".codex-plugin/plugin.json", 0o644),
+    (".mcp.json", ".mcp.json", 0o644),
+    (".app.json", ".app.json", 0o644),
+    ("codex-hive.json", "codex-hive.json", 0o644),
+    ("codex-agent-classes.json", "codex-agent-classes.json", 0o644),
+    ("codex-agent-pool.json", "codex-agent-pool.json", 0o644),
+    ("codex-model-policy.json", "codex-model-policy.json", 0o644),
+)
+_RUNTIME_IMAGE_TREES = (
+    ("src/codex_master", "src/codex_master"),
+    ("skills/codex-master-fleet", "skills/codex-master-fleet"),
+    ("hooks", "hooks"),
+    ("schemas", "schemas"),
 )
 
 
@@ -32,8 +54,8 @@ def _directory(path: Path, *, mode: int, create: bool) -> None:
             raise InstallError("home_unavailable") from None
         path.mkdir(mode=mode)
         item = path.lstat()
-    except OSError:
-        raise InstallError("install_path_untrusted") from None
+    except OSError as exc:
+        raise InstallError("install_path_untrusted") from exc
     if (
         stat.S_ISLNK(item.st_mode)
         or not stat.S_ISDIR(item.st_mode)
@@ -56,17 +78,14 @@ def _child_directory(home: Path, parts: tuple[str, ...], *, mode: int) -> Path:
 
 
 def _source_bytes(path: Path) -> bytes:
-    """Read one immutable regular source through a no-follow descriptor.
-
-    The source tree is untrusted at the filesystem boundary: validate the
-    descriptor identity before and after the bounded read so a replaced path
-    cannot become an installer input between ``lstat`` and consumption.
-    """
+    """Read one bounded, own regular source through a no-follow descriptor."""
 
     descriptor = -1
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-        descriptor = os.open(path, flags)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
         before = os.fstat(descriptor)
         if (
             not stat.S_ISREG(before.st_mode)
@@ -118,36 +137,6 @@ def _source_directory(path: Path) -> None:
         raise InstallError("install_source_untrusted")
 
 
-def _install_python_package(*, source_root: Path, install_root: Path) -> None:
-    """Materialize the closed Python package without copying checkout links."""
-
-    _source_directory(source_root)
-    copied = 0
-    for directory, child_directories, file_names in os.walk(source_root):
-        current = Path(directory)
-        _source_directory(current)
-        for name in child_directories:
-            _source_directory(current / name)
-        child_directories[:] = [
-            name for name in child_directories if name != "__pycache__"
-        ]
-        for name in sorted(file_names):
-            source = current / name
-            relative = source.relative_to(source_root)
-            if source.suffix != ".py":
-                continue
-            target = install_root / "src" / "codex_master" / relative
-            _child_directory(
-                install_root,
-                ("src", "codex_master", *relative.parts[:-1]),
-                mode=0o700,
-            )
-            _install_regular(source, target, mode=0o644)
-            copied += 1
-    if copied == 0:
-        raise InstallError("install_source_untrusted")
-
-
 def _install_regular(source: Path, target: Path, *, mode: int) -> None:
     content = _source_bytes(source)
     try:
@@ -156,16 +145,12 @@ def _install_regular(source: Path, target: Path, *, mode: int) -> None:
         existing = None
     except OSError as exc:
         raise InstallError("install_target_untrusted") from exc
-    if existing is not None and (
-        stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
-    ):
+    if existing is not None and (stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)):
         raise InstallError("install_target_untrusted")
     descriptor = -1
     temporary = Path()
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{target.name}.", dir=target.parent
-        )
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
         temporary = Path(temporary_name)
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
@@ -179,6 +164,8 @@ def _install_regular(source: Path, target: Path, *, mode: int) -> None:
         if (
             stat.S_ISLNK(installed.st_mode)
             or not stat.S_ISREG(installed.st_mode)
+            or installed.st_nlink != 1
+            or installed.st_uid != os.geteuid()
             or stat.S_IMODE(installed.st_mode) != mode
         ):
             raise InstallError("install_target_untrusted")
@@ -196,66 +183,216 @@ def _install_regular(source: Path, target: Path, *, mode: int) -> None:
                 pass
 
 
-def install(*, home: Path) -> dict[str, object]:
-    if not home.is_absolute():
-        raise InstallError("home_unavailable")
-    _directory(home, mode=0o700, create=False)
-    repository = Path(__file__).resolve().parents[1]
-    libexec = _child_directory(home, (".local", "libexec"), mode=0o700)
-    install_root = _child_directory(
-        home, (".local", "lib", _INSTALL_ROOT_NAME), mode=0o700
-    )
-    state = _child_directory(
-        home, (".local", "state", "codex-master-mcp"), mode=0o700
-    )
-    units = _child_directory(home, (".config", "systemd", "user"), mode=0o700)
-    _install_regular(
-        repository / "systemd" / "libexec" / _ENTRYPOINT_NAME,
-        libexec / _ENTRYPOINT_NAME,
-        mode=0o755,
-    )
-    _install_python_package(
-        source_root=repository / "src" / "codex_master", install_root=install_root
-    )
-    _install_regular(
-        repository / "bin" / "codex-master-mcp",
-        _child_directory(install_root, ("bin",), mode=0o700) / "codex-master-mcp",
-        mode=0o755,
-    )
-    for name in ("codex-hive.json", "codex-agent-classes.json"):
-        _install_regular(repository / name, install_root / name, mode=0o644)
-    for name in _UNIT_NAMES:
-        _install_regular(
-            repository / "systemd" / "user" / name,
-            units / name,
-            mode=0o644,
-        )
+def _install_tree(source_root: Path, target_root: Path) -> None:
+    _source_directory(source_root)
+    copied = 0
+    for directory, child_directories, file_names in os.walk(source_root):
+        current = Path(directory)
+        _source_directory(current)
+        relative_directory = current.relative_to(source_root)
+        _child_directory(target_root, tuple(relative_directory.parts), mode=0o700)
+        for name in child_directories:
+            _source_directory(current / name)
+        child_directories[:] = [name for name in child_directories if name != "__pycache__"]
+        for name in sorted(file_names):
+            source = current / name
+            target = target_root / relative_directory / name
+            _install_regular(source, target, mode=0o644)
+            copied += 1
+    if copied == 0:
+        raise InstallError("install_source_untrusted")
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise InstallError("install_fsync_failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _fsync_tree(root: Path) -> None:
+    for directory, _child_directories, file_names in os.walk(root, topdown=False):
+        current = Path(directory)
+        _source_directory(current)
+        for name in file_names:
+            if not _source_bytes(current / name):
+                raise InstallError("install_target_untrusted")
+        _fsync_directory(current)
+
+
+def _build_runtime_image(*, repository: Path, stage: Path) -> None:
+    _directory(stage, mode=0o700, create=False)
+    for source_name, target_name, mode in _RUNTIME_IMAGE_FILES:
+        target = stage / target_name
+        _child_directory(stage, tuple(target.parent.relative_to(stage).parts), mode=0o700)
+        _install_regular(repository / source_name, target, mode=mode)
+    for source_name, target_name in _RUNTIME_IMAGE_TREES:
+        target = stage / target_name
+        _child_directory(stage, tuple(target.relative_to(stage).parts), mode=0o700)
+        _install_tree(repository / source_name, target)
+    _fsync_tree(stage)
+
+
+def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
+    """Exercise the three v2 diagnostics from the isolated, complete stage."""
+
+    command = stage / "bin" / "codex-master-mcp"
+    environment = {
+        "HOME": os.fspath(home),
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    for hive_command in ("runtime-status", "status", "doctor"):
+        try:
+            completed = subprocess.run(
+                [os.fspath(command), "hive", hive_command],
+                cwd=stage,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+                env=environment,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise InstallError("install_stage_validation_failed") from exc
+        if (
+            completed.returncode != 0
+            or len(completed.stdout.encode("utf-8")) > _MAX_STAGE_DIAGNOSTIC_BYTES
+        ):
+            raise InstallError("install_stage_validation_failed")
+        try:
+            payload = json.loads(completed.stdout)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise InstallError("install_stage_validation_failed") from exc
+        if not isinstance(payload, dict):
+            raise InstallError("install_stage_validation_failed")
+        if hive_command == "runtime-status" and payload.get("ok") is not True:
+            raise InstallError("install_stage_validation_failed")
+
+
+def _remove_tree(path: Path) -> None:
+    try:
+        item = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise InstallError("install_legacy_cleanup_failed") from exc
+    if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise InstallError("install_legacy_cleanup_failed") from exc
+        return
+    for child in path.iterdir():
+        _remove_tree(child)
+    try:
+        path.rmdir()
+    except OSError as exc:
+        raise InstallError("install_legacy_cleanup_failed") from exc
+
+
+def _publish_runtime_image(*, stage: Path, target: Path) -> None:
+    try:
+        existing = target.lstat()
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        raise InstallError("install_target_untrusted") from exc
+    if existing is None:
+        try:
+            os.replace(stage, target)
+        except OSError as exc:
+            raise InstallError("install_swap_failed") from exc
+        _fsync_directory(target.parent)
+        return
+    if (
+        stat.S_ISLNK(existing.st_mode)
+        or not stat.S_ISDIR(existing.st_mode)
+        or existing.st_uid != os.geteuid()
+        or stat.S_IMODE(existing.st_mode) != 0o700
+    ):
+        raise InstallError("install_target_untrusted")
+    library = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(library, "renameat2", None)
+    if renameat2 is None:
+        raise InstallError("install_swap_unavailable")
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    renameat2.restype = ctypes.c_int
+    if renameat2(-100, os.fsencode(stage), -100, os.fsencode(target), 2) != 0:
+        error = ctypes.get_errno()
+        if error in {errno.ENOSYS, errno.EINVAL}:
+            raise InstallError("install_swap_unavailable")
+        raise InstallError("install_swap_failed")
+    _fsync_directory(target.parent)
+    _remove_tree(stage)
+    _fsync_directory(target.parent)
+
+
+def _ensure_probe_lock(state: Path) -> None:
     lock = state / ".hive-hourly-probe.lock"
+    descriptor = -1
     try:
         try:
             descriptor = os.open(
                 lock,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
             )
         except FileExistsError:
             descriptor = -1
         if descriptor >= 0:
             os.close(descriptor)
-        lock_stat = lock.lstat()
+            descriptor = -1
+        item = lock.lstat()
         if (
-            stat.S_ISLNK(lock_stat.st_mode)
-            or not stat.S_ISREG(lock_stat.st_mode)
-            or lock_stat.st_nlink != 1
-            or lock_stat.st_uid != os.geteuid()
-            or stat.S_IMODE(lock_stat.st_mode) != 0o600
+            stat.S_ISLNK(item.st_mode)
+            or not stat.S_ISREG(item.st_mode)
+            or item.st_nlink != 1
+            or item.st_uid != os.geteuid()
+            or stat.S_IMODE(item.st_mode) != 0o600
         ):
             raise InstallError("install_target_untrusted")
     except OSError as exc:
         raise InstallError("install_target_untrusted") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def install(*, home: Path) -> dict[str, object]:
+    if not home.is_absolute():
+        raise InstallError("home_unavailable")
+    _directory(home, mode=0o700, create=False)
+    repository = Path(__file__).resolve().parents[1]
+    library = _child_directory(home, (".local", "lib"), mode=0o700)
+    state = _child_directory(home, (".local", "state", "codex-master-mcp"), mode=0o700)
+    units = _child_directory(home, (".config", "systemd", "user"), mode=0o700)
+    for name in _UNIT_NAMES:
+        _install_regular(repository / "systemd" / "user" / name, units / name, mode=0o644)
+    _ensure_probe_lock(state)
+    stage = Path(tempfile.mkdtemp(prefix=f".{_RUNTIME_ROOT_NAME}.stage.", dir=library))
+    try:
+        _build_runtime_image(repository=repository, stage=stage)
+        _validate_runtime_image_stage(stage=stage, home=home)
+        _publish_runtime_image(stage=stage, target=library / _RUNTIME_ROOT_NAME)
+        stage = Path()
+    finally:
+        if stage.name:
+            _remove_tree(stage)
+    for legacy in (
+        library / "codex-master-hive-probe",
+        home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py",
+        home / ".local" / "bin" / "codex-master-mcp",
+    ):
+        _remove_tree(legacy)
     return {"status": "installed", "raw_output": "not_returned"}
 
 
