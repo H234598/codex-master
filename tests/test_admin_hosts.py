@@ -9,10 +9,17 @@ from typing import Any, cast
 
 import pytest
 
-from codex_master.admin_hosts import ControlHostV1, HostRegistry, HostRegistryError
+from codex_master.admin_hosts import (
+    AgentBindingV1,
+    ControlHostV1,
+    HostRegistry,
+    HostRegistryError,
+)
 
 
 OBSERVED_AT = "2026-08-28T10:00:00Z"
+SPKI_ONE = "sha256:" + "a" * 64
+SPKI_TWO = "sha256:" + "b" * 64
 
 
 class PrivateProbeFailure(BaseException):
@@ -81,6 +88,35 @@ def valid_evidence(
 
 def registry_at(tmp_path: Path) -> HostRegistry:
     return HostRegistry.for_test(tmp_path)
+
+
+def agent_binding(
+    host_ref: str = "worker-one",
+    *,
+    spki: str = SPKI_ONE,
+    lease_epoch: int = 1,
+    enabled: bool = True,
+) -> AgentBindingV1:
+    return AgentBindingV1(
+        host_ref=host_ref,
+        client_spki_sha256=spki,
+        lease_epoch=lease_epoch,
+        enabled=enabled,
+    )
+
+
+def static_registration(
+    ref: str = "worker-one",
+    *,
+    label: str = "Worker One",
+    role: str = "execution",
+) -> dict[str, object]:
+    return {
+        "ref": ref,
+        "label": label,
+        "role": role,
+        "capabilities": ["resource.probe", "codex.execute"],
+    }
 
 
 def _record_host(root: str, ref: str, generation: int) -> None:
@@ -474,7 +510,7 @@ def test_nested_private_binding_values_remain_private_only(tmp_path: Path) -> No
     public_rendered = json.dumps(host.public_projection(), sort_keys=True)
     repr_rendered = repr(host)
 
-    assert document["bindings"][0]["binding_state"] == evidence["binding_state"]
+    assert document["bindings"]["ssh"][0]["binding_state"] == evidence["binding_state"]
     for private_value in (
         "worker.internal",
         "opaque-private-value",
@@ -570,7 +606,7 @@ def test_newer_probe_replaces_prior_evidence_and_survives_restart(
     assert registry_at(tmp_path).get("worker-one") == current
 
 
-def test_legacy_document_migrates_binding_into_separate_v2_state(
+def test_legacy_document_migrates_binding_into_separate_v3_state(
     tmp_path: Path,
 ) -> None:
     evidence = valid_evidence()
@@ -590,20 +626,107 @@ def test_legacy_document_migrates_binding_into_separate_v2_state(
     migrated = json.loads(document.read_text(encoding="utf-8"))
 
     assert host.generation == 4
-    assert migrated["schema_version"] == 2
-    assert set(migrated) == {"schema_version", "hosts", "bindings"}
-    assert "binding_state" not in migrated["hosts"][0]
-    assert migrated["bindings"] == [
+    assert migrated["schema_version"] == 3
+    assert set(migrated) == {
+        "schema_version",
+        "registrations",
+        "bindings",
+        "observations",
+    }
+    assert migrated["registrations"][0]["ref"] == "worker-one"
+    assert migrated["observations"][0]["ref"] == "worker-one"
+    assert "binding_state" not in migrated["observations"][0]
+    assert migrated["bindings"]["ssh"] == [
         {"ref": "worker-one", "binding_state": evidence["binding_state"]}
     ]
+    assert migrated["bindings"]["agent"] == []
+
+
+def test_static_agent_provisioning_creates_unavailable_registration_without_probe(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+
+    host = registry.provision_agent_binding(
+        static_registration(), agent_binding(), expected_generation=0
+    )
+
+    document = json.loads((tmp_path / "admin-hosts" / "hosts.json").read_text())
+    public = host.public_projection()
+    rendered = json.dumps(public, sort_keys=True)
+    assert host.ref == "worker-one"
+    assert host.generation == 1
+    assert host.reachability == {"state": "unavailable"}
+    assert document["schema_version"] == 3
+    assert document["observations"] == []
+    assert document["registrations"] == [
+        {
+            "ref": "worker-one",
+            "label": "Worker One",
+            "role": "execution",
+            "transport_binding": {"kind": "ssh", "binding_ref": "worker-one"},
+            "capabilities": ["resource.probe", "codex.execute"],
+            "reachability": {"state": "unavailable"},
+            "resource_evidence": {},
+            "generation": 1,
+            "observed_at": None,
+            "source": "static-agent-binding",
+        }
+    ]
+    assert "client_spki_sha256" not in rendered
+    assert SPKI_ONE not in rendered
+    assert "lease_epoch" not in rendered
+
+
+def test_agent_binding_is_private_and_legacy_ssh_is_not_resolvable(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.record_probe("legacy-one", generation=1, evidence=valid_evidence())
+    registry.provision_agent_binding(
+        static_registration(), agent_binding(), expected_generation=1
+    )
+
+    assert registry.agent_binding("worker-one") == agent_binding()
+    with pytest.raises(HostRegistryError, match="host.identity_not_found"):
+        registry.resolve_agent_spki("sha256:" + "0" * 64)
+    assert registry.get("legacy-one").transport_binding == {
+        "kind": "ssh",
+        "binding_ref": "worker-one-ssh",
+    }
+
+
+def test_agent_binding_expected_generation_and_rotation_are_atomic(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    first = registry.provision_agent_binding(
+        static_registration(), agent_binding(), expected_generation=0
+    )
+
+    with pytest.raises(HostRegistryError, match="credential.generation_conflict"):
+        registry.provision_agent_binding(
+            static_registration(),
+            agent_binding(spki=SPKI_TWO),
+            expected_generation=0,
+        )
+
+    assert registry.agent_binding("worker-one") == agent_binding()
+    rotated = registry.provision_agent_binding(
+        static_registration(),
+        agent_binding(spki=SPKI_TWO),
+        expected_generation=first.generation,
+    )
+    assert rotated.generation == first.generation + 1
+    assert registry.agent_binding("worker-one").lease_epoch == 2
 
 
 @pytest.mark.parametrize(
     "raw",
     [
         b'{"schema_version":2,"hosts":',
-        b'{"schema_version":9,"hosts":[],"bindings":[]}',
-        b'{"schema_version":2,"hosts":[],"bindings":[],"extra":true}',
+        b'{"schema_version":9,"registrations":[],"bindings":{"ssh":[],"agent":[]},"observations":[]}',
+        b'{"schema_version":3,"registrations":[],"bindings":{"ssh":[],"agent":[]},"observations":[],"extra":true}',
     ],
 )
 def test_corrupt_truncated_or_unknown_state_fails_closed(
@@ -623,7 +746,7 @@ def test_probe_digest_detects_persisted_host_or_binding_tampering(
     registry.record_probe("worker-one", generation=4, evidence=valid_evidence())
     document = tmp_path / "admin-hosts" / "hosts.json"
     payload = json.loads(document.read_text(encoding="utf-8"))
-    payload["bindings"][0]["binding_state"]["root"] = "/srv/tampered"
+    payload["bindings"]["ssh"][0]["binding_state"]["root"] = "/srv/tampered"
     document.write_text(json.dumps(payload), encoding="utf-8")
     document.chmod(0o600)
 
@@ -763,7 +886,12 @@ def test_state_schema_version_requires_exact_integer(
 ) -> None:
     payload: dict[str, object]
     if schema_version == 2.0:
-        payload = {"schema_version": schema_version, "hosts": [], "bindings": []}
+        payload = {
+            "schema_version": schema_version,
+            "registrations": [],
+            "bindings": {"ssh": [], "agent": []},
+            "observations": [],
+        }
     else:
         payload = {"schema_version": schema_version, "hosts": []}
     _write_registry_document(tmp_path, payload)

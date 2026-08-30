@@ -27,7 +27,7 @@ from .admin_daemon import (
     CloudflareJwksFetcher,
     RefreshingCloudflareAccessVerifier,
 )
-from .admin_hosts import HostRegistry
+from .admin_hosts import AgentBindingV1, HostRegistry, HostRegistryError
 from .admin_http import AdminHttpServer
 from .admin_operations import AdminOperationStore
 from .admin_secret_ingress import AdminSecretIngressOwner
@@ -163,7 +163,9 @@ class SystemdCredentialSet:
         "admin-attestation",
         "admin-vault-key",
         "admin-quota-evidence",
+        "agent-bindings",
     )
+    _OPTIONAL_NAMES = frozenset({"agent-bindings"})
 
     def __init__(self, directory: Path) -> None:
         if not directory.is_absolute():
@@ -188,16 +190,23 @@ class SystemdCredentialSet:
                 raise AdminAssemblyError
             self._directory_fd = directory_fd
             for name in self._NAMES:
-                self._fds[name] = self._open(name)
+                descriptor = self._open(name)
+                if descriptor is not None:
+                    self._fds[name] = descriptor
         except BaseException:
             self.close()
             raise AdminAssemblyError from None
 
-    def _open(self, name: str) -> int:
+    def _open(self, name: str) -> int | None:
         directory_fd = self._directory_fd
         if directory_fd is None:
             raise AdminAssemblyError
-        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        try:
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if name in self._OPTIONAL_NAMES:
+                return None
+            raise
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_uid not in {0, os.geteuid()}
@@ -241,6 +250,13 @@ class SystemdCredentialSet:
             return value
         except OSError:
             raise AdminAssemblyError from None
+
+    def read_optional(self, name: str, maximum: int) -> bytes | None:
+        if name not in self._OPTIONAL_NAMES:
+            raise AdminAssemblyError
+        if name not in self._fds:
+            return None
+        return self.read(name, maximum)
 
     def close(self) -> None:
         for descriptor in self._fds.values():
@@ -349,6 +365,65 @@ def parse_admin_config(raw: bytes) -> AdminConfig:
         team,
         audience,
     )
+
+
+def provision_agent_bindings_from_credential(
+    registry: HostRegistry, raw: bytes | None
+) -> None:
+    if raw is None:
+        return
+    value = _parse_json(raw)
+    if (
+        set(value) != {"schema_version", "hosts"}
+        or value.get("schema_version") != 1
+        or type(value.get("hosts")) is not list
+        or len(cast(list[object], value["hosts"])) > 256
+    ):
+        raise AdminAssemblyError
+    expected_generation = max((host.generation for host in registry.list()), default=0)
+    seen_refs: set[str] = set()
+    seen_enabled_spkis: set[str] = set()
+    try:
+        for item in cast(list[object], value["hosts"]):
+            if type(item) is not dict or set(item) != {
+                "ref",
+                "label",
+                "role",
+                "capabilities",
+                "client_spki_sha256",
+                "lease_epoch",
+                "enabled",
+            }:
+                raise AdminAssemblyError
+            record = cast(dict[str, object], item)
+            ref = record["ref"]
+            spki = record["client_spki_sha256"]
+            enabled = record["enabled"]
+            if type(ref) is not str or ref in seen_refs:
+                raise AdminAssemblyError
+            if type(spki) is str and enabled is True:
+                if spki in seen_enabled_spkis:
+                    raise AdminAssemblyError
+                seen_enabled_spkis.add(spki)
+            seen_refs.add(ref)
+            host = registry.provision_agent_binding(
+                {
+                    "ref": record["ref"],
+                    "label": record["label"],
+                    "role": record["role"],
+                    "capabilities": record["capabilities"],
+                },
+                AgentBindingV1(
+                    cast(str, record["ref"]),
+                    cast(str, record["client_spki_sha256"]),
+                    cast(int, record["lease_epoch"]),
+                    cast(bool, record["enabled"]),
+                ),
+                expected_generation=expected_generation,
+            )
+            expected_generation = max(expected_generation, host.generation)
+    except (HostRegistryError, TypeError, ValueError):
+        raise AdminAssemblyError from None
 
 
 def _empty_inventory(path: Path) -> None:
@@ -2213,6 +2288,10 @@ def assemble_admin_runtime() -> AdminRuntime:
 
         operation_store = AdminOperationStore(state_root)
         host_registry = HostRegistry(state_root)
+        provision_agent_bindings_from_credential(
+            host_registry,
+            credentials.read_optional("agent-bindings", _CONFIG_MAX_BYTES),
+        )
         identities = OpenAIIdentitySource(state_root / "openai-identities")
         registry = DurableAccountRegistry(
             state_root / "account-registry",

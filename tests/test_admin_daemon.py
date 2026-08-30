@@ -1683,6 +1683,10 @@ def _product_directories(tmp_path: Path) -> tuple[Path, Path, Path, int]:
         credentials / "admin-quota-evidence",
         b'{"schema_version":1,"accounts":[]}',
     )
+    _credential(
+        credentials / "agent-bindings",
+        b'{"schema_version":1,"hosts":[]}',
+    )
     return credentials, runtime, state, port
 
 
@@ -1760,6 +1764,79 @@ def test_product_assembly_owns_empty_ollama_registry(
         "instance_count": 0,
         "instances": [],
     }
+
+
+def test_product_assembly_materializes_agent_bindings_before_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials, runtime_root, state, _port = _product_directories(tmp_path)
+    payload = {
+        "schema_version": 1,
+        "hosts": [
+            {
+                "ref": "worker-one",
+                "label": "Worker One",
+                "role": "worker",
+                "capabilities": ["resource.probe", "ollama.execute"],
+                "client_spki_sha256": "sha256:" + "a" * 64,
+                "lease_epoch": 1,
+                "enabled": True,
+            }
+        ],
+    }
+    _credential(
+        credentials / "agent-bindings",
+        json.dumps(payload, separators=(",", ":")).encode("ascii"),
+    )
+    events: list[str] = []
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", os.fspath(credentials))
+    monkeypatch.setenv("RUNTIME_DIRECTORY", os.fspath(runtime_root))
+    monkeypatch.setenv("STATE_DIRECTORY", os.fspath(state))
+    monkeypatch.setattr(
+        admin_assembly.AdminDaemon,
+        "__init__",
+        lambda self, service, **_kwargs: events.append(
+            "daemon-after-" + service._host_registry.agent_binding("worker-one").host_ref
+        ),
+    )
+
+    runtime = assemble_admin_runtime()
+    try:
+        assert events == ["daemon-after-worker-one"]
+        assert runtime.service._host_registry.resolve_agent_spki(
+            "sha256:" + "a" * 64
+        ).host_ref == "worker-one"
+    finally:
+        runtime.close()
+
+
+def test_missing_agent_bindings_credential_means_zero_remote_hosts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials, runtime_root, state, _port = _product_directories(tmp_path)
+    (credentials / "agent-bindings").unlink()
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", os.fspath(credentials))
+    monkeypatch.setenv("RUNTIME_DIRECTORY", os.fspath(runtime_root))
+    monkeypatch.setenv("STATE_DIRECTORY", os.fspath(state))
+
+    runtime = assemble_admin_runtime()
+    try:
+        assert runtime.service._host_registry.list() == ()
+    finally:
+        runtime.close()
+
+
+def test_corrupt_agent_bindings_credential_blocks_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials, runtime_root, state, _port = _product_directories(tmp_path)
+    _credential(credentials / "agent-bindings", b'{"schema_version":1,"hosts":[')
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", os.fspath(credentials))
+    monkeypatch.setenv("RUNTIME_DIRECTORY", os.fspath(runtime_root))
+    monkeypatch.setenv("STATE_DIRECTORY", os.fspath(state))
+
+    with pytest.raises(admin_assembly.AdminAssemblyError):
+        assemble_admin_runtime()
 
 
 def test_product_account_registry_lists_and_disables_openai_account(
