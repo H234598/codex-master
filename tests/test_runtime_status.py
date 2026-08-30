@@ -37,7 +37,7 @@ def materialize_runtime_image(tmp_path: Path, *, mcp_mode: str = "healthy") -> P
         "    if request.get('method') == 'initialize':\n"
         "        print(json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': {'protocolVersion': '2024-11-05', 'capabilities': {}, 'serverInfo': {'name': 'codex-master-mcp'}}}), flush=True)\n"
         "    elif request.get('method') == 'tools/list' and mode == 'healthy':\n"
-        "        print(json.dumps({'jsonrpc': '2.0', 'id': 2, 'result': {'tools': [{'name': 'hive_status'}]}}), flush=True)\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': 2, 'result': {'tools': [{'name': 'runtime_status'}]}}), flush=True)\n"
         "    elif request.get('method') == 'tools/list' and mode == 'empty-tools':\n"
         "        print(json.dumps({'jsonrpc': '2.0', 'id': 2, 'result': {'tools': []}}), flush=True)\n"
         "if mode == 'exit-error':\n"
@@ -154,7 +154,7 @@ def test_runtime_status_rejects_mcp_start_and_incomplete_tools_surface(tmp_path:
         assert result["raw_output"] == "not_returned"
 
 
-def test_runtime_status_accepts_an_empty_direct_tool_list(tmp_path: Path) -> None:
+def test_runtime_status_rejects_an_empty_direct_tool_list(tmp_path: Path) -> None:
     modules = _runtime_modules()
     assert modules is not None
     layout_module, status_module = modules
@@ -164,11 +164,11 @@ def test_runtime_status_accepts_an_empty_direct_tool_list(tmp_path: Path) -> Non
 
     result = status_module.runtime_status(layout=layout)
 
-    assert result["ok"] is True
+    assert result["ok"] is False
     assert result["mcp_surface"] == {
-        "ok": True,
+        "ok": False,
         "initialize": True,
         "tools_list": True,
         "tool_count": 0,
-        "reason_code": "ok",
+        "reason_code": "mcp_surface_invalid",
     }

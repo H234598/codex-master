@@ -30,7 +30,6 @@ NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 def green_probe(checked_at: str) -> dict[str, object]:
     return {
         "schema_version": 2,
-        "functional": True,
         "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True},
         "checked_at": checked_at,
         "commands": {"runtime_status": True, "hive_status": True, "hive_doctor": True},
@@ -106,7 +105,7 @@ def test_probe_evaluation_is_fail_closed_for_runtime_status_and_hive_evidence() 
         {"healthy": True, "checks": {"authority": "fail_closed", "repository": "not_configured", "state": "not_configured"}},
     )
 
-    assert result["functional"] is False
+    assert set(result) == {"checks"}
     assert result["checks"] == {
         "runtime_layout": False,
         "hive_runtime": False,
@@ -127,7 +126,7 @@ def test_probe_evaluation_requires_all_canonical_hive_evidence_fields() -> None:
             hive,
             doctor,
         )
-        assert result["functional"] is False
+        assert set(result) == {"checks"}
         assert result["checks"]["hive_runtime"] is False
 
 
@@ -144,7 +143,7 @@ def test_probe_evaluation_rejects_unknown_canonical_hive_evidence_states() -> No
             {**base, field: "unexpected"},
             doctor,
         )
-        assert result["functional"] is False
+        assert set(result) == {"checks"}
         assert result["checks"]["hive_runtime"] is False
 
     result = evaluate(
@@ -152,7 +151,7 @@ def test_probe_evaluation_rejects_unknown_canonical_hive_evidence_states() -> No
         {**base, "unexpected": "field"},
         doctor,
     )
-    assert result["functional"] is False
+    assert set(result) == {"checks"}
     assert result["checks"]["hive_runtime"] is False
 
 
@@ -164,8 +163,8 @@ def test_probe_has_exactly_eight_deterministic_utc_slots() -> None:
 def test_spawn_gate_accepts_only_a_fresh_complete_green_v2_record() -> None:
     fresh = green_probe(NOW.isoformat())
     assert probe_spawn_gate(fresh, now=NOW)["allowed"] is True
-    assert probe_spawn_gate({"functional": True}, now=NOW)["reason_code"] == "probe_ambiguous"
-    assert probe_spawn_gate({**fresh, "functional": False}, now=NOW)["reason_code"] == "probe_red"
+    assert probe_spawn_gate({"checks": {}}, now=NOW)["reason_code"] == "probe_ambiguous"
+    assert probe_spawn_gate({**fresh, "unexpected": True}, now=NOW)["reason_code"] == "probe_ambiguous"
     assert probe_spawn_gate({**fresh, "checks": {"runtime_layout": True, "hive_runtime": True}}, now=NOW)["allowed"] is False
     assert probe_spawn_gate({**fresh, "schema_version": 1}, now=NOW)["allowed"] is False
     assert probe_spawn_gate({**fresh, "commands": {**fresh["commands"], "runtime_status": False}}, now=NOW)["allowed"] is False
@@ -214,11 +213,10 @@ def test_run_probe_persists_only_one_schema_v2_health_record(tmp_path: Path) -> 
         now=lambda: NOW,
         runner=runner,
     )
-    assert result["functional"] is True
+    assert set(result) == {"schema_version", "checked_at", "checks", "commands"}
     assert result["schema_version"] == 2
     assert calls == [("hive", "runtime-status"), ("hive", "status"), ("hive", "doctor")]
     assert read_probe_gate(state_file=state_directory / "hive-hourly-health.json", now=NOW)["allowed"] is True
-    assert not (state_directory / "hive-functional").exists()
     assert not (state_directory / "hive-hourly-alarm.json").exists()
 
     def red_runner(_command: Path, *arguments: str) -> tuple[dict[str, object], bool]:
@@ -232,8 +230,7 @@ def test_run_probe_persists_only_one_schema_v2_health_record(tmp_path: Path) -> 
         now=lambda: NOW,
         runner=red_runner,
     )
-    assert result["functional"] is False
-    assert not (state_directory / "hive-functional").exists()
+    assert set(result) == {"schema_version", "checked_at", "checks", "commands"}
     assert not (state_directory / "hive-hourly-alarm.json").exists()
 
 
@@ -262,13 +259,12 @@ def test_hourly_probe_direct_entrypoint_requires_json_mode(
     monkeypatch.setattr(
         hourly_probe_module,
         "run_probe",
-        lambda: {"functional": True, "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True}},
+        lambda: {"checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True}},
     )
 
     assert hourly_probe_module.main(["--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True},
-        "functional": True,
     }
     assert hourly_probe_module.main([]) == 2
     assert capsys.readouterr().out == ""
@@ -328,7 +324,10 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
 
     environment = {
         "HOME": str(home),
-        "PATH": "/usr/bin:/bin",
+        "PATH": "/attacker/path",
+        "PYTHONPATH": "/attacker/python",
+        "CODEX_HOME": str(tmp_path / "attacker-codex-home"),
+        "CODEX_MASTER_MCP_STATE": str(tmp_path / "attacker-state"),
     }
     completed = subprocess.run(
         [entrypoint, "--json"],
@@ -339,7 +338,7 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         cwd=tmp_path,
     )
     assert completed.returncode in {0, 1}, completed.stderr
-    assert set(json.loads(completed.stdout)) == {"checks", "functional"}
+    assert set(json.loads(completed.stdout)) == {"checks"}
     runtime_status = subprocess.run(
         [installed_cli, "hive", "runtime-status"],
         check=False,
@@ -350,6 +349,24 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     )
     assert runtime_status.returncode == 0, runtime_status.stderr
     assert json.loads(runtime_status.stdout)["ok"] is True
+    direct_mcp = subprocess.run(
+        [installed_cli],
+        check=False,
+        capture_output=True,
+        input=(
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}\n'
+            '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}\n'
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n'
+        ),
+        text=True,
+        env=environment,
+        cwd=tmp_path,
+    )
+    assert direct_mcp.returncode == 0, direct_mcp.stderr
+    responses = [json.loads(line) for line in direct_mcp.stdout.splitlines()]
+    tools_response = next(response for response in responses if response.get("id") == 2)
+    tool_names = {tool["name"] for tool in tools_response["result"]["tools"]}
+    assert tool_names == {"runtime_status"}
     health = home / ".local" / "state" / "codex-master-mcp" / "hive-hourly-health.json"
     health_stat = health.lstat()
     assert stat.S_ISREG(health_stat.st_mode)
@@ -380,6 +397,110 @@ def test_installer_source_reader_is_no_follow_descriptor_bounded(tmp_path: Path)
     )
 
 
+def _sealed_publish_image(installer: dict[str, object], root: Path, marker: str) -> Path:
+    root.mkdir(mode=0o700)
+    payload = root / marker
+    payload.write_text(marker + "\n", encoding="utf-8")
+    payload.chmod(0o644)
+    installer["_write_runtime_image_manifest"](root=root)  # type: ignore[operator]
+    return root
+
+
+def test_runtime_image_publish_rejects_a_foreign_sentinel_before_exchange(tmp_path: Path) -> None:
+    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
+    install_error = installer["InstallError"]
+    library = tmp_path / "lib"
+    library.mkdir(mode=0o700)
+    target = _sealed_publish_image(installer, library / "codex-master-runtime", "old-image")
+    foreign = target / "foreign-sentinel"
+    foreign.write_text("do-not-delete\n", encoding="utf-8")
+    foreign.chmod(0o644)
+    stage = _sealed_publish_image(installer, library / ".codex-master-runtime.stage.test", "new-image")
+
+    with pytest.raises(install_error, match="install_target_untrusted"):
+        installer["_publish_runtime_image"](stage=stage, target=target)
+
+    assert foreign.read_text(encoding="utf-8") == "do-not-delete\n"
+    assert (stage / "new-image").read_text(encoding="utf-8") == "new-image\n"
+
+
+def test_runtime_image_publish_refuses_the_unmanifested_pre_cutover_candidate(tmp_path: Path) -> None:
+    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
+    install_error = installer["InstallError"]
+    library = tmp_path / "lib"
+    library.mkdir(mode=0o700)
+    target = library / "codex-master-runtime"
+    target.mkdir(mode=0o700)
+    candidate = target / "candidate-without-manifest"
+    candidate.write_text("do-not-adopt\n", encoding="utf-8")
+    candidate.chmod(0o644)
+    stage = _sealed_publish_image(installer, library / ".codex-master-runtime.stage.test", "new-image")
+
+    with pytest.raises(install_error, match="install_target_untrusted"):
+        installer["_publish_runtime_image"](stage=stage, target=target)
+
+    assert candidate.read_text(encoding="utf-8") == "do-not-adopt\n"
+    assert (stage / "new-image").read_text(encoding="utf-8") == "new-image\n"
+
+
+@pytest.mark.parametrize("legacy_relative", (".local/lib/codex-master-hive-probe", ".local/libexec/codex_master_hive_hourly_probe.py", ".local/bin/codex-master-mcp"))
+@pytest.mark.parametrize("entry_kind", ("file", "symlink", "directory"))
+def test_install_rejects_foreign_legacy_entries_before_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_relative: str, entry_kind: str
+) -> None:
+    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
+    install_error = installer["InstallError"]
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    legacy = home / legacy_relative
+    legacy.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if entry_kind == "file":
+        legacy.write_text("foreign\n", encoding="utf-8")
+        legacy.chmod(0o600)
+    elif entry_kind == "symlink":
+        foreign = home / "foreign-target"
+        foreign.write_text("foreign\n", encoding="utf-8")
+        foreign.chmod(0o600)
+        legacy.symlink_to(foreign)
+    else:
+        legacy.mkdir(mode=0o700)
+        (legacy / "foreign-sentinel").write_text("foreign\n", encoding="utf-8")
+    published: list[Path] = []
+    globals_dict = installer["install"].__globals__  # type: ignore[index]
+    monkeypatch.setitem(globals_dict, "_build_runtime_image", lambda **_kwargs: None)
+    monkeypatch.setitem(globals_dict, "_validate_runtime_image_stage", lambda **_kwargs: None)
+    monkeypatch.setitem(globals_dict, "_publish_runtime_image", lambda *, stage, target: published.append(target))
+
+    with pytest.raises(install_error, match="install_legacy_untrusted"):
+        installer["install"](home=home)
+
+    assert legacy.exists() or legacy.is_symlink()
+    assert not published
+
+
+def test_runtime_image_cleanup_refuses_an_old_root_changed_after_prevalidation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
+    install_error = installer["InstallError"]
+    library = tmp_path / "lib"
+    library.mkdir(mode=0o700)
+    target = _sealed_publish_image(installer, library / "codex-master-runtime", "old-image")
+    stage = _sealed_publish_image(installer, library / ".codex-master-runtime.stage.test", "new-image")
+    exchange = installer["_rename_exchange"]
+
+    def change_old_root_after_exchange(*arguments: object) -> None:
+        exchange(*arguments)
+        (stage / "foreign-sentinel").write_text("do-not-delete\n", encoding="utf-8")
+
+    monkeypatch.setitem(installer["_publish_runtime_image"].__globals__, "_rename_exchange", change_old_root_after_exchange)
+    with pytest.raises(install_error, match="install_old_image_changed"):
+        installer["_publish_runtime_image"](stage=stage, target=target)
+
+    assert (target / "new-image").read_text(encoding="utf-8") == "new-image\n"
+    assert (stage / "foreign-sentinel").read_text(encoding="utf-8") == "do-not-delete\n"
+
+
 def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -388,15 +509,20 @@ def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
     stage.mkdir()
     observed: list[tuple[str, ...]] = []
 
-    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    class Completed:
+        def __init__(self, returncode: int, stdout: str) -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+
+    def run(command: list[str], **_kwargs: object) -> Completed:
         observed.append(tuple(command))
         diagnostic = command[-1]
         payload: dict[str, object] = {"status": "ready"}
         if diagnostic == "runtime-status":
             payload = {"ok": True}
-        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+        return Completed(0, json.dumps(payload))
 
-    monkeypatch.setattr(installer["subprocess"], "run", run)
+    monkeypatch.setitem(installer["_validate_runtime_image_stage"].__globals__, "run_bounded", run)
     installer["_validate_runtime_image_stage"](stage=stage, home=tmp_path / "home")
 
     entrypoint = str(stage / "bin" / "codex-master-mcp")
@@ -414,12 +540,8 @@ def test_runtime_image_publish_failure_leaves_the_previous_complete_image_untouc
     install_error = installer["InstallError"]
     library = tmp_path / "lib"
     library.mkdir(mode=0o700)
-    target = library / "codex-master-runtime"
-    target.mkdir(mode=0o700)
-    (target / "old-complete-image").write_text("old\n", encoding="utf-8")
-    stage = library / ".codex-master-runtime.stage.test"
-    stage.mkdir(mode=0o700)
-    (stage / "new-complete-image").write_text("new\n", encoding="utf-8")
+    target = _sealed_publish_image(installer, library / "codex-master-runtime", "old-complete-image")
+    stage = _sealed_publish_image(installer, library / ".codex-master-runtime.stage.test", "new-complete-image")
 
     def renameat2(*_args: object) -> int:
         return -1
@@ -435,9 +557,9 @@ def test_runtime_image_publish_failure_leaves_the_previous_complete_image_untouc
     with pytest.raises(install_error, match="install_swap_failed"):
         installer["_publish_runtime_image"](stage=stage, target=target)
 
-    assert (target / "old-complete-image").read_text(encoding="utf-8") == "old\n"
+    assert (target / "old-complete-image").read_text(encoding="utf-8") == "old-complete-image\n"
     assert not (target / "new-complete-image").exists()
-    assert (stage / "new-complete-image").read_text(encoding="utf-8") == "new\n"
+    assert (stage / "new-complete-image").read_text(encoding="utf-8") == "new-complete-image\n"
 
 
 def test_runtime_image_build_failure_never_publishes_a_partial_stage(
@@ -472,16 +594,12 @@ def test_runtime_image_publish_exchange_exposes_only_complete_directory_generati
     installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
     library = tmp_path / "lib"
     library.mkdir(mode=0o700)
-    target = library / "codex-master-runtime"
-    target.mkdir(mode=0o700)
-    (target / "old-complete-image").write_text("old\n", encoding="utf-8")
-    stage = library / ".codex-master-runtime.stage.test"
-    stage.mkdir(mode=0o700)
-    (stage / "new-complete-image").write_text("new\n", encoding="utf-8")
+    target = _sealed_publish_image(installer, library / "codex-master-runtime", "old-complete-image")
+    stage = _sealed_publish_image(installer, library / ".codex-master-runtime.stage.test", "new-complete-image")
 
     installer["_publish_runtime_image"](stage=stage, target=target)
 
-    assert (target / "new-complete-image").read_text(encoding="utf-8") == "new\n"
+    assert (target / "new-complete-image").read_text(encoding="utf-8") == "new-complete-image\n"
     assert not (target / "old-complete-image").exists()
     assert not stage.exists()
 

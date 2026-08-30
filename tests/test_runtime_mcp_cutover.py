@@ -129,3 +129,12 @@ def test_runtime_cutover_source_has_no_legacy_registration_path() -> None:
         "--remove-symlink",
     ):
         assert forbidden not in source
+
+
+def test_agent_pool_installer_uses_only_the_runtime_image_entrypoint() -> None:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "install-agent-pool"
+    source = script.read_text(encoding="utf-8")
+
+    assert '"${HOME}/.local/lib/codex-master-runtime/bin/codex-master-mcp" pool install' in source
+    assert "repo_root" not in source
+    assert "/.local/bin/codex-master-mcp" not in source

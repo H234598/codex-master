@@ -283,6 +283,7 @@ from codex_master.hive.runtime import (
     build_hive_runtime,
 )
 from codex_master.hive.tools import call_hive_tool, hive_tool_definitions
+from codex_master.runtime_status import runtime_status
 from codex_master.selection.model_policy import load_model_policy
 from codex_master.limit_tracker import (
     derive_limit_decisions,
@@ -34144,6 +34145,15 @@ def spawn_admission_lock() -> Any:
 
 TOOLS: list[dict[str, Any]] = [
     {
+        "name": "runtime_status",
+        "description": "Return the autonomous runtime-image health contract without principal or client integration state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_spawn_offers",
         "description": "Return short-lived, advisory spawn offers for currently admitted routes. Does not reserve capacity or return raw output.",
         "inputSchema": {
@@ -35565,7 +35575,7 @@ def handle_rpc(
             tools = (
                 teamleader_tool_catalog()
                 if master_tool_access_status()["authorized"]
-                else []
+                else [tool for tool in TOOLS if tool["name"] == "runtime_status"]
             )
         return reply(rpc_result(message_id, {"tools": tools}))
     if method == "resources/list":
@@ -35575,8 +35585,6 @@ def handle_rpc(
     if method == "tools/call":
         try:
             principal_class = None
-            if enforce_master_role:
-                status = require_teamleader_tool_access()
             params = msg.get("params", {})
             if params is None:
                 params = {}
@@ -35586,11 +35594,13 @@ def handle_rpc(
                 requested_name = params.get("name")
                 if not isinstance(requested_name, str):
                     raise AgentError("tools/call requires a known tool name")
-                principal_class = require_principal_tool_access(requested_name, status)
+                if requested_name != "runtime_status":
+                    status = require_teamleader_tool_access()
+                    principal_class = require_principal_tool_access(requested_name, status)
             name, args = validate_tool_call(
                 params.get("name"), params.get("arguments", {})
             )
-            payload = (
+            payload = runtime_status() if name == "runtime_status" else (
                 call_tool(name, args, principal_class=principal_class)
                 if principal_class is not None
                 else call_tool(name, args)

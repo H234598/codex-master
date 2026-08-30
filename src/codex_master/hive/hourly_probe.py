@@ -10,12 +10,12 @@ import json
 import os
 from pathlib import Path
 import stat
-import subprocess
 import sys
 import tempfile
 from typing import Any
 
 from codex_master.runtime_layout import LayoutError, RuntimeLayout
+from codex_master.runtime_process import BoundedProcessError, DEFAULT_STDERR_LIMIT, DEFAULT_STDOUT_LIMIT, run_bounded
 
 
 DETERMINISTIC_PROBE_HOURS_UTC = (0, 3, 6, 9, 12, 15, 18, 21)
@@ -23,7 +23,7 @@ STATE_FILE_NAME = "hive-hourly-health.json"
 PROBE_GATE_LOCK_NAME = ".hive-hourly-probe.lock"
 MAX_PROBE_STATE_BYTES = 64 * 1024
 MAX_PROBE_AGE_SECONDS = 4 * 60 * 60
-_PROBE_RECORD_KEYS = frozenset({"schema_version", "checked_at", "checks", "commands", "functional"})
+_PROBE_RECORD_KEYS = frozenset({"schema_version", "checked_at", "checks", "commands"})
 _PROBE_CHECK_KEYS = frozenset({"runtime_layout", "hive_runtime", "hive_doctor"})
 _PROBE_COMMAND_KEYS = frozenset({"runtime_status", "hive_status", "hive_doctor"})
 _HIVE_STATUS_KEYS = frozenset(
@@ -99,7 +99,7 @@ def _green_runtime_status(value: object) -> bool:
         and surface.get("initialize") is True
         and surface.get("tools_list") is True
         and type(surface.get("tool_count")) is int
-        and surface.get("tool_count") >= 0
+        and surface.get("tool_count") >= 1
         and surface.get("reason_code") == "ok"
         and value.get("raw_output") == "not_returned"
     )
@@ -124,7 +124,7 @@ def evaluate(
         "hive_runtime": _green_hive_runtime(hive),
         "hive_doctor": doctor.get("healthy") is True and doctor_ready,
     }
-    return {"functional": all(checks.values()), "checks": checks}
+    return {"checks": checks}
 
 
 def probe_spawn_gate(
@@ -146,7 +146,6 @@ def probe_spawn_gate(
         or not isinstance(commands, Mapping)
         or frozenset(commands) != _PROBE_COMMAND_KEYS
         or any(value is not True for value in commands.values())
-        or payload.get("functional") is not True
     ):
         return {"allowed": False, "reason_code": "probe_red", "raw_output": "not_returned"}
     checked_at = payload.get("checked_at")
@@ -411,20 +410,19 @@ def _atomic_write(path: Path, payload: Mapping[str, object]) -> None:
 
 def _run_json(command: Path, *arguments: str) -> tuple[dict[str, Any], bool]:
     try:
-        completed = subprocess.run(
+        completed = run_bounded(
             [os.fspath(command), *arguments],
             cwd=command.parent.parent,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=45,
-            check=False,
+            home=Path.home(),
+            timeout_seconds=45,
+            stdout_limit=DEFAULT_STDOUT_LIMIT,
+            stderr_limit=DEFAULT_STDERR_LIMIT,
         )
         if completed.returncode != 0:
             return {}, False
         value = json.loads(completed.stdout)
         return (value, True) if isinstance(value, dict) else ({}, False)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, TypeError):
+    except (BoundedProcessError, json.JSONDecodeError, TypeError):
         return {}, False
 
 
@@ -473,8 +471,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if tuple(arguments or ()) != ("--json",):
         return 2
     result = run_probe()
-    print(json.dumps({"functional": result["functional"], "checks": result["checks"]}, sort_keys=True))
-    return 0 if result["functional"] else 1
+    print(json.dumps({"checks": result["checks"]}, sort_keys=True))
+    return 0 if all(result["checks"].values()) else 1
 
 
 __all__ = [

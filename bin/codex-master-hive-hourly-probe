@@ -1,8 +1,17 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 set -euo pipefail
 
-script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
-runtime_root="$(cd -- "$(dirname -- "${script_path}")/.." && pwd)"
-export PYTHONPATH="${runtime_root}/src"
-export PYTHONDONTWRITEBYTECODE=1
-exec python3 -m codex_master.hive.hourly_probe "$@"
+runtime_root="${BASH_SOURCE[0]%/bin/codex-master-hive-hourly-probe}"
+[[ "${runtime_root}" != "${BASH_SOURCE[0]}" && "${runtime_root}" == /* ]] || exit 64
+for variable in "${!CODEX_@}"; do unset "${variable}"; done
+unset PYTHONHOME PYTHONPATH
+export PATH=/usr/bin:/bin
+exec /usr/bin/python3 -I -B -c '
+import runpy
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "src"))
+sys.argv = [str(root / "bin" / "codex-master-hive-hourly-probe"), *sys.argv[2:]]
+runpy.run_module("codex_master.hive.hourly_probe", run_name="__main__", alter_sys=True)
+' "${runtime_root}" "$@"

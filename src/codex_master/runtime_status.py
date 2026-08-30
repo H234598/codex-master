@@ -3,29 +3,17 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import selectors
-import signal
-import subprocess
-import time
-from typing import Any
 
 from codex_master.runtime_layout import LayoutError, RuntimeLayout, validate_runtime_metadata
+from codex_master.runtime_process import BoundedProcessError, DEFAULT_STDERR_LIMIT, run_bounded
 
 
 _MCP_SERVER_NAME = "codex-master-mcp"
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 _MAX_MCP_OUTPUT_BYTES = 256 * 1024
 _MCP_TIMEOUT_SECONDS = 10
-
-
-class _McpProbeError(RuntimeError):
-    pass
-
-
-class _McpProbeTimeout(_McpProbeError):
-    pass
+_REQUIRED_AUTONOMOUS_TOOL = "runtime_status"
 
 
 def _probe_payload() -> bytes:
@@ -46,99 +34,29 @@ def _probe_payload() -> bytes:
     return b"".join(json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n" for message in messages)
 
 
-def _probe_environment() -> dict[str, str]:
-    environment = {
-        "PATH": "/usr/bin:/bin",
-        "LANG": "C.UTF-8",
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-    home = os.environ.get("HOME")
-    if home and Path(home).is_absolute():
-        environment["HOME"] = home
-    return environment
-
-
-def _terminate(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except OSError:
-        process.terminate()
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except OSError:
-            process.kill()
-        process.wait()
-
-
 def _run_direct_mcp(layout: RuntimeLayout) -> tuple[int, str]:
-    process: subprocess.Popen[bytes] | None = None
-    selector: selectors.BaseSelector | None = None
-    stdout: Any = None
     try:
-        process = subprocess.Popen(
+        result = run_bounded(
             [str(layout.mcp_entrypoint)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
             cwd=layout.root,
-            env=_probe_environment(),
-            close_fds=True,
-            start_new_session=True,
+            home=Path.home(),
+            timeout_seconds=_MCP_TIMEOUT_SECONDS,
+            stdout_limit=_MAX_MCP_OUTPUT_BYTES,
+            stderr_limit=DEFAULT_STDERR_LIMIT,
+            input_data=_probe_payload(),
         )
-        if process.stdin is None or process.stdout is None:
-            raise _McpProbeError("mcp_pipe_unavailable")
-        try:
-            process.stdin.write(_probe_payload())
-        except BrokenPipeError:
-            pass
-        finally:
-            process.stdin.close()
-        stdout = process.stdout
-        selector = selectors.DefaultSelector()
-        selector.register(stdout, selectors.EVENT_READ)
-        output = bytearray()
-        deadline = time.monotonic() + _MCP_TIMEOUT_SECONDS
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _McpProbeTimeout("mcp_timeout")
-            ready = selector.select(remaining)
-            if not ready:
-                raise _McpProbeTimeout("mcp_timeout")
-            for key, _ in ready:
-                chunk = os.read(key.fileobj.fileno(), min(8192, _MAX_MCP_OUTPUT_BYTES + 1 - len(output)))
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                output.extend(chunk)
-                if len(output) > _MAX_MCP_OUTPUT_BYTES:
-                    raise _McpProbeError("mcp_output_too_large")
-        try:
-            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired as exc:
-            raise _McpProbeTimeout("mcp_timeout") from exc
-        return returncode, output.decode("utf-8")
-    except (OSError, UnicodeError) as exc:
-        raise _McpProbeError("mcp_unavailable") from exc
-    finally:
-        if selector is not None:
-            selector.close()
-        if stdout is not None:
-            stdout.close()
-        if process is not None:
-            _terminate(process)
+    except BoundedProcessError as exc:
+        if exc.code == "command_timeout":
+            raise TimeoutError from exc
+        raise RuntimeError from exc
+    return result.returncode, result.stdout
 
 
 def _mcp_surface(returncode: int, output: str) -> dict[str, object]:
     initialized = False
     tools_list = False
     tool_count = 0
+    tool_names: set[str] = set()
     for line in output.splitlines():
         try:
             payload = json.loads(line)
@@ -161,13 +79,14 @@ def _mcp_surface(returncode: int, output: str) -> dict[str, object]:
             result = payload.get("result")
             tools = result.get("tools") if isinstance(result, dict) else None
             if isinstance(tools, list):
-                tool_count = sum(
-                    1
+                tool_names = {
+                    tool["name"]
                     for tool in tools
                     if isinstance(tool, dict) and isinstance(tool.get("name"), str) and tool["name"]
-                )
+                }
+                tool_count = len(tool_names)
                 tools_list = True
-    ok = returncode == 0 and initialized and tools_list
+    ok = returncode == 0 and initialized and tools_list and _REQUIRED_AUTONOMOUS_TOOL in tool_names
     return {
         "ok": ok,
         "initialize": initialized,
@@ -202,9 +121,9 @@ def runtime_status(*, layout: RuntimeLayout | None = None) -> dict[str, object]:
         }
     try:
         returncode, output = _run_direct_mcp(active_layout)
-    except _McpProbeTimeout:
+    except TimeoutError:
         surface = _blocked_surface("mcp_timeout")
-    except _McpProbeError:
+    except RuntimeError:
         surface = _blocked_surface("mcp_unavailable")
     else:
         surface = _mcp_surface(returncode, output)
