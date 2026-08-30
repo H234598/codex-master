@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "python3 ${PLUGIN_ROOT}/hooks/native_spawn_admission.py",
-            "timeout": 1
+            "timeout": 10
           }
         ]
       },
@@ -17,7 +17,7 @@
           {
             "type": "command",
             "command": "python3 ${PLUGIN_ROOT}/hooks/native_bee_event.py",
-            "timeout": 1
+            "timeout": 10
           }
         ]
       }

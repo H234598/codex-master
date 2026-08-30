@@ -118,6 +118,108 @@ def make_executable(path: Path) -> Path:
     return path
 
 
+def test_full_local_fleet_slice_is_idempotent_and_stops_only_failed_unit(
+    tmp_path: Path,
+) -> None:
+    from codex_master.fleet_service import FleetConflictError, FleetPaths, FleetService
+    from codex_master.ollama_host_transport import (
+        CONTROL_HOST_REF,
+        OllamaHostLease,
+        OllamaHostTransport,
+        Task3LocalOllamaHostAdapter,
+    )
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    executable = make_executable(tmp_path / "fake-ollama")
+    models_directory = make_models_directory(tmp_path / "models")
+    registry_root = tmp_path / "registry"
+    registry = OllamaRegistryStore.for_test(registry_root)
+    registry.replace(models=valid_models(), instances=(), expected_generation=0)
+    runtime = FakeRuntime()
+    lease = OllamaHostLease(
+        CONTROL_HOST_REF,
+        "lease-" + "a" * 32,
+        1,
+        7,
+        time.monotonic() + 3600,
+    )
+
+    class Leases:
+        def resolve(self, host_ref: str) -> OllamaHostLease | None:
+            return lease if host_ref == CONTROL_HOST_REF else None
+
+    class NoRemoteBroker:
+        def exchange(self, *_args: object, **_values: object) -> object:
+            raise AssertionError("local fleet slice reached remote broker")
+
+    transport = OllamaHostTransport(
+        registry=registry,
+        leases=Leases(),
+        broker=NoRemoteBroker(),
+        local=Task3LocalOllamaHostAdapter(runtime),
+    )
+    paths = FleetPaths.from_state_root(tmp_path / "fleet-state")
+    service = FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+    )
+
+    def candidate(ref: str) -> OllamaInstanceV1:
+        return OllamaInstanceV1(
+            ref,
+            ref,
+            CONTROL_HOST_REF,
+            str(executable),
+            str(models_directory),
+            ("llama", "qwen"),
+            "0-3",
+            350,
+            40,
+            "planned",
+            "unknown",
+        )
+
+    first_plan = service.plan_ollama_instance(
+        candidate("ollama-main"), expected_generation=1
+    )
+    first = service.apply_ollama_instance(
+        first_plan.plan_id, expected_generation=1
+    )
+    reloaded = OllamaRegistryStore.for_test(registry_root).load()
+    retried = service.apply_ollama_instance(
+        first_plan.plan_id, expected_generation=1
+    )
+
+    assert retried is first
+    assert reloaded.generation == 2
+    assert [lane.model_ref for lane in first.hive_lanes] == ["llama", "qwen"]
+    assert len(runtime.started) == 1
+    assert runtime.started[0].systemd_properties == (  # type: ignore[attr-defined]
+        ("AllowedCPUs", "0-3"),
+        ("CPUQuota", "350%"),
+        ("CPUWeight", "40"),
+    )
+
+    second_plan = service.plan_ollama_instance(
+        candidate("ollama-canary"), expected_generation=2
+    )
+    runtime.tags = {"llama-small"}
+    with pytest.raises(FleetConflictError, match="ollama.instance_not_ready"):
+        service.apply_ollama_instance(
+            second_plan.plan_id, expected_generation=2
+        )
+
+    assert len(runtime.started) == 2
+    assert [request.unit_name for request in runtime.stopped] == [  # type: ignore[attr-defined]
+        runtime.started[1].unit_name  # type: ignore[attr-defined]
+    ]
+    assert runtime.stopped[0].unit_name != runtime.started[0].unit_name  # type: ignore[attr-defined]
+
+
 def bind_current_scope_identity(
     runtime: SystemOllamaRuntime,
     monkeypatch: pytest.MonkeyPatch,

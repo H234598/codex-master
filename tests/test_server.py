@@ -29431,11 +29431,20 @@ google_accounts:
                     return subprocess.CompletedProcess(args, 1, "", "")
                 if args[:3] == ["git", "worktree", "add"]:
                     observed.append(Path(kwargs["cwd"]).resolve())
+                    (Path(kwargs["cwd"]) / ".git").write_text(
+                        "gitdir: /mock\n", encoding="utf-8"
+                    )
                 return subprocess.CompletedProcess(args, 0, "", "")
 
             mock_subprocess_run.side_effect = race_before_git
+            scope_store = SimpleNamespace(
+                create=Mock(return_value=SimpleNamespace(attestation_id="test-scope"))
+            )
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("codex_master.server.repo_root", return_value=repo), patch(
+                "codex_master.server._headless_write_scope_store",
+                return_value=scope_store,
+            ):
                 result = worktree_create_for_agent("a", path=str(target))
 
         self.assertEqual(result["status"], "created")
@@ -29465,7 +29474,9 @@ google_accounts:
 
             with patch("codex_master.server.open_directory_no_follow_matching", side_effect=race_target_open):
                 with patch("codex_master.server.repo_root", return_value=repo):
-                    with self.assertRaisesRegex(AgentError, "worktree path must be a real directory"):
+                    with self.assertRaisesRegex(
+                        AgentError, "headless_attestation_rollback_incomplete"
+                    ):
                         worktree_create_for_agent("a", path=str(target))
 
             target_is_symlink = target.is_symlink()
@@ -29497,12 +29508,24 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            mock_run_command.side_effect = [
-                subprocess.CompletedProcess(["git"], 1, "", ""),
-                subprocess.CompletedProcess(["git"], 0, "", ""),
-            ]
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            def run_git(args, **kwargs):
+                if args[:3] == ["git", "show-ref", "--verify"]:
+                    return subprocess.CompletedProcess(args, 1, "", "")
+                (Path(kwargs["cwd"]) / ".git").write_text(
+                    "gitdir: /mock\n", encoding="utf-8"
+                )
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            mock_run_command.side_effect = run_git
+            scope_store = SimpleNamespace(
+                create=Mock(return_value=SimpleNamespace(attestation_id="test-scope"))
+            )
+
+            with patch("codex_master.server.repo_root", return_value=repo), patch(
+                "codex_master.server._headless_write_scope_store",
+                return_value=scope_store,
+            ):
                 result = worktree_create_for_agent("a", path=relative)
 
         self.assertEqual(result["path"], relative)
@@ -29518,9 +29541,22 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            mock_run_command.return_value = subprocess.CompletedProcess(["git"], 0, "", "")
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            def run_git(args, **kwargs):
+                (Path(kwargs["cwd"]) / ".git").write_text(
+                    "gitdir: /mock\n", encoding="utf-8"
+                )
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            mock_run_command.side_effect = run_git
+            scope_store = SimpleNamespace(
+                create=Mock(return_value=SimpleNamespace(attestation_id="test-scope"))
+            )
+
+            with patch("codex_master.server.repo_root", return_value=repo), patch(
+                "codex_master.server._headless_write_scope_store",
+                return_value=scope_store,
+            ):
                 result = worktree_create_for_agent("a", path=relative, base_ref="origin/main")
 
         self.assertEqual(result["base_ref"], "not_returned")
@@ -29562,12 +29598,18 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            mock_run_command.return_value = subprocess.CompletedProcess(
-                ["git"],
-                128,
-                "",
-                f"SECRET_WORKTREE_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
-            )
+
+            def run_git(args, **_kwargs):
+                if args[:4] == ["git", "worktree", "list", "--porcelain"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                return subprocess.CompletedProcess(
+                    args,
+                    128,
+                    "",
+                    f"SECRET_WORKTREE_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
+                )
+
+            mock_run_command.side_effect = run_git
 
             with patch("codex_master.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(AgentError, "git worktree add failed") as raised:
@@ -34073,6 +34115,8 @@ class CliLifecycleTest(unittest.TestCase):
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
+            ), patch(
+                "codex_master.server.require_fleet_recovery_ready"
             ), server_module.temporary_agent_inventory(inventory):
                 result = send_agent("a", "hello", True)
 

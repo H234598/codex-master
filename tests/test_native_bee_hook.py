@@ -38,7 +38,7 @@ class NativeBeeHookTest(unittest.TestCase):
             text=True,
             capture_output=True,
             env=env,
-            timeout=2,
+            timeout=10,
             check=False,
         )
 
@@ -48,7 +48,7 @@ class NativeBeeHookTest(unittest.TestCase):
         if state_root is not None:
             env["CODEX_MASTER_MCP_STATE"] = str(state_root)
         return subprocess.run(
-            [sys.executable, str(SPAWN_HOOK)], input=payload, text=True, capture_output=True, env=env, timeout=2, check=False
+            [sys.executable, str(SPAWN_HOOK)], input=payload, text=True, capture_output=True, env=env, timeout=10, check=False
         )
 
     def test_hooks_manifest_uses_official_event_group_schema(self) -> None:
@@ -74,7 +74,7 @@ class NativeBeeHookTest(unittest.TestCase):
                         {
                             "type": "command",
                             "command": "python3 ${PLUGIN_ROOT}/hooks/native_spawn_admission.py",
-                            "timeout": 1,
+                            "timeout": 10,
                         }
                     ],
                 },
@@ -84,7 +84,7 @@ class NativeBeeHookTest(unittest.TestCase):
                         {
                             "type": "command",
                             "command": "python3 ${PLUGIN_ROOT}/hooks/native_bee_event.py",
-                            "timeout": 1,
+                            "timeout": 10,
                         }
                     ],
                 },

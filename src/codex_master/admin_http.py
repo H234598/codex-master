@@ -46,6 +46,19 @@ _ORIGIN = re.compile(
     re.ASCII,
 )
 _INGRESS_PREFIX = "/admin/v1/secret-ingress-sessions/"
+_OLLAMA_QUERY_ROUTES = {
+    "/admin/v1/ollama/models": "ollama.models.list",
+    "/admin/v1/ollama/instances": "ollama.instances.list",
+}
+_OLLAMA_PLAN_ROUTE = "/admin/v1/ollama/instance-plans"
+_OLLAMA_APPLY_ROUTE = re.compile(
+    r"/admin/v1/ollama/instance-plans/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})/apply\Z",
+    re.ASCII,
+)
+_OLLAMA_PROBE_ROUTE = re.compile(
+    r"/admin/v1/ollama/instances/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})/probe\Z",
+    re.ASCII,
+)
 _AUTHORITY_MODES = frozenset({"cloudflare", "bearer", "require_both"})
 
 
@@ -101,7 +114,21 @@ class _AdminHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
-        if self.path != "/admin/v1":
+        expected_operation: str | None = None
+        route_argument: tuple[str, str] | None = None
+        apply_match = _OLLAMA_APPLY_ROUTE.fullmatch(self.path)
+        probe_match = _OLLAMA_PROBE_ROUTE.fullmatch(self.path)
+        if self.path == "/admin/v1":
+            pass
+        elif self.path == _OLLAMA_PLAN_ROUTE:
+            expected_operation = "ollama.instance.plan"
+        elif apply_match is not None:
+            expected_operation = "ollama.instance.apply"
+            route_argument = ("plan_id", apply_match.group(1))
+        elif probe_match is not None:
+            expected_operation = "ollama.instance.probe"
+            route_argument = ("instance_ref", probe_match.group(1))
+        else:
             self._reply_problem(404, "control.route_not_found")
             return
         if not self._boundary_valid():
@@ -126,6 +153,15 @@ class _AdminHandler(BaseHTTPRequestHandler):
             ValueError,
             TypeError,
             RecursionError,
+        ):
+            self._reply_problem(400, "control.request_invalid")
+            return
+        if (
+            expected_operation is not None
+            and request.operation != expected_operation
+        ) or (
+            route_argument is not None
+            and request.arguments.get(route_argument[0]) != route_argument[1]
         ):
             self._reply_problem(400, "control.request_invalid")
             return
@@ -217,16 +253,49 @@ class _AdminHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+        operation = _OLLAMA_QUERY_ROUTES.get(self.path)
+        if operation is None:
+            self._reply_problem(
+                405 if self.path == "/admin/v1" else 404,
+                "control.route_not_found",
+            )
+            return
+        if not self._boundary_valid():
+            return
+        try:
+            principal = self._authenticate()
+            request = AdminRequestV1(operation, {}, None, None, None)
+            result = self.server.service.handle(principal, request)
+        except AdminAuthError as error:
+            self._reply_auth_error(error)
+            return
+        except AdminServiceError as error:
+            self._reply_service_error(error)
+            return
+        except Exception:
+            self._reply_problem(503, "control.owner_unavailable")
+            return
+        self._reply_json(200, self._wire_result(request, result))
+
+    def do_DELETE(self) -> None:  # noqa: N802 - stdlib handler API
+        known_route = (
+            self.path == "/admin/v1"
+            or self.path in _OLLAMA_QUERY_ROUTES
+            or self.path == _OLLAMA_PLAN_ROUTE
+            or _OLLAMA_APPLY_ROUTE.fullmatch(self.path) is not None
+            or _OLLAMA_PROBE_ROUTE.fullmatch(self.path) is not None
+            or self.path.startswith(_INGRESS_PREFIX)
+        )
         self._reply_problem(
-            405 if self.path == "/admin/v1" else 404, "control.route_not_found"
+            405 if known_route else 404,
+            "control.route_not_found",
         )
 
-    do_DELETE = do_GET
-    do_PATCH = do_GET
-    do_HEAD = do_GET
-    do_OPTIONS = do_GET
-    do_TRACE = do_GET
-    do_CONNECT = do_GET
+    do_PATCH = do_DELETE
+    do_HEAD = do_DELETE
+    do_OPTIONS = do_DELETE
+    do_TRACE = do_DELETE
+    do_CONNECT = do_DELETE
 
     def handle_expect_100(self) -> bool:
         self._reply_problem(417, "control.request_invalid")

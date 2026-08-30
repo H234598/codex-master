@@ -70,6 +70,8 @@ EXPECTED_RISKS = {
     "fleet_account_list": Risk.READ_ONLY,
     "fleet_openai_accounts": Risk.READ_ONLY,
     "fleet_google_inventory": Risk.READ_ONLY,
+    "fleet_ollama_models": Risk.READ_ONLY,
+    "fleet_ollama_instances": Risk.READ_ONLY,
     "fleet_operation_status": Risk.READ_ONLY,
     "fleet_gemini_bootstrap_plan": Risk.READ_ONLY,
     "fleet_series_list": Risk.READ_ONLY,
@@ -84,6 +86,10 @@ EXPECTED_RISKS = {
     "fleet_google_provision_apply": Risk.MUTATING,
     "fleet_google_billing_plan": Risk.MUTATING,
     "fleet_google_billing_apply": Risk.MUTATING,
+    "fleet_google_quota_evidence_sync": Risk.MUTATING,
+    "fleet_ollama_instance_plan": Risk.MUTATING,
+    "fleet_ollama_instance_apply": Risk.MUTATING,
+    "fleet_ollama_instance_probe": Risk.MUTATING,
     "fleet_provider_models": Risk.READ_ONLY,
     "fleet_series_plan": Risk.READ_ONLY,
     "fleet_series_apply": Risk.MUTATING,
@@ -263,6 +269,18 @@ class ControlCatalogTest(unittest.TestCase):
                 "properties": {"values": {"type": "array", "items": {"type": "integer"}}},
                 "additionalProperties": False,
             },
+            "non-boolean unique items": {
+                "type": "object",
+                "properties": {
+                    "values": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 8},
+                        "maxItems": 2,
+                        "uniqueItems": "true",
+                    }
+                },
+                "additionalProperties": False,
+            },
         }
 
         for label, schema in invalid_schemas.items():
@@ -347,7 +365,8 @@ class ControlCatalogTest(unittest.TestCase):
                 "enabled": {"type": "boolean"},
                 "paths": {
                     "type": "array",
-                    "maxItems": 1,
+                    "maxItems": 2,
+                    "uniqueItems": True,
                     "items": {"type": "string", "maxLength": 3},
                 },
             },
@@ -364,7 +383,8 @@ class ControlCatalogTest(unittest.TestCase):
             ({"agent": "a1", "enabled": "false"}, "boolean"),
             ({"agent": "a1", "paths": "src"}, "array"),
             ({"agent": "a1", "paths": ["long"]}, "characters"),
-            ({"agent": "a1", "paths": ["src", "tst"]}, "at most"),
+            ({"agent": "a1", "paths": ["src", "tst", "foo"]}, "at most"),
+            ({"agent": "a1", "paths": ["src", "src"]}, "duplicates"),
         ]
 
         for arguments, message in invalid:

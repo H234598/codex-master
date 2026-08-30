@@ -295,6 +295,7 @@ def _running_server(
         yield server, service
     finally:
         server.shutdown()
+        server.drain(2)
         server.server_close()
         thread.join(timeout=2)
         assert not thread.is_alive()
@@ -364,6 +365,117 @@ def test_http_dispatches_only_parsed_admin_request_and_sets_no_store(tmp_path) -
     assert headers["Content-Type"] == "application/json"
     assert json.loads(payload)["operation"] == "google.accounts.list"
     assert type(service.calls[0][1]) is AdminRequestV1
+
+
+@pytest.mark.parametrize(
+    ("target", "operation"),
+    [
+        ("/admin/v1/ollama/models", "ollama.models.list"),
+        ("/admin/v1/ollama/instances", "ollama.instances.list"),
+    ],
+)
+def test_ollama_rest_queries_bind_exact_operation(tmp_path, target, operation) -> None:
+    with _running_server(tmp_path) as (server, service):
+        status, headers, payload = _request(server, "GET", target, b"", _headers())
+
+    assert status == 200
+    assert headers["Cache-Control"] == "no-store"
+    assert json.loads(payload)["operation"] == operation
+    assert service.calls[0][1] == AdminRequestV1(operation, {}, None, None, None)
+
+
+@pytest.mark.parametrize(
+    "method", ["DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"]
+)
+def test_ollama_rest_queries_reject_unsupported_methods(tmp_path, method) -> None:
+    with _running_server(tmp_path) as (server, service):
+        status, _headers_out, payload = _request(
+            server,
+            method,
+            "/admin/v1/ollama/models",
+            b"",
+            _headers(),
+        )
+
+    assert status == 405
+    if method != "HEAD":
+        assert json.loads(payload)["code"] == "control.route_not_found"
+    assert service.calls == []
+
+
+@pytest.mark.parametrize(
+    ("target", "operation", "arguments", "extra"),
+    [
+        (
+            "/admin/v1/ollama/instance-plans",
+            "ollama.instance.plan",
+            {
+                "ref": "quiet-runner",
+                "label": "Quiet Runner",
+                "host_ref": "control-host",
+                "ollama_executable": "/usr/bin/ollama",
+                "models_directory": "/srv/ollama/models",
+                "selected_model_refs": ["model-a"],
+                "allowed_cpus": "4-7",
+                "cpu_quota_percent": 350,
+                "cpu_weight": 40,
+            },
+            {"expected_generation": 3, "idempotency_key": "plan-one"},
+        ),
+        (
+            "/admin/v1/ollama/instance-plans/plan-one/apply",
+            "ollama.instance.apply",
+            {"plan_id": "plan-one"},
+            {
+                "expected_generation": 3,
+                "idempotency_key": "apply-one",
+                "plan_digest": DIGEST,
+            },
+        ),
+        (
+            "/admin/v1/ollama/instances/quiet-runner/probe",
+            "ollama.instance.probe",
+            {"instance_ref": "quiet-runner"},
+            {"expected_generation": 4, "idempotency_key": "probe-one"},
+        ),
+    ],
+)
+def test_ollama_rest_commands_bind_route_identity(
+    tmp_path, target, operation, arguments, extra
+) -> None:
+    with _running_server(tmp_path) as (server, service):
+        status, _headers_out, payload = _request(
+            server,
+            "POST",
+            target,
+            _document(operation, arguments, **extra),
+            _headers(),
+        )
+
+    assert status == 200
+    assert json.loads(payload)["operation"] == operation
+    assert service.calls[0][1].operation == operation
+
+
+def test_ollama_rest_path_and_request_identity_cannot_diverge(tmp_path) -> None:
+    with _running_server(tmp_path) as (server, service):
+        status, _headers_out, payload = _request(
+            server,
+            "POST",
+            "/admin/v1/ollama/instance-plans/plan-one/apply",
+            _document(
+                "ollama.instance.apply",
+                {"plan_id": "plan-two"},
+                expected_generation=3,
+                idempotency_key="apply-one",
+                plan_digest=DIGEST,
+            ),
+            _headers(),
+        )
+
+    assert status == 400
+    assert json.loads(payload)["code"] == "control.request_invalid"
+    assert service.calls == []
 
 
 def test_cloudflare_mode_uses_assertion_header_without_cookie_or_bearer(
@@ -1421,15 +1533,17 @@ def test_matching_flow_reserves_owner_before_raw_put(tmp_path) -> None:
 
 def test_oversized_content_length_is_rejected_without_owner_call(tmp_path) -> None:
     with _running_server(tmp_path) as (server, service):
-        status, _headers_out, payload = _request(
-            server,
-            "POST",
-            "/admin/v1",
-            b"x" * (MAX_ADMIN_JSON_BYTES + 1),
-            _headers(),
-        )
+        connection = http.client.HTTPConnection(*server.server_address, timeout=2)
+        connection.putrequest("POST", "/admin/v1", skip_host=True)
+        for name, value in _headers().items():
+            connection.putheader(name, value)
+        connection.putheader("Content-Length", str(MAX_ADMIN_JSON_BYTES + 1))
+        connection.endheaders()
+        response = connection.getresponse()
+        payload = response.read()
+        connection.close()
 
-    assert status == 413
+    assert response.status == 413
     assert json.loads(payload)["code"] == "control.request_too_large"
     assert service.calls == []
 
