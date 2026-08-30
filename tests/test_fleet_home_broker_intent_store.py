@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import FrozenInstanceError
+import base64
 import errno
 import hashlib
 import inspect
+import json
 import threading
 import traceback
 
@@ -81,6 +83,50 @@ PARENT_IDENTITY = BrokerIntentFileIdentity(
     2,
     "system_u:object_r:codex_master_home_broker_state_t:s0",
 )
+
+
+def _terminal_evidence_records(
+    claim_name: str, intent_payload: bytes
+) -> tuple[str, bytes, str, bytes]:
+    """Build the independently verified terminal sidecar expected by recovery."""
+
+    name_digest = hashlib.sha256(claim_name.encode("ascii")).hexdigest()
+    evidence_name = f".terminal-evidence-{name_digest}.json"
+    evidence = (
+        json.dumps(
+            {
+                "claim_name": claim_name,
+                "intent_b64": base64.b64encode(intent_payload).decode("ascii"),
+                "result": "succeeded",
+                "schema_version": 1,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    commit_name = f".terminal-commit-{name_digest}.json"
+    commit = (
+        json.dumps(
+            {
+                "evidence_sha256": hashlib.sha256(evidence).hexdigest(),
+                "schema_version": 1,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    return evidence_name, evidence, commit_name, commit
+
+
+def _terminal_staging_name(kind: str, final_name: str, index: int = 0) -> str:
+    return (
+        f".tmp-terminal-{kind}-"
+        f"{hashlib.sha256(final_name.encode('ascii')).hexdigest()}-{index}.json"
+    )
 
 
 class FakeStore:
@@ -229,6 +275,14 @@ class FakeLinuxOperations:
         for fd, name in self.fd_names.items():
             if name == old_name:
                 self.fd_names[fd] = new_name
+
+    def unlinkat(self, parent_fd: int, name: str) -> None:
+        self.calls.append(("unlinkat", parent_fd, name))
+        if name not in self.files:
+            raise FileNotFoundError(errno.ENOENT, "missing")
+        self.files.pop(name)
+        self.identities.pop(name)
+        self.labels.pop(name)
 
     def lock_exclusive_nonblocking(self, fd: int) -> None:
         self.calls.append(("lock_exclusive_nonblocking", fd))
@@ -602,6 +656,442 @@ def test_linux_recovery_takes_a_crashed_claim_with_a_new_store_and_retains_one_l
     assert len(operations.locked_fds) == 1
 
 
+def test_linux_terminal_evidence_preserves_intent_binding_before_cleanup() -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    intent_payload = encode_broker_intent(INTENT)
+    operations.files[final_name] = intent_payload
+    operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
+    store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    claim = store.claim_next()
+    assert claim is not None
+    store.mark_terminal(claim.claim_name, b'{"result":"succeeded"}\n')
+
+    evidence_name, evidence, commit_name, commit = _terminal_evidence_records(
+        claim.claim_name, intent_payload
+    )
+    assert operations.files == {evidence_name: evidence, commit_name: commit}
+    assert "truncate" not in [call[0] for call in operations.calls]
+    assert base64.b64decode(json.loads(evidence)["intent_b64"]) == intent_payload
+
+
+def test_linux_recovery_finalizes_bound_terminal_evidence_without_resuming() -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    intent_payload = encode_broker_intent(INTENT)
+    evidence_name, evidence, commit_name, commit = _terminal_evidence_records(
+        claim_name, intent_payload
+    )
+    operations.files.update(
+        {claim_name: intent_payload, evidence_name: evidence, commit_name: commit}
+    )
+    operations.identities.update(
+        {
+            claim_name: ObjectIdentity(8, 1001, 0o100600, 0, 0, 1),
+            evidence_name: ObjectIdentity(8, 1002, 0o100600, 0, 0, 1),
+            commit_name: ObjectIdentity(8, 1003, 0o100600, 0, 0, 1),
+        }
+    )
+    operations.labels.update(
+        {
+            claim_name: PARENT_IDENTITY.selinux_label,
+            evidence_name: PARENT_IDENTITY.selinux_label,
+            commit_name: PARENT_IDENTITY.selinux_label,
+        }
+    )
+
+    recovered = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).recover_next()
+
+    assert recovered is None
+    assert operations.files == {evidence_name: evidence, commit_name: commit}
+    assert operations.locked_fds == {}
+
+
+def test_linux_recovery_reuses_valid_evidence_only_without_renaming_claim() -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    intent_payload = encode_broker_intent(INTENT)
+    evidence_name, evidence, commit_name, commit = _terminal_evidence_records(
+        claim_name, intent_payload
+    )
+    operations.files.update({claim_name: intent_payload, evidence_name: evidence})
+    operations.identities.update(
+        {
+            claim_name: ObjectIdentity(8, 1001, 0o100600, 0, 0, 1),
+            evidence_name: ObjectIdentity(8, 1002, 0o100600, 0, 0, 1),
+        }
+    )
+    operations.labels.update(
+        {
+            claim_name: PARENT_IDENTITY.selinux_label,
+            evidence_name: PARENT_IDENTITY.selinux_label,
+        }
+    )
+    store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    recovered = store.recover_next()
+
+    assert recovered == BrokerIntentClaimBytes(
+        claim_name,
+        intent_payload,
+        BrokerIntentFileIdentity(
+            8, 1001, 0o100600, 0, 0, 1, PARENT_IDENTITY.selinux_label
+        ),
+        recovered=True,
+    )
+    assert operations.files == {claim_name: intent_payload, evidence_name: evidence}
+
+    store.mark_terminal(claim_name, b'{"result":"succeeded"}\n')
+
+    assert operations.files == {evidence_name: evidence, commit_name: commit}
+    assert not any("recover" in name for name in operations.files)
+
+
+@pytest.mark.parametrize("bool_record", ("evidence", "commit"))
+def test_linux_recovery_rejects_boolean_terminal_schema_version(
+    bool_record: str,
+) -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    intent_payload = encode_broker_intent(INTENT)
+    evidence_name, evidence, commit_name, commit = _terminal_evidence_records(
+        claim_name, intent_payload
+    )
+    if bool_record == "evidence":
+        evidence_document = json.loads(evidence)
+        evidence_document["schema_version"] = True
+        evidence = (
+            json.dumps(
+                evidence_document,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+        commit = (
+            json.dumps(
+                {
+                    "evidence_sha256": hashlib.sha256(evidence).hexdigest(),
+                    "schema_version": 1,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+    else:
+        commit_document = json.loads(commit)
+        commit_document["schema_version"] = True
+        commit = (
+            json.dumps(
+                commit_document,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+    operations.files.update(
+        {claim_name: intent_payload, evidence_name: evidence, commit_name: commit}
+    )
+    for index, name in enumerate(operations.files, start=1001):
+        operations.identities[name] = ObjectIdentity(8, index, 0o100600, 0, 0, 1)
+        operations.labels[name] = PARENT_IDENTITY.selinux_label
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).recover_next()
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    assert operations.files[claim_name] == intent_payload
+
+
+def test_linux_recovery_discards_invalid_provisional_evidence_without_quarantine() -> (
+    None
+):
+    operations = AtomicRecoveryLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    intent_payload = encode_broker_intent(INTENT)
+    evidence_name, _, _, _ = _terminal_evidence_records(claim_name, intent_payload)
+    operations.files.update({claim_name: intent_payload, evidence_name: b"corrupt"})
+    operations.identities.update(
+        {
+            claim_name: ObjectIdentity(8, 1001, 0o100600, 0, 0, 1),
+            evidence_name: ObjectIdentity(8, 1002, 0o100600, 0, 0, 1),
+        }
+    )
+    operations.labels.update(
+        {
+            claim_name: PARENT_IDENTITY.selinux_label,
+            evidence_name: PARENT_IDENTITY.selinux_label,
+        }
+    )
+
+    recovered = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).recover_next()
+
+    assert recovered is not None
+    assert recovered.claim_name == ".recover-" + claim_name[7:]
+    assert recovered.payload == intent_payload
+    assert evidence_name not in operations.files
+    assert not any(name.startswith(".quarantine-") for name in operations.files)
+
+
+def test_linux_terminal_does_not_unlink_a_raced_staging_path() -> None:
+    class RacingStagingOperations(FakeLinuxOperations):
+        def __init__(self) -> None:
+            super().__init__()
+            self.raced_staging_name: str | None = None
+
+        def openat2(self, parent_fd: int, name: str, how: object) -> PinnedFd:
+            if (
+                name.startswith(".tmp-terminal-evidence-")
+                and self.raced_staging_name is None
+            ):
+                self.raced_staging_name = name
+                self.files[name] = b"raced"
+                self.identities[name] = ObjectIdentity(8, 9001, 0o100600, 0, 0, 1)
+                self.labels[name] = PARENT_IDENTITY.selinux_label
+            return super().openat2(parent_fd, name, how)
+
+    operations = RacingStagingOperations()
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    payload = encode_broker_intent(INTENT)
+    operations.files[final_name] = payload
+    operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
+    store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    claim = store.claim_next()
+    assert claim is not None
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        store.mark_terminal(claim.claim_name, b'{"result":"succeeded"}\n')
+
+    assert raised.value.code is LinuxBrokerCode.ALREADY_EXISTS
+    assert operations.raced_staging_name is not None
+    assert operations.files[operations.raced_staging_name] == b"raced"
+    assert (
+        "unlinkat",
+        7,
+        operations.raced_staging_name,
+    ) not in operations.calls
+
+
+@pytest.mark.parametrize(
+    ("crash_point", "record_kind", "record_payload", "terminal"),
+    (
+        ("after_temp_create", "evidence-staging", b"", False),
+        ("before_evidence_write", "evidence-staging", b"", False),
+        ("after_partial_evidence_write", "evidence-staging", b"partial", False),
+        ("after_evidence_file_fsync", "evidence-staging", b"evidence", False),
+        ("after_evidence_publish_before_parent_fsync", "evidence", b"evidence", False),
+        ("after_evidence_parent_fsync_before_commit", "evidence", b"evidence", False),
+        ("after_commit_temp_create", "commit-staging", b"", False),
+        ("after_partial_commit_write", "commit-staging", b"partial", False),
+        ("after_commit_file_fsync", "commit-staging", b"commit", False),
+        ("after_commit_publish_before_parent_fsync", "commit", b"commit", True),
+        ("after_commit_parent_fsync_before_claim_cleanup", "commit", b"commit", True),
+    ),
+)
+def test_linux_recovery_handles_each_terminal_publication_crash_point(
+    crash_point: str, record_kind: str, record_payload: bytes, terminal: bool
+) -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    intent_payload = encode_broker_intent(INTENT)
+    evidence_name, evidence, commit_name, commit = _terminal_evidence_records(
+        claim_name, intent_payload
+    )
+    files: dict[str, bytes] = {claim_name: intent_payload}
+    if record_kind == "evidence-staging":
+        files[_terminal_staging_name("evidence", evidence_name)] = (
+            evidence if record_payload == b"evidence" else record_payload
+        )
+    elif record_kind == "evidence":
+        files[evidence_name] = evidence
+    elif record_kind == "commit-staging":
+        files[evidence_name] = evidence
+        files[_terminal_staging_name("commit", commit_name)] = (
+            commit if record_payload == b"commit" else record_payload
+        )
+    else:
+        assert record_kind == "commit"
+        files.update({evidence_name: evidence, commit_name: commit})
+    operations.files.update(files)
+    for index, name in enumerate(files, start=1001):
+        operations.identities[name] = ObjectIdentity(8, index, 0o100600, 0, 0, 1)
+        operations.labels[name] = PARENT_IDENTITY.selinux_label
+
+    recovered = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).recover_next()
+
+    if terminal:
+        assert recovered is None, crash_point
+        assert operations.files == {evidence_name: evidence, commit_name: commit}
+        return
+    assert recovered is not None, crash_point
+    assert recovered.recovered is True
+    assert recovered.payload == intent_payload
+    evidence_only = record_kind in {"evidence", "commit-staging"}
+    assert recovered.claim_name == (
+        claim_name if evidence_only else ".recover-" + claim_name[7:]
+    )
+    assert operations.files[recovered.claim_name] == intent_payload
+    if record_kind == "evidence-staging":
+        assert _terminal_staging_name("evidence", evidence_name) not in operations.files
+    if record_kind == "commit-staging":
+        assert _terminal_staging_name("commit", commit_name) not in operations.files
+
+
+def test_linux_recovery_rejects_contradictory_committed_terminal_evidence() -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    intent_payload = encode_broker_intent(INTENT)
+    evidence_name, evidence, commit_name, _ = _terminal_evidence_records(
+        claim_name, intent_payload
+    )
+    conflicting_commit = (
+        json.dumps(
+            {"evidence_sha256": "0" * 64, "schema_version": 1},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    operations.files.update(
+        {
+            claim_name: intent_payload,
+            evidence_name: evidence,
+            commit_name: conflicting_commit,
+        }
+    )
+    for index, name in enumerate(operations.files, start=1001):
+        operations.identities[name] = ObjectIdentity(8, index, 0o100600, 0, 0, 1)
+        operations.labels[name] = PARENT_IDENTITY.selinux_label
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).recover_next()
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    assert operations.files[claim_name] == intent_payload
+    assert not any(name.startswith(".recover-") for name in operations.files)
+
+
+def test_two_linux_recoverers_cannot_own_a_committed_terminal_claim_together() -> None:
+    class TerminalRaceOperations(AtomicRecoveryLinuxOperations):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lock_barrier = threading.Barrier(2)
+
+        def lock_exclusive_nonblocking(self, fd: int) -> None:
+            try:
+                super().lock_exclusive_nonblocking(fd)
+            except BlockingIOError:
+                self.lock_barrier.wait(timeout=5)
+                raise
+            self.lock_barrier.wait(timeout=5)
+
+    operations = TerminalRaceOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    intent_payload = encode_broker_intent(INTENT)
+    evidence_name, evidence, commit_name, commit = _terminal_evidence_records(
+        claim_name, intent_payload
+    )
+    operations.files.update(
+        {claim_name: intent_payload, evidence_name: evidence, commit_name: commit}
+    )
+    for index, name in enumerate(operations.files, start=1001):
+        operations.identities[name] = ObjectIdentity(8, index, 0o100600, 0, 0, 1)
+        operations.labels[name] = PARENT_IDENTITY.selinux_label
+    stores = [
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY),
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY),
+    ]
+    results: list[BrokerIntentClaimBytes | None] = [None, None]
+    errors: list[BaseException] = []
+
+    def recover(index: int) -> None:
+        try:
+            results[index] = stores[index].recover_next()
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    workers = [threading.Thread(target=recover, args=(index,)) for index in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert not any(worker.is_alive() for worker in workers)
+    assert errors == []
+    assert results == [None, None]
+    assert operations.files == {evidence_name: evidence, commit_name: commit}
+    assert operations.locked_fds == {}
+
+
+def test_linux_terminal_requires_the_local_inode_lease() -> None:
+    operations = FakeLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    original = encode_broker_intent(INTENT)
+    operations.files[claim_name] = original
+    operations.identities[claim_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).mark_terminal(
+            claim_name, b'{"result":"succeeded"}\n'
+        )
+
+    assert raised.value.code is LinuxBrokerCode.IDENTITY_MISMATCH
+    assert operations.files == {claim_name: original}
+
+
+def test_two_linux_terminalizers_cannot_publish_divergent_evidence() -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    intent_payload = encode_broker_intent(INTENT)
+    operations.files[final_name] = intent_payload
+    operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
+    owner = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    claim = owner.claim_next()
+    assert claim is not None
+    rival = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    assert rival.recover_next() is None
+    with pytest.raises(LinuxBrokerError) as raised:
+        rival.mark_terminal(claim.claim_name, b'{"result":"execution_failed"}\n')
+
+    assert raised.value.code is LinuxBrokerCode.IDENTITY_MISMATCH
+    assert operations.files == {claim.claim_name: intent_payload}
+    owner.mark_terminal(claim.claim_name, b'{"result":"succeeded"}\n')
+    evidence_name, evidence, commit_name, commit = _terminal_evidence_records(
+        claim.claim_name, intent_payload
+    )
+
+    assert operations.files == {evidence_name: evidence, commit_name: commit}
+    assert LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).recover_next() is None
+    assert operations.files == {evidence_name: evidence, commit_name: commit}
+
+
 def test_linux_recovery_reclaims_recovered_orphans_without_starving_later_claims() -> (
     None
 ):
@@ -748,6 +1238,9 @@ def test_linux_terminal_failure_releases_the_claim_lease() -> None:
         store.mark_terminal(claim.claim_name, b'{"result":"succeeded"}\n')
 
     assert operations.locked_fds == {}
+    assert operations.files[claim.claim_name] == encode_broker_intent(INTENT)
+    assert not any(name.startswith(".terminal-") for name in operations.files)
+    assert "truncate" not in [call[0] for call in operations.calls]
 
 
 def test_linux_terminal_or_quarantine_validation_failure_releases_the_claim_lease() -> (
@@ -765,7 +1258,7 @@ def test_linux_terminal_or_quarantine_validation_failure_releases_the_claim_leas
 
         if operation == "terminal":
             operations.files.update(
-                {f".terminal-retained-{index}": b"x" for index in range(128)}
+                {f".terminal-evidence-retained-{index}": b"x" for index in range(128)}
             )
             with pytest.raises(LinuxBrokerError):
                 store.mark_terminal(claim.claim_name, b'{"result":"succeeded"}\n')
@@ -1089,54 +1582,46 @@ def test_linux_quarantine_retention_allows_128_then_rejects_129_without_mutation
     )
 
 
-def test_linux_mark_terminal_writes_bounded_payload_then_retains_claim_atomically() -> (
+def test_linux_mark_terminal_writes_bound_evidence_then_removes_claim_atomically() -> (
     None
 ):
     operations = FakeLinuxOperations()
-    claim_name = (
-        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
-    )
-    operations.files[claim_name] = encode_broker_intent(INTENT)
-    operations.identities[claim_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
-    operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    intent_payload = encode_broker_intent(INTENT)
+    operations.files[final_name] = intent_payload
+    operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
     adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
-    terminal_payload = b'{"result":"committed"}\n'
-    adapter.mark_terminal(claim_name, terminal_payload)
-    terminal_name = ".terminal-claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
-    assert operations.files == {terminal_name: terminal_payload}
-    open_call = next(
-        call
-        for call in operations.calls
-        if call[0] == "openat2" and call[2] == claim_name
+    claim = adapter.claim_next()
+    assert claim is not None
+    terminal_payload = b'{"result":"succeeded"}\n'
+    adapter.mark_terminal(claim.claim_name, terminal_payload)
+    evidence_name, evidence, commit_name, commit = _terminal_evidence_records(
+        claim.claim_name, intent_payload
     )
-    assert not (getattr(open_call[3], "flags") & 0o1000)
-    assert [call[0] for call in operations.calls].index("truncate") < [
-        call[0] for call in operations.calls
-    ].index("write_all")
+    assert operations.files == {evidence_name: evidence, commit_name: commit}
+    assert "truncate" not in [call[0] for call in operations.calls]
 
 
-def test_linux_mark_terminal_truncates_before_retention_rename() -> None:
+def test_linux_mark_terminal_rejects_noncanonical_result_without_mutating_intent() -> (
+    None
+):
     operations = FakeLinuxOperations()
-    claim_name = (
-        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
-    )
-    operations.files[claim_name] = b"original-intent-payload-that-is-longer"
-    operations.identities[claim_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
-    operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    intent_payload = encode_broker_intent(INTENT)
+    operations.files[final_name] = intent_payload
+    operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
     adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    claim = adapter.claim_next()
+    assert claim is not None
 
-    terminal_payload = b"done"
-    adapter.mark_terminal(claim_name, terminal_payload)
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.mark_terminal(claim.claim_name, b"done")
 
-    terminal_name = ".terminal-claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
-    assert operations.files[terminal_name] == terminal_payload
-    open_call = next(
-        call
-        for call in operations.calls
-        if call[0] == "openat2" and call[2] == claim_name
-    )
-    assert not (getattr(open_call[3], "flags") & 0o1000)
-    assert [call[0] for call in operations.calls].count("truncate") == 1
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    assert operations.files == {claim.claim_name: intent_payload}
+    assert "truncate" not in [call[0] for call in operations.calls]
 
 
 @pytest.mark.parametrize(
@@ -1177,57 +1662,69 @@ def test_linux_terminal_rejects_invalid_identity_before_mutation(
 def test_linux_terminal_retention_allows_limit_then_fails_without_mutation() -> None:
     operations = FakeLinuxOperations()
     adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    payload = encode_broker_intent(INTENT)
 
     for index in range(128):
-        claim_name = f".claim-intent-{index:020d}-{'d' * 32}.json"
-        operations.files[claim_name] = b"intent"
-        operations.identities[claim_name] = ObjectIdentity(
+        final_name = f"intent-{index:020d}-{'d' * 32}.json"
+        operations.files[final_name] = payload
+        operations.identities[final_name] = ObjectIdentity(
             8, 2000 + index, 0o100600, 0, 0, 1
         )
-        operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
-        adapter.mark_terminal(claim_name, b"done")
+        operations.labels[final_name] = PARENT_IDENTITY.selinux_label
+        claim = adapter.claim_next()
+        assert claim is not None
+        adapter.mark_terminal(claim.claim_name, b'{"result":"succeeded"}\n')
 
     assert (
-        len([name for name in operations.files if name.startswith(".terminal-")]) == 128
+        len(
+            [
+                name
+                for name in operations.files
+                if name.startswith(".terminal-evidence-")
+            ]
+        )
+        == 128
     )
-    claim_name = (
-        ".claim-intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json"
-    )
-    operations.files[claim_name] = b"intent"
-    operations.identities[claim_name] = ObjectIdentity(8, 3000, 0o100600, 0, 0, 1)
-    operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
+    final_name = "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json"
+    operations.files[final_name] = payload
+    operations.identities[final_name] = ObjectIdentity(8, 3000, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
+    claim = adapter.claim_next()
+    assert claim is not None
     calls_before = tuple(operations.calls)
 
     with pytest.raises(LinuxBrokerError) as raised:
-        adapter.mark_terminal(claim_name, b"done")
+        adapter.mark_terminal(claim.claim_name, b'{"result":"succeeded"}\n')
 
     assert raised.value.code is LinuxBrokerCode.IO_FAILURE
     new_calls = operations.calls[len(calls_before) :]
-    assert [call[0] for call in new_calls] == ["list_names"]
-    assert claim_name in operations.files
-    assert not any(
-        name.endswith("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json")
-        and name.startswith(".terminal-")
-        for name in operations.files
-    )
+    assert [call[0] for call in new_calls][:3] == [
+        "stat_fd",
+        "selinux_label",
+        "read_all",
+    ]
+    assert claim.claim_name in operations.files
+    evidence_name, _, _, _ = _terminal_evidence_records(claim.claim_name, payload)
+    assert evidence_name not in operations.files
 
 
-def test_linux_terminal_parent_swap_is_rejected_before_retention_rename() -> None:
+def test_linux_terminal_parent_swap_is_rejected_before_evidence_publication() -> None:
     operations = FakeLinuxOperations()
-    claim_name = (
-        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
-    )
-    operations.files[claim_name] = encode_broker_intent(INTENT)
-    operations.identities[claim_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
-    operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    payload = encode_broker_intent(INTENT)
+    operations.files[final_name] = payload
+    operations.identities[final_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[final_name] = PARENT_IDENTITY.selinux_label
     adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    claim = adapter.claim_next()
+    assert claim is not None
     operations.parent_stat_sequence = [
         ObjectIdentity(8, 100, 0o40700, 0, 0, 2),
         ObjectIdentity(8, 999, 0o40700, 0, 0, 2),
     ]
     with pytest.raises(LinuxBrokerError):
-        adapter.mark_terminal(claim_name, b'{"result":"committed"}\n')
-    assert claim_name in operations.files
+        adapter.mark_terminal(claim.claim_name, b'{"result":"succeeded"}\n')
+    assert operations.files[claim.claim_name] == payload
     assert not any(name.startswith(".terminal-") for name in operations.files)
 
 

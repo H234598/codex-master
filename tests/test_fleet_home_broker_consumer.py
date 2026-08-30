@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
 import dataclasses
+import errno
 import hashlib
 import inspect
+import json
 import threading
 import traceback
 from dataclasses import FrozenInstanceError
@@ -838,7 +841,15 @@ def test_fresh_linux_store_and_consumer_resume_a_crashed_atomic_claim_once() -> 
 
         def openat2(self, parent_fd: int, name: str, how: object) -> PinnedFd:
             if name not in self.files:
-                raise FileNotFoundError
+                if not (getattr(how, "flags", 0) & 0o200):
+                    raise FileNotFoundError(errno.ENOENT, "missing")
+                self.files[name] = b""
+                self.identities[name] = ObjectIdentity(
+                    8, 1000 + self.next_fd, 0o100600, 0, 0, 1
+                )
+                self.labels[name] = self.parent_label
+            elif getattr(how, "flags", 0) & 0o200:
+                raise FileExistsError(errno.EEXIST, "exists")
             fd = self.next_fd
             self.next_fd += 1
             self.fd_names[fd] = name
@@ -974,12 +985,188 @@ def test_fresh_linux_store_and_consumer_resume_a_crashed_atomic_claim_once() -> 
     assert resumed_plan is resolver.plan
     assert getattr(context, "transaction_id") == intent.transaction_id
     assert execution.effects == 1
-    assert operations.files == {
-        ".terminal-recover-intent-00000000000000000007-"
-        + intent.nonce
-        + ".json": b'{"result":"succeeded"}\n'
-    }
+    assert len(operations.files) == 2
+    assert sum(name.startswith(".terminal-evidence-") for name in operations.files) == 1
+    assert sum(name.startswith(".terminal-commit-") for name in operations.files) == 1
     assert operations.locked_fds == {}
+
+    terminal_restart = consume_one_broker_intent(
+        LinuxBrokerIntentStore(operations, 7, parent_identity),
+        UnusedResolver(),
+        UnusedExecution(),
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert terminal_restart.code is BrokerIntentConsumeCode.EMPTY
+    assert execution.effects == 1
+
+    recovered_claim_name = (
+        ".recover-intent-00000000000000000007-" + intent.nonce + ".json"
+    )
+    name_digest = hashlib.sha256(recovered_claim_name.encode("ascii")).hexdigest()
+    evidence_name = f".terminal-evidence-{name_digest}.json"
+    evidence = (
+        json.dumps(
+            {
+                "claim_name": recovered_claim_name,
+                "intent_b64": base64.b64encode(encode_broker_intent(intent)).decode(
+                    "ascii"
+                ),
+                "result": "succeeded",
+                "schema_version": 1,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    commit_name = f".terminal-commit-{name_digest}.json"
+    commit = (
+        json.dumps(
+            {
+                "evidence_sha256": hashlib.sha256(evidence).hexdigest(),
+                "schema_version": 1,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+
+    for crash_point, additions, terminal in (
+        ("after_temp_create", {".tmp-terminal-evidence-crash-a.json": b""}, False),
+        (
+            "after_partial_write",
+            {".tmp-terminal-evidence-crash-b.json": evidence[:9]},
+            False,
+        ),
+        (
+            "after_file_fsync_before_publish",
+            {".tmp-terminal-evidence-crash-c.json": evidence},
+            False,
+        ),
+        ("after_publish_before_parent_fsync", {evidence_name: evidence}, False),
+        (
+            "after_parent_fsync_before_commit",
+            {evidence_name: evidence},
+            False,
+        ),
+        (
+            "after_commit_file_fsync",
+            {
+                evidence_name: evidence,
+                ".tmp-terminal-commit-crash-d.json": commit,
+            },
+            False,
+        ),
+        (
+            "after_durable_terminal_record_before_claim_finalization",
+            {evidence_name: evidence, commit_name: commit},
+            True,
+        ),
+    ):
+        crashed_operations = SharedLinuxIntentFiles(
+            recovered_claim_name, encode_broker_intent(intent)
+        )
+        crashed_operations.files.update(additions)
+        for index, name in enumerate(additions, start=2000):
+            crashed_operations.identities[name] = ObjectIdentity(
+                8, index, 0o100600, 0, 0, 1
+            )
+            crashed_operations.labels[name] = crashed_operations.parent_label
+        crashed_store = LinuxBrokerIntentStore(crashed_operations, 7, parent_identity)
+        crash_resolver = LocalResolver(_plan(intent))
+        crash_execution = LocalResumeExecution()
+        crash_result = consume_one_broker_intent(
+            crashed_store,
+            crash_resolver if not terminal else UnusedResolver(),
+            crash_execution if not terminal else UnusedExecution(),
+            now_unix_ms=intent.created_at_unix_ms + 1,
+        )
+
+        if terminal:
+            assert crash_result.code is BrokerIntentConsumeCode.EMPTY, crash_point
+            assert recovered_claim_name not in crashed_operations.files
+            continue
+        assert crash_result.code is BrokerIntentConsumeCode.SUCCEEDED, crash_point
+        assert crash_execution.execute_calls == 0
+        assert crash_execution.effects == 1
+        assert len(crash_execution.resume_calls) == 1
+        assert (
+            crash_execution.resume_calls[0][0].transaction_id == intent.transaction_id
+        )
+        assert crash_execution.resume_calls[0][0].request_id == intent.request_id
+
+    evidence_only_claim_name = (
+        ".claim-intent-00000000000000000007-" + intent.nonce + ".json"
+    )
+    evidence_only_digest = hashlib.sha256(
+        evidence_only_claim_name.encode("ascii")
+    ).hexdigest()
+    evidence_only_name = f".terminal-evidence-{evidence_only_digest}.json"
+    evidence_only = (
+        json.dumps(
+            {
+                "claim_name": evidence_only_claim_name,
+                "intent_b64": base64.b64encode(encode_broker_intent(intent)).decode(
+                    "ascii"
+                ),
+                "result": "succeeded",
+                "schema_version": 1,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    evidence_only_commit_name = f".terminal-commit-{evidence_only_digest}.json"
+    evidence_only_commit = (
+        json.dumps(
+            {
+                "evidence_sha256": hashlib.sha256(evidence_only).hexdigest(),
+                "schema_version": 1,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    evidence_only_operations = SharedLinuxIntentFiles(
+        evidence_only_claim_name, encode_broker_intent(intent)
+    )
+    evidence_only_operations.files[evidence_only_name] = evidence_only
+    evidence_only_operations.identities[evidence_only_name] = ObjectIdentity(
+        8, 3001, 0o100600, 0, 0, 1
+    )
+    evidence_only_operations.labels[evidence_only_name] = (
+        evidence_only_operations.parent_label
+    )
+    evidence_only_execution = LocalResumeExecution()
+
+    evidence_only_result = consume_one_broker_intent(
+        LinuxBrokerIntentStore(evidence_only_operations, 7, parent_identity),
+        LocalResolver(_plan(intent)),
+        evidence_only_execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert evidence_only_result.code is BrokerIntentConsumeCode.SUCCEEDED
+    assert evidence_only_execution.execute_calls == 0
+    assert evidence_only_execution.effects == 1
+    assert len(evidence_only_execution.resume_calls) == 1
+    assert (
+        evidence_only_execution.resume_calls[0][0].transaction_id
+        == intent.transaction_id
+    )
+    assert evidence_only_operations.files == {
+        evidence_only_name: evidence_only,
+        evidence_only_commit_name: evidence_only_commit,
+    }
+    assert not any("recover" in name for name in evidence_only_operations.files)
 
 
 def test_recovered_claim_resumes_the_same_intent_transaction_after_crash_before_wal() -> (
