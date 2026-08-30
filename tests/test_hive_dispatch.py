@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from codex_master.hive import dispatch as dispatch_module
 from codex_master.hive.dispatch import (
     AssignmentIntent,
     GlobalRequest,
@@ -15,7 +16,6 @@ from codex_master.hive.dispatch import (
     acknowledge_checkpoint,
     cancel_global_request,
     execute_global_request,
-    execute_queen_assignment,
     plan_global_request,
     plan_queen_assignment,
     retry_repo_dispatch,
@@ -334,10 +334,9 @@ def queen_plan(mode: str = "shadow", **overrides):
     )
 
 
-def test_queen_assignment_shadow_and_closed_default_never_mutate() -> None:
-    plan = queen_plan()
-    assert execute_queen_assignment(plan)["reason_code"] == "shadow_only"
-    assert execute_queen_assignment(queen_plan("enforced"))["reason_code"] == "pilot_gate_blocked"
+def test_queen_dispatch_exports_no_forward_execution_bypass() -> None:
+    assert not hasattr(dispatch_module, "execute_queen_assignment")
+    assert "execute_queen_assignment" not in dispatch_module.__all__
 
 
 @pytest.mark.parametrize(
@@ -372,37 +371,17 @@ def test_queen_assignment_context_keeps_account_model_and_sp_gates_closed() -> N
     assert not context.ready_for(plan)
 
 
-def test_queen_assignment_enforced_runs_in_order_and_compensates_reverse_order() -> None:
-    events: list[str] = []
+def test_queen_assignment_context_requires_every_explicit_callback() -> None:
     context = QueenAssignmentExecutionContext(
         frozenset({"queen-codex-master"}), frozenset({"codex-master"}), frozenset({"sha256:" + "a" * 64}), frozenset({"gpt-primary"}), False,
-        lambda _plan: events.append("teamlead") or "teamlead-created",
-        lambda _plan: events.append("specialist") or "specialist-created",
-        lambda _plan: events.append("grant") or "grant-created",
-        lambda _plan: events.append("admission") or "admission-created",
-        lambda _plan: events.append("assignment") or {"status": "accepted"},
-        lambda name, _plan, _result: events.append(f"compensate:{name}"),
+        lambda _plan: "teamlead-created",
+        lambda _plan: "specialist-created",
+        lambda _plan: "grant-created",
+        lambda _plan: "admission-created",
+        lambda _plan: {"status": "accepted"},
+        lambda _name, _plan, _result: None,
     )
-    result = execute_queen_assignment(
-        queen_plan("enforced"), context, step_executor=lambda _name, callback, plan: callback(plan)
-    )
-    assert result["allowed"] is True
-    assert events == ["teamlead", "specialist", "grant", "admission", "assignment"]
-
-    events.clear()
-    failing = QueenAssignmentExecutionContext(
-        context.pilot_queens, context.pilot_repositories, context.confirmed_accounts, context.primary_models, False,
-        context.create_teamlead_principal, context.create_specialist_principal, context.issue_grant,
-        context.reserve_admission, lambda _plan: (_ for _ in ()).throw(RuntimeError("assignment")), context.compensate,
-    )
-    failed = execute_queen_assignment(
-        queen_plan("enforced"), failing, step_executor=lambda _name, callback, plan: callback(plan)
-    )
-    assert failed["reason_code"] == "assignment_transaction_failed"
-    assert events[-5:] == [
-        "compensate:assignment", "compensate:admission", "compensate:grant",
-        "compensate:specialist", "compensate:teamlead",
-    ]
+    assert context.ready_for(queen_plan("enforced"))
     cancel_global_request,
     execute_global_request,
     plan_global_request,

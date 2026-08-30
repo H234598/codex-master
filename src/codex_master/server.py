@@ -270,7 +270,6 @@ from codex_master.hive.dispatch import (
     QueenAssignmentPlan,
     WorkPackage,
     acknowledge_checkpoint,
-    execute_queen_assignment,
     plan_queen_assignment,
     request_cooperative_pause,
 )
@@ -39131,6 +39130,78 @@ def _execute_server_queen_assignment_capacity_sink(
             return callback(plan)
 
 
+def _execute_server_queen_assignment(
+    plan: QueenAssignmentPlan,
+    context: QueenAssignmentExecutionContext | None,
+) -> Mapping[str, object]:
+    """Execute the Queen saga only through final named server capacity sinks.
+
+    This is intentionally server-local.  Dispatch owns immutable planning;
+    every enforced forward callback crosses its own mutation-lock/probe-lock
+    boundary here.  Shadow, pilot denial, and compensation never enter one.
+    """
+
+    if plan.mode != "enforced":
+        return {
+            "allowed": False,
+            "reason_code": "shadow_only",
+            "mutation_performed": False,
+            "plan": plan.public(),
+            "raw_output": "not_returned",
+        }
+    if context is None or not context.ready_for(plan):
+        return {
+            "allowed": False,
+            "reason_code": "pilot_gate_blocked",
+            "mutation_performed": False,
+            "plan": plan.public(),
+            "raw_output": "not_returned",
+        }
+    steps: list[tuple[str, object | None]] = []
+    callbacks = (
+        ("teamlead", context.create_teamlead_principal),
+        ("specialist", context.create_specialist_principal),
+        ("grant", context.issue_grant),
+        ("admission", context.reserve_admission),
+        ("assignment", context.execute_assignment),
+    )
+    try:
+        for name, callback in callbacks:
+            if not callable(callback):
+                raise AgentError("queen_assignment_callback_unavailable")
+            steps.append((name, None))
+            result = _execute_server_queen_assignment_capacity_sink(
+                name, callback, plan
+            )
+            if name == "assignment" and not isinstance(result, Mapping):
+                raise AgentError("queen_assignment_result_invalid")
+            steps[-1] = (name, result)
+        return {
+            "allowed": True,
+            "reason_code": "assignment_executed",
+            "mutation_performed": True,
+            "plan": plan.public(),
+            "result": dict(steps[-1][1]) if isinstance(steps[-1][1], Mapping) else {},
+            "raw_output": "not_returned",
+        }
+    except Exception:
+        compensation_complete = True
+        for name, result in reversed(steps):
+            try:
+                context.compensate(name, plan, result)
+            except Exception:
+                compensation_complete = False
+        return {
+            "allowed": False,
+            "reason_code": "assignment_transaction_failed",
+            "mutation_performed": False,
+            "compensation_attempted": True,
+            "compensation_complete": compensation_complete,
+            "plan": plan.public(),
+            "raw_output": "not_returned",
+        }
+
+
 def execute_server_queen_assignment(
     *,
     queen_id: str,
@@ -39157,13 +39228,7 @@ def execute_server_queen_assignment(
             )
         except HiveEventError as exc:
             raise AgentError("hive_event_persistence_failed") from exc
-    result = dict(
-        execute_queen_assignment(
-            plan,
-            context,
-            step_executor=_execute_server_queen_assignment_capacity_sink,
-        )
-    )
+    result = dict(_execute_server_queen_assignment(plan, context))
     if event_store is None:
         return result
     reason_code = result.get("reason_code")

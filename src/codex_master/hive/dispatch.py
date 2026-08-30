@@ -712,75 +712,6 @@ def plan_queen_assignment(
         raise HiveDispatchError("invalid_workpackage_plan") from exc
 
 
-def execute_queen_assignment(
-    plan: QueenAssignmentPlan,
-    context: QueenAssignmentExecutionContext | None = None,
-    *,
-    step_executor: Callable[
-        [str, Callable[[QueenAssignmentPlan], object], QueenAssignmentPlan], object
-    ]
-    | None = None,
-) -> Mapping[str, object]:
-    """Execute one pilot assignment transaction through explicit forward sinks.
-
-    The dispatch layer owns planning and compensation only.  A server-provided
-    step executor is mandatory before any enforced forward callback can run,
-    which keeps the capacity lock/recheck boundary out of shadow and rollback.
-    """
-
-    if not isinstance(plan, QueenAssignmentPlan):
-        raise HiveDispatchError("invalid_queen_assignment_plan")
-    if plan.mode != "enforced":
-        return {"allowed": False, "reason_code": "shadow_only", "mutation_performed": False, "plan": plan.public(), "raw_output": "not_returned"}
-    if context is None or not context.ready_for(plan):
-        return {"allowed": False, "reason_code": "pilot_gate_blocked", "mutation_performed": False, "plan": plan.public(), "raw_output": "not_returned"}
-    if not callable(step_executor):
-        return {"allowed": False, "reason_code": "assignment_capacity_sink_required", "mutation_performed": False, "plan": plan.public(), "raw_output": "not_returned"}
-    steps: list[tuple[str, object | None]] = []
-    callbacks = (
-        ("teamlead", context.create_teamlead_principal),
-        ("specialist", context.create_specialist_principal),
-        ("grant", context.issue_grant),
-        ("admission", context.reserve_admission),
-        ("assignment", context.execute_assignment),
-    )
-    try:
-        for name, callback in callbacks:
-            if not callable(callback):
-                raise HiveDispatchError("assignment_callback_unavailable")
-            steps.append((name, None))
-            result = step_executor(name, callback, plan)
-            if name == "assignment" and not isinstance(result, Mapping):
-                raise HiveDispatchError("assignment_result_invalid")
-            steps[-1] = (name, result)
-        return {
-            "allowed": True,
-            "reason_code": "assignment_executed",
-            "mutation_performed": True,
-            "plan": plan.public(),
-            "result": dict(steps[-1][1]) if isinstance(steps[-1][1], Mapping) else {},
-            "raw_output": "not_returned",
-        }
-    except Exception:
-        compensation_complete = True
-        for name, result in reversed(steps):
-            try:
-                if not callable(context.compensate):
-                    raise HiveDispatchError("compensation_unavailable")
-                context.compensate(name, plan, result)
-            except Exception:
-                compensation_complete = False
-        return {
-            "allowed": False,
-            "reason_code": "assignment_transaction_failed",
-            "mutation_performed": False,
-            "compensation_attempted": True,
-            "compensation_complete": compensation_complete,
-            "plan": plan.public(),
-            "raw_output": "not_returned",
-        }
-
-
 _T = TypeVar("_T")
 
 
@@ -929,7 +860,6 @@ __all__ = [
     "WORKPACKAGE_STATES",
     "WorkPackage",
     "cancel_global_request",
-    "execute_queen_assignment",
     "execute_global_request",
     "plan_global_request",
     "plan_queen_assignment",
