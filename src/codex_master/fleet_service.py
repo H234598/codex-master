@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 import stat
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace as dataclass_replace
@@ -59,6 +60,14 @@ from .selection import (
     TaskKind,
     preview_selection,
 )
+from .ollama_host_transport import CONTROL_HOST_REF
+from .ollama_registry import (
+    OllamaInstanceV1,
+    OllamaModelV1,
+    OllamaRegistryStore,
+    OllamaRegistryV1,
+)
+from .ollama_runtime import OllamaReadinessStatus
 
 
 MAX_REGISTRY_BYTES = 1024 * 1024
@@ -344,6 +353,67 @@ class FleetPrivateIO:
     remove_file: Callable[[Path], bool] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class OllamaResourceSnapshotV1:
+    host_ref: str
+    generation: int
+    observed_at_utc: str
+    valid_until_utc: str
+    green: bool
+    headroom_seconds: int
+
+    def __post_init__(self) -> None:
+        try:
+            observed = datetime.fromisoformat(
+                self.observed_at_utc.replace("Z", "+00:00")
+            )
+            valid_until = datetime.fromisoformat(
+                self.valid_until_utc.replace("Z", "+00:00")
+            )
+        except (AttributeError, ValueError):
+            raise ValueError("ollama.resource_snapshot_invalid") from None
+        if (
+            not _ACCOUNT_ID_RE.fullmatch(self.host_ref)
+            or type(self.generation) is not int
+            or self.generation < 1
+            or observed.tzinfo is None
+            or valid_until.tzinfo is None
+            or valid_until <= observed
+            or type(self.green) is not bool
+            or type(self.headroom_seconds) is not int
+            or self.headroom_seconds < 0
+        ):
+            raise ValueError("ollama.resource_snapshot_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaFleetPlanV1:
+    plan_id: str
+    plan_digest: str
+    registry_generation: int
+    resource_generation: int | None
+    instance: OllamaInstanceV1 = field(repr=False)
+    host_plan: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaHiveLaneV1:
+    lane_ref: str
+    instance_ref: str
+    host_ref: str
+    model_ref: str
+    provider_model_id: str
+    task_profile: str = "simple_only"
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaApplyResultV1:
+    registry: OllamaRegistryV1
+    instance: OllamaInstanceV1
+    readiness: OllamaReadinessStatus
+    hive_lanes: tuple[OllamaHiveLaneV1, ...]
+
+
 class FleetService:
     def __init__(
         self,
@@ -353,6 +423,11 @@ class FleetService:
         pool_root: Path,
         probe_max_age_seconds: int = 900,
         read_only: bool = False,
+        ollama_registry: OllamaRegistryStore | None = None,
+        ollama_transport: object | None = None,
+        ollama_resource_snapshot: Callable[
+            [str], OllamaResourceSnapshotV1 | None
+        ] | None = None,
     ) -> None:
         self._paths = paths
         self._io = private_io
@@ -367,6 +442,235 @@ class FleetService:
         ):
             raise ValueError("invalid_probe_max_age")
         self._probe_max_age_seconds = probe_max_age_seconds
+        self._ollama_registry = ollama_registry
+        self._ollama_transport = ollama_transport
+        self._ollama_resource_snapshot = ollama_resource_snapshot
+        self._ollama_lock = threading.RLock()
+        self._ollama_plans: dict[str, OllamaFleetPlanV1] = {}
+        self._ollama_applied: dict[str, OllamaApplyResultV1] = {}
+        self._ollama_ready: dict[str, OllamaReadinessStatus] = {}
+
+    def _require_ollama(self) -> tuple[OllamaRegistryStore, object]:
+        if self._ollama_registry is None or self._ollama_transport is None:
+            raise FleetConflictError("ollama.not_configured")
+        return self._ollama_registry, self._ollama_transport
+
+    def ollama_models(self) -> tuple[OllamaModelV1, ...]:
+        registry, _transport = self._require_ollama()
+        return registry.load().models
+
+    def ollama_instances(self) -> tuple[OllamaInstanceV1, ...]:
+        registry, _transport = self._require_ollama()
+        return registry.load().instances
+
+    def plan_ollama_instance(
+        self,
+        instance: OllamaInstanceV1,
+        *,
+        expected_generation: int,
+    ) -> OllamaFleetPlanV1:
+        registry, transport = self._require_ollama()
+        current = registry.load()
+        if (
+            type(instance) is not OllamaInstanceV1
+            or type(expected_generation) is not int
+            or current.generation != expected_generation
+        ):
+            raise FleetConflictError("generation_conflict")
+        existing = next(
+            (candidate for candidate in current.instances if candidate.ref == instance.ref),
+            None,
+        )
+        running_on_host = sum(
+            candidate.host_ref == instance.host_ref
+            and candidate.lifecycle_state == "running"
+            and candidate.ref != instance.ref
+            for candidate in current.instances
+        )
+        if running_on_host >= 4 and (
+            existing is None or existing.lifecycle_state != "running"
+        ):
+            code = (
+                "ollama.local_limit_reached"
+                if instance.host_ref == CONTROL_HOST_REF
+                else "ollama.host_limit_reached"
+            )
+            raise FleetConflictError(code)
+        resource_generation = None
+        if running_on_host >= 2 and (
+            existing is None or existing.lifecycle_state != "running"
+        ):
+            snapshot = (
+                self._ollama_resource_snapshot(instance.host_ref)
+                if self._ollama_resource_snapshot is not None
+                else None
+            )
+            now = self._io.utc_now()
+            if not isinstance(snapshot, OllamaResourceSnapshotV1):
+                raise FleetConflictError("ollama.resource_headroom_required")
+            observed = datetime.fromisoformat(
+                snapshot.observed_at_utc.replace("Z", "+00:00")
+            )
+            valid_until = datetime.fromisoformat(
+                snapshot.valid_until_utc.replace("Z", "+00:00")
+            )
+            if (
+                snapshot.host_ref != instance.host_ref
+                or not snapshot.green
+                or snapshot.headroom_seconds < 3600
+                or not observed <= now < valid_until
+                or (valid_until - now).total_seconds() < 3600
+            ):
+                raise FleetConflictError("ollama.resource_headroom_required")
+            resource_generation = snapshot.generation
+        try:
+            host_plan = transport.plan(instance, generation=current.generation)
+        except AttributeError:
+            raise FleetConflictError("ollama.transport_invalid") from None
+        plan_id = secrets.token_hex(16)
+        host_digest = getattr(host_plan, "plan_digest", None)
+        if not isinstance(host_digest, str):
+            raise FleetConflictError("ollama.transport_invalid")
+        plan_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "instance": {
+                        "ref": instance.ref,
+                        "host_ref": instance.host_ref,
+                        "models": instance.selected_model_refs,
+                        "allowed_cpus": instance.allowed_cpus,
+                        "cpu_quota_percent": instance.cpu_quota_percent,
+                        "cpu_weight": instance.cpu_weight,
+                    },
+                    "registry_generation": current.generation,
+                    "resource_generation": resource_generation,
+                    "host_plan_digest": host_digest,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        planned = OllamaFleetPlanV1(
+            plan_id,
+            plan_digest,
+            current.generation,
+            resource_generation,
+            instance,
+            host_plan,
+        )
+        with self._ollama_lock:
+            self._ollama_plans[plan_id] = planned
+        return planned
+
+    def apply_ollama_instance(
+        self,
+        plan_id: str,
+        *,
+        expected_generation: int,
+    ) -> OllamaApplyResultV1:
+        registry, transport = self._require_ollama()
+        with self._ollama_lock:
+            applied = self._ollama_applied.get(plan_id)
+            if applied is not None:
+                return applied
+            plan = self._ollama_plans.get(plan_id)
+            if (
+                plan is None
+                or type(expected_generation) is not int
+                or plan.registry_generation != expected_generation
+            ):
+                raise FleetConflictError("control.plan_stale")
+            current = registry.load()
+            if current.generation != expected_generation:
+                raise FleetConflictError("control.plan_stale")
+            execution = None
+            try:
+                fence = getattr(plan.host_plan, "fence")
+                execution = transport.apply(plan.host_plan, current_fence=fence)
+                readiness = transport.probe(execution, current_fence=fence)
+                models_by_ref = {model.ref: model for model in current.models}
+                selected_models = tuple(
+                    models_by_ref[ref] for ref in plan.instance.selected_model_refs
+                )
+                if (
+                    not isinstance(readiness, OllamaReadinessStatus)
+                    or not readiness.ready
+                    or not {
+                        model.provider_model_id for model in selected_models
+                    }.issubset(readiness.available_model_ids)
+                ):
+                    raise FleetConflictError("ollama.instance_not_ready")
+                ready_instance = dataclass_replace(
+                    plan.instance,
+                    lifecycle_state="running",
+                    readiness_state="ready",
+                )
+                instances = tuple(
+                    ready_instance if candidate.ref == ready_instance.ref else candidate
+                    for candidate in current.instances
+                )
+                if all(candidate.ref != ready_instance.ref for candidate in current.instances):
+                    instances += (ready_instance,)
+                stored = registry.replace(
+                    models=current.models,
+                    instances=instances,
+                    expected_generation=current.generation,
+                )
+            except Exception:
+                cleanup_failed = False
+                if execution is not None:
+                    try:
+                        transport.stop(execution, current_fence=fence)
+                    except Exception:
+                        cleanup_failed = True
+                self._ollama_plans.pop(plan_id, None)
+                if cleanup_failed:
+                    raise FleetConflictError("ollama.cleanup_failed") from None
+                raise
+            self._ollama_ready[ready_instance.ref] = readiness
+            result = OllamaApplyResultV1(
+                stored,
+                ready_instance,
+                readiness,
+                self.ollama_hive_lanes(),
+            )
+            self._ollama_applied[plan_id] = result
+            return result
+
+    def ollama_hive_lanes(self) -> tuple[OllamaHiveLaneV1, ...]:
+        registry, _transport = self._require_ollama()
+        current = registry.load()
+        models = {model.ref: model for model in current.models}
+        lanes = []
+        for instance in current.instances:
+            readiness = self._ollama_ready.get(instance.ref)
+            if (
+                instance.lifecycle_state != "running"
+                or instance.readiness_state != "ready"
+                or readiness is None
+                or not readiness.ready
+            ):
+                continue
+            for model_ref in instance.selected_model_refs:
+                model = models.get(model_ref)
+                if (
+                    model is None
+                    or not model.installed
+                    or not model.hive_enabled
+                    or not model.simple_only
+                    or model.provider_model_id not in readiness.available_model_ids
+                ):
+                    continue
+                lanes.append(
+                    OllamaHiveLaneV1(
+                        f"ollama:{instance.ref}:{model.ref}",
+                        instance.ref,
+                        instance.host_ref,
+                        model.ref,
+                        model.provider_model_id,
+                    )
+                )
+        return tuple(lanes)
 
     def _ensure_layout(self) -> None:
         self._io.ensure_dir(self._paths.root)

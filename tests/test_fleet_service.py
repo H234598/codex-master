@@ -5,7 +5,7 @@ import json
 import importlib
 import threading
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -43,7 +43,7 @@ from codex_master.fleet_runners import (
     ProviderErrorQuotaObservation,
     ProbeResult,
 )
-from codex_master.fleet_service import FleetRateLimitError
+from codex_master.fleet_service import FleetConflictError, FleetRateLimitError
 from codex_master.worker_resolution_carrier import (
     WorkerRegistryReservationIssuerV2,
     WorkerResolutionEvidenceV2,
@@ -1927,3 +1927,246 @@ def test_private_lock_serializes_cross_thread_registry_access(tmp_path: Path) ->
     assert not first_thread.is_alive()
     assert not second_thread.is_alive()
     assert second_entered.is_set()
+
+
+@dataclass(frozen=True)
+class _FleetOllamaHostPlan:
+    instance_ref: str
+    fence: int = 7
+    plan_digest: str = "a" * 64
+
+
+@dataclass(frozen=True)
+class _FleetOllamaExecution:
+    plan: _FleetOllamaHostPlan
+
+
+class _FleetOllamaTransport:
+    def __init__(self, *, ready: bool = True, stop_fails: bool = False) -> None:
+        self.ready = ready
+        self.stop_fails = stop_fails
+        self.calls: list[tuple[str, object]] = []
+
+    def plan(self, instance, *, generation):
+        self.calls.append(("plan", (instance, generation)))
+        return _FleetOllamaHostPlan(instance.ref)
+
+    def apply(self, plan, *, current_fence):
+        self.calls.append(("apply", (plan, current_fence)))
+        return _FleetOllamaExecution(plan)
+
+    def probe(self, execution, *, current_fence):
+        from codex_master.ollama_runtime import OllamaReadinessStatus
+
+        self.calls.append(("probe", (execution, current_fence)))
+        return OllamaReadinessStatus(
+            self.ready,
+            () if self.ready else ("provider.model_unavailable",),
+            True,
+            True,
+            True,
+            ("provider-a", "provider-b") if self.ready else ("provider-a",),
+        )
+
+    def stop(self, execution, *, current_fence):
+        self.calls.append(("stop", (execution, current_fence)))
+        if self.stop_fails:
+            raise RuntimeError("private cleanup detail")
+
+
+def _ollama_model(ref: str, provider_id: str):
+    from codex_master.ollama_registry import OllamaModelV1
+
+    return OllamaModelV1(ref, provider_id, True, True, True, "2026-08-30T12:00:00Z")
+
+
+def _ollama_instance(ref: str = "local-main", *, state: str = "planned"):
+    from codex_master.ollama_host_transport import CONTROL_HOST_REF
+    from codex_master.ollama_registry import OllamaInstanceV1
+
+    return OllamaInstanceV1(
+        ref,
+        ref.replace("-", " ").title(),
+        CONTROL_HOST_REF,
+        "/usr/bin/ollama",
+        "/srv/ollama/models",
+        ("model-a", "model-b"),
+        "4-7",
+        350,
+        40,
+        state,
+        "ready" if state == "running" else "unknown",
+    )
+
+
+def _ollama_fleet_service(
+    tmp_path: Path,
+    *,
+    instances=(),
+    ready: bool = True,
+    stop_fails: bool = False,
+    resource_attestation=None,
+):
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    private_io = replace(
+        build_fleet_private_io(paths),
+        utc_now=lambda: datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc),
+    )
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    registry.replace(
+        models=(
+            _ollama_model("model-a", "provider-a"),
+            _ollama_model("model-b", "provider-b"),
+        ),
+        instances=tuple(instances),
+        expected_generation=0,
+    )
+    transport = _FleetOllamaTransport(ready=ready, stop_fails=stop_fails)
+    service = FleetService(
+        paths,
+        private_io,
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        ollama_resource_snapshot=(lambda _host_ref: resource_attestation),
+    )
+    return service, registry, transport
+
+
+def test_ollama_models_and_instances_remain_separate_registry_views(tmp_path: Path) -> None:
+    placed = _ollama_instance()
+    service, _registry, _transport = _ollama_fleet_service(
+        tmp_path, instances=(placed,)
+    )
+
+    assert [model.ref for model in service.ollama_models()] == ["model-a", "model-b"]
+    assert service.ollama_instances() == (placed,)
+
+
+def test_apply_publishes_one_lane_per_selected_model_only_after_readiness(
+    tmp_path: Path,
+) -> None:
+    service, registry, transport = _ollama_fleet_service(tmp_path)
+    candidate = _ollama_instance()
+
+    planned = service.plan_ollama_instance(candidate, expected_generation=1)
+    assert service.ollama_hive_lanes() == ()
+    result = service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+
+    assert [lane.model_ref for lane in result.hive_lanes] == ["model-a", "model-b"]
+    assert [lane.provider_model_id for lane in result.hive_lanes] == [
+        "provider-a",
+        "provider-b",
+    ]
+    assert registry.load().instances[0].readiness_state == "ready"
+    assert [call[0] for call in transport.calls] == ["plan", "apply", "probe"]
+
+
+def test_failed_readiness_stops_only_new_execution_and_publishes_nothing(
+    tmp_path: Path,
+) -> None:
+    service, registry, transport = _ollama_fleet_service(tmp_path, ready=False)
+    planned = service.plan_ollama_instance(
+        _ollama_instance(), expected_generation=1
+    )
+
+    with pytest.raises(FleetConflictError, match="ollama.instance_not_ready"):
+        service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+
+    assert registry.load().instances == ()
+    assert service.ollama_hive_lanes() == ()
+    assert [call[0] for call in transport.calls] == ["plan", "apply", "probe", "stop"]
+
+
+def test_failed_readiness_surfaces_cleanup_failure_without_private_detail(
+    tmp_path: Path,
+) -> None:
+    service, _registry, _transport = _ollama_fleet_service(
+        tmp_path, ready=False, stop_fails=True
+    )
+    planned = service.plan_ollama_instance(
+        _ollama_instance(), expected_generation=1
+    )
+
+    with pytest.raises(FleetConflictError, match="^ollama.cleanup_failed$") as error:
+        service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+
+    assert "private cleanup detail" not in str(error.value)
+
+
+def test_four_running_local_instances_block_fifth_before_host_plan(tmp_path: Path) -> None:
+    instances = tuple(
+        replace(_ollama_instance(f"local-{letter}", state="running"), selected_model_refs=("model-a",))
+        for letter in "abcd"
+    )
+    service, _registry, transport = _ollama_fleet_service(
+        tmp_path, instances=instances
+    )
+
+    with pytest.raises(FleetConflictError, match="ollama.local_limit_reached"):
+        service.plan_ollama_instance(
+            replace(_ollama_instance("local-fifth"), selected_model_refs=("model-a",)),
+            expected_generation=1,
+        )
+
+    assert transport.calls == []
+
+
+def test_third_local_instance_requires_green_sixty_minute_attestation(
+    tmp_path: Path,
+) -> None:
+    from codex_master.fleet_service import OllamaResourceSnapshotV1
+
+    instances = tuple(
+        replace(_ollama_instance(f"local-{letter}", state="running"), selected_model_refs=("model-a",))
+        for letter in "ab"
+    )
+    denied, _registry, denied_transport = _ollama_fleet_service(
+        tmp_path / "denied", instances=instances
+    )
+    with pytest.raises(FleetConflictError, match="ollama.resource_headroom_required"):
+        denied.plan_ollama_instance(
+            replace(_ollama_instance("local-third"), selected_model_refs=("model-a",)),
+            expected_generation=1,
+        )
+    assert denied_transport.calls == []
+
+    attestation = OllamaResourceSnapshotV1(
+        host_ref="control-host",
+        generation=9,
+        observed_at_utc="2026-08-30T11:59:00Z",
+        valid_until_utc="2026-08-30T13:01:00Z",
+        green=True,
+        headroom_seconds=3600,
+    )
+    allowed, _registry, allowed_transport = _ollama_fleet_service(
+        tmp_path / "allowed",
+        instances=instances,
+        resource_attestation=attestation,
+    )
+
+    planned = allowed.plan_ollama_instance(
+        replace(_ollama_instance("local-third"), selected_model_refs=("model-a",)),
+        expected_generation=1,
+    )
+
+    assert planned.resource_generation == 9
+    assert [call[0] for call in allowed_transport.calls] == ["plan"]
+
+
+def test_successful_ollama_apply_retry_is_idempotent(tmp_path: Path) -> None:
+    service, registry, transport = _ollama_fleet_service(tmp_path)
+    planned = service.plan_ollama_instance(
+        _ollama_instance(), expected_generation=1
+    )
+
+    first = service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+    second = service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+
+    assert second is first
+    assert registry.load().generation == 2
+    assert [call[0] for call in transport.calls] == ["plan", "apply", "probe"]

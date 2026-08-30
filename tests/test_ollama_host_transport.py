@@ -249,6 +249,24 @@ def test_remote_plan_is_executed_on_selected_host_with_fixed_redacted_payload():
     assert LEASE_ID not in repr(planned)
 
 
+def test_plan_accepts_new_candidate_bound_to_current_model_catalog():
+    placed = instance("worker-west")
+    source = RegistrySource(OllamaRegistryV1(1, MODEL_GENERATION, (model(),), ()))
+    broker = FakeBroker()
+    transport = OllamaHostTransport(
+        registry=source,
+        leases=LeaseSource(lease("worker-west")),
+        broker=broker,
+        local=FakeLocalAdapter(),
+        monotonic=lambda: 100.0,
+    )
+
+    planned = transport.plan(placed, generation=MODEL_GENERATION)
+
+    assert planned.instance_ref == placed.ref
+    assert broker.calls[0][0].action == "plan"
+
+
 def test_stale_host_fence_blocks_before_runtime_action():
     placed = instance("worker-west")
     transport, broker, _local = transport_for(placed)

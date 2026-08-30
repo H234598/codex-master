@@ -112,6 +112,8 @@ class OllamaHostPlan:
     idempotency_key: str
     expires_at_monotonic: float
     lease_id: str = field(repr=False)
+    _registry: OllamaRegistryV1 = field(repr=False, compare=False)
+    _instance: OllamaInstanceV1 = field(repr=False, compare=False)
     _local_plan: object | None = field(repr=False, compare=False)
     _provenance: bytes = field(repr=False, compare=False)
     _seal: object = field(repr=False, compare=False)
@@ -131,6 +133,9 @@ class OllamaHostPlan:
             or not _hex_token(self.plan_digest, 64)
             or not _hex_token(self.idempotency_key, 64)
             or not _safe_token(self.lease_id)
+            or not isinstance(self._registry, OllamaRegistryV1)
+            or not isinstance(self._instance, OllamaInstanceV1)
+            or self._instance.ref != self.instance_ref
             or type(self.expires_at_monotonic) not in (int, float)
             or not math.isfinite(float(self.expires_at_monotonic))
             or not isinstance(self._provenance, bytes)
@@ -188,13 +193,7 @@ class Task3LocalOllamaHostAdapter:
         self, instance: OllamaInstanceV1, registry: OllamaRegistryV1
     ) -> object:
         local_instance = replace(instance, host_ref="local")
-        local_registry = replace(
-            registry,
-            instances=tuple(
-                local_instance if candidate.ref == instance.ref else candidate
-                for candidate in registry.instances
-            ),
-        )
+        local_registry = _registry_with_instance(registry, local_instance)
         host = probe_ollama_host(runtime=self._runtime)
         return plan_local_instance(local_instance, host, registry=local_registry)
 
@@ -246,9 +245,9 @@ class OllamaHostTransport:
             type(instance) is not OllamaInstanceV1
             or type(generation) is not int
             or current.generation != generation
-            or _registry_instance(current, instance.ref) != instance
         ):
             _fail("control.plan_stale")
+        _registry_with_instance(current, instance)
         lease = self._lease(instance.host_ref)
         idempotency_key = secrets.token_hex(32)
         document = _plan_document(
@@ -260,13 +259,7 @@ class OllamaHostTransport:
         if instance.host_ref == CONTROL_HOST_REF:
             try:
                 local_instance = replace(instance, host_ref="local")
-                local_registry = replace(
-                    current,
-                    instances=tuple(
-                        local_instance if candidate.ref == instance.ref else candidate
-                        for candidate in current.instances
-                    ),
-                )
+                local_registry = _registry_with_instance(current, local_instance)
                 local_plan = self._local.plan(local_instance, local_registry)
             except OllamaRuntimeError as error:
                 raise OllamaHostError(error.code) from None
@@ -288,6 +281,8 @@ class OllamaHostTransport:
             idempotency_key,
             lease.expires_at_monotonic,
             lease.lease_id,
+            current,
+            instance,
             local_plan,
             provenance,
             _PLAN_SEAL,
@@ -438,10 +433,10 @@ class OllamaHostTransport:
         ):
             _fail("control.plan_stale")
         current = self._load_registry()
-        instance = _registry_instance(current, plan.instance_ref)
+        instance = plan._instance
         lease = self._lease(plan.host_ref)
         if (
-            instance is None
+            current != plan._registry
             or current.generation != plan.model_generation
             or instance.host_ref != plan.host_ref
             or lease.lease_id != plan.lease_id
@@ -514,11 +509,23 @@ class OllamaHostTransport:
         return value
 
 
-def _registry_instance(
-    registry: OllamaRegistryV1, instance_ref: str
-) -> OllamaInstanceV1 | None:
-    matches = tuple(instance for instance in registry.instances if instance.ref == instance_ref)
-    return matches[0] if len(matches) == 1 else None
+def _registry_with_instance(
+    registry: OllamaRegistryV1, instance: OllamaInstanceV1
+) -> OllamaRegistryV1:
+    replaced = False
+    instances = []
+    for candidate in registry.instances:
+        if candidate.ref == instance.ref:
+            instances.append(instance)
+            replaced = True
+        else:
+            instances.append(candidate)
+    if not replaced:
+        instances.append(instance)
+    try:
+        return replace(registry, instances=tuple(instances))
+    except Exception:
+        _fail("provider.instance_invalid")
 
 
 def _broker_payload(document: dict[str, object]) -> BrokerOllamaInstancePayload:
@@ -700,6 +707,8 @@ def _plan_state(plan: OllamaHostPlan) -> tuple[object, ...]:
         plan.idempotency_key,
         plan.expires_at_monotonic,
         plan.lease_id,
+        plan._registry,
+        plan._instance,
         id(plan._local_plan),
         plan._provenance,
         id(plan._seal),
