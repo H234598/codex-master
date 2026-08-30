@@ -2013,12 +2013,11 @@ def test_linux_publish_uses_openat2_exclusive_write_fsync_and_noreplace_rename()
     ]
 
 
-def test_linux_publish_rejects_regex_valid_overlong_final_name_before_file_io() -> None:
+def test_linux_publish_rejects_overlong_final_name_before_file_io() -> None:
     operations = FakeLinuxOperations()
     adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
     final_name = f"intent-{'0' * 20}-{'a' * 256}.json"
 
-    assert intent_store_module._INTENT_NAME.fullmatch(final_name) is not None
     assert not intent_store_module._valid_name(final_name)
 
     with pytest.raises(LinuxBrokerError) as raised:
@@ -2030,6 +2029,50 @@ def test_linux_publish_rejects_regex_valid_overlong_final_name_before_file_io() 
         for call in operations.calls
     )
     assert final_name not in operations.files
+
+
+def test_linux_publish_rejects_final_name_with_256_byte_recovery_target_before_file_io() -> (
+    None
+):
+    operations = FakeLinuxOperations()
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    final_name = f"intent-{'0' * 20}-{'a' * 214}.json"
+    recovery_name = f".recover-{final_name}"
+
+    assert intent_store_module._valid_name(final_name)
+    assert len(recovery_name.encode("ascii")) == 256
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(encode_broker_intent(INTENT), final_name)
+
+    assert raised.value.code is LinuxBrokerCode.UNSAFE_PATH
+    assert not any(
+        call[0] in {"openat2", "write_all", "renameat2_noreplace"}
+        for call in operations.calls
+    )
+    assert final_name not in operations.files
+
+
+def test_linux_publishes_and_recovers_name_with_255_byte_recovery_target() -> None:
+    operations = FakeLinuxOperations()
+    final_name = f"intent-{'0' * 20}-{'a' * 213}.json"
+    recovery_name = f".recover-{final_name}"
+    payload = encode_broker_intent(INTENT)
+
+    assert len(final_name.encode("ascii")) == 246
+    assert len(recovery_name.encode("ascii")) == 255
+
+    store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    store.publish(payload, final_name)
+    claimed = store.claim_next()
+    assert claimed is not None
+    store.release_claim(claimed.claim_name)
+
+    recovered = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).recover_next()
+
+    assert recovered is not None
+    assert recovered.claim_name == recovery_name
+    assert operations.files == {recovery_name: payload}
 
 
 def test_linux_claim_rechecks_identity_after_read_and_claims_once() -> None:
@@ -2061,6 +2104,35 @@ def test_linux_claim_loser_gets_none_when_atomic_rename_reports_source_race() ->
     operations.rename_error = FileNotFoundError(errno.ENOENT, "raced")
     assert adapter.claim_next() is None
     assert not any(call[0] == "fsync" for call in operations.calls[4:])
+
+
+def test_linux_claim_skips_lost_race_and_claims_later_candidate() -> None:
+    first_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    second_name = "intent-00000000000000000008-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json"
+
+    class RaceFirstRenameOperations(FakeLinuxOperations):
+        def renameat2_noreplace(
+            self, parent_fd: int, old_name: str, new_name: str
+        ) -> None:
+            if old_name == first_name:
+                self.calls.append(
+                    ("renameat2_noreplace", parent_fd, old_name, new_name)
+                )
+                self.files.pop(old_name)
+                self.identities.pop(old_name)
+                self.labels.pop(old_name)
+                raise FileNotFoundError(errno.ENOENT, "raced")
+            super().renameat2_noreplace(parent_fd, old_name, new_name)
+
+    operations = RaceFirstRenameOperations()
+    _add_active_intent(operations, first_name)
+    _add_active_intent(operations, second_name)
+
+    claimed = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).claim_next()
+
+    assert claimed is not None
+    assert claimed.claim_name == f".claim-{second_name}"
+    assert operations.files == {claimed.claim_name: encode_broker_intent(INTENT)}
 
 
 def test_linux_parent_swap_is_rejected_before_claim_visibility() -> None:
@@ -2206,8 +2278,8 @@ def test_linux_quarantine_binds_valid_claim_before_rename_and_closes_fd() -> Non
     adapter.quarantine(claim_name, "invalid_field")
 
     quarantine_name = (
-        ".quarantine-invalid_field-claim-intent-00000000000000000007-"
-        "dddddddddddddddddddddddddddddddd.json"
+        ".quarantine-invalid_field-"
+        f"{hashlib.sha256(claim_name.encode('ascii')).hexdigest()}.json"
     )
     assert operations.files == {quarantine_name: b"claimed-payload"}
     names = [call[0] for call in operations.calls]
@@ -2218,34 +2290,25 @@ def test_linux_quarantine_binds_valid_claim_before_rename_and_closes_fd() -> Non
     )
 
 
-def test_linux_quarantine_rejects_overlong_destination_before_rename() -> None:
+def test_linux_quarantine_bounds_destination_for_longest_valid_claim() -> None:
     operations = FakeLinuxOperations()
-    claim_name = ".claim-intent-00000000000000000007-" + "d" * 216 + ".json"
+    claim_name = ".claim-intent-00000000000000000007-" + "d" * 213 + ".json"
     code = "a" * intent_store_module.MAX_INTENT_STORE_CODE_BYTES
     operations.files[claim_name] = b"claimed-payload"
     operations.identities[claim_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
     operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
     adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
-    quarantine_name = f".quarantine-{code}-{claim_name[1:]}"
+    quarantine_name = f".quarantine-{code}-{hashlib.sha256(claim_name.encode('ascii')).hexdigest()}.json"
 
-    assert (
-        len(claim_name.encode("ascii"))
-        == intent_store_module.MAX_INTENT_STORE_NAME_BYTES
-    )
+    assert len(claim_name.encode("ascii")) == 253
     assert intent_store_module._CLAIM_NAME.fullmatch(claim_name) is not None
     assert intent_store_module._valid_name(claim_name)
     assert intent_store_module._valid_code(code)
-    assert not intent_store_module._valid_name(quarantine_name)
+    assert len(quarantine_name.encode("ascii")) <= 255
 
-    with pytest.raises(LinuxBrokerError) as raised:
-        adapter.quarantine(claim_name, code)
+    adapter.quarantine(claim_name, code)
 
-    assert raised.value.code is LinuxBrokerCode.UNSAFE_PATH
-    assert operations.files[claim_name] == b"claimed-payload"
-    assert not any(
-        call[0] in {"write_all", "renameat2_noreplace"} for call in operations.calls
-    )
-    assert quarantine_name not in operations.files
+    assert operations.files == {quarantine_name: b"claimed-payload"}
 
 
 def test_linux_quarantine_rejects_valid_but_missing_claim_before_rename() -> None:

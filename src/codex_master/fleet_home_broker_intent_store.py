@@ -33,7 +33,7 @@ from codex_master.fleet_home_broker_linux_contract import (
 )
 
 
-MAX_INTENT_STORE_NAME_BYTES = 256
+MAX_INTENT_STORE_NAME_BYTES = 255
 MAX_INTENT_STORE_CODE_BYTES = 64
 MAX_TERMINAL_INTENT_RECORDS = 128
 MAX_QUARANTINED_INTENT_RECORDS = 128
@@ -60,16 +60,18 @@ INTENT_SELINUX_LABEL = "system_u:object_r:codex_master_home_broker_state_t:s0"
 
 _STORE_NAME = re.compile(r"[A-Za-z0-9.][A-Za-z0-9_.:@+\-]{0,255}\Z", re.ASCII)
 _STORE_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
+# The recovery claim adds nine bytes to a published intent name.  Keep every
+# name in this lifecycle at or below Linux NAME_MAX before any rename.
 _INTENT_NAME = re.compile(
-    r"intent-[0-9]{20}-[A-Za-z0-9][A-Za-z0-9_.:@+\-]{0,255}\.json\Z",
+    r"intent-[0-9]{20}-[A-Za-z0-9][A-Za-z0-9_.:@+\-]{0,212}\.json\Z",
     re.ASCII,
 )
 _CLAIM_NAME = re.compile(
-    r"\.claim-intent-[0-9]{20}-[A-Za-z0-9][A-Za-z0-9_.:@+\-]{0,255}\.json\Z",
+    r"\.claim-intent-[0-9]{20}-[A-Za-z0-9][A-Za-z0-9_.:@+\-]{0,212}\.json\Z",
     re.ASCII,
 )
 _RECOVERED_CLAIM_NAME = re.compile(
-    r"\.recover-intent-[0-9]{20}-[A-Za-z0-9][A-Za-z0-9_.:@+\-]{0,255}\.json\Z",
+    r"\.recover-intent-[0-9]{20}-[A-Za-z0-9][A-Za-z0-9_.:@+\-]{0,212}\.json\Z",
     re.ASCII,
 )
 _PUBLISH_STAGING_NAME = ".tmp-intent-slot.json"
@@ -1039,12 +1041,14 @@ class LinuxBrokerIntentStore:
 
         self._verify_parent()
         for name in self._candidate_names(_INTENT_NAME):
-            return self._claim_candidate(
+            claimed = self._claim_candidate(
                 name,
                 f".claim-{name}",
                 recovered=False,
                 rename_claim=True,
             )
+            if claimed is not None:
+                return claimed
         return None
 
     def recover_next(self) -> BrokerIntentClaimBytes | None:
@@ -1206,7 +1210,8 @@ class LinuxBrokerIntentStore:
         try:
             if not _valid_code(code):
                 _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
-            quarantine_name = f".quarantine-{code}-{claim_name[1:]}"
+            claim_digest = hashlib.sha256(claim_name.encode("ascii")).hexdigest()
+            quarantine_name = f".quarantine-{code}-{claim_digest}.json"
             if not _valid_name(quarantine_name):
                 _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
             self._retention_check(".quarantine-", MAX_QUARANTINED_INTENT_RECORDS)

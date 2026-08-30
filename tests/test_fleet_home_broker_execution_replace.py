@@ -231,7 +231,6 @@ class FakeReplaceOperations:
         self.generated_ids: list[str] = []
         self.closed: list[int] = []
         self.old_quarantined = False
-        self.restore_attempts = 0
         self.delete_attempts = 0
         self.fail_effect: str | None = None
         self.switch_race = False
@@ -302,6 +301,19 @@ class FakeReplaceOperations:
     ) -> None:
         self._effect("cas_registry")
         self.registry_state = BrokerRegistryState.CURRENT
+
+    def attest_deprovision_effect(
+        self,
+        plan: OfflineBrokerPlan,
+        binding: TransactionBinding,
+        action: object,
+    ) -> None:
+        self.delete_attempts += 1
+
+    def deprovision_home(
+        self, plan: OfflineBrokerPlan, binding: TransactionBinding
+    ) -> None:
+        self.delete_attempts += 1
 
     def close(self, fd: int) -> None:
         self.closed.append(fd)
@@ -551,7 +563,6 @@ def test_switch_race_keeps_old_object_quarantined_without_restore_or_delete() ->
     assert response.reply.result is BrokerResultCode.BLOCKED_DRIFT
     assert operations.effects.count("switch_replacement") == 1
     assert operations.old_quarantined
-    assert operations.restore_attempts == 0
     assert operations.delete_attempts == 0
 
 
@@ -565,7 +576,6 @@ def test_unknown_post_switch_is_blocked_with_quarantine_retained() -> None:
 
     assert response.reply.result is BrokerResultCode.BLOCKED_DRIFT
     assert operations.old_quarantined
-    assert operations.restore_attempts == 0
     assert operations.delete_attempts == 0
     assert operations.effects.count("cas_registry") == 0
 
@@ -698,7 +708,6 @@ def test_replace_rollback_boundary_fails_closed_without_cleanup_effect() -> None
 
     assert response.reply.result is BrokerResultCode.BLOCKED_DRIFT
     assert operations.effects == []
-    assert operations.restore_attempts == 0
     assert operations.delete_attempts == 0
 
 
