@@ -735,7 +735,11 @@ class LinuxBrokerIntentStore:
         """Durably publish one regular root-owned intent file."""
 
         self._payload(payload)
-        if type(final_name) is not str or _INTENT_NAME.fullmatch(final_name) is None:
+        if (
+            type(final_name) is not str
+            or not _valid_name(final_name)
+            or _INTENT_NAME.fullmatch(final_name) is None
+        ):
             _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
         self._verify_parent()
         locked = False
@@ -1202,9 +1206,11 @@ class LinuxBrokerIntentStore:
         try:
             if not _valid_code(code):
                 _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
+            quarantine_name = f".quarantine-{code}-{claim_name[1:]}"
+            if not _valid_name(quarantine_name):
+                _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
             self._retention_check(".quarantine-", MAX_QUARANTINED_INTENT_RECORDS)
             self._verify_parent()
-            quarantine_name = f".quarantine-{code}-{claim_name[1:]}"
             fd, before, leased = self._claim_fd(claim_name, self._O_RDONLY)
             self._after_file_identity(fd, before)
             if not leased:
