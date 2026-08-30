@@ -118,11 +118,7 @@ def _active_intent_count(operations: FakeLinuxOperations) -> int:
 
 
 def _admission_observation_ceiling() -> int:
-    return (
-        intent_store_module.MAX_PENDING_INTENT_RECORDS
-        + intent_store_module.MAX_TERMINAL_INTENT_RECORDS * 2
-        + intent_store_module.MAX_QUARANTINED_INTENT_RECORDS
-    )
+    return intent_store_module.MAX_INTENT_STORE_ADMISSION_OBSERVATION_RECORDS
 
 
 def _bounded_observation(
@@ -233,6 +229,7 @@ class FakeLinuxOperations:
         self.pinned_identity_overrides: dict[str, ObjectIdentity] = {}
         self.locked_fds: dict[int, tuple[int, int]] = {}
         self._locked_identities: set[tuple[int, int]] = set()
+        self.observed_entries = 0
 
     def openat2(self, parent_fd: int, name: str, how: object) -> PinnedFd:
         self.calls.append(("openat2", parent_fd, name, how))
@@ -280,9 +277,13 @@ class FakeLinuxOperations:
 
     def observe_names_bounded(self, parent_fd: int, maximum: int) -> object:
         self.calls.append(("observe_names_bounded", parent_fd, maximum))
-        if len(self.files) > maximum:
-            return _bounded_observation((), False, True)
-        return _bounded_observation(tuple(self.files), True, False)
+        names: list[str] = []
+        for name in self.files:
+            self.observed_entries += 1
+            if len(names) >= maximum:
+                return _bounded_observation((), False, True)
+            names.append(name)
+        return _bounded_observation(tuple(names), True, False)
 
     def read_all(self, fd: int) -> bytes:
         self.calls.append(("read_all", fd))
@@ -741,7 +742,12 @@ def test_linux_publish_admission_ceiling_is_bounded_before_active_scan() -> None
         _add_active_intent(operations, f".terminal-commit-{index:032x}.json")
         _add_active_intent(operations, f".quarantine-invalid-{index:032x}.json")
     ceiling = _admission_observation_ceiling()
-    assert len(operations.files) == ceiling
+    assert len(operations.files) == (
+        intent_store_module.MAX_PENDING_INTENT_RECORDS
+        + intent_store_module.MAX_TERMINAL_INTENT_RECORDS * 2
+        + intent_store_module.MAX_QUARANTINED_INTENT_RECORDS
+    )
+    assert _active_intent_count(operations) == 128
     adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
     calls_before_publish = len(operations.calls)
 
@@ -766,6 +772,120 @@ def test_linux_publish_admission_ceiling_is_bounded_before_active_scan() -> None
     )
 
 
+def test_linux_publish_admission_ignores_unbounded_failed_staging_attempts() -> None:
+    operations = FakeLinuxOperations()
+    active_before = intent_store_module.MAX_PENDING_INTENT_RECORDS - 1
+    staging_classes = intent_store_module.MAX_INTENT_PUBLISH_STAGING_RECORDS + 2
+    staging_attempts = (
+        _admission_observation_ceiling() - active_before
+    ) // staging_classes
+    for index in range(active_before):
+        _add_active_intent(operations, _active_intent_name("pending", index))
+    for index in range(staging_attempts):
+        _add_active_intent(operations, f".tmp-intent-crash-{index:032x}.json")
+        _add_active_intent(
+            operations,
+            f".tmp-terminal-evidence-crash-{index:032x}-0.json",
+        )
+        _add_active_intent(
+            operations,
+            f".tmp-terminal-commit-crash-{index:032x}-0.json",
+        )
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    calls_before_publish = len(operations.calls)
+
+    adapter.publish(
+        encode_broker_intent(INTENT),
+        "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+    )
+
+    admission_calls = operations.calls[calls_before_publish:]
+    observe_index = next(
+        index
+        for index, call in enumerate(admission_calls)
+        if call[0] == "observe_names_bounded"
+    )
+    assert admission_calls[observe_index] == (
+        "observe_names_bounded",
+        7,
+        _admission_observation_ceiling(),
+    )
+    assert not any(
+        call[0] == "openat2"
+        and (
+            str(call[2]).startswith(".tmp-intent-")
+            or str(call[2]).startswith(".tmp-terminal-")
+        )
+        for call in admission_calls[: observe_index + 1]
+    )
+    assert (
+        _active_intent_count(operations)
+        == intent_store_module.MAX_PENDING_INTENT_RECORDS
+    )
+    assert sum(name.startswith(".tmp-intent-") for name in operations.files) == 0
+    assert sum(name.startswith(".tmp-terminal-") for name in operations.files) == (
+        staging_attempts * 2
+    )
+
+
+def test_linux_admission_ceiling_covers_each_bounded_store_name_class() -> None:
+    assert _admission_observation_ceiling() == (
+        intent_store_module.MAX_PENDING_INTENT_RECORDS
+        + intent_store_module.MAX_TERMINAL_INTENT_RECORDS
+        * len(intent_store_module._TERMINAL_STAGING_KINDS)
+        + intent_store_module.MAX_QUARANTINED_INTENT_RECORDS
+        + intent_store_module.MAX_INTENT_PUBLISH_STAGING_RECORDS
+        + intent_store_module.MAX_PENDING_INTENT_RECORDS
+        * len(intent_store_module._TERMINAL_STAGING_KINDS)
+        * intent_store_module.MAX_TERMINAL_STAGING_RECORDS
+    )
+
+
+def test_linux_admission_overflows_at_first_name_beyond_all_class_budgets() -> None:
+    operations = FakeLinuxOperations()
+    for index in range(intent_store_module.MAX_PENDING_INTENT_RECORDS):
+        _add_active_intent(operations, _active_intent_name("claim", index))
+    for index in range(intent_store_module.MAX_TERMINAL_INTENT_RECORDS):
+        _add_active_intent(operations, f".terminal-evidence-{index:032x}.json")
+        _add_active_intent(operations, f".terminal-commit-{index:032x}.json")
+        _add_active_intent(operations, f".quarantine-invalid-{index:032x}.json")
+    _add_active_intent(operations, intent_store_module._PUBLISH_STAGING_NAME)
+    for index in range(intent_store_module.MAX_PENDING_INTENT_RECORDS):
+        claim_name = _active_intent_name("claim", index)
+        evidence_name, _, commit_name, _ = _terminal_evidence_records(claim_name, b"")
+        for kind, final_name in zip(
+            intent_store_module._TERMINAL_STAGING_KINDS,
+            (evidence_name, commit_name),
+        ):
+            for staging_index in range(
+                intent_store_module.MAX_TERMINAL_STAGING_RECORDS
+            ):
+                _add_active_intent(
+                    operations,
+                    _terminal_staging_name(kind, final_name, staging_index),
+                )
+    _add_active_intent(operations, ".tmp-terminal-overflow.json")
+
+    ceiling = _admission_observation_ceiling()
+    assert len(operations.files) == ceiling + 1
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    assert operations.observed_entries == (
+        ceiling + intent_store_module.MAX_INTENT_STORE_ADMISSION_SENTINEL_RECORDS
+    )
+    assert not any(
+        call[0] in {"openat2", "write_all", "renameat2_noreplace", "fsync"}
+        for call in operations.calls
+    )
+
+
 @pytest.mark.parametrize("kind", ("overflow", "incomplete"))
 def test_linux_publish_admission_rejects_nonfinal_bounded_observation(
     kind: str,
@@ -775,7 +895,7 @@ def test_linux_publish_admission_rejects_nonfinal_bounded_observation(
     if kind == "overflow":
         operations = FakeLinuxOperations()
         for index in range(ceiling + 1):
-            _add_active_intent(operations, f".quarantine-overflow-{index:032x}.json")
+            _add_active_intent(operations, _active_intent_name("pending", index))
     else:
 
         class IncompleteObservationOperations(FakeLinuxOperations):
@@ -798,6 +918,10 @@ def test_linux_publish_admission_rejects_nonfinal_bounded_observation(
     assert [call for call in admission_calls if call[0] == "observe_names_bounded"] == [
         ("observe_names_bounded", 7, ceiling)
     ]
+    if kind == "overflow":
+        assert operations.observed_entries == ceiling + 1
+    else:
+        assert operations.observed_entries == 0
     assert not any(
         call[0]
         in {"list_names", "openat2", "write_all", "renameat2_noreplace", "fsync"}
@@ -815,6 +939,31 @@ def test_linux_publish_admission_rejects_duplicate_bounded_observation() -> None
 
     operations = DuplicateObservationOperations()
     _add_active_intent(operations, name)
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    calls_before_publish = len(operations.calls)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    admission_calls = operations.calls[calls_before_publish:]
+    assert not any(
+        call[0]
+        in {"list_names", "openat2", "write_all", "renameat2_noreplace", "fsync"}
+        for call in admission_calls
+    )
+
+
+def test_linux_publish_admission_rejects_nonactive_bounded_name() -> None:
+    class LeakingObservationOperations(FakeLinuxOperations):
+        def observe_names_bounded(self, parent_fd: int, maximum: int) -> object:
+            self.calls.append(("observe_names_bounded", parent_fd, maximum))
+            return _bounded_observation(("unrelated",), True, False)
+
+    operations = LeakingObservationOperations()
     adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
     calls_before_publish = len(operations.calls)
 
@@ -1351,6 +1500,51 @@ def test_linux_recovery_discards_invalid_provisional_evidence_without_quarantine
     assert recovered.payload == intent_payload
     assert evidence_name not in operations.files
     assert not any(name.startswith(".quarantine-") for name in operations.files)
+
+
+def test_linux_recovery_cleans_all_terminal_staging_slots_before_admission() -> None:
+    operations = AtomicRecoveryLinuxOperations()
+    claim_name = (
+        ".claim-intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+    )
+    intent_payload = encode_broker_intent(INTENT)
+    evidence_name, _, commit_name, _ = _terminal_evidence_records(
+        claim_name, intent_payload
+    )
+    operations.files[claim_name] = intent_payload
+    operations.identities[claim_name] = ObjectIdentity(8, 1001, 0o100600, 0, 0, 1)
+    operations.labels[claim_name] = PARENT_IDENTITY.selinux_label
+    staging_names: list[str] = []
+    for kind, final_name in zip(
+        intent_store_module._TERMINAL_STAGING_KINDS,
+        (evidence_name, commit_name),
+    ):
+        for index in range(intent_store_module.MAX_TERMINAL_STAGING_RECORDS):
+            staging_name = _terminal_staging_name(kind, final_name, index)
+            staging_names.append(staging_name)
+            operations.files[staging_name] = b"crashed"
+            operations.identities[staging_name] = ObjectIdentity(
+                8, 1001 + len(staging_names), 0o100600, 0, 0, 1
+            )
+            operations.labels[staging_name] = PARENT_IDENTITY.selinux_label
+
+    store = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    recovered = store.recover_next()
+
+    assert recovered is not None
+    assert recovered.claim_name == ".recover-" + claim_name[7:]
+    assert all(name not in operations.files for name in staging_names)
+    assert operations.files[recovered.claim_name] == intent_payload
+
+    store.quarantine(recovered.claim_name, "invalid_field")
+    assert recovered.claim_name not in operations.files
+
+    final_name = "intent-00000000000000000008-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json"
+    LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY).publish(
+        intent_payload, final_name
+    )
+    assert operations.files[final_name] == intent_payload
+    assert operations.observed_entries <= (2 * (_admission_observation_ceiling() + 1))
 
 
 def test_linux_terminal_does_not_unlink_a_raced_staging_path() -> None:
@@ -2091,7 +2285,9 @@ def test_linux_quarantine_retention_allows_128_then_rejects_129_without_mutation
 
     assert raised.value.code is LinuxBrokerCode.IO_FAILURE
     assert operations.files == files_before
-    assert [call[0] for call in operations.calls[calls_before:]] == ["list_names"]
+    assert [call[0] for call in operations.calls[calls_before:]] == [
+        "observe_names_bounded"
+    ]
     assert not any(
         call[0] == "renameat2_noreplace" for call in operations.calls[calls_before:]
     )

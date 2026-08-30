@@ -12,6 +12,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+import codex_master.fleet_home_broker_intent_store as intent_store_module
 from codex_master.fleet_home_broker import OfflineBrokerPlan
 from codex_master.fleet_home_broker_consumer import (
     BrokerExecutionComposition,
@@ -999,6 +1000,18 @@ def test_fresh_linux_store_and_consumer_resume_a_crashed_atomic_claim_once() -> 
 
         def list_names(self, parent_fd: int) -> tuple[str, ...]:
             return tuple(sorted(self.files))
+
+        def observe_names_bounded(self, parent_fd: int, maximum: int) -> object:
+            names: list[str] = []
+            for name in self.files:
+                if len(names) >= maximum:
+                    return intent_store_module._BoundedIntentNameObservation(
+                        (), False, True
+                    )
+                names.append(name)
+            return intent_store_module._BoundedIntentNameObservation(
+                tuple(names), True, False
+            )
 
         def read_all(self, fd: int) -> bytes:
             return self.files[self.fd_names[fd]]

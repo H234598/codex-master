@@ -38,15 +38,22 @@ MAX_INTENT_STORE_CODE_BYTES = 64
 MAX_TERMINAL_INTENT_RECORDS = 128
 MAX_QUARANTINED_INTENT_RECORDS = 128
 MAX_PENDING_INTENT_RECORDS = 128
-# ponytail: This 4x ceiling covers active, terminal evidence+commit, and quarantine; increasing it needs a bounded-adapter and retention-model upgrade.
+MAX_INTENT_PUBLISH_STAGING_RECORDS = 1
+MAX_TERMINAL_STAGING_RECORDS = 8
+_TERMINAL_STAGING_KINDS = ("evidence", "commit")
+MAX_INTENT_STORE_ADMISSION_SENTINEL_RECORDS = 1
+# ponytail: This real-entry ceiling covers every bounded store name class; the adapter adds one sentinel inspection, and changing either requires the corresponding retention, staging-cleanup, and adapter-work invariants to be upgraded together.
 MAX_INTENT_STORE_ADMISSION_OBSERVATION_RECORDS = (
     MAX_PENDING_INTENT_RECORDS
-    + MAX_TERMINAL_INTENT_RECORDS * 2
+    + MAX_TERMINAL_INTENT_RECORDS * len(_TERMINAL_STAGING_KINDS)
     + MAX_QUARANTINED_INTENT_RECORDS
+    + MAX_INTENT_PUBLISH_STAGING_RECORDS
+    + MAX_PENDING_INTENT_RECORDS
+    * len(_TERMINAL_STAGING_KINDS)
+    * MAX_TERMINAL_STAGING_RECORDS
 )
 MAX_TERMINAL_EVIDENCE_BYTES = MAX_BROKER_INTENT_BYTES * 2
 MAX_TERMINAL_COMMIT_BYTES = 256
-MAX_TERMINAL_STAGING_RECORDS = 8
 INTENT_FILE_MODE = 0o100600
 INTENT_PARENT_MODE = 0o40700
 INTENT_SELINUX_LABEL = "system_u:object_r:codex_master_home_broker_state_t:s0"
@@ -65,6 +72,7 @@ _RECOVERED_CLAIM_NAME = re.compile(
     r"\.recover-intent-[0-9]{20}-[A-Za-z0-9][A-Za-z0-9_.:@+\-]{0,255}\.json\Z",
     re.ASCII,
 )
+_PUBLISH_STAGING_NAME = ".tmp-intent-slot.json"
 
 
 def _canonical_json_bytes(document: object) -> bytes:
@@ -177,7 +185,7 @@ class BrokerIntentClaimBytes:
 
 @dataclass(frozen=True, slots=True)
 class _BoundedIntentNameObservation:
-    """Private, bounded directory observation used only for admission."""
+    """Private, bounded complete directory observation used by admission/recovery."""
 
     names: tuple[str, ...]
     complete: bool
@@ -211,7 +219,17 @@ class _LinuxIntentStoreOperations(Protocol):
 
     def observe_names_bounded(
         self, parent_fd: int, maximum: int
-    ) -> _BoundedIntentNameObservation: ...
+    ) -> _BoundedIntentNameObservation:
+        """Observe every visible directory name with a hard bounded result.
+
+        ``maximum`` is the real-entry capacity.  The adapter must append
+        directory entries while enumerating and inspect at most
+        ``MAX_INTENT_STORE_ADMISSION_SENTINEL_RECORDS`` additional overflow
+        sentinel entries, returning ``overflow`` instead of materializing them.
+        ``complete`` is true only when the entire directory was consumed.  It
+        must not sort or expose an unbounded directory snapshot to the caller.
+        """
+        ...
 
     def read_all(self, fd: int) -> bytes: ...
 
@@ -251,6 +269,38 @@ def _valid_name(value: object) -> bool:
         )
     except UnicodeEncodeError:
         return False
+
+
+def _active_intent_name(value: object) -> bool:
+    return (
+        type(value) is str
+        and _valid_name(value)
+        and (
+            _INTENT_NAME.fullmatch(value) is not None
+            or _CLAIM_NAME.fullmatch(value) is not None
+            or _RECOVERED_CLAIM_NAME.fullmatch(value) is not None
+        )
+    )
+
+
+def _publish_staging_name(value: object) -> bool:
+    return type(value) is str and (
+        value == _PUBLISH_STAGING_NAME or value.startswith(".tmp-intent-")
+    )
+
+
+def _store_name(value: object) -> bool:
+    if type(value) is not str or not _valid_name(value):
+        return False
+    return (
+        _active_intent_name(value)
+        or _publish_staging_name(value)
+        or value.startswith(".tmp-terminal-")
+        or value.startswith(".terminal-evidence-")
+        or value.startswith(".terminal-commit-")
+        or value.startswith(".terminal-claim-")
+        or value.startswith(".quarantine-")
+    )
 
 
 def _valid_code(value: object) -> bool:
@@ -568,14 +618,11 @@ class LinuxBrokerIntentStore:
 
     def _cleanup_temp(self, name: str) -> None:
         try:
-            self._operations.unlinkat(self._parent_fd, name)
+            self._discard_staging_file(name)
         except Exception:
             pass
 
-    def _active_intent_count(self) -> int:
-        """Safely count every visible pending or still-owned claimed intent."""
-
-        self._verify_parent()
+    def _bounded_visible_names(self) -> tuple[str, ...]:
         observation = _linux_call(
             self._operations.observe_names_bounded,
             self._parent_fd,
@@ -589,43 +636,78 @@ class LinuxBrokerIntentStore:
             or observation.complete is not True
             or observation.overflow is not False
             or len(observation.names) > MAX_INTENT_STORE_ADMISSION_OBSERVATION_RECORDS
-            or any(
-                type(name) is not str or not _valid_name(name)
-                for name in observation.names
-            )
+            or any(not _store_name(name) for name in observation.names)
+            or len(set(observation.names)) != len(observation.names)
         ):
             _linux_fail(LinuxBrokerCode.IO_FAILURE)
-        candidates = tuple(
-            sorted(
-                name
-                for name in observation.names
-                if (
-                    _INTENT_NAME.fullmatch(name) is not None
-                    or _CLAIM_NAME.fullmatch(name) is not None
-                    or _RECOVERED_CLAIM_NAME.fullmatch(name) is not None
-                )
-            )
-        )
-        if len(set(candidates)) != len(candidates):
-            _linux_fail(LinuxBrokerCode.IO_FAILURE)
-        for name in candidates:
-            fd = None
-            primary_error: BaseException | None = None
-            try:
-                fd, before = self._open_file(name, self._O_RDONLY)
-                self._after_file_identity(fd, before)
-            except BaseException as error:
-                primary_error = error
-                raise
-            finally:
-                if fd is not None:
-                    try:
-                        _linux_call(self._operations.close, fd)
-                    except BaseException:
-                        if primary_error is None:
-                            raise
+        return observation.names
+
+    def _discard_staging_file(self, name: str) -> None:
+        if not (
+            _publish_staging_name(name)
+            or (type(name) is str and name.startswith(".tmp-terminal-"))
+            or (type(name) is str and name.startswith(".terminal-evidence-"))
+            or (type(name) is str and name.startswith(".terminal-commit-"))
+        ):
+            _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
+        fd = None
+        primary_error: BaseException | None = None
+        try:
+            fd, before = self._open_file(name, self._O_RDONLY)
+            self._after_file_identity(fd, before)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            if fd is not None:
+                try:
+                    _linux_call(self._operations.close, fd)
+                except BaseException:
+                    if primary_error is None:
+                        raise
         self._verify_parent()
-        return len(candidates)
+        _linux_call(self._operations.unlinkat, self._parent_fd, name)
+        _linux_call(self._operations.fsync, self._parent_fd)
+        self._verify_parent()
+
+    def _active_intent_count(self) -> int:
+        """Safely count every visible pending or still-owned claimed intent."""
+
+        self._verify_parent()
+
+        def scan_active(names: tuple[str, ...]) -> int:
+            candidates = tuple(
+                sorted(name for name in names if _active_intent_name(name))
+            )
+            for name in candidates:
+                fd = None
+                primary_error: BaseException | None = None
+                try:
+                    fd, before = self._open_file(name, self._O_RDONLY)
+                    self._after_file_identity(fd, before)
+                except BaseException as error:
+                    primary_error = error
+                    raise
+                finally:
+                    if fd is not None:
+                        try:
+                            _linux_call(self._operations.close, fd)
+                        except BaseException:
+                            if primary_error is None:
+                                raise
+            self._verify_parent()
+            return len(candidates)
+
+        names = self._bounded_visible_names()
+        count = scan_active(names)
+        if count >= MAX_PENDING_INTENT_RECORDS:
+            return count
+        staging_names = tuple(name for name in names if _publish_staging_name(name))
+        for name in staging_names:
+            self._discard_staging_file(name)
+        if staging_names:
+            count = scan_active(self._bounded_visible_names())
+        return count
 
     def _acquire_admission_lock(self) -> None:
         """Take the existing root-parent lease for one admission/publish."""
@@ -664,7 +746,7 @@ class LinuxBrokerIntentStore:
             self._verify_parent()
             if self._active_intent_count() >= MAX_PENDING_INTENT_RECORDS:
                 raise BrokerIntentError(BrokerIntentCode.QUEUE_FULL)
-            staging_name = f".tmp-{final_name}"
+            staging_name = _PUBLISH_STAGING_NAME
             fd = None
             renamed = False
             try:
@@ -839,9 +921,8 @@ class LinuxBrokerIntentStore:
     def _terminal_staging_names(self, claim_name: str) -> tuple[str, ...]:
         evidence_name, commit_name = _terminal_record_names(claim_name)
         names: list[str] = []
-        for kind, final_name in (
-            ("evidence", evidence_name),
-            ("commit", commit_name),
+        for kind, final_name in zip(
+            _TERMINAL_STAGING_KINDS, (evidence_name, commit_name)
         ):
             final_digest = hashlib.sha256(final_name.encode("ascii")).hexdigest()
             names.extend(
@@ -865,17 +946,7 @@ class LinuxBrokerIntentStore:
 
         if name not in visible_names:
             return
-        fd = None
-        try:
-            fd, before = self._open_file(name, self._O_RDONLY)
-            self._after_file_identity(fd, before)
-        finally:
-            if fd is not None:
-                self._close(fd)
-        self._verify_parent()
-        _linux_call(self._operations.unlinkat, self._parent_fd, name)
-        _linux_call(self._operations.fsync, self._parent_fd)
-        self._verify_parent()
+        self._discard_staging_file(name)
 
     def _discard_terminal_evidence(
         self, claim_name: str, visible_names: tuple[object, ...]
@@ -976,9 +1047,7 @@ class LinuxBrokerIntentStore:
         """Atomically take one crashed claim after acquiring its inode lease."""
 
         self._verify_parent()
-        visible_names = _linux_call(self._operations.list_names, self._parent_fd)
-        if type(visible_names) is not tuple:
-            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        visible_names = self._bounded_visible_names()
         candidates = tuple(
             sorted(
                 name
@@ -1005,9 +1074,7 @@ class LinuxBrokerIntentStore:
         return None
 
     def _retention_check(self, prefix: str, maximum: int) -> None:
-        names = _linux_call(self._operations.list_names, self._parent_fd)
-        if type(names) is not tuple:
-            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        names = self._bounded_visible_names()
         if (
             sum(1 for name in names if type(name) is str and name.startswith(prefix))
             >= maximum
@@ -1017,9 +1084,7 @@ class LinuxBrokerIntentStore:
     def _terminal_retention_check(self) -> None:
         """Count one evidence record per terminal intent, including legacy data."""
 
-        names = _linux_call(self._operations.list_names, self._parent_fd)
-        if type(names) is not tuple:
-            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        names = self._bounded_visible_names()
         if (
             sum(
                 1
@@ -1092,9 +1157,7 @@ class LinuxBrokerIntentStore:
             evidence = _terminal_evidence(claim_name, intent_payload, result)
             commit = _terminal_commit(evidence)
             self._verify_parent()
-            visible_names = _linux_call(self._operations.list_names, self._parent_fd)
-            if type(visible_names) is not tuple:
-                _linux_fail(LinuxBrokerCode.IO_FAILURE)
+            visible_names = self._bounded_visible_names()
             existing_evidence = self._read_terminal_record(evidence_name, visible_names)
             existing_commit = self._read_terminal_record(commit_name, visible_names)
             if existing_commit is not None:
@@ -1121,11 +1184,7 @@ class LinuxBrokerIntentStore:
                     # A previously published but uncommitted sidecar becomes
                     # durable before its commit marker is created.
                     _linux_call(self._operations.fsync, self._parent_fd)
-                visible_names = _linux_call(
-                    self._operations.list_names, self._parent_fd
-                )
-                if type(visible_names) is not tuple:
-                    _linux_fail(LinuxBrokerCode.IO_FAILURE)
+                visible_names = self._bounded_visible_names()
                 self._publish_terminal_record(
                     "commit", commit_name, commit, visible_names
                 )
@@ -1152,6 +1211,7 @@ class LinuxBrokerIntentStore:
                 self._close(fd)
                 fd = None
             self._verify_parent()
+            self._discard_terminal_staging(claim_name, self._bounded_visible_names())
             self._rename_and_sync(claim_name, quarantine_name)
             self._verify_parent()
         finally:
