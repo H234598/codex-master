@@ -866,6 +866,7 @@ def test_google_inventory_query_uses_manager_once() -> None:
 
     result = service.query(principal("fleet.read"), "google.accounts.list", {})
 
+    assert result["registry_generation"] == 4
     assert result["accounts"][0]["ref"] == "google-one"  # type: ignore[index]
     assert result["accounts"][0]["inventory_generation"] == 4  # type: ignore[index]
     assert result["accounts"][0]["enabled"] is True  # type: ignore[index]
@@ -873,6 +874,26 @@ def test_google_inventory_query_uses_manager_once() -> None:
     assert result["accounts"][0]["quota_state"] == "fresh"  # type: ignore[index]
     assert result["accounts"][0]["reload_state"] == "ready"  # type: ignore[index]
     assert owners.google_manager.list_calls == 1
+    assert owners.account_registry.calls == [("generation", "google")]
+
+
+def test_google_accounts_list_reports_registry_generation_when_empty() -> None:
+    class EmptyGoogleManager(GoogleManager):
+        def list_accounts(self) -> tuple[dict[str, object], ...]:
+            with self._lock:
+                self.list_calls += 1
+            return ()
+
+    service, owners = service_at()
+    owners.google_manager = EmptyGoogleManager()
+    owners.account_registry.generation = 9
+    service._google_manager = owners.google_manager
+
+    result = service.query(principal("fleet.read"), "google.accounts.list", {})
+
+    assert result == {"registry_generation": 9, "accounts": []}
+    assert owners.google_manager.list_calls == 1
+    assert owners.account_registry.calls == [("generation", "google")]
 
 
 def test_google_accounts_list_projects_exact_opaque_default_oauth_client_ref() -> None:

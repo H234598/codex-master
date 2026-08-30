@@ -441,6 +441,12 @@ def test_documented_rest_response_keeps_exact_service_contract(tmp_path) -> None
             {"expected_generation": 4, "idempotency_key": "account-add"},
         ),
         (
+            "/admin/v1/google/accounts",
+            "google.accounts.add",
+            {"account_ref": "google-two", "label": "Google Two"},
+            {"expected_generation": 4, "idempotency_key": "google-account-add"},
+        ),
+        (
             "/admin/v1/openai/accounts/openai-one/auth-sync-plans",
             "openai.auth.plan",
             {"account_ref": "openai-one"},
@@ -1455,6 +1461,7 @@ def _real_google_list_service(tmp_path):
         google_billing=owners.google_billing,
         host_registry=owners.hosts,
         secret_ingress=owners.secret_ingress,
+        account_registry=owners.account_registry,
     )
     return service, google, imported
 
@@ -1479,6 +1486,7 @@ def test_google_accounts_http_projects_real_bound_opaque_oauth_client_ref(
     )
     assert status == 200
     assert document["schema_version"] == 1
+    assert document["registry_generation"] == 4
     assert account["default_oauth_client_ref"] == imported.client_ref
     assert account["oauth_client_availability"] == "available"
     assert set(account) == {
@@ -1530,6 +1538,7 @@ def test_google_accounts_http_degrades_oauth_journal_lock_fault(
     )
     assert status == 200
     assert document["schema_version"] == 1
+    assert document["registry_generation"] == 4
     assert account["default_oauth_client_ref"] is None
     assert account["oauth_client_availability"] == "unavailable"
 

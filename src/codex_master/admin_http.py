@@ -68,6 +68,7 @@ _REST_GET_ROUTES = {
 }
 _REST_POST_ROUTES = {
     "/admin/v1/openai/accounts": ("openai.accounts.add", ()),
+    "/admin/v1/google/accounts": ("google.accounts.add", ()),
     "/admin/v1/secret-ingress-sessions": ("secret.ingress.create", ()),
     "/admin/v1/google/oauth-transactions": ("google.oauth.begin", ()),
     "/admin/v1/google/oauth-client-import-plans": (

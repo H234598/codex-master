@@ -774,10 +774,12 @@ class MasterjetControlService:
         }
 
     def _google_accounts_list(self, *_values: object) -> dict[str, object]:
+        owner = _required(self._account_registry)
         status = self._google_manager.status()
         if type(status) is not GoogleAccountInventoryStatusV1:
             raise _service_error("control.response_private")
         return {
+            "registry_generation": owner.current_generation("google"),
             "accounts": [
                 _serialize_google_account(self._google_account_summary(item, status))
                 for item in self._google_manager.list_accounts()
