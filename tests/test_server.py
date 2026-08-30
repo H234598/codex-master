@@ -41353,14 +41353,12 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
         )
 
     def test_fleet_operation_status_cli_and_mcp_outputs_are_identical(self) -> None:
-        arguments = {"account_ref": "google-one", "operation_id": "operation-one"}
+        arguments = {"operation_id": "operation-one"}
         with self._binding():
             status, cli = self._cli(
                 "fleet",
                 "operation",
                 "status",
-                "--account-ref",
-                "google-one",
                 "--operation-id",
                 "operation-one",
             )

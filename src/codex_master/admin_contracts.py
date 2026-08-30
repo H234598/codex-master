@@ -42,7 +42,7 @@ ADMIN_OPERATION_METADATA = MappingProxyType(
             "fleet.read", False, ("account_ref",)
         ),
         "operations.get": AdminOperationMetadataV1(
-            "fleet.read", False, ("account_ref", "operation_id")
+            "fleet.read", False, ("operation_id",)
         ),
         "ollama.models.list": AdminOperationMetadataV1("fleet.read", False, ()),
         "ollama.instances.list": AdminOperationMetadataV1("fleet.read", False, ()),

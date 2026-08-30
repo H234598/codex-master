@@ -395,6 +395,11 @@ def test_ollama_rest_queries_bind_exact_operation(tmp_path, target, operation) -
             "google.projects.list",
             {"account_ref": "google-one"},
         ),
+        (
+            "/admin/v1/operations/op-one",
+            "operations.get",
+            {"operation_id": "op-one"},
+        ),
     ],
 )
 def test_documented_rest_queries_bind_exact_operation(

@@ -949,11 +949,8 @@ class MasterjetControlService:
         request: AdminRequestV1,
         *_values: object,
     ) -> dict[str, object]:
-        account_ref = cast(str, request.arguments["account_ref"])
         operation_id = cast(str, request.arguments["operation_id"])
         operation = self._operation_store.get(operation_id)
-        if not operation.kind.endswith(":" + account_ref):
-            raise _denied("authority.scope_denied")
         return public_admin_result(operation)
 
     def _openai_auth_plan(

@@ -34316,7 +34316,7 @@ _MASTERJET_ADMIN_TOOL_SPECS = (
     (
         "fleet_operation_status",
         "operations.get",
-        "Return one account-bound durable operation.",
+        "Return one durable operation by opaque identifier.",
         None,
     ),
     (

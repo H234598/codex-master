@@ -241,19 +241,16 @@ def test_command_contracts_require_generation_idempotency_and_optional_digest(
     assert request.plan_digest == (DIGEST if requires_digest else None)
 
 
-def test_operations_get_is_account_bound() -> None:
+def test_operations_get_uses_only_opaque_operation_id() -> None:
     request = parse_admin_request(
         {
             "schema_version": 1,
             "operation": "operations.get",
-            "arguments": {"account_ref": "google-one", "operation_id": "op-one"},
+            "arguments": {"operation_id": "op-one"},
         }
     )
 
-    assert dict(request.arguments) == {
-        "account_ref": "google-one",
-        "operation_id": "op-one",
-    }
+    assert dict(request.arguments) == {"operation_id": "op-one"}
 
 
 def test_oauth_complete_uses_transaction_generation_without_shadow_replay_fields() -> (

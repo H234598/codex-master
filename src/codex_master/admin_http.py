@@ -84,6 +84,11 @@ _REST_GET_PATTERNS = (
         "google.projects.list",
         ("account_ref",),
     ),
+    (
+        re.compile(rf"/admin/v1/operations/{_REST_SEGMENT}\Z", re.ASCII),
+        "operations.get",
+        ("operation_id",),
+    ),
 )
 _REST_POST_PATTERNS = (
     (
