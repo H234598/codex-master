@@ -4,7 +4,6 @@
 #include <errno.h>
 #include <features.h>
 #include <spawn.h>
-#include <sys/prctl.h>
 
 #if !defined(__linux__)
 # error "codex-master runtime spawn helper requires Linux"
@@ -17,14 +16,6 @@
 #ifndef POSIX_SPAWN_SETSID
 # error "codex-master runtime spawn helper requires POSIX_SPAWN_SETSID"
 #endif
-
-int
-codex_master_enable_subreaper(void)
-{
-  if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == -1)
-    return errno;
-  return 0;
-}
 
 int
 codex_master_pidfd_spawnp(int *pidfd, int stdin_fd, int stdout_fd, int stderr_fd,

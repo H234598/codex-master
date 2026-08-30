@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import seal_runtime_image
+
 
 pytestmark = pytest.mark.usefixtures("runtime_spawn_helper")
 
@@ -96,6 +98,7 @@ def materialize_runtime_image(tmp_path: Path, *, mcp_mode: str = "healthy") -> P
     for path in root.rglob("*"):
         if path.is_dir():
             path.chmod(0o700)
+    seal_runtime_image(root)
     return root
 
 

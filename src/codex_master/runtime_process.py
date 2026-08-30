@@ -1,4 +1,4 @@
-"""Bounded, isolated subprocess support for autonomous runtime checks."""
+"""Bounded subprocess support inside one non-delegated systemd cgroup-v2 unit."""
 
 from __future__ import annotations
 
@@ -7,28 +7,31 @@ import contextlib
 import ctypes
 from dataclasses import dataclass
 import errno
+import hashlib
 import os
 from pathlib import Path
+import secrets
 import selectors
 import signal
 import stat
+import subprocess
 import time
+
+from codex_master.runtime_layout import (
+    LayoutError,
+    RuntimeLayout,
+    validate_runtime_metadata,
+)
 
 
 DEFAULT_STDOUT_LIMIT = 256 * 1024
 DEFAULT_STDERR_LIMIT = 64 * 1024
-_RUNTIME_SPAWN_HELPER = "_runtime_spawn_helper.so"
-_GROUP_BINDING_ERRORS = frozenset(
-    {
-        errno.EAGAIN,
-        errno.EINVAL,
-        errno.EMFILE,
-        errno.ENFILE,
-        errno.ENOMEM,
-        errno.ENOSYS,
-        errno.EOPNOTSUPP,
-    }
-)
+_SYSTEMD_RUN = "/usr/bin/systemd-run"
+_SYSTEMCTL = "/usr/bin/systemctl"
+_ENV = "/usr/bin/env"
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_RUNTIME_DIRECTORY_ROOT = Path("/run/user")
+_CLEANUP_SECONDS = 0.5
 
 
 class BoundedProcessError(RuntimeError):
@@ -50,21 +53,37 @@ class BoundedProcessResult:
 class _NativeSpawnHelper:
     library: object
     spawn: object
-    enable_subreaper: object
 
 
 @dataclass(slots=True)
 class _SpawnedProcess:
-    process_group: int
+    unit: str
     pidfd: int
     stdin_fd: int
     stdout_fd: int
     stderr_fd: int
+    cgroup: Path | None = None
     returncode: int | None = None
 
 
+def _runtime_directory() -> Path:
+    path = _RUNTIME_DIRECTORY_ROOT / str(os.geteuid())
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise BoundedProcessError("command_group_unavailable")
+    return path
+
+
 def minimal_environment(*, home: Path) -> dict[str, str]:
-    """Return the complete child environment; no caller environment is inherited."""
+    """Return the complete direct-child environment; no caller values leak in."""
 
     if (
         not isinstance(home, Path)
@@ -78,6 +97,7 @@ def minimal_environment(*, home: Path) -> dict[str, str]:
         "PATH": "/usr/bin:/bin",
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
+        "XDG_RUNTIME_DIR": os.fspath(_runtime_directory()),
     }
 
 
@@ -88,36 +108,56 @@ def _close_descriptor(descriptor: int) -> int:
     return -1
 
 
-def _runtime_spawn_helper_path(helper_path: Path | None = None) -> Path:
-    if helper_path is not None and (
-        not isinstance(helper_path, Path)
-        or not helper_path.is_absolute()
-        or "\x00" in os.fspath(helper_path)
-    ):
-        raise BoundedProcessError("command_group_unavailable")
-    path = (
-        Path(__file__).with_name(_RUNTIME_SPAWN_HELPER)
-        if helper_path is None
-        else helper_path
-    )
+def _digest_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
     try:
-        item = path.lstat()
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+        os.lseek(descriptor, 0, os.SEEK_SET)
     except OSError as exc:
         raise BoundedProcessError("command_group_unavailable") from exc
-    if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
+    return digest.hexdigest()
+
+
+def _load_runtime_spawn_helper(layout: RuntimeLayout) -> _NativeSpawnHelper:
+    """Load exactly the verified helper FD from the validated Runtime Image.
+
+    The Runtime Image manifest is an atomic-image integrity contract, not an
+    independent signing authority: an actor who can replace that whole private
+    image already has runtime-code authority. This binding prevents a helper
+    pathname swap or an individual helper/manifest deviation between validation
+    and ``dlopen``; stronger authority requires an external trust root.
+    """
+
+    if not isinstance(layout, RuntimeLayout):
         raise BoundedProcessError("command_group_unavailable")
-    return path
-
-
-def _load_runtime_spawn_helper(
-    helper_path: Path | None = None,
-) -> _NativeSpawnHelper:
-    """Load the image-built helper with its checked C header/ABI contract."""
-
     try:
-        library = ctypes.CDLL(
-            os.fspath(_runtime_spawn_helper_path(helper_path)), use_errno=True
+        validate_runtime_metadata(layout)
+    except (LayoutError, TypeError, ValueError) as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            layout.spawn_helper,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
         )
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o022
+            or info.st_nlink != 1
+            or _digest_descriptor(descriptor) != layout.spawn_helper_digest
+        ):
+            raise BoundedProcessError("command_group_unavailable")
+        bound_identity = (info.st_dev, info.st_ino)
+        library = ctypes.CDLL(f"/proc/self/fd/{descriptor}", use_errno=True)
+        loaded = os.fstat(descriptor)
+        if (loaded.st_dev, loaded.st_ino) != bound_identity:
+            raise BoundedProcessError("command_group_unavailable")
         spawn = library.codex_master_pidfd_spawnp
         spawn.argtypes = (
             ctypes.POINTER(ctypes.c_int),
@@ -129,111 +169,90 @@ def _load_runtime_spawn_helper(
             ctypes.POINTER(ctypes.c_char_p),
         )
         spawn.restype = ctypes.c_int
-        enable_subreaper = library.codex_master_enable_subreaper
-        enable_subreaper.argtypes = ()
-        enable_subreaper.restype = ctypes.c_int
     except (AttributeError, OSError) as exc:
         raise BoundedProcessError("command_group_unavailable") from exc
-    return _NativeSpawnHelper(library, spawn, enable_subreaper)
+    finally:
+        descriptor = _close_descriptor(descriptor)
+    return _NativeSpawnHelper(library, spawn)
 
 
-def _pid_from_fdinfo(pidfd: int) -> int:
-    """Read the unreusable leader PID that the kernel associates with pidfd."""
+def _remaining(deadline: float) -> float:
+    value = deadline - time.monotonic()
+    if value <= 0:
+        raise BoundedProcessError("command_timeout")
+    return value
+
+
+def _systemctl(
+    arguments: Sequence[str], *, environment: dict[str, str], deadline: float
+) -> bytes:
+    try:
+        completed = subprocess.run(
+            [_SYSTEMCTL, "--user", *arguments],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            timeout=_remaining(deadline),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BoundedProcessError("command_timeout") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    if completed.returncode != 0:
+        raise BoundedProcessError("command_group_unavailable")
+    return completed.stdout
+
+
+def _verify_runner_capability(*, environment: dict[str, str], deadline: float) -> None:
+    """Require the user manager and cgroup-v2 before launching the command."""
 
     try:
-        lines = (
-            (Path("/proc/self/fdinfo") / str(pidfd))
-            .read_text(encoding="ascii")
-            .splitlines()
-        )
+        controllers = (_CGROUP_ROOT / "cgroup.controllers").read_bytes()
     except OSError as exc:
         raise BoundedProcessError("command_group_unavailable") from exc
-    values = [line.split("\t", 1)[1] for line in lines if line.startswith("Pid:\t")]
-    if len(values) != 1:
+    if not controllers or not hasattr(os, "P_PIDFD") or not hasattr(os, "pipe2"):
         raise BoundedProcessError("command_group_unavailable")
-    try:
-        process_group = int(values[0])
-    except ValueError as exc:
-        raise BoundedProcessError("command_group_unavailable") from exc
-    if process_group <= 0:
-        raise BoundedProcessError("command_group_unavailable")
-    return process_group
+    _systemctl(("show-environment",), environment=environment, deadline=deadline)
 
 
-def _verify_pidfd_capability(helper: _NativeSpawnHelper) -> None:
-    """Fail before opening pipes unless every process-control primitive exists."""
-
-    if (
-        not hasattr(os, "P_PIDFD")
-        or not hasattr(os, "P_PGID")
-        or not hasattr(os, "O_CLOEXEC")
-        or not hasattr(os, "pipe2")
-        or not hasattr(signal, "pidfd_send_signal")
-    ):
-        raise BoundedProcessError("command_group_unavailable")
-    if helper.enable_subreaper() != 0:
-        raise BoundedProcessError("command_group_unavailable")
-    try:
-        pidfd = os.pidfd_open(os.getpid())
-    except (AttributeError, OSError) as exc:
-        raise BoundedProcessError("command_group_unavailable") from exc
-    try:
-        if _pid_from_fdinfo(pidfd) != os.getpid():
-            raise BoundedProcessError("command_group_unavailable")
-    finally:
-        _close_descriptor(pidfd)
+def _unit_name() -> str:
+    return f"codex-master-runtime-{os.geteuid()}-{secrets.token_hex(16)}.service"
 
 
-def _signal_bound_group(process_group: int, pidfd: int, signal_number: int) -> bool:
-    """Signal only a process group whose leader PID remains held by pidfd."""
-
-    while True:
-        try:
-            os.killpg(process_group, signal_number)
-            return True
-        except InterruptedError:
-            continue
-        except ProcessLookupError:
-            return False
-        except OSError:
-            with contextlib.suppress(OSError):
-                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
-            return False
-
-
-def _reap_process_group(process_group: int) -> None:
-    """Reap subreaper-adopted descendants after their pinned group is killed."""
-
-    while True:
-        try:
-            os.waitid(os.P_PGID, process_group, os.WEXITED)
-        except InterruptedError:
-            continue
-        except (ChildProcessError, OSError):
-            return
+def _systemd_run_arguments(
+    arguments: Sequence[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    unit: str,
+) -> tuple[str, ...]:
+    clean_environment = tuple(f"{name}={value}" for name, value in environment.items())
+    return (
+        _SYSTEMD_RUN,
+        "--user",
+        f"--unit={unit}",
+        "--property=Delegate=no",
+        "--property=KillMode=control-group",
+        "--pipe",
+        "--wait",
+        "--collect",
+        "--quiet",
+        f"--working-directory={os.fspath(cwd)}",
+        "--",
+        _ENV,
+        "-i",
+        *clean_environment,
+        *arguments,
+    )
 
 
 def _terminate_unbound_spawn(pidfd: int) -> None:
-    """Kill/reap a partial spawn while its leader PID cannot be reused."""
-
     with contextlib.suppress(OSError):
         signal.pidfd_send_signal(pidfd, signal.SIGKILL)
-    waited = None
-    while True:
-        try:
-            waited = os.waitid(os.P_PIDFD, pidfd, os.WEXITED | os.WNOWAIT)
-            break
-        except InterruptedError:
-            continue
-        except (ChildProcessError, OSError):
-            break
-    process_group = waited.si_pid if waited is not None else None
-    if type(process_group) is int and process_group > 0:
-        _signal_bound_group(process_group, pidfd, signal.SIGKILL)
     with contextlib.suppress(ChildProcessError, OSError):
         os.waitid(os.P_PIDFD, pidfd, os.WEXITED)
-    if type(process_group) is int and process_group > 0:
-        _reap_process_group(process_group)
 
 
 def _spawn_with_pidfd(
@@ -242,10 +261,10 @@ def _spawn_with_pidfd(
     cwd: Path,
     environment: dict[str, str],
     helper: _NativeSpawnHelper,
+    unit: str,
 ) -> _SpawnedProcess:
-    """Spawn with typed native glibc state and only raw parent pipe FDs."""
+    """Spawn one systemd-run client with typed glibc state and raw pipe FDs."""
 
-    _verify_pidfd_capability(helper)
     try:
         encoded_cwd = os.fsencode(cwd)
         encoded_arguments = [os.fsencode(argument) for argument in arguments]
@@ -284,22 +303,11 @@ def _spawn_with_pidfd(
             argv,
             envp,
         )
-        if result != 0:
-            code = (
-                "command_group_unavailable"
-                if result in _GROUP_BINDING_ERRORS
-                else "command_unavailable"
-            )
-            raise BoundedProcessError(code)
-        pidfd = spawned_pidfd.value
-        if pidfd < 0:
+        if result != 0 or spawned_pidfd.value < 0:
             raise BoundedProcessError("command_group_unavailable")
+        pidfd = spawned_pidfd.value
         process = _SpawnedProcess(
-            _pid_from_fdinfo(pidfd),
-            pidfd,
-            stdin_parent,
-            stdout_parent,
-            stderr_parent,
+            unit, pidfd, stdin_parent, stdout_parent, stderr_parent
         )
         stdin_parent = stdout_parent = stderr_parent = -1
         transferred = True
@@ -319,27 +327,72 @@ def _spawn_with_pidfd(
                 _close_descriptor(pidfd)
 
 
-def _process_group_exists(process_group: int) -> bool:
+def _cgroup_path(value: bytes) -> Path:
     try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+        relative = value.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    path = Path(relative)
+    if (
+        not path.is_absolute()
+        or "\x00" in relative
+        or any(part in {".", ".."} for part in path.parts)
+    ):
+        raise BoundedProcessError("command_group_unavailable")
+    return _CGROUP_ROOT / path.relative_to(path.anchor)
+
+
+def _bind_cgroup(
+    process: _SpawnedProcess, *, environment: dict[str, str], deadline: float
+) -> None:
+    while True:
+        output = _systemctl(
+            ("show", "--value", "--property=ControlGroup", process.unit),
+            environment=environment,
+            deadline=deadline,
+        )
+        if output.strip():
+            cgroup = _cgroup_path(output)
+            if (cgroup / "cgroup.events").is_file():
+                process.cgroup = cgroup
+                return
+        time.sleep(min(0.005, _remaining(deadline)))
+
+
+def _cgroup_is_empty(cgroup: Path) -> bool:
+    try:
+        events = (cgroup / "cgroup.events").read_text(encoding="ascii")
+    except FileNotFoundError:
         return True
-    return True
+    except (OSError, UnicodeError) as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    populated = [line for line in events.splitlines() if line.startswith("populated ")]
+    if populated != ["populated 0"]:
+        return False
+    try:
+        return not (cgroup / "cgroup.procs").read_text(encoding="ascii").split()
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeError) as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
 
 
-def _terminate_process_group(process: _SpawnedProcess) -> None:
-    """Terminate only the session whose group number is held by its pidfd."""
-
-    if not _signal_bound_group(process.process_group, process.pidfd, signal.SIGTERM):
-        return
-    deadline = time.monotonic() + 0.05
+def _wait_for_cgroup_empty(cgroup: Path, deadline: float) -> bool:
     while time.monotonic() < deadline:
-        if not _process_group_exists(process.process_group):
-            return
+        if _cgroup_is_empty(cgroup):
+            return True
         time.sleep(0.005)
-    _signal_bound_group(process.process_group, process.pidfd, signal.SIGKILL)
+    return _cgroup_is_empty(cgroup)
+
+
+def _stop_cgroup(
+    process: _SpawnedProcess, *, environment: dict[str, str], deadline: float
+) -> None:
+    with contextlib.suppress(BoundedProcessError):
+        _systemctl(("stop", process.unit), environment=environment, deadline=deadline)
+    if process.cgroup is not None:
+        with contextlib.suppress(BoundedProcessError):
+            _wait_for_cgroup_empty(process.cgroup, deadline)
 
 
 def _returncode(waited: object) -> int:
@@ -367,16 +420,16 @@ def _wait_for_process(process: _SpawnedProcess, timeout: float) -> int:
         time.sleep(0.005)
 
 
-def _reap_process(process: _SpawnedProcess) -> None:
+def _reap_process(process: _SpawnedProcess, deadline: float) -> None:
     try:
-        _wait_for_process(process, 1)
+        _wait_for_process(process, max(0.0, deadline - time.monotonic()))
     except (BoundedProcessError, TimeoutError):
         with contextlib.suppress(OSError):
             signal.pidfd_send_signal(process.pidfd, signal.SIGKILL)
         with contextlib.suppress(
             BoundedProcessError, ChildProcessError, OSError, TimeoutError
         ):
-            _wait_for_process(process, 1)
+            _wait_for_process(process, max(0.0, deadline - time.monotonic()))
 
 
 def _close_process_descriptors(process: _SpawnedProcess) -> None:
@@ -402,9 +455,9 @@ def run_bounded(
     stdout_limit: int = DEFAULT_STDOUT_LIMIT,
     stderr_limit: int = DEFAULT_STDERR_LIMIT,
     input_data: bytes = b"",
-    _runtime_spawn_helper_path: Path | None = None,
+    runtime_layout: RuntimeLayout | None = None,
 ) -> BoundedProcessResult:
-    """Run one command with bounded nonblocking I/O and pidfd-bound cleanup."""
+    """Run one command inside a bounded non-delegated cgroup-v2 service."""
 
     if (
         not isinstance(cwd, Path)
@@ -427,19 +480,29 @@ def run_bounded(
     ):
         raise BoundedProcessError("command_arguments_invalid")
     deadline = time.monotonic() + float(timeout_seconds)
+    try:
+        layout = (
+            RuntimeLayout.from_module_path(Path(__file__))
+            if runtime_layout is None
+            else runtime_layout
+        )
+    except LayoutError as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
     environment = minimal_environment(home=home)
-    helper = _load_runtime_spawn_helper(_runtime_spawn_helper_path)
-    if time.monotonic() >= deadline:
-        raise BoundedProcessError("command_timeout")
+    helper = _load_runtime_spawn_helper(layout)
+    _verify_runner_capability(environment=environment, deadline=deadline)
+    unit = _unit_name()
+    command = _systemd_run_arguments(
+        arguments, cwd=cwd, environment=environment, unit=unit
+    )
     process: _SpawnedProcess | None = None
     selector: selectors.BaseSelector | None = None
     outputs = {"stdout": bytearray(), "stderr": bytearray()}
     try:
         process = _spawn_with_pidfd(
-            arguments, cwd=cwd, environment=environment, helper=helper
+            command, cwd=cwd, environment=environment, helper=helper, unit=unit
         )
-        if time.monotonic() >= deadline:
-            raise BoundedProcessError("command_timeout")
+        _bind_cgroup(process, environment=environment, deadline=deadline)
         selector = selectors.DefaultSelector()
         streams = {
             process.stdout_fd: ("stdout", stdout_limit),
@@ -454,10 +517,7 @@ def run_bounded(
         else:
             process.stdin_fd = _close_descriptor(process.stdin_fd)
         while streams or process.stdin_fd >= 0:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise BoundedProcessError("command_timeout")
-            ready = selector.select(remaining)
+            ready = selector.select(_remaining(deadline))
             if not ready:
                 raise BoundedProcessError("command_timeout")
             for key, _events in ready:
@@ -499,11 +559,13 @@ def run_bounded(
                 if len(outputs[name]) > limit:
                     raise BoundedProcessError(f"command_{name}_limit")
         try:
-            returncode = _wait_for_process(
-                process, max(0.0, deadline - time.monotonic())
-            )
+            returncode = _wait_for_process(process, _remaining(deadline))
         except TimeoutError as exc:
             raise BoundedProcessError("command_timeout") from exc
+        if process.cgroup is None or not _wait_for_cgroup_empty(
+            process.cgroup, deadline
+        ):
+            raise BoundedProcessError("command_timeout")
         try:
             stdout = outputs["stdout"].decode("utf-8")
             stderr = outputs["stderr"].decode("utf-8")
@@ -518,10 +580,10 @@ def run_bounded(
         if selector is not None:
             selector.close()
         if process is not None:
-            _terminate_process_group(process)
-            _reap_process(process)
-            _reap_process_group(process.process_group)
+            cleanup_deadline = time.monotonic() + _CLEANUP_SECONDS
             _close_process_descriptors(process)
+            _stop_cgroup(process, environment=environment, deadline=cleanup_deadline)
+            _reap_process(process, cleanup_deadline)
             process.pidfd = _close_descriptor(process.pidfd)
 
 

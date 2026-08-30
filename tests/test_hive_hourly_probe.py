@@ -13,6 +13,7 @@ import threading
 
 import pytest
 
+from conftest import seal_runtime_image
 from codex_master.hive import hourly_probe as hourly_probe_module
 from codex_master.hive.hourly_probe import (
     DETERMINISTIC_PROBE_HOURS_UTC,
@@ -118,6 +119,7 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     for path in root.rglob("*"):
         if path.is_dir():
             path.chmod(0o700)
+    seal_runtime_image(root)
     return RuntimeLayout.from_runtime_root(root)
 
 
@@ -749,7 +751,8 @@ def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
         str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
     )
     stage = tmp_path / "stage"
-    stage.mkdir()
+    stage.mkdir(mode=0o700)
+    installer["_build_runtime_image"](repository=ROOT, stage=stage)
     observed: list[tuple[str, ...]] = []
 
     class Completed:

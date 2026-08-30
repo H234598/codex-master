@@ -55,6 +55,7 @@ def _run_direct_mcp(layout: RuntimeLayout) -> tuple[int, str]:
             stdout_limit=_MAX_MCP_OUTPUT_BYTES,
             stderr_limit=DEFAULT_STDERR_LIMIT,
             input_data=_probe_payload(),
+            runtime_layout=layout,
         )
     except BoundedProcessError as exc:
         if exc.code == "command_timeout":

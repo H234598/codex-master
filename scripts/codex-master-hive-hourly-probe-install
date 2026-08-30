@@ -26,6 +26,7 @@ from codex_master.runtime_process import (  # noqa: E402
     BoundedProcessError,
     run_bounded,
 )
+from codex_master.runtime_layout import RuntimeLayout  # noqa: E402
 
 
 _RUNTIME_ROOT_NAME = "codex-master-runtime"
@@ -322,6 +323,10 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
     """Exercise the three v2 diagnostics from the isolated, complete stage."""
 
     command = stage / "bin" / "codex-master-mcp"
+    try:
+        layout = RuntimeLayout.from_runtime_root(stage)
+    except ValueError as exc:
+        raise InstallError("install_stage_validation_failed") from exc
     for hive_command in ("runtime-status", "status", "doctor"):
         try:
             completed = run_bounded(
@@ -331,7 +336,7 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
                 timeout_seconds=45,
                 stdout_limit=_MAX_STAGE_DIAGNOSTIC_BYTES,
                 stderr_limit=DEFAULT_STDERR_LIMIT,
-                _runtime_spawn_helper_path=(stage / _RUNTIME_SPAWN_HELPER_LIBRARY),
+                runtime_layout=layout,
             )
         except BoundedProcessError as exc:
             raise InstallError("install_stage_validation_failed") from exc

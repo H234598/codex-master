@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
+import stat
 
 import pytest
 
@@ -62,10 +65,32 @@ def materialize_runtime_image(tmp_path: Path) -> Path:
     _write_file(root / "skills" / "codex-master-fleet" / "SKILL.md", "---\nname: codex-master-fleet\n---\n")
     _write_file(root / "codex-hive.json", json.dumps({"schema_version": 1, "mode": "shadow"}))
     _write_file(root / "codex-agent-classes.json", json.dumps({"schema_version": 1, "classes": []}))
+    _write_file(root / "src" / "codex_master" / "_runtime_spawn_helper.so", "test helper", 0o755)
     _write_file(root / "src" / "codex_master" / "hive" / "cli.py", "# image module\n")
     for path in root.rglob("*"):
         if path.is_dir():
             path.chmod(0o700)
+    directories: dict[str, dict[str, int]] = {}
+    files: dict[str, dict[str, object]] = {}
+    for directory, _child_directories, file_names in os.walk(root):
+        current = Path(directory)
+        relative = current.relative_to(root).as_posix() if current != root else "."
+        info = current.lstat()
+        directories[relative] = {"mode": stat.S_IMODE(info.st_mode), "nlink": info.st_nlink}
+        for name in file_names:
+            path = current / name
+            raw = path.read_bytes()
+            item = path.lstat()
+            files[path.relative_to(root).as_posix()] = {
+                "mode": stat.S_IMODE(item.st_mode),
+                "nlink": item.st_nlink,
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+    _write_file(
+        root / ".codex-master-runtime-manifest.json",
+        json.dumps({"schema_version": 1, "directories": directories, "files": files}),
+    )
     return root
 
 
@@ -80,6 +105,8 @@ def test_runtime_layout_is_immutable_and_derived_only_from_a_valid_image(tmp_pat
     assert layout.mcp_entrypoint == root / "bin" / "codex-master-mcp"
     assert layout.probe_entrypoint == root / "bin" / "codex-master-hive-hourly-probe"
     assert layout.metadata_root == root
+    assert layout.spawn_helper == root / "src" / "codex_master" / "_runtime_spawn_helper.so"
+    assert len(layout.spawn_helper_digest) == 64
     with pytest.raises(FrozenInstanceError):
         layout.root = root.parent  # type: ignore[misc]
 
@@ -120,6 +147,8 @@ def test_runtime_layout_rejects_an_image_reached_through_a_linked_parent(tmp_pat
         "skills/codex-master-fleet/SKILL.md",
         "codex-hive.json",
         "codex-agent-classes.json",
+        "src/codex_master/_runtime_spawn_helper.so",
+        ".codex-master-runtime-manifest.json",
     ),
 )
 def test_runtime_layout_rejects_missing_required_image_members(tmp_path: Path, relative_path: str) -> None:
@@ -153,7 +182,27 @@ def test_runtime_layout_rejects_linked_and_outside_entrypoints(tmp_path: Path) -
             mcp_entrypoint=target,
             probe_entrypoint=restored / "bin" / "codex-master-hive-hourly-probe",
             metadata_root=restored,
+            spawn_helper=restored / "src" / "codex_master" / "_runtime_spawn_helper.so",
+            spawn_helper_digest="0" * 64,
         )
+
+
+def test_runtime_layout_rejects_a_helper_or_manifest_digest_deviation(tmp_path: Path) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    helper = root / "src" / "codex_master" / "_runtime_spawn_helper.so"
+    helper.write_bytes(b"swapped helper")
+
+    with pytest.raises(module.LayoutError):
+        module.RuntimeLayout.from_runtime_root(root)
+
+    root = materialize_runtime_image(tmp_path / "manifest")
+    manifest = root / ".codex-master-runtime-manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(module.LayoutError):
+        module.RuntimeLayout.from_runtime_root(root)
 
 
 def test_runtime_layout_rejects_a_nonprivate_image_subdirectory(tmp_path: Path) -> None:

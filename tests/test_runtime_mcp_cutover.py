@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+from conftest import seal_runtime_image
 import codex_master.server as server
 from codex_master.runtime_layout import RuntimeLayout
 
@@ -59,6 +60,7 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     for path in root.rglob("*"):
         if path.is_dir():
             path.chmod(0o700)
+    seal_runtime_image(root)
     return RuntimeLayout.from_runtime_root(root)
 
 

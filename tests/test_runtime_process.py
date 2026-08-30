@@ -36,6 +36,18 @@ def test_runtime_spawn_helper_has_a_compiled_glibc_header_contract() -> None:
     assert "_SPAWN_BUFFER_BYTES" not in runner_source
 
 
+def test_default_runtime_image_loads_its_manifest_bound_native_helper(
+    runtime_image,
+) -> None:
+    import codex_master.runtime_process as runtime_process
+
+    helper = runtime_process._load_runtime_spawn_helper(runtime_image)
+
+    assert callable(helper.spawn)
+    assert runtime_image.spawn_helper.name == "_runtime_spawn_helper.so"
+    assert len(runtime_image.spawn_helper_digest) == 64
+
+
 def test_bounded_runner_uses_an_explicit_minimal_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -87,7 +99,7 @@ def test_bounded_runner_rejects_each_output_overflow(
         )
 
 
-def test_bounded_runner_times_out_and_terminates_the_whole_process_group(
+def test_bounded_runner_times_out_and_terminates_the_whole_cgroup(
     tmp_path: Path,
 ) -> None:
     from codex_master.runtime_process import BoundedProcessError, run_bounded
@@ -119,6 +131,108 @@ def test_bounded_runner_times_out_and_terminates_the_whole_process_group(
         time.sleep(0.02)
     else:
         pytest.fail("descendant process survived bounded-runner termination")
+
+
+def test_bounded_runner_terminates_a_setsid_descendant_after_leader_exit(
+    tmp_path: Path,
+) -> None:
+    from codex_master.runtime_process import run_bounded
+
+    descendant_pid = tmp_path / "setsid-descendant.pid"
+    ready = tmp_path / "setsid-descendant.ready"
+    cgroup_marker = tmp_path / "setsid-descendant.cgroup"
+    descendant = (
+        "import os, time\n"
+        "os.setsid()\n"
+        f"open({str(descendant_pid)!r}, 'w', encoding='utf-8').write(str(os.getpid()))\n"
+        "cgroup = next(line.split('::', 1)[1].strip() for line in open('/proc/self/cgroup', encoding='utf-8') if line.startswith('0::'))\n"
+        f"open({str(cgroup_marker)!r}, 'w', encoding='utf-8').write(cgroup)\n"
+        f"open({str(ready)!r}, 'wb').write(b'ready')\n"
+        "os.write(int(os.environ['READY_FD']), b'ready')\n"
+        "time.sleep(60)\n"
+    )
+    parent = _script(
+        tmp_path / "setsid-leader-exit.py",
+        "import os, subprocess, sys\n"
+        + "reader, writer = os.pipe()\n"
+        + f"subprocess.Popen(['/usr/bin/python3', '-c', {descendant!r}], pass_fds=(writer,), env={{**os.environ, 'READY_FD': str(writer)}})\n"
+        + "os.close(writer)\n"
+        + "assert os.read(reader, 5) == b'ready'\n"
+        + "sys.exit(0)\n",
+    )
+
+    try:
+        result = run_bounded(
+            [str(parent)], cwd=tmp_path, home=tmp_path, timeout_seconds=0.5
+        )
+        assert result.returncode == 0
+        assert ready.read_bytes() == b"ready"
+        _wait_until_process_is_not_live(int(descendant_pid.read_text(encoding="utf-8")))
+        relative = cgroup_marker.read_text(encoding="utf-8").strip().lstrip("/")
+        assert not (Path("/sys/fs/cgroup") / relative).exists()
+    finally:
+        if descendant_pid.exists():
+            with contextlib.suppress(OSError):
+                os.kill(int(descendant_pid.read_text(encoding="utf-8")), signal.SIGKILL)
+
+
+@pytest.mark.parametrize(
+    ("mode", "failure_code"),
+    (
+        ("success", None),
+        ("timeout", "command_timeout"),
+        ("stdout", "command_stdout_limit"),
+        ("stderr", "command_stderr_limit"),
+    ),
+)
+def test_bounded_runner_removes_the_actual_cgroup_after_every_outcome(
+    tmp_path: Path, mode: str, failure_code: str | None
+) -> None:
+    import codex_master.runtime_process as runtime_process
+    from codex_master.runtime_process import BoundedProcessError, run_bounded
+
+    cgroup_marker = tmp_path / f"{mode}.cgroup"
+    body = (
+        "from pathlib import Path\n"
+        "import sys, time\n"
+        "cgroup = next(line.split('::', 1)[1].strip() for line in open('/proc/self/cgroup', encoding='utf-8') if line.startswith('0::'))\n"
+        f"Path({str(cgroup_marker)!r}).write_text(cgroup, encoding='utf-8')\n"
+    )
+    if mode == "success":
+        body += "print('ok')\n"
+    elif mode == "timeout":
+        body += "time.sleep(60)\n"
+    else:
+        body += f"sys.{mode}.write('x' * 4096)\nsys.{mode}.flush()\ntime.sleep(60)\n"
+    child = _script(tmp_path / f"cgroup-{mode}.py", body)
+
+    if failure_code is None:
+        result = run_bounded(
+            [str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=1
+        )
+        assert result.returncode == 0
+    else:
+        with pytest.raises(BoundedProcessError, match=failure_code):
+            run_bounded(
+                [str(child)],
+                cwd=tmp_path,
+                home=tmp_path,
+                timeout_seconds=0.5,
+                stdout_limit=128,
+                stderr_limit=128,
+            )
+
+    relative = cgroup_marker.read_text(encoding="utf-8").strip().lstrip("/")
+    assert not (Path("/sys/fs/cgroup") / relative).exists()
+    unit = Path(relative).name
+    assert (
+        runtime_process._systemctl(
+            ("show", "--value", "--property=LoadState", unit),
+            environment=runtime_process.minimal_environment(home=tmp_path),
+            deadline=time.monotonic() + 1,
+        ).strip()
+        == b"not-found"
+    )
 
 
 def test_bounded_runner_times_out_while_a_child_does_not_read_64k_stdin(
@@ -264,24 +378,30 @@ def _wait_until_process_is_not_live(process_id: int) -> None:
 def test_bounded_runner_repeatedly_reaps_descendants_after_leader_exit(
     tmp_path: Path, attempt: int
 ) -> None:
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
+    from codex_master.runtime_process import run_bounded
 
     descendant_pid = tmp_path / f"repeated-descendant-{attempt}.pid"
+    descendant = (
+        "import os, time\n"
+        f"open({str(descendant_pid)!r}, 'w', encoding='utf-8').write(str(os.getpid()))\n"
+        "os.write(int(os.environ['READY_FD']), b'ready')\n"
+        "time.sleep(60)\n"
+    )
     parent = _script(
         tmp_path / f"leader-exit-{attempt}.py",
-        "import subprocess, sys\n"
-        "child = subprocess.Popen(['/usr/bin/python3', '-c', 'import time; time.sleep(60)'])\n"
-        f"open({str(descendant_pid)!r}, 'w', encoding='utf-8').write(str(child.pid))\n"
+        "import os, subprocess, sys\n"
+        "reader, writer = os.pipe()\n"
+        + f"subprocess.Popen(['/usr/bin/python3', '-c', {descendant!r}], pass_fds=(writer,), env={{**os.environ, 'READY_FD': str(writer)}})\n"
+        + "os.close(writer)\n"
+        + "assert os.read(reader, 5) == b'ready'\n"
         "sys.exit(0)\n",
     )
 
     try:
-        with pytest.raises(BoundedProcessError, match="command_timeout"):
-            run_bounded([str(parent)], cwd=tmp_path, home=tmp_path, timeout_seconds=1)
-        deadline = time.monotonic() + 2
-        while not descendant_pid.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert descendant_pid.exists()
+        result = run_bounded(
+            [str(parent)], cwd=tmp_path, home=tmp_path, timeout_seconds=1
+        )
+        assert result.returncode == 0
         _wait_until_process_is_not_live(int(descendant_pid.read_text(encoding="utf-8")))
     finally:
         if descendant_pid.exists():
@@ -289,7 +409,7 @@ def test_bounded_runner_repeatedly_reaps_descendants_after_leader_exit(
                 os.kill(int(descendant_pid.read_text(encoding="utf-8")), signal.SIGKILL)
 
 
-def test_bounded_runner_fails_before_execution_when_atomic_pidfd_spawn_is_unavailable(
+def test_bounded_runner_fails_before_execution_when_cgroup_capability_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import codex_master.runtime_process as runtime_process
@@ -299,18 +419,14 @@ def test_bounded_runner_fails_before_execution_when_atomic_pidfd_spawn_is_unavai
         tmp_path / "must-not-run.py",
         f"open({str(marker)!r}, 'w', encoding='utf-8').write('started')\n",
     )
-    group_signals: list[tuple[int, signal.Signals]] = []
+    descriptors_before = len(list(Path("/proc/self/fd").iterdir()))
 
     def unavailable(*_args: object, **_kwargs: object) -> object:
         raise runtime_process.BoundedProcessError("command_group_unavailable")
 
-    def record_group_signal(process_group: int, sig: signal.Signals) -> None:
-        group_signals.append((process_group, sig))
-
     monkeypatch.setattr(
-        runtime_process, "_spawn_with_pidfd", unavailable, raising=False
+        runtime_process, "_verify_runner_capability", unavailable, raising=False
     )
-    monkeypatch.setattr(runtime_process.os, "killpg", record_group_signal)
 
     with pytest.raises(
         runtime_process.BoundedProcessError, match="command_group_unavailable"
@@ -320,10 +436,10 @@ def test_bounded_runner_fails_before_execution_when_atomic_pidfd_spawn_is_unavai
         )
 
     assert not marker.exists()
-    assert group_signals == []
+    assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
 
 
-def test_bounded_runner_fails_before_execution_when_pidfd_preflight_fails(
+def test_bounded_runner_fails_before_execution_when_pidfd_primitive_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import codex_master.runtime_process as runtime_process
@@ -334,10 +450,7 @@ def test_bounded_runner_fails_before_execution_when_pidfd_preflight_fails(
         f"open({str(marker)!r}, 'w', encoding='utf-8').write('started')\n",
     )
 
-    def unavailable(_process_id: int) -> int:
-        raise OSError(errno.EMFILE, "pidfd unavailable")
-
-    monkeypatch.setattr(runtime_process.os, "pidfd_open", unavailable)
+    monkeypatch.delattr(runtime_process.os, "P_PIDFD", raising=False)
 
     with pytest.raises(
         runtime_process.BoundedProcessError, match="command_group_unavailable"
@@ -349,50 +462,60 @@ def test_bounded_runner_fails_before_execution_when_pidfd_preflight_fails(
     assert not marker.exists()
 
 
-def test_bounded_runner_reaps_the_group_when_post_spawn_pidfd_identity_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_bound_helper_path_swap_never_loads_the_replacement_constructor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime_image
 ) -> None:
+    import shutil
+    import subprocess
+
     import codex_master.runtime_process as runtime_process
+    from codex_master.runtime_layout import RuntimeLayout
 
-    descendant_pid = tmp_path / "descendant.pid"
-    parent = _script(
-        tmp_path / "post-spawn-identity-failure.py",
-        "import subprocess, time\n"
-        "child = subprocess.Popen(['/usr/bin/python3', '-c', 'import time; time.sleep(60)'])\n"
-        f"open({str(descendant_pid)!r}, 'w', encoding='utf-8').write(str(child.pid))\n"
-        "time.sleep(60)\n",
+    image = tmp_path / "swappable-image"
+    shutil.copytree(runtime_image.root, image)
+    layout = RuntimeLayout.from_runtime_root(image)
+    sentinel = tmp_path / "helper-constructor-ran"
+    replacement_source = tmp_path / "replacement.c"
+    replacement = tmp_path / "replacement.so"
+    replacement_source.write_text(
+        "#include <fcntl.h>\n"
+        "#include <unistd.h>\n"
+        "__attribute__((constructor)) static void mark(void) {\n"
+        f"  int fd = open({json.dumps(str(sentinel))}, O_WRONLY | O_CREAT, 0600);\n"
+        "  if (fd >= 0) close(fd);\n"
+        "}\n",
+        encoding="utf-8",
     )
-    read_identity = runtime_process._pid_from_fdinfo
-    reads = 0
+    completed = subprocess.run(
+        [
+            "/usr/bin/cc",
+            "-shared",
+            "-fPIC",
+            "-o",
+            str(replacement),
+            str(replacement_source),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    validate = runtime_process.validate_runtime_metadata
 
-    def fail_after_preflight(pidfd: int) -> int:
-        nonlocal reads
-        reads += 1
-        if reads == 1:
-            return read_identity(pidfd)
-        time.sleep(1)
-        raise runtime_process.BoundedProcessError("command_group_unavailable")
+    def validate_then_swap(value: RuntimeLayout) -> None:
+        validate(value)
+        os.replace(replacement, value.spawn_helper)
 
-    monkeypatch.setattr(runtime_process, "_pid_from_fdinfo", fail_after_preflight)
+    monkeypatch.setattr(
+        runtime_process, "validate_runtime_metadata", validate_then_swap
+    )
 
-    try:
-        with pytest.raises(
-            runtime_process.BoundedProcessError, match="command_group_unavailable"
-        ):
-            runtime_process.run_bounded(
-                [str(parent)], cwd=tmp_path, home=tmp_path, timeout_seconds=1
-            )
+    with pytest.raises(
+        runtime_process.BoundedProcessError, match="command_group_unavailable"
+    ):
+        runtime_process._load_runtime_spawn_helper(layout)
 
-        assert reads == 2
-        deadline = time.monotonic() + 2
-        while not descendant_pid.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert descendant_pid.exists()
-        _wait_until_process_is_not_live(int(descendant_pid.read_text(encoding="utf-8")))
-    finally:
-        if descendant_pid.exists():
-            with contextlib.suppress(OSError):
-                os.kill(int(descendant_pid.read_text(encoding="utf-8")), signal.SIGKILL)
+    assert not sentinel.exists()
 
 
 def test_bounded_runner_never_treats_a_lost_child_status_as_success(
@@ -433,61 +556,7 @@ def test_reap_process_suppresses_a_lost_child_status(
     monkeypatch.setattr(runtime_process, "_wait_for_process", child_already_reaped)
     monkeypatch.setattr(runtime_process.signal, "pidfd_send_signal", record_signal)
 
-    runtime_process._reap_process(process)
+    runtime_process._reap_process(process, time.monotonic() + 0.1)
 
     assert waits == 2
     assert signals == [(17, signal.SIGKILL)]
-
-
-@pytest.mark.parametrize(
-    ("stream", "failure_code"),
-    (
-        ("stdout", "command_stdout_limit"),
-        ("stderr", "command_stderr_limit"),
-        ("stdout", "command_timeout"),
-        ("stderr", "command_timeout"),
-    ),
-)
-def test_bounded_runner_terminates_descendants_after_early_parent_exit(
-    tmp_path: Path, stream: str, failure_code: str
-) -> None:
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
-
-    descendant_pid = tmp_path / f"{stream}-{failure_code}.pid"
-    descendant_body = (
-        "import sys, time\n"
-        + (
-            f"sys.{stream}.write('x' * 4096)\nsys.{stream}.flush()\n"
-            if "limit" in failure_code
-            else ""
-        )
-        + "time.sleep(60)\n"
-    )
-    parent = _script(
-        tmp_path / f"early-exit-{stream}-{failure_code}.py",
-        "import subprocess, sys\n"
-        + f"child = subprocess.Popen(['/usr/bin/python3', '-c', {descendant_body!r}])\n"
-        + f"open({str(descendant_pid)!r}, 'w', encoding='utf-8').write(str(child.pid))\n"
-        + "sys.exit(0)\n",
-    )
-
-    try:
-        with pytest.raises(BoundedProcessError, match=failure_code):
-            run_bounded(
-                [str(parent)],
-                cwd=tmp_path,
-                home=tmp_path,
-                timeout_seconds=1,
-                stdout_limit=128,
-                stderr_limit=128,
-            )
-
-        deadline = time.monotonic() + 2
-        while not descendant_pid.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert descendant_pid.exists()
-        _wait_until_process_is_not_live(int(descendant_pid.read_text(encoding="utf-8")))
-    finally:
-        if descendant_pid.exists():
-            with contextlib.suppress(OSError):
-                os.kill(int(descendant_pid.read_text(encoding="utf-8")), signal.SIGKILL)

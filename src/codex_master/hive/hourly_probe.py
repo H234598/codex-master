@@ -402,7 +402,9 @@ def _atomic_write(path: Path, payload: Mapping[str, object]) -> None:
             os.close(descriptor)
 
 
-def _run_json(command: Path, *arguments: str) -> tuple[dict[str, Any], bool]:
+def _run_json(
+    layout: RuntimeLayout, command: Path, *arguments: str
+) -> tuple[dict[str, Any], bool]:
     try:
         completed = run_bounded(
             [os.fspath(command), *arguments],
@@ -411,6 +413,7 @@ def _run_json(command: Path, *arguments: str) -> tuple[dict[str, Any], bool]:
             timeout_seconds=45,
             stdout_limit=DEFAULT_STDOUT_LIMIT,
             stderr_limit=DEFAULT_STDERR_LIMIT,
+            runtime_layout=layout,
         )
         if completed.returncode != 0:
             return {}, False
@@ -436,10 +439,22 @@ def run_probe(
     if not isinstance(active_layout, RuntimeLayout):
         raise ValueError("probe_runtime_layout_unavailable")
     state_directory = _state_directory(state_directory or _probe_state_root())
-    execute = runner or _run_json
-    runtime, runtime_command = execute(active_layout.mcp_entrypoint, "hive", "runtime-status")
-    hive, hive_command = execute(active_layout.mcp_entrypoint, "hive", "status")
-    doctor, doctor_command = execute(active_layout.mcp_entrypoint, "hive", "doctor")
+    if runner is None:
+        runtime, runtime_command = _run_json(
+            active_layout, active_layout.mcp_entrypoint, "hive", "runtime-status"
+        )
+        hive, hive_command = _run_json(
+            active_layout, active_layout.mcp_entrypoint, "hive", "status"
+        )
+        doctor, doctor_command = _run_json(
+            active_layout, active_layout.mcp_entrypoint, "hive", "doctor"
+        )
+    else:
+        runtime, runtime_command = runner(
+            active_layout.mcp_entrypoint, "hive", "runtime-status"
+        )
+        hive, hive_command = runner(active_layout.mcp_entrypoint, "hive", "status")
+        doctor, doctor_command = runner(active_layout.mcp_entrypoint, "hive", "doctor")
     result = evaluate(runtime, hive, doctor)
     moment = (now or (lambda: datetime.now(UTC)))()
     if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:

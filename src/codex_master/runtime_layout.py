@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,9 +15,11 @@ class LayoutError(ValueError):
     """The runtime image is not a private, complete regular-file image."""
 
 
-_MAX_IMAGE_FILE_BYTES = 1024 * 1024
+_MAX_IMAGE_FILE_BYTES = 2 * 1024 * 1024
 _MAX_METADATA_BYTES = 256 * 1024
 _ROOT_MODE = 0o700
+_MANIFEST_NAME = ".codex-master-runtime-manifest.json"
+_RUNTIME_SPAWN_HELPER = "src/codex_master/_runtime_spawn_helper.so"
 _REQUIRED_FILES: tuple[tuple[str, int], ...] = (
     ("bin/codex-master-mcp", 0o755),
     ("bin/codex-master-hive-hourly-probe", 0o755),
@@ -27,6 +30,8 @@ _REQUIRED_FILES: tuple[tuple[str, int], ...] = (
     ("skills/codex-master-fleet/SKILL.md", 0o644),
     ("codex-hive.json", 0o644),
     ("codex-agent-classes.json", 0o644),
+    (_RUNTIME_SPAWN_HELPER, 0o755),
+    (_MANIFEST_NAME, 0o644),
 )
 
 
@@ -99,7 +104,7 @@ def _validate_regular(root: Path, relative_path: str, mode: int) -> Path:
     return path
 
 
-def _read_regular_text(root: Path, relative_path: str, *, max_bytes: int) -> str:
+def _read_regular_bytes(root: Path, relative_path: str, *, max_bytes: int) -> bytes:
     path = _image_path(root, relative_path)
     expected = _lstat(path)
     if (
@@ -135,17 +140,36 @@ def _read_regular_text(root: Path, relative_path: str, *, max_bytes: int) -> str
         raw = b"".join(chunks)
         if len(raw) != current.st_size or len(raw) > max_bytes:
             raise _invalid()
-        return raw.decode("utf-8")
-    except (OSError, UnicodeError) as exc:
+        return raw
+    except OSError as exc:
         raise _invalid() from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
 
 
+def _read_regular_text(root: Path, relative_path: str, *, max_bytes: int) -> str:
+    try:
+        return _read_regular_bytes(root, relative_path, max_bytes=max_bytes).decode("utf-8")
+    except UnicodeError as exc:
+        raise _invalid() from exc
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON member")
+        value[key] = item
+    return value
+
+
 def _read_json_object(root: Path, relative_path: str) -> dict[str, Any]:
     try:
-        value = json.loads(_read_regular_text(root, relative_path, max_bytes=_MAX_METADATA_BYTES))
+        value = json.loads(
+            _read_regular_text(root, relative_path, max_bytes=_MAX_METADATA_BYTES),
+            object_pairs_hook=_unique_json_object,
+        )
     except json.JSONDecodeError as exc:
         raise _invalid() from exc
     if not isinstance(value, dict):
@@ -194,11 +218,81 @@ def _validate_metadata(root: Path) -> None:
         raise _invalid()
 
 
+def _runtime_manifest_payload(root: Path) -> dict[str, object]:
+    directories: dict[str, dict[str, int]] = {}
+    files: dict[str, dict[str, object]] = {}
+    for directory, child_directories, file_names in os.walk(root):
+        current = Path(directory)
+        relative = current.relative_to(root).as_posix() if current != root else "."
+        current_info = _lstat(current)
+        if (
+            stat.S_ISLNK(current_info.st_mode)
+            or not stat.S_ISDIR(current_info.st_mode)
+            or current_info.st_uid != os.geteuid()
+            or stat.S_IMODE(current_info.st_mode) != _ROOT_MODE
+        ):
+            raise _invalid()
+        directories[relative] = {
+            "mode": stat.S_IMODE(current_info.st_mode),
+            "nlink": current_info.st_nlink,
+        }
+        child_directories[:] = sorted(child_directories)
+        for name in child_directories:
+            _image_path(root, (current / name).relative_to(root).as_posix())
+        for name in sorted(file_names):
+            path = current / name
+            relative_path = path.relative_to(root).as_posix()
+            if relative_path == _MANIFEST_NAME:
+                continue
+            info = _lstat(path)
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) & 0o022
+                or not 0 < info.st_size <= _MAX_IMAGE_FILE_BYTES
+            ):
+                raise _invalid()
+            raw = _read_regular_bytes(
+                root, relative_path, max_bytes=_MAX_IMAGE_FILE_BYTES
+            )
+            files[relative_path] = {
+                "mode": stat.S_IMODE(info.st_mode),
+                "nlink": info.st_nlink,
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+    return {"schema_version": 1, "directories": directories, "files": files}
+
+
+def _validated_spawn_helper_digest(root: Path) -> str:
+    manifest = _read_json_object(root, _MANIFEST_NAME)
+    if manifest != _runtime_manifest_payload(root):
+        raise _invalid()
+    files = manifest["files"]
+    if not isinstance(files, dict):
+        raise _invalid()
+    helper = files.get(_RUNTIME_SPAWN_HELPER)
+    if not isinstance(helper, dict):
+        raise _invalid()
+    digest = helper.get("sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise _invalid()
+    return digest
+
+
 def _validate_layout_values(
     root: Path,
     mcp_entrypoint: Path,
     probe_entrypoint: Path,
     metadata_root: Path,
+    spawn_helper: Path,
+    spawn_helper_digest: str,
 ) -> None:
     _validate_root(root)
     if (
@@ -208,11 +302,14 @@ def _validate_layout_values(
         or mcp_entrypoint != root / "bin" / "codex-master-mcp"
         or probe_entrypoint != root / "bin" / "codex-master-hive-hourly-probe"
         or metadata_root != root
+        or spawn_helper != root / _RUNTIME_SPAWN_HELPER
     ):
         raise _invalid()
     for relative_path, mode in _REQUIRED_FILES:
         _validate_regular(root, relative_path, mode)
     _validate_metadata(root)
+    if spawn_helper_digest != _validated_spawn_helper_digest(root):
+        raise _invalid()
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +320,8 @@ class RuntimeLayout:
     mcp_entrypoint: Path
     probe_entrypoint: Path
     metadata_root: Path
+    spawn_helper: Path
+    spawn_helper_digest: str
 
     def __post_init__(self) -> None:
         _validate_layout_values(
@@ -230,17 +329,22 @@ class RuntimeLayout:
             self.mcp_entrypoint,
             self.probe_entrypoint,
             self.metadata_root,
+            self.spawn_helper,
+            self.spawn_helper_digest,
         )
 
     @classmethod
     def from_runtime_root(cls, root: Path) -> RuntimeLayout:
         if not isinstance(root, Path) or not root.is_absolute():
             raise _invalid()
+        helper_digest = _validated_spawn_helper_digest(root)
         return cls(
             root=root,
             mcp_entrypoint=root / "bin" / "codex-master-mcp",
             probe_entrypoint=root / "bin" / "codex-master-hive-hourly-probe",
             metadata_root=root,
+            spawn_helper=root / _RUNTIME_SPAWN_HELPER,
+            spawn_helper_digest=helper_digest,
         )
 
     @classmethod
@@ -272,6 +376,8 @@ def validate_runtime_metadata(layout: RuntimeLayout) -> None:
         layout.mcp_entrypoint,
         layout.probe_entrypoint,
         layout.metadata_root,
+        layout.spawn_helper,
+        layout.spawn_helper_digest,
     )
 
 
