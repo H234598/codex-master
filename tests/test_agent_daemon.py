@@ -160,6 +160,9 @@ class _WireSocket:
     def do_handshake(self) -> None:
         pass
 
+    def recv(self, length: int) -> bytes:
+        return self.input.read(length)
+
     def sendall(self, value: bytes) -> None:
         self.output.write(value)
 
@@ -552,6 +555,52 @@ def test_live_handshake_header_and_body_deadlines_close_stalled_peer(
         assert client.recv(1) == b""
     finally:
         client.close()
+        _stop_live(server, thread)
+
+
+@pytest.mark.parametrize("phase", ["header", "body"])
+def test_live_trickle_progress_cannot_extend_absolute_request_phase_deadline(
+    live_pki, monkeypatch, phase
+) -> None:
+    monkeypatch.setattr(agent_daemon, "HTTP_HEADER_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(agent_daemon, "HTTP_BODY_TIMEOUT_SECONDS", 0.2)
+    server, thread = _live_server(live_pki)
+    progressed = threading.Event()
+    stopped = threading.Event()
+    send_count = 0
+    try:
+        with socket.create_connection(server.server_address, timeout=1) as plain:
+            with _client_context(live_pki).wrap_socket(plain, server_hostname="localhost") as client:
+                if phase == "header":
+                    client.sendall(b"POST /agent/v1/polls HTTP/1.1\r\nX-Trickle: ")
+                else:
+                    client.sendall(
+                        b"POST /agent/v1/polls HTTP/1.1\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: 100\r\n\r\n"
+                    )
+
+                def trickle() -> None:
+                    nonlocal send_count
+                    while not stopped.wait(0.03):
+                        try:
+                            client.sendall(b"a")
+                        except (OSError, ssl.SSLError):
+                            return
+                        send_count += 1
+                        if send_count >= 3:
+                            progressed.set()
+
+                writer = threading.Thread(target=trickle)
+                writer.start()
+                try:
+                    assert progressed.wait(0.15)
+                    client.settimeout(0.5)
+                    assert client.recv(1) == b""
+                finally:
+                    stopped.set()
+                    writer.join(0.5)
+                    assert not writer.is_alive()
+    finally:
         _stop_live(server, thread)
 
 

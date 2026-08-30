@@ -108,8 +108,8 @@ class _AgentRequestHandler(socketserver.StreamRequestHandler):
         try:
             self.request.settimeout(TLS_HANDSHAKE_TIMEOUT_SECONDS)
             self.request.do_handshake()
-            self.request.settimeout(HTTP_HEADER_TIMEOUT_SECONDS)
-            header = self._read_headers()
+            header_deadline = time.monotonic() + HTTP_HEADER_TIMEOUT_SECONDS
+            header = self._read_headers(header_deadline)
             if header is None:
                 return
             method, target, headers = header
@@ -130,9 +130,9 @@ class _AgentRequestHandler(socketserver.StreamRequestHandler):
             if length_status != 200:
                 self._reply(length_status, {"error": "agent.request_too_large" if length_status == 413 else "agent.request_invalid"})
                 return
-            self.request.settimeout(HTTP_BODY_TIMEOUT_SECONDS)
-            body = self.rfile.read(length)
-            if len(body) != length:
+            body_deadline = time.monotonic() + HTTP_BODY_TIMEOUT_SECONDS
+            body = self._read_body(length, body_deadline)
+            if body is None:
                 self._reply(400, {"error": "agent.request_invalid"})
                 return
             self._send(self.server.application.handle(principal, method, target, body))
@@ -145,13 +145,14 @@ class _AgentRequestHandler(socketserver.StreamRequestHandler):
         finally:
             self.server.release_request_socket(self.request)
 
-    def _read_headers(self) -> tuple[str, str, dict[str, str]] | None:
+    def _read_headers(self, deadline: float) -> tuple[str, str, dict[str, str]] | None:
         data = bytearray()
         while not data.endswith(b"\r\n\r\n"):
             if len(data) >= MAX_AGENT_HEADER_BYTES:
                 self._reply(431, {"error": "agent.headers_too_large"})
                 return None
-            chunk = self.rfile.read(1)
+            self.request.settimeout(_remaining_timeout(deadline))
+            chunk = self.request.recv(1)
             if not chunk:
                 return None
             data.extend(chunk)
@@ -172,6 +173,16 @@ class _AgentRequestHandler(socketserver.StreamRequestHandler):
         except (UnicodeError, ValueError):
             self._reply(400, {"error": "agent.request_invalid"})
             return None
+
+    def _read_body(self, length: int, deadline: float) -> bytes | None:
+        body = bytearray()
+        while len(body) < length:
+            self.request.settimeout(_remaining_timeout(deadline))
+            chunk = self.request.recv(min(8192, length - len(body)))
+            if not chunk:
+                return None
+            body.extend(chunk)
+        return bytes(body)
 
     def _reply(self, status: int, value: object) -> None:
         self._send(
@@ -280,6 +291,13 @@ def _parse_content_length(value: str | None) -> tuple[int, int]:
     if len(value) > len(limit) or (len(value) == len(limit) and value > limit):
         return 413, 0
     return 200, int(value)
+
+
+def _remaining_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
 
 
 def assemble_server(address: str, port: int, credentials: AgentCredentialFds) -> AgentApiServer:
