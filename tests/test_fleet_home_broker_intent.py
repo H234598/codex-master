@@ -163,7 +163,10 @@ def test_public_error_surface_has_only_declared_names() -> None:
         "EXPIRED",
         "INVERTED_TIMESTAMPS",
         "FORBIDDEN_VALUE",
+        "QUEUE_FULL",
     )
+    assert BrokerIntentCode.QUEUE_FULL.value == "queue_full"
+    assert str(BrokerIntentError(BrokerIntentCode.QUEUE_FULL)) == "queue_full"
     assert not hasattr(intent_codec, "BrokerIntentValidationError")
     assert "BrokerIntentValidationError" not in intent_codec.__all__
 

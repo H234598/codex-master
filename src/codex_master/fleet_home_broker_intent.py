@@ -37,6 +37,7 @@ class BrokerIntentCode(str, Enum):
     EXPIRED = "expired"
     INVERTED_TIMESTAMPS = "inverted_timestamps"
     FORBIDDEN_VALUE = "forbidden_value"
+    QUEUE_FULL = "queue_full"
 
 
 class BrokerIntentError(ValueError):

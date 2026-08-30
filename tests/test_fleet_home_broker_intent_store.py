@@ -85,6 +85,38 @@ PARENT_IDENTITY = BrokerIntentFileIdentity(
 )
 
 
+def _active_intent_name(kind: str, index: int) -> str:
+    suffix = f"intent-{index:020d}-{index:032x}.json"
+    if kind == "pending":
+        return suffix
+    if kind == "claim":
+        return f".claim-{suffix}"
+    if kind == "recover":
+        return f".recover-{suffix}"
+    raise AssertionError("unknown active intent kind")
+
+
+def _add_active_intent(
+    operations: FakeLinuxOperations, name: str, payload: bytes | None = None
+) -> None:
+    operations.files[name] = (
+        encode_broker_intent(INTENT) if payload is None else payload
+    )
+    operations.identities[name] = ObjectIdentity(
+        8, 2000 + len(operations.files), 0o100600, 0, 0, 1
+    )
+    operations.labels[name] = PARENT_IDENTITY.selinux_label
+
+
+def _active_intent_count(operations: FakeLinuxOperations) -> int:
+    return sum(
+        name.startswith("intent-")
+        or name.startswith(".claim-intent-")
+        or name.startswith(".recover-intent-")
+        for name in operations.files
+    )
+
+
 def _terminal_evidence_records(
     claim_name: str, intent_payload: bytes
 ) -> tuple[str, bytes, str, bytes]:
@@ -287,16 +319,26 @@ class FakeLinuxOperations:
     def lock_exclusive_nonblocking(self, fd: int) -> None:
         self.calls.append(("lock_exclusive_nonblocking", fd))
         pinned = getattr(self, "_fd_identities", None)
-        identity = (
-            pinned[fd]
-            if type(pinned) is dict and fd in pinned
-            else self.identities[self.fd_names[fd]]
-        )
+        if fd == 7:
+            identity = self.parent_stat
+        else:
+            identity = (
+                pinned[fd]
+                if type(pinned) is dict and fd in pinned
+                else self.identities[self.fd_names[fd]]
+            )
         key = (identity.dev, identity.ino)
         if key in self._locked_identities:
             raise BlockingIOError(errno.EAGAIN, "leased")
         self._locked_identities.add(key)
         self.locked_fds[fd] = key
+
+    def unlock_exclusive(self, fd: int) -> None:
+        self.calls.append(("unlock_exclusive", fd))
+        key = self.locked_fds.pop(fd, None)
+        if key is None:
+            raise OSError(errno.EINVAL, "not locked")
+        self._locked_identities.remove(key)
 
     def close(self, fd: int) -> None:
         self.calls.append(("close", fd))
@@ -397,6 +439,22 @@ class AtomicRecoveryLinuxOperations(FakeLinuxOperations):
             self._fd_labels.pop(fd, None)
 
 
+class AtomicPublishLinuxOperations(FakeLinuxOperations):
+    """Shared fake directory that serializes the parent-descriptor lease."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._state_lock = threading.Lock()
+
+    def lock_exclusive_nonblocking(self, fd: int) -> None:
+        with self._state_lock:
+            super().lock_exclusive_nonblocking(fd)
+
+    def unlock_exclusive(self, fd: int) -> None:
+        with self._state_lock:
+            super().unlock_exclusive(fd)
+
+
 def test_public_store_types_are_frozen_slotted_and_protocol_is_narrow() -> None:
     for type_ in (
         BrokerIntentFileIdentity,
@@ -448,6 +506,19 @@ def test_publish_encodes_once_and_uses_safe_nonce_bound_final_name() -> None:
             "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json",
         )
     ]
+
+
+def test_public_publish_preserves_value_free_queue_full_without_details() -> None:
+    class FullStore(FakeStore):
+        def publish(self, payload: bytes, final_name: str) -> None:
+            raise BrokerIntentError(BrokerIntentCode.QUEUE_FULL)
+
+    with pytest.raises(BrokerIntentError) as raised:
+        publish_broker_intent(FullStore(), INTENT)
+
+    assert raised.value.code is BrokerIntentCode.QUEUE_FULL
+    assert str(raised.value) == "queue_full"
+    assert raised.value.__context__ is None
 
 
 def test_claim_decodes_one_claim_and_preserves_source_identity() -> None:
@@ -579,6 +650,237 @@ def test_public_claim_maps_unexpected_codec_category_to_stable_error(
         claim_broker_intent(FakeStore(claim), now_unix_ms=1_700_000_001_000)
 
     assert raised.value.code is BrokerIntentCode.INVALID_FIELD
+
+
+def test_linux_publish_admission_allows_128th_then_rejects_full_before_file_io() -> (
+    None
+):
+    operations = FakeLinuxOperations()
+    for index in range(127):
+        _add_active_intent(operations, _active_intent_name("pending", index))
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    payload = encode_broker_intent(INTENT)
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+
+    adapter.publish(payload, final_name)
+
+    assert _active_intent_count(operations) == 128
+    calls_before_rejection = len(operations.calls)
+    with pytest.raises(BrokerIntentError) as raised:
+        adapter.publish(
+            payload, "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json"
+        )
+
+    assert raised.value.code is BrokerIntentCode.QUEUE_FULL
+    assert str(raised.value) == "queue_full"
+    assert _active_intent_count(operations) == 128
+    rejected_calls = operations.calls[calls_before_rejection:]
+    assert not any(
+        call[0] in {"write_all", "renameat2_noreplace", "fsync"}
+        or (call[0] == "openat2" and str(call[2]).startswith(".tmp-intent-"))
+        for call in rejected_calls
+    )
+    assert not any(name.startswith(".tmp-intent-") for name in operations.files)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda operations, name: operations.identities.__setitem__(
+            name, ObjectIdentity(8, 2065, 0o100600, 0, 0, 2)
+        ),
+        lambda operations, name: operations.identities.__setitem__(
+            name, ObjectIdentity(8, 2065, 0o100666, 0, 0, 1)
+        ),
+        lambda operations, name: operations.labels.__setitem__(
+            name, "system_u:object_r:tmp_t:s0"
+        ),
+    ),
+    ids=("hardlink", "mode", "selinux_label"),
+)
+def test_linux_publish_admission_rejects_unsafe_active_entry_before_queue_full(
+    mutate,
+) -> None:
+    operations = FakeLinuxOperations()
+    for index in range(128):
+        _add_active_intent(operations, _active_intent_name("pending", index))
+    unsafe_name = _active_intent_name("pending", 64)
+    mutate(operations, unsafe_name)
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    calls_before_publish = len(operations.calls)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+
+    assert raised.value.code is LinuxBrokerCode.IDENTITY_MISMATCH
+    publication_calls = operations.calls[calls_before_publish:]
+    assert not any(
+        call[0] in {"write_all", "renameat2_noreplace", "fsync"}
+        or (call[0] == "openat2" and str(call[2]).startswith(".tmp-intent-"))
+        for call in publication_calls
+    )
+
+
+def test_linux_publish_admission_rejects_active_entry_missing_after_listing() -> None:
+    missing_name = _active_intent_name("pending", 128)
+
+    class MissingActiveEntryOperations(FakeLinuxOperations):
+        def list_names(self, parent_fd: int) -> tuple[str, ...]:
+            return (*super().list_names(parent_fd), missing_name)
+
+    operations = MissingActiveEntryOperations()
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    calls_before_publish = len(operations.calls)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    publication_calls = operations.calls[calls_before_publish:]
+    assert not any(
+        call[0] in {"write_all", "renameat2_noreplace", "fsync"}
+        or (call[0] == "openat2" and str(call[2]).startswith(".tmp-intent-"))
+        for call in publication_calls
+    )
+
+
+def test_linux_publish_admission_counts_pending_claim_and_recover_until_claim_removed() -> (
+    None
+):
+    operations = FakeLinuxOperations()
+    for index in range(42):
+        _add_active_intent(operations, _active_intent_name("pending", index))
+    terminal_claim = _active_intent_name("claim", 0)
+    intent_payload = encode_broker_intent(INTENT)
+    _add_active_intent(operations, terminal_claim, intent_payload)
+    for index in range(1, 43):
+        _add_active_intent(operations, _active_intent_name("claim", index))
+    for index in range(43):
+        _add_active_intent(operations, _active_intent_name("recover", index))
+    evidence_name, evidence, commit_name, commit = _terminal_evidence_records(
+        terminal_claim, intent_payload
+    )
+    _add_active_intent(operations, evidence_name, evidence)
+    _add_active_intent(operations, commit_name, commit)
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    payload = encode_broker_intent(INTENT)
+    final_name = "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json"
+
+    assert _active_intent_count(operations) == 128
+    with pytest.raises(BrokerIntentError) as raised:
+        adapter.publish(payload, final_name)
+    assert raised.value.code is BrokerIntentCode.QUEUE_FULL
+    assert terminal_claim in operations.files
+
+    assert adapter.recover_next() is not None
+    assert terminal_claim not in operations.files
+    assert _active_intent_count(operations) == 127
+
+    adapter.publish(payload, final_name)
+
+    assert _active_intent_count(operations) == 128
+    assert evidence_name in operations.files
+    assert commit_name in operations.files
+
+
+def test_two_linux_publishers_at_boundary_admit_at_most_one_then_report_full() -> None:
+    operations = AtomicPublishLinuxOperations()
+    for index in range(127):
+        _add_active_intent(operations, _active_intent_name("pending", index))
+    adapters = [
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY),
+        LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY),
+    ]
+    payloads = (
+        encode_broker_intent(_intent(intent_generation=128, nonce="e" * 32)),
+        encode_broker_intent(_intent(intent_generation=129, nonce="f" * 32)),
+    )
+    names = (
+        "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        "intent-00000000000000000129-ffffffffffffffffffffffffffffffff.json",
+    )
+    start = threading.Barrier(2)
+    successes: list[int] = []
+    failures: list[BaseException] = []
+
+    def publish(index: int) -> None:
+        try:
+            start.wait(timeout=5)
+            adapters[index].publish(payloads[index], names[index])
+            successes.append(index)
+        except BaseException as error:  # pragma: no cover - assertions report it
+            failures.append(error)
+
+    workers = [threading.Thread(target=publish, args=(index,)) for index in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert not any(worker.is_alive() for worker in workers)
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert _active_intent_count(operations) == 128
+    failure = failures[0]
+    if type(failure) is BrokerIntentError:
+        assert failure.code is BrokerIntentCode.QUEUE_FULL
+    else:
+        assert type(failure) is LinuxBrokerError
+        assert failure.code is LinuxBrokerCode.IO_FAILURE
+
+    with pytest.raises(BrokerIntentError) as raised:
+        adapters[0].publish(
+            encode_broker_intent(_intent(intent_generation=130, nonce="a" * 32)),
+            "intent-00000000000000000130-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+        )
+    assert raised.value.code is BrokerIntentCode.QUEUE_FULL
+    assert _active_intent_count(operations) == 128
+
+
+def test_linux_publish_admission_lock_failure_is_not_queue_full() -> None:
+    class LockFailureOperations(FakeLinuxOperations):
+        def lock_exclusive_nonblocking(self, fd: int) -> None:
+            raise OSError(errno.EIO, "lock-failure-secret")
+
+    operations = LockFailureOperations()
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json",
+        )
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    assert operations.files == {}
+
+
+def test_linux_publish_admission_unlock_failure_is_fail_closed_not_queue_full() -> None:
+    class UnlockFailureOperations(FakeLinuxOperations):
+        def unlock_exclusive(self, fd: int) -> None:
+            raise OSError(errno.EIO, "unlock-failure-secret")
+
+    operations = UnlockFailureOperations()
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    final_name = "intent-00000000000000000007-dddddddddddddddddddddddddddddddd.json"
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(encode_broker_intent(INTENT), final_name)
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    assert final_name in operations.files
+    with pytest.raises(LinuxBrokerError) as repeated:
+        adapter.publish(
+            encode_broker_intent(_intent(intent_generation=8, nonce="e" * 32)),
+            "intent-00000000000000000008-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+    assert repeated.value.code is LinuxBrokerCode.IO_FAILURE
 
 
 def test_two_linux_consumers_claim_shared_intent_once_atomically() -> None:
@@ -1287,6 +1589,14 @@ def test_linux_publish_uses_openat2_exclusive_write_fsync_and_noreplace_rename()
         "selinux_label",
         "stat_fd",
         "selinux_label",
+        "lock_exclusive_nonblocking",
+        "stat_fd",
+        "selinux_label",
+        "stat_fd",
+        "selinux_label",
+        "list_names",
+        "stat_fd",
+        "selinux_label",
         "openat2",
         "selinux_label",
         "stat_fd",
@@ -1301,6 +1611,7 @@ def test_linux_publish_uses_openat2_exclusive_write_fsync_and_noreplace_rename()
         "fsync",
         "stat_fd",
         "selinux_label",
+        "unlock_exclusive",
     ]
 
 

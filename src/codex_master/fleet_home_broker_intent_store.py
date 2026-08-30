@@ -14,6 +14,7 @@ import errno
 import hashlib
 import json
 import re
+import threading
 from typing import Protocol
 
 from codex_master.fleet_home_broker_intent import (
@@ -206,6 +207,8 @@ class _LinuxIntentStoreOperations(Protocol):
     ) -> None: ...
 
     def lock_exclusive_nonblocking(self, fd: int) -> None: ...
+
+    def unlock_exclusive(self, fd: int) -> None: ...
 
     def unlinkat(self, parent_fd: int, name: str) -> None: ...
 
@@ -408,6 +411,7 @@ class LinuxBrokerIntentStore:
         self._expected_parent_identity = expected_parent_identity
         self._selinux_label = selinux_label
         self._leases: dict[str, tuple[int, BrokerIntentFileIdentity]] = {}
+        self._admission_mutex = threading.Lock()
         self._verify_parent()
 
     def _verify_parent(self) -> BrokerIntentFileIdentity:
@@ -549,6 +553,62 @@ class LinuxBrokerIntentStore:
         except Exception:
             pass
 
+    def _active_intent_count(self) -> int:
+        """Safely count every visible pending or still-owned claimed intent."""
+
+        self._verify_parent()
+        names = _linux_call(self._operations.list_names, self._parent_fd)
+        if type(names) is not tuple:
+            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        candidates = tuple(
+            sorted(
+                name
+                for name in names
+                if type(name) is str
+                and (
+                    _INTENT_NAME.fullmatch(name) is not None
+                    or _CLAIM_NAME.fullmatch(name) is not None
+                    or _RECOVERED_CLAIM_NAME.fullmatch(name) is not None
+                )
+            )
+        )
+        if len(candidates) > MAX_PENDING_INTENT_RECORDS or len(set(candidates)) != len(
+            candidates
+        ):
+            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        for name in candidates:
+            fd = None
+            try:
+                fd, before = self._open_file(name, self._O_RDONLY)
+                self._after_file_identity(fd, before)
+            finally:
+                if fd is not None:
+                    self._close(fd)
+        self._verify_parent()
+        return len(candidates)
+
+    def _acquire_admission_lock(self) -> None:
+        """Take the existing root-parent lease for one admission/publish."""
+
+        if not self._admission_mutex.acquire(blocking=False):
+            _linux_fail(LinuxBrokerCode.IO_FAILURE)
+        try:
+            _linux_call(
+                self._operations.lock_exclusive_nonblocking,
+                self._parent_fd,
+            )
+        except BaseException:
+            self._admission_mutex.release()
+            raise
+
+    def _release_admission_lock(self) -> None:
+        """Release the parent lease and always unblock this store instance."""
+
+        try:
+            _linux_call(self._operations.unlock_exclusive, self._parent_fd)
+        finally:
+            self._admission_mutex.release()
+
     def publish(self, payload: bytes, final_name: str) -> None:
         """Durably publish one regular root-owned intent file."""
 
@@ -556,27 +616,48 @@ class LinuxBrokerIntentStore:
         if type(final_name) is not str or _INTENT_NAME.fullmatch(final_name) is None:
             _linux_fail(LinuxBrokerCode.UNSAFE_PATH)
         self._verify_parent()
-        staging_name = f".tmp-{final_name}"
-        fd = None
-        renamed = False
+        locked = False
+        primary_error: BaseException | None = None
         try:
-            fd, before = self._open_file(
-                staging_name,
-                self._O_WRONLY | self._O_CREAT | self._O_EXCL,
-            )
-            self._write_and_sync(fd, payload)
-            self._after_file_identity(fd, before)
-            self._close(fd)
+            self._acquire_admission_lock()
+            locked = True
+            self._verify_parent()
+            if self._active_intent_count() >= MAX_PENDING_INTENT_RECORDS:
+                raise BrokerIntentError(BrokerIntentCode.QUEUE_FULL)
+            staging_name = f".tmp-{final_name}"
             fd = None
-            self._verify_parent()
-            self._rename_and_sync(staging_name, final_name)
-            renamed = True
-            self._verify_parent()
-        finally:
-            if fd is not None:
+            renamed = False
+            try:
+                fd, before = self._open_file(
+                    staging_name,
+                    self._O_WRONLY | self._O_CREAT | self._O_EXCL,
+                )
+                self._write_and_sync(fd, payload)
+                self._after_file_identity(fd, before)
                 self._close(fd)
-            if not renamed:
-                self._cleanup_temp(staging_name)
+                fd = None
+                self._verify_parent()
+                self._rename_and_sync(staging_name, final_name)
+                renamed = True
+                self._verify_parent()
+            finally:
+                if fd is not None:
+                    self._close(fd)
+                if not renamed:
+                    self._cleanup_temp(staging_name)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            if locked:
+                try:
+                    self._release_admission_lock()
+                except BaseException:
+                    if primary_error is None or (
+                        type(primary_error) is BrokerIntentError
+                        and primary_error.code is BrokerIntentCode.QUEUE_FULL
+                    ):
+                        raise
 
     def _candidate_names(self, expression: re.Pattern[str]) -> tuple[str, ...]:
         names = _linux_call(self._operations.list_names, self._parent_fd)
