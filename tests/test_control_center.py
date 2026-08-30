@@ -170,6 +170,20 @@ class ControlCenterViewModelTest(unittest.TestCase):
         self.assertFalse(window.ollama_apply_sensitive())
         window.ollama_apply_button.set_sensitive.assert_called_with(False)
 
+    def test_show_selects_ollama_page_before_refresh(self) -> None:
+        window = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        window.window = Mock()
+        window.notebook = Mock()
+        window.refresh = Mock()
+
+        window.show("ollama")
+
+        window.notebook.set_current_page.assert_called_once_with(2)
+        window.window.show_all.assert_called_once_with()
+        window.refresh.assert_called_once_with()
+
     def test_ollama_refresh_loads_models_then_instances(self) -> None:
         window = control_center.ControlCenterWindow.__new__(
             control_center.ControlCenterWindow
@@ -687,6 +701,19 @@ class ControlCenterCliTest(unittest.TestCase):
         mock_context.assert_called_once_with()
         mock_access.assert_called_once_with()
         mock_launch.assert_called_once_with([])
+
+    @patch("codex_master.control_center.launch_gtk_application", return_value=0)
+    @patch("codex_master.control_center.require_teamleader_tool_access")
+    @patch("codex_master.control_center.assert_install_context_allows_master_registration")
+    def test_run_accepts_only_ollama_deep_link(
+        self, _mock_context, _mock_access, mock_launch
+    ) -> None:
+        self.assertEqual(
+            control_center.run_control_center(["--page", "ollama"]), 0
+        )
+        mock_launch.assert_called_once_with(["--page", "ollama"])
+        with self.assertRaisesRegex(AgentError, "page is invalid"):
+            control_center.run_control_center(["--page", "secrets"])
 
     @patch("codex_master.control_center.load_gtk", side_effect=RuntimeError("GTK unavailable"))
     def test_launch_fails_without_traceback_when_gtk_is_missing(self, _mock_load) -> None:

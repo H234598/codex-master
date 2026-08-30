@@ -33606,6 +33606,11 @@ class CliLifecycleTest(unittest.TestCase):
         mock_control_center.assert_called_once_with([])
         self.assertNotIn("control_center", {tool["name"] for tool in server_module.TOOLS})
 
+    @patch("codex_master.control_center.run_control_center", return_value=0)
+    def test_cli_control_center_forwards_ollama_page(self, mock_control_center) -> None:
+        self.assertEqual(main_cli(["control-center", "--page", "ollama"]), 0)
+        mock_control_center.assert_called_once_with(["--page", "ollama"])
+
     @patch("codex_master.server.require_teamleader_tool_access")
     @patch("codex_master.server.subprocess.Popen")
     @patch("codex_master.server.os.posix_spawn", return_value=12345)
@@ -33668,6 +33673,26 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["status"], "launched")
         self.assertEqual(result["raw_output"], "not_returned")
 
+    def test_detached_control_center_forwards_only_ollama_page(self) -> None:
+        command = Path("/home/tester/.local/bin/codex-master-mcp")
+        with (
+            patch.object(server_module.os, "POSIX_SPAWN_CLOSEFROM", 3, create=True),
+            patch.object(server_module.os, "posix_spawn", return_value=12345) as spawn,
+            patch.object(server_module, "require_teamleader_tool_access"),
+        ):
+            server_module.launch_control_center_detached(
+                command_path=command, environ={}, page="ollama"
+            )
+
+            self.assertEqual(
+                spawn.call_args.args[1],
+                [str(command), "control-center", "--page", "ollama"],
+            )
+            with self.assertRaisesRegex(AgentError, "page is invalid"):
+                server_module.launch_control_center_detached(
+                    command_path=command, environ={}, page="secrets"
+                )
+
     @patch("codex_master.server.print_json", return_value=0)
     @patch("codex_master.server.launch_control_center_detached")
     def test_cli_control_center_launch_routes_to_hidden_detach_helper(
@@ -33683,6 +33708,21 @@ class CliLifecycleTest(unittest.TestCase):
         mock_launch.assert_called_once_with()
         mock_print.assert_called_once_with(payload)
         self.assertNotIn("control_center_launch", {tool["name"] for tool in server_module.TOOLS})
+
+    @patch("codex_master.server.print_json", return_value=0)
+    @patch("codex_master.server.launch_control_center_detached")
+    def test_cli_control_center_launch_forwards_ollama_page(
+        self,
+        mock_launch,
+        _mock_print,
+    ) -> None:
+        mock_launch.return_value = {"status": "launched", "raw_output": "not_returned"}
+
+        self.assertEqual(
+            main_cli(["control-center-launch", "--page", "ollama"]), 0
+        )
+
+        mock_launch.assert_called_once_with(page="ollama")
 
     @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})

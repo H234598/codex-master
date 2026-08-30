@@ -875,8 +875,10 @@ class ControlCenterWindow:
         self.notebook.append_page(self._build_ollama_page(), Gtk.Label(label="Ollama"))
         self.window.add(self.notebook)
 
-    def show(self) -> None:
+    def show(self, page: str | None = None) -> None:
         self.window.show_all()
+        if page == "ollama":
+            self.notebook.set_current_page(2)
         self.refresh()
 
     def page_names(self) -> set[str]:
@@ -1693,19 +1695,23 @@ def launch_gtk_application(args: list[str]) -> int:
         raise AgentError("control-center display is unavailable")
     application = Gtk.Application(application_id=APPLICATION_ID)
     holder: dict[str, ControlCenterWindow] = {}
+    page = "ollama" if args == ["--page", "ollama"] else None
 
     def activate(app: Any) -> None:
         window = holder.get("window")
         if window is None:
             window = ControlCenterWindow(Gtk, GLib, app)
             holder["window"] = window
-        window.show()
+        window.show(page)
 
     application.connect("activate", activate)
     return int(application.run(["codex-master-control-center", *args]))
 
 
 def run_control_center(args: list[str] | None = None) -> int:
+    normalized_args = list(args or [])
+    if normalized_args not in ([], ["--page", "ollama"]):
+        raise AgentError("control-center page is invalid")
     assert_install_context_allows_master_registration()
     require_teamleader_tool_access()
-    return launch_gtk_application(list(args or []))
+    return launch_gtk_application(normalized_args)

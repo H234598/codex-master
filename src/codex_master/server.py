@@ -23011,9 +23011,12 @@ def launch_control_center_detached(
     *,
     command_path: Path = DEFAULT_INSTALL_PATH,
     environ: Mapping[str, str] | None = None,
+    page: str | None = None,
 ) -> dict[str, Any]:
     require_teamleader_tool_access()
     fleet_desktop_entry_bytes(command_path)
+    if page not in {None, "ollama"}:
+        raise AgentError("control-center page is invalid")
     source = os.environ if environ is None else environ
     child_env = {
         key: value
@@ -23031,6 +23034,9 @@ def launch_control_center_detached(
         (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0),
     )
     command = str(command_path)
+    argv = [command, "control-center"]
+    if page == "ollama":
+        argv.extend(("--page", "ollama"))
     try:
         closefrom = getattr(os, "POSIX_SPAWN_CLOSEFROM", None)
         if closefrom is None:
@@ -23039,7 +23045,7 @@ def launch_control_center_detached(
                 open(os.devnull, "wb") as null_stdout,
             ):
                 subprocess.Popen(
-                    [command, "control-center"],
+                    argv,
                     env=child_env,
                     stdin=null_stdin,
                     stdout=null_stdout,
@@ -23050,7 +23056,7 @@ def launch_control_center_detached(
         else:
             os.posix_spawn(
                 command,
-                [command, "control-center"],
+                argv,
                 child_env,
                 file_actions=(*file_actions, (closefrom, 3)),
                 setsid=True,
@@ -37887,8 +37893,10 @@ def _main_cli_impl(argv: list[str]) -> int:
     sub.add_parser("release-status")
     sub.add_parser("watchdog-status")
     sub.add_parser("timeout-policy")
-    sub.add_parser("control-center")
-    sub.add_parser("control-center-launch", help=argparse.SUPPRESS)
+    p_control_center = sub.add_parser("control-center")
+    p_control_center.add_argument("--page", choices=("ollama",))
+    p_control_center_launch = sub.add_parser("control-center-launch", help=argparse.SUPPRESS)
+    p_control_center_launch.add_argument("--page", choices=("ollama",))
     p_applet_status = sub.add_parser("applet-status")
     p_applet_status.add_argument("agents", nargs="*")
     p_applet_status.add_argument("--schema-version", type=int, default=1)
@@ -38579,9 +38587,11 @@ def _main_cli_impl(argv: list[str]) -> int:
         if args.command == "control-center":
             from codex_master.control_center import run_control_center
 
-            return run_control_center([])
+            control_args = ["--page", args.page] if args.page else []
+            return run_control_center(control_args)
         if args.command == "control-center-launch":
-            return print_json(launch_control_center_detached())
+            launch_values = {"page": args.page} if args.page else {}
+            return print_json(launch_control_center_detached(**launch_values))
         if args.command == "applet-status":
             return print_json(
                 call_validated_tool(

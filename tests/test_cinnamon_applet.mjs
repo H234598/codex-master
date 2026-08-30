@@ -813,6 +813,39 @@ test("overview settings expose the approved defaults", () => {
   assert.equal(applet.overviewDetail, true);
 });
 
+test("ollama menu shows bounded readiness summary", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+  assert.equal(applet.renderOllamaSummary({
+    ready_instances: 2,
+    ready_lanes: 4,
+    blocked_instances: 1,
+  }), true);
+  assert.equal(applet.ollamaText(), "Ollama: 2 Instanzen · 4 Lanes · 1 blockiert");
+  assert.equal(getMenuItemText(applet._ollamaSummaryItem), applet.ollamaText());
+  assert.equal(applet.renderOllamaSummary({
+    ready_instances: 65,
+    ready_lanes: 4,
+    blocked_instances: 1,
+  }), false);
+  assert.equal(applet.ollamaText(), "Ollama: nicht verfügbar");
+});
+
+test("ollama action opens exact control center page", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+  applet.activateOllamaManage();
+
+  assert.deepEqual(Array.from(fixture.launcherSpawns[0].argv), [
+    "/home/tester/.local/bin/codex-master-mcp",
+    "control-center-launch",
+    "--page",
+    "ollama",
+  ]);
+});
+
 test("overview argv is shell-free and adds only explicit session flag", () => {
   const first = loadApplet();
   first.setHome("/tmp/overview-home");
