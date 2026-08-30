@@ -35,16 +35,18 @@ def materialize_runtime_image(tmp_path: Path, *, mcp_mode: str = "healthy") -> P
         "for raw in sys.stdin:\n"
         "    request = json.loads(raw)\n"
         "    if request.get('method') == 'initialize':\n"
-        "        print(json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': {'protocolVersion': '2024-11-05', 'capabilities': {}, 'serverInfo': {'name': 'codex-master-mcp'}}}), flush=True)\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}, 'resources': {}, 'prompts': {}}, 'serverInfo': {'name': 'codex-master-mcp', 'version': '1'}}}), flush=True)\n"
         "    elif request.get('method') == 'tools/list' and mode == 'healthy':\n"
-        "        print(json.dumps({'jsonrpc': '2.0', 'id': 2, 'result': {'tools': [{'name': 'runtime_status'}]}}), flush=True)\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': 2, 'result': {'tools': [{'name': 'runtime_status', 'description': 'Runtime status', 'inputSchema': {'type': 'object', 'properties': {}, 'additionalProperties': False}}]}}), flush=True)\n"
         "    elif request.get('method') == 'tools/list' and mode == 'empty-tools':\n"
         "        print(json.dumps({'jsonrpc': '2.0', 'id': 2, 'result': {'tools': []}}), flush=True)\n"
         "if mode == 'exit-error':\n"
         "    raise SystemExit(1)\n",
         0o755,
     )
-    _write_file(root / "bin" / "codex-master-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
+    _write_file(
+        root / "bin" / "codex-master-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755
+    )
     _write_file(
         root / ".codex-plugin" / "plugin.json",
         json.dumps(
@@ -61,25 +63,46 @@ def materialize_runtime_image(tmp_path: Path, *, mcp_mode: str = "healthy") -> P
     _write_file(
         root / ".mcp.json",
         json.dumps(
-            {"mcpServers": {"codex-master-mcp": {"command": "./bin/codex-master-mcp", "args": []}}}
+            {
+                "mcpServers": {
+                    "codex-master-mcp": {
+                        "command": "./bin/codex-master-mcp",
+                        "args": [],
+                    }
+                }
+            }
         ),
     )
-    _write_file(root / ".app.json", json.dumps({"apps": {"codex-master": {"id": "connector"}}}))
+    _write_file(
+        root / ".app.json", json.dumps({"apps": {"codex-master": {"id": "connector"}}})
+    )
     _write_file(root / "hooks" / "hooks.json", json.dumps({"hooks": {}}))
-    _write_file(root / "skills" / "codex-master-fleet" / "SKILL.md", "---\nname: codex-master-fleet\n---\n")
-    _write_file(root / "codex-hive.json", json.dumps({"schema_version": 1, "mode": "shadow"}))
-    _write_file(root / "codex-agent-classes.json", json.dumps({"schema_version": 1, "classes": []}))
+    _write_file(
+        root / "skills" / "codex-master-fleet" / "SKILL.md",
+        "---\nname: codex-master-fleet\n---\n",
+    )
+    _write_file(
+        root / "codex-hive.json", json.dumps({"schema_version": 1, "mode": "shadow"})
+    )
+    _write_file(
+        root / "codex-agent-classes.json",
+        json.dumps({"schema_version": 1, "classes": []}),
+    )
     for path in root.rglob("*"):
         if path.is_dir():
             path.chmod(0o700)
     return root
 
 
-def test_runtime_status_checks_validated_metadata_and_direct_mcp_surface(tmp_path: Path) -> None:
+def test_runtime_status_checks_validated_metadata_and_direct_mcp_surface(
+    tmp_path: Path,
+) -> None:
     modules = _runtime_modules()
     assert modules is not None
     layout_module, status_module = modules
-    layout = layout_module.RuntimeLayout.from_runtime_root(materialize_runtime_image(tmp_path))
+    layout = layout_module.RuntimeLayout.from_runtime_root(
+        materialize_runtime_image(tmp_path)
+    )
 
     result = status_module.runtime_status(layout=layout)
 
@@ -95,16 +118,22 @@ def test_runtime_status_checks_validated_metadata_and_direct_mcp_surface(tmp_pat
     assert result["raw_output"] == "not_returned"
 
 
-def test_runtime_status_sanitizes_client_layout_environment(tmp_path: Path, monkeypatch) -> None:
+def test_runtime_status_sanitizes_client_layout_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
     modules = _runtime_modules()
     assert modules is not None
     layout_module, status_module = modules
-    layout = layout_module.RuntimeLayout.from_runtime_root(materialize_runtime_image(tmp_path))
+    layout = layout_module.RuntimeLayout.from_runtime_root(
+        materialize_runtime_image(tmp_path)
+    )
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "client-home"))
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "checkout"))
     monkeypatch.setenv("CODEX_MASTER_RUNTIME_ROOT", str(tmp_path / "untrusted-runtime"))
     (tmp_path / "client-home" / ".codex").mkdir(parents=True)
-    (tmp_path / "client-home" / ".codex" / "config.toml").write_text("[mcp_servers]\n", encoding="utf-8")
+    (tmp_path / "client-home" / ".codex" / "config.toml").write_text(
+        "[mcp_servers]\n", encoding="utf-8"
+    )
 
     result = status_module.runtime_status(layout=layout)
 
@@ -112,7 +141,9 @@ def test_runtime_status_sanitizes_client_layout_environment(tmp_path: Path, monk
     assert result["mcp_surface"]["ok"] is True
 
 
-def test_runtime_status_rejects_invalid_metadata_without_starting_mcp(tmp_path: Path) -> None:
+def test_runtime_status_rejects_invalid_metadata_without_starting_mcp(
+    tmp_path: Path,
+) -> None:
     modules = _runtime_modules()
     assert modules is not None
     layout_module, status_module = modules
@@ -133,7 +164,9 @@ def test_runtime_status_rejects_invalid_metadata_without_starting_mcp(tmp_path: 
     }
 
 
-def test_runtime_status_rejects_mcp_start_and_incomplete_tools_surface(tmp_path: Path) -> None:
+def test_runtime_status_rejects_mcp_start_and_incomplete_tools_surface(
+    tmp_path: Path,
+) -> None:
     modules = _runtime_modules()
     assert modules is not None
     layout_module, status_module = modules
@@ -172,3 +205,57 @@ def test_runtime_status_rejects_an_empty_direct_tool_list(tmp_path: Path) -> Non
         "tool_count": 0,
         "reason_code": "mcp_surface_invalid",
     }
+
+
+def test_runtime_status_rejects_any_noncanonical_runtime_status_tool_surface() -> None:
+    modules = _runtime_modules()
+    assert modules is not None
+    _layout_module, status_module = modules
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+            "serverInfo": {"name": "codex-master-mcp", "version": "1"},
+        },
+    }
+    canonical_tool = {
+        "name": "runtime_status",
+        "description": "Runtime status",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    }
+    malformed_variants = (
+        [{**canonical_tool}, {**canonical_tool, "name": "agent_start"}],
+        [{**canonical_tool}, {**canonical_tool}],
+        [{**canonical_tool, "inputSchema": {"type": "object", "properties": {}}}],
+        [{"name": "runtime_status", "inputSchema": canonical_tool["inputSchema"]}],
+        [{**canonical_tool, "unexpected": True}],
+    )
+    for tools in malformed_variants:
+        output = "\n".join(
+            json.dumps(payload)
+            for payload in (
+                initialize,
+                {"jsonrpc": "2.0", "id": 2, "result": {"tools": tools}},
+            )
+        )
+        surface = status_module._mcp_surface(0, output)
+        assert surface["ok"] is False
+        assert surface["reason_code"] == "mcp_surface_invalid"
+
+    competing = "\n".join(
+        json.dumps(payload)
+        for payload in (
+            initialize,
+            {"jsonrpc": "2.0", "id": 2, "result": {"tools": [canonical_tool]}},
+            {"jsonrpc": "2.0", "id": 2, "result": {"tools": [canonical_tool]}},
+        )
+    )
+    surface = status_module._mcp_surface(0, competing)
+    assert surface["ok"] is False
+    assert surface["reason_code"] == "mcp_surface_invalid"

@@ -5,8 +5,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from codex_master.runtime_layout import LayoutError, RuntimeLayout, validate_runtime_metadata
-from codex_master.runtime_process import BoundedProcessError, DEFAULT_STDERR_LIMIT, run_bounded
+from codex_master.runtime_layout import (
+    LayoutError,
+    RuntimeLayout,
+    validate_runtime_metadata,
+)
+from codex_master.runtime_process import (
+    BoundedProcessError,
+    DEFAULT_STDERR_LIMIT,
+    run_bounded,
+)
 
 
 _MCP_SERVER_NAME = "codex-master-mcp"
@@ -14,6 +22,11 @@ _MCP_PROTOCOL_VERSION = "2024-11-05"
 _MAX_MCP_OUTPUT_BYTES = 256 * 1024
 _MCP_TIMEOUT_SECONDS = 10
 _REQUIRED_AUTONOMOUS_TOOL = "runtime_status"
+_RUNTIME_STATUS_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
 
 
 def _probe_payload() -> bytes:
@@ -31,7 +44,10 @@ def _probe_payload() -> bytes:
         {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
     )
-    return b"".join(json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n" for message in messages)
+    return b"".join(
+        json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+        for message in messages
+    )
 
 
 def _run_direct_mcp(layout: RuntimeLayout) -> tuple[int, str]:
@@ -56,37 +72,76 @@ def _mcp_surface(returncode: int, output: str) -> dict[str, object]:
     initialized = False
     tools_list = False
     tool_count = 0
-    tool_names: set[str] = set()
+    tools_contract_valid = False
+    invalid = False
+    responses: set[int] = set()
     for line in output.splitlines():
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
+            invalid = True
             continue
-        if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0":
+        if (
+            type(payload) is not dict
+            or set(payload) != {"jsonrpc", "id", "result"}
+            or payload.get("jsonrpc") != "2.0"
+            or type(payload.get("id")) is not int
+            or payload["id"] not in {1, 2}
+            or payload["id"] in responses
+        ):
+            invalid = True
             continue
-        if payload.get("id") == 1:
+        response_id = payload["id"]
+        responses.add(response_id)
+        if response_id == 1:
             result = payload.get("result")
             server_info = result.get("serverInfo") if isinstance(result, dict) else None
             if (
-                isinstance(result, dict)
+                type(result) is dict
+                and set(result) == {"protocolVersion", "capabilities", "serverInfo"}
                 and result.get("protocolVersion") == _MCP_PROTOCOL_VERSION
-                and isinstance(result.get("capabilities"), dict)
-                and isinstance(server_info, dict)
+                and result.get("capabilities")
+                == {"tools": {}, "resources": {}, "prompts": {}}
+                and type(server_info) is dict
+                and set(server_info) == {"name", "version"}
                 and server_info.get("name") == _MCP_SERVER_NAME
+                and isinstance(server_info.get("version"), str)
+                and server_info["version"]
             ):
                 initialized = True
-        if payload.get("id") == 2:
+            else:
+                invalid = True
+        if response_id == 2:
             result = payload.get("result")
             tools = result.get("tools") if isinstance(result, dict) else None
-            if isinstance(tools, list):
-                tool_names = {
-                    tool["name"]
-                    for tool in tools
-                    if isinstance(tool, dict) and isinstance(tool.get("name"), str) and tool["name"]
-                }
-                tool_count = len(tool_names)
+            if (
+                type(result) is dict
+                and set(result) == {"tools"}
+                and type(tools) is list
+            ):
+                tool_count = len(tools)
                 tools_list = True
-    ok = returncode == 0 and initialized and tools_list and _REQUIRED_AUTONOMOUS_TOOL in tool_names
+                tools_contract_valid = (
+                    len(tools) == 1
+                    and type(tools[0]) is dict
+                    and set(tools[0]) == {"name", "description", "inputSchema"}
+                    and tools[0].get("name") == _REQUIRED_AUTONOMOUS_TOOL
+                    and isinstance(tools[0].get("description"), str)
+                    and bool(tools[0]["description"])
+                    and tools[0].get("inputSchema") == _RUNTIME_STATUS_INPUT_SCHEMA
+                )
+                if not tools_contract_valid:
+                    invalid = True
+            else:
+                invalid = True
+    ok = (
+        returncode == 0
+        and initialized
+        and tools_list
+        and tools_contract_valid
+        and responses == {1, 2}
+        and not invalid
+    )
     return {
         "ok": ok,
         "initialize": initialized,
@@ -110,7 +165,9 @@ def runtime_status(*, layout: RuntimeLayout | None = None) -> dict[str, object]:
     """Check only the image metadata and its direct MCP initialize/tools surface."""
 
     try:
-        active_layout = RuntimeLayout.from_module_path(Path(__file__)) if layout is None else layout
+        active_layout = (
+            RuntimeLayout.from_module_path(Path(__file__)) if layout is None else layout
+        )
         validate_runtime_metadata(active_layout)
     except (LayoutError, TypeError, ValueError):
         return {

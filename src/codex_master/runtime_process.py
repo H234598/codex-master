@@ -35,7 +35,11 @@ class BoundedProcessResult:
 def minimal_environment(*, home: Path) -> dict[str, str]:
     """Return the complete child environment; no caller environment is inherited."""
 
-    if not isinstance(home, Path) or not home.is_absolute() or "\x00" in os.fspath(home):
+    if (
+        not isinstance(home, Path)
+        or not home.is_absolute()
+        or "\x00" in os.fspath(home)
+    ):
         raise BoundedProcessError("command_environment_invalid")
     return {
         "HOME": os.fspath(home),
@@ -46,26 +50,50 @@ def minimal_environment(*, home: Path) -> dict[str, str]:
     }
 
 
-def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[bytes], *, leader_pidfd: int
+) -> None:
+    """Terminate the original session even after its leader has exited.
+
+    A pidfd pins the leader's numeric PID until cleanup completes.  That makes
+    ``killpg(process.pid, ...)`` safe after a fast leader exit: the old PGID
+    cannot be recycled into an unrelated process group while this descriptor
+    remains open.
+    """
+
+    process_group = process.pid
+    if leader_pidfd < 0:
         return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except OSError:
-        with contextlib.suppress(OSError):
-            process.terminate()
-    try:
-        process.wait(timeout=1)
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
         return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
     except OSError:
-        with contextlib.suppress(OSError):
-            process.kill()
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=1)
+        return
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        if not _process_group_exists(process_group):
+            return
+        time.sleep(0.02)
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except OSError:
+        return
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        if not _process_group_exists(process_group):
+            return
+        time.sleep(0.02)
 
 
 def run_bounded(
@@ -84,7 +112,10 @@ def run_bounded(
         not isinstance(cwd, Path)
         or not cwd.is_absolute()
         or not arguments
-        or any(not isinstance(argument, str) or not argument or "\x00" in argument for argument in arguments)
+        or any(
+            not isinstance(argument, str) or not argument or "\x00" in argument
+            for argument in arguments
+        )
         or not isinstance(timeout_seconds, (int, float))
         or isinstance(timeout_seconds, bool)
         or timeout_seconds <= 0
@@ -97,6 +128,7 @@ def run_bounded(
     ):
         raise BoundedProcessError("command_arguments_invalid")
     process: subprocess.Popen[bytes] | None = None
+    leader_pidfd = -1
     selector: selectors.BaseSelector | None = None
     streams: dict[int, tuple[str, object, int]] = {}
     output = {"stdout": bytearray(), "stderr": bytearray()}
@@ -111,6 +143,10 @@ def run_bounded(
             close_fds=True,
             start_new_session=True,
         )
+        try:
+            leader_pidfd = os.pidfd_open(process.pid)
+        except (AttributeError, OSError) as exc:
+            raise BoundedProcessError("command_group_unavailable") from exc
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise BoundedProcessError("command_pipe_unavailable")
         try:
@@ -168,7 +204,10 @@ def run_bounded(
             with contextlib.suppress(OSError):
                 stream.close()
         if process is not None:
-            _terminate_process_group(process)
+            _terminate_process_group(process, leader_pidfd=leader_pidfd)
+        if leader_pidfd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(leader_pidfd)
 
 
 __all__ = [

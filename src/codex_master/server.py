@@ -351,9 +351,7 @@ HEADLESS_ROLLBACK_DIR_NAME = "headless-write-scope-rollback"
 HEADLESS_ROLLBACK_SCHEMA_VERSION = 1
 MAX_HEADLESS_ROLLBACK_RECORDS = 32
 MAX_HEADLESS_ROLLBACK_RECORD_BYTES = 16 * 1024
-HEADLESS_ROLLBACK_RECORD_RE = re.compile(
-    r"^rollback-[0-9TZ-]+-[0-9a-f]{32}\.json$"
-)
+HEADLESS_ROLLBACK_RECORD_RE = re.compile(r"^rollback-[0-9TZ-]+-[0-9a-f]{32}\.json$")
 
 
 def agent_base_args(
@@ -1153,9 +1151,11 @@ class ResourceEvidenceProjectionV2:
     gate_facts: ResourceEvidenceGateFactsV2
 
 
-_RESOURCE_GATE_RUNTIME: contextvars.ContextVar[ResourceGateRuntime | None] = contextvars.ContextVar(
-    "codex_master_resource_gate_runtime",
-    default=None,
+_RESOURCE_GATE_RUNTIME: contextvars.ContextVar[ResourceGateRuntime | None] = (
+    contextvars.ContextVar(
+        "codex_master_resource_gate_runtime",
+        default=None,
+    )
 )
 _RESOURCE_GATE_RUNTIME_TYPED_G5: contextvars.ContextVar[
     tuple[CgroupProfileV1, SystemdUserCgroupAdapter] | bool | None
@@ -1280,7 +1280,9 @@ def _call_with_resource_gate_composer(callback: Any) -> Any:
 def _read_resource_evidence_projection_v2(
     runtime: ResourceGateRuntime,
 ) -> ResourceEvidenceProjectionV2:
-    if not isinstance(runtime, ResourceGateRuntime) or not isinstance(runtime.state, HiveStateStore):
+    if not isinstance(runtime, ResourceGateRuntime) or not isinstance(
+        runtime.state, HiveStateStore
+    ):
         raise ResourceSnapshotError("resource_snapshot_invalid")
     now_utc = runtime.now_utc()
     if (
@@ -1312,7 +1314,8 @@ def _read_resource_evidence_projection_v2(
             if evidence.reason_codes != ("resource_ready",):
                 raise ResourceSnapshotError("resource_snapshot_invalid")
         elif not evidence.reason_codes or any(
-            reason not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
+            reason
+            not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
             for reason in evidence.reason_codes
         ):
             raise ResourceSnapshotError("resource_snapshot_invalid")
@@ -1348,11 +1351,19 @@ def _read_resource_operator_status() -> ResourceEvidenceOperatorViewV2:
             raise AgentError("resource_status_unavailable")
         try:
             return _read_resource_evidence_projection_v2(runtime).operator_status
-        except (ResourceSnapshotError, TypeError, ValueError, AttributeError, OverflowError):
+        except (
+            ResourceSnapshotError,
+            TypeError,
+            ValueError,
+            AttributeError,
+            OverflowError,
+        ):
             raise AgentError("resource_status_unavailable") from None
 
 
-def _resource_operator_document(status: ResourceEvidenceOperatorViewV2) -> dict[str, Any]:
+def _resource_operator_document(
+    status: ResourceEvidenceOperatorViewV2,
+) -> dict[str, Any]:
     if not isinstance(status, ResourceEvidenceOperatorViewV2):
         raise AgentError("resource_status_unavailable")
     if any(
@@ -6714,7 +6725,9 @@ def _total_running_agent_count(
     return managed + active + unconfirmed + reservations
 
 
-def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
+def _resource_gate_snapshot(
+    *, running_agents_override: int | None = None
+) -> dict[str, Any]:
     """Project exactly one authorized V2 evidence read; never read host metrics here."""
 
     runtime = _RESOURCE_GATE_RUNTIME.get()
@@ -6790,13 +6803,20 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
         elif facts.state is ResourceEvidenceStateV2.PRESSURE:
             declared = list(facts.reason_codes)
             if not declared or any(
-                reason not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
+                reason
+                not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
                 for reason in declared
             ):
                 raise ValueError
         else:
             raise ValueError
-    except (ResourceSnapshotError, TypeError, ValueError, AttributeError, OverflowError):
+    except (
+        ResourceSnapshotError,
+        TypeError,
+        ValueError,
+        AttributeError,
+        OverflowError,
+    ):
         return {
             "ok": False,
             "_typed_hive_io_pressure": False,
@@ -6825,7 +6845,9 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
     }
 
 
-def system_resource_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
+def system_resource_snapshot(
+    *, running_agents_override: int | None = None
+) -> dict[str, Any]:
     """Return the V2-backed admission projection for the current G5 flow."""
 
     return _resource_gate_snapshot(running_agents_override=running_agents_override)
@@ -9518,10 +9540,12 @@ def _materialize_managed_codex_runtime_class(
                     "agent_class_materialization_invalid",
                 )
             else:
-                current_descriptor, _current_runtime_profile = _fleet_effective_runtime_descriptor(
-                    marker,
-                    descriptor,
-                    "agent_class_materialization_invalid",
+                current_descriptor, _current_runtime_profile = (
+                    _fleet_effective_runtime_descriptor(
+                        marker,
+                        descriptor,
+                        "agent_class_materialization_invalid",
+                    )
                 )
                 if marker.get("model") != descriptor.model:
                     raise AgentError("agent_class_materialization_invalid")
@@ -9562,12 +9586,14 @@ def _materialize_managed_codex_runtime_class(
                     descriptor,
                     "fleet_home_content_invalid",
                 ) as codex_runtime_symlinks:
-                    actual_files, actual_directories, actual_symlinks = _fleet_tree_entries(
-                        home_fd,
-                        "fleet_home_content_invalid",
-                        allow_gemini_runtime=True,
-                        opaque_runtime_directories=codex_runtime_directories,
-                        allowed_runtime_symlinks=codex_runtime_symlinks,
+                    actual_files, actual_directories, actual_symlinks = (
+                        _fleet_tree_entries(
+                            home_fd,
+                            "fleet_home_content_invalid",
+                            allow_gemini_runtime=True,
+                            opaque_runtime_directories=codex_runtime_directories,
+                            allowed_runtime_symlinks=codex_runtime_symlinks,
+                        )
                     )
                     runtime_regular_files = {
                         path
@@ -9592,10 +9618,14 @@ def _materialize_managed_codex_runtime_class(
                         {name: None for name in marker_files}
                     )
                     runtime_files = runtime_regular_files | set(actual_symlinks)
-                    runtime_directories = actual_directories & set(codex_runtime_directories)
+                    runtime_directories = actual_directories & set(
+                        codex_runtime_directories
+                    )
                     if (
-                        not (actual_files | set(actual_symlinks)) <= allowed_files | runtime_files
-                        or actual_directories != expected_directories | runtime_directories
+                        not (actual_files | set(actual_symlinks))
+                        <= allowed_files | runtime_files
+                        or actual_directories
+                        != expected_directories | runtime_directories
                     ):
                         raise AgentError("fleet_home_content_invalid")
                     _fleet_revalidate_symlink_snapshots(
@@ -9691,7 +9721,9 @@ def _materialize_managed_codex_runtime_class(
                             refreshed_config,
                             old_config_stat,
                         )
-                for name in sorted(desired_directories, key=lambda item: (len(Path(item).parts), item)):
+                for name in sorted(
+                    desired_directories, key=lambda item: (len(Path(item).parts), item)
+                ):
                     ensure_directory_at(home_fd, name)
                 for name, content in sorted(desired.items()):
                     old = projection.get(name)
@@ -10026,9 +10058,15 @@ def validate_codex_usage_routing_decision(
         raise AgentError("codex-usage routing schema is unsupported")
     decision = payload.get("decision")
     model = payload.get("model")
-    if not isinstance(decision, str) or decision not in CODEX_USAGE_DECISIONS or payload.get("role") != role:
+    if (
+        not isinstance(decision, str)
+        or decision not in CODEX_USAGE_DECISIONS
+        or payload.get("role") != role
+    ):
         raise AgentError("codex-usage routing decision is invalid")
-    if not isinstance(payload.get("account"), str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(payload["account"]):
+    if not isinstance(
+        payload.get("account"), str
+    ) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(payload["account"]):
         raise AgentError("codex-usage routing account is invalid")
     backend_account_id = bounded_text(
         payload.get("backend_account_id"),
@@ -10045,7 +10083,9 @@ def validate_codex_usage_routing_decision(
     }[decision]
     if model not in expected_models:
         raise AgentError("codex-usage routing model does not match decision")
-    selected_model = DEFAULT_AGENT_MODEL if model == CODEX_USAGE_LEGACY_MAIN_MODEL else model
+    selected_model = (
+        DEFAULT_AGENT_MODEL if model == CODEX_USAGE_LEGACY_MAIN_MODEL else model
+    )
     if decision == "credits" and payload.get("paid_overage_allowed") is not True:
         raise AgentError("codex-usage credits decision lacks explicit paid policy")
     if not isinstance(payload.get("paid_overage_allowed"), bool):
@@ -10057,7 +10097,9 @@ def validate_codex_usage_routing_decision(
         "role": role,
         "decision": decision,
         "model": selected_model,
-        "reason": bounded_text(payload.get("reason"), field="routing reason", max_chars=120),
+        "reason": bounded_text(
+            payload.get("reason"), field="routing reason", max_chars=120
+        ),
         "usage_state": bounded_text(
             payload.get("usage_state"), field="routing usage_state", max_chars=32
         ),
@@ -10111,7 +10153,12 @@ def validate_codex_usage_routing_decision(
             raise AgentError("codex-usage routing resets are invalid")
         for window, value in resets.items():
             parsed = parse_utc_timestamp(value)
-            if not isinstance(window, str) or not window or len(window) > 32 or parsed is None:
+            if (
+                not isinstance(window, str)
+                or not window
+                or len(window) > 32
+                or parsed is None
+            ):
                 raise AgentError("codex-usage routing resets are invalid")
             normalized_resets[window] = (parsed, value)
     if decision == "blocked" and normalized_resets:
@@ -10130,7 +10177,6 @@ def validate_codex_usage_routing_decision(
         if blocked_resets:
             result["blocked_until_utc"] = max(blocked_resets)[1]
     return result
-
 
 
 def resolve_runtime_agent_selection(
@@ -10954,7 +11000,13 @@ def raw_log_retention_status() -> dict[str, Any]:
 
 def raw_log_writer_command(raw_log: Path) -> str:
     return shlex.join(
-        [str(_runtime_mcp_entrypoint()), "raw-log-writer", str(raw_log), "--max-bytes", str(MAX_RAW_LOG_BYTES)]
+        [
+            str(_runtime_mcp_entrypoint()),
+            "raw-log-writer",
+            str(raw_log),
+            "--max-bytes",
+            str(MAX_RAW_LOG_BYTES),
+        ]
     )
 
 
@@ -13886,7 +13938,10 @@ def _assign_headless_agent(
         raise AgentError("headless_gate_binding_changed")
     if role == "arbeitsbiene":
         scope_result = scope_check(scope, write_paths, cwd=repo_root())
-        if not isinstance(scope_result, Mapping) or scope_result.get("allowed") is not True:
+        if (
+            not isinstance(scope_result, Mapping)
+            or scope_result.get("allowed") is not True
+        ):
             violations = (
                 scope_result.get("violations", [])
                 if isinstance(scope_result, Mapping)
@@ -13909,7 +13964,9 @@ def _assign_headless_agent(
             if role == "arbeitsbiene":
                 assert write_scope_store is not None
                 try:
-                    if agent != requested_agent and not write_scope_store.has_available(agent):
+                    if agent != requested_agent and not write_scope_store.has_available(
+                        agent
+                    ):
                         raise HeadlessWriteScopeFailure(
                             "headless_write_scope_unenforced",
                             "headless writes lack isolated worktree and diff attribution",
@@ -13928,7 +13985,9 @@ def _assign_headless_agent(
                     )
                 except HeadlessWriteScopeFailure as exc:
                     _raise_headless_scope_failure(exc)
-            headless_inflight_reservation = reserve_headless_inflight(agent, assignment_id)
+            headless_inflight_reservation = reserve_headless_inflight(
+                agent, assignment_id
+            )
             if headless_inflight_reservation is None:
                 raise AgentCapacityError(
                     "capacity unavailable",
@@ -15784,7 +15843,11 @@ def ensure_emergency_queen(*, dry_run: bool = False) -> dict[str, Any] | None:
 
     state = emergency_queen_status()
     if state["state"] in {"running", "finishing", "next", "draining"}:
-        return {"status": "already_active", "state": state, "raw_output": "not_returned"}
+        return {
+            "status": "already_active",
+            "state": state,
+            "raw_output": "not_returned",
+        }
     if state["state"] != "requested":
         return {"status": "not_requested", "state": state, "raw_output": "not_returned"}
     candidates = _emergency_queen_agent_candidates()
@@ -16568,10 +16631,15 @@ def _usage_watchdog_agent_unlocked(
                 "action_taken": "none",
             }
         claimed_for_watchdog = False
-        if not safe_shutdown_only and not lease.get("held_by_this_server") and lease.get("state") in {
-            "unclaimed",
-            "expired",
-        }:
+        if (
+            not safe_shutdown_only
+            and not lease.get("held_by_this_server")
+            and lease.get("state")
+            in {
+                "unclaimed",
+                "expired",
+            }
+        ):
             claim = claim_agent(agent)
             lease = claim["lease"]
             claimed_for_watchdog = claim["status"] in {"claimed", "claimed_expired"}
@@ -18557,9 +18625,7 @@ def normalize_git_branch_name(value: str) -> str:
     return value
 
 
-def _headless_rollback_directory(
-    *, create: bool
-) -> tuple[Path, os.stat_result] | None:
+def _headless_rollback_directory(*, create: bool) -> tuple[Path, os.stat_result] | None:
     root = Path(STATE_ROOT).expanduser()
     if not root.is_absolute():
         root = Path.cwd() / root
@@ -18784,9 +18850,7 @@ def _persist_headless_rollback_state(
             reason=reason,
         )
         name = f"rollback-{now_id()}-{uuid.uuid4().hex}.json"
-        write_private_new_bytes(
-            Path(name), raw, mode=0o600, dir_fd=directory_fd
-        )
+        write_private_new_bytes(Path(name), raw, mode=0o600, dir_fd=directory_fd)
         info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         _headless_verify_rollback_record_stat(info)
         os.fsync(directory_fd)
@@ -18938,7 +19002,11 @@ def _headless_resume_rollback_payload(
                 pass_fds=(repository_fd, target_fd),
             )
             returncode = getattr(cleanup, "returncode", None)
-            if not isinstance(returncode, int) or isinstance(returncode, bool) or returncode != 0:
+            if (
+                not isinstance(returncode, int)
+                or isinstance(returncode, bool)
+                or returncode != 0
+            ):
                 raise AgentError("headless_attestation_rollback_incomplete")
         else:
             try:
@@ -19068,26 +19136,22 @@ def worktree_create_for_agent(
         if target_stat is None or target_fd < 0:
             raise_rollback_incomplete("target_identity_unavailable")
         try:
-            current_path = os.stat(
-                target.name, dir_fd=parent_fd, follow_symlinks=False
-            )
+            current_path = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError as exc:
             raise_rollback_incomplete("target_path_missing", exc)
         except OSError as exc:
             raise_rollback_incomplete("target_path_stat_failed", exc)
-        if (
-            not stat_module.S_ISDIR(current_path.st_mode)
-            or not source_identity_matches(current_path, target_stat)
+        if not stat_module.S_ISDIR(current_path.st_mode) or not source_identity_matches(
+            current_path, target_stat
         ):
             raise_rollback_incomplete("target_path_identity_changed")
         try:
             current_target = os.fstat(target_fd)
         except OSError as exc:
             raise_rollback_incomplete("target_fstat_failed", exc)
-        if (
-            not stat_module.S_ISDIR(current_target.st_mode)
-            or not source_identity_matches(current_target, target_stat)
-        ):
+        if not stat_module.S_ISDIR(
+            current_target.st_mode
+        ) or not source_identity_matches(current_target, target_stat):
             raise_rollback_incomplete("target_identity_changed")
         try:
             cleanup = run_command(
@@ -19105,7 +19169,11 @@ def worktree_create_for_agent(
         except Exception as exc:
             raise_rollback_incomplete("rollback_command_failed", exc)
         returncode = getattr(cleanup, "returncode", None)
-        if not isinstance(returncode, int) or isinstance(returncode, bool) or returncode != 0:
+        if (
+            not isinstance(returncode, int)
+            or isinstance(returncode, bool)
+            or returncode != 0
+        ):
             raise_rollback_incomplete("rollback_command_failed")
         try:
             os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -19163,8 +19231,7 @@ def worktree_create_for_agent(
                 else:
                     target_text = str(target)
                     worktree_registered = any(
-                        line.startswith("worktree ")
-                        and line[9:] == target_text
+                        line.startswith("worktree ") and line[9:] == target_text
                         for line in registration.stdout.splitlines()
                     )
             raise AgentError("git worktree add failed")
@@ -19199,9 +19266,13 @@ def worktree_create_for_agent(
             metadata_stat = None
         except OSError as exc:
             raise AgentError("headless_attestation_invalid") from exc
-        if metadata_stat is None or stat_module.S_ISLNK(metadata_stat.st_mode) or not (
-            stat_module.S_ISREG(metadata_stat.st_mode)
-            or stat_module.S_ISDIR(metadata_stat.st_mode)
+        if (
+            metadata_stat is None
+            or stat_module.S_ISLNK(metadata_stat.st_mode)
+            or not (
+                stat_module.S_ISREG(metadata_stat.st_mode)
+                or stat_module.S_ISDIR(metadata_stat.st_mode)
+            )
         ):
             raise AgentError("headless_attestation_invalid")
         try:
@@ -22580,7 +22651,9 @@ def master_watchdog_status(
 
 
 def master_timeout_policy() -> dict[str, Any]:
-    client_config = codex_client_mcp_config_status(command_path=_runtime_mcp_entrypoint())
+    client_config = codex_client_mcp_config_status(
+        command_path=_runtime_mcp_entrypoint()
+    )
     startup_timeout = {
         "scope": "codex_cli_mcp_server_startup",
         "configured_seconds": client_config.get("startup_timeout_sec"),
@@ -23573,9 +23646,7 @@ def _install_enrolled_unlocked(
                     "_config_snapshot", None
                 )
             else:
-                client_config = codex_client_mcp_config_status(
-                    command_path=entrypoint
-                )
+                client_config = codex_client_mcp_config_status(command_path=entrypoint)
                 if not client_config.get("startup_timeout_ok") or not client_config.get(
                     "default_tools_approval_mode_ok"
                 ):
@@ -23990,7 +24061,8 @@ def send_agent(
             if enter:
                 cp = run_tmux(
                     _tmux_args_for_session(
-                        session, ["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY],
+                        session,
+                        ["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY],
                     ),
                     check=False,
                 )
@@ -24070,7 +24142,10 @@ def _interrupt_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]
         try:
             claim = claim_agent(agent)
         except AgentError as exc:
-            if not isinstance(exc, FleetRecoveryBlockedError) and str(exc) != "hive_spawn_probe_blocked":
+            if (
+                not isinstance(exc, FleetRecoveryBlockedError)
+                and str(exc) != "hive_spawn_probe_blocked"
+            ):
                 raise
             # Interrupt is an emergency control operation and remains
             # available while fleet recovery or the spawn probe blocks new
@@ -28023,9 +28098,7 @@ def _fleet_managed_home_details(
             else markdown_files
         )
         portable_files = {
-            name
-            for name in marker_files
-            if _portable_skill_projection_name(name)
+            name for name in marker_files if _portable_skill_projection_name(name)
         }
         if (
             not base_expected_files <= marker_files
@@ -35596,14 +35669,20 @@ def handle_rpc(
                     raise AgentError("tools/call requires a known tool name")
                 if requested_name != "runtime_status":
                     status = require_teamleader_tool_access()
-                    principal_class = require_principal_tool_access(requested_name, status)
+                    principal_class = require_principal_tool_access(
+                        requested_name, status
+                    )
             name, args = validate_tool_call(
                 params.get("name"), params.get("arguments", {})
             )
-            payload = runtime_status() if name == "runtime_status" else (
-                call_tool(name, args, principal_class=principal_class)
-                if principal_class is not None
-                else call_tool(name, args)
+            payload = (
+                runtime_status()
+                if name == "runtime_status"
+                else (
+                    call_tool(name, args, principal_class=principal_class)
+                    if principal_class is not None
+                    else call_tool(name, args)
+                )
             )
             text = json.dumps(payload, indent=2, sort_keys=True)
             return reply(
@@ -36018,6 +36097,45 @@ def _publish_startup_fleet_inventory() -> None:
         swap_agent_inventory(None)
 
 
+def _unauthenticated_mcp_request(message: object) -> bool:
+    """Identify requests that must stay on the sterile runtime surface."""
+
+    if not isinstance(message, dict):
+        return True
+    if message.get("method") in ("initialize", "notifications/initialized"):
+        return True
+    try:
+        return master_tool_access_status().get("authorized") is not True
+    except Exception:
+        return True
+
+
+def _sterile_runtime_surface_response(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Serve only autonomous runtime RPCs without initializing private state."""
+
+    method = message.get("method")
+    if method in (
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "tools/call",
+    ):
+        return handle_rpc(message, enforce_master_role=True)
+    message_id = message.get("id")
+    if "id" not in message:
+        return None
+    if not (
+        isinstance(message_id, str)
+        or (
+            isinstance(message_id, (int, float))
+            and not isinstance(message_id, bool)
+            and (not isinstance(message_id, float) or math.isfinite(message_id))
+        )
+    ):
+        return handle_rpc(message, enforce_master_role=True)
+    return rpc_error(message_id, -32000, "teamleader authorization required")
+
+
 def serve_mcp() -> int:
     """Serve MCP with a startup inventory scoped to this server lifetime."""
 
@@ -36030,16 +36148,22 @@ def serve_mcp() -> int:
 
 def _serve_mcp_impl() -> int:
     global _FLEET_STARTUP_ERROR
-    ensure_state()
-    _fleet_initialize_recovery_startup_state()
-    _FLEET_STARTUP_ERROR = None
-    _publish_startup_fleet_inventory()
+    initialized_regular_surface = False
     while True:
         try:
             msg = read_message()
             if msg is None:
                 return 0
-            response = handle_rpc(msg, enforce_master_role=True)
+            if _unauthenticated_mcp_request(msg):
+                response = _sterile_runtime_surface_response(msg)
+            else:
+                if not initialized_regular_surface:
+                    ensure_state()
+                    _fleet_initialize_recovery_startup_state()
+                    _FLEET_STARTUP_ERROR = None
+                    _publish_startup_fleet_inventory()
+                    initialized_regular_surface = True
+                response = handle_rpc(msg, enforce_master_role=True)
             if response is not None:
                 write_message(response)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -36266,7 +36390,9 @@ def _fleet_overview_cli(argv: list[str]) -> int:
         return 1
 
 
-def _render_resource_operator_status(status: ResourceEvidenceOperatorViewV2, *, format: str) -> str:
+def _render_resource_operator_status(
+    status: ResourceEvidenceOperatorViewV2, *, format: str
+) -> str:
     if format not in {"compact", "json", "markdown"}:
         raise AgentError("resource_status_unavailable")
     document = _resource_operator_document(status)
@@ -40267,8 +40393,7 @@ _SKILL_PROFILE_BLOCKS: dict[str, tuple[str, ...]] = {
 
 _VISUAL_COMPANION_TEAMLEAD_PROFILES = frozenset({"teamlead", "teamleiterin"})
 _VISUAL_COMPANION_SOURCE = (
-    ".codex/plugins/cache/openai-curated-remote/superpowers/6.3.0/"
-    "skills/brainstorming"
+    ".codex/plugins/cache/openai-curated-remote/superpowers/6.3.0/skills/brainstorming"
 )
 _VISUAL_COMPANION_PORTABLE_ROOT = "skills/.portable/plugins/superpowers/brainstorming"
 _VISUAL_COMPANION_PORTABLE_GUIDE = (
@@ -43174,7 +43299,9 @@ class _FleetHomeV2ServerAuthorityPort(FleetHomeV2AuthorityPort):
         if processes is None:
             return "process-observation-unavailable"
         return hashlib.sha256(
-            json.dumps(processes, sort_keys=True, separators=(",", ":"), default=str).encode()
+            json.dumps(
+                processes, sort_keys=True, separators=(",", ":"), default=str
+            ).encode()
         ).hexdigest()
 
     @staticmethod
@@ -43230,7 +43357,9 @@ class _FleetHomeV2ServerAuthorityPort(FleetHomeV2AuthorityPort):
             runtime_skill_profile=marker.get(_FLEET_RUNTIME_SKILL_PROFILE_FIELD),
         )
 
-    def observe_current(self, agent_id: str) -> tuple[Any, AgentDescriptor | None, list[dict[str, Any]] | None]:
+    def observe_current(
+        self, agent_id: str
+    ) -> tuple[Any, AgentDescriptor | None, list[dict[str, Any]] | None]:
         """One registry/lease/process observation, reused by quiescence validation."""
 
         service = current_fleet_service()
@@ -43285,7 +43414,9 @@ class _FleetHomeV2ServerQuiescencePort(FleetHomeV2QuiescencePort):
         from codex_master.fleet_home_v2_cutover import FleetHomeV2Quiescence
 
         self._generation += 1
-        current, descriptor, processes = self._authority_port.observe_current(authority.agent_id)
+        current, descriptor, processes = self._authority_port.observe_current(
+            authority.agent_id
+        )
         if current is None or descriptor is None:
             return FleetHomeV2Quiescence(
                 authority.agent_id,
@@ -43369,7 +43500,10 @@ def fleet_home_v2_cutover_operation(
                 raise AgentError("fleet_home_v2_cutover_failed")
             return service.plan(target_ids)
         if operation in {"apply", "verify", "recover", "rollback"}:
-            if not isinstance(plan_handle, FleetHomeV2PlanHandle) or target_ids is not None:
+            if (
+                not isinstance(plan_handle, FleetHomeV2PlanHandle)
+                or target_ids is not None
+            ):
                 raise AgentError("fleet_home_v2_cutover_failed")
             return getattr(service, operation)(plan_handle)
     except FleetHomeV2CutoverError as exc:

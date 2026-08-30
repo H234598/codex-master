@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import ctypes
+from dataclasses import dataclass
 import errno
 import hashlib
 import json
@@ -21,7 +22,11 @@ _RUNTIME_PROCESS_SOURCE = Path(__file__).resolve().parents[1] / "src"
 if not _RUNTIME_PROCESS_SOURCE.is_dir():
     raise SystemExit("runtime_process_source_missing")
 sys.path.insert(0, os.fspath(_RUNTIME_PROCESS_SOURCE))
-from codex_master.runtime_process import DEFAULT_STDERR_LIMIT, BoundedProcessError, run_bounded  # noqa: E402
+from codex_master.runtime_process import (  # noqa: E402
+    DEFAULT_STDERR_LIMIT,
+    BoundedProcessError,
+    run_bounded,
+)
 
 
 _RUNTIME_ROOT_NAME = "codex-master-runtime"
@@ -30,8 +35,15 @@ _MAX_STAGE_DIAGNOSTIC_BYTES = 256 * 1024
 _MAX_MANIFEST_BYTES = 512 * 1024
 _MANIFEST_NAME = ".codex-master-runtime-manifest.json"
 _MANIFEST_SCHEMA_VERSION = 1
-_LEGACY_PROBE_MANIFEST_DIGEST = "723416595c8c8eec8c68d3021964d01014652abb8300a39a511d32e6976f7802"
-_LEGACY_LIBEXEC_DIGEST = "eda064e0df15689218e45d4a3460c26c8007ad097edc3101b20302038f3c262f"
+# Provenance: canonical 23510da legacy probe payload.  The focused regression
+# test reconstructs the former installer contract from that revision; runtime
+# cleanup remains fully static and never invokes Git or a checkout.
+_LEGACY_PROBE_MANIFEST_DIGEST = (
+    "723416595c8c8eec8c68d3021964d01014652abb8300a39a511d32e6976f7802"
+)
+_LEGACY_LIBEXEC_DIGEST = (
+    "eda064e0df15689218e45d4a3460c26c8007ad097edc3101b20302038f3c262f"
+)
 _LEGACY_LIBEXEC_SIZE = 520
 _UNIT_NAMES = (
     "codex-master-hive-hourly-probe.service",
@@ -60,6 +72,15 @@ _RUNTIME_IMAGE_TREES = (
 
 class InstallError(Exception):
     pass
+
+
+@dataclass(slots=True)
+class _LegacyCleanupEntry:
+    parent_fd: int
+    name: str
+    kind: str
+    identity: tuple[int, int, str]
+    root_fd: int | None = None
 
 
 def _directory(path: Path, *, mode: int, create: bool) -> None:
@@ -132,8 +153,22 @@ def _source_bytes(path: Path) -> bytes:
     if (
         not data
         or len(data) > _MAX_SOURCE_BYTES
-        or (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_nlink, before.st_size)
-        != (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_nlink, after.st_size)
+        or (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_uid,
+            before.st_nlink,
+            before.st_size,
+        )
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_nlink,
+            after.st_size,
+        )
     ):
         raise InstallError("install_source_untrusted")
     return data
@@ -161,12 +196,16 @@ def _install_regular(source: Path, target: Path, *, mode: int) -> None:
         existing = None
     except OSError as exc:
         raise InstallError("install_target_untrusted") from exc
-    if existing is not None and (stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)):
+    if existing is not None and (
+        stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
+    ):
         raise InstallError("install_target_untrusted")
     descriptor = -1
     temporary = Path()
     try:
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", dir=target.parent
+        )
         temporary = Path(temporary_name)
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
@@ -209,7 +248,9 @@ def _install_tree(source_root: Path, target_root: Path) -> None:
         _child_directory(target_root, tuple(relative_directory.parts), mode=0o700)
         for name in child_directories:
             _source_directory(current / name)
-        child_directories[:] = [name for name in child_directories if name != "__pycache__"]
+        child_directories[:] = [
+            name for name in child_directories if name != "__pycache__"
+        ]
         for name in sorted(file_names):
             source = current / name
             target = target_root / relative_directory / name
@@ -222,7 +263,10 @@ def _install_tree(source_root: Path, target_root: Path) -> None:
 def _fsync_directory(path: Path) -> None:
     descriptor = -1
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
         os.fsync(descriptor)
     except OSError as exc:
         raise InstallError("install_fsync_failed") from exc
@@ -245,7 +289,9 @@ def _build_runtime_image(*, repository: Path, stage: Path) -> None:
     _directory(stage, mode=0o700, create=False)
     for source_name, target_name, mode in _RUNTIME_IMAGE_FILES:
         target = stage / target_name
-        _child_directory(stage, tuple(target.parent.relative_to(stage).parts), mode=0o700)
+        _child_directory(
+            stage, tuple(target.parent.relative_to(stage).parts), mode=0o700
+        )
         _install_regular(repository / source_name, target, mode=mode)
     for source_name, target_name in _RUNTIME_IMAGE_TREES:
         target = stage / target_name
@@ -271,9 +317,7 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
             )
         except BoundedProcessError as exc:
             raise InstallError("install_stage_validation_failed") from exc
-        if (
-            completed.returncode != 0
-        ):
+        if completed.returncode != 0:
             raise InstallError("install_stage_validation_failed")
         try:
             payload = json.loads(completed.stdout)
@@ -287,7 +331,10 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
 
 def _canonical_json(value: object) -> bytes:
     try:
-        return (json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+        return (
+            json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("ascii")
     except (TypeError, ValueError, RecursionError) as exc:
         raise InstallError("install_target_untrusted") from exc
 
@@ -340,7 +387,9 @@ def _open_absolute_directory(path: Path, *, error_code: str) -> int:
             os.close(descriptor)
 
 
-def _open_directory_at(parent_fd: int, name: str, *, error_code: str) -> tuple[int, os.stat_result]:
+def _open_directory_at(
+    parent_fd: int, name: str, *, error_code: str
+) -> tuple[int, os.stat_result]:
     _relative_name(name)
     descriptor = -1
     retained = False
@@ -358,8 +407,20 @@ def _open_directory_at(parent_fd: int, name: str, *, error_code: str) -> tuple[i
         if (
             stat.S_ISLNK(expected.st_mode)
             or not stat.S_ISDIR(expected.st_mode)
-            or (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink)
-            != (expected.st_dev, expected.st_ino, expected.st_mode, expected.st_uid, expected.st_nlink)
+            or (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_uid,
+                opened.st_nlink,
+            )
+            != (
+                expected.st_dev,
+                expected.st_ino,
+                expected.st_mode,
+                expected.st_uid,
+                expected.st_nlink,
+            )
         ):
             raise InstallError(error_code)
         retained = True
@@ -373,7 +434,9 @@ def _open_directory_at(parent_fd: int, name: str, *, error_code: str) -> tuple[i
             os.close(descriptor)
 
 
-def _read_regular_at(parent_fd: int, name: str, *, max_bytes: int, error_code: str) -> tuple[bytes, os.stat_result]:
+def _read_regular_at(
+    parent_fd: int, name: str, *, max_bytes: int, error_code: str
+) -> tuple[bytes, os.stat_result]:
     _relative_name(name)
     descriptor = -1
     try:
@@ -390,8 +453,22 @@ def _read_regular_at(parent_fd: int, name: str, *, max_bytes: int, error_code: s
             or before.st_uid != os.geteuid()
             or before.st_size <= 0
             or before.st_size > max_bytes
-            or (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_nlink, before.st_size)
-            != (expected.st_dev, expected.st_ino, expected.st_mode, expected.st_uid, expected.st_nlink, expected.st_size)
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_nlink,
+                before.st_size,
+            )
+            != (
+                expected.st_dev,
+                expected.st_ino,
+                expected.st_mode,
+                expected.st_uid,
+                expected.st_nlink,
+                expected.st_size,
+            )
         ):
             raise InstallError(error_code)
         chunks: list[bytes] = []
@@ -407,8 +484,22 @@ def _read_regular_at(parent_fd: int, name: str, *, max_bytes: int, error_code: s
         if (
             len(raw) != before.st_size
             or len(raw) > max_bytes
-            or (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_nlink, before.st_size)
-            != (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_nlink, after.st_size)
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_nlink,
+                before.st_size,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_nlink,
+                after.st_size,
+            )
         ):
             raise InstallError(error_code)
         return raw, after
@@ -430,7 +521,10 @@ def _runtime_manifest_payload(root: Path) -> dict[str, object]:
         _source_directory(current)
         relative = current.relative_to(root).as_posix() if current != root else "."
         current_stat = current.lstat()
-        directories[relative] = {"mode": stat.S_IMODE(current_stat.st_mode), "nlink": current_stat.st_nlink}
+        directories[relative] = {
+            "mode": stat.S_IMODE(current_stat.st_mode),
+            "nlink": current_stat.st_nlink,
+        }
         child_directories[:] = sorted(child_directories)
         for name in child_directories:
             _source_directory(current / name)
@@ -445,7 +539,11 @@ def _runtime_manifest_payload(root: Path) -> dict[str, object]:
                 "size": len(raw),
                 "sha256": hashlib.sha256(raw).hexdigest(),
             }
-    return {"schema_version": _MANIFEST_SCHEMA_VERSION, "directories": directories, "files": files}
+    return {
+        "schema_version": _MANIFEST_SCHEMA_VERSION,
+        "directories": directories,
+        "files": files,
+    }
 
 
 def _write_runtime_image_manifest(*, root: Path) -> None:
@@ -455,7 +553,9 @@ def _write_runtime_image_manifest(*, root: Path) -> None:
     descriptor = -1
     temporary = Path()
     try:
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{_MANIFEST_NAME}.", dir=root)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{_MANIFEST_NAME}.", dir=root
+        )
         temporary = Path(temporary_name)
         os.fchmod(descriptor, 0o644)
         with os.fdopen(descriptor, "wb") as handle:
@@ -475,8 +575,12 @@ def _write_runtime_image_manifest(*, root: Path) -> None:
                 temporary.unlink()
 
 
-def _validated_manifest(root_fd: int, *, error_code: str) -> tuple[dict[str, object], bytes]:
-    raw, item = _read_regular_at(root_fd, _MANIFEST_NAME, max_bytes=_MAX_MANIFEST_BYTES, error_code=error_code)
+def _validated_manifest(
+    root_fd: int, *, error_code: str
+) -> tuple[dict[str, object], bytes]:
+    raw, item = _read_regular_at(
+        root_fd, _MANIFEST_NAME, max_bytes=_MAX_MANIFEST_BYTES, error_code=error_code
+    )
     if stat.S_IMODE(item.st_mode) != 0o644:
         raise InstallError(error_code)
     try:
@@ -485,23 +589,38 @@ def _validated_manifest(root_fd: int, *, error_code: str) -> tuple[dict[str, obj
         raise InstallError(error_code) from exc
     if not isinstance(payload, dict) or raw != _canonical_json(payload):
         raise InstallError(error_code)
-    if frozenset(payload) != {"schema_version", "directories", "files"} or payload.get("schema_version") != _MANIFEST_SCHEMA_VERSION:
+    if (
+        frozenset(payload) != {"schema_version", "directories", "files"}
+        or payload.get("schema_version") != _MANIFEST_SCHEMA_VERSION
+    ):
         raise InstallError(error_code)
     directories = payload.get("directories")
     files = payload.get("files")
-    if not isinstance(directories, dict) or not isinstance(files, dict) or "." not in directories:
+    if (
+        not isinstance(directories, dict)
+        or not isinstance(files, dict)
+        or "." not in directories
+    ):
         raise InstallError(error_code)
     for name, details in directories.items():
         _relative_name(name, root_allowed=True)
         if not isinstance(details, dict) or frozenset(details) != {"mode", "nlink"}:
             raise InstallError(error_code)
-        if details.get("mode") != 0o700 or type(details.get("nlink")) is not int or details["nlink"] < 2:
+        if (
+            details.get("mode") != 0o700
+            or type(details.get("nlink")) is not int
+            or details["nlink"] < 2
+        ):
             raise InstallError(error_code)
         if name != "." and "/" in name and name.rsplit("/", 1)[0] not in directories:
             raise InstallError(error_code)
     for name, details in files.items():
         _relative_name(name)
-        if name == _MANIFEST_NAME or not isinstance(details, dict) or frozenset(details) != {"mode", "nlink", "size", "sha256"}:
+        if (
+            name == _MANIFEST_NAME
+            or not isinstance(details, dict)
+            or frozenset(details) != {"mode", "nlink", "size", "sha256"}
+        ):
             raise InstallError(error_code)
         parent = name.rsplit("/", 1)[0] if "/" in name else "."
         if parent not in directories:
@@ -520,7 +639,9 @@ def _validated_manifest(root_fd: int, *, error_code: str) -> tuple[dict[str, obj
     return payload, raw
 
 
-def _validate_manifest_tree(root_fd: int, payload: dict[str, object], manifest_raw: bytes, *, error_code: str) -> None:
+def _validate_manifest_tree(
+    root_fd: int, payload: dict[str, object], manifest_raw: bytes, *, error_code: str
+) -> None:
     directories = payload["directories"]
     files = payload["files"]
     assert isinstance(directories, dict) and isinstance(files, dict)
@@ -537,9 +658,17 @@ def _validate_manifest_tree(root_fd: int, payload: dict[str, object], manifest_r
                 item = entry.stat(follow_symlinks=False)
                 if stat.S_ISDIR(item.st_mode):
                     details = directories.get(relative)
-                    if not isinstance(details, dict) or stat.S_ISLNK(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != details.get("mode") or item.st_nlink != details.get("nlink"):
+                    if (
+                        not isinstance(details, dict)
+                        or stat.S_ISLNK(item.st_mode)
+                        or item.st_uid != os.geteuid()
+                        or stat.S_IMODE(item.st_mode) != details.get("mode")
+                        or item.st_nlink != details.get("nlink")
+                    ):
                         raise InstallError(error_code)
-                    child_fd, _opened = _open_directory_at(directory_fd, name, error_code=error_code)
+                    child_fd, _opened = _open_directory_at(
+                        directory_fd, name, error_code=error_code
+                    )
                     try:
                         observed_directories.add(relative)
                         walk(child_fd, relative)
@@ -549,14 +678,27 @@ def _validate_manifest_tree(root_fd: int, payload: dict[str, object], manifest_r
                 if not stat.S_ISREG(item.st_mode) or stat.S_ISLNK(item.st_mode):
                     raise InstallError(error_code)
                 if relative == _MANIFEST_NAME:
-                    raw, manifest_item = _read_regular_at(directory_fd, name, max_bytes=_MAX_MANIFEST_BYTES, error_code=error_code)
-                    if stat.S_IMODE(manifest_item.st_mode) != 0o644 or raw != manifest_raw:
+                    raw, manifest_item = _read_regular_at(
+                        directory_fd,
+                        name,
+                        max_bytes=_MAX_MANIFEST_BYTES,
+                        error_code=error_code,
+                    )
+                    if (
+                        stat.S_IMODE(manifest_item.st_mode) != 0o644
+                        or raw != manifest_raw
+                    ):
                         raise InstallError(error_code)
                     continue
                 details = files.get(relative)
                 if not isinstance(details, dict):
                     raise InstallError(error_code)
-                raw, opened = _read_regular_at(directory_fd, name, max_bytes=_MAX_SOURCE_BYTES, error_code=error_code)
+                raw, opened = _read_regular_at(
+                    directory_fd,
+                    name,
+                    max_bytes=_MAX_SOURCE_BYTES,
+                    error_code=error_code,
+                )
                 if (
                     stat.S_IMODE(opened.st_mode) != details.get("mode")
                     or opened.st_nlink != details.get("nlink")
@@ -568,23 +710,38 @@ def _validate_manifest_tree(root_fd: int, payload: dict[str, object], manifest_r
 
     root_details = directories.get(".")
     root_stat = os.fstat(root_fd)
-    if not isinstance(root_details, dict) or root_stat.st_uid != os.geteuid() or stat.S_IMODE(root_stat.st_mode) != root_details.get("mode") or root_stat.st_nlink != root_details.get("nlink"):
+    if (
+        not isinstance(root_details, dict)
+        or root_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(root_stat.st_mode) != root_details.get("mode")
+        or root_stat.st_nlink != root_details.get("nlink")
+    ):
         raise InstallError(error_code)
     walk(root_fd, "")
     if observed_directories != set(directories) or observed_files != set(files):
         raise InstallError(error_code)
 
 
-def _validated_image_at(parent_fd: int, name: str, *, error_code: str) -> tuple[int, int, str]:
+def _validated_image_at(
+    parent_fd: int, name: str, *, error_code: str
+) -> tuple[int, int, str]:
     root_fd = -1
     try:
         root_fd, root_stat = _open_directory_at(parent_fd, name, error_code=error_code)
-        if root_stat.st_uid != os.geteuid() or stat.S_IMODE(root_stat.st_mode) != 0o700 or root_stat.st_nlink < 2:
+        if (
+            root_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(root_stat.st_mode) != 0o700
+            or root_stat.st_nlink < 2
+        ):
             raise InstallError(error_code)
         manifest, raw = _validated_manifest(root_fd, error_code=error_code)
         _validate_manifest_tree(root_fd, manifest, raw, error_code=error_code)
         final_stat = os.fstat(root_fd)
-        if (final_stat.st_dev, final_stat.st_ino, final_stat.st_nlink) != (root_stat.st_dev, root_stat.st_ino, root_stat.st_nlink):
+        if (final_stat.st_dev, final_stat.st_ino, final_stat.st_nlink) != (
+            root_stat.st_dev,
+            root_stat.st_ino,
+            root_stat.st_nlink,
+        ):
             raise InstallError(error_code)
         return root_stat.st_dev, root_stat.st_ino, hashlib.sha256(raw).hexdigest()
     finally:
@@ -597,9 +754,20 @@ def _rename_exchange(parent_fd: int, stage_name: str, target_name: str) -> None:
     renameat2 = getattr(library, "renameat2", None)
     if renameat2 is None:
         raise InstallError("install_swap_unavailable")
-    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
     renameat2.restype = ctypes.c_int
-    if renameat2(parent_fd, os.fsencode(stage_name), parent_fd, os.fsencode(target_name), 2) != 0:
+    if (
+        renameat2(
+            parent_fd, os.fsencode(stage_name), parent_fd, os.fsencode(target_name), 2
+        )
+        != 0
+    ):
         error = ctypes.get_errno()
         if error in {errno.ENOSYS, errno.EINVAL}:
             raise InstallError("install_swap_unavailable")
@@ -612,7 +780,9 @@ def _open_relative_directory(root_fd: int, relative: str, *, error_code: str) ->
         if relative == ".":
             return descriptor
         for part in _relative_name(relative).split("/"):
-            next_descriptor, _item = _open_directory_at(descriptor, part, error_code=error_code)
+            next_descriptor, _item = _open_directory_at(
+                descriptor, part, error_code=error_code
+            )
             os.close(descriptor)
             descriptor = next_descriptor
         return descriptor
@@ -621,72 +791,282 @@ def _open_relative_directory(root_fd: int, relative: str, *, error_code: str) ->
         raise
 
 
-def _remove_validated_image(parent_fd: int, name: str, identity: tuple[int, int, str]) -> None:
-    if _validated_image_at(parent_fd, name, error_code="install_old_image_changed") != identity:
-        raise InstallError("install_old_image_changed")
-    root_fd, _root_stat = _open_directory_at(parent_fd, name, error_code="install_old_image_changed")
+def _open_bound_image_root(
+    parent_fd: int, name: str, identity: tuple[int, int, str], *, error_code: str
+) -> tuple[int, dict[str, object], bytes]:
+    """Reopen one image root only when name, inode and manifest still agree."""
+
+    root_fd = -1
+    retained = False
     try:
-        manifest, raw = _validated_manifest(root_fd, error_code="install_old_image_changed")
+        root_fd, root_stat = _open_directory_at(parent_fd, name, error_code=error_code)
+        if (root_stat.st_dev, root_stat.st_ino) != identity[:2]:
+            raise InstallError(error_code)
+        manifest, raw = _validated_manifest(root_fd, error_code=error_code)
         if hashlib.sha256(raw).hexdigest() != identity[2]:
-            raise InstallError("install_old_image_changed")
+            raise InstallError(error_code)
+        _validate_manifest_tree(root_fd, manifest, raw, error_code=error_code)
+        final_stat = os.fstat(root_fd)
+        if (final_stat.st_dev, final_stat.st_ino) != identity[:2]:
+            raise InstallError(error_code)
+        retained = True
+        return root_fd, manifest, raw
+    finally:
+        if root_fd >= 0 and not retained:
+            os.close(root_fd)
+
+
+def _cleanup_directory_fds(
+    root_fd: int, directories: dict[str, object], *, error_code: str
+) -> dict[str, int]:
+    """Pin every manifest directory before destructive child operations."""
+
+    descriptors = {".": os.dup(root_fd)}
+    try:
+        for relative in sorted(name for name in directories if name != "."):
+            parent = relative.rsplit("/", 1)[0] if "/" in relative else "."
+            base = relative.rsplit("/", 1)[-1]
+            parent_fd = descriptors[parent]
+            descriptor, item = _open_directory_at(
+                parent_fd, base, error_code=error_code
+            )
+            expected = directories[relative]
+            if (
+                not isinstance(expected, dict)
+                or item.st_uid != os.geteuid()
+                or stat.S_IMODE(item.st_mode) != expected.get("mode")
+                or item.st_nlink != expected.get("nlink")
+            ):
+                os.close(descriptor)
+                raise InstallError(error_code)
+            descriptors[relative] = descriptor
+        return descriptors
+    except Exception:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+        raise
+
+
+def _close_directory_fds(descriptors: dict[str, int]) -> None:
+    for descriptor in descriptors.values():
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+
+
+def _unlink_verified_regular_at(
+    parent_fd: int,
+    name: str,
+    details: dict[str, object],
+    *,
+    max_bytes: int,
+    error_code: str,
+) -> None:
+    """Verify the no-follow object in this exact parent FD immediately before unlink."""
+
+    _relative_name(name)
+    descriptor = -1
+    try:
+        named_before = os.lstat(name, dir_fd=parent_fd)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != details.get("nlink")
+            or stat.S_IMODE(opened.st_mode) != details.get("mode")
+            or opened.st_size != details.get("size")
+            or (
+                named_before.st_dev,
+                named_before.st_ino,
+                named_before.st_mode,
+                named_before.st_uid,
+                named_before.st_nlink,
+                named_before.st_size,
+            )
+            != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_uid,
+                opened.st_nlink,
+                opened.st_size,
+            )
+        ):
+            raise InstallError(error_code)
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        final_stat = os.fstat(descriptor)
+        named_final = os.lstat(name, dir_fd=parent_fd)
+        if (
+            len(content) != opened.st_size
+            or len(content) > max_bytes
+            or hashlib.sha256(content).hexdigest() != details.get("sha256")
+            or (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_uid,
+                opened.st_nlink,
+                opened.st_size,
+            )
+            != (
+                final_stat.st_dev,
+                final_stat.st_ino,
+                final_stat.st_mode,
+                final_stat.st_uid,
+                final_stat.st_nlink,
+                final_stat.st_size,
+            )
+            or (
+                named_final.st_dev,
+                named_final.st_ino,
+                named_final.st_mode,
+                named_final.st_uid,
+                named_final.st_nlink,
+                named_final.st_size,
+            )
+            != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_uid,
+                opened.st_nlink,
+                opened.st_size,
+            )
+        ):
+            raise InstallError(error_code)
+        os.unlink(name, dir_fd=parent_fd)
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError(error_code) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _rmdir_bound_directory(
+    parent_fd: int, name: str, directory_fd: int, *, error_code: str
+) -> None:
+    """Refuse to remove a name unless this parent still names the pinned directory."""
+
+    try:
+        named = os.lstat(name, dir_fd=parent_fd)
+        opened = os.fstat(directory_fd)
+        if (
+            stat.S_ISLNK(named.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise InstallError(error_code)
+        os.rmdir(name, dir_fd=parent_fd)
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError(error_code) from exc
+
+
+def _remove_validated_image(
+    parent_fd: int, name: str, identity: tuple[int, int, str]
+) -> None:
+    if (
+        _validated_image_at(parent_fd, name, error_code="install_old_image_changed")
+        != identity
+    ):
+        raise InstallError("install_old_image_changed")
+    root_fd, manifest, raw = _open_bound_image_root(
+        parent_fd, name, identity, error_code="install_old_image_changed"
+    )
+    descriptors: dict[str, int] = {}
+    try:
         files = manifest["files"]
         directories = manifest["directories"]
         assert isinstance(files, dict) and isinstance(directories, dict)
-        for relative in sorted(files, key=lambda item: (item.count("/"), item), reverse=True):
+        descriptors = _cleanup_directory_fds(
+            root_fd, directories, error_code="install_old_image_changed"
+        )
+        for relative in sorted(
+            files, key=lambda item: (item.count("/"), item), reverse=True
+        ):
             parent = relative.rsplit("/", 1)[0] if "/" in relative else "."
             base = relative.rsplit("/", 1)[-1]
-            directory_fd = _open_relative_directory(root_fd, parent, error_code="install_old_image_changed")
-            try:
-                content, item = _read_regular_at(directory_fd, base, max_bytes=_MAX_SOURCE_BYTES, error_code="install_old_image_changed")
-                details = files[relative]
-                if not isinstance(details, dict) or stat.S_IMODE(item.st_mode) != details.get("mode") or item.st_size != details.get("size") or hashlib.sha256(content).hexdigest() != details.get("sha256"):
-                    raise InstallError("install_old_image_changed")
-                os.unlink(base, dir_fd=directory_fd)
-            except OSError as exc:
-                raise InstallError("install_old_image_changed") from exc
-            finally:
-                os.close(directory_fd)
-        manifest_content, manifest_item = _read_regular_at(root_fd, _MANIFEST_NAME, max_bytes=_MAX_MANIFEST_BYTES, error_code="install_old_image_changed")
-        if stat.S_IMODE(manifest_item.st_mode) != 0o644 or hashlib.sha256(manifest_content).hexdigest() != identity[2]:
-            raise InstallError("install_old_image_changed")
-        os.unlink(_MANIFEST_NAME, dir_fd=root_fd)
-        for relative in sorted((name for name in directories if name != "."), key=lambda item: (item.count("/"), item), reverse=True):
+            details = files[relative]
+            if not isinstance(details, dict):
+                raise InstallError("install_old_image_changed")
+            _unlink_verified_regular_at(
+                descriptors[parent],
+                base,
+                details,
+                max_bytes=_MAX_SOURCE_BYTES,
+                error_code="install_old_image_changed",
+            )
+        _unlink_verified_regular_at(
+            descriptors["."],
+            _MANIFEST_NAME,
+            {
+                "mode": 0o644,
+                "nlink": 1,
+                "size": len(raw),
+                "sha256": identity[2],
+            },
+            max_bytes=_MAX_MANIFEST_BYTES,
+            error_code="install_old_image_changed",
+        )
+        for relative in sorted(
+            (item for item in directories if item != "."),
+            key=lambda item: (item.count("/"), item),
+            reverse=True,
+        ):
             parent = relative.rsplit("/", 1)[0] if "/" in relative else "."
-            base = relative.rsplit("/", 1)[-1]
-            directory_fd = _open_relative_directory(root_fd, parent, error_code="install_old_image_changed")
-            try:
-                item = os.lstat(base, dir_fd=directory_fd)
-                if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o700:
-                    raise InstallError("install_old_image_changed")
-                os.rmdir(base, dir_fd=directory_fd)
-            except OSError as exc:
-                raise InstallError("install_old_image_changed") from exc
-            finally:
-                os.close(directory_fd)
+            _rmdir_bound_directory(
+                descriptors[parent],
+                relative.rsplit("/", 1)[-1],
+                descriptors[relative],
+                error_code="install_old_image_changed",
+            )
+        _rmdir_bound_directory(
+            parent_fd, name, root_fd, error_code="install_old_image_changed"
+        )
     finally:
+        _close_directory_fds(descriptors)
         os.close(root_fd)
-    try:
-        os.rmdir(name, dir_fd=parent_fd)
-    except OSError as exc:
-        raise InstallError("install_old_image_changed") from exc
 
 
 def _publish_runtime_image(*, stage: Path, target: Path) -> None:
-    if stage.parent != target.parent or not stage.name.startswith(f".{_RUNTIME_ROOT_NAME}.stage."):
+    if stage.parent != target.parent or not stage.name.startswith(
+        f".{_RUNTIME_ROOT_NAME}.stage."
+    ):
         raise InstallError("install_stage_untrusted")
-    parent_fd = _open_absolute_directory(target.parent, error_code="install_target_untrusted")
+    parent_fd = _open_absolute_directory(
+        target.parent, error_code="install_target_untrusted"
+    )
     try:
         _validated_image_at(parent_fd, stage.name, error_code="install_stage_untrusted")
         try:
             os.lstat(target.name, dir_fd=parent_fd)
         except FileNotFoundError:
             try:
-                os.rename(stage.name, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                os.rename(
+                    stage.name, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+                )
             except OSError as exc:
                 raise InstallError("install_swap_failed") from exc
             os.fsync(parent_fd)
             return
-        previous_identity = _validated_image_at(parent_fd, target.name, error_code="install_target_untrusted")
+        previous_identity = _validated_image_at(
+            parent_fd, target.name, error_code="install_target_untrusted"
+        )
         _rename_exchange(parent_fd, stage.name, target.name)
         os.fsync(parent_fd)
         _remove_validated_image(parent_fd, stage.name, previous_identity)
@@ -709,9 +1089,15 @@ def _legacy_probe_payload(root_fd: int) -> dict[str, object]:
                 relative = f"{prefix}/{name}" if prefix else name
                 item = entry.stat(follow_symlinks=False)
                 if stat.S_ISDIR(item.st_mode):
-                    if stat.S_ISLNK(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o700:
+                    if (
+                        stat.S_ISLNK(item.st_mode)
+                        or item.st_uid != os.geteuid()
+                        or stat.S_IMODE(item.st_mode) != 0o700
+                    ):
                         raise InstallError("install_legacy_untrusted")
-                    child_fd, _opened = _open_directory_at(directory_fd, name, error_code="install_legacy_untrusted")
+                    child_fd, _opened = _open_directory_at(
+                        directory_fd, name, error_code="install_legacy_untrusted"
+                    )
                     try:
                         directories.add(relative)
                         walk(child_fd, relative)
@@ -720,7 +1106,12 @@ def _legacy_probe_payload(root_fd: int) -> dict[str, object]:
                     continue
                 if not stat.S_ISREG(item.st_mode) or stat.S_ISLNK(item.st_mode):
                     raise InstallError("install_legacy_untrusted")
-                raw, opened = _read_regular_at(directory_fd, name, max_bytes=_MAX_SOURCE_BYTES, error_code="install_legacy_untrusted")
+                raw, opened = _read_regular_at(
+                    directory_fd,
+                    name,
+                    max_bytes=_MAX_SOURCE_BYTES,
+                    error_code="install_legacy_untrusted",
+                )
                 mode = stat.S_IMODE(opened.st_mode)
                 if mode not in {0o644, 0o755}:
                     raise InstallError("install_legacy_untrusted")
@@ -732,7 +1123,13 @@ def _legacy_probe_payload(root_fd: int) -> dict[str, object]:
                 }
 
     root = os.fstat(root_fd)
-    if stat.S_ISLNK(root.st_mode) or not stat.S_ISDIR(root.st_mode) or root.st_uid != os.geteuid() or stat.S_IMODE(root.st_mode) != 0o700 or root.st_nlink < 2:
+    if (
+        stat.S_ISLNK(root.st_mode)
+        or not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != os.geteuid()
+        or stat.S_IMODE(root.st_mode) != 0o700
+        or root.st_nlink < 2
+    ):
         raise InstallError("install_legacy_untrusted")
     walk(root_fd, "")
     return {"schema_version": 1, "directories": sorted(directories), "files": files}
@@ -741,11 +1138,17 @@ def _legacy_probe_payload(root_fd: int) -> dict[str, object]:
 def _validated_legacy_probe_root(parent_fd: int, name: str) -> tuple[int, int, str]:
     root_fd = -1
     try:
-        root_fd, root = _open_directory_at(parent_fd, name, error_code="install_legacy_untrusted")
+        root_fd, root = _open_directory_at(
+            parent_fd, name, error_code="install_legacy_untrusted"
+        )
         payload = _legacy_probe_payload(root_fd)
         encoded = _canonical_json(payload)
         digest = hashlib.sha256(encoded).hexdigest()
-        if digest != _LEGACY_PROBE_MANIFEST_DIGEST or len(payload["directories"]) != 6 or len(payload["files"]) != 143:
+        if (
+            digest != _LEGACY_PROBE_MANIFEST_DIGEST
+            or len(payload["directories"]) != 6
+            or len(payload["files"]) != 143
+        ):
             raise InstallError("install_legacy_untrusted")
         return root.st_dev, root.st_ino, digest
     finally:
@@ -754,13 +1157,24 @@ def _validated_legacy_probe_root(parent_fd: int, name: str) -> tuple[int, int, s
 
 
 def _validated_legacy_libexec(parent_fd: int, name: str) -> tuple[int, int, str]:
-    raw, item = _read_regular_at(parent_fd, name, max_bytes=_MAX_SOURCE_BYTES, error_code="install_legacy_untrusted")
-    if stat.S_IMODE(item.st_mode) != 0o755 or item.st_size != _LEGACY_LIBEXEC_SIZE or hashlib.sha256(raw).hexdigest() != _LEGACY_LIBEXEC_DIGEST:
+    raw, item = _read_regular_at(
+        parent_fd,
+        name,
+        max_bytes=_MAX_SOURCE_BYTES,
+        error_code="install_legacy_untrusted",
+    )
+    if (
+        stat.S_IMODE(item.st_mode) != 0o755
+        or item.st_size != _LEGACY_LIBEXEC_SIZE
+        or hashlib.sha256(raw).hexdigest() != _LEGACY_LIBEXEC_DIGEST
+    ):
         raise InstallError("install_legacy_untrusted")
     return item.st_dev, item.st_ino, _LEGACY_LIBEXEC_DIGEST
 
 
-def _validated_legacy_bin(parent_fd: int, name: str, *, repository: Path) -> tuple[int, int, str]:
+def _validated_legacy_bin(
+    parent_fd: int, name: str, *, repository: Path
+) -> tuple[int, int, str]:
     try:
         item = os.lstat(name, dir_fd=parent_fd)
         target = os.readlink(name, dir_fd=parent_fd)
@@ -778,14 +1192,30 @@ def _validated_legacy_bin(parent_fd: int, name: str, *, repository: Path) -> tup
     return item.st_dev, item.st_ino, hashlib.sha256(target.encode("utf-8")).hexdigest()
 
 
-def _preflight_legacy_paths(*, library: Path, libexec: Path, user_bin: Path, repository: Path) -> tuple[tuple[Path, str, str, tuple[int, int, str]], ...]:
-    entries: list[tuple[Path, str, str, tuple[int, int, str]]] = []
+def _close_legacy_cleanup_entries(entries: tuple[_LegacyCleanupEntry, ...]) -> None:
+    for entry in entries:
+        if entry.root_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(entry.root_fd)
+            entry.root_fd = None
+        if entry.parent_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(entry.parent_fd)
+            entry.parent_fd = -1
+
+
+def _preflight_legacy_paths(
+    *, library: Path, libexec: Path, user_bin: Path, repository: Path
+) -> tuple[_LegacyCleanupEntry, ...]:
+    entries: list[_LegacyCleanupEntry] = []
     for parent, name, kind in (
         (library, "codex-master-hive-probe", "probe_root"),
         (libexec, "codex_master_hive_hourly_probe.py", "libexec"),
         (user_bin, "codex-master-mcp", "bin"),
     ):
-        parent_fd = _open_absolute_directory(parent, error_code="install_legacy_untrusted")
+        parent_fd = _open_absolute_directory(
+            parent, error_code="install_legacy_untrusted"
+        )
         try:
             try:
                 os.lstat(name, dir_fd=parent_fd)
@@ -797,77 +1227,175 @@ def _preflight_legacy_paths(*, library: Path, libexec: Path, user_bin: Path, rep
                 identity = _validated_legacy_libexec(parent_fd, name)
             else:
                 identity = _validated_legacy_bin(parent_fd, name, repository=repository)
-            entries.append((parent, name, kind, identity))
+            root_fd: int | None = None
+            if kind == "probe_root":
+                root_fd, root_stat = _open_directory_at(
+                    parent_fd, name, error_code="install_legacy_untrusted"
+                )
+                if (root_stat.st_dev, root_stat.st_ino) != identity[:2]:
+                    os.close(root_fd)
+                    root_fd = None
+                    raise InstallError("install_legacy_untrusted")
+            entries.append(
+                _LegacyCleanupEntry(parent_fd, name, kind, identity, root_fd)
+            )
+            parent_fd = -1
+        except Exception:
+            _close_legacy_cleanup_entries(tuple(entries))
+            raise
         finally:
-            os.close(parent_fd)
+            if parent_fd >= 0:
+                os.close(parent_fd)
     return tuple(entries)
 
 
-def _remove_legacy_probe_root(parent_fd: int, name: str, identity: tuple[int, int, str]) -> None:
+def _open_bound_legacy_probe_root(
+    parent_fd: int, name: str, identity: tuple[int, int, str], *, error_code: str
+) -> int:
+    root_fd = -1
+    retained = False
+    try:
+        root_fd, root = _open_directory_at(parent_fd, name, error_code=error_code)
+        if (root.st_dev, root.st_ino) != identity[:2]:
+            raise InstallError(error_code)
+        payload = _legacy_probe_payload(root_fd)
+        digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
+        if digest != identity[2]:
+            raise InstallError(error_code)
+        retained = True
+        return root_fd
+    finally:
+        if root_fd >= 0 and not retained:
+            os.close(root_fd)
+
+
+def _legacy_cleanup_directory_fds(
+    root_fd: int, directories: list[object], *, error_code: str
+) -> dict[str, int]:
+    descriptors = {".": os.dup(root_fd)}
+    try:
+        names = [item for item in directories if isinstance(item, str) and item != "."]
+        if len(names) != len(directories) - 1:
+            raise InstallError(error_code)
+        for relative in sorted(names):
+            parent = relative.rsplit("/", 1)[0] if "/" in relative else "."
+            descriptor, _item = _open_directory_at(
+                descriptors[parent],
+                relative.rsplit("/", 1)[-1],
+                error_code=error_code,
+            )
+            descriptors[relative] = descriptor
+        return descriptors
+    except Exception:
+        _close_directory_fds(descriptors)
+        raise
+
+
+def _remove_legacy_probe_root(
+    parent_fd: int, name: str, identity: tuple[int, int, str], root_fd: int
+) -> None:
     if _validated_legacy_probe_root(parent_fd, name) != identity:
         raise InstallError("install_legacy_cleanup_failed")
-    root_fd, _root = _open_directory_at(parent_fd, name, error_code="install_legacy_cleanup_failed")
+    rebound_fd = _open_bound_legacy_probe_root(
+        parent_fd, name, identity, error_code="install_legacy_cleanup_failed"
+    )
+    os.close(rebound_fd)
+    held_root = os.fstat(root_fd)
+    if (held_root.st_dev, held_root.st_ino) != identity[:2]:
+        raise InstallError("install_legacy_cleanup_failed")
+    descriptors: dict[str, int] = {}
     try:
         payload = _legacy_probe_payload(root_fd)
+        if hashlib.sha256(_canonical_json(payload)).hexdigest() != identity[2]:
+            raise InstallError("install_legacy_cleanup_failed")
         files = payload["files"]
         directories = payload["directories"]
         assert isinstance(files, dict) and isinstance(directories, list)
-        for relative in sorted(files, key=lambda item: (item.count("/"), item), reverse=True):
+        descriptors = _legacy_cleanup_directory_fds(
+            root_fd, directories, error_code="install_legacy_cleanup_failed"
+        )
+        for relative in sorted(
+            files, key=lambda item: (item.count("/"), item), reverse=True
+        ):
             parent = relative.rsplit("/", 1)[0] if "/" in relative else "."
             base = relative.rsplit("/", 1)[-1]
-            directory_fd = _open_relative_directory(root_fd, parent, error_code="install_legacy_cleanup_failed")
-            try:
-                raw, item = _read_regular_at(directory_fd, base, max_bytes=_MAX_SOURCE_BYTES, error_code="install_legacy_cleanup_failed")
-                expected = files[relative]
-                if not isinstance(expected, dict) or stat.S_IMODE(item.st_mode) != expected.get("mode") or item.st_size != expected.get("size") or hashlib.sha256(raw).hexdigest() != expected.get("sha256"):
-                    raise InstallError("install_legacy_cleanup_failed")
-                os.unlink(base, dir_fd=directory_fd)
-            except OSError as exc:
-                raise InstallError("install_legacy_cleanup_failed") from exc
-            finally:
-                os.close(directory_fd)
-        for relative in sorted((item for item in directories if item != "."), key=lambda item: (item.count("/"), item), reverse=True):
-            parent = relative.rsplit("/", 1)[0] if "/" in relative else "."
-            base = relative.rsplit("/", 1)[-1]
-            directory_fd = _open_relative_directory(root_fd, parent, error_code="install_legacy_cleanup_failed")
-            try:
-                item = os.lstat(base, dir_fd=directory_fd)
-                if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode) or item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o700:
-                    raise InstallError("install_legacy_cleanup_failed")
-                os.rmdir(base, dir_fd=directory_fd)
-            except OSError as exc:
-                raise InstallError("install_legacy_cleanup_failed") from exc
-            finally:
-                os.close(directory_fd)
-    finally:
-        os.close(root_fd)
-    try:
-        os.rmdir(name, dir_fd=parent_fd)
-    except OSError as exc:
-        raise InstallError("install_legacy_cleanup_failed") from exc
-
-
-def _remove_preflighted_legacy(entries: tuple[tuple[Path, str, str, tuple[int, int, str]], ...], *, repository: Path) -> None:
-    for parent, name, kind, identity in entries:
-        parent_fd = _open_absolute_directory(parent, error_code="install_legacy_cleanup_failed")
-        try:
-            if kind == "probe_root":
-                _remove_legacy_probe_root(parent_fd, name, identity)
-                continue
-            current = (
-                _validated_legacy_libexec(parent_fd, name)
-                if kind == "libexec"
-                else _validated_legacy_bin(parent_fd, name, repository=repository)
-            )
-            if current != identity:
+            expected = files[relative]
+            if not isinstance(expected, dict):
                 raise InstallError("install_legacy_cleanup_failed")
-            os.unlink(name, dir_fd=parent_fd)
-        except InstallError:
-            raise
-        except OSError as exc:
-            raise InstallError("install_legacy_cleanup_failed") from exc
-        finally:
-            os.close(parent_fd)
+            _unlink_verified_regular_at(
+                descriptors[parent],
+                base,
+                expected,
+                max_bytes=_MAX_SOURCE_BYTES,
+                error_code="install_legacy_cleanup_failed",
+            )
+        for relative in sorted(
+            (item for item in directories if item != "."),
+            key=lambda item: (item.count("/"), item),
+            reverse=True,
+        ):
+            parent = relative.rsplit("/", 1)[0] if "/" in relative else "."
+            _rmdir_bound_directory(
+                descriptors[parent],
+                relative.rsplit("/", 1)[-1],
+                descriptors[relative],
+                error_code="install_legacy_cleanup_failed",
+            )
+        _rmdir_bound_directory(
+            parent_fd, name, root_fd, error_code="install_legacy_cleanup_failed"
+        )
+    finally:
+        _close_directory_fds(descriptors)
+
+
+def _unlink_bound_legacy_path(
+    parent_fd: int, name: str, identity: tuple[int, int, str], *, error_code: str
+) -> None:
+    try:
+        named = os.lstat(name, dir_fd=parent_fd)
+        if (named.st_dev, named.st_ino) != identity[:2]:
+            raise InstallError(error_code)
+        os.unlink(name, dir_fd=parent_fd)
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError(error_code) from exc
+
+
+def _remove_preflighted_legacy(
+    entries: tuple[_LegacyCleanupEntry, ...], *, repository: Path
+) -> None:
+    try:
+        for entry in entries:
+            parent_fd = entry.parent_fd
+            name = entry.name
+            kind = entry.kind
+            identity = entry.identity
+            try:
+                if kind == "probe_root":
+                    if entry.root_fd is None:
+                        raise InstallError("install_legacy_cleanup_failed")
+                    _remove_legacy_probe_root(parent_fd, name, identity, entry.root_fd)
+                    continue
+                current = (
+                    _validated_legacy_libexec(parent_fd, name)
+                    if kind == "libexec"
+                    else _validated_legacy_bin(parent_fd, name, repository=repository)
+                )
+                if current != identity:
+                    raise InstallError("install_legacy_cleanup_failed")
+                _unlink_bound_legacy_path(
+                    parent_fd,
+                    name,
+                    identity,
+                    error_code="install_legacy_cleanup_failed",
+                )
+            except InstallError:
+                raise
+            except OSError as exc:
+                raise InstallError("install_legacy_cleanup_failed") from exc
+    finally:
+        _close_legacy_cleanup_entries(entries)
 
 
 def _ensure_probe_lock(state: Path) -> None:
@@ -915,19 +1443,28 @@ def install(*, home: Path) -> dict[str, object]:
         user_bin=user_bin,
         repository=repository,
     )
-    state = _child_directory(home, (".local", "state", "codex-master-mcp"), mode=0o700)
-    units = _child_directory(home, (".config", "systemd", "user"), mode=0o700)
-    for name in _UNIT_NAMES:
-        _install_regular(repository / "systemd" / "user" / name, units / name, mode=0o644)
-    _ensure_probe_lock(state)
-    stage = Path(tempfile.mkdtemp(prefix=f".{_RUNTIME_ROOT_NAME}.stage.", dir=library))
-    _build_runtime_image(repository=repository, stage=stage)
-    _validate_runtime_image_stage(stage=stage, home=home)
-    _publish_runtime_image(stage=stage, target=library / _RUNTIME_ROOT_NAME)
-    # A failed build or exchange leaves its private stage intact.  Deleting it
-    # after an interrupted exchange could delete the prevalidated old root.
-    _remove_preflighted_legacy(legacy_entries, repository=repository)
-    return {"status": "installed", "raw_output": "not_returned"}
+    try:
+        state = _child_directory(
+            home, (".local", "state", "codex-master-mcp"), mode=0o700
+        )
+        units = _child_directory(home, (".config", "systemd", "user"), mode=0o700)
+        for name in _UNIT_NAMES:
+            _install_regular(
+                repository / "systemd" / "user" / name, units / name, mode=0o644
+            )
+        _ensure_probe_lock(state)
+        stage = Path(
+            tempfile.mkdtemp(prefix=f".{_RUNTIME_ROOT_NAME}.stage.", dir=library)
+        )
+        _build_runtime_image(repository=repository, stage=stage)
+        _validate_runtime_image_stage(stage=stage, home=home)
+        _publish_runtime_image(stage=stage, target=library / _RUNTIME_ROOT_NAME)
+        # A failed build or exchange leaves its private stage intact.  Deleting it
+        # after an interrupted exchange could delete the prevalidated old root.
+        _remove_preflighted_legacy(legacy_entries, repository=repository)
+        return {"status": "installed", "raw_output": "not_returned"}
+    finally:
+        _close_legacy_cleanup_entries(legacy_entries)
 
 
 def main() -> int:
@@ -937,7 +1474,11 @@ def main() -> int:
     try:
         print(json.dumps(install(home=arguments.home), sort_keys=True))
     except InstallError as exc:
-        print(json.dumps({"status": str(exc), "raw_output": "not_returned"}, sort_keys=True))
+        print(
+            json.dumps(
+                {"status": str(exc), "raw_output": "not_returned"}, sort_keys=True
+            )
+        )
         return 1
     return 0
 

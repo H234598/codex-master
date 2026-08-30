@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
 from pathlib import Path
+import signal
 import time
 
 import pytest
@@ -15,7 +17,9 @@ def _script(path: Path, body: str) -> Path:
     return path
 
 
-def test_bounded_runner_uses_an_explicit_minimal_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bounded_runner_uses_an_explicit_minimal_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from codex_master.runtime_process import run_bounded
 
     home = tmp_path / "home"
@@ -43,7 +47,9 @@ def test_bounded_runner_uses_an_explicit_minimal_environment(tmp_path: Path, mon
 
 
 @pytest.mark.parametrize("stream", ("stdout", "stderr"))
-def test_bounded_runner_rejects_each_output_overflow(tmp_path: Path, stream: str) -> None:
+def test_bounded_runner_rejects_each_output_overflow(
+    tmp_path: Path, stream: str
+) -> None:
     from codex_master.runtime_process import BoundedProcessError, run_bounded
 
     child = _script(
@@ -62,7 +68,9 @@ def test_bounded_runner_rejects_each_output_overflow(tmp_path: Path, stream: str
         )
 
 
-def test_bounded_runner_times_out_and_terminates_the_whole_process_group(tmp_path: Path) -> None:
+def test_bounded_runner_times_out_and_terminates_the_whole_process_group(
+    tmp_path: Path,
+) -> None:
     from codex_master.runtime_process import BoundedProcessError, run_bounded
 
     child_pid = tmp_path / "child.pid"
@@ -92,3 +100,79 @@ def test_bounded_runner_times_out_and_terminates_the_whole_process_group(tmp_pat
         time.sleep(0.02)
     else:
         pytest.fail("descendant process survived bounded-runner termination")
+
+
+def _wait_until_process_is_not_live(process_id: int) -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(process_id, 0)
+        except OSError as exc:
+            assert exc.errno == errno.ESRCH
+            return
+        try:
+            state = (
+                (Path("/proc") / str(process_id) / "stat")
+                .read_text(encoding="utf-8")
+                .split(") ", 1)[1][0]
+            )
+        except (FileNotFoundError, IndexError):
+            return
+        if state == "Z":
+            return
+        time.sleep(0.02)
+    pytest.fail("descendant process survived bounded-runner termination")
+
+
+@pytest.mark.parametrize(
+    ("stream", "failure_code"),
+    (
+        ("stdout", "command_stdout_limit"),
+        ("stderr", "command_stderr_limit"),
+        ("stdout", "command_timeout"),
+        ("stderr", "command_timeout"),
+    ),
+)
+def test_bounded_runner_terminates_descendants_after_early_parent_exit(
+    tmp_path: Path, stream: str, failure_code: str
+) -> None:
+    from codex_master.runtime_process import BoundedProcessError, run_bounded
+
+    descendant_pid = tmp_path / f"{stream}-{failure_code}.pid"
+    descendant_body = (
+        "import sys, time\n"
+        + (
+            f"sys.{stream}.write('x' * 4096)\nsys.{stream}.flush()\n"
+            if "limit" in failure_code
+            else ""
+        )
+        + "time.sleep(60)\n"
+    )
+    parent = _script(
+        tmp_path / f"early-exit-{stream}-{failure_code}.py",
+        "import subprocess, sys\n"
+        + f"child = subprocess.Popen(['/usr/bin/python3', '-c', {descendant_body!r}])\n"
+        + f"open({str(descendant_pid)!r}, 'w', encoding='utf-8').write(str(child.pid))\n"
+        + "sys.exit(0)\n",
+    )
+
+    try:
+        with pytest.raises(BoundedProcessError, match=failure_code):
+            run_bounded(
+                [str(parent)],
+                cwd=tmp_path,
+                home=tmp_path,
+                timeout_seconds=0.2,
+                stdout_limit=128,
+                stderr_limit=128,
+            )
+
+        deadline = time.monotonic() + 2
+        while not descendant_pid.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert descendant_pid.exists()
+        _wait_until_process_is_not_live(int(descendant_pid.read_text(encoding="utf-8")))
+    finally:
+        if descendant_pid.exists():
+            with contextlib.suppress(OSError):
+                os.kill(int(descendant_pid.read_text(encoding="utf-8")), signal.SIGKILL)
