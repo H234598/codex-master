@@ -883,6 +883,109 @@ def test_agent_sync_identical_desired_state_is_byte_identical(tmp_path: Path) ->
     assert document.read_bytes() == before
 
 
+def test_static_then_probe_advances_document_generation_and_preserves_identity(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.provision_agent_binding(
+        static_registration(), agent_binding(), expected_generation=0
+    )
+
+    observed = registry.record_probe(
+        "worker-one", generation=1, evidence=valid_evidence()
+    )
+
+    document = json.loads((tmp_path / "admin-hosts" / "hosts.json").read_text())
+    principal = registry.resolve_agent_spki(SPKI_ONE)
+    assert document["generation"] == 2
+    assert observed.reachability == {"state": "reachable", "latency_ms": 12}
+    assert registry.get("worker-one").source == "host-agent"
+    assert principal.registry_generation == 2
+    assert principal.lease_epoch == 1
+
+
+def test_probe_then_static_advances_generation_and_preserves_observation(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.record_probe("worker-one", generation=1, evidence=valid_evidence())
+
+    registry.provision_agent_binding(
+        static_registration(), agent_binding(), expected_generation=1
+    )
+
+    document = json.loads((tmp_path / "admin-hosts" / "hosts.json").read_text())
+    assert document["generation"] == 2
+    assert document["observations"][0]["ref"] == "worker-one"
+    assert registry.get("worker-one").source == "host-agent"
+    assert registry.resolve_agent_spki(SPKI_ONE).registry_generation == 2
+
+
+def test_identical_probe_is_byte_identical_at_max_document_generation(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.record_probe("worker-one", generation=4, evidence=valid_evidence())
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    payload = json.loads(document.read_text())
+    payload["generation"] = 2**63 - 1
+    document.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+    document.chmod(0o600)
+    before = document.read_bytes()
+
+    host = registry.record_probe(
+        "worker-one", generation=4, evidence=valid_evidence()
+    )
+
+    assert host.generation == 4
+    assert document.read_bytes() == before
+
+
+def test_agent_rotation_after_probe_invalidates_old_spki_and_advances_generation(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.provision_agent_binding(
+        static_registration(), agent_binding(), expected_generation=0
+    )
+    registry.record_probe("worker-one", generation=1, evidence=valid_evidence())
+
+    registry.provision_agent_binding(
+        static_registration(),
+        agent_binding(spki=SPKI_TWO),
+        expected_generation=2,
+    )
+
+    principal = registry.resolve_agent_spki(SPKI_TWO)
+    assert principal.registry_generation == 3
+    assert principal.lease_epoch == 2
+    assert registry.get("worker-one").source == "host-agent"
+    with pytest.raises(HostRegistryError, match="host.identity_not_found"):
+        registry.resolve_agent_spki(SPKI_ONE)
+
+
+def test_changed_probe_at_max_document_generation_fails_without_mutation(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.record_probe("worker-one", generation=1, evidence=valid_evidence())
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    payload = json.loads(document.read_text())
+    payload["generation"] = 2**63 - 1
+    document.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+    document.chmod(0o600)
+    before = document.read_bytes()
+
+    with pytest.raises(HostRegistryError, match="credential.generation_exhausted"):
+        registry.record_probe(
+            "worker-one",
+            generation=2,
+            evidence=valid_evidence(label="Changed Worker"),
+        )
+
+    assert document.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "raw",
     [

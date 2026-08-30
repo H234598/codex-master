@@ -622,6 +622,9 @@ class HostRegistry:
                 if generation == current_generation:
                     return self._host(existing)
                 observations.remove(existing)
+            if document_generation == _MAX_GENERATION:
+                raise HostRegistryError("credential.generation_exhausted")
+            mutation_generation = max(document_generation + 1, generation)
             observations.append(record)
             registrations[:] = [item for item in registrations if item["ref"] != ref]
             registrations.append(_registration_from_probe(record))
@@ -633,7 +636,7 @@ class HostRegistry:
                 ssh_bindings,
                 agent_bindings,
                 observations,
-                max(document_generation, generation),
+                mutation_generation,
                 epoch_history,
             )
             return self._host(record)
