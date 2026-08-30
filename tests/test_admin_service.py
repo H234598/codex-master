@@ -1079,11 +1079,32 @@ def test_account_commands_delegate_once_to_account_registry(
 
     result = command(service, operation, arguments, scope)
 
-    assert result["account"]["ref"] == arguments["account_ref"]  # type: ignore[index]
+    assert result == {
+        "account": {"ref": arguments["account_ref"], "generation": 5}
+    }
     assert owners.account_registry.calls == [
         ("generation", operation.split(".", 1)[0]),
         expected_call,
     ]
+
+
+def test_account_add_rejects_noncanonical_owner_receipt() -> None:
+    service, owners = service_at()
+
+    owners.account_registry.add_account = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+        "account": {"ref": "google-two", "generation": 5},
+        "unexpected": "public-but-not-contractual",
+    }
+
+    with pytest.raises(AdminServiceError) as captured:
+        command(
+            service,
+            "google.accounts.add",
+            {"account_ref": "google-two", "label": "Google Two"},
+            "fleet.google.oauth",
+        )
+
+    assert captured.value.problem.code == "control.response_private"
 
 
 def test_provision_apply_requires_scope_and_step_up_before_owner() -> None:

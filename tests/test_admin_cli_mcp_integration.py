@@ -137,19 +137,25 @@ def test_real_cli_process_calls_attested_admin_socket(tmp_path: Path) -> None:
         )
 
     assert completed.returncode == 0, completed.stderr
-    document = json.loads(completed.stdout)
-    assert document["registry_generation"] == 4
-    assert len(document["accounts"]) == 1
-    assert {
-        "billing_count": 1,
-        "default_oauth_client_ref": "oauth-client-opaque",
-        "inventory_generation": 4,
-        "label": "Google One",
-        "oauth_client_availability": "available",
-        "project_count": 1,
-        "ref": "google-one",
-        "subject_bound": True,
-    }.items() <= document["accounts"][0].items()
+    assert json.loads(completed.stdout) == {
+        "registry_generation": 4,
+        "accounts": [
+            {
+                "billing_count": 1,
+                "default_oauth_client_ref": "oauth-client-opaque",
+                "enabled": True,
+                "inventory_generation": 4,
+                "label": "Google One",
+                "oauth_client_availability": "available",
+                "oauth_state": "ready",
+                "project_count": 1,
+                "quota_state": "fresh",
+                "ref": "google-one",
+                "reload_state": "ready",
+                "subject_bound": True,
+            }
+        ],
+    }
 
 
 def test_real_mcp_stdio_process_calls_same_attested_admin_socket(

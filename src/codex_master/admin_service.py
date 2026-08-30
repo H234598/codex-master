@@ -736,15 +736,29 @@ class MasterjetControlService:
     ) -> dict[str, object]:
         owner = _required(self._account_registry)
         provider = request.operation.split(".", 1)[0]
-        return dict(
+        account_ref = cast(str, request.arguments["account_ref"])
+        expected_generation = _generation(request)
+        receipt = _exact_mapping(
             owner.add_account(
                 provider,
-                cast(str, request.arguments["account_ref"]),
+                account_ref,
                 cast(str, request.arguments["label"]),
-                expected_generation=_generation(request),
+                expected_generation=expected_generation,
                 idempotency_key=_idempotency(request),
-            )
+            ),
+            frozenset({"account"}),
         )
+        account = _exact_mapping(
+            receipt["account"], frozenset({"ref", "generation"})
+        )
+        generation = account["generation"]
+        if (
+            account["ref"] != account_ref
+            or type(generation) is not int
+            or generation != expected_generation + 1
+        ):
+            raise _service_error("control.response_private")
+        return {"account": {"ref": account_ref, "generation": generation}}
 
     def _account_disable(
         self,
