@@ -7,11 +7,13 @@ from enum import Enum
 from typing import Protocol
 
 from codex_master.fleet_home_broker import OfflineBrokerPlan
+from codex_master.fleet_home_broker_dispatch import BrokerDispatchOperations
 from codex_master.fleet_home_broker_intent import BrokerIntentV1
 from codex_master.fleet_home_broker_intent_store import (
     BrokerIntentStoreOperations,
     claim_broker_intent,
 )
+from codex_master.fleet_home_broker_protocol import validate_chpb_message
 from codex_master.fleet_home_broker_transport import BrokerTransportResponse
 
 
@@ -52,7 +54,7 @@ class BrokerIntentResolver(Protocol):
     def resolve_plan(self, intent: BrokerIntentV1) -> OfflineBrokerPlan: ...
 
 
-class BrokerExecutionComposition(Protocol):
+class BrokerExecutionComposition(BrokerDispatchOperations, Protocol):
     def execute_intent(
         self, intent: BrokerIntentV1, plan: OfflineBrokerPlan
     ) -> BrokerTransportResponse: ...
@@ -96,11 +98,49 @@ def _mark_terminal(
 ) -> None:
     terminal_failed = False
     try:
-        store.mark_terminal(claim_name, _TERMINAL_PAYLOADS[code])
+        result = store.mark_terminal(claim_name, _TERMINAL_PAYLOADS[code])
+        if result is not None:
+            terminal_failed = True
     except Exception:
         terminal_failed = True
     if terminal_failed:
         raise BrokerIntentConsumerError(BrokerIntentConsumeCode.TERMINAL_WRITE_FAILED)
+
+
+def _valid_execution_response(response: object, intent: BrokerIntentV1) -> bool:
+    if type(response) is not BrokerTransportResponse or type(response.fds) is not tuple:
+        return False
+    if response.fds:
+        return False
+    try:
+        validate_chpb_message(response.reply)
+        return response.reply.request_id == intent.request_id
+    except Exception:
+        return False
+
+
+def _response_fds(response: object) -> tuple[int, ...]:
+    try:
+        fds = response.fds
+        if type(fds) not in (tuple, list):
+            return ()
+        valid = []
+        for fd in fds:
+            if type(fd) is int and fd >= 0 and fd not in valid:
+                valid.append(fd)
+        return tuple(valid)
+    except Exception:
+        return ()
+
+
+def _close_response_fds(
+    execution: BrokerExecutionComposition, response: object
+) -> None:
+    for fd in _response_fds(response):
+        try:
+            execution.close(fd)
+        except Exception:
+            pass
 
 
 def consume_one_broker_intent(
@@ -132,13 +172,15 @@ def consume_one_broker_intent(
         )
         return BrokerIntentConsumeResult(BrokerIntentConsumeCode.RESOLVER_DRIFT)
     execution_failed = False
+    response = None
     try:
         response = execution.execute_intent(claimed.intent, plan)
-        if type(response) is not BrokerTransportResponse or response.fds != ():
+        if not _valid_execution_response(response, claimed.intent):
             execution_failed = True
     except Exception:
         execution_failed = True
     if execution_failed:
+        _close_response_fds(execution, response)
         _mark_terminal(
             store, claimed.claim_name, BrokerIntentConsumeCode.EXECUTION_FAILED
         )

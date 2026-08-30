@@ -18,6 +18,7 @@ from codex_master.fleet_home_broker_consumer import (
     BrokerIntentResolver,
     consume_one_broker_intent,
 )
+from codex_master.fleet_home_broker_dispatch import BrokerDispatchOperations
 import codex_master.fleet_home_broker_consumer as consumer
 from codex_master.fleet_home_broker_identity import (
     BrokerIdentity,
@@ -36,7 +37,11 @@ from codex_master.fleet_home_broker_intent_store import (
     claim_broker_intent,
 )
 from codex_master.fleet_home_broker_protocol import (
+    BrokerReply,
+    BrokerResultCode,
+    CHPB_PROTOCOL,
     ChpbTransactionOperation,
+    ChpbMessageKind,
     PrincipalBinding,
 )
 from codex_master.fleet_home_broker_transport import BrokerTransportResponse
@@ -55,6 +60,12 @@ class UnusedResolver:
 class UnusedExecution:
     def execute_intent(self, intent, plan):
         raise AssertionError("empty store must not execute")
+
+    def execute(self, command):
+        raise AssertionError("consumer must not invoke dispatch execute")
+
+    def close(self, fd):
+        raise AssertionError("empty store must not close")
 
 
 def _intent(**changes: object) -> BrokerIntentV1:
@@ -121,6 +132,25 @@ def _plan(intent: BrokerIntentV1) -> OfflineBrokerPlan:
     )
 
 
+def _response(
+    intent: BrokerIntentV1,
+    *,
+    request_id: str | None = None,
+    fds: tuple[int, ...] = (),
+) -> BrokerTransportResponse:
+    return BrokerTransportResponse(
+        BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            request_id or intent.request_id,
+            BrokerResultCode.INVALID_MESSAGE,
+            None,
+            None,
+        ),
+        fds,
+    )
+
+
 IDENTITY = BrokerIntentFileIdentity(
     8, 101, 0o100600, 0, 0, 1, "system_u:object_r:codex_master_home_broker_state_t:s0"
 )
@@ -132,9 +162,11 @@ class FakeStore:
         claims: list[BrokerIntentClaimBytes] | None = None,
         *,
         terminal_error: Exception | None = None,
+        terminal_result: object | None = None,
     ) -> None:
         self.claims = list(claims or ())
         self.terminal_error = terminal_error
+        self.terminal_result = terminal_result
         self.terminals: list[tuple[str, bytes]] = []
         self.quarantines: list[tuple[str, str]] = []
 
@@ -143,10 +175,11 @@ class FakeStore:
             return None
         return self.claims.pop(0)
 
-    def mark_terminal(self, claim_name: str, payload: bytes) -> None:
+    def mark_terminal(self, claim_name: str, payload: bytes) -> object | None:
         if self.terminal_error is not None:
             raise self.terminal_error
         self.terminals.append((claim_name, payload))
+        return self.terminal_result
 
     def quarantine(self, claim_name: str, code: str) -> None:
         self.quarantines.append((claim_name, code))
@@ -182,9 +215,13 @@ class FailingResolver:
 
 
 class FakeExecution:
-    def __init__(self, response: BrokerTransportResponse) -> None:
+    def __init__(
+        self, response: BrokerTransportResponse, *, close_error: bool = False
+    ) -> None:
         self.response = response
+        self.close_error = close_error
         self.calls: list[tuple[BrokerIntentV1, OfflineBrokerPlan]] = []
+        self.closed: list[int] = []
 
     def execute_intent(
         self, intent: BrokerIntentV1, plan: OfflineBrokerPlan
@@ -192,16 +229,31 @@ class FakeExecution:
         self.calls.append((intent, plan))
         return self.response
 
+    def execute(self, command: object) -> BrokerTransportResponse:
+        raise AssertionError("consumer must not invoke dispatch execute")
+
+    def close(self, fd: int) -> None:
+        self.closed.append(fd)
+        if self.close_error:
+            raise RuntimeError("secret-value /host/path must stay private")
+
 
 class FailingExecution:
     def __init__(self) -> None:
         self.calls: list[tuple[BrokerIntentV1, OfflineBrokerPlan]] = []
+        self.closed: list[int] = []
 
     def execute_intent(
         self, intent: BrokerIntentV1, plan: OfflineBrokerPlan
     ) -> BrokerTransportResponse:
         self.calls.append((intent, plan))
         raise RuntimeError("secret-value /host/path must stay private")
+
+    def execute(self, command: object) -> BrokerTransportResponse:
+        raise AssertionError("consumer must not invoke dispatch execute")
+
+    def close(self, fd: int) -> None:
+        self.closed.append(fd)
 
 
 def test_public_results_and_errors_are_frozen_typed_and_value_free() -> None:
@@ -241,6 +293,14 @@ def test_public_results_and_errors_are_frozen_typed_and_value_free() -> None:
     ) == ("self", "intent", "plan")
 
 
+def test_execution_composition_reuses_existing_dispatch_close_contract() -> None:
+    assert BrokerDispatchOperations in BrokerExecutionComposition.__mro__
+    assert tuple(inspect.signature(BrokerExecutionComposition.close).parameters) == (
+        "self",
+        "fd",
+    )
+
+
 def test_empty_store_returns_typed_empty_result_without_downstream_calls() -> None:
     result = consume_one_broker_intent(
         EmptyStore(), UnusedResolver(), UnusedExecution(), now_unix_ms=1
@@ -259,7 +319,7 @@ def test_claimed_revalidated_intent_executes_once_then_writes_typed_terminal() -
     )
     store = FakeStore([claim])
     resolver = FakeResolver(_plan(intent))
-    execution = FakeExecution(BrokerTransportResponse(object(), ()))
+    execution = FakeExecution(_response(intent))
 
     result = consume_one_broker_intent(
         store,
@@ -417,7 +477,7 @@ def test_execution_failure_is_redacted_and_terminal_without_effect_retry() -> No
     assert store.terminals == [(claim.claim_name, b'{"result":"execution_failed"}\n')]
     assert "secret-value" not in repr(result)
     assert "host/path" not in store.terminals[0][1].decode("ascii")
-    restart_execution = FakeExecution(BrokerTransportResponse(object(), ()))
+    restart_execution = FakeExecution(_response(intent))
     restart = consume_one_broker_intent(
         store,
         UnusedResolver(),
@@ -436,7 +496,7 @@ def test_execution_response_with_fd_is_terminal_failure_without_fd_lifecycle() -
         IDENTITY,
     )
     store = FakeStore([claim])
-    execution = FakeExecution(BrokerTransportResponse(object(), (41,)))
+    execution = FakeExecution(_response(intent, fds=(41,)))
 
     result = consume_one_broker_intent(
         store,
@@ -462,7 +522,7 @@ def test_terminal_write_failure_is_typed_redacted_and_not_retried_after_restart(
     store = FakeStore(
         [claim], terminal_error=OSError("secret-value /host/path must stay private")
     )
-    execution = FakeExecution(BrokerTransportResponse(object(), ()))
+    execution = FakeExecution(_response(intent))
 
     with pytest.raises(BrokerIntentConsumerError) as caught:
         consume_one_broker_intent(
@@ -477,7 +537,43 @@ def test_terminal_write_failure_is_typed_redacted_and_not_retried_after_restart(
     assert caught.value.__context__ is None
     assert "secret-value" not in "".join(traceback.format_exception(caught.value))
     assert len(execution.calls) == 1
-    restart_execution = FakeExecution(BrokerTransportResponse(object(), ()))
+    restart_execution = FakeExecution(_response(intent))
+    restart = consume_one_broker_intent(
+        store,
+        UnusedResolver(),
+        restart_execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+    assert restart.code is BrokerIntentConsumeCode.EMPTY
+    assert restart_execution.calls == []
+
+
+def test_terminal_non_none_result_is_typed_redacted_and_not_retried_after_restart() -> (
+    None
+):
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".claim-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+    )
+    store = FakeStore([claim], terminal_result="secret-value /host/path")
+    execution = FakeExecution(_response(intent))
+
+    with pytest.raises(BrokerIntentConsumerError) as caught:
+        consume_one_broker_intent(
+            store,
+            FakeResolver(_plan(intent)),
+            execution,
+            now_unix_ms=intent.created_at_unix_ms + 1,
+        )
+
+    assert caught.value.code is BrokerIntentConsumeCode.TERMINAL_WRITE_FAILED
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "secret-value" not in "".join(traceback.format_exception(caught.value))
+    assert len(execution.calls) == 1
+    restart_execution = FakeExecution(_response(intent))
     restart = consume_one_broker_intent(
         store,
         UnusedResolver(),
@@ -520,8 +616,8 @@ def test_two_independent_consumers_racing_one_transaction_execute_it_once() -> N
     store = AtomicFakeStore([claim])
     start = threading.Barrier(3)
     results: list[BrokerIntentConsumeResult] = []
-    first_execution = FakeExecution(BrokerTransportResponse(object(), ()))
-    second_execution = FakeExecution(BrokerTransportResponse(object(), ()))
+    first_execution = FakeExecution(_response(intent))
+    second_execution = FakeExecution(_response(intent))
 
     def consume(execution: FakeExecution) -> None:
         start.wait()
@@ -561,7 +657,7 @@ def test_restart_after_atomic_claim_cannot_reexecute_transaction_or_request() ->
     assert claimed.intent.transaction_id == intent.transaction_id
     assert claimed.intent.request_id == intent.request_id
 
-    restart_execution = FakeExecution(BrokerTransportResponse(object(), ()))
+    restart_execution = FakeExecution(_response(intent))
     result = consume_one_broker_intent(
         store,
         UnusedResolver(),
@@ -572,3 +668,99 @@ def test_restart_after_atomic_claim_cannot_reexecute_transaction_or_request() ->
     assert result.code is BrokerIntentConsumeCode.EMPTY
     assert restart_execution.calls == []
     assert store.terminals == []
+
+
+def test_wrong_reply_type_is_terminal_execution_failure_without_restart_retry() -> None:
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".claim-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+    )
+    store = FakeStore([claim])
+    execution = FakeExecution(BrokerTransportResponse(object(), ()))
+
+    result = consume_one_broker_intent(
+        store,
+        FakeResolver(_plan(intent)),
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.EXECUTION_FAILED
+    assert len(execution.calls) == 1
+    assert store.terminals == [(claim.claim_name, b'{"result":"execution_failed"}\n')]
+    restart_execution = FakeExecution(_response(intent))
+    restart = consume_one_broker_intent(
+        store,
+        UnusedResolver(),
+        restart_execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+    assert restart.code is BrokerIntentConsumeCode.EMPTY
+    assert restart_execution.calls == []
+
+
+def test_mismatched_reply_request_id_is_terminal_execution_failure() -> None:
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".claim-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+    )
+    store = FakeStore([claim])
+    execution = FakeExecution(_response(intent, request_id="9" * 32))
+
+    result = consume_one_broker_intent(
+        store,
+        FakeResolver(_plan(intent)),
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.EXECUTION_FAILED
+    assert len(execution.calls) == 1
+    assert store.terminals == [(claim.claim_name, b'{"result":"execution_failed"}\n')]
+
+
+@pytest.mark.parametrize(
+    ("fds", "expected_closed"),
+    (
+        ((73, 73, -1, True, "bad", 74), [73, 74]),
+        ([75, 75, True, "bad"], [75]),
+    ),
+    ids=("invalid_entries", "invalid_container"),
+)
+def test_rejected_response_closes_unique_valid_fds_without_masking_terminalization(
+    fds: object, expected_closed: list[int]
+) -> None:
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".claim-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+    )
+    store = FakeStore([claim])
+    response = BrokerTransportResponse(_response(intent).reply, fds)  # type: ignore[arg-type]
+    execution = FakeExecution(response, close_error=True)
+
+    result = consume_one_broker_intent(
+        store,
+        FakeResolver(_plan(intent)),
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.EXECUTION_FAILED
+    assert execution.closed == expected_closed
+    assert store.terminals == [(claim.claim_name, b'{"result":"execution_failed"}\n')]
+    assert "secret-value" not in repr(result)
+    restart_execution = FakeExecution(_response(intent))
+    restart = consume_one_broker_intent(
+        store,
+        UnusedResolver(),
+        restart_execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+    assert restart.code is BrokerIntentConsumeCode.EMPTY
+    assert restart_execution.calls == []
