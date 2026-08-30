@@ -196,8 +196,10 @@ class FakeWal:
         self.records = records if records is not None else []
         self.fail_before_append: int | None = None
         self.fail_after_fsync: int | None = None
+        self.fail_after_parent_fsync: int | None = None
         self.append_count = 0
         self.fsync_count = 0
+        self.parent_fsync_count = 0
         self.error_text: str | None = None
         self.events = events if events is not None else []
 
@@ -222,6 +224,10 @@ class FakeWal:
 
     def fsync_parent(self) -> None:
         self.events.append("wal:parent_fsync")
+        self.parent_fsync_count += 1
+        if self.parent_fsync_count == self.fail_after_parent_fsync:
+            self.fail_after_parent_fsync = None
+            raise RuntimeError(self.error_text or "redacted-cutpoint")
         return None
 
 
@@ -465,7 +471,10 @@ def test_dispatch_binds_only_to_the_root_execution_composition() -> None:
     assert response.reply.transaction.binding == request.binding
 
 
-@pytest.mark.parametrize("failure_field", ("fail_before_append", "fail_after_fsync"))
+@pytest.mark.parametrize(
+    "failure_field",
+    ("fail_before_append", "fail_after_fsync", "fail_after_parent_fsync"),
+)
 @pytest.mark.parametrize("ordinal", range(1, 9))
 def test_every_wal_pre_or_post_fsync_cutpoint_resumes_same_transaction_or_blocks(
     failure_field: str, ordinal: int
@@ -494,8 +503,32 @@ def test_every_wal_pre_or_post_fsync_cutpoint_resumes_same_transaction_or_blocks
     assert len(operations.population_effects) == len(set(operations.population_effects))
     assert operations.effects.count("publish_home") <= 1
     assert operations.effects.count("cas_registry") <= 1
+    if failure_field == "fail_after_parent_fsync":
+        assert wal.parent_fsync_count >= ordinal
     if fresh.reply.transaction is not None:
         assert fresh.reply.transaction.binding.transaction_id == TRANSACTION
+
+
+def test_unknown_cas_outcome_never_retries_after_blocked_wal_append_fails() -> None:
+    plan = _plan()
+    intent = _intent(plan)
+    operations = FakeProvisionOperations(plan)
+    operations.fail_effect = "cas_registry"
+    wal = FakeWal()
+    wal.fail_before_append = 7
+
+    first = _composition(plan, operations, wal).execute_intent(intent, plan)
+    second = _composition(plan, operations, wal).resume_intent(
+        intent, plan, _context(intent)
+    )
+
+    assert first.reply.result is BrokerResultCode.BLOCKED_DRIFT
+    assert second.reply.result is BrokerResultCode.BLOCKED_DRIFT
+    assert first.reply.transaction is not None
+    assert second.reply.transaction is not None
+    assert first.reply.transaction.binding.transaction_id == intent.transaction_id
+    assert second.reply.transaction.binding.transaction_id == intent.transaction_id
+    assert operations.effects.count("cas_registry") == 1
 
 
 @pytest.mark.parametrize(

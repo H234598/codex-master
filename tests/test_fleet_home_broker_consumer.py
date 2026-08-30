@@ -22,6 +22,7 @@ from codex_master.fleet_home_broker_consumer import (
     consume_one_broker_intent,
 )
 from codex_master.fleet_home_broker_dispatch import BrokerDispatchOperations
+from codex_master.fleet_home_broker_execution import RootBrokerExecutionComposition
 import codex_master.fleet_home_broker_consumer as consumer
 from codex_master.fleet_home_broker_identity import (
     BrokerIdentity,
@@ -42,6 +43,7 @@ from codex_master.fleet_home_broker_intent_store import (
 )
 from codex_master.fleet_home_broker_identity_contract import ObjectIdentity
 from codex_master.fleet_home_broker_linux_contract import PinnedFd
+from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
 from codex_master.fleet_home_broker_protocol import (
     BrokerCheckpoint,
     BrokerObjectState,
@@ -486,6 +488,139 @@ def test_claimed_revalidated_intent_executes_once_then_writes_typed_terminal() -
     assert intent.broker_manifest_digest.encode("ascii") not in store.terminals[0][1]
     assert intent.server_digest.encode("ascii") not in store.terminals[0][1]
     assert intent.credential_binding_ref.encode("ascii") not in store.terminals[0][1]
+
+
+@pytest.mark.parametrize(
+    "observation",
+    (
+        BrokerObservation(
+            BrokerObjectState.DRIFT, BrokerRegistryState.NOT_APPLICABLE, 0
+        ),
+        BrokerObservation(BrokerObjectState.ABSENT, BrokerRegistryState.FOREIGN, 0),
+    ),
+    ids=("object_drift", "registry_drift"),
+)
+def test_fresh_claim_composition_blocked_drift_is_terminalized_as_blocked_drift(
+    observation: BrokerObservation,
+) -> None:
+    class CompositionLinux:
+        def __init__(self, principal: PrincipalBinding) -> None:
+            self.principal = principal
+            self.identity = PidfdIdentity(1234, 7)
+
+        def pidfd_open(self, pid: int, flags: int) -> int:
+            return 11
+
+        def pidfd_reuse_check(self, *args: object) -> PidfdIdentity:
+            return self.identity
+
+        def open_pinned_proc_pid(self, *args: object) -> int:
+            return 12
+
+        def open_proc_cgroup(self, *args: object) -> int:
+            return 13
+
+        def fstat(self, fd: int) -> FdStat:
+            if fd == 13:
+                return FdStat(
+                    self.principal.cgroup_dev,
+                    self.principal.cgroup_ino,
+                    0o40755,
+                    0,
+                    0,
+                )
+            return FdStat(0, 1, 0o40700, 0, 0)
+
+        def read_proc_control_group(self, *args: object) -> str:
+            return "/user.slice/broker.scope"
+
+        def read_pid1_unit_name(self, *args: object) -> str:
+            return "broker.scope"
+
+        def read_pid1_unit_generation(self, *args: object) -> int:
+            return self.principal.unit_generation
+
+        def read_pid1_invocation_id(self, *args: object) -> str:
+            return self.principal.invocation_id
+
+        def read_pid1_control_group(self, *args: object) -> str:
+            return "/user.slice/broker.scope"
+
+        def read_peer_mcs_pair(self, *args: object) -> str:
+            return self.principal.mcs_pair
+
+        def close(self, fd: int) -> None:
+            return None
+
+    class CompositionWal:
+        def __init__(self) -> None:
+            self.records: list[bytes] = []
+
+        def read_all(self) -> tuple[bytes, ...]:
+            return tuple(self.records)
+
+        def append(self, record: bytes) -> None:
+            self.records.append(record)
+
+        def fsync_wal(self) -> None:
+            return None
+
+        def fsync_parent(self) -> None:
+            return None
+
+    class ContradictoryProvision:
+        def __init__(self) -> None:
+            self.effects: list[str] = []
+
+        def new_transaction_id(self) -> str:
+            raise AssertionError("intent transaction must be fixed")
+
+        def observe(self, plan: OfflineBrokerPlan) -> BrokerObservation:
+            return observation
+
+        def create_staging(self, plan: OfflineBrokerPlan) -> None:
+            self.effects.append("create_staging")
+
+        def populate_next(self, plan: OfflineBrokerPlan) -> None:
+            self.effects.append("populate_next")
+
+        def publish_home(self, plan: OfflineBrokerPlan) -> None:
+            self.effects.append("publish_home")
+
+        def cas_registry(
+            self, plan: OfflineBrokerPlan, binding: TransactionBinding
+        ) -> None:
+            self.effects.append("cas_registry")
+
+        def close(self, fd: int) -> None:
+            return None
+
+    intent = _intent()
+    plan = _plan(intent)
+    claim = BrokerIntentClaimBytes(
+        ".claim-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+    )
+    store = FakeStore([claim])
+    effects = ContradictoryProvision()
+    execution = RootBrokerExecutionComposition(
+        effects,
+        CompositionLinux(plan.expected_principal),
+        CompositionWal(),
+        peer_pid=1234,
+    )
+
+    result = consume_one_broker_intent(
+        store,
+        FakeResolver(plan),
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.BLOCKED_DRIFT
+    assert effects.effects == []
+    assert store.terminals == [(claim.claim_name, b'{"result":"blocked_drift"}\n')]
 
 
 def test_resolver_drift_is_terminal_before_execution() -> None:
@@ -1444,13 +1579,7 @@ def test_committed_reply_with_foreign_intent_binding_is_terminal_execution_failu
     assert restart_execution.calls == []
 
 
-@pytest.mark.parametrize(
-    "result",
-    (BrokerResultCode.ROLLED_BACK, BrokerResultCode.BLOCKED_DRIFT),
-)
-def test_noncommitted_terminal_reply_is_terminal_execution_failure(
-    result: BrokerResultCode,
-) -> None:
+def test_rolled_back_terminal_reply_is_terminal_execution_failure() -> None:
     intent = _intent()
     claim = BrokerIntentClaimBytes(
         ".claim-intent-00000000000000000007-" + intent.nonce + ".json",
@@ -1458,7 +1587,7 @@ def test_noncommitted_terminal_reply_is_terminal_execution_failure(
         IDENTITY,
     )
     store = FakeStore([claim])
-    execution = FakeExecution(_response(intent, result=result))
+    execution = FakeExecution(_response(intent, result=BrokerResultCode.ROLLED_BACK))
 
     consumed = consume_one_broker_intent(
         store,
@@ -1469,6 +1598,37 @@ def test_noncommitted_terminal_reply_is_terminal_execution_failure(
 
     assert consumed.code is BrokerIntentConsumeCode.EXECUTION_FAILED
     assert len(execution.calls) == 1
+    assert store.terminals == [(claim.claim_name, b'{"result":"execution_failed"}\n')]
+
+
+def test_unbound_blocked_drift_reply_is_terminal_execution_failure() -> None:
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".claim-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+    )
+    store = FakeStore([claim])
+    unbound = BrokerTransportResponse(
+        BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            intent.request_id,
+            BrokerResultCode.BLOCKED_DRIFT,
+            None,
+            None,
+        ),
+        (),
+    )
+
+    result = consume_one_broker_intent(
+        store,
+        FakeResolver(_plan(intent)),
+        FakeExecution(unbound),
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.EXECUTION_FAILED
     assert store.terminals == [(claim.claim_name, b'{"result":"execution_failed"}\n')]
 
 

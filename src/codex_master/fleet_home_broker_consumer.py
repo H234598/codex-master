@@ -141,7 +141,7 @@ def _mark_terminal(
 
 
 def _execution_result(
-    response: object, intent: BrokerIntentV1, *, recovered: bool
+    response: object, intent: BrokerIntentV1
 ) -> BrokerIntentConsumeCode | None:
     if type(response) is not BrokerTransportResponse or type(response.fds) is not tuple:
         return None
@@ -175,8 +175,7 @@ def _execution_result(
         ):
             return BrokerIntentConsumeCode.SUCCEEDED
         if (
-            recovered
-            and reply.result is BrokerResultCode.BLOCKED_DRIFT
+            reply.result is BrokerResultCode.BLOCKED_DRIFT
             and status.terminal_result is BrokerResultCode.BLOCKED_DRIFT
         ):
             return BrokerIntentConsumeCode.BLOCKED_DRIFT
@@ -286,9 +285,7 @@ def consume_one_broker_intent(
                 )
             else:
                 response = execution.execute_intent(claimed.intent, plan)
-            outcome = _execution_result(
-                response, claimed.intent, recovered=claimed.recovered
-            )
+            outcome = _execution_result(response, claimed.intent)
             if outcome is None:
                 execution_failed = True
         except Exception:

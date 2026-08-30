@@ -318,6 +318,14 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
                 return None
             if recovered.decision.action is BrokerRecoveryAction.RETURN_BLOCKED:
                 return None
+            if (
+                status.checkpoint is BrokerCheckpoint.REGISTRY_CAS_INTENT
+                and recovered.decision.action is BrokerRecoveryAction.CAS_REGISTRY
+            ):
+                # A prior CAS may have taken effect despite its caller failing
+                # before a durable terminal outcome was written.  No retry is
+                # safe while the attested registry remains OLD.
+                return None
             return status
         except Exception:
             return None
