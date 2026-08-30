@@ -31,7 +31,6 @@ from codex_master.remote_queen_home import (
     QueenTopicBindingV1,
     RemoteQueenHomeApplyJournalV1,
     RemoteQueenHomeManifestV1,
-    RemoteQueenHomeOperations,
     ResumeCapsuleV1,
     RollbackRemoteQueenHomeRequestV1,
     VerifyRemoteQueenHomeRequestV1,

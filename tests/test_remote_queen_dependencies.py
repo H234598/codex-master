@@ -13,7 +13,6 @@ from codex_master.remote_queen_bootstrap import (
     DNF_PACKAGES,
     HostFactsV1,
     ManifestGenerationV1,
-    PackagePlanV1,
     RemoteQueenBootstrapError,
     package_plan_for,
 )

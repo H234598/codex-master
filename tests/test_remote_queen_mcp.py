@@ -1,8 +1,6 @@
 import ast
 import inspect
 from dataclasses import FrozenInstanceError, fields, replace
-from enum import Enum
-
 import pytest
 
 from codex_master.remote_queen_bootstrap import (
