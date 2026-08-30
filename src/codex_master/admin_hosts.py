@@ -330,6 +330,8 @@ class HostRegistry:
                     existing_binding["client_spki_sha256"] != binding.client_spki_sha256
                     or existing_binding["enabled"] != binding.enabled
                 ):
+                    if next_epoch == _MAX_GENERATION:
+                        raise HostRegistryError("host.identity_epoch_exhausted")
                     next_epoch += 1
             if binding.lease_epoch not in {1, next_epoch}:
                 raise HostRegistryError("host.identity_invalid")
@@ -370,6 +372,115 @@ class HostRegistry:
             agent_bindings.sort(key=lambda item: str(item["ref"]))
             self._write_locked(registrations, ssh_bindings, agent_bindings, observations)
             return self._host(registration_record)
+
+    def synchronize_agent_bindings(
+        self,
+        desired: tuple[tuple[Mapping[str, object], AgentBindingV1], ...],
+        *,
+        expected_generation: int,
+    ) -> None:
+        expected_generation = _generation(
+            expected_generation, "credential.generation_conflict"
+        )
+        validated: list[tuple[dict[str, object], AgentBindingV1]] = []
+        seen_refs: set[str] = set()
+        seen_enabled_spkis: set[str] = set()
+        for registration, binding in desired:
+            record = _agent_registration_record(registration, generation=1)
+            if binding.host_ref != record["ref"] or binding.host_ref in seen_refs:
+                raise HostRegistryError("host.identity_mismatch")
+            if binding.enabled:
+                if binding.client_spki_sha256 in seen_enabled_spkis:
+                    raise HostRegistryError("host.identity_mismatch")
+                seen_enabled_spkis.add(binding.client_spki_sha256)
+            seen_refs.add(binding.host_ref)
+            validated.append((record, binding))
+
+        with self._locked_state() as (
+            registrations,
+            ssh_bindings,
+            agent_bindings,
+            observations,
+        ):
+            current_generation = _document_generation(registrations, observations)
+            if current_generation != expected_generation:
+                raise HostRegistryError("credential.generation_conflict")
+            existing_registrations = {
+                str(item["ref"]): item for item in registrations
+            }
+            existing_bindings = {str(item["ref"]): item for item in agent_bindings}
+            next_registrations = [
+                item
+                for item in registrations
+                if item["ref"] in seen_refs
+                or item["source"] != "static-agent-binding"
+            ]
+            next_bindings: list[dict[str, object]] = []
+            changed = len(next_registrations) != len(registrations) or bool(
+                set(existing_bindings) - seen_refs
+            )
+
+            prepared: list[tuple[dict[str, object], dict[str, object], bool]] = []
+            for registration, binding in validated:
+                existing_binding = existing_bindings.get(binding.host_ref)
+                next_epoch = binding.lease_epoch
+                if existing_binding is not None:
+                    next_epoch = _generation(
+                        existing_binding["lease_epoch"],
+                        "control.host_store_unavailable",
+                    )
+                    binding_changed = (
+                        existing_binding["client_spki_sha256"]
+                        != binding.client_spki_sha256
+                        or existing_binding["enabled"] != binding.enabled
+                    )
+                    if binding_changed:
+                        if next_epoch == _MAX_GENERATION:
+                            raise HostRegistryError("host.identity_epoch_exhausted")
+                        next_epoch += 1
+                if binding.lease_epoch not in {1, next_epoch}:
+                    raise HostRegistryError("host.identity_invalid")
+                stored_binding = {
+                    "ref": binding.host_ref,
+                    "client_spki_sha256": binding.client_spki_sha256,
+                    "lease_epoch": next_epoch,
+                    "enabled": binding.enabled,
+                }
+                existing_registration = existing_registrations.get(binding.host_ref)
+                item_changed = (
+                    existing_binding != stored_binding
+                    or existing_registration is None
+                    or _registration_without_generation(existing_registration)
+                    != _registration_without_generation(registration)
+                )
+                changed = changed or item_changed
+                prepared.append((registration, stored_binding, item_changed))
+
+            if not changed:
+                return
+            if current_generation == _MAX_GENERATION:
+                raise HostRegistryError("credential.generation_conflict")
+            mutation_generation = current_generation + 1
+            desired_refs = {binding.host_ref for _record, binding in validated}
+            next_registrations = [
+                item for item in next_registrations if item["ref"] not in desired_refs
+            ]
+            for registration, stored_binding, item_changed in prepared:
+                existing_registration = existing_registrations.get(
+                    str(stored_binding["ref"])
+                )
+                registration["generation"] = (
+                    mutation_generation
+                    if item_changed or existing_registration is None
+                    else existing_registration["generation"]
+                )
+                next_registrations.append(registration)
+                next_bindings.append(stored_binding)
+            next_registrations.sort(key=lambda item: str(item["ref"]))
+            next_bindings.sort(key=lambda item: str(item["ref"]))
+            self._write_locked(
+                next_registrations, ssh_bindings, next_bindings, observations
+            )
 
     def agent_binding(self, host_ref: str) -> AgentBindingV1:
         host_ref = _host_ref(host_ref, "host.identity_invalid")
@@ -734,6 +845,13 @@ class HostRegistry:
         agent_bindings: builtins.list[dict[str, object]],
         observations: builtins.list[dict[str, object]],
     ) -> None:
+        try:
+            validated_agent_bindings = [
+                _agent_binding_record(item, "control.host_store_unavailable")
+                for item in agent_bindings
+            ]
+        except (KeyError, TypeError, ValueError):
+            raise HostRegistryError("control.host_store_unavailable") from None
         if (
             len(registrations) > MAX_HOST_RECORDS
             or len(observations) > MAX_HOST_RECORDS
@@ -753,7 +871,7 @@ class HostRegistry:
                     {"ref": ref, "binding_state": ssh_bindings[ref]}
                     for ref in sorted(ssh_bindings)
                 ],
-                "agent": agent_bindings,
+                "agent": validated_agent_bindings,
             },
             "observations": observations,
         }

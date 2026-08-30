@@ -34,7 +34,12 @@ from codex_master.admin_daemon import (
     JwksRefreshShutdownError,
     RefreshingCloudflareAccessVerifier,
 )
-from codex_master.admin_assembly import CredentialQuotaCollector, assemble_admin_runtime
+from codex_master.admin_assembly import (
+    CredentialQuotaCollector,
+    assemble_admin_runtime,
+    provision_agent_bindings_from_credential,
+)
+from codex_master.admin_hosts import HostRegistry, HostRegistryError
 from codex_master.admin_http import AdminHttpServer
 from codex_master.admin_service import MasterjetControlService
 from codex_master.admin_socket import UnixPeerCredentials
@@ -1824,6 +1829,123 @@ def test_missing_agent_bindings_credential_means_zero_remote_hosts(
         assert runtime.service._host_registry.list() == ()
     finally:
         runtime.close()
+
+
+def test_agent_bindings_credential_deprovisions_omitted_and_missing_static_hosts(
+    tmp_path: Path,
+) -> None:
+    registry = HostRegistry.for_test(tmp_path)
+    registry.record_probe(
+        "probe-one",
+        generation=1,
+        evidence={
+            "label": "Probe One",
+            "role": "execution",
+            "transport_binding": {"kind": "ssh", "binding_ref": "probe-one-ssh"},
+            "capabilities": ["resource.probe"],
+            "reachability": {"state": "reachable", "latency_ms": 1},
+            "resource_evidence": {"cpu_threads": 1, "memory_bytes": 1024},
+            "observed_at": "2026-08-28T10:00:00Z",
+            "source": "host-agent",
+            "binding_state": {"endpoint": "ssh://127.0.0.1:22"},
+        },
+    )
+
+    def credential(*refs: str) -> bytes:
+        characters = {"worker-one": "a", "worker-two": "b"}
+        hosts = [
+            {
+                "ref": ref,
+                "label": ref.replace("-", " ").title(),
+                "role": "worker",
+                "capabilities": ["resource.probe"],
+                "client_spki_sha256": "sha256:" + characters[ref] * 64,
+                "lease_epoch": 1,
+                "enabled": True,
+            }
+            for ref in refs
+        ]
+        return json.dumps(
+            {"schema_version": 1, "hosts": hosts}, separators=(",", ":")
+        ).encode("ascii")
+
+    provision_agent_bindings_from_credential(
+        registry, credential("worker-one", "worker-two")
+    )
+    provision_agent_bindings_from_credential(registry, credential("worker-two"))
+
+    with pytest.raises(HostRegistryError, match="host.identity_not_found"):
+        registry.resolve_agent_spki("sha256:" + "a" * 64)
+    assert {host.ref for host in registry.list()} == {"probe-one", "worker-two"}
+
+    provision_agent_bindings_from_credential(registry, None)
+
+    with pytest.raises(HostRegistryError, match="host.identity_not_found"):
+        registry.resolve_agent_spki("sha256:" + "b" * 64)
+    assert [host.ref for host in registry.list()] == ["probe-one"]
+    assert registry.get("probe-one").reachability == {
+        "state": "reachable",
+        "latency_ms": 1,
+    }
+
+
+def test_agent_bindings_credential_validates_all_hosts_before_atomic_commit(
+    tmp_path: Path,
+) -> None:
+    registry = HostRegistry.for_test(tmp_path)
+    provision_agent_bindings_from_credential(
+        registry,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hosts": [
+                    {
+                        "ref": "worker-zero",
+                        "label": "Worker Zero",
+                        "role": "worker",
+                        "capabilities": ["resource.probe"],
+                        "client_spki_sha256": "sha256:" + "0" * 64,
+                        "lease_epoch": 1,
+                        "enabled": True,
+                    }
+                ],
+            },
+            separators=(",", ":"),
+        ).encode("ascii"),
+    )
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    before = document.read_bytes()
+    payload = {
+        "schema_version": 1,
+        "hosts": [
+            {
+                "ref": "worker-one",
+                "label": "Worker One",
+                "role": "worker",
+                "capabilities": ["resource.probe"],
+                "client_spki_sha256": "sha256:" + "a" * 64,
+                "lease_epoch": 1,
+                "enabled": True,
+            },
+            {
+                "ref": "worker-two",
+                "label": "Worker Two",
+                "role": "worker",
+                "capabilities": ["resource.probe"],
+                "client_spki_sha256": "sha256:" + "b" * 64,
+                "lease_epoch": 0,
+                "enabled": True,
+            },
+        ],
+    }
+
+    with pytest.raises(admin_assembly.AdminAssemblyError):
+        provision_agent_bindings_from_credential(
+            registry, json.dumps(payload, separators=(",", ":")).encode("ascii")
+        )
+
+    assert document.read_bytes() == before
+    assert [host.ref for host in registry.list()] == ["worker-zero"]
 
 
 def test_corrupt_agent_bindings_credential_blocks_start(

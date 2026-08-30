@@ -721,6 +721,31 @@ def test_agent_binding_expected_generation_and_rotation_are_atomic(
     assert registry.agent_binding("worker-one").lease_epoch == 2
 
 
+def test_agent_binding_rotation_at_max_epoch_fails_without_mutation(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.provision_agent_binding(
+        static_registration(),
+        agent_binding(lease_epoch=2**63 - 1),
+        expected_generation=0,
+    )
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    before = document.read_bytes()
+
+    with pytest.raises(HostRegistryError, match="host.identity_epoch_exhausted"):
+        registry.provision_agent_binding(
+            static_registration(),
+            agent_binding(spki=SPKI_TWO),
+            expected_generation=1,
+        )
+
+    assert document.read_bytes() == before
+    assert registry_at(tmp_path).agent_binding("worker-one") == agent_binding(
+        lease_epoch=2**63 - 1
+    )
+
+
 @pytest.mark.parametrize(
     "raw",
     [

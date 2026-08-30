@@ -370,9 +370,7 @@ def parse_admin_config(raw: bytes) -> AdminConfig:
 def provision_agent_bindings_from_credential(
     registry: HostRegistry, raw: bytes | None
 ) -> None:
-    if raw is None:
-        return
-    value = _parse_json(raw)
+    value = {"schema_version": 1, "hosts": []} if raw is None else _parse_json(raw)
     if (
         set(value) != {"schema_version", "hosts"}
         or value.get("schema_version") != 1
@@ -383,6 +381,7 @@ def provision_agent_bindings_from_credential(
     expected_generation = max((host.generation for host in registry.list()), default=0)
     seen_refs: set[str] = set()
     seen_enabled_spkis: set[str] = set()
+    desired: list[tuple[dict[str, object], AgentBindingV1]] = []
     try:
         for item in cast(list[object], value["hosts"]):
             if type(item) is not dict or set(item) != {
@@ -406,8 +405,8 @@ def provision_agent_bindings_from_credential(
                     raise AdminAssemblyError
                 seen_enabled_spkis.add(spki)
             seen_refs.add(ref)
-            host = registry.provision_agent_binding(
-                {
+            desired.append(
+                ({
                     "ref": record["ref"],
                     "label": record["label"],
                     "role": record["role"],
@@ -418,10 +417,11 @@ def provision_agent_bindings_from_credential(
                     cast(str, record["client_spki_sha256"]),
                     cast(int, record["lease_epoch"]),
                     cast(bool, record["enabled"]),
-                ),
-                expected_generation=expected_generation,
+                ))
             )
-            expected_generation = max(expected_generation, host.generation)
+        registry.synchronize_agent_bindings(
+            tuple(desired), expected_generation=expected_generation
+        )
     except (HostRegistryError, TypeError, ValueError):
         raise AdminAssemblyError from None
 
