@@ -590,7 +590,7 @@ class DurableAccountRegistry:
             result = {
                 "account": {
                     "ref": account_ref,
-                    "generation": existing["identity_generation"],
+                    "generation": generations[provider],
                 }
             }
             receipts.append(
