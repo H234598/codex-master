@@ -37,12 +37,20 @@ from codex_master.fleet_home_broker_intent_store import (
     claim_broker_intent,
 )
 from codex_master.fleet_home_broker_protocol import (
+    BrokerCheckpoint,
+    BrokerObjectState,
+    BrokerObservation,
+    BrokerRegistryState,
     BrokerReply,
     BrokerResultCode,
     CHPB_PROTOCOL,
     ChpbTransactionOperation,
     ChpbMessageKind,
+    PolicyBinding,
     PrincipalBinding,
+    TransactionBinding,
+    TransactionStatus,
+    b2a_phase_for_checkpoint,
 )
 from codex_master.fleet_home_broker_transport import BrokerTransportResponse
 
@@ -132,22 +140,73 @@ def _plan(intent: BrokerIntentV1) -> OfflineBrokerPlan:
     )
 
 
+def _binding(intent: BrokerIntentV1, **changes: object) -> TransactionBinding:
+    binding = TransactionBinding(
+        ChpbTransactionOperation(intent.operation.value),
+        intent.transaction_id,
+        intent.store_uuid,
+        _plan(intent).expected_principal,
+        PolicyBinding(intent.policy_generation, intent.projection_digest),
+    )
+    return dataclasses.replace(binding, **changes)
+
+
 def _response(
     intent: BrokerIntentV1,
     *,
     request_id: str | None = None,
+    result: BrokerResultCode = BrokerResultCode.COMMITTED,
+    binding: TransactionBinding | None = None,
     fds: tuple[int, ...] = (),
 ) -> BrokerTransportResponse:
+    transaction_binding = binding or _binding(intent)
+    checkpoint = {
+        BrokerResultCode.COMMITTED: BrokerCheckpoint.COMMITTED,
+        BrokerResultCode.ROLLED_BACK: BrokerCheckpoint.ROLLED_BACK,
+        BrokerResultCode.BLOCKED_DRIFT: BrokerCheckpoint.BLOCKED_DRIFT,
+    }[result]
+    observation = {
+        BrokerCheckpoint.COMMITTED: BrokerObservation(
+            BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1
+        ),
+        BrokerCheckpoint.ROLLED_BACK: BrokerObservation(
+            BrokerObjectState.ROLLED_BACK, BrokerRegistryState.NOT_APPLICABLE, 1
+        ),
+        BrokerCheckpoint.BLOCKED_DRIFT: BrokerObservation(
+            BrokerObjectState.DRIFT, BrokerRegistryState.FOREIGN, 1
+        ),
+    }[checkpoint]
     return BrokerTransportResponse(
         BrokerReply(
             CHPB_PROTOCOL,
             ChpbMessageKind.REPLY,
             request_id or intent.request_id,
+            result,
+            TransactionStatus(
+                transaction_binding,
+                b2a_phase_for_checkpoint(checkpoint),
+                checkpoint,
+                observation,
+                1,
+                result,
+            ),
+            None,
+        ),
+        fds,
+    )
+
+
+def _invalid_message_response(intent: BrokerIntentV1) -> BrokerTransportResponse:
+    return BrokerTransportResponse(
+        BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            intent.request_id,
             BrokerResultCode.INVALID_MESSAGE,
             None,
             None,
         ),
-        fds,
+        (),
     )
 
 
@@ -699,6 +758,150 @@ def test_wrong_reply_type_is_terminal_execution_failure_without_restart_retry() 
     )
     assert restart.code is BrokerIntentConsumeCode.EMPTY
     assert restart_execution.calls == []
+
+
+def test_invalid_message_reply_is_terminal_execution_failure_without_restart_retry() -> (
+    None
+):
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".claim-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+    )
+    store = FakeStore([claim])
+    execution = FakeExecution(_invalid_message_response(intent))
+
+    result = consume_one_broker_intent(
+        store,
+        FakeResolver(_plan(intent)),
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.EXECUTION_FAILED
+    assert len(execution.calls) == 1
+    assert store.terminals == [(claim.claim_name, b'{"result":"execution_failed"}\n')]
+    restart_execution = FakeExecution(_response(intent))
+    restart = consume_one_broker_intent(
+        store,
+        UnusedResolver(),
+        restart_execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+    assert restart.code is BrokerIntentConsumeCode.EMPTY
+    assert restart_execution.calls == []
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        lambda binding: dataclasses.replace(binding, transaction_id="4" * 32),
+        lambda binding: dataclasses.replace(
+            binding, operation=ChpbTransactionOperation.REPLACE
+        ),
+        lambda binding: dataclasses.replace(binding, store_uuid="4" * 32),
+        lambda binding: dataclasses.replace(
+            binding,
+            principal=dataclasses.replace(binding.principal, agent_id="bee_2"),
+        ),
+        lambda binding: dataclasses.replace(
+            binding,
+            principal=dataclasses.replace(binding.principal, manifest_generation=4),
+        ),
+        lambda binding: dataclasses.replace(
+            binding,
+            principal=dataclasses.replace(binding.principal, unit_generation=10),
+        ),
+        lambda binding: dataclasses.replace(
+            binding,
+            principal=dataclasses.replace(binding.principal, mcs_pair="c1,c2"),
+        ),
+        lambda binding: dataclasses.replace(
+            binding,
+            principal=dataclasses.replace(binding.principal, fencing_epoch=5),
+        ),
+        lambda binding: dataclasses.replace(
+            binding,
+            policy=dataclasses.replace(binding.policy, policy_generation=8),
+        ),
+        lambda binding: dataclasses.replace(
+            binding,
+            policy=dataclasses.replace(binding.policy, projection_digest="b" * 64),
+        ),
+    ),
+    ids=(
+        "transaction_id",
+        "operation",
+        "store_uuid",
+        "principal_agent",
+        "principal_manifest",
+        "principal_unit",
+        "principal_mcs",
+        "principal_fencing",
+        "policy_generation",
+        "policy_projection",
+    ),
+)
+def test_committed_reply_with_foreign_intent_binding_is_terminal_execution_failure(
+    drift,
+) -> None:
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".claim-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+    )
+    store = FakeStore([claim])
+    execution = FakeExecution(_response(intent, binding=drift(_binding(intent))))
+
+    result = consume_one_broker_intent(
+        store,
+        FakeResolver(_plan(intent)),
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.EXECUTION_FAILED
+    assert len(execution.calls) == 1
+    assert store.terminals == [(claim.claim_name, b'{"result":"execution_failed"}\n')]
+    restart_execution = FakeExecution(_response(intent))
+    restart = consume_one_broker_intent(
+        store,
+        UnusedResolver(),
+        restart_execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+    assert restart.code is BrokerIntentConsumeCode.EMPTY
+    assert restart_execution.calls == []
+
+
+@pytest.mark.parametrize(
+    "result",
+    (BrokerResultCode.ROLLED_BACK, BrokerResultCode.BLOCKED_DRIFT),
+)
+def test_noncommitted_terminal_reply_is_terminal_execution_failure(
+    result: BrokerResultCode,
+) -> None:
+    intent = _intent()
+    claim = BrokerIntentClaimBytes(
+        ".claim-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+    )
+    store = FakeStore([claim])
+    execution = FakeExecution(_response(intent, result=result))
+
+    consumed = consume_one_broker_intent(
+        store,
+        FakeResolver(_plan(intent)),
+        execution,
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert consumed.code is BrokerIntentConsumeCode.EXECUTION_FAILED
+    assert len(execution.calls) == 1
+    assert store.terminals == [(claim.claim_name, b'{"result":"execution_failed"}\n')]
 
 
 def test_mismatched_reply_request_id_is_terminal_execution_failure() -> None:

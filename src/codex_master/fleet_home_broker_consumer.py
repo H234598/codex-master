@@ -13,7 +13,12 @@ from codex_master.fleet_home_broker_intent_store import (
     BrokerIntentStoreOperations,
     claim_broker_intent,
 )
-from codex_master.fleet_home_broker_protocol import validate_chpb_message
+from codex_master.fleet_home_broker_protocol import (
+    BrokerReply,
+    BrokerResultCode,
+    ChpbTransactionOperation,
+    validate_chpb_message,
+)
 from codex_master.fleet_home_broker_transport import BrokerTransportResponse
 
 
@@ -113,8 +118,31 @@ def _valid_execution_response(response: object, intent: BrokerIntentV1) -> bool:
     if response.fds:
         return False
     try:
-        validate_chpb_message(response.reply)
-        return response.reply.request_id == intent.request_id
+        reply = validate_chpb_message(response.reply)
+        if type(reply) is not BrokerReply or reply.request_id != intent.request_id:
+            return False
+        status = reply.transaction
+        if (
+            reply.result is not BrokerResultCode.COMMITTED
+            or status is None
+            or status.terminal_result is not BrokerResultCode.COMMITTED
+        ):
+            return False
+        binding = status.binding
+        principal = binding.principal
+        policy = binding.policy
+        return (
+            binding.operation is ChpbTransactionOperation(intent.operation.value)
+            and binding.transaction_id == intent.transaction_id
+            and binding.store_uuid == intent.store_uuid
+            and principal.agent_id == intent.agent_id
+            and principal.manifest_generation == intent.manifest_generation
+            and principal.unit_generation == intent.unit_generation
+            and principal.mcs_pair == intent.mcs_pair
+            and principal.fencing_epoch == intent.fencing_epoch
+            and policy.policy_generation == intent.policy_generation
+            and policy.projection_digest == intent.projection_digest
+        )
     except Exception:
         return False
 
