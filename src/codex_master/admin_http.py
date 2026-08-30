@@ -59,6 +59,82 @@ _OLLAMA_PROBE_ROUTE = re.compile(
     r"/admin/v1/ollama/instances/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})/probe\Z",
     re.ASCII,
 )
+_REST_SEGMENT = r"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})"
+_REST_DIGEST = r"(sha256:[0-9a-f]{64})"
+_REST_GET_ROUTES = {
+    "/admin/v1/hosts": ("hosts.list", {}),
+    "/admin/v1/openai/accounts": ("openai.accounts.list", {}),
+    "/admin/v1/google/accounts": ("google.accounts.list", {}),
+}
+_REST_POST_ROUTES = {
+    "/admin/v1/openai/accounts": ("openai.accounts.add", ()),
+    "/admin/v1/secret-ingress-sessions": ("secret.ingress.create", ()),
+    "/admin/v1/google/oauth-transactions": ("google.oauth.begin", ()),
+    "/admin/v1/google/oauth-client-import-plans": (
+        "google.oauth-client-import.plan",
+        (),
+    ),
+    "/admin/v1/google/inventory-refreshes": ("google.inventory.refresh", ()),
+    "/admin/v1/google/provision-plans": ("google.provision.plan", ()),
+    "/admin/v1/google/billing-bind-plans": ("google.billing.plan", ()),
+}
+_REST_GET_PATTERNS = (
+    (
+        re.compile(rf"/admin/v1/google/accounts/{_REST_SEGMENT}\Z", re.ASCII),
+        "google.projects.list",
+        ("account_ref",),
+    ),
+)
+_REST_POST_PATTERNS = (
+    (
+        re.compile(
+            rf"/admin/v1/openai/accounts/{_REST_SEGMENT}/auth-sync-plans\Z",
+            re.ASCII,
+        ),
+        "openai.auth.plan",
+        ("account_ref",),
+    ),
+    (
+        re.compile(
+            rf"/admin/v1/openai/accounts/{_REST_SEGMENT}/auth-sync-plans/"
+            rf"{_REST_DIGEST}/apply\Z",
+            re.ASCII,
+        ),
+        "openai.auth.apply",
+        ("account_ref", "plan_digest"),
+    ),
+    (
+        re.compile(
+            rf"/admin/v1/google/oauth-transactions/{_REST_SEGMENT}/complete\Z",
+            re.ASCII,
+        ),
+        "google.oauth.complete",
+        ("transaction_id",),
+    ),
+    (
+        re.compile(
+            rf"/admin/v1/google/oauth-client-import-plans/{_REST_DIGEST}/apply\Z",
+            re.ASCII,
+        ),
+        "google.oauth-client-import.apply",
+        ("plan_digest",),
+    ),
+    (
+        re.compile(
+            rf"/admin/v1/google/provision-plans/{_REST_DIGEST}/apply\Z", re.ASCII
+        ),
+        "google.provision.apply",
+        ("plan_digest",),
+    ),
+    (
+        re.compile(
+            rf"/admin/v1/google/billing-bind-plans/{_REST_SEGMENT}/apply\Z",
+            re.ASCII,
+        ),
+        "google.billing.apply",
+        ("plan_id",),
+    ),
+)
 _AUTHORITY_MODES = frozenset({"cloudflare", "bearer", "require_both"})
 
 
@@ -115,7 +191,7 @@ class _AdminHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         expected_operation: str | None = None
-        route_argument: tuple[str, str] | None = None
+        route_arguments: dict[str, str] = {}
         apply_match = _OLLAMA_APPLY_ROUTE.fullmatch(self.path)
         probe_match = _OLLAMA_PROBE_ROUTE.fullmatch(self.path)
         if self.path == "/admin/v1":
@@ -124,13 +200,16 @@ class _AdminHandler(BaseHTTPRequestHandler):
             expected_operation = "ollama.instance.plan"
         elif apply_match is not None:
             expected_operation = "ollama.instance.apply"
-            route_argument = ("plan_id", apply_match.group(1))
+            route_arguments = {"plan_id": apply_match.group(1)}
         elif probe_match is not None:
             expected_operation = "ollama.instance.probe"
-            route_argument = ("instance_ref", probe_match.group(1))
+            route_arguments = {"instance_ref": probe_match.group(1)}
         else:
-            self._reply_problem(404, "control.route_not_found")
-            return
+            route = _post_route(self.path)
+            if route is None:
+                self._reply_problem(404, "control.route_not_found")
+                return
+            expected_operation, route_arguments = route
         if not self._boundary_valid():
             return
         try:
@@ -160,8 +239,7 @@ class _AdminHandler(BaseHTTPRequestHandler):
             expected_operation is not None
             and request.operation != expected_operation
         ) or (
-            route_argument is not None
-            and request.arguments.get(route_argument[0]) != route_argument[1]
+            not _route_arguments_match(request, route_arguments)
         ):
             self._reply_problem(400, "control.request_invalid")
             return
@@ -254,6 +332,11 @@ class _AdminHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         operation = _OLLAMA_QUERY_ROUTES.get(self.path)
+        arguments: dict[str, str] = {}
+        if operation is None:
+            route = _get_route(self.path)
+            if route is not None:
+                operation, arguments = route
         if operation is None:
             self._reply_problem(
                 405 if self.path == "/admin/v1" else 404,
@@ -264,7 +347,7 @@ class _AdminHandler(BaseHTTPRequestHandler):
             return
         try:
             principal = self._authenticate()
-            request = AdminRequestV1(operation, {}, None, None, None)
+            request = AdminRequestV1(operation, arguments, None, None, None)
             result = self.server.service.handle(principal, request)
         except AdminAuthError as error:
             self._reply_auth_error(error)
@@ -284,6 +367,8 @@ class _AdminHandler(BaseHTTPRequestHandler):
             or self.path == _OLLAMA_PLAN_ROUTE
             or _OLLAMA_APPLY_ROUTE.fullmatch(self.path) is not None
             or _OLLAMA_PROBE_ROUTE.fullmatch(self.path) is not None
+            or _get_route(self.path) is not None
+            or _post_route(self.path) is not None
             or self.path.startswith(_INGRESS_PREFIX)
         )
         self._reply_problem(
@@ -482,8 +567,7 @@ class _AdminHandler(BaseHTTPRequestHandler):
     def _wire_result(
         self, request: AdminRequestV1, result: Mapping[str, object]
     ) -> dict[str, object]:
-        del request
-        return {"schema_version": 1, **result}
+        return {"schema_version": 1, "operation": request.operation, **result}
 
     def _reply_auth_error(self, error: AdminAuthError) -> None:
         status = 401 if error.code == "authority.identity_invalid" else 403
@@ -736,6 +820,47 @@ def _trusted_proxies(values: object) -> frozenset[str]:
         return result
     except (TypeError, ValueError):
         raise ValueError("control.origin_invalid") from None
+
+
+def _get_route(path: str) -> tuple[str, dict[str, str]] | None:
+    static = _REST_GET_ROUTES.get(path)
+    if static is not None:
+        operation, arguments = static
+        return operation, dict(arguments)
+    return _pattern_route(path, _REST_GET_PATTERNS)
+
+
+def _post_route(path: str) -> tuple[str, dict[str, str]] | None:
+    static = _REST_POST_ROUTES.get(path)
+    if static is not None:
+        operation, fields = static
+        return operation, {field: "" for field in fields}
+    return _pattern_route(path, _REST_POST_PATTERNS)
+
+
+def _pattern_route(
+    path: str,
+    patterns: tuple[tuple[re.Pattern[str], str, tuple[str, ...]], ...],
+) -> tuple[str, dict[str, str]] | None:
+    for pattern, operation, fields in patterns:
+        match = pattern.fullmatch(path)
+        if match is None:
+            continue
+        return operation, dict(zip(fields, match.groups(), strict=True))
+    return None
+
+
+def _route_arguments_match(
+    request: AdminRequestV1, route_arguments: Mapping[str, str]
+) -> bool:
+    for field, expected in route_arguments.items():
+        if field == "plan_digest":
+            actual = request.plan_digest
+        else:
+            actual = request.arguments.get(field)
+        if actual != expected:
+            return False
+    return True
 
 
 def _status_for_code(code: str) -> int:
