@@ -6,6 +6,7 @@ import argparse
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -14,6 +15,7 @@ import socketserver
 import ssl
 import sys
 import threading
+import time
 from types import FrameType
 from typing import Iterator, Mapping, Sequence
 
@@ -30,8 +32,11 @@ from .agent_operations import AgentOperationStore
 
 _STATE_ROOT = Path("/var/lib/codex-master")
 _CREDENTIAL_NAMES = ("agent-server.crt", "agent-server.key", "agent-ca.crt")
+TLS_HANDSHAKE_TIMEOUT_SECONDS = 2.0
+HTTP_HEADER_TIMEOUT_SECONDS = 2.0
+HTTP_BODY_TIMEOUT_SECONDS = 2.0
+AGENT_DRAIN_TIMEOUT_SECONDS = 5.0
 _active_server: object | None = None
-_shutdown_thread: threading.Thread | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +106,9 @@ class _AgentRequestHandler(socketserver.StreamRequestHandler):
 
     def handle(self) -> None:
         try:
+            self.request.settimeout(TLS_HANDSHAKE_TIMEOUT_SECONDS)
+            self.request.do_handshake()
+            self.request.settimeout(HTTP_HEADER_TIMEOUT_SECONDS)
             header = self._read_headers()
             if header is None:
                 return
@@ -118,14 +126,11 @@ class _AgentRequestHandler(socketserver.StreamRequestHandler):
             if headers.get("content-type") != "application/json":
                 self._reply(415, {"error": "agent.content_type_invalid"})
                 return
-            length_raw = headers.get("content-length")
-            if length_raw is None or not length_raw.isascii() or not length_raw.isdecimal():
-                self._reply(400, {"error": "agent.request_invalid"})
+            length_status, length = _parse_content_length(headers.get("content-length"))
+            if length_status != 200:
+                self._reply(length_status, {"error": "agent.request_too_large" if length_status == 413 else "agent.request_invalid"})
                 return
-            length = int(length_raw)
-            if length > MAX_AGENT_BODY_BYTES:
-                self._reply(413, {"error": "agent.request_too_large"})
-                return
+            self.request.settimeout(HTTP_BODY_TIMEOUT_SECONDS)
             body = self.rfile.read(length)
             if len(body) != length:
                 self._reply(400, {"error": "agent.request_invalid"})
@@ -133,6 +138,12 @@ class _AgentRequestHandler(socketserver.StreamRequestHandler):
             self._send(self.server.application.handle(principal, method, target, body))
         except (ConnectionError, OSError, ssl.SSLError):
             return
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            self.server.release_request_socket(self.request)
 
     def _read_headers(self) -> tuple[str, str, dict[str, str]] | None:
         data = bytearray()
@@ -183,13 +194,16 @@ class _AgentRequestHandler(socketserver.StreamRequestHandler):
 
 class AgentApiServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
-    daemon_threads = False
-    block_on_close = True
+    daemon_threads = True
+    block_on_close = False
 
     def __init__(self, server_address, application, resolver, ssl_context) -> None:
         self.application = application
         self.resolver = resolver
         self.ssl_context = ssl_context
+        self._request_condition = threading.Condition()
+        self._request_sockets: set[socket.socket] = set()
+        self._shutdown_worker: threading.Thread | None = None
         super().__init__(server_address, _AgentRequestHandler)
 
     def get_request(self):
@@ -201,7 +215,71 @@ class AgentApiServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             raise
 
     def get_request_from_socket(self, plain: socket.socket, address):
-        return self.ssl_context.wrap_socket(plain, server_side=True), address
+        wrapped = self.ssl_context.wrap_socket(
+            plain, server_side=True, do_handshake_on_connect=False
+        )
+        with self._request_condition:
+            self._request_sockets.add(wrapped)
+        return wrapped, address
+
+    def release_request_socket(self, request: socket.socket) -> None:
+        with self._request_condition:
+            self._request_sockets.discard(request)
+            self._request_condition.notify_all()
+
+    def stop_accepting(self) -> None:
+        with self._request_condition:
+            if self._shutdown_worker is not None:
+                return
+            self._shutdown_worker = threading.Thread(
+                target=self.shutdown, name="agent-api-stop-accepting", daemon=True
+            )
+            self._shutdown_worker.start()
+
+    def drain(self, timeout: float) -> bool:
+        if type(timeout) not in {int, float} or not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("agent.drain_timeout_invalid")
+        deadline = time.monotonic() + float(timeout)
+        worker = self._shutdown_worker
+        if worker is not None:
+            worker.join(max(0.0, deadline - time.monotonic()))
+        with self._request_condition:
+            while self._request_sockets:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    outstanding = tuple(self._request_sockets)
+                    break
+                self._request_condition.wait(remaining)
+            else:
+                outstanding = ()
+        for request in outstanding:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
+        stopped = worker is None or not worker.is_alive()
+        if outstanding or not stopped:
+            self.socket.close()
+        return not outstanding and stopped
+
+
+def _parse_content_length(value: str | None) -> tuple[int, int]:
+    if (
+        value is None
+        or not value
+        or not value.isascii()
+        or not value.isdecimal()
+        or (len(value) > 1 and value.startswith("0"))
+    ):
+        return 400, 0
+    limit = str(MAX_AGENT_BODY_BYTES)
+    if len(value) > len(limit) or (len(value) == len(limit) and value > limit):
+        return 413, 0
+    return 200, int(value)
 
 
 def assemble_server(address: str, port: int, credentials: AgentCredentialFds) -> AgentApiServer:
@@ -216,28 +294,24 @@ def assemble_server(address: str, port: int, credentials: AgentCredentialFds) ->
 
 
 def _handle_signal(_signum: int, _frame: FrameType | None) -> None:
-    global _shutdown_thread
     server = _active_server
-    if server is None or _shutdown_thread is not None:
+    if server is None:
         return
-    _shutdown_thread = threading.Thread(target=server.shutdown, name="agent-api-drain")
-    _shutdown_thread.start()
+    server.stop_accepting()
 
 
 def run_server(server: object) -> None:
-    global _active_server, _shutdown_thread
+    global _active_server
     previous = signal.getsignal(signal.SIGTERM)
     _active_server = server
-    _shutdown_thread = None
     signal.signal(signal.SIGTERM, _handle_signal)
     try:
         server.serve_forever()
     finally:
-        if _shutdown_thread is not None:
-            _shutdown_thread.join()
+        server.stop_accepting()
+        server.drain(AGENT_DRAIN_TIMEOUT_SECONDS)
         server.server_close()
         _active_server = None
-        _shutdown_thread = None
         signal.signal(signal.SIGTERM, previous)
 
 
