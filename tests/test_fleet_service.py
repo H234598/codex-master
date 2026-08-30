@@ -2045,6 +2045,7 @@ def test_ollama_models_and_instances_remain_separate_registry_views(tmp_path: Pa
 
     assert [model.ref for model in service.ollama_models()] == ["model-a", "model-b"]
     assert service.ollama_instances() == (placed,)
+    assert service.ollama_generation() == 1
 
 
 def test_apply_publishes_one_lane_per_selected_model_only_after_readiness(
@@ -2170,3 +2171,24 @@ def test_successful_ollama_apply_retry_is_idempotent(tmp_path: Path) -> None:
     assert second is first
     assert registry.load().generation == 2
     assert [call[0] for call in transport.calls] == ["plan", "apply", "probe"]
+
+
+def test_ollama_probe_withdraws_lanes_when_runtime_loses_readiness(
+    tmp_path: Path,
+) -> None:
+    service, registry, transport = _ollama_fleet_service(tmp_path)
+    planned = service.plan_ollama_instance(
+        _ollama_instance(), expected_generation=1
+    )
+    service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+    transport.ready = False
+
+    status = service.probe_ollama_instance(
+        "local-main", expected_generation=2
+    )
+
+    assert status.ready is False
+    assert service.ollama_hive_lanes() == ()
+    stored = registry.load()
+    assert stored.generation == 3
+    assert stored.instances[0].readiness_state == "not_ready"

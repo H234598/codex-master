@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -14,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import threading
+import time
 from typing import Any, Final, cast
 import urllib.parse
 import urllib.request
@@ -65,6 +67,14 @@ from .openai_credential_service import (
     OpenAICredentialService,
     OpenAIIdentitySource,
 )
+from .fleet_home_broker_transport import BrokerTransportError
+from .fleet_service import FleetPaths, FleetPrivateIO, FleetService
+from .ollama_host_transport import (
+    CONTROL_HOST_REF,
+    OllamaHostLease,
+    OllamaHostTransport,
+)
+from .ollama_registry import OllamaRegistryStore
 
 
 _CONFIG_MAX_BYTES: Final[int] = 64 * 1024
@@ -107,6 +117,25 @@ class AdminAssemblyError(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("control.admin_configuration_invalid")
+
+
+class _ControlHostOllamaLeases:
+    def __init__(self) -> None:
+        self._lease = OllamaHostLease(
+            CONTROL_HOST_REF,
+            "control-daemon",
+            1,
+            1,
+            time.monotonic() + 365 * 24 * 60 * 60,
+        )
+
+    def resolve(self, host_ref: str) -> OllamaHostLease | None:
+        return self._lease if host_ref == CONTROL_HOST_REF else None
+
+
+class _LocalOnlyOllamaBroker:
+    def exchange(self, *_args: object, **_values: object) -> object:
+        raise BrokerTransportError("resource.host_unreachable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2238,6 +2267,33 @@ def assemble_admin_runtime() -> AdminRuntime:
             GoogleBillingAuthority(google_manager, access_tokens),
             state_root=state_root / "google-billing",
         )
+        ollama_registry = OllamaRegistryStore(
+            state_root / "ollama" / "registry.json"
+        )
+        ollama_transport = OllamaHostTransport(
+            registry=ollama_registry,
+            leases=_ControlHostOllamaLeases(),
+            broker=_LocalOnlyOllamaBroker(),
+        )
+        ollama_paths = FleetPaths.from_state_root(state_root / "ollama-owner")
+        ollama_fleet = FleetService(
+            ollama_paths,
+            FleetPrivateIO(
+                ensure_dir=lambda path: path.mkdir(
+                    mode=0o700, parents=True, exist_ok=True
+                ),
+                read_text=lambda *_args: None,
+                replace_text=lambda *_args: None,
+                read_bytes=lambda *_args: None,
+                replace_bytes=lambda *_args: None,
+                lock=contextlib.nullcontext,
+                utc_now=lambda: datetime.now(UTC),
+            ),
+            pool_root=state_root / "ollama-pool",
+            ollama_registry=ollama_registry,
+            ollama_transport=ollama_transport,
+            ollama_resource_snapshot=lambda _host_ref: None,
+        )
 
         service = MasterjetControlService(
             operation_store=operation_store,
@@ -2251,6 +2307,7 @@ def assemble_admin_runtime() -> AdminRuntime:
             host_registry=host_registry,
             secret_ingress=ingress,
             account_registry=registry,
+            ollama_fleet=ollama_fleet,
         )
 
         bearer = (

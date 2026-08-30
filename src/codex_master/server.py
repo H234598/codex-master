@@ -34313,6 +34313,36 @@ _MASTERJET_ADMIN_TOOL_SPECS = (
         "Return one account-bound durable operation.",
         None,
     ),
+    (
+        "fleet_ollama_models",
+        "ollama.models.list",
+        "List redacted Ollama model catalog entries.",
+        None,
+    ),
+    (
+        "fleet_ollama_instances",
+        "ollama.instances.list",
+        "List redacted Ollama fleet instances.",
+        None,
+    ),
+    (
+        "fleet_ollama_instance_plan",
+        "ollama.instance.plan",
+        "Plan one typed Ollama instance placement.",
+        None,
+    ),
+    (
+        "fleet_ollama_instance_apply",
+        "ollama.instance.apply",
+        "Apply one immutable Ollama instance plan.",
+        None,
+    ),
+    (
+        "fleet_ollama_instance_probe",
+        "ollama.instance.probe",
+        "Probe one owned Ollama instance and update readiness.",
+        None,
+    ),
 )
 _MASTERJET_ADMIN_TOOL_ROUTES = MappingProxyType(
     {
@@ -34341,6 +34371,11 @@ _MASTERJET_ADMIN_CLI_COMMANDS = MappingProxyType(
         ("google", "billing-plan"): ("google.billing.plan", None),
         ("google", "billing-apply"): ("google.billing.apply", None),
         ("operation", "status"): ("operations.get", None),
+        ("ollama", "models"): ("ollama.models.list", None),
+        ("ollama", "instances"): ("ollama.instances.list", None),
+        ("ollama", "instance-plan"): ("ollama.instance.plan", None),
+        ("ollama", "instance-apply"): ("ollama.instance.apply", None),
+        ("ollama", "probe"): ("ollama.instance.probe", None),
     }
 )
 
@@ -34376,11 +34411,16 @@ def _add_masterjet_admin_cli_command(
             dict.fromkeys((*optional, *alternate_required, *alternate_optional))
         )
     for field in (*required, *optional):
-        parser.add_argument(
-            f"--{field.replace('_', '-')}",
-            type=int if field == "expected_generation" else str,
-            required=field in required,
-        )
+        options: dict[str, object] = {
+            "type": int
+            if field == "expected_generation"
+            or field in ADMIN_OPERATION_METADATA[operation].integer_argument_fields
+            else str,
+            "required": field in required,
+        }
+        if field in ADMIN_OPERATION_METADATA[operation].token_list_argument_fields:
+            options["action"] = "append"
+        parser.add_argument(f"--{field.replace('_', '-')}", **options)
     parser.set_defaults(
         masterjet_admin_operation=operation,
         masterjet_admin_alternate_operation=alternate_operation,
@@ -34628,6 +34668,20 @@ def _masterjet_admin_tool_definition(
         field: (
             {"type": "integer", "minimum": 0}
             if field == "expected_generation"
+            else {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000,
+            }
+            if field in metadata.integer_argument_fields
+            else {
+                "type": "array",
+                "items": text_schema(128),
+                "minItems": 1,
+                "maxItems": 64,
+                "uniqueItems": True,
+            }
+            if field in metadata.token_list_argument_fields
             else text_schema(text_max_lengths.get(field, 128))
         )
         for field in (*required, *optional)
@@ -37725,6 +37779,19 @@ def _main_cli_impl(argv: list[str]) -> int:
         if namespace == "google":
             _add_masterjet_admin_cli_command(
                 google_sub, command, operation, alternate_operation
+            )
+
+    p_fleet_ollama = fleet_sub.add_parser("ollama")
+    ollama_sub = p_fleet_ollama.add_subparsers(
+        dest="fleet_ollama_command", required=True
+    )
+    for (namespace, command), (
+        operation,
+        alternate_operation,
+    ) in _MASTERJET_ADMIN_CLI_COMMANDS.items():
+        if namespace == "ollama":
+            _add_masterjet_admin_cli_command(
+                ollama_sub, command, operation, alternate_operation
             )
 
     p_fleet_operation = fleet_sub.add_parser("operation")

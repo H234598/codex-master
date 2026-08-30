@@ -65,6 +65,23 @@ def test_model_rejects_non_simple_only():
         valid_model(simple_only=False)
 
 
+def test_model_capabilities_survive_registry_round_trip(tmp_path):
+    store = OllamaRegistryStore.for_test(tmp_path)
+    model = OllamaModelV1(
+        ref="llama-small",
+        provider_model_id="provider/llama-small",
+        installed=True,
+        hive_enabled=True,
+        simple_only=True,
+        evidence_at_utc="2026-08-28T12:00:00Z",
+        capabilities=("chat", "tools"),
+    )
+
+    store.replace(models=(model,), instances=(), expected_generation=0)
+
+    assert store.load().models[0].capabilities == ("chat", "tools")
+
+
 def test_registry_rejects_unknown_major_schema_version(tmp_path):
     store = OllamaRegistryStore.for_test(tmp_path)
     (tmp_path / "ollama-registry.json").write_text(

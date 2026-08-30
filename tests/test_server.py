@@ -40871,6 +40871,7 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
             "fleet.google.oauth",
             "fleet.google.provision",
             "fleet.google.billing.bind",
+            "fleet.ollama.write",
         )
 
     def _binding(self, principal: Any | None = None) -> Any:
@@ -40912,6 +40913,158 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
         self.assertFalse(mcp["isError"])
         self.assertEqual(cli, mcp["payload"])
         self.assertEqual(cli["accounts"][0]["ref"], "google-one")
+
+    def test_fleet_ollama_list_cli_and_mcp_outputs_are_identical(self) -> None:
+        with self._binding():
+            models_status, models_cli = self._cli("fleet", "ollama", "models")
+            models_mcp = self._mcp("fleet_ollama_models", {})
+            instances_status, instances_cli = self._cli(
+                "fleet", "ollama", "instances"
+            )
+            instances_mcp = self._mcp("fleet_ollama_instances", {})
+
+        self.assertEqual(models_status, 0)
+        self.assertEqual(instances_status, 0)
+        self.assertFalse(models_mcp["isError"])
+        self.assertFalse(instances_mcp["isError"])
+        self.assertEqual(models_cli, models_mcp["payload"])
+        self.assertEqual(instances_cli, instances_mcp["payload"])
+
+    def test_fleet_ollama_plan_cli_and_mcp_preserve_typed_cpu_profile(self) -> None:
+        arguments = {
+            "ref": "quiet-runner",
+            "label": "Quiet Runner",
+            "host_ref": "control-host",
+            "ollama_executable": "/usr/bin/ollama",
+            "models_directory": "/srv/ollama/models",
+            "selected_model_refs": ["model-a"],
+            "allowed_cpus": "4-7",
+            "cpu_quota_percent": 350,
+            "cpu_weight": 40,
+            "expected_generation": 3,
+            "idempotency_key": "request-one",
+        }
+        with self._binding():
+            status, cli = self._cli(
+                "fleet",
+                "ollama",
+                "instance-plan",
+                "--ref",
+                "quiet-runner",
+                "--label",
+                "Quiet Runner",
+                "--host-ref",
+                "control-host",
+                "--ollama-executable",
+                "/usr/bin/ollama",
+                "--models-directory",
+                "/srv/ollama/models",
+                "--selected-model-refs",
+                "model-a",
+                "--allowed-cpus",
+                "4-7",
+                "--cpu-quota-percent",
+                "350",
+                "--cpu-weight",
+                "40",
+                "--expected-generation",
+                "3",
+                "--idempotency-key",
+                "request-one",
+            )
+            mcp = self._mcp("fleet_ollama_instance_plan", arguments)
+
+        tool = next(
+            item
+            for item in server_module.TOOLS
+            if item["name"] == "fleet_ollama_instance_plan"
+        )
+        properties = tool["inputSchema"]["properties"]
+        self.assertEqual(properties["selected_model_refs"]["type"], "array")
+        self.assertEqual(properties["cpu_quota_percent"]["type"], "integer")
+        self.assertEqual(properties["cpu_weight"]["type"], "integer")
+        self.assertEqual(status, 0)
+        self.assertFalse(mcp["isError"])
+        self.assertEqual(cli, mcp["payload"])
+
+    def test_fleet_ollama_apply_and_probe_match_cli_and_mcp(self) -> None:
+        from test_admin_service import principal, service_at
+
+        plan_arguments = {
+            "ref": "quiet-runner",
+            "label": "Quiet Runner",
+            "host_ref": "control-host",
+            "ollama_executable": "/usr/bin/ollama",
+            "models_directory": "/srv/ollama/models",
+            "selected_model_refs": ["model-a"],
+            "allowed_cpus": "4-7",
+            "cpu_quota_percent": 350,
+            "cpu_weight": 40,
+            "expected_generation": 3,
+            "idempotency_key": "request-one",
+        }
+        cli_service, _cli_owners = service_at()
+        mcp_service, _mcp_owners = service_at()
+        operator = principal("fleet.read", "fleet.ollama.write")
+
+        with patch.object(
+            server_module, "_MASTERJET_ADMIN_BINDING", (cli_service, operator)
+        ):
+            _plan_status, cli_plan = self._cli(
+                "fleet", "ollama", "instance-plan",
+                "--ref", "quiet-runner",
+                "--label", "Quiet Runner",
+                "--host-ref", "control-host",
+                "--ollama-executable", "/usr/bin/ollama",
+                "--models-directory", "/srv/ollama/models",
+                "--selected-model-refs", "model-a",
+                "--allowed-cpus", "4-7",
+                "--cpu-quota-percent", "350",
+                "--cpu-weight", "40",
+                "--expected-generation", "3",
+                "--idempotency-key", "request-one",
+            )
+            apply_status, cli_apply = self._cli(
+                "fleet", "ollama", "instance-apply",
+                "--plan-id", str(cli_plan["plan_id"]),
+                "--expected-generation", "3",
+                "--idempotency-key", "apply-one",
+                "--plan-digest", str(cli_plan["plan_digest"]),
+            )
+            probe_status, cli_probe = self._cli(
+                "fleet", "ollama", "probe",
+                "--instance-ref", "quiet-runner",
+                "--expected-generation", "4",
+                "--idempotency-key", "probe-one",
+            )
+
+        with patch.object(
+            server_module, "_MASTERJET_ADMIN_BINDING", (mcp_service, operator)
+        ):
+            mcp_plan = self._mcp("fleet_ollama_instance_plan", plan_arguments)
+            mcp_apply = self._mcp(
+                "fleet_ollama_instance_apply",
+                {
+                    "plan_id": mcp_plan["payload"]["plan_id"],
+                    "expected_generation": 3,
+                    "idempotency_key": "apply-one",
+                    "plan_digest": mcp_plan["payload"]["plan_digest"],
+                },
+            )
+            mcp_probe = self._mcp(
+                "fleet_ollama_instance_probe",
+                {
+                    "instance_ref": "quiet-runner",
+                    "expected_generation": 4,
+                    "idempotency_key": "probe-one",
+                },
+            )
+
+        self.assertEqual((apply_status, probe_status), (0, 0))
+        self.assertFalse(mcp_apply["isError"])
+        self.assertFalse(mcp_probe["isError"])
+        self.assertEqual(cli_apply, mcp_apply["payload"])
+        self.assertEqual(cli_probe, mcp_probe["payload"])
 
     def test_google_oauth_redirect_cli_and_mcp_accept_same_long_ascii_value(
         self,
@@ -41197,11 +41350,13 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
         self.assertIsNotNone(reply)
         assert reply is not None
         tools = {tool["name"]: tool for tool in reply["result"]["tools"]}
-        self.assertEqual(len(tools), 79)
+        self.assertEqual(len(tools), 86)
         for allowed_name in {
             "fleet_google_inventory",
             "fleet_openai_accounts",
             "fleet_operation_status",
+            "fleet_ollama_models",
+            "fleet_ollama_instances",
         }:
             self.assertIn(allowed_name, tools)
         for forbidden_name in {
@@ -41211,6 +41366,9 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
             "fleet_google_provision_apply",
             "fleet_google_billing_plan",
             "fleet_google_billing_apply",
+            "fleet_ollama_instance_plan",
+            "fleet_ollama_instance_apply",
+            "fleet_ollama_instance_probe",
         }:
             self.assertNotIn(forbidden_name, tools)
         forbidden = {
@@ -41234,6 +41392,11 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
             "fleet_google_billing_plan",
             "fleet_google_billing_apply",
             "fleet_operation_status",
+            "fleet_ollama_models",
+            "fleet_ollama_instances",
+            "fleet_ollama_instance_plan",
+            "fleet_ollama_instance_apply",
+            "fleet_ollama_instance_probe",
         }
         all_tools = {tool["name"]: tool for tool in server_module.TOOLS}
         for name in admin_names:
@@ -41265,7 +41428,7 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
             status = server_module.master_tool_access_status()
 
         self.assertTrue(status["authorized"])
-        self.assertEqual(status["visible_tool_count"], 79)
+        self.assertEqual(status["visible_tool_count"], 86)
 
     def test_admin_capability_catalog_rejects_wire_shape_downgrade(self) -> None:
         from codex_master.admin_contracts import (

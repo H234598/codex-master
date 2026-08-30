@@ -107,6 +107,51 @@ def test_operation_metadata_is_immutable_and_owns_scope_and_fields() -> None:
         ADMIN_OPERATION_METADATA["google.provision.apply"] = metadata  # type: ignore[index]
 
 
+def test_ollama_instance_plan_preserves_typed_cpu_and_model_arguments() -> None:
+    arguments = {
+        "ref": "quiet-runner",
+        "label": "Quiet Runner",
+        "host_ref": "control-host",
+        "ollama_executable": "/usr/bin/ollama",
+        "models_directory": "/srv/ollama/models",
+        "selected_model_refs": ["llama-small", "qwen-small"],
+        "allowed_cpus": "4-7",
+        "cpu_quota_percent": 350,
+        "cpu_weight": 40,
+    }
+
+    request = AdminRequestV1(
+        "ollama.instance.plan", arguments, 3, "request-one", None
+    )
+
+    assert request.arguments["selected_model_refs"] == (
+        "llama-small",
+        "qwen-small",
+    )
+    assert request.arguments["cpu_quota_percent"] == 350
+    assert request.arguments["cpu_weight"] == 40
+    assert ADMIN_OPERATION_METADATA[request.operation].scope == "fleet.ollama.write"
+
+
+@pytest.mark.parametrize("field", ("cpu_quota_percent", "cpu_weight"))
+def test_ollama_instance_plan_rejects_boolean_cpu_values(field: str) -> None:
+    arguments = {
+        "ref": "quiet-runner",
+        "label": "Quiet Runner",
+        "host_ref": "control-host",
+        "ollama_executable": "/usr/bin/ollama",
+        "models_directory": "/srv/ollama/models",
+        "selected_model_refs": ["llama-small"],
+        "allowed_cpus": "4-7",
+        "cpu_quota_percent": 350,
+        "cpu_weight": 40,
+    }
+    arguments[field] = True
+
+    with pytest.raises(AdminContractError, match="control.request_invalid"):
+        AdminRequestV1("ollama.instance.plan", arguments, 3, "request-one", None)
+
+
 @pytest.mark.parametrize("value", [True, 2])
 def test_admin_request_requires_exact_schema_major_one(value: object) -> None:
     with pytest.raises(AdminContractError, match="control.request_invalid"):

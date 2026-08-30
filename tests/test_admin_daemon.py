@@ -1473,6 +1473,23 @@ def service(
         owner_runtime.close()
 
 
+def test_product_assembly_owns_empty_ollama_registry(
+    service: MasterjetControlService,
+) -> None:
+    operator = AdminPrincipalV1("operator-one", ("fleet.read",), "unix-peer", True)
+
+    models = service.query(operator, "ollama.models.list", {})
+    instances = service.query(operator, "ollama.instances.list", {})
+
+    assert models == {"schema_version": 1, "model_count": 0, "models": []}
+    assert instances == {
+        "schema_version": 1,
+        "generation": 0,
+        "instance_count": 0,
+        "instances": [],
+    }
+
+
 def test_installed_product_path_uses_credentials_both_adapters_and_sigterm(
     tmp_path: Path,
     installed_admin_entrypoint: Path,

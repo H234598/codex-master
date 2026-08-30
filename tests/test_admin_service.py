@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from threading import Lock
 
@@ -36,6 +36,17 @@ from codex_master.google_oauth_session import (
     GoogleOAuthTransactionV1,
 )
 from codex_master.openai_credential_service import AuthSyncPlanV1, AuthSyncReceiptV1
+from codex_master.fleet_service import (
+    OllamaApplyResultV1,
+    OllamaFleetPlanV1,
+    OllamaHiveLaneV1,
+)
+from codex_master.ollama_registry import (
+    OllamaInstanceV1,
+    OllamaModelV1,
+    OllamaRegistryV1,
+)
+from codex_master.ollama_runtime import OllamaReadinessStatus
 from codex_master.admin_service import (
     AdminDenied,
     AdminServiceError,
@@ -519,6 +530,81 @@ class Hosts:
         )
 
 
+class OllamaFleet:
+    def __init__(self) -> None:
+        self.generation = 3
+        self.calls: list[tuple[str, object]] = []
+        self.model = OllamaModelV1(
+            "model-a",
+            "provider-a",
+            True,
+            True,
+            True,
+            "2026-08-30T12:00:00Z",
+            ("chat", "tools"),
+        )
+        self.instance = OllamaInstanceV1(
+            "quiet-runner",
+            "Quiet Runner",
+            "control-host",
+            "/usr/bin/ollama",
+            "/srv/ollama/models",
+            ("model-a",),
+            "4-7",
+            350,
+            40,
+            "planned",
+            "unknown",
+        )
+        self.plan = OllamaFleetPlanV1(
+            "plan-one", "a" * 64, 3, None, self.instance, object()
+        )
+
+    def ollama_generation(self) -> int:
+        return self.generation
+
+    def ollama_models(self):
+        self.calls.append(("models", None))
+        return (self.model,)
+
+    def ollama_instances(self):
+        self.calls.append(("instances", None))
+        return (self.instance,)
+
+    def plan_ollama_instance(self, instance, *, expected_generation):
+        self.calls.append(("plan", (instance, expected_generation)))
+        return self.plan
+
+    def apply_ollama_instance(self, plan_id, *, expected_generation):
+        self.calls.append(("apply", (plan_id, expected_generation)))
+        ready_instance = replace(
+            self.instance, lifecycle_state="running", readiness_state="ready"
+        )
+        readiness = OllamaReadinessStatus(
+            True, (), True, True, True, ("provider-a",)
+        )
+        lane = OllamaHiveLaneV1(
+            "ollama:quiet-runner:model-a",
+            "quiet-runner",
+            "control-host",
+            "model-a",
+            "provider-a",
+        )
+        self.generation = 4
+        return OllamaApplyResultV1(
+            OllamaRegistryV1(1, 4, (self.model,), (ready_instance,)),
+            ready_instance,
+            readiness,
+            (lane,),
+        )
+
+    def probe_ollama_instance(self, instance_ref, *, expected_generation):
+        self.calls.append(("probe", (instance_ref, expected_generation)))
+        return OllamaReadinessStatus(
+            True, (), True, True, True, ("provider-a",)
+        )
+
+
 class SecretIngress:
     def __init__(self) -> None:
         self.create_calls = 0
@@ -647,6 +733,7 @@ class Owners:
     google_billing: GoogleBilling
     hosts: Hosts
     secret_ingress: SecretIngress
+    ollama_fleet: OllamaFleet
 
 
 def service_at() -> tuple[MasterjetControlService, Owners]:
@@ -662,6 +749,7 @@ def service_at() -> tuple[MasterjetControlService, Owners]:
         GoogleBilling(),
         Hosts(),
         SecretIngress(),
+        OllamaFleet(),
     )
     service = MasterjetControlService(
         operation_store=owners.operation_store,
@@ -675,6 +763,7 @@ def service_at() -> tuple[MasterjetControlService, Owners]:
         host_registry=owners.hosts,
         secret_ingress=owners.secret_ingress,
         account_registry=owners.account_registry,
+        ollama_fleet=owners.ollama_fleet,
     )
     return service, owners
 
@@ -832,6 +921,65 @@ def test_queries_require_their_exact_scope(
         service.query(principal("fleet.unrelated"), operation, arguments)
 
     assert service.query(principal(required_scope), operation, arguments)
+
+
+def test_ollama_models_and_instances_queries_keep_layers_separate() -> None:
+    service, owners = service_at()
+
+    models = service.query(principal("fleet.read"), "ollama.models.list", {})
+    instances = service.query(principal("fleet.read"), "ollama.instances.list", {})
+
+    assert models["models"][0]["capabilities"] == ["chat", "tools"]  # type: ignore[index]
+    assert "selected_model_refs" not in models["models"][0]  # type: ignore[index]
+    assert instances["instances"][0]["selected_model_refs"] == ["model-a"]  # type: ignore[index]
+    assert owners.ollama_fleet.calls == [("models", None), ("instances", None)]
+
+
+def test_ollama_plan_apply_and_probe_use_one_admin_owner() -> None:
+    service, owners = service_at()
+    arguments = {
+        "ref": "quiet-runner",
+        "label": "Quiet Runner",
+        "host_ref": "control-host",
+        "ollama_executable": "/usr/bin/ollama",
+        "models_directory": "/srv/ollama/models",
+        "selected_model_refs": ("model-a",),
+        "allowed_cpus": "4-7",
+        "cpu_quota_percent": 350,
+        "cpu_weight": 40,
+    }
+
+    planned = command(
+        service,
+        "ollama.instance.plan",
+        arguments,
+        "fleet.ollama.write",
+        generation=3,
+    )
+    applied = command(
+        service,
+        "ollama.instance.apply",
+        {"plan_id": planned["plan_id"]},
+        "fleet.ollama.write",
+        generation=3,
+        digest=planned["plan_digest"],  # type: ignore[arg-type]
+    )
+    probed = command(
+        service,
+        "ollama.instance.probe",
+        {"instance_ref": "quiet-runner"},
+        "fleet.ollama.write",
+        generation=4,
+    )
+
+    assert planned["plan_digest"] == DIGEST
+    assert applied["hive_lanes"][0]["task_profile"] == "simple_only"  # type: ignore[index]
+    assert probed["ready"] is True
+    assert [call[0] for call in owners.ollama_fleet.calls] == [
+        "plan",
+        "apply",
+        "probe",
+    ]
 
 
 def test_operations_get_denies_cross_account_operation() -> None:

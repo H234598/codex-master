@@ -251,7 +251,9 @@ def _redacted_gemini_event_reason(reason: str | None) -> str | None:
 
 
 class FleetConflictError(ValueError):
-    pass
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 class FleetSecretError(ValueError):
@@ -449,6 +451,7 @@ class FleetService:
         self._ollama_plans: dict[str, OllamaFleetPlanV1] = {}
         self._ollama_applied: dict[str, OllamaApplyResultV1] = {}
         self._ollama_ready: dict[str, OllamaReadinessStatus] = {}
+        self._ollama_executions: dict[str, tuple[object, int]] = {}
 
     def _require_ollama(self) -> tuple[OllamaRegistryStore, object]:
         if self._ollama_registry is None or self._ollama_transport is None:
@@ -462,6 +465,65 @@ class FleetService:
     def ollama_instances(self) -> tuple[OllamaInstanceV1, ...]:
         registry, _transport = self._require_ollama()
         return registry.load().instances
+
+    def ollama_generation(self) -> int:
+        registry, _transport = self._require_ollama()
+        return registry.load().generation
+
+    def probe_ollama_instance(
+        self,
+        instance_ref: str,
+        *,
+        expected_generation: int,
+    ) -> OllamaReadinessStatus:
+        registry, transport = self._require_ollama()
+        with self._ollama_lock:
+            current = registry.load()
+            if (
+                not isinstance(instance_ref, str)
+                or type(expected_generation) is not int
+                or current.generation != expected_generation
+            ):
+                raise FleetConflictError("generation_conflict")
+            instance = next(
+                (
+                    candidate
+                    for candidate in current.instances
+                    if candidate.ref == instance_ref
+                ),
+                None,
+            )
+            execution_record = self._ollama_executions.get(instance_ref)
+            if instance is None or execution_record is None:
+                raise FleetConflictError("ollama.runtime_not_owned")
+            execution, fence = execution_record
+            readiness = transport.probe(execution, current_fence=fence)
+            if not isinstance(readiness, OllamaReadinessStatus):
+                raise FleetConflictError("ollama.transport_invalid")
+            readiness_state = "ready" if readiness.ready else "not_ready"
+            lifecycle_state = "running" if readiness.process_running else "failed"
+            if readiness.ready:
+                self._ollama_ready[instance_ref] = readiness
+            else:
+                self._ollama_ready.pop(instance_ref, None)
+            if (
+                instance.readiness_state != readiness_state
+                or instance.lifecycle_state != lifecycle_state
+            ):
+                updated = dataclass_replace(
+                    instance,
+                    readiness_state=readiness_state,
+                    lifecycle_state=lifecycle_state,
+                )
+                registry.replace(
+                    models=current.models,
+                    instances=tuple(
+                        updated if candidate.ref == instance_ref else candidate
+                        for candidate in current.instances
+                    ),
+                    expected_generation=current.generation,
+                )
+            return readiness
 
     def plan_ollama_instance(
         self,
@@ -628,6 +690,7 @@ class FleetService:
                     raise FleetConflictError("ollama.cleanup_failed") from None
                 raise
             self._ollama_ready[ready_instance.ref] = readiness
+            self._ollama_executions[ready_instance.ref] = (execution, fence)
             result = OllamaApplyResultV1(
                 stored,
                 ready_instance,

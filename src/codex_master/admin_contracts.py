@@ -24,6 +24,8 @@ class AdminOperationMetadataV1:
     argument_fields: tuple[str, ...]
     optional_argument_fields: tuple[str, ...] = ()
     text_argument_fields: tuple[str, ...] = ()
+    integer_argument_fields: tuple[str, ...] = ()
+    token_list_argument_fields: tuple[str, ...] = ()
     text_argument_max_utf8_bytes: int = MAX_ADMIN_TEXT_UTF8_BYTES
     requires_idempotency: bool = False
     requires_digest: bool = False
@@ -42,6 +44,8 @@ ADMIN_OPERATION_METADATA = MappingProxyType(
         "operations.get": AdminOperationMetadataV1(
             "fleet.read", False, ("account_ref", "operation_id")
         ),
+        "ollama.models.list": AdminOperationMetadataV1("fleet.read", False, ()),
+        "ollama.instances.list": AdminOperationMetadataV1("fleet.read", False, ()),
         "openai.accounts.add": AdminOperationMetadataV1(
             "fleet.openai.write",
             True,
@@ -168,6 +172,45 @@ ADMIN_OPERATION_METADATA = MappingProxyType(
             requires_idempotency=True,
             requires_digest=True,
             generation_domain="google",
+        ),
+        "ollama.instance.plan": AdminOperationMetadataV1(
+            "fleet.ollama.write",
+            True,
+            (
+                "ref",
+                "label",
+                "host_ref",
+                "ollama_executable",
+                "models_directory",
+                "selected_model_refs",
+                "allowed_cpus",
+                "cpu_quota_percent",
+                "cpu_weight",
+            ),
+            text_argument_fields=(
+                "label",
+                "ollama_executable",
+                "models_directory",
+            ),
+            integer_argument_fields=("cpu_quota_percent", "cpu_weight"),
+            token_list_argument_fields=("selected_model_refs",),
+            requires_idempotency=True,
+            generation_domain="ollama",
+        ),
+        "ollama.instance.apply": AdminOperationMetadataV1(
+            "fleet.ollama.write",
+            True,
+            ("plan_id",),
+            requires_idempotency=True,
+            requires_digest=True,
+            generation_domain="ollama",
+        ),
+        "ollama.instance.probe": AdminOperationMetadataV1(
+            "fleet.ollama.write",
+            True,
+            ("instance_ref",),
+            requires_idempotency=True,
+            generation_domain="ollama",
         ),
     }
 )
@@ -369,15 +412,31 @@ def _arguments(operation: str, value: object) -> Mapping[str, object]:
     allowed = set(fields) | set(metadata.optional_argument_fields)
     if set(arguments) - allowed or not set(fields) <= set(arguments):
         _invalid()
-    result = {
-        field: _text(
-            arguments[field],
-            max_utf8_bytes=metadata.text_argument_max_utf8_bytes,
-        )
-        if field in metadata.text_argument_fields
-        else _token(arguments[field])
-        for field in arguments
-    }
+    result = {}
+    for field in arguments:
+        if field in metadata.text_argument_fields:
+            result[field] = _text(
+                arguments[field],
+                max_utf8_bytes=metadata.text_argument_max_utf8_bytes,
+            )
+        elif field in metadata.integer_argument_fields:
+            integer = arguments[field]
+            if type(integer) is not int or not 1 <= integer <= 10000:
+                _invalid()
+            result[field] = integer
+        elif field in metadata.token_list_argument_fields:
+            values = arguments[field]
+            if (
+                type(values) not in {list, tuple}
+                or not 1 <= len(values) <= 64
+            ):
+                _invalid()
+            tokens = tuple(_token(item) for item in values)
+            if len(set(tokens)) != len(tokens):
+                _invalid()
+            result[field] = tokens
+        else:
+            result[field] = _token(arguments[field])
     if operation == "secret.ingress.create" and result["credential_kind"] not in {
         "openai.auth-json",
         "google.oauth-client",

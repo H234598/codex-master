@@ -56,6 +56,13 @@ from .openai_credential_service import (
     OpenAICredentialError,
     OpenAICredentialService,
 )
+from .fleet_service import (
+    FleetConflictError,
+    OllamaApplyResultV1,
+    OllamaFleetPlanV1,
+)
+from .ollama_registry import OllamaInstanceV1, OllamaModelV1
+from .ollama_runtime import OllamaReadinessStatus
 
 
 QUERY_SCOPES = MappingProxyType(
@@ -163,6 +170,26 @@ class GoogleProvisionerPort(Protocol):
         idempotency_key: str,
         plan_digest: str,
     ) -> ProvisionReceipt | ProvisionPartialReceipt: ...
+
+
+class OllamaFleetPort(Protocol):
+    def ollama_generation(self) -> int: ...
+
+    def ollama_models(self) -> Sequence[OllamaModelV1]: ...
+
+    def ollama_instances(self) -> Sequence[OllamaInstanceV1]: ...
+
+    def plan_ollama_instance(
+        self, instance: OllamaInstanceV1, *, expected_generation: int
+    ) -> OllamaFleetPlanV1: ...
+
+    def apply_ollama_instance(
+        self, plan_id: str, *, expected_generation: int
+    ) -> OllamaApplyResultV1: ...
+
+    def probe_ollama_instance(
+        self, instance_ref: str, *, expected_generation: int
+    ) -> OllamaReadinessStatus: ...
 
 
 class SecretIngressPort(Protocol):
@@ -314,6 +341,7 @@ class MasterjetControlService:
         host_registry: HostRegistry,
         secret_ingress: SecretIngressPort | None,
         account_registry: AccountRegistryPort | None = None,
+        ollama_fleet: OllamaFleetPort | None = None,
     ) -> None:
         self._operation_store = operation_store
         self._openai_accounts = openai_accounts
@@ -326,6 +354,8 @@ class MasterjetControlService:
         self._host_registry = host_registry
         self._secret_ingress = secret_ingress
         self._account_registry = account_registry
+        self._ollama_fleet = ollama_fleet
+        self._ollama_plan_digests: dict[str, str] = {}
 
     @classmethod
     def with_admin_secret_ingress(
@@ -673,6 +703,9 @@ class MasterjetControlService:
                 account_ref = cast(str, request.arguments["account_ref"])
                 owner = _required(self._google_oauth)
                 current = owner.account_generation(account_ref)
+            elif domain == "ollama":
+                owner = _required(self._ollama_fleet)
+                current = owner.ollama_generation()
             else:
                 current = self._google_manager.inventory_generation()
         except AdminServiceError:
@@ -796,6 +829,78 @@ class MasterjetControlService:
                 for item in self._google_manager.list_projects(account_ref)
             ]
         }
+
+    def _ollama_models_list(self, *_values: object) -> dict[str, object]:
+        models = _required(self._ollama_fleet).ollama_models()
+        return {
+            "schema_version": 1,
+            "model_count": len(models),
+            "models": [_serialize_ollama_model(model) for model in models],
+        }
+
+    def _ollama_instances_list(self, *_values: object) -> dict[str, object]:
+        owner = _required(self._ollama_fleet)
+        instances = owner.ollama_instances()
+        return {
+            "schema_version": 1,
+            "generation": owner.ollama_generation(),
+            "instance_count": len(instances),
+            "instances": [
+                _serialize_ollama_instance(instance) for instance in instances
+            ],
+        }
+
+    def _ollama_instance_plan(
+        self,
+        _principal: AdminPrincipalV1,
+        request: AdminRequestV1,
+        *_values: object,
+    ) -> dict[str, object]:
+        arguments = request.arguments
+        instance = OllamaInstanceV1(
+            cast(str, arguments["ref"]),
+            cast(str, arguments["label"]),
+            cast(str, arguments["host_ref"]),
+            cast(str, arguments["ollama_executable"]),
+            cast(str, arguments["models_directory"]),
+            cast(tuple[str, ...], arguments["selected_model_refs"]),
+            cast(str, arguments["allowed_cpus"]),
+            cast(int, arguments["cpu_quota_percent"]),
+            cast(int, arguments["cpu_weight"]),
+            "planned",
+            "unknown",
+        )
+        plan = _required(self._ollama_fleet).plan_ollama_instance(
+            instance, expected_generation=_generation(request)
+        )
+        self._ollama_plan_digests[plan.plan_id] = _public_digest(plan.plan_digest)
+        return _serialize_ollama_plan(plan)
+
+    def _ollama_instance_apply(
+        self,
+        _principal: AdminPrincipalV1,
+        request: AdminRequestV1,
+        *_values: object,
+    ) -> dict[str, object]:
+        plan_id = cast(str, request.arguments["plan_id"])
+        if self._ollama_plan_digests.get(plan_id) != _digest(request):
+            raise _service_error("control.plan_stale")
+        result = _required(self._ollama_fleet).apply_ollama_instance(
+            plan_id, expected_generation=_generation(request)
+        )
+        return _serialize_ollama_apply(result)
+
+    def _ollama_instance_probe(
+        self,
+        _principal: AdminPrincipalV1,
+        request: AdminRequestV1,
+        *_values: object,
+    ) -> dict[str, object]:
+        status = _required(self._ollama_fleet).probe_ollama_instance(
+            cast(str, request.arguments["instance_ref"]),
+            expected_generation=_generation(request),
+        )
+        return _serialize_ollama_readiness(status)
 
     def _operation_get(
         self,
@@ -1187,6 +1292,8 @@ _QUERY_HANDLERS: Mapping[str, Handler] = MappingProxyType(
         "google.accounts.list": MasterjetControlService._google_accounts_list,
         "google.projects.list": MasterjetControlService._google_projects_list,
         "operations.get": MasterjetControlService._operation_get,
+        "ollama.models.list": MasterjetControlService._ollama_models_list,
+        "ollama.instances.list": MasterjetControlService._ollama_instances_list,
     }
 )
 _COMMAND_HANDLERS: Mapping[str, Handler] = MappingProxyType(
@@ -1207,6 +1314,9 @@ _COMMAND_HANDLERS: Mapping[str, Handler] = MappingProxyType(
         "google.provision.apply": MasterjetControlService._google_provision_apply,
         "google.billing.plan": MasterjetControlService._google_billing_plan,
         "google.billing.apply": MasterjetControlService._google_billing_apply,
+        "ollama.instance.plan": MasterjetControlService._ollama_instance_plan,
+        "ollama.instance.apply": MasterjetControlService._ollama_instance_apply,
+        "ollama.instance.probe": MasterjetControlService._ollama_instance_probe,
     }
 )
 
@@ -1521,6 +1631,83 @@ def _serialize_google_project(value: object) -> dict[str, object]:
     )
 
 
+def _serialize_ollama_model(value: OllamaModelV1) -> dict[str, object]:
+    if type(value) is not OllamaModelV1:
+        raise _service_error("control.response_private")
+    return {
+        "ref": value.ref,
+        "provider_model_id": value.provider_model_id,
+        "installed": value.installed,
+        "hive_enabled": value.hive_enabled,
+        "simple_only": value.simple_only,
+        "capabilities": list(value.capabilities),
+        "evidence_at_utc": value.evidence_at_utc,
+    }
+
+
+def _serialize_ollama_instance(value: OllamaInstanceV1) -> dict[str, object]:
+    if type(value) is not OllamaInstanceV1:
+        raise _service_error("control.response_private")
+    return {
+        "ref": value.ref,
+        "label": value.label,
+        "host_ref": value.host_ref,
+        "selected_model_refs": list(value.selected_model_refs),
+        "allowed_cpus": value.allowed_cpus,
+        "cpu_quota_percent": value.cpu_quota_percent,
+        "cpu_weight": value.cpu_weight,
+        "lifecycle_state": value.lifecycle_state,
+        "readiness_state": value.readiness_state,
+        "path_state": "configured_private",
+    }
+
+
+def _serialize_ollama_plan(value: OllamaFleetPlanV1) -> dict[str, object]:
+    if type(value) is not OllamaFleetPlanV1:
+        raise _service_error("control.response_private")
+    return {
+        "plan_id": value.plan_id,
+        "plan_digest": _public_digest(value.plan_digest),
+        "expected_generation": value.registry_generation,
+        "resource_generation": value.resource_generation,
+        "instance": _serialize_ollama_instance(value.instance),
+    }
+
+
+def _serialize_ollama_readiness(value: OllamaReadinessStatus) -> dict[str, object]:
+    if type(value) is not OllamaReadinessStatus:
+        raise _service_error("control.response_private")
+    return {
+        "ready": value.ready,
+        "reason_codes": list(value.reason_codes),
+        "process_running": value.process_running,
+        "cgroup_member": value.cgroup_member,
+        "loopback_endpoint_reachable": value.loopback_endpoint_reachable,
+        "available_model_ids": list(value.available_model_ids),
+    }
+
+
+def _serialize_ollama_apply(value: OllamaApplyResultV1) -> dict[str, object]:
+    if type(value) is not OllamaApplyResultV1:
+        raise _service_error("control.response_private")
+    return {
+        "generation": value.registry.generation,
+        "instance": _serialize_ollama_instance(value.instance),
+        "readiness": _serialize_ollama_readiness(value.readiness),
+        "hive_lanes": [
+            {
+                "lane_ref": lane.lane_ref,
+                "instance_ref": lane.instance_ref,
+                "host_ref": lane.host_ref,
+                "model_ref": lane.model_ref,
+                "provider_model_id": lane.provider_model_id,
+                "task_profile": lane.task_profile,
+            }
+            for lane in value.hive_lanes
+        ],
+    }
+
+
 def _serialize_openai_plan(value: AuthSyncPlanV1) -> dict[str, object]:
     if type(value) is not AuthSyncPlanV1:
         raise _service_error("control.response_private")
@@ -1711,6 +1898,7 @@ _OWNER_ERROR_PREFIXES: tuple[tuple[type[BaseException], tuple[str, ...]], ...] =
     (GoogleOAuthSessionError, ("control.", "credential.", "oauth.")),
     (GoogleCloudProvisionerError, ("provisioner.", "quota.")),
     (GoogleBillingError, ("billing.",)),
+    (FleetConflictError, ("control.", "ollama.")),
 )
 
 

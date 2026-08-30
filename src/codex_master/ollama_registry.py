@@ -46,6 +46,7 @@ class OllamaModelV1:
     hive_enabled: bool
     simple_only: bool
     evidence_at_utc: str | None
+    capabilities: tuple[str, ...] = ("chat",)
 
     def __post_init__(self) -> None:
         _required_string(self.ref, "ollama.model_invalid")
@@ -58,6 +59,19 @@ class OllamaModelV1:
                 self.evidence_at_utc is not None
                 and not isinstance(self.evidence_at_utc, str)
             )
+            or not isinstance(self.capabilities, tuple)
+            or not 1 <= len(self.capabilities) <= 16
+            or any(
+                not isinstance(capability, str)
+                or not 1 <= len(capability) <= 64
+                or not capability.isascii()
+                or any(
+                    not (character.isalnum() or character in "._-")
+                    for character in capability
+                )
+                for capability in self.capabilities
+            )
+            or len(set(self.capabilities)) != len(self.capabilities)
         ):
             _fail("ollama.model_invalid")
 
@@ -269,7 +283,19 @@ def _registry_from_document(value: object) -> OllamaRegistryV1:
         return OllamaRegistryV1(
             schema_version=value["schema_version"],
             generation=value["generation"],
-            models=tuple(OllamaModelV1(**model) for model in models),
+            models=tuple(
+                OllamaModelV1(
+                    **{
+                        **model,
+                        **(
+                            {"capabilities": tuple(model["capabilities"])}
+                            if "capabilities" in model
+                            else {}
+                        ),
+                    }
+                )
+                for model in models
+            ),
             instances=tuple(
                 OllamaInstanceV1(
                     **{
@@ -296,6 +322,7 @@ def _registry_document(registry: OllamaRegistryV1) -> dict[str, object]:
                 "hive_enabled": model.hive_enabled,
                 "simple_only": model.simple_only,
                 "evidence_at_utc": model.evidence_at_utc,
+                "capabilities": list(model.capabilities),
             }
             for model in registry.models
         ],
