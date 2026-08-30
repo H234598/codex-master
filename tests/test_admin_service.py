@@ -271,6 +271,7 @@ class GoogleManager:
                 "inventory_generation": self.generation,
                 "project_count": 1,
                 "billing_count": 1,
+                "billing_refs": ("billing-one",),
             },
         )
 
@@ -872,6 +873,7 @@ def test_google_inventory_query_uses_manager_once() -> None:
     assert result["accounts"][0]["enabled"] is True  # type: ignore[index]
     assert result["accounts"][0]["oauth_state"] == "ready"  # type: ignore[index]
     assert result["accounts"][0]["quota_state"] == "fresh"  # type: ignore[index]
+    assert result["accounts"][0]["billing_refs"] == ["billing-one"]  # type: ignore[index]
     assert result["accounts"][0]["reload_state"] == "ready"  # type: ignore[index]
     assert owners.google_manager.list_calls == 1
     assert owners.account_registry.calls == [("generation", "google")]

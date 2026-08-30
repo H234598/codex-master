@@ -142,6 +142,7 @@ def test_real_cli_process_calls_attested_admin_socket(tmp_path: Path) -> None:
         "accounts": [
             {
                 "billing_count": 1,
+                "billing_refs": ["billing-one"],
                 "default_oauth_client_ref": "oauth-client-opaque",
                 "enabled": True,
                 "inventory_generation": 4,

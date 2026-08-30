@@ -529,6 +529,7 @@ def test_admin_views_are_immutable_redacted_and_account_isolated(
             "inventory_generation": 1,
             "project_count": 1,
             "billing_count": 1,
+            "billing_refs": ("billing-01",),
         },
         {
             "ref": "google-account-02",
@@ -537,6 +538,7 @@ def test_admin_views_are_immutable_redacted_and_account_isolated(
             "inventory_generation": 1,
             "project_count": 1,
             "billing_count": 1,
+            "billing_refs": ("billing-02",),
         },
     )
     assert manager.get_account("google-account-01") == accounts[0]

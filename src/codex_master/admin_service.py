@@ -251,6 +251,7 @@ class GoogleAccountSummaryV1:
     quota_state: str
     project_count: int
     billing_count: int
+    billing_refs: tuple[str, ...]
     reload_state: str
     default_oauth_client_ref: str | None
     oauth_client_availability: str
@@ -868,6 +869,7 @@ class MasterjetControlService:
             quota_state,
             cast(int, account["project_count"]),
             cast(int, account["billing_count"]),
+            cast(tuple[str, ...], account["billing_refs"]),
             status.state.value,
             binding.default_oauth_client_ref,
             binding.availability.value,
@@ -1648,6 +1650,7 @@ def _google_inventory_account(value: object) -> dict[str, object]:
                 "inventory_generation",
                 "project_count",
                 "billing_count",
+                "billing_refs",
             }
         ),
     )
@@ -1666,6 +1669,7 @@ def _serialize_google_account(value: GoogleAccountSummaryV1) -> dict[str, object
         "quota_state": value.quota_state,
         "project_count": value.project_count,
         "billing_count": value.billing_count,
+        "billing_refs": list(value.billing_refs),
         "reload_state": value.reload_state,
         "default_oauth_client_ref": value.default_oauth_client_ref,
         "oauth_client_availability": value.oauth_client_availability,

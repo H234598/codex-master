@@ -1499,6 +1499,7 @@ def test_google_accounts_http_projects_real_bound_opaque_oauth_client_ref(
         "quota_state",
         "project_count",
         "billing_count",
+        "billing_refs",
         "reload_state",
         "default_oauth_client_ref",
         "oauth_client_availability",

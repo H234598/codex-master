@@ -590,6 +590,9 @@ class GoogleAccountInventoryManager:
                 "inventory_generation": generation,
                 "project_count": len(account.projects),
                 "billing_count": len(account.billing_accounts),
+                "billing_refs": tuple(
+                    public_admin_ref(item.ref) for item in account.billing_accounts
+                ),
             }
         )
 
