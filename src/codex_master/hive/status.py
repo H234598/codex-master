@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from codex_master.hive.messages import HiveMessage, HiveMessageError, record_child_report
 from codex_master.hive.principals import PrincipalRegistry
+from codex_master.hive.runtime import HiveRuntimeEvidence, read_hive_runtime_evidence
 
 if TYPE_CHECKING:
     from codex_master.selection.reset_anchor import ProactiveAnchorSafetyStatus
@@ -28,16 +29,46 @@ _STATUS_RANK = {
 MAX_AGGREGATE_REPORTS = 256
 
 
-def hive_status(*, mode: str = "disabled", counts: Mapping[str, int] | None = None) -> Mapping[str, object]:
-    if mode not in {"disabled", "shadow", "enforced"}:
+def _runtime_evidence(runtime_evidence: HiveRuntimeEvidence | None) -> HiveRuntimeEvidence:
+    if runtime_evidence is None:
+        return read_hive_runtime_evidence()
+    if not isinstance(runtime_evidence, HiveRuntimeEvidence):
+        raise ValueError("invalid_hive_runtime_evidence")
+    return runtime_evidence
+
+
+def hive_status(
+    *,
+    mode: str | None = None,
+    counts: Mapping[str, int] | None = None,
+    runtime_evidence: HiveRuntimeEvidence | None = None,
+) -> Mapping[str, object]:
+    if mode is not None and mode not in {"disabled", "shadow", "enforced"}:
         raise ValueError("invalid_hive_mode")
-    values = dict(counts or {})
+    evidence = _runtime_evidence(runtime_evidence)
+    values = (
+        {
+            "principals": evidence.principal_count,
+            "repositories": evidence.repository_count,
+        }
+        if counts is None
+        else dict(counts)
+    )
     if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values.values()):
         raise ValueError("invalid_hive_counts")
     return {
-        "mode": mode,
+        "mode": evidence.mode,
         "counts": {key: values[key] for key in sorted(values) if isinstance(key, str) and len(key) <= 64},
-        "authority": "fail_closed",
+        "authority": evidence.authority,
+        "checks": evidence.checks,
+        "repository": evidence.repository,
+        "principal": evidence.principal,
+        "state": evidence.state,
+        "pilot": evidence.pilot,
+        "reason_codes": list(evidence.reason_codes),
+        "config_digest": evidence.config_digest,
+        "catalog_digest": evidence.catalog_digest,
+        "mutation_performed": evidence.mutation_performed,
         "raw_output": "not_returned",
     }
 
@@ -75,8 +106,28 @@ def admission_status(admission_id: str, *, state: str = "unknown") -> Mapping[st
     return {"admission_id": admission_id, "state": state, "account_key": "not_returned", "scope": "not_returned", "raw_output": "not_returned"}
 
 
-def hive_doctor() -> Mapping[str, object]:
-    return {"healthy": True, "checks": {"authority": "fail_closed", "repository": "not_configured", "state": "not_configured"}, "raw_output": "not_returned"}
+def hive_doctor(*, runtime_evidence: HiveRuntimeEvidence | None = None) -> Mapping[str, object]:
+    evidence = _runtime_evidence(runtime_evidence)
+    return {
+        "healthy": (
+            evidence.authority == "ready"
+            and evidence.pilot == "ready"
+            and evidence.state == "ready"
+            and evidence.repository == "ready"
+            and evidence.principal == "ready"
+        ),
+        "mode": evidence.mode,
+        "checks": evidence.checks,
+        "repository": evidence.repository,
+        "principal": evidence.principal,
+        "state": evidence.state,
+        "pilot": evidence.pilot,
+        "reason_codes": list(evidence.reason_codes),
+        "config_digest": evidence.config_digest,
+        "catalog_digest": evidence.catalog_digest,
+        "mutation_performed": evidence.mutation_performed,
+        "raw_output": "not_returned",
+    }
 
 
 def selection_status() -> Mapping[str, object]:

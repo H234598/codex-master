@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
@@ -11,6 +12,8 @@ from codex_master.hive.runtime import (
     HiveRuntimeError,
     _compose_hive_runtime_from_catalog_snapshot,
     build_hive_runtime,
+    enforced_pilot_gate,
+    read_hive_runtime_evidence,
 )
 from codex_master.hive.repositories import RepositoryRegistry
 from codex_master.server import AgentError, build_server_admission_runtime
@@ -211,3 +214,146 @@ def test_server_factory_accepts_one_bundle_and_rejects_split_authority_state(tmp
             hive_runtime=bundle,
             repository_registry=RepositoryRegistry(()),
         )
+
+
+def test_runtime_evidence_is_read_only_and_data_sparse_when_state_is_missing(tmp_path: Path) -> None:
+    catalog = ROOT / "codex-agent-classes.json"
+    config = ROOT / "codex-hive.json"
+    state_root = tmp_path / "state"
+
+    evidence = read_hive_runtime_evidence(
+        catalog_path=catalog,
+        config_path=config,
+        state_root=state_root,
+        now=lambda: NOW,
+    )
+
+    assert evidence.public() == {
+        "schema_version": 1,
+        "mode": "shadow",
+        "config_digest": evidence.config_digest,
+        "catalog_digest": evidence.catalog_digest,
+        "repository": "not_configured",
+        "principal": "not_configured",
+        "authority": "fail_closed",
+        "state": "not_configured",
+        "pilot": "blocked",
+        "reason_codes": ["repository_not_configured", "principal_not_configured", "state_not_configured"],
+        "mutation_performed": False,
+        "raw_output": "not_returned",
+    }
+    assert not state_root.exists()
+
+
+def test_runtime_evidence_reuses_read_only_assembled_runtime_without_materializing_state(tmp_path: Path) -> None:
+    classes, config = config_bundle()
+    roots = {"repo-one": repo(tmp_path)}
+    state_root = tmp_path / "state"
+    build_hive_runtime(
+        config,
+        classes,
+        repository_roots=roots,
+        state_root=state_root,
+        materialize_principals=True,
+        now=lambda: NOW,
+    )
+    before = (state_root / "principals.json").read_bytes()
+
+    evidence = read_hive_runtime_evidence(
+        catalog_path=ROOT / "tests/fixtures/hive/classes-valid.json",
+        config_path=ROOT / "tests/fixtures/hive/hive-enforced-valid.json",
+        state_root=state_root,
+        repository_roots=roots,
+        now=lambda: NOW,
+    )
+
+    assert evidence.public()["repository"] == "ready"
+    assert evidence.public()["principal"] == "ready"
+    assert evidence.public()["authority"] == "fail_closed"
+    assert evidence.public()["state"] == "ready"
+    assert evidence.public()["mutation_performed"] is False
+    assert (state_root / "principals.json").read_bytes() == before
+
+
+def test_runtime_evidence_fails_closed_for_untrusted_principal_state(tmp_path: Path) -> None:
+    classes, config = config_bundle()
+    roots = {"repo-one": repo(tmp_path)}
+    state_root = tmp_path / "state"
+    build_hive_runtime(
+        config,
+        classes,
+        repository_roots=roots,
+        state_root=state_root,
+        materialize_principals=True,
+        now=lambda: NOW,
+    )
+    principal_state = state_root / "principals.json"
+    principal_state.chmod(0o644)
+
+    evidence = read_hive_runtime_evidence(
+        catalog_path=ROOT / "tests/fixtures/hive/classes-valid.json",
+        config_path=ROOT / "tests/fixtures/hive/hive-enforced-valid.json",
+        state_root=state_root,
+        repository_roots=roots,
+        now=lambda: NOW,
+    )
+
+    assert evidence.authority == "fail_closed"
+    assert evidence.principal == "invalid"
+    assert evidence.state == "ready"
+    assert evidence.mutation_performed is False
+    assert "hive_runtime_invalid" in evidence.reason_codes
+
+
+def test_runtime_evidence_does_not_treat_unlocked_state_directory_as_ready(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    evidence = read_hive_runtime_evidence(
+        catalog_path=ROOT / "codex-agent-classes.json",
+        config_path=ROOT / "codex-hive.json",
+        state_root=state_root,
+        now=lambda: NOW,
+    )
+    assert evidence.state == "unavailable"
+    assert evidence.authority == "fail_closed"
+    assert evidence.mutation_performed is False
+
+
+def test_enforced_pilot_gate_requires_closed_config_and_fresh_dynamic_sol_max_attestation() -> None:
+    classes, source_config = config_bundle()
+    classes = {
+        **classes,
+        "koenigin": replace(
+            classes["koenigin"],
+            public_lifecycle="persistent",
+            allowed_lifecycles=("persistent",),
+            allowed_model_families=("sol",),
+            min_reasoning="max",
+            max_reasoning="max",
+        ),
+    }
+    config = replace(
+        source_config,
+        mode="enforced",
+        repositories=(
+            {
+                "repo_id": "codex-master",
+                "remote_identity": "https://github.com/H234598/codex-master.git",
+                "default_branch": "main",
+                "config_digest": "sha256:" + "a" * 64,
+            },
+        ),
+        principals=(
+            {"principal_id": "godbee-main", "class_id": "gottbiene", "parent_principal_id": None, "repo_id": None},
+            {"principal_id": "queen-codex-master", "class_id": "koenigin", "parent_principal_id": "godbee-main", "repo_id": "codex-master"},
+        ),
+    )
+
+    assert enforced_pilot_gate(config, classes)["reason_code"] == "pilot_account_attestation_missing"
+    assert enforced_pilot_gate(config, classes, {"fresh": True, "model_family": "sol", "reasoning": "xhigh", "long_lived": True})["reason_code"] == "pilot_account_attestation_invalid"
+    ready = enforced_pilot_gate(
+        config,
+        classes,
+        {"fresh": True, "model_family": "sol", "reasoning": "max", "long_lived": True, "account_id": "secret"},
+    )
+    assert ready == {"allowed": True, "reason_code": "pilot_ready", "raw_output": "not_returned"}

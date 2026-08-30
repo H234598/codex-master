@@ -38139,6 +38139,7 @@ def build_current_hive_runtime(
     *,
     repository_roots: Mapping[str, Path],
     materialize_principals: bool = False,
+    read_only: bool = False,
     now: Any = None,
 ) -> HiveRuntime:
     """Load the checked-in Hive contract into one explicit runtime bundle.
@@ -38158,6 +38159,7 @@ def build_current_hive_runtime(
         repository_roots=repository_roots,
         state_root=STATE_ROOT / "hive",
         materialize_principals=materialize_principals,
+        read_only=read_only,
         now=clock,
     )
 

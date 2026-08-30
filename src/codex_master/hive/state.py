@@ -57,14 +57,35 @@ def _ensure_private_directory(path: Path) -> None:
             raise HiveStateError("state_directory_unavailable") from exc
 
 
+def _validate_existing_private_directory(path: Path) -> None:
+    """Validate an existing private directory without repairing or creating it."""
+
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        raise HiveStateError("state_not_found") from None
+    except OSError as exc:
+        raise HiveStateError("state_directory_unavailable") from exc
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode) or current.st_mode & 0o077:
+        raise HiveStateError("state_directory_untrusted")
+    if current.st_uid != os.geteuid() or stat.S_IMODE(current.st_mode) != 0o700:
+        raise HiveStateError("state_directory_untrusted")
+
+
 class HiveStateStore:
     """Private state root with no-follow reads and atomic replacement."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, read_only: bool = False) -> None:
         if not isinstance(root, Path) or not root.is_absolute():
             raise HiveStateError("invalid_state_root")
+        if type(read_only) is not bool:
+            raise HiveStateError("invalid_state_mode")
         self._root = root
-        _ensure_private_directory(root)
+        self._read_only = read_only
+        if read_only:
+            _validate_existing_private_directory(root)
+        else:
+            _ensure_private_directory(root)
         self._lock_path = root / ".hive-state.lock"
         descriptor = self._open_private_root()
         try:
@@ -92,6 +113,7 @@ class HiveStateStore:
         return dict(payload)
 
     def replace_json(self, relative: PurePosixPath, payload: Mapping[str, object]) -> None:
+        self._ensure_writable()
         if not isinstance(payload, Mapping):
             raise HiveStateError("invalid_state_document")
         encoded = self._encode(payload)
@@ -107,6 +129,7 @@ class HiveStateStore:
     ) -> None:
         """Replace while the caller already owns :meth:`locked`."""
 
+        self._ensure_writable()
         path = self._path(relative)
         if not isinstance(payload, Mapping):
             raise HiveStateError("invalid_state_document")
@@ -122,6 +145,7 @@ class HiveStateStore:
     def replace_private_bytes(self, relative: PurePosixPath, payload: bytes) -> None:
         """Atomically replace one private regular file through the store lock."""
 
+        self._ensure_writable()
         if type(payload) is not bytes:
             raise HiveStateError("invalid_state_document")
         if len(payload) > MAX_HIVE_STATE_BYTES:
@@ -132,6 +156,7 @@ class HiveStateStore:
     def remove_private_bytes(self, relative: PurePosixPath) -> None:
         """Remove one private regular file through the store lock."""
 
+        self._ensure_writable()
         with self._lock():
             self._remove_private_bytes_locked(relative)
 
@@ -150,6 +175,7 @@ class HiveStateStore:
         max_records: int,
         max_bytes: int,
     ) -> None:
+        self._ensure_writable()
         path = self._path(relative)
         if not isinstance(payload, Mapping):
             raise HiveStateError("invalid_state_document")
@@ -217,7 +243,10 @@ class HiveStateStore:
         relative = _validate_relative(relative)
         path = self._root.joinpath(*relative.parts)
         parent = path.parent
-        _ensure_private_directory(parent)
+        if self._read_only:
+            _validate_existing_private_directory(parent)
+        else:
+            _ensure_private_directory(parent)
         try:
             root_resolved = self._root.resolve(strict=True)
             parent_resolved = parent.resolve(strict=True)
@@ -242,6 +271,8 @@ class HiveStateStore:
                 try:
                     child = os.open(part, flags, dir_fd=descriptor)
                 except FileNotFoundError:
+                    if self._read_only:
+                        raise HiveStateError("state_not_found") from None
                     try:
                         os.mkdir(part, 0o700, dir_fd=descriptor)
                         child = os.open(part, flags, dir_fd=descriptor)
@@ -305,13 +336,11 @@ class HiveStateStore:
             raise HiveStateError("state_lock_unavailable") from exc
         if existing is not None:
             self._validate_private_file(existing, MAX_HIVE_STATE_BYTES)
+        flags = (os.O_RDONLY if self._read_only else os.O_RDWR) | getattr(os, "O_NOFOLLOW", 0)
+        if not self._read_only:
+            flags |= os.O_CREAT
         try:
-            descriptor = os.open(
-                lock_name,
-                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=root_descriptor,
-            )
+            descriptor = os.open(lock_name, flags, 0o600, dir_fd=root_descriptor)
         except OSError as exc:
             raise HiveStateError("state_lock_unavailable") from exc
         try:
@@ -319,7 +348,8 @@ class HiveStateStore:
             self._validate_private_file(opened, MAX_HIVE_STATE_BYTES)
             if existing is not None and not self._same_file(existing, opened):
                 raise HiveStateError("state_lock_unavailable")
-            os.fchmod(descriptor, 0o600)
+            if not self._read_only:
+                os.fchmod(descriptor, 0o600)
             self._validate_private_file(os.fstat(descriptor), MAX_HIVE_STATE_BYTES)
             return descriptor
         except Exception:
@@ -394,6 +424,7 @@ class HiveStateStore:
                 os.close(descriptor)
 
     def _replace_private_bytes_locked(self, relative: PurePosixPath, payload: bytes) -> None:
+        self._ensure_writable()
         with self._private_parent(relative) as (parent_descriptor, name):
             try:
                 existing = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -453,6 +484,7 @@ class HiveStateStore:
                         os.unlink(temporary, dir_fd=parent_descriptor)
 
     def _remove_private_bytes_locked(self, relative: PurePosixPath) -> None:
+        self._ensure_writable()
         with self._private_parent(relative) as (parent_descriptor, name):
             try:
                 current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -501,8 +533,7 @@ class HiveStateStore:
             raise HiveStateError("state_file_untrusted")
         return True
 
-    @staticmethod
-    def _read_bytes(path: Path, max_bytes: int) -> bytes:
+    def _read_bytes(self, path: Path, max_bytes: int) -> bytes:
         try:
             descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except FileNotFoundError:
@@ -511,7 +542,9 @@ class HiveStateStore:
             raise HiveStateError("state_unavailable") from exc
         try:
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > max_bytes:
+            if self._read_only:
+                self._validate_private_file(info, max_bytes)
+            elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > max_bytes:
                 raise HiveStateError("state_file_untrusted" if info.st_size <= max_bytes else "state_oversize")
             raw = os.read(descriptor, max_bytes + 1)
             if len(raw) > max_bytes:
@@ -523,6 +556,7 @@ class HiveStateStore:
             os.close(descriptor)
 
     def _atomic_replace(self, path: Path, encoded: bytes) -> None:
+        self._ensure_writable()
         if len(encoded) > MAX_HIVE_STATE_BYTES:
             raise HiveStateError("state_oversize")
         parent = path.parent
@@ -591,7 +625,7 @@ class HiveStateStore:
             self._verify_bound_root_descriptor(root_descriptor)
             lock_descriptor = self._open_lock_descriptor(root_descriptor)
             try:
-                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                fcntl.flock(lock_descriptor, fcntl.LOCK_SH if self._read_only else fcntl.LOCK_EX)
             except OSError as exc:
                 raise HiveStateError("state_lock_unavailable") from exc
             self._verify_bound_root_descriptor(root_descriptor)
@@ -609,6 +643,10 @@ class HiveStateStore:
             if root_descriptor is not None:
                 os.close(root_descriptor)
             process_lock.release()
+
+    def _ensure_writable(self) -> None:
+        if self._read_only:
+            raise HiveStateError("state_read_only")
 
 
 __all__ = ["HiveStateError", "HiveStateStore"]

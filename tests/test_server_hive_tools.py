@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -6,6 +7,7 @@ from codex_master import server
 from codex_master.hive.dispatch import HiveDispatchError
 from codex_master.hive.events import HiveEventStore
 from codex_master.hive.messages import validate_message
+from codex_master.hive.config import load_agent_class_catalog, load_hive_config
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
@@ -15,6 +17,26 @@ def test_server_exposes_additive_read_only_hive_tools() -> None:
     names = {tool["name"] for tool in server.TOOLS}
     assert {"hive_status", "godbee_status", "queen_list", "agent_selection_status"} <= names
     assert server.call_validated_tool("hive_status", {})["raw_output"] == "not_returned"
+
+
+def test_server_runtime_factory_can_forward_read_only_assembly() -> None:
+    classes = load_agent_class_catalog(server.repo_root() / "codex-agent-classes.json")
+    config = load_hive_config(server.repo_root() / "codex-hive.json", classes)
+    with patch.object(server, "load_agent_class_catalog", return_value=classes), patch.object(
+        server, "load_hive_config", return_value=config
+    ), patch.object(server, "build_hive_runtime", return_value=object()) as builder:
+        result = server.build_current_hive_runtime(repository_roots={}, read_only=True)
+
+    assert result is not None
+    builder.assert_called_once_with(
+        config,
+        classes,
+        repository_roots={},
+        state_root=server.STATE_ROOT / "hive",
+        materialize_principals=False,
+        read_only=True,
+        now=None,
+    )
 
 
 def queen_workpackage(mode: str = "enforced") -> dict[str, object]:

@@ -1,6 +1,7 @@
 import argparse
 
 from codex_master.hive.cli import add_hive_cli_parsers, run_hive_cli
+from codex_master.hive.runtime import HiveRuntimeEvidence
 
 
 ANCHOR_KEY = "sha256:" + "a" * 64
@@ -35,3 +36,25 @@ def test_migration_cli_is_read_only_and_requires_explicit_dry_run() -> None:
     assert rollback["dry_run"] is True
     assert rollback["rollback_allowed"] is False
     assert rollback["statefiles_deleted"] is False
+
+
+def test_cli_status_and_doctor_accept_the_same_canonical_runtime_evidence() -> None:
+    evidence = HiveRuntimeEvidence(
+        schema_version=1,
+        mode="shadow",
+        config_digest="sha256:" + "a" * 64,
+        catalog_digest="sha256:" + "b" * 64,
+        repository="not_configured",
+        principal="not_configured",
+        authority="fail_closed",
+        state="not_configured",
+        pilot="blocked",
+        reason_codes=("repository_not_configured", "principal_not_configured", "state_not_configured"),
+        mutation_performed=False,
+    )
+    status = run_hive_cli({"hive_command": "status"}, runtime_evidence=evidence)
+    doctor = run_hive_cli({"hive_command": "doctor"}, runtime_evidence=evidence)
+    assert status["checks"] == doctor["checks"]
+    assert status["mode"] == doctor["mode"] == "shadow"
+    assert status["mutation_performed"] is False
+    assert doctor["mutation_performed"] is False

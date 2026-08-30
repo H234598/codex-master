@@ -8,7 +8,10 @@ from codex_master.hive.status import (
     aggregate_queen_status,
     aggregate_teamlead_status,
     proactive_anchor_status,
+    hive_doctor,
+    hive_status,
 )
+from codex_master.hive.runtime import HiveRuntimeEvidence
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
@@ -90,3 +93,30 @@ def test_proactive_anchor_status_is_dry_run_only_by_default() -> None:
     assert result["execute_reason_code"] == "selection_proactive_anchor_safety_gate"
     assert result["safety"]["kill_switch_active"] is True
     assert result["raw_output"] == "not_returned"
+
+
+def test_status_and_doctor_project_one_canonical_runtime_evidence() -> None:
+    evidence = HiveRuntimeEvidence(
+        schema_version=1,
+        mode="shadow",
+        config_digest="sha256:" + "a" * 64,
+        catalog_digest="sha256:" + "b" * 64,
+        repository="not_configured",
+        principal="not_configured",
+        authority="fail_closed",
+        state="not_configured",
+        pilot="blocked",
+        reason_codes=("repository_not_configured", "principal_not_configured", "state_not_configured"),
+        mutation_performed=False,
+    )
+
+    status = hive_status(runtime_evidence=evidence)
+    doctor = hive_doctor(runtime_evidence=evidence)
+    assert status["mode"] == doctor["mode"] == "shadow"
+    assert status["authority"] == doctor["checks"]["authority"] == "fail_closed"
+    assert status["checks"] == doctor["checks"]
+    assert doctor["healthy"] is False
+    assert status["mutation_performed"] is False
+    assert doctor["mutation_performed"] is False
+    assert "state_root" not in str(status)
+    assert "state_root" not in str(doctor)

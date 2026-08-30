@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 
 from codex_master.hive.migration import migration_status, rollback_hive_state
+from codex_master.hive.runtime import HiveRuntimeEvidence
 from codex_master.hive.status import hive_doctor, hive_status, selection_status
 from codex_master.selection.reset_anchor import AnchorRecord, ResetAnchorPlanner
 
@@ -30,7 +31,11 @@ def add_hive_cli_parsers(subparsers: object) -> None:
     reset_anchor.set_defaults(hive_command="reset-anchor-run")
 
 
-def run_hive_cli(args: object) -> Mapping[str, object]:
+def run_hive_cli(
+    args: object,
+    *,
+    runtime_evidence: HiveRuntimeEvidence | None = None,
+) -> Mapping[str, object]:
     if isinstance(args, argparse.Namespace):
         command = getattr(args, "hive_command", None)
     elif isinstance(args, Mapping):
@@ -38,9 +43,9 @@ def run_hive_cli(args: object) -> Mapping[str, object]:
     else:
         raise ValueError("invalid_cli_args")
     if command in {"validate", "status"}:
-        return hive_status()
+        return hive_status(runtime_evidence=runtime_evidence)
     if command == "doctor":
-        return hive_doctor()
+        return hive_doctor(runtime_evidence=runtime_evidence)
     if command == "migration-status":
         return migration_status()
     if command == "rollback":

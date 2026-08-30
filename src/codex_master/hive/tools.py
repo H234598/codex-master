@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from codex_master.hive.runtime import HiveRuntimeEvidence
 from codex_master.hive.status import godbee_status, hive_status, queen_list, selection_status
 
 
@@ -20,14 +21,19 @@ def hive_tool_definitions() -> list[dict[str, object]]:
     ]
 
 
-def call_hive_tool(name: str, args: Mapping[str, object] | None = None) -> Mapping[str, object]:
+def call_hive_tool(
+    name: str,
+    args: Mapping[str, object] | None = None,
+    *,
+    runtime_evidence: HiveRuntimeEvidence | None = None,
+) -> Mapping[str, object]:
     if name not in _NAMES or (args is not None and not isinstance(args, Mapping)):
         raise ValueError("unknown_hive_tool")
     args = args or {}
     if args:
         raise ValueError("hive_tool_arguments_not_allowed")
     if name == "hive_status":
-        return hive_status()
+        return hive_status(runtime_evidence=runtime_evidence)
     if name == "godbee_status":
         return godbee_status()
     if name == "queen_list":

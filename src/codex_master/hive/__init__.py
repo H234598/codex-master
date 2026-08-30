@@ -57,7 +57,14 @@ from codex_master.hive.memory import MemoryEntry, MemoryError, promote_queen_mem
 from codex_master.hive.queue import QueueDecision, QueueError, WorkPriorityKey, WorkQueue
 from codex_master.hive.admission import ExecutionAdmission, HiveAdmissionError, create_assignment_admission
 from codex_master.hive.config import AgentClassProfile, HiveConfig, HiveConfigError, load_agent_class_catalog, load_hive_config
-from codex_master.hive.runtime import HiveRuntime, HiveRuntimeError, build_hive_runtime
+from codex_master.hive.runtime import (
+    HiveRuntime,
+    HiveRuntimeError,
+    HiveRuntimeEvidence,
+    build_hive_runtime,
+    enforced_pilot_gate,
+    read_hive_runtime_evidence,
+)
 from codex_master.hive.status import aggregate_godbee_status, aggregate_queen_status, aggregate_teamlead_status
 
 __all__ = [
@@ -136,7 +143,10 @@ __all__ = [
     "load_hive_config",
     "HiveRuntime",
     "HiveRuntimeError",
+    "HiveRuntimeEvidence",
     "build_hive_runtime",
+    "enforced_pilot_gate",
+    "read_hive_runtime_evidence",
     "aggregate_godbee_status",
     "aggregate_queen_status",
     "aggregate_teamlead_status",

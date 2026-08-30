@@ -25,6 +25,27 @@ def test_state_store_round_trips_private_json_and_jsonl(tmp_path: Path) -> None:
     assert [json.loads(line)["event"] for line in lines] == ["two", "three"]
 
 
+def test_read_only_state_store_rejects_all_mutations(tmp_path: Path) -> None:
+    writable = HiveStateStore(tmp_path / "state")
+    writable.replace_json(PurePosixPath("principals.json"), {"schema_version": 1})
+    before = (tmp_path / "state" / "principals.json").read_bytes()
+
+    read_only = HiveStateStore(tmp_path / "state", read_only=True)
+    with pytest.raises(HiveStateError, match="^state_read_only$"):
+        read_only.replace_json(PurePosixPath("principals.json"), {"schema_version": 2})
+    with pytest.raises(HiveStateError, match="^state_read_only$"):
+        read_only.replace_private_bytes(PurePosixPath("private.bin"), b"blocked")
+    with pytest.raises(HiveStateError, match="^state_read_only$"):
+        read_only.remove_private_bytes(PurePosixPath("principals.json"))
+    with pytest.raises(HiveStateError, match="^state_read_only$"):
+        read_only.append_bounded_jsonl(
+            PurePosixPath("events.jsonl"), {"event": "blocked"}, max_records=4, max_bytes=4096
+        )
+    assert (tmp_path / "state" / "principals.json").read_bytes() == before
+    assert not (tmp_path / "state" / "private.bin").exists()
+    assert not (tmp_path / "state" / "events.jsonl").exists()
+
+
 def test_state_store_uses_private_modes(tmp_path: Path) -> None:
     store = HiveStateStore(tmp_path / "state")
     store.replace_json(PurePosixPath("record.json"), {"ok": True})
