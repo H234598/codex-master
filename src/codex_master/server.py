@@ -242,6 +242,8 @@ from codex_master.admission import (
 from codex_master.admission_journal import CompletionJournal
 from codex_master.admission_runtime import (
     AdmissionGate,
+    MAX_OPERATION_LENGTH,
+    MAX_REASON_LENGTH,
     RuntimeGateDecision,
     ServerAdmissionRuntime,
 )
@@ -273,10 +275,14 @@ from codex_master.hive.dispatch import (
     request_cooperative_pause,
 )
 from codex_master.hive.events import HiveEventError, HiveEventStore
+from codex_master.hive.hourly_probe import probe_capacity_lock, read_probe_gate
 from codex_master.hive.messages import HiveMessage
 from codex_master.hive.repositories import RepositoryRegistry
 from codex_master.hive.config import load_agent_class_catalog, load_hive_config
-from codex_master.hive.runtime import HiveRuntime, build_hive_runtime
+from codex_master.hive.runtime import (
+    HiveRuntime,
+    build_hive_runtime,
+)
 from codex_master.hive.tools import call_hive_tool, hive_tool_definitions
 from codex_master.selection.model_policy import load_model_policy
 from codex_master.limit_tracker import (
@@ -723,20 +729,36 @@ FLEET_BASH_EXECUTABLE = Path("/usr/bin/bash")
 FLEET_TASKSET_EXECUTABLE = Path("/usr/bin/taskset")
 FLEET_TRUE_EXECUTABLE = Path("/usr/bin/true")
 POOL_SCHEMA_VERSION = 1
-FLEET_RECOVERY_GATED_OPERATIONS = frozenset(
+FLEET_RECOVERY_JOURNAL_OPERATIONS = frozenset(
     {
         "agent_claim",
         "agent_start",
-        "agent_send",
         "agent_assign",
-        "agent_report_request",
+        "fleet_watchdog",
+        "fleet_home_v2_cutover",
+        "fleet_skill_sync",
         "worktree_create_for_agent",
         "fleet_series_apply",
-        "fleet_series_disable",
-        "fleet_series_delete",
         "fleet_account_mutation",
         "fleet_auth_mutation",
         "fleet_limit_mutation",
+    }
+)
+# This list is intentionally narrower than the recovery-journal operations.
+# It covers only operations that can admit *new* runtime capacity; diagnostics,
+# communication, teardown, rollback, configuration, skills, and worktrees do
+# not become unavailable because a capacity probe is red.
+RESOURCE_CAPACITY_PREFLIGHT_OPERATIONS = frozenset(
+    {
+        "native_spawn",
+        "managed_replacement",
+        "headless_assignment",
+        "agent_claim",
+        "agent_start",
+        "agent_assign",
+        "fleet_series_apply",
+        "emergency_queen_start",
+        "hive_assignment",
     }
 )
 POOL_DEFAULT_CODEX_BIN = "${CODEX_AGENT_BIN:-/usr/local/bin/codex}"
@@ -6362,6 +6384,7 @@ def reserve_native_agent_spawn(payload: Any) -> dict[str, Any]:
     parent_session_id = payload.get("session_id")
     if not _validate_native_agent_identifier(parent_session_id, NATIVE_AGENT_ID_RE):
         return {"allowed": False, "reason_codes": ["invalid_input"]}
+    require_resource_capacity_preflight(operation="native_spawn")
     with spawn_admission_lock():
         admission = spawn_admission_decision()
         if admission.get("allowed") is not True:
@@ -6395,20 +6418,21 @@ def reserve_native_agent_spawn(payload: Any) -> dict[str, Any]:
                     "error_code": "spawn_capacity_unavailable",
                     "reason_codes": ["session_metrics_unavailable"],
                 }
-            reservations = registry.setdefault("reservations", [])
-            reservations.append(
-                {
-                    "reservation_id": uuid.uuid4().hex,
-                    "kind": "native_spawn",
-                    "created_at": time.time(),
-                    "parent_session_id": parent_session_id,
+            with hive_capacity_probe_guard("native_spawn"):
+                reservations = registry.setdefault("reservations", [])
+                reservations.append(
+                    {
+                        "reservation_id": uuid.uuid4().hex,
+                        "kind": "native_spawn",
+                        "created_at": time.time(),
+                        "parent_session_id": parent_session_id,
+                    }
+                )
+                _write_native_agent_registry(registry)
+                return {
+                    "allowed": True,
+                    "reservation_id": reservations[-1]["reservation_id"],
                 }
-            )
-            _write_native_agent_registry(registry)
-            return {
-                "allowed": True,
-                "reservation_id": reservations[-1]["reservation_id"],
-            }
 
 
 def reserve_managed_replacement(managed_session: Any) -> dict[str, Any]:
@@ -6419,6 +6443,7 @@ def reserve_managed_replacement(managed_session: Any) -> dict[str, Any]:
             "error_code": "spawn_capacity_unavailable",
             "reason_codes": ["session_metrics_unavailable"],
         }
+    require_resource_capacity_preflight(operation="managed_replacement")
     with spawn_admission_lock():
         managed_ids = _managed_tmux_session_ids()
         if managed_ids is None or managed_session not in managed_ids:
@@ -6447,15 +6472,19 @@ def reserve_managed_replacement(managed_session: Any) -> dict[str, Any]:
                     "error_code": "spawn_capacity_unavailable",
                     "reason_codes": ["replacement_reservation_pending"],
                 }
-            reservation = {
-                "reservation_id": uuid.uuid4().hex,
-                "kind": "managed_replacement",
-                "created_at": time.time(),
-                "managed_session": managed_session,
-            }
-            reservations.append(reservation)
-            _write_native_agent_registry(registry)
-            return {"allowed": True, "reservation_id": reservation["reservation_id"]}
+            with hive_capacity_probe_guard("managed_replacement"):
+                reservation = {
+                    "reservation_id": uuid.uuid4().hex,
+                    "kind": "managed_replacement",
+                    "created_at": time.time(),
+                    "managed_session": managed_session,
+                }
+                reservations.append(reservation)
+                _write_native_agent_registry(registry)
+                return {
+                    "allowed": True,
+                    "reservation_id": reservation["reservation_id"],
+                }
 
 
 def reserve_headless_inflight(agent: Any, assignment_id: Any) -> dict[str, Any] | None:
@@ -6463,6 +6492,7 @@ def reserve_headless_inflight(agent: Any, assignment_id: Any) -> dict[str, Any] 
         agent, NATIVE_AGENT_ID_RE
     ) or not _validate_native_agent_identifier(assignment_id, NATIVE_AGENT_ID_RE):
         return None
+    require_resource_capacity_preflight(operation="headless_assignment")
     timestamp = time.time()
     with spawn_admission_lock():
         with native_agent_registry_lock():
@@ -6484,17 +6514,18 @@ def reserve_headless_inflight(agent: Any, assignment_id: Any) -> dict[str, Any] 
                         "assignment_id": row["assignment_id"],
                         "created_at": row["created_at"],
                     }
-            reservation_id = uuid.uuid4().hex
-            reservation = {
-                "kind": "headless_inflight",
-                "reservation_id": reservation_id,
-                "agent": agent,
-                "assignment_id": assignment_id,
-                "created_at": timestamp,
-            }
-            reservations.append(reservation)
-            _write_native_agent_registry(registry)
-            return reservation
+            with hive_capacity_probe_guard("headless_assignment"):
+                reservation_id = uuid.uuid4().hex
+                reservation = {
+                    "kind": "headless_inflight",
+                    "reservation_id": reservation_id,
+                    "agent": agent,
+                    "assignment_id": assignment_id,
+                    "created_at": timestamp,
+                }
+                reservations.append(reservation)
+                _write_native_agent_registry(registry)
+                return reservation
 
 
 def release_headless_inflight(
@@ -7706,6 +7737,7 @@ def claim_agent(
     recover_stopped: bool = False,
     stopped_grace_seconds: int = DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
 ) -> dict[str, Any]:
+    require_resource_capacity_preflight(operation="agent_claim")
     require_fleet_recovery_ready("agent_claim")
     with agent_lifecycle_lock(agent):
         return _claim_agent_unlocked(
@@ -7718,6 +7750,43 @@ def claim_agent(
 
 
 def _claim_agent_unlocked(
+    agent: str,
+    ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS,
+    force: bool = False,
+    recover_stopped: bool = False,
+    stopped_grace_seconds: int = DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
+    *,
+    enforce_recovery_gate: bool = True,
+) -> dict[str, Any]:
+    """Claim either new capacity or a narrowly scoped control lease.
+
+    ``enforce_recovery_gate=False`` is reserved for control paths that already
+    hold the lifecycle lock and can only stop, interrupt, release, or recover
+    an existing agent.  It preserves the normal lease ownership checks while
+    deliberately bypassing resource-capacity admission.
+    """
+
+    if not enforce_recovery_gate:
+        return _claim_agent_after_capacity_probe_unlocked(
+            agent,
+            ttl_seconds=ttl_seconds,
+            force=force,
+            recover_stopped=recover_stopped,
+            stopped_grace_seconds=stopped_grace_seconds,
+            enforce_recovery_gate=enforce_recovery_gate,
+        )
+    with hive_capacity_probe_guard("agent_claim"):
+        return _claim_agent_after_capacity_probe_unlocked(
+            agent,
+            ttl_seconds=ttl_seconds,
+            force=force,
+            recover_stopped=recover_stopped,
+            stopped_grace_seconds=stopped_grace_seconds,
+            enforce_recovery_gate=True,
+        )
+
+
+def _claim_agent_after_capacity_probe_unlocked(
     agent: str,
     ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS,
     force: bool = False,
@@ -7833,6 +7902,7 @@ def claim_agent_with_wait(
     recover_stopped: bool = True,
     stopped_grace_seconds: int = DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
 ) -> dict[str, Any]:
+    require_resource_capacity_preflight(operation="agent_claim")
     require_fleet_recovery_ready("agent_claim")
     agent = canonical_agent_id(agent)
     wait_seconds = normalize_claim_wait_seconds(wait_seconds)
@@ -11964,35 +12034,37 @@ def start_agent(
     replacement_reservation_id: str | None = None,
     confirm_home_refresh: bool = False,
 ) -> dict[str, Any]:
+    require_resource_capacity_preflight(operation="agent_start")
     require_fleet_recovery_ready("agent_start")
     if type(confirm_home_refresh) is not bool:
         raise AgentError("confirm_home_refresh must be a boolean")
     agent = canonical_agent_id(agent)
     _reject_legacy_teamlead_start_target(agent_class)
     with agent_lifecycle_lock(agent):
-        with _resource_gate_composer_scope():
-            name_args = {"name": name} if name is not None else {}
-            replacement_args = (
-                {"replacement_reservation_id": replacement_reservation_id}
-                if replacement_reservation_id is not None
-                else {}
-            )
-            home_refresh_args = (
-                {"confirm_home_refresh": True} if confirm_home_refresh else {}
-            )
-            return _start_agent_unlocked(
-                agent,
-                cwd,
-                prompt,
-                lease,
-                release_lease_on_failure,
-                model,
-                model_reasoning_effort,
-                agent_class,
-                **name_args,
-                **replacement_args,
-                **home_refresh_args,
-            )
+        with hive_capacity_probe_guard("agent_start"):
+            with _resource_gate_composer_scope():
+                name_args = {"name": name} if name is not None else {}
+                replacement_args = (
+                    {"replacement_reservation_id": replacement_reservation_id}
+                    if replacement_reservation_id is not None
+                    else {}
+                )
+                home_refresh_args = (
+                    {"confirm_home_refresh": True} if confirm_home_refresh else {}
+                )
+                return _start_agent_unlocked(
+                    agent,
+                    cwd,
+                    prompt,
+                    lease,
+                    release_lease_on_failure,
+                    model,
+                    model_reasoning_effort,
+                    agent_class,
+                    **name_args,
+                    **replacement_args,
+                    **home_refresh_args,
+                )
 
 
 def _start_agent_unlocked(
@@ -12780,6 +12852,16 @@ def cancel_headless_job(agent: str, force: bool = False) -> dict[str, Any]:
 
 
 def _start_headless_agent_unlocked(agent: str) -> dict[str, Any]:
+    """Create a ready headless slot only under the final capacity recheck."""
+
+    require_resource_capacity_preflight(operation="agent_start")
+    with hive_capacity_probe_guard("agent_start"):
+        return _start_headless_agent_after_capacity_probe_unlocked(agent)
+
+
+def _start_headless_agent_after_capacity_probe_unlocked(
+    agent: str,
+) -> dict[str, Any]:
     requested_agent = canonical_agent_id(agent)
     agent, descriptor, structured_gate, routing_gate = _resolve_gemini_headless_route(
         requested_agent
@@ -12875,6 +12957,7 @@ def _run_headless_process(
     write_scope_binding: ScopeBinding | None = None,
     write_scope_store: HeadlessWriteScopeStore | None = None,
 ) -> dict[str, Any]:
+    require_resource_capacity_preflight(operation="headless_assignment")
     headless_inflight_reservation_id = (
         headless_inflight_reservation.get("reservation_id")
         if isinstance(headless_inflight_reservation, Mapping)
@@ -13140,9 +13223,10 @@ def _run_headless_process(
     try:
         try:
             if reservation is None and gate.account_id is not None:
-                reservation = service.reserve_gemini_request(
-                    gate.account_id, model=descriptor.model
-                )
+                with hive_capacity_probe_guard("headless_assignment"):
+                    reservation = service.reserve_gemini_request(
+                        gate.account_id, model=descriptor.model
+                    )
             secret = service.read_secret(
                 gate.account_id, expected_generation=gate.generation
             )
@@ -13205,10 +13289,11 @@ def _run_headless_process(
             if worktree_fd >= 0:
                 popen_kwargs["pass_fds"] = (worktree_fd,)
             try:
-                process = subprocess.Popen(
-                    tuple(argv),
-                    **popen_kwargs,
-                )
+                with hive_capacity_probe_guard("headless_assignment"):
+                    process = subprocess.Popen(
+                        tuple(argv),
+                        **popen_kwargs,
+                    )
             except (OSError, ValueError) as exc:
                 raise AgentError("headless_start_failed") from exc
         except Exception:
@@ -13594,14 +13679,16 @@ def run_headless_assignment(
     lease: Mapping[str, Any],
     timeout_seconds: float,
 ) -> dict[str, Any]:
+    require_resource_capacity_preflight(operation="headless_assignment")
     agent = canonical_agent_id(agent)
-    return _run_headless_process(
-        agent,
-        prompt,
-        lease,
-        timeout_seconds,
-        role="exploriererin",
-    )
+    with hive_capacity_probe_guard("headless_assignment"):
+        return _run_headless_process(
+            agent,
+            prompt,
+            lease,
+            timeout_seconds,
+            role="exploriererin",
+        )
 
 
 def _headless_route_candidates(
@@ -13674,6 +13761,7 @@ def _assign_headless_agent(
     required_skills: Any = None,
 ) -> dict[str, Any]:
     del operation, allow_unauthenticated
+    require_resource_capacity_preflight(operation="agent_assign")
     requested_agent = canonical_agent_id(agent)
     agent = requested_agent
     descriptor = _headless_descriptor(requested_agent)
@@ -13862,54 +13950,54 @@ def _assign_headless_agent(
             claim = _claim_agent_unlocked(agent)
             lease = claim["lease"]
             release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
-            record_assignment(
-                {
-                    "assignment_id": assignment_id,
-                    "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                    "agent": agent,
-                    "role": role,
-                    "name": name or default_agentin_name(agent),
-                    "model": descriptor.model,
-                    "group_id": group_id,
-                    "job_id": job_id,
-                    "skill": {
-                        "requested": skill,
-                        "available": bool(matches) if skill else None,
-                        "match_count": len(matches),
-                    },
-                    "scope": redact_list(scope),
-                    "write_paths": redact_list(write_paths),
-                    "context_count": len(context),
-                    "forbidden_count": len(forbidden),
-                    "write_policy": "read_only"
-                    if role == "exploriererin"
-                    else "explicit_paths_only",
-                    "write_scope": (
-                        {
-                            "state": "bound",
-                            "attestation_id": write_scope_binding.attestation_id,
-                            "raw_output": "not_returned",
-                        }
-                        if write_scope_binding is not None
-                        else None
-                    ),
-                    "allow_subagents": allow_subagents,
-                    "requires_search": requires_search,
-                    "live_data": {
-                        "required": requires_search,
-                        "topic_state": "set" if live_data_topic else "task",
+            assignment_record = {
+                "assignment_id": assignment_id,
+                "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                "agent": agent,
+                "role": role,
+                "name": name or default_agentin_name(agent),
+                "model": descriptor.model,
+                "group_id": group_id,
+                "job_id": job_id,
+                "skill": {
+                    "requested": skill,
+                    "available": bool(matches) if skill else None,
+                    "match_count": len(matches),
+                },
+                "scope": redact_list(scope),
+                "write_paths": redact_list(write_paths),
+                "context_count": len(context),
+                "forbidden_count": len(forbidden),
+                "write_policy": "read_only"
+                if role == "exploriererin"
+                else "explicit_paths_only",
+                "write_scope": (
+                    {
+                        "state": "bound",
+                        "attestation_id": write_scope_binding.attestation_id,
                         "raw_output": "not_returned",
-                    },
-                    "lease": lease,
-                    "submitted": enter,
-                    "prompt_chars": len(prompt),
-                    "prompt_output": "not_returned",
-                    "response_output": "not_returned",
-                }
-            )
-            marker = _headless_marker(agent)
-            marker.update({"state": "ready", "assignment_id": assignment_id})
-            _write_headless_marker(agent, marker)
+                    }
+                    if write_scope_binding is not None
+                    else None
+                ),
+                "allow_subagents": allow_subagents,
+                "requires_search": requires_search,
+                "live_data": {
+                    "required": requires_search,
+                    "topic_state": "set" if live_data_topic else "task",
+                    "raw_output": "not_returned",
+                },
+                "lease": lease,
+                "submitted": enter,
+                "prompt_chars": len(prompt),
+                "prompt_output": "not_returned",
+                "response_output": "not_returned",
+            }
+            with hive_capacity_probe_guard("agent_assign"):
+                record_assignment(assignment_record)
+                marker = _headless_marker(agent)
+                marker.update({"state": "ready", "assignment_id": assignment_id})
+                _write_headless_marker(agent, marker)
     except Exception:
         if write_scope_binding is not None and write_scope_store is not None:
             with contextlib.suppress(Exception):
@@ -13987,29 +14075,31 @@ def start_agent_with_lease(
     name: str | None = None,
     confirm_home_refresh: bool = False,
 ) -> dict[str, Any]:
+    require_resource_capacity_preflight(operation="agent_start")
     require_fleet_recovery_ready("agent_start")
     if type(confirm_home_refresh) is not bool:
         raise AgentError("confirm_home_refresh must be a boolean")
     agent = canonical_agent_id(agent)
     with agent_lifecycle_lock(agent):
-        with _resource_gate_composer_scope():
-            name_args = {"name": name} if name is not None else {}
-            home_refresh_args = (
-                {"confirm_home_refresh": True} if confirm_home_refresh else {}
-            )
-            return _start_agent_with_lease_unlocked(
-                agent,
-                cwd,
-                prompt,
-                allow_unauthenticated=allow_unauthenticated,
-                agent_class=agent_class,
-                lifecycle=lifecycle,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                complexity=complexity,
-                **name_args,
-                **home_refresh_args,
-            )
+        with hive_capacity_probe_guard("agent_start"):
+            with _resource_gate_composer_scope():
+                name_args = {"name": name} if name is not None else {}
+                home_refresh_args = (
+                    {"confirm_home_refresh": True} if confirm_home_refresh else {}
+                )
+                return _start_agent_with_lease_unlocked(
+                    agent,
+                    cwd,
+                    prompt,
+                    allow_unauthenticated=allow_unauthenticated,
+                    agent_class=agent_class,
+                    lifecycle=lifecycle,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    complexity=complexity,
+                    **name_args,
+                    **home_refresh_args,
+                )
 
 
 def _start_agent_with_lease_unlocked(
@@ -15684,6 +15774,15 @@ def ensure_emergency_queen(*, dry_run: bool = False) -> dict[str, Any] | None:
         return {"status": "not_requested", "state": state, "raw_output": "not_returned"}
     candidates = _emergency_queen_agent_candidates()
     if not candidates:
+        if dry_run:
+            return {
+                "status": "would_block",
+                "error_code": "queen_spawn_unavailable",
+                "reason": "hive_queen_runtime_not_materialized",
+                "state": state,
+                "raw_output": "not_returned",
+            }
+        require_resource_capacity_preflight(operation="emergency_queen_start")
         blocked = set_emergency_queen_blocked(
             int(state["generation"]),
             "queen_spawn_unavailable:hive_queen_runtime_not_materialized",
@@ -15703,6 +15802,7 @@ def ensure_emergency_queen(*, dry_run: bool = False) -> dict[str, Any] | None:
             "state": state,
             "raw_output": "not_returned",
         }
+    require_resource_capacity_preflight(operation="emergency_queen_start")
     prompt = (
         "Du bist die Notfall-Königin des codex-master-Repositories. "
         "Arbeite ausschließlich den aktuell zugewiesenen freigegebenen Plan ab: "
@@ -15995,8 +16095,12 @@ def watchdog_agent(
     manage_unclaimed: bool,
     dry_run: bool,
 ) -> dict[str, Any]:
-
     agent = canonical_agent_id(agent)
+    safe_shutdown_only = (
+        _fleet_safe_shutdown_only("fleet_watchdog")
+        if not dry_run and action != "none"
+        else False
+    )
     with agent_lifecycle_lock(agent):
         return _watchdog_agent_unlocked(
             agent,
@@ -16006,6 +16110,7 @@ def watchdog_agent(
             require_lease=require_lease,
             manage_unclaimed=manage_unclaimed,
             dry_run=dry_run,
+            safe_shutdown_only=safe_shutdown_only,
         )
 
 
@@ -16019,6 +16124,7 @@ def _watchdog_agent_unlocked(
     manage_unclaimed: bool,
     dry_run: bool,
     snapshot: FleetWatchdogSnapshot | None = None,
+    safe_shutdown_only: bool = False,
 ) -> dict[str, Any]:
     now = time.time()
     observed_snapshot = snapshot if snapshot is not None else _WATCHDOG_SNAPSHOT.get()
@@ -16076,7 +16182,7 @@ def _watchdog_agent_unlocked(
             "action_taken": "none",
         }
     if not status.get("running"):
-        if not dry_run:
+        if not dry_run and not safe_shutdown_only:
             marker = watchdog_marker(read_meta(agent))
             marker_lease_matches = watchdog_marker_lease_matches(
                 marker,
@@ -16134,7 +16240,7 @@ def _watchdog_agent_unlocked(
     if effective_idle < idle_seconds and response_state != "blocked_by_limit":
         meta = read_meta(agent)
         marker = watchdog_marker(meta)
-        if marker and not dry_run and lease_allowed:
+        if marker and not dry_run and lease_allowed and not safe_shutdown_only:
             marker_lease_matches = watchdog_marker_lease_matches(
                 marker,
                 assignment_id=assignment_id,
@@ -16185,11 +16291,17 @@ def _watchdog_agent_unlocked(
         status, marker, now=now
     )
     if marker_is_current and output_changed:
-        if not dry_run:
+        if not dry_run and not safe_shutdown_only:
             update_watchdog_marker(agent, None)
         marker_is_current = False
 
     if action != "none" and not marker_is_current:
+        if safe_shutdown_only:
+            return {
+                **base,
+                "watchdog_state": "skipped_probe_blocked_without_report",
+                "action_taken": "none",
+            }
         if dry_run:
             return {
                 **base,
@@ -16301,6 +16413,25 @@ def _watchdog_agent_unlocked(
 
     if dry_run:
         return {**base, "watchdog_state": f"would_{action}", "action_taken": "none"}
+    if safe_shutdown_only:
+        if not held_by_this_server:
+            return {
+                **base,
+                "watchdog_state": "skipped_probe_blocked_without_lease",
+                "action_taken": "none",
+            }
+        result = watchdog_action(
+            agent,
+            action,
+            release_after_interrupt=False,
+            release_lease_id=None,
+        )
+        return {
+            **base,
+            "watchdog_state": "action_sent" if action != "none" else "no_action",
+            "action_taken": action,
+            "action_result": public_watchdog_action_result(result),
+        }
     if (
         action == "none"
         and release_watchdog_lease
@@ -16339,11 +16470,21 @@ def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     if dry_run:
         return _usage_watchdog_agent_unlocked(agent, dry_run=True)
+    safe_shutdown_only = _fleet_safe_shutdown_only("fleet_watchdog")
     with agent_lifecycle_lock(agent):
-        return _usage_watchdog_agent_unlocked(agent, dry_run=False)
+        return _usage_watchdog_agent_unlocked(
+            agent,
+            dry_run=False,
+            safe_shutdown_only=safe_shutdown_only,
+        )
 
 
-def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, Any]:
+def _usage_watchdog_agent_unlocked(
+    agent: str,
+    *,
+    dry_run: bool,
+    safe_shutdown_only: bool = False,
+) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     if not dry_run:
         ensure_state()
@@ -16406,8 +16547,14 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
                 "usage_watchdog_state": "would_stop",
                 "action_taken": "none",
             }
+        if safe_shutdown_only and not lease.get("held_by_this_server"):
+            return {
+                **base,
+                "usage_watchdog_state": "skipped_probe_blocked_without_lease",
+                "action_taken": "none",
+            }
         claimed_for_watchdog = False
-        if not lease.get("held_by_this_server") and lease.get("state") in {
+        if not safe_shutdown_only and not lease.get("held_by_this_server") and lease.get("state") in {
             "unclaimed",
             "expired",
         }:
@@ -16450,13 +16597,20 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
 def fleet_usage_watchdog(
     agent: str = "all", *, dry_run: bool = False
 ) -> dict[str, Any]:
+    safe_shutdown_only = (
+        _fleet_safe_shutdown_only("fleet_watchdog") if not dry_run else False
+    )
     selected = agent_ids(agent)
     run_agent = (
         (lambda item: usage_watchdog_agent(item, dry_run=True))
         if dry_run
         else lambda item: call_agent_lifecycle(
             item,
-            lambda: _usage_watchdog_agent_unlocked(item, dry_run=False),
+            lambda: _usage_watchdog_agent_unlocked(
+                item,
+                dry_run=False,
+                safe_shutdown_only=safe_shutdown_only,
+            ),
         )
     )
     results = multi_agent_result(
@@ -16501,6 +16655,11 @@ def fleet_watchdog(
     report_grace_seconds = normalize_watchdog_report_grace_seconds(report_grace_seconds)
     if action not in {"interrupt", "stop", "release", "none"}:
         raise AgentError("watchdog action must be interrupt, stop, release, or none")
+    safe_shutdown_only = (
+        _fleet_safe_shutdown_only("fleet_watchdog")
+        if not dry_run and action != "none"
+        else False
+    )
     inventory = current_agent_inventory()
     configs = {item: agent_config(item, inventory) for item in selected}
     try:
@@ -16541,6 +16700,7 @@ def fleet_watchdog(
                     manage_unclaimed=manage_unclaimed,
                     dry_run=False,
                     snapshot=snapshot,
+                    safe_shutdown_only=safe_shutdown_only,
                 ),
             )
         )
@@ -17069,6 +17229,7 @@ def ensure_assignment_session_model(
     release_lease_on_failure: bool = False,
     agent_class: str | None = None,
     name: str | None = None,
+    lease_acquisition: list[bool] | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     cfg = agent_config(agent)
@@ -17105,6 +17266,109 @@ def ensure_assignment_session_model(
             "model": model,
             "raw_output": "not_returned",
         }
+    return _restart_assignment_session_after_capacity_probe(
+        agent,
+        cfg=cfg,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        lease=lease,
+        release_lease_on_failure=release_lease_on_failure,
+        agent_class=agent_class,
+        name=name,
+        previous_model=current_model,
+        cwd=meta.get("cwd"),
+        lease_acquisition=lease_acquisition,
+    )
+
+
+def _restart_assignment_session_after_capacity_probe(
+    agent: str,
+    *,
+    cfg: Mapping[str, Any],
+    model: str,
+    reasoning_effort: str | None,
+    lease: dict[str, Any],
+    release_lease_on_failure: bool,
+    agent_class: str | None,
+    name: str | None,
+    previous_model: str,
+    cwd: Any,
+    lease_acquisition: list[bool] | None,
+) -> dict[str, Any]:
+    """Perform the restart-only assignment branch under the capacity guard."""
+
+    with hive_capacity_probe_guard("agent_assign"):
+        return _restart_assignment_session_after_capacity_probe_unlocked(
+            agent,
+            cfg=cfg,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            lease=lease,
+            release_lease_on_failure=release_lease_on_failure,
+            agent_class=agent_class,
+            name=name,
+            previous_model=previous_model,
+            cwd=cwd,
+            lease_acquisition=lease_acquisition,
+        )
+
+
+def _restart_assignment_session_after_capacity_probe_unlocked(
+    agent: str,
+    *,
+    cfg: Mapping[str, Any],
+    model: str,
+    reasoning_effort: str | None,
+    lease: dict[str, Any],
+    release_lease_on_failure: bool,
+    agent_class: str | None,
+    name: str | None,
+    previous_model: str,
+    cwd: Any,
+    lease_acquisition: list[bool] | None,
+) -> dict[str, Any]:
+    claimed_for_restart = False
+    if lease.get("state") != "held" or lease.get("held_by_this_server") is not True:
+        claim, claimed = claim_for_agent_mutation(agent)
+        lease.clear()
+        lease.update(claim)
+        claimed_for_restart = claimed
+        if lease_acquisition is not None:
+            lease_acquisition.append(claimed)
+        release_lease_on_failure = claimed
+    try:
+        return _restart_assignment_session_with_lease_unlocked(
+            agent,
+            cfg=cfg,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            lease=lease,
+            release_lease_on_failure=release_lease_on_failure,
+            agent_class=agent_class,
+            name=name,
+            previous_model=previous_model,
+            cwd=cwd,
+        )
+    except Exception:
+        if claimed_for_restart:
+            with contextlib.suppress(Exception):
+                release_start_lease_if_safe(agent, lease, True)
+        raise
+
+
+def _restart_assignment_session_with_lease_unlocked(
+    agent: str,
+    *,
+    cfg: Mapping[str, Any],
+    model: str,
+    reasoning_effort: str | None,
+    lease: dict[str, Any],
+    release_lease_on_failure: bool,
+    agent_class: str | None,
+    name: str | None,
+    previous_model: str,
+    cwd: Any,
+) -> dict[str, Any]:
     status = status_agent(agent)
     response_state = (status.get("response_state") or {}).get("state")
     if response_state not in {"running_tui_starter_context", "running_idle"}:
@@ -17128,7 +17392,7 @@ def ensure_assignment_session_model(
         name_args = {"name": name} if name is not None else {}
         restarted = start_agent(
             agent,
-            cwd=meta.get("cwd"),
+            cwd=cwd,
             lease=lease,
             release_lease_on_failure=release_lease_on_failure,
             model=model,
@@ -17142,7 +17406,7 @@ def ensure_assignment_session_model(
         )
     return {
         "status": "restarted",
-        "previous_model": current_model,
+        "previous_model": previous_model,
         "model": model,
         "start_status": restarted.get("status"),
         "raw_output": "not_returned",
@@ -17150,9 +17414,10 @@ def ensure_assignment_session_model(
 
 
 def assign_agent(agent: str, **kwargs: Any) -> dict[str, Any]:
-    require_fleet_recovery_ready("agent_assign")
     agent = canonical_agent_id(agent)
     if _headless_descriptor(agent) is not None:
+        require_resource_capacity_preflight(operation="agent_assign")
+        require_fleet_recovery_ready("agent_assign")
         return _assign_headless_agent(agent, **kwargs)
     with agent_lifecycle_lock(agent):
         return _call_with_resource_gate_composer(
@@ -17201,7 +17466,6 @@ def _assign_agent_unlocked(
     ci_or_release: bool = False,
     authority_class: str | None = None,
 ) -> dict[str, Any]:
-    require_fleet_recovery_ready("agent_assign")
     agent = canonical_agent_id(agent)
     ollama_descriptor = _ollama_descriptor(agent)
     admission: dict[str, Any] | None = None
@@ -17386,8 +17650,9 @@ def _assign_agent_unlocked(
         raise AgentError(f"assignment prompt exceeds {MAX_ASSIGNMENT_TEXT} characters")
 
     release_on_failure = False
+    lease_acquisition: list[bool] = []
     if lease is None:
-        lease, release_on_failure = claim_for_agent_mutation(agent)
+        lease = agent_lease_status(agent)
     model_switch: dict[str, Any] | None = None
     sent: dict[str, Any] | None = None
     try:
@@ -17400,6 +17665,7 @@ def _assign_agent_unlocked(
                 lease=lease,
                 release_lease_on_failure=release_on_failure,
                 agent_class=agent_class,
+                lease_acquisition=lease_acquisition,
                 **name_args,
             )
         else:
@@ -17411,10 +17677,13 @@ def _assign_agent_unlocked(
                     lease=lease,
                     release_lease_on_failure=release_on_failure,
                     agent_class=agent_class,
+                    lease_acquisition=lease_acquisition,
                     **name_args,
                 )
+        release_on_failure = any(lease_acquisition)
         sent = send_agent(agent, prompt, enter, operation=operation)
     except Exception:
+        release_on_failure = release_on_failure or any(lease_acquisition)
         if release_on_failure and not (
             isinstance(sent, dict) and sent.get("status") == "sent"
         ):
@@ -18180,7 +18449,6 @@ def request_agent_report(
     enter: bool = True,
     lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    require_fleet_recovery_ready("agent_report_request")
     agent = canonical_agent_id(agent)
     with agent_lifecycle_lock(agent):
         return _request_agent_report_unlocked(agent, assignment_id, enter, lease=lease)
@@ -18192,7 +18460,6 @@ def _request_agent_report_unlocked(
     enter: bool = True,
     lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    require_fleet_recovery_ready("agent_report_request")
     resolved_assignment_id = None
     if assignment_id:
         resolved_assignment_id = (
@@ -18698,8 +18965,8 @@ def _resume_headless_rollback_records() -> list[str]:
 def worktree_create_for_agent(
     agent: str, path: Any = None, base_ref: Any = None
 ) -> dict[str, Any]:
-    require_fleet_recovery_ready("worktree_create_for_agent")
     _resume_headless_rollback_records()
+    require_fleet_recovery_ready("worktree_create_for_agent")
     agent = canonical_agent_id(agent)
     path = (
         bounded_text(path, field="path", max_chars=MAX_PATH_TEXT)
@@ -24015,10 +24282,6 @@ def send_agent(
     ready_timeout_seconds: float = DEFAULT_SEND_READY_TIMEOUT_SECONDS,
     operation: str = "agent_send",
 ) -> dict[str, Any]:
-    gate_operation = (
-        "agent_assign" if operation.startswith("agent_assign") else operation
-    )
-    require_fleet_recovery_ready(gate_operation)
     agent = canonical_agent_id(agent)
     text = (
         bounded_text(
@@ -24068,7 +24331,8 @@ def send_agent(
             require_managed_tmux_session(agent)
             cp = run_tmux(
                 _tmux_args_for_session(
-                    session, ["paste-buffer", "-d", "-b", buffer_name, "-t", session]
+                    session,
+                    ["paste-buffer", "-d", "-b", buffer_name, "-t", session],
                 ),
                 check=False,
             )
@@ -24077,7 +24341,7 @@ def send_agent(
             if enter:
                 cp = run_tmux(
                     _tmux_args_for_session(
-                        session, ["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY]
+                        session, ["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY],
                     ),
                     check=False,
                 )
@@ -24156,12 +24420,14 @@ def _interrupt_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]
     else:
         try:
             claim = claim_agent(agent)
-        except FleetRecoveryBlockedError:
+        except AgentError as exc:
+            if not isinstance(exc, FleetRecoveryBlockedError) and str(exc) != "hive_spawn_probe_blocked":
+                raise
             # Interrupt is an emergency control operation and remains
-            # available while a managed-fleet recovery journal blocks new
+            # available while fleet recovery or the spawn probe blocks new
             # work. Claiming still uses the normal lease rules, but bypasses
-            # only the fleet-wide recovery gate because the lifecycle lock is
-            # already held here.
+            # only the admission gate because the lifecycle lock is already
+            # held here and this path can only interrupt the existing session.
             claim = _claim_agent_unlocked(agent, enforce_recovery_gate=False)
         release_on_failure = claim["status"] in {"claimed", "claimed_expired"}
         lease = claim["lease"]
@@ -27094,6 +27360,28 @@ class _FleetPartialHomeError(Exception):
 
 
 def _fleet_create_home(
+    root_fd: int,
+    agent_id: str,
+    artifacts: dict[str, Any],
+    *,
+    hidden_name: str | None = None,
+    entry_index: int | None = None,
+    transaction: _FleetRecoveryTransaction | None = None,
+) -> os.stat_result:
+    """Materialize one new home under the caller's pool mutation lock."""
+
+    with hive_capacity_probe_guard("fleet_series_apply"):
+        return _fleet_create_home_unlocked(
+            root_fd,
+            agent_id,
+            artifacts,
+            hidden_name=hidden_name,
+            entry_index=entry_index,
+            transaction=transaction,
+        )
+
+
+def _fleet_create_home_unlocked(
     root_fd: int,
     agent_id: str,
     artifacts: dict[str, Any],
@@ -30636,11 +30924,16 @@ def fleet_series_apply(
     codex_executable: Path | None = None,
     gemini_executable: Path | None = None,
 ) -> dict[str, Any]:
-    service = current_fleet_service()
     fleet_paths = FleetPaths.from_state_root(STATE_ROOT)
     if prefix == "q":
+        service = current_fleet_service()
         with fleet_mutation_lock(fleet_paths):
             _fleet_recover_pending_q_inplace(service, fleet_paths)
+    else:
+        require_fleet_recovery_ready("fleet_series_apply")
+        service = current_fleet_service()
+    if prefix == "q":
+        require_fleet_recovery_ready("fleet_series_apply")
     plan, current, planned, existing, candidate, materialization = (
         _fleet_series_plan_with_service(
             service,
@@ -30657,6 +30950,8 @@ def fleet_series_apply(
             task_profile=task_profile,
         )
     )
+    if materialization["create_ids"]:
+        require_resource_capacity_preflight(operation="fleet_series_apply")
     planned_inventory = build_inventory(planned, AGENT_POOL_ROOT)
     old_count = existing.count if existing is not None else 0
     managed_changed = existing is not None and (
@@ -33967,15 +34262,9 @@ def applet_action(action: Any, agent: Any, context_token: Any) -> dict[str, Any]
     agent = normalize_applet_agents([agent])[0]
     if not isinstance(context_token, str):
         raise AgentError("applet context token is invalid")
-    composer_scope = (
-        _resource_gate_composer_scope()
-        if action == "start"
-        else contextlib.nullcontext()
-    )
-    with (
-        agent_lifecycle_lock(agent, timeout_seconds=APPLET_TMUX_TIMEOUT_SECONDS),
-        composer_scope,
-    ):
+    if action == "start":
+        require_fleet_recovery_ready("agent_start")
+    with agent_lifecycle_lock(agent, timeout_seconds=APPLET_TMUX_TIMEOUT_SECONDS):
         key = read_applet_action_key()
         claims = validate_applet_action_token(context_token, key)
         if claims["a"] != action or claims["g"] != agent:
@@ -33998,17 +34287,24 @@ def applet_action(action: Any, agent: Any, context_token: Any) -> dict[str, Any]
             raise AgentError("applet action is no longer allowed")
 
         if action == "start":
-            result = _start_agent_with_lease_unlocked(
-                agent,
-                cwd=str(Path.home()),
-            )
+            require_resource_capacity_preflight(operation="agent_start")
+            with _resource_gate_composer_scope():
+                with hive_capacity_probe_guard("agent_start"):
+                    result = _start_agent_with_lease_unlocked(
+                        agent,
+                        cwd=str(Path.home()),
+                    )
             final_state = (
                 "running"
                 if result.get("status") in {"started", "already_running"}
                 else "unknown"
             )
         else:
-            _claim_agent_unlocked(agent, ttl_seconds=60)
+            _claim_agent_unlocked(
+                agent,
+                ttl_seconds=60,
+                enforce_recovery_gate=False,
+            )
             try:
                 result = _stop_agent_unlocked(agent)
             except Exception:
@@ -38164,6 +38460,97 @@ def build_current_hive_runtime(
     )
 
 
+def _require_hive_probe_result(
+    *, operation: str, gate: Mapping[str, object] | None
+) -> Mapping[str, object]:
+
+    if (
+        not isinstance(operation, str)
+        or not 1 <= len(operation) <= MAX_OPERATION_LENGTH
+        or any(ord(character) < 32 for character in operation)
+    ):
+        raise AgentError("invalid_hive_spawn_operation")
+    gate_is_green = (
+        isinstance(gate, Mapping)
+        and frozenset(gate) == {"allowed", "reason_code", "raw_output"}
+        and gate.get("allowed") is True
+        and gate.get("reason_code") == "probe_ready"
+        and gate.get("raw_output") == PATH_NOT_RETURNED
+    )
+    if not gate_is_green:
+        reason = (
+            gate.get("reason_code")
+            if isinstance(gate, Mapping) and gate.get("allowed") is not True
+            else None
+        )
+        if (
+            not isinstance(reason, str)
+            or not 1 <= len(reason) <= MAX_REASON_LENGTH
+            or any(
+                not (character.isalnum() or character in {"_", "-"})
+                for character in reason
+            )
+        ):
+            reason = "probe_gate_unavailable"
+        raise AgentError(
+            "hive_spawn_probe_blocked",
+            {
+                "error_code": "hive_spawn_probe_blocked",
+                "operation": operation,
+                "reason_code": reason,
+                "raw_output": PATH_NOT_RETURNED,
+            },
+        )
+    return {
+        "allowed": True,
+        "reason_code": "probe_ready",
+        "raw_output": PATH_NOT_RETURNED,
+    }
+
+
+def require_hive_probe_for_spawn(*, operation: str) -> Mapping[str, object]:
+    """Fail closed from the canonical persisted probe record."""
+
+    try:
+        gate = read_probe_gate()
+    except Exception:
+        gate = None
+    return _require_hive_probe_result(operation=operation, gate=gate)
+
+
+def require_resource_capacity_preflight(*, operation: str) -> Mapping[str, object]:
+    """Preflight only a new runtime-capacity admission, never administration."""
+
+    if operation not in RESOURCE_CAPACITY_PREFLIGHT_OPERATIONS:
+        raise AgentError("resource_capacity_unknown_operation")
+    return require_hive_probe_for_spawn(operation=operation)
+
+
+@contextlib.contextmanager
+def hive_capacity_probe_guard(operation: str) -> Any:
+    """Linearize a new capacity sink after its mutation lock.
+
+    Lock order is mutation lock followed by this shared probe lock.  Probe
+    publication takes the exclusive side only while replacing final health
+    state, so red/stale publication cannot race an admitted sink.
+    """
+
+    try:
+        capacity_lock = probe_capacity_lock()
+        capacity_lock.__enter__()
+    except (OSError, ValueError):
+        _require_hive_probe_result(operation=operation, gate=None)
+        raise AssertionError("unreachable")
+    try:
+        try:
+            gate = read_probe_gate()
+        except Exception:
+            gate = None
+        yield _require_hive_probe_result(operation=operation, gate=gate)
+    finally:
+        capacity_lock.__exit__(*sys.exc_info())
+
+
 def _runtime_decision(allowed: bool, reason_code: str) -> RuntimeGateDecision:
     """Normalize server gate output without exposing provider/path details."""
 
@@ -38615,6 +39002,7 @@ def execute_server_hive_assignment(
     or lifecycle mutation.
     """
 
+    require_resource_capacity_preflight(operation="hive_assignment")
     if now is not None and not callable(now):
         raise AgentError("invalid_admission_clock")
     if not isinstance(admission_id, str) or not admission_id:
@@ -38715,6 +39103,7 @@ def execute_server_queen_assignment(
 ) -> Mapping[str, object]:
     """Run the shared Queen planner through the closed server-side adapter."""
 
+    require_resource_capacity_preflight(operation="hive_assignment")
     if event_store is not None and not isinstance(event_store, HiveEventStore):
         raise AgentError("invalid_hive_event_store")
     plan = plan_queen_assignment(
@@ -39484,6 +39873,7 @@ def fleet_account_sync_env(
 def fleet_sync_skill_projections() -> dict[str, Any]:
     """Refresh the class-filtered Markdown skill projection for every registry Agentin."""
 
+    require_fleet_recovery_ready("fleet_skill_sync")
     # The registry is authoritative here.  Reading the last published
     # inventory would omit newly materialized series until a long-lived MCP
     # process happened to republish it.
@@ -39753,7 +40143,6 @@ def fleet_account_set_secret(
 def fleet_account_disable(
     *, account_id: str, expected_generation: int
 ) -> dict[str, Any]:
-    require_fleet_recovery_ready("fleet_account_mutation")
     with fleet_mutation_lock():
         service = current_fleet_service()
         current = service.load()
@@ -40907,7 +41296,6 @@ def _fleet_series_apply_locked(
 def _fleet_series_disable_locked(
     *, prefix: str, expected_generation: int
 ) -> dict[str, Any]:
-    require_fleet_recovery_ready("fleet_series_disable")
     service = current_fleet_service()
     current: FleetSnapshot | None = None
     transaction: _FleetRecoveryTransaction | None = None
@@ -41001,7 +41389,6 @@ def _fleet_series_delete_locked(
     expected_generation: int,
     confirmed_remove_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    require_fleet_recovery_ready("fleet_series_delete")
     service = current_fleet_service()
     current = service.load()
     series = next((item for item in current.series if item.prefix == prefix), None)
@@ -41441,7 +41828,7 @@ def _fleet_initialize_recovery_startup_state() -> dict[str, Any]:
 
 
 def require_fleet_recovery_ready(operation: str) -> None:
-    if operation not in FLEET_RECOVERY_GATED_OPERATIONS:
+    if operation not in FLEET_RECOVERY_JOURNAL_OPERATIONS:
         raise AgentError("fleet_recovery_unknown_operation")
     status = fleet_recovery_status()
     if status["blocking"]:
@@ -41451,6 +41838,20 @@ def require_fleet_recovery_ready(operation: str) -> None:
             else "fleet_recovery_pending"
         )
         raise FleetRecoveryBlockedError(str(code), status)
+
+
+def _fleet_safe_shutdown_only(operation: str) -> bool:
+    """Permit watchdog shutdown actions without new work after a gate denial."""
+
+    try:
+        require_fleet_recovery_ready(operation)
+    except FleetRecoveryBlockedError:
+        return True
+    except AgentError as exc:
+        if str(exc) == "hive_spawn_probe_blocked":
+            return True
+        raise
+    return False
 
 
 def _fleet_series_recovery_entries(
@@ -41917,6 +42318,9 @@ def _fleet_recovery_finish(
 
 
 def fleet_recovery_retry() -> dict[str, Any]:
+    journal = _fleet_load_recovery_journal()
+    if journal is None:
+        return fleet_recovery_status()
     with fleet_mutation_lock():
         journal = _fleet_load_recovery_journal()
         if journal is None:
@@ -42810,6 +43214,7 @@ def _apply_g_series_migration_for_authorized_caller(
                 if recovered is None:
                     raise AgentError("migration_recovery_rolled_back")
                 return recovered
+            require_fleet_recovery_ready("fleet_series_apply")
             pool_root = _g_migration_pool_root(pool_root)
             if type(current) is not FleetSnapshot:
                 raise AgentError("migration_manifest_invalid")
@@ -43202,6 +43607,10 @@ def fleet_home_v2_cutover_operation(
 ) -> Any:
     """Dispatch a product-owned V2 cutover operation from Queen intent only."""
 
+    if operation not in {"plan", "apply", "verify", "recover", "rollback"}:
+        raise AgentError("fleet_home_v2_cutover_failed")
+    if operation == "apply":
+        require_fleet_recovery_ready("fleet_home_v2_cutover")
     from codex_master.fleet_home_v2_cutover import FleetHomeV2CutoverError
 
     try:

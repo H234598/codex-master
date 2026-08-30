@@ -41,6 +41,15 @@ HMAC_B = "hmac-sha256:" + "b" * 64
 UUIDS = tuple(UUID(f"{value:08d}-0000-4000-8000-000000000000") for value in range(1, 32))
 
 
+@pytest.fixture(autouse=True)
+def fresh_green_hive_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        server_module,
+        "require_fleet_recovery_ready",
+        lambda _operation: None,
+    )
+
+
 def _account(account_id: str, *, enabled: bool = True) -> FleetAccount:
     return FleetAccount(
         account_id,

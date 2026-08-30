@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
 import subprocess
@@ -13,6 +14,20 @@ import pytest
 from codex_master import server
 from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from codex_master.fleet_service import FleetConflictError
+
+
+@pytest.fixture(autouse=True)
+def fresh_green_hive_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        server,
+        "read_probe_gate",
+        lambda: {
+            "allowed": True,
+            "reason_code": "probe_ready",
+            "raw_output": "not_returned",
+        },
+    )
+    monkeypatch.setattr(server, "hive_capacity_probe_guard", lambda _operation: nullcontext())
 
 
 def test_v1_series_apply_remains_compatible_with_dual_schema_reader() -> None:
@@ -371,6 +386,7 @@ CRASH_POINTS = (
 
 
 _FRESH_RECOVERY_CHILD = r'''
+from contextlib import nullcontext
 import json
 import sys
 from pathlib import Path
@@ -404,7 +420,13 @@ with patch.object(server, "STATE_ROOT", state_root), patch.object(
         nonlocal_fired = [False]
         raised = [False]
         try:
-            with patch.object(server, "_fleet_recovery_crash_point", side_effect=crash_hook):
+            with patch.object(
+                server, "require_fleet_recovery_ready", return_value=None
+            ), patch.object(
+                server, "require_resource_capacity_preflight", return_value=None
+            ), patch.object(
+                server, "hive_capacity_probe_guard", side_effect=lambda _operation: nullcontext()
+            ), patch.object(server, "_fleet_recovery_crash_point", side_effect=crash_hook):
                 server.fleet_series_apply(
                     prefix="d", count=2 if crash_point == "between_reconciliation_actions" else 1,
                     runner="codex_cli", provider="ollama_local", model="model",

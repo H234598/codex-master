@@ -57,6 +57,7 @@ def hive_status(
     if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values.values()):
         raise ValueError("invalid_hive_counts")
     return {
+        "schema_version": evidence.schema_version,
         "mode": evidence.mode,
         "counts": {key: values[key] for key in sorted(values) if isinstance(key, str) and len(key) <= 64},
         "authority": evidence.authority,

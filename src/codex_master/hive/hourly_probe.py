@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+import contextlib
 from datetime import UTC, datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,7 @@ DETERMINISTIC_PROBE_HOURS_UTC = (0, 3, 6, 9, 12, 15, 18, 21)
 STATE_FILE_NAME = "hive-hourly-health.json"
 ALARM_FILE_NAME = "hive-hourly-alarm.json"
 FUNCTIONAL_MARKER_NAME = "hive-functional"
+PROBE_GATE_LOCK_NAME = ".hive-hourly-probe.lock"
 MAX_PROBE_STATE_BYTES = 64 * 1024
 MAX_PROBE_AGE_SECONDS = 4 * 60 * 60
 _BLOCKED_STATES = frozenset({"", "disabled", "fail_closed", "invalid", "missing", "not_configured", "unknown", "unavailable"})
@@ -24,10 +27,66 @@ _ALARM_ROUTE = ("queen-codex-master", "active_queen", "native_recovery_queen")
 _PROBE_RECORD_KEYS = frozenset({"alarm", "checked_at", "checks", "commands", "functional"})
 _PROBE_CHECK_KEYS = frozenset({"namespace", "plugin", "hive_doctor", "hive_runtime"})
 _PROBE_COMMAND_KEYS = frozenset({"namespace", "plugin", "hive_status", "hive_doctor"})
+_HIVE_STATUS_KEYS = frozenset(
+    {
+        "schema_version",
+        "mode",
+        "counts",
+        "checks",
+        "config_digest",
+        "catalog_digest",
+        "repository",
+        "principal",
+        "authority",
+        "state",
+        "pilot",
+        "reason_codes",
+        "mutation_performed",
+        "raw_output",
+    }
+)
 
 
 def _ready_state(value: object) -> bool:
-    return isinstance(value, str) and value.strip().lower() not in _BLOCKED_STATES
+    return value == "ready"
+
+
+def _digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def _green_hive_runtime(value: object) -> bool:
+    if not isinstance(value, Mapping) or frozenset(value) != _HIVE_STATUS_KEYS:
+        return False
+    counts = value.get("counts")
+    checks = value.get("checks")
+    reasons = value.get("reason_codes")
+    return (
+        type(value.get("schema_version")) is int
+        and value.get("schema_version") == 1
+        and value.get("mode") == "enforced"
+        and _digest(value.get("config_digest"))
+        and _digest(value.get("catalog_digest"))
+        and type(counts) is dict
+        and frozenset(counts) == {"principals", "repositories"}
+        and all(type(item) is int and item >= 0 for item in counts.values())
+        and type(checks) is dict
+        and frozenset(checks) == {"authority", "repository", "state"}
+        and all(_ready_state(checks.get(key)) for key in checks)
+        and all(
+            _ready_state(value.get(key))
+            for key in ("authority", "repository", "principal", "state", "pilot")
+        )
+        and type(reasons) is list
+        and not reasons
+        and value.get("mutation_performed") is False
+        and value.get("raw_output") == "not_returned"
+    )
 
 
 def _safe_reason(value: object) -> str | None:
@@ -77,10 +136,7 @@ def evaluate(
     doctor_ready = isinstance(doctor_checks, Mapping) and all(
         _ready_state(doctor_checks.get(key)) for key in ("authority", "repository", "state")
     )
-    hive_runtime = hive.get("mode") == "enforced" and _ready_state(hive.get("authority"))
-    for key in ("repository", "principal", "state", "pilot"):
-        if key in hive and not _ready_state(hive.get(key)):
-            hive_runtime = False
+    hive_runtime = _green_hive_runtime(hive)
     checks = {
         "namespace": namespace.get("ok") is True and namespace.get("namespace_ready") is True,
         "plugin": plugin.get("ok") is True,
@@ -207,6 +263,111 @@ def read_probe_gate(
     except (OSError, ValueError):
         return {"allowed": False, "reason_code": "probe_invalid", "raw_output": "not_returned"}
     return probe_spawn_gate(payload, now=now)
+
+
+def _probe_gate_lock_path(state_file: Path) -> Path:
+    if not isinstance(state_file, Path) or not state_file.is_absolute():
+        raise ValueError("probe_gate_lock_invalid")
+    return state_file.parent / PROBE_GATE_LOCK_NAME
+
+
+def _open_probe_gate_lock(state_file: Path, *, create: bool) -> int:
+    lock_path = _probe_gate_lock_path(state_file)
+    try:
+        parent = lock_path.parent.lstat()
+        if (
+            stat.S_ISLNK(parent.st_mode)
+            or not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or stat.S_IMODE(parent.st_mode) != 0o700
+        ):
+            raise ValueError("probe_gate_lock_invalid")
+        if create:
+            try:
+                descriptor = os.open(
+                    lock_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            except FileExistsError:
+                descriptor = -1
+            else:
+                os.close(descriptor)
+        item = lock_path.lstat()
+        if (
+            stat.S_ISLNK(item.st_mode)
+            or not stat.S_ISREG(item.st_mode)
+            or item.st_nlink != 1
+            or item.st_uid != os.geteuid()
+            or stat.S_IMODE(item.st_mode) != 0o600
+        ):
+            raise ValueError("probe_gate_lock_invalid")
+        descriptor = os.open(
+            lock_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise ValueError("probe_gate_lock_invalid") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != item.st_dev
+            or opened.st_ino != item.st_ino
+            or opened.st_nlink != 1
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise ValueError("probe_gate_lock_invalid")
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+@contextlib.contextmanager
+def _probe_gate_lock(state_file: Path, *, exclusive: bool, create: bool) -> object:
+    descriptor = _open_probe_gate_lock(state_file, create=create)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    except OSError as exc:
+        os.close(descriptor)
+        raise ValueError("probe_gate_lock_unavailable") from exc
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def probe_capacity_lock(*, state_file: Path | None = None) -> object:
+    """Hold the shared publication lock across one capacity-creating sink."""
+
+    if state_file is None:
+        state_file = _probe_state_root() / STATE_FILE_NAME
+    with _probe_gate_lock(state_file, exclusive=False, create=False):
+        yield
+
+
+@contextlib.contextmanager
+def probe_capacity_guard(
+    *,
+    state_file: Path | None = None,
+    now: datetime | Callable[[], datetime] | None = None,
+) -> object:
+    """Read a fresh canonical probe while holding the shared publication lock."""
+
+    try:
+        with probe_capacity_lock(state_file=state_file):
+            yield read_probe_gate(state_file=state_file, now=now)
+    except (OSError, ValueError):
+        yield {
+            "allowed": False,
+            "reason_code": "probe_invalid",
+            "raw_output": "not_returned",
+        }
 
 
 def _repository_from_source() -> Path:
@@ -364,19 +525,23 @@ def run_probe(
             },
         }
     )
-    _atomic_write(state_directory / STATE_FILE_NAME, result)
-    alarm = result.get("alarm")
-    if isinstance(alarm, Mapping):
-        _atomic_write(state_directory / ALARM_FILE_NAME, alarm)
-        _remove_probe_file(state_directory / FUNCTIONAL_MARKER_NAME)
-    else:
-        _remove_probe_file(state_directory / ALARM_FILE_NAME)
-        _remove_probe_file(state_directory / FUNCTIONAL_MARKER_NAME)
-        _atomic_write(state_directory / FUNCTIONAL_MARKER_NAME, checked_at + "\n")
+    state_file = state_directory / STATE_FILE_NAME
+    with _probe_gate_lock(state_file, exclusive=True, create=True):
+        _atomic_write(state_file, result)
+        alarm = result.get("alarm")
+        if isinstance(alarm, Mapping):
+            _atomic_write(state_directory / ALARM_FILE_NAME, alarm)
+            _remove_probe_file(state_directory / FUNCTIONAL_MARKER_NAME)
+        else:
+            _remove_probe_file(state_directory / ALARM_FILE_NAME)
+            _remove_probe_file(state_directory / FUNCTIONAL_MARKER_NAME)
+            _atomic_write(state_directory / FUNCTIONAL_MARKER_NAME, checked_at + "\n")
     return result
 
 
-def main() -> int:
+def main(arguments: Sequence[str] | None = None) -> int:
+    if tuple(arguments or ()) != ("--json",):
+        return 2
     result = run_probe()
     print(json.dumps({"functional": result["functional"], "checks": result["checks"], "alarm": result["alarm"]}, sort_keys=True))
     return 0 if result["functional"] else 1
@@ -388,11 +553,14 @@ __all__ = [
     "FUNCTIONAL_MARKER_NAME",
     "MAX_PROBE_AGE_SECONDS",
     "MAX_PROBE_STATE_BYTES",
+    "PROBE_GATE_LOCK_NAME",
     "STATE_FILE_NAME",
     "build_hive_probe_alarm",
     "evaluate",
     "main",
+    "probe_capacity_lock",
     "probe_spawn_gate",
+    "probe_capacity_guard",
     "read_probe_gate",
     "run_probe",
 ]

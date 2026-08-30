@@ -1,0 +1,182 @@
+#!/usr/bin/python3
+"""Install the Hive hourly probe without activating any user units."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+
+
+_ENTRYPOINT_NAME = "codex_master_hive_hourly_probe.py"
+_UNIT_NAMES = (
+    "codex-master-hive-hourly-probe.service",
+    "codex-master-hive-hourly-probe.timer",
+)
+
+
+class InstallError(Exception):
+    pass
+
+
+def _directory(path: Path, *, mode: int, create: bool) -> None:
+    try:
+        item = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            raise InstallError("home_unavailable") from None
+        path.mkdir(mode=mode)
+        item = path.lstat()
+    except OSError:
+        raise InstallError("install_path_untrusted") from None
+    if (
+        stat.S_ISLNK(item.st_mode)
+        or not stat.S_ISDIR(item.st_mode)
+        or item.st_uid != os.geteuid()
+        or stat.S_IMODE(item.st_mode) & 0o022
+    ):
+        raise InstallError("install_path_untrusted")
+
+
+def _child_directory(home: Path, parts: tuple[str, ...], *, mode: int) -> Path:
+    current = home
+    for part in parts:
+        current /= part
+        _directory(current, mode=mode, create=True)
+    try:
+        os.chmod(current, mode)
+    except OSError as exc:
+        raise InstallError("install_path_untrusted") from exc
+    return current
+
+
+def _source_bytes(path: Path) -> bytes:
+    try:
+        item = path.lstat()
+        if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
+            raise InstallError("install_source_untrusted")
+        data = path.read_bytes()
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError("install_source_untrusted") from exc
+    if not data or len(data) > 512 * 1024:
+        raise InstallError("install_source_untrusted")
+    return data
+
+
+def _install_regular(source: Path, target: Path, *, mode: int) -> None:
+    content = _source_bytes(source)
+    try:
+        existing = target.lstat()
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        raise InstallError("install_target_untrusted") from exc
+    if existing is not None and (
+        stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
+    ):
+        raise InstallError("install_target_untrusted")
+    descriptor = -1
+    temporary = Path()
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", dir=target.parent
+        )
+        temporary = Path(temporary_name)
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        temporary = Path()
+        installed = target.lstat()
+        if (
+            stat.S_ISLNK(installed.st_mode)
+            or not stat.S_ISREG(installed.st_mode)
+            or stat.S_IMODE(installed.st_mode) != mode
+        ):
+            raise InstallError("install_target_untrusted")
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError("install_target_untrusted") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary.name:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def install(*, home: Path) -> dict[str, object]:
+    if not home.is_absolute():
+        raise InstallError("home_unavailable")
+    _directory(home, mode=0o700, create=False)
+    repository = Path(__file__).resolve().parents[1]
+    libexec = _child_directory(home, (".local", "libexec"), mode=0o700)
+    state = _child_directory(
+        home, (".local", "state", "codex-master-mcp"), mode=0o700
+    )
+    units = _child_directory(home, (".config", "systemd", "user"), mode=0o700)
+    _install_regular(
+        repository / "systemd" / "libexec" / _ENTRYPOINT_NAME,
+        libexec / _ENTRYPOINT_NAME,
+        mode=0o755,
+    )
+    for name in _UNIT_NAMES:
+        _install_regular(
+            repository / "systemd" / "user" / name,
+            units / name,
+            mode=0o644,
+        )
+    lock = state / ".hive-hourly-probe.lock"
+    try:
+        try:
+            descriptor = os.open(
+                lock,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except FileExistsError:
+            descriptor = -1
+        if descriptor >= 0:
+            os.close(descriptor)
+        lock_stat = lock.lstat()
+        if (
+            stat.S_ISLNK(lock_stat.st_mode)
+            or not stat.S_ISREG(lock_stat.st_mode)
+            or lock_stat.st_nlink != 1
+            or lock_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(lock_stat.st_mode) != 0o600
+        ):
+            raise InstallError("install_target_untrusted")
+    except OSError as exc:
+        raise InstallError("install_target_untrusted") from exc
+    return {"status": "installed", "raw_output": "not_returned"}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="codex-master-hive-hourly-probe-install")
+    parser.add_argument("--home", type=Path, default=Path.home())
+    arguments = parser.parse_args()
+    try:
+        print(json.dumps(install(home=arguments.home), sort_keys=True))
+    except InstallError as exc:
+        print(json.dumps({"status": str(exc), "raw_output": "not_returned"}, sort_keys=True))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

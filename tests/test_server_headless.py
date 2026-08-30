@@ -30,6 +30,24 @@ from codex_master.fleet_registry import (
 from codex_master.fleet_service import AccountGateDecision, FleetSecretError, GeminiGateDecision
 
 
+@pytest.fixture(autouse=True)
+def fresh_green_hive_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        server,
+        "require_hive_probe_for_spawn",
+        lambda **_kwargs: {
+            "allowed": True,
+            "reason_code": "probe_ready",
+            "raw_output": "not_returned",
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "hive_capacity_probe_guard",
+        lambda _operation: nullcontext(),
+    )
+
+
 class RecordingInput(io.BytesIO):
     def __init__(self) -> None:
         super().__init__()

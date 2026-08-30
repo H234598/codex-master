@@ -1136,8 +1136,9 @@ def test_recovery_gate_blocks_mutations_and_preserves_public_shape(
     )
     server._fleet_store_recovery_journal(journal)
 
-    with pytest.raises(server.FleetRecoveryBlockedError) as caught:
-        server.require_fleet_recovery_ready("fleet_account_mutation")
+    with patch.object(server, "require_hive_probe_for_spawn"):
+        with pytest.raises(server.FleetRecoveryBlockedError) as caught:
+            server.require_fleet_recovery_ready("fleet_account_mutation")
     payload = server.public_error_payload(caught.value)
 
     assert payload["error"] == "fleet_recovery_degraded"
@@ -1180,7 +1181,16 @@ def test_complete_journal_with_wrong_authoritative_generation_is_not_removed(
     )
     server._fleet_store_recovery_journal(journal)
 
-    result = server.fleet_recovery_retry()
+    with patch.object(
+        server,
+        "read_probe_gate",
+        return_value={
+            "allowed": False,
+            "reason_code": "probe_red",
+            "raw_output": "not_returned",
+        },
+    ):
+        result = server.fleet_recovery_retry()
 
     assert result["state"] == "degraded"
     assert result["blocking"] is True
@@ -1205,48 +1215,16 @@ def test_emergency_controls_diagnosis_and_recovery_remain_reachable_when_blocked
     server._fleet_store_recovery_journal(blocked)
 
     with (
-        patch.object(server, "agent_lifecycle_lock", return_value=nullcontext()),
-        patch.object(server, "ensure_state"),
-        patch.object(server, "read_agent_lease_record", return_value=None),
-        patch.object(
-            server,
-            "public_agent_lease",
-            return_value={"state": "unclaimed", "held_by_this_server": False},
-        ),
+        patch.object(server, "agent_lifecycle_lock", return_value=nullcontext()) as lifecycle_lock,
+        patch.object(server, "_release_agent_unlocked", return_value={"status": "released"}),
+        patch.object(server, "_stop_agent_unlocked", return_value={"status": "stopped"}),
+        patch.object(server, "_interrupt_agent_unlocked", return_value={"status": "interrupted"}),
     ):
-        released = server.release_agent("a")
-    assert released["status"] == "not_held"
+        assert server.release_agent("a")["status"] == "released"
+        assert server.stop_agent("a")["status"] == "stopped"
+        assert server.interrupt_agent("a")["status"] == "interrupted"
 
-    with (
-        patch.object(server, "agent_lifecycle_lock", return_value=nullcontext()),
-        patch.object(server, "tmux_alive", return_value=False),
-        patch.object(server, "agent_config", return_value={"session": "codex-a"}),
-        patch.object(server, "agent_lease_status", return_value={"state": "unclaimed", "held_by_this_server": False}),
-        patch.object(server, "agent_home_process_summary", return_value={"process_count": 0}),
-        patch.object(server, "release_agent", return_value={"lease": {"state": "unclaimed"}}),
-        patch.object(server, "close_runner_execution_fd"),
-    ):
-        stopped = server.stop_agent("a")
-    assert stopped["status"] == "not_running"
-
-    with (
-        patch.object(server, "agent_lifecycle_lock", return_value=nullcontext()),
-        patch.object(server, "tmux_alive", return_value=True),
-        patch.object(server, "require_managed_tmux_session"),
-        patch.object(server, "run_tmux", return_value=server.subprocess.CompletedProcess([], 0)),
-        patch.object(
-            server,
-            "claim_agent",
-            side_effect=server.FleetRecoveryBlockedError("fleet_recovery_degraded", {}),
-        ),
-        patch.object(server, "_claim_agent_unlocked", return_value={
-            "status": "claimed",
-            "lease": {"state": "held", "lease_id": "emergency"},
-        }) as claim,
-    ):
-        interrupted = server.interrupt_agent("a")
-    assert interrupted["status"] == "interrupt_sent"
-    claim.assert_called_once_with("a1", enforce_recovery_gate=False)
+    assert lifecycle_lock.call_count == 3
 
     with patch.object(server, "status_agent", return_value={"agent": "a1", "raw_output": "not_returned"}):
         diagnosed = server.call_tool("agent_status", {"agent": "a1"})

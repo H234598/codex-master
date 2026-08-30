@@ -10,6 +10,7 @@ from codex_master.hive.config import load_agent_class_catalog, load_agent_class_
 from codex_master.hive.events import HiveEventStore
 from codex_master.hive.runtime import (
     HiveRuntimeError,
+    HiveRuntimeEvidence,
     _compose_hive_runtime_from_catalog_snapshot,
     build_hive_runtime,
     enforced_pilot_gate,
@@ -243,6 +244,44 @@ def test_runtime_evidence_is_read_only_and_data_sparse_when_state_is_missing(tmp
         "raw_output": "not_returned",
     }
     assert not state_root.exists()
+
+
+def test_runtime_evidence_returns_schema_complete_fail_closed_dto_for_bad_inputs(tmp_path: Path) -> None:
+    catalog = ROOT / "codex-agent-classes.json"
+    config = ROOT / "codex-hive.json"
+
+    for kwargs, reason in (
+        ({"state_root": Path("relative-state")}, "hive_runtime_unavailable"),
+        ({"config_path": tmp_path / "missing-config.json"}, "hive_config_unavailable"),
+        ({"catalog_path": object()}, "hive_runtime_unavailable"),
+        ({"config_path": object()}, "hive_runtime_unavailable"),
+        ({"state_root": object()}, "hive_runtime_unavailable"),
+    ):
+        evidence = read_hive_runtime_evidence(
+            catalog_path=kwargs.get("catalog_path", catalog),
+            config_path=kwargs.get("config_path", config),
+            state_root=kwargs.get("state_root", tmp_path / "state"),
+            now=lambda: NOW,
+        )
+        assert isinstance(evidence, HiveRuntimeEvidence)
+        public = evidence.public()
+        assert public["schema_version"] == 1
+        assert public["reason_codes"] == [reason]
+        assert public["mutation_performed"] is False
+        assert set(public) == {
+            "schema_version",
+            "mode",
+            "config_digest",
+            "catalog_digest",
+            "repository",
+            "principal",
+            "authority",
+            "state",
+            "pilot",
+            "reason_codes",
+            "mutation_performed",
+            "raw_output",
+        }
 
 
 def test_runtime_evidence_reuses_read_only_assembled_runtime_without_materializing_state(tmp_path: Path) -> None:

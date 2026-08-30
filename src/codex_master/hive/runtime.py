@@ -248,6 +248,7 @@ def read_hive_runtime_evidence(
     config_path = config_path or repository_root / "codex-hive.json"
     state_root = state_root or _default_hive_state_root()
     empty = {
+        "schema_version": 1,
         "mode": "disabled",
         "config_digest": None,
         "catalog_digest": None,
@@ -268,12 +269,16 @@ def read_hive_runtime_evidence(
         or not isinstance(state_root, Path)
         or not state_root.is_absolute()
     ):
-        return HiveRuntimeEvidence(**empty, reason_codes=("hive_runtime_unavailable",))
+        return HiveRuntimeEvidence(
+            **{**empty, "reason_codes": ("hive_runtime_unavailable",)}
+        )
     try:
         snapshot = load_agent_class_catalog_snapshot(catalog_path)
         config = load_hive_config(config_path, snapshot.classes)
     except (HiveConfigError, OSError, TypeError, ValueError):
-        return HiveRuntimeEvidence(**empty, reason_codes=("hive_config_unavailable",))
+        return HiveRuntimeEvidence(
+            **{**empty, "reason_codes": ("hive_config_unavailable",)}
+        )
 
     state_kind = _existing_state_kind(state_root)
     repository_kind = "not_configured" if not config.repositories else "unavailable"

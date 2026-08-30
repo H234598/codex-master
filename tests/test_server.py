@@ -32855,7 +32855,9 @@ class AppletStatusContractTest(unittest.TestCase):
         token = server_module.issue_applet_action_token("start", "a1", state, b"k" * 32)
         mock_observation.return_value = {**offered, "lease_state": "held", "control_state": "blocked"}
 
-        with patch("codex_master.server._start_agent_with_lease_unlocked") as mock_start:
+        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
+            "codex_master.server._start_agent_with_lease_unlocked"
+        ) as mock_start:
             with self.assertRaisesRegex(AgentError, "context token is stale"):
                 server_module.applet_action("start", "a1", token)
 
@@ -41274,8 +41276,17 @@ def test_fleet_home_v2_cutover_adapter_owns_product_ports_and_operation_id() -> 
         def rollback(self, plan_handle: object) -> tuple[str, object]:
             return ("rollback", plan_handle)
 
+    green_probe = {
+        "allowed": True,
+        "reason_code": "probe_ready",
+        "raw_output": "not_returned",
+    }
     core = ProductCore()
-    with patch.object(server_module, "_fleet_home_v2_product_service", return_value=core):
+    with patch.object(
+        server_module, "require_hive_probe_for_spawn", return_value=green_probe
+    ), patch.object(
+        server_module, "fleet_recovery_status", return_value={"blocking": False}
+    ), patch.object(server_module, "_fleet_home_v2_product_service", return_value=core):
         plan = server_module.fleet_home_v2_cutover_operation(
             operation="plan",
             target_ids=("g1",),
@@ -41292,7 +41303,11 @@ def test_fleet_home_v2_cutover_adapter_owns_product_ports_and_operation_id() -> 
         def apply(self, _plan_handle: object) -> object:
             raise FleetHomeV2CutoverError("fleet_home_v2_recovery_required")
 
-    with patch.object(server_module, "_fleet_home_v2_product_service", return_value=SafetyFailure()):
+    with patch.object(
+        server_module, "require_hive_probe_for_spawn", return_value=green_probe
+    ), patch.object(
+        server_module, "fleet_recovery_status", return_value={"blocking": False}
+    ), patch.object(server_module, "_fleet_home_v2_product_service", return_value=SafetyFailure()):
         try:
             server_module.fleet_home_v2_cutover_operation(
                 operation="apply",
