@@ -513,6 +513,8 @@ def validate_transaction_status(value: object) -> TransactionStatus:
         },
         ChpbTransactionOperation.DEPROVISION: {
             BrokerCheckpoint.DEPROVISION_INTENT,
+            BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            BrokerCheckpoint.FINALIZE_INTENT,
             BrokerCheckpoint.DEPROVISIONED,
             BrokerCheckpoint.BLOCKED_DRIFT,
         },
@@ -1197,9 +1199,9 @@ _TRANSITIONS = {
     BrokerCheckpoint.SWITCH_INTENT: {BrokerCheckpoint.SWITCHED, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
     BrokerCheckpoint.SWITCHED: {BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
     BrokerCheckpoint.REGISTRY_CAS_INTENT: {BrokerCheckpoint.FINALIZE_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.FINALIZE_INTENT: {BrokerCheckpoint.COMMITTED, BrokerCheckpoint.BLOCKED_DRIFT},
+    BrokerCheckpoint.FINALIZE_INTENT: {BrokerCheckpoint.COMMITTED, BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
     BrokerCheckpoint.ROLLBACK_INTENT: {BrokerCheckpoint.ROLLED_BACK, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.DEPROVISION_INTENT: {BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
+    BrokerCheckpoint.DEPROVISION_INTENT: {BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
     BrokerCheckpoint.DEPROVISIONED: {BrokerCheckpoint.DEPROVISIONED},
     BrokerCheckpoint.COMMITTED: {BrokerCheckpoint.COMMITTED},
     BrokerCheckpoint.ROLLED_BACK: {BrokerCheckpoint.ROLLED_BACK},
@@ -1279,12 +1281,23 @@ def decide_broker_recovery(status: TransactionStatus, observation: BrokerObserva
         if obj is BrokerObjectState.REPLACEMENT_SWITCHED and reg is BrokerRegistryState.OLD:
             return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.REGISTRY_CAS_INTENT)
     elif checkpoint is BrokerCheckpoint.REGISTRY_CAS_INTENT:
-        if obj in (BrokerObjectState.FINAL_COMPLETE, BrokerObjectState.REPLACEMENT_SWITCHED) and reg is BrokerRegistryState.OLD:
-            return _decision(BrokerRecoveryAction.CAS_REGISTRY, None)
-        if obj in (BrokerObjectState.FINAL_COMPLETE, BrokerObjectState.REPLACEMENT_SWITCHED) and reg is BrokerRegistryState.CURRENT:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.FINALIZE_INTENT)
+        if status.binding.operation is ChpbTransactionOperation.DEPROVISION:
+            if obj is BrokerObjectState.FINAL_COMPLETE and reg is BrokerRegistryState.CURRENT:
+                return _decision(BrokerRecoveryAction.CAS_REGISTRY, None)
+            if obj is BrokerObjectState.FINAL_COMPLETE and reg is na:
+                return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.FINALIZE_INTENT)
+        else:
+            if obj in (BrokerObjectState.FINAL_COMPLETE, BrokerObjectState.REPLACEMENT_SWITCHED) and reg is BrokerRegistryState.OLD:
+                return _decision(BrokerRecoveryAction.CAS_REGISTRY, None)
+            if obj in (BrokerObjectState.FINAL_COMPLETE, BrokerObjectState.REPLACEMENT_SWITCHED) and reg is BrokerRegistryState.CURRENT:
+                return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.FINALIZE_INTENT)
     elif checkpoint is BrokerCheckpoint.FINALIZE_INTENT:
-        if obj in (BrokerObjectState.FINAL_COMPLETE, BrokerObjectState.REPLACEMENT_SWITCHED) and reg is BrokerRegistryState.CURRENT:
+        if status.binding.operation is ChpbTransactionOperation.DEPROVISION:
+            if obj is BrokerObjectState.FINAL_COMPLETE and reg is na:
+                return _decision(BrokerRecoveryAction.DEPROVISION_HOME, None)
+            if obj is BrokerObjectState.ABSENT and reg is na:
+                return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.DEPROVISIONED, BrokerResultCode.COMMITTED)
+        elif obj in (BrokerObjectState.FINAL_COMPLETE, BrokerObjectState.REPLACEMENT_SWITCHED) and reg is BrokerRegistryState.CURRENT:
             return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.COMMITTED, BrokerResultCode.COMMITTED)
     elif checkpoint is BrokerCheckpoint.ROLLBACK_INTENT:
         if obj is BrokerObjectState.ROLLBACK_READY and reg is na:
@@ -1292,8 +1305,8 @@ def decide_broker_recovery(status: TransactionStatus, observation: BrokerObserva
         if obj is BrokerObjectState.ROLLED_BACK and reg is na:
             return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.ROLLED_BACK, BrokerResultCode.ROLLED_BACK)
     elif checkpoint is BrokerCheckpoint.DEPROVISION_INTENT:
-        if obj is BrokerObjectState.FINAL_COMPLETE and reg is na:
-            return _decision(BrokerRecoveryAction.DEPROVISION_HOME, None)
+        if obj is BrokerObjectState.FINAL_COMPLETE and reg is BrokerRegistryState.CURRENT:
+            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.REGISTRY_CAS_INTENT)
         if obj is BrokerObjectState.ABSENT and reg is na:
             return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.DEPROVISIONED, BrokerResultCode.COMMITTED)
     elif checkpoint is BrokerCheckpoint.COMMITTED:

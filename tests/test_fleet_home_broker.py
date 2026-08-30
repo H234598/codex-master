@@ -395,36 +395,51 @@ def test_plan_validation_rejects_static_drift_before_any_call(change):
 
 
 @pytest.mark.parametrize(
-    ("operation", "object_state", "checkpoint", "phase", "action"),
+    (
+        "operation",
+        "object_state",
+        "registry_state",
+        "checkpoint",
+        "phase",
+        "action",
+        "next_checkpoint",
+    ),
     [
         (
             ChpbTransactionOperation.PROVISION,
             BrokerObjectState.ABSENT,
+            BrokerRegistryState.NOT_APPLICABLE,
             BrokerCheckpoint.CREATE_INTENT,
             B2aRecoveryPhase.ABSENT_CREATE_PENDING,
             BrokerRecoveryAction.CREATE_STAGING,
+            None,
         ),
         (
             ChpbTransactionOperation.REPLACE,
             BrokerObjectState.REPLACEMENT_ORIGINAL,
+            BrokerRegistryState.NOT_APPLICABLE,
             BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT,
             B2aRecoveryPhase.PREPARE_PENDING,
             BrokerRecoveryAction.PREPARE_REPLACEMENT,
+            None,
         ),
         (
             ChpbTransactionOperation.DEPROVISION,
             BrokerObjectState.FINAL_COMPLETE,
+            BrokerRegistryState.CURRENT,
             BrokerCheckpoint.DEPROVISION_INTENT,
             B2aRecoveryPhase.DEPROVISION_PENDING,
-            BrokerRecoveryAction.DEPROVISION_HOME,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.REGISTRY_CAS_INTENT,
         ),
     ],
 )
 def test_begin_uses_broker_id_initial_mapping_and_proposal(
-    operation, object_state, checkpoint, phase, action
+    operation, object_state, registry_state, checkpoint, phase, action, next_checkpoint
 ):
     plan = _plan(operation=operation)
-    result, operations, _, wal = _begin(plan, _observation(object_state))
+    initial = _observation(object_state, registry_state)
+    result, operations, _, wal = _begin(plan, initial)
 
     assert result.status is not None
     assert result.status.binding.transaction_id == TRANSACTION
@@ -433,10 +448,24 @@ def test_begin_uses_broker_id_initial_mapping_and_proposal(
     assert result.status.binding.policy == PolicyBinding(7, PROJECTION)
     assert result.status.checkpoint is checkpoint
     assert result.status.b2a_phase is phase
-    assert result.status.observation == _observation(object_state)
+    assert result.status.observation == initial
     assert result.decision.action is action
-    assert result.decision.next_checkpoint is None
+    assert result.decision.next_checkpoint is next_checkpoint
     assert operations.events == ["new_transaction_id", "observe"]
+    assert wal.events == ["read", "append", "fsync_wal", "fsync_parent"]
+
+
+def test_begin_permits_only_absent_not_applicable_as_deprovision_idempotent_bootstrap():
+    plan = _plan(operation=ChpbTransactionOperation.DEPROVISION)
+    absent = _observation(BrokerObjectState.ABSENT)
+
+    result, _, _, wal = _begin(plan, absent)
+
+    assert result.status is not None
+    assert result.status.checkpoint is BrokerCheckpoint.DEPROVISION_INTENT
+    assert result.status.observation == absent
+    assert result.decision.action is BrokerRecoveryAction.PERSIST_CHECKPOINT
+    assert result.decision.next_checkpoint is BrokerCheckpoint.DEPROVISIONED
     assert wal.events == ["read", "append", "fsync_wal", "fsync_parent"]
 
 

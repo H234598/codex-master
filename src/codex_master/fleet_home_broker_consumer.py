@@ -224,7 +224,7 @@ def _resume_context(intent: BrokerIntentV1) -> BrokerIntentResumeContext:
         ),
         ChpbTransactionOperation.DEPROVISION: BrokerObservation(
             BrokerObjectState.FINAL_COMPLETE,
-            BrokerRegistryState.NOT_APPLICABLE,
+            BrokerRegistryState.CURRENT,
             0,
         ),
     }

@@ -175,8 +175,22 @@ def _initial_observation(operation: ChpbTransactionOperation) -> BrokerObservati
         )
     return BrokerObservation(
         BrokerObjectState.FINAL_COMPLETE,
-        BrokerRegistryState.NOT_APPLICABLE,
+        BrokerRegistryState.CURRENT,
         0,
+    )
+
+
+def _is_initial_observation(
+    operation: ChpbTransactionOperation, observation: BrokerObservation
+) -> bool:
+    if observation == _initial_observation(operation):
+        return True
+    return (
+        operation is ChpbTransactionOperation.DEPROVISION
+        and observation
+        == BrokerObservation(
+            BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 0
+        )
     )
 
 
@@ -272,7 +286,7 @@ def begin_offline_transaction(
 
     if type(observation) is not BrokerObservation:
         return _blocked_step()
-    if observation != _initial_observation(plan.operation):
+    if not _is_initial_observation(plan.operation, observation):
         return _blocked_step()
 
     status = _initial_status(plan, policy, transaction_id, observation)

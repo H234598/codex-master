@@ -708,9 +708,9 @@ def test_checkpoint_transition_table_accepts_only_documented_edges():
         BrokerCheckpoint.SWITCH_INTENT: {BrokerCheckpoint.SWITCHED, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
         BrokerCheckpoint.SWITCHED: {BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
         BrokerCheckpoint.REGISTRY_CAS_INTENT: {BrokerCheckpoint.FINALIZE_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.FINALIZE_INTENT: {BrokerCheckpoint.COMMITTED, BrokerCheckpoint.BLOCKED_DRIFT},
+        BrokerCheckpoint.FINALIZE_INTENT: {BrokerCheckpoint.COMMITTED, BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
         BrokerCheckpoint.ROLLBACK_INTENT: {BrokerCheckpoint.ROLLED_BACK, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.DEPROVISION_INTENT: {BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
+        BrokerCheckpoint.DEPROVISION_INTENT: {BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
         BrokerCheckpoint.DEPROVISIONED: {BrokerCheckpoint.DEPROVISIONED},
         BrokerCheckpoint.COMMITTED: {BrokerCheckpoint.COMMITTED},
         BrokerCheckpoint.ROLLED_BACK: {BrokerCheckpoint.ROLLED_BACK},
@@ -768,7 +768,7 @@ def test_rollback_intent_absent_observation_is_not_terminal_rollback():
     assert decision.action is BrokerRecoveryAction.RETURN_BLOCKED
 
 
-def test_deprovision_intent_with_final_complete_requests_deprovision_home():
+def test_deprovision_intent_with_final_complete_not_applicable_is_blocked():
     status_value = status(
         BrokerCheckpoint.DEPROVISION_INTENT,
         observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1),
@@ -776,7 +776,49 @@ def test_deprovision_intent_with_final_complete_requests_deprovision_home():
         ChpbTransactionOperation.DEPROVISION,
     )
     d = _decision(status_value, status_value.observation)
-    assert d == RecoveryDecision(BrokerRecoveryAction.DEPROVISION_HOME, None, None, BrokerResultCode.PENDING)
+    assert d.action is BrokerRecoveryAction.RETURN_BLOCKED
+
+
+def test_deprovision_requires_durable_cas_and_finalize_intents_before_removal():
+    initial = status(
+        BrokerCheckpoint.DEPROVISION_INTENT,
+        observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 0),
+        1,
+        ChpbTransactionOperation.DEPROVISION,
+    )
+
+    assert decide_broker_recovery(initial, initial.observation) == RecoveryDecision(
+        BrokerRecoveryAction.PERSIST_CHECKPOINT,
+        B2aRecoveryPhase.CAS_PENDING,
+        BrokerCheckpoint.REGISTRY_CAS_INTENT,
+        BrokerResultCode.PENDING,
+    )
+    cas_intent = dataclasses.replace(
+        initial,
+        b2a_phase=B2aRecoveryPhase.CAS_PENDING,
+        checkpoint=BrokerCheckpoint.REGISTRY_CAS_INTENT,
+    )
+    assert decide_broker_recovery(
+        cas_intent,
+        observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 0),
+    ) == RecoveryDecision(
+        BrokerRecoveryAction.PERSIST_CHECKPOINT,
+        B2aRecoveryPhase.COMMIT_PENDING,
+        BrokerCheckpoint.FINALIZE_INTENT,
+        BrokerResultCode.PENDING,
+    )
+    finalize_intent = dataclasses.replace(
+        cas_intent,
+        b2a_phase=B2aRecoveryPhase.COMMIT_PENDING,
+        checkpoint=BrokerCheckpoint.FINALIZE_INTENT,
+        observation=observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 0),
+    )
+    assert decide_broker_recovery(finalize_intent, finalize_intent.observation) == RecoveryDecision(
+        BrokerRecoveryAction.DEPROVISION_HOME,
+        None,
+        None,
+        BrokerResultCode.PENDING,
+    )
 
 
 def test_publish_intent_with_only_final_persists_published():

@@ -383,9 +383,7 @@ class RecoveryStateExecution:
                 0,
             ),
             BrokerIntentOperation.DEPROVISION: BrokerObservation(
-                BrokerObjectState.FINAL_COMPLETE,
-                BrokerRegistryState.NOT_APPLICABLE,
-                0,
+                BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 0
             ),
         }[intent.operation]
         assert getattr(context, "initial_observation") == expected
@@ -1338,6 +1336,69 @@ def test_recovered_claim_resumes_the_same_intent_transaction_after_crash_before_
     assert execution.effect_count == 1
     assert store.terminals == [(claim.claim_name, b'{"result":"succeeded"}\n')]
     assert store.releases == [claim.claim_name]
+
+
+def test_recovered_deprovision_uses_current_registry_resume_context() -> None:
+    intent = _intent(operation=BrokerIntentOperation.DEPROVISION)
+    claim = BrokerIntentClaimBytes(
+        ".recover-intent-00000000000000000007-" + intent.nonce + ".json",
+        encode_broker_intent(intent),
+        IDENTITY,
+        recovered=True,
+    )
+
+    class DeprovisionResume:
+        def execute_intent(self, intent: BrokerIntentV1, plan: OfflineBrokerPlan):
+            raise AssertionError("recovered deprovision must not execute fresh")
+
+        def resume_intent(
+            self, resumed: BrokerIntentV1, plan: OfflineBrokerPlan, context: object
+        ) -> BrokerTransportResponse:
+            assert resumed == intent
+            assert getattr(context, "transaction_id") == intent.transaction_id
+            assert getattr(context, "initial_observation") == BrokerObservation(
+                BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 0
+            )
+            status = TransactionStatus(
+                _binding(intent),
+                b2a_phase_for_checkpoint(BrokerCheckpoint.DEPROVISIONED),
+                BrokerCheckpoint.DEPROVISIONED,
+                BrokerObservation(
+                    BrokerObjectState.ABSENT,
+                    BrokerRegistryState.NOT_APPLICABLE,
+                    0,
+                ),
+                1,
+                BrokerResultCode.COMMITTED,
+            )
+            return BrokerTransportResponse(
+                BrokerReply(
+                    CHPB_PROTOCOL,
+                    ChpbMessageKind.REPLY,
+                    intent.request_id,
+                    BrokerResultCode.COMMITTED,
+                    status,
+                    None,
+                ),
+                (),
+            )
+
+        def execute(self, command: object):
+            raise AssertionError("consumer must not invoke dispatch execute")
+
+        def close(self, fd: int) -> None:
+            raise AssertionError("successful deprovision has no response FDs")
+
+    store = FakeStore(recoveries=[claim])
+    result = consume_one_broker_intent(
+        store,
+        FakeResolver(_plan(intent)),
+        DeprovisionResume(),
+        now_unix_ms=intent.created_at_unix_ms + 1,
+    )
+
+    assert result.code is BrokerIntentConsumeCode.SUCCEEDED
+    assert store.terminals == [(claim.claim_name, b'{"result":"succeeded"}\n')]
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,4 @@
-"""Root-owned offline CHPB/2 provision and replacement execution composition.
+"""Root-owned offline CHPB/2 Provision/Replace/Deprovision composition.
 
 This module is deliberately an adapter around the existing offline transaction,
 WAL, Linux-attestation, and B2a recovery contracts.  It owns no transport and
@@ -34,6 +34,7 @@ from codex_master.fleet_home_broker_protocol import (
     CHPB_PROTOCOL,
     ChpbMessageKind,
     ChpbTransactionOperation,
+    DeprovisionHomeRequest,
     PolicyBinding,
     ProvisionHomeRequest,
     ReplaceHomeRequest,
@@ -60,6 +61,9 @@ _INITIAL_REPLACEMENT_OBSERVATION = BrokerObservation(
     BrokerRegistryState.NOT_APPLICABLE,
     0,
 )
+_INITIAL_DEPROVISION_OBSERVATION = BrokerObservation(
+    BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 0
+)
 _MAX_DRIVE_STEPS = 2 * 256 + 16
 _EXECUTION_CHECKPOINTS = {
     BrokerCheckpoint.CREATE_INTENT,
@@ -75,9 +79,15 @@ _EXECUTION_CHECKPOINTS = {
     BrokerCheckpoint.REPLACEMENT_PREPARED,
     BrokerCheckpoint.SWITCH_INTENT,
     BrokerCheckpoint.SWITCHED,
+    BrokerCheckpoint.DEPROVISION_INTENT,
+    BrokerCheckpoint.DEPROVISIONED,
 }
 _SUPPORTED_OPERATIONS = frozenset(
-    (ChpbTransactionOperation.PROVISION, ChpbTransactionOperation.REPLACE)
+    (
+        ChpbTransactionOperation.PROVISION,
+        ChpbTransactionOperation.REPLACE,
+        ChpbTransactionOperation.DEPROVISION,
+    )
 )
 
 
@@ -101,6 +111,25 @@ class RootBrokerExecutionOperations(Protocol):
     ) -> None: ...
 
     def cas_registry(
+        self, plan: OfflineBrokerPlan, binding: TransactionBinding
+    ) -> None: ...
+
+    def attest_deprovision_effect(
+        self,
+        plan: OfflineBrokerPlan,
+        binding: TransactionBinding,
+        action: BrokerRecoveryAction,
+    ) -> None:
+        """Fresh root gate immediately before an irreversible Deprovision effect.
+
+        ``action`` is only ``CAS_REGISTRY`` with observed registry ``CURRENT``
+        or ``DEPROVISION_HOME`` with ``NOT_APPLICABLE``.  In both cases,
+        quiescence, no active process/lease, inode/device, registry, and fence
+        evidence must match.
+        """
+        ...
+
+    def deprovision_home(
         self, plan: OfflineBrokerPlan, binding: TransactionBinding
     ) -> None: ...
 
@@ -130,7 +159,7 @@ class _FixedTransactionOperations:
 
 
 class RootBrokerExecutionComposition(BrokerDispatchOperations):
-    """The one offline provision/replacement implementation behind dispatch."""
+    """The one offline Provision/Replace/Deprovision implementation behind dispatch."""
 
     def __init__(
         self,
@@ -165,6 +194,7 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
                 is not {
                     ChpbTransactionOperation.PROVISION: ProvisionHomeRequest,
                     ChpbTransactionOperation.REPLACE: ReplaceHomeRequest,
+                    ChpbTransactionOperation.DEPROVISION: DeprovisionHomeRequest,
                 }.get(plan.operation)
                 or plan.operation not in _SUPPORTED_OPERATIONS
                 or not self._valid_request_id(request.request_id)
@@ -304,9 +334,19 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
                     self._operations.switch_replacement(plan, status.binding)
                     continue
                 if decision.action is BrokerRecoveryAction.CAS_REGISTRY:
+                    if plan.operation is ChpbTransactionOperation.DEPROVISION:
+                        self._operations.attest_deprovision_effect(
+                            plan, status.binding, BrokerRecoveryAction.CAS_REGISTRY
+                        )
                     self._operations.cas_registry(plan, status.binding)
                     continue
-                raise ValueError("unsupported provision recovery action")
+                if decision.action is BrokerRecoveryAction.DEPROVISION_HOME:
+                    self._operations.attest_deprovision_effect(
+                        plan, status.binding, BrokerRecoveryAction.DEPROVISION_HOME
+                    )
+                    self._operations.deprovision_home(plan, status.binding)
+                    continue
+                raise ValueError("unsupported broker recovery action")
             except Exception:
                 return self._blocked(
                     plan, status.binding.transaction_id, request_id, status
@@ -323,7 +363,9 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
         if type(target) is not BrokerCheckpoint:
             raise ValueError("missing checkpoint")
         terminal = (
-            BrokerResultCode.COMMITTED if target is BrokerCheckpoint.COMMITTED else None
+            BrokerResultCode.COMMITTED
+            if target in {BrokerCheckpoint.COMMITTED, BrokerCheckpoint.DEPROVISIONED}
+            else None
         )
         next_status = TransactionStatus(
             status.binding,
@@ -361,6 +403,14 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
                 # A prior CAS may have taken effect despite its caller failing
                 # before a durable terminal outcome was written.  No retry is
                 # safe while the attested registry remains OLD.
+                return None
+            if (
+                status.binding.operation is ChpbTransactionOperation.DEPROVISION
+                and status.checkpoint is BrokerCheckpoint.FINALIZE_INTENT
+                and recovered.decision.action is BrokerRecoveryAction.DEPROVISION_HOME
+            ):
+                # The delete can have succeeded after FINALIZE_INTENT was
+                # fsynced.  A fresh composition must not issue it twice.
                 return None
             return status
         except Exception:
@@ -483,6 +533,7 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
         return {
             ChpbTransactionOperation.PROVISION: _INITIAL_PROVISION_OBSERVATION,
             ChpbTransactionOperation.REPLACE: _INITIAL_REPLACEMENT_OBSERVATION,
+            ChpbTransactionOperation.DEPROVISION: _INITIAL_DEPROVISION_OBSERVATION,
         }.get(operation)
 
     @classmethod

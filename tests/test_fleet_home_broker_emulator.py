@@ -179,7 +179,7 @@ def test_recover_publish_conflicts_blocks_without_persisting_and_replays_determi
         (BrokerCheckpoint.FINALIZE_INTENT, BrokerObjectState.REPLACEMENT_SWITCHED, BrokerRegistryState.CURRENT, 1, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.COMMITTED, None),
         (BrokerCheckpoint.ROLLBACK_INTENT, BrokerObjectState.ROLLBACK_READY, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.ROLLBACK, None, None),
         (BrokerCheckpoint.ROLLBACK_INTENT, BrokerObjectState.ROLLED_BACK, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.ROLLED_BACK, None),
-        (BrokerCheckpoint.DEPROVISION_INTENT, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.DEPROVISION_HOME, None, None),
+        (BrokerCheckpoint.DEPROVISION_INTENT, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.REGISTRY_CAS_INTENT, None),
         (BrokerCheckpoint.DEPROVISION_INTENT, BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.DEPROVISIONED, None),
         (BrokerCheckpoint.COMMITTED, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1, 1, BrokerRecoveryAction.RETURN_COMMITTED, BrokerCheckpoint.COMMITTED, BrokerResultCode.COMMITTED),
         (BrokerCheckpoint.ROLLED_BACK, BrokerObjectState.ROLLED_BACK, BrokerRegistryState.NOT_APPLICABLE, 1, 1, BrokerRecoveryAction.RETURN_ROLLED_BACK, BrokerCheckpoint.ROLLED_BACK, BrokerResultCode.ROLLED_BACK),
@@ -205,6 +205,45 @@ def test_recover_complete_crash_matrix(checkpoint, current, registry, index, tot
             BrokerCheckpoint.BLOCKED_DRIFT: BrokerResultCode.BLOCKED_DRIFT,
         }.get(target)
         assert step.state.transactions[0].status.terminal_result is expected_terminal
+
+
+def test_deprovision_emulator_persists_cas_then_finalize_before_cleanup_action():
+    initial = stat(
+        BrokerCheckpoint.DEPROVISION_INTENT,
+        obs(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1),
+        1,
+    )
+    initial_state = opened(status_value=initial)
+
+    cas_intent = recover_emulator_transaction(
+        initial_state,
+        T,
+        principal(),
+        obs(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1),
+        now_ns=2,
+    )
+    assert cas_intent.action is BrokerRecoveryAction.PERSIST_CHECKPOINT
+    assert cas_intent.state.transactions[0].status.checkpoint is BrokerCheckpoint.REGISTRY_CAS_INTENT
+
+    finalize_intent = recover_emulator_transaction(
+        cas_intent.state,
+        T,
+        principal(),
+        obs(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1),
+        now_ns=3,
+    )
+    assert finalize_intent.action is BrokerRecoveryAction.PERSIST_CHECKPOINT
+    assert finalize_intent.state.transactions[0].status.checkpoint is BrokerCheckpoint.FINALIZE_INTENT
+
+    cleanup = recover_emulator_transaction(
+        finalize_intent.state,
+        T,
+        principal(),
+        obs(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1),
+        now_ns=4,
+    )
+    assert cleanup.action is BrokerRecoveryAction.DEPROVISION_HOME
+    assert cleanup.state.transactions == finalize_intent.state.transactions
 
 
 def _committed_state():
