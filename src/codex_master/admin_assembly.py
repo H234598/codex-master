@@ -378,7 +378,6 @@ def provision_agent_bindings_from_credential(
         or len(cast(list[object], value["hosts"])) > 256
     ):
         raise AdminAssemblyError
-    expected_generation = max((host.generation for host in registry.list()), default=0)
     seen_refs: set[str] = set()
     seen_enabled_spkis: set[str] = set()
     desired: list[tuple[dict[str, object], AgentBindingV1]] = []
@@ -419,9 +418,7 @@ def provision_agent_bindings_from_credential(
                     cast(bool, record["enabled"]),
                 ))
             )
-        registry.synchronize_agent_bindings(
-            tuple(desired), expected_generation=expected_generation
-        )
+        registry.synchronize_agent_bindings(tuple(desired))
     except (HostRegistryError, TypeError, ValueError):
         raise AdminAssemblyError from None
 

@@ -78,9 +78,10 @@ _HOST_FIELDS = frozenset(
     }
 )
 _BINDING_FIELDS = frozenset({"ref", "binding_state"})
-_SCHEMA3_FIELDS = frozenset(
+_LEGACY_SCHEMA3_FIELDS = frozenset(
     {"schema_version", "registrations", "bindings", "observations"}
 )
+_SCHEMA3_FIELDS = _LEGACY_SCHEMA3_FIELDS | {"generation", "agent_epoch_history"}
 _REGISTRATION_FIELDS = frozenset(
     {
         "ref",
@@ -98,6 +99,7 @@ _REGISTRATION_FIELDS = frozenset(
 _AGENT_BINDING_FIELDS = frozenset(
     {"ref", "client_spki_sha256", "lease_epoch", "enabled"}
 )
+_AGENT_EPOCH_FIELDS = frozenset({"ref", "lease_epoch"})
 _STATIC_REGISTRATION_INPUT_FIELDS = frozenset(
     {"ref", "label", "role", "capabilities"}
 )
@@ -258,11 +260,24 @@ class HostRegistry:
         try:
             self._state = HiveStateStore(self._root)
             with self._state.locked():
-                hosts, ssh_bindings, agent_bindings, observations, migrated = (
-                    self._read_locked()
-                )
+                (
+                    hosts,
+                    ssh_bindings,
+                    agent_bindings,
+                    observations,
+                    generation,
+                    epoch_history,
+                    migrated,
+                ) = self._read_locked()
                 if migrated:
-                    self._write_locked(hosts, ssh_bindings, agent_bindings, observations)
+                    self._write_locked(
+                        hosts,
+                        ssh_bindings,
+                        agent_bindings,
+                        observations,
+                        generation,
+                        epoch_history,
+                    )
         except HostRegistryError:
             raise
         except (HiveStateError, OSError, TypeError, ValueError):
@@ -273,13 +288,27 @@ class HostRegistry:
         return cls(state_root)
 
     def list(self) -> tuple[ControlHostV1, ...]:
-        with self._locked_state() as (hosts, _ssh_bindings, _agent_bindings, observations):
+        with self._locked_state() as (
+            hosts,
+            _ssh_bindings,
+            _agent_bindings,
+            observations,
+            _generation_value,
+            _epoch_history,
+        ):
             hosts = _merged_hosts(hosts, observations)
             return tuple(self._host(record) for record in hosts)
 
     def get(self, ref: str) -> ControlHostV1:
         ref = _host_ref(ref, "control.host_invalid")
-        with self._locked_state() as (hosts, _ssh_bindings, _agent_bindings, observations):
+        with self._locked_state() as (
+            hosts,
+            _ssh_bindings,
+            _agent_bindings,
+            observations,
+            _generation_value,
+            _epoch_history,
+        ):
             for record in _merged_hosts(hosts, observations):
                 if record["ref"] == ref:
                     return self._host(record)
@@ -295,9 +324,7 @@ class HostRegistry:
         expected_generation = _generation(
             expected_generation, "credential.generation_conflict"
         )
-        registration_record = _agent_registration_record(
-            registration, generation=expected_generation + 1
-        )
+        registration_record = _agent_registration_record(registration, generation=1)
         if binding.host_ref != registration_record["ref"]:
             raise HostRegistryError("host.identity_mismatch")
         with self._locked_state() as (
@@ -305,9 +332,10 @@ class HostRegistry:
             ssh_bindings,
             agent_bindings,
             observations,
+            document_generation,
+            epoch_history,
         ):
-            current_generation = _document_generation(registrations, observations)
-            if current_generation != expected_generation:
+            if document_generation != expected_generation:
                 raise HostRegistryError("credential.generation_conflict")
             for item in agent_bindings:
                 if (
@@ -321,6 +349,7 @@ class HostRegistry:
                 (item for item in agent_bindings if item["ref"] == binding.host_ref),
                 None,
             )
+            prior_epoch = epoch_history.get(binding.host_ref, 0)
             next_epoch = binding.lease_epoch
             if existing_binding is not None:
                 next_epoch = _generation(
@@ -333,6 +362,10 @@ class HostRegistry:
                     if next_epoch == _MAX_GENERATION:
                         raise HostRegistryError("host.identity_epoch_exhausted")
                     next_epoch += 1
+            elif prior_epoch:
+                if prior_epoch == _MAX_GENERATION:
+                    raise HostRegistryError("host.identity_epoch_exhausted")
+                next_epoch = prior_epoch + 1
             if binding.lease_epoch not in {1, next_epoch}:
                 raise HostRegistryError("host.identity_invalid")
             stored_binding = {
@@ -356,32 +389,41 @@ class HostRegistry:
                 == _registration_without_generation(registration_record)
             ):
                 return self._host(existing_registration)
+            if document_generation == _MAX_GENERATION:
+                raise HostRegistryError("credential.generation_exhausted")
+            mutation_generation = document_generation + 1
             registrations[:] = [
                 item for item in registrations if item["ref"] != binding.host_ref
-            ]
-            observations[:] = [
-                item for item in observations if item["ref"] != binding.host_ref
             ]
             agent_bindings[:] = [
                 item for item in agent_bindings if item["ref"] != binding.host_ref
             ]
-            registration_record["generation"] = expected_generation + 1
+            registration_record["generation"] = mutation_generation
             registrations.append(registration_record)
             agent_bindings.append(stored_binding)
+            epoch_history[binding.host_ref] = next_epoch
             registrations.sort(key=lambda item: str(item["ref"]))
             agent_bindings.sort(key=lambda item: str(item["ref"]))
-            self._write_locked(registrations, ssh_bindings, agent_bindings, observations)
+            self._write_locked(
+                registrations,
+                ssh_bindings,
+                agent_bindings,
+                observations,
+                mutation_generation,
+                epoch_history,
+            )
             return self._host(registration_record)
 
     def synchronize_agent_bindings(
         self,
         desired: tuple[tuple[Mapping[str, object], AgentBindingV1], ...],
         *,
-        expected_generation: int,
+        expected_generation: int | None = None,
     ) -> None:
-        expected_generation = _generation(
-            expected_generation, "credential.generation_conflict"
-        )
+        if expected_generation is not None:
+            expected_generation = _generation(
+                expected_generation, "credential.generation_conflict"
+            )
         validated: list[tuple[dict[str, object], AgentBindingV1]] = []
         seen_refs: set[str] = set()
         seen_enabled_spkis: set[str] = set()
@@ -401,9 +443,13 @@ class HostRegistry:
             ssh_bindings,
             agent_bindings,
             observations,
+            document_generation,
+            epoch_history,
         ):
-            current_generation = _document_generation(registrations, observations)
-            if current_generation != expected_generation:
+            if (
+                expected_generation is not None
+                and document_generation != expected_generation
+            ):
                 raise HostRegistryError("credential.generation_conflict")
             existing_registrations = {
                 str(item["ref"]): item for item in registrations
@@ -423,6 +469,7 @@ class HostRegistry:
             prepared: list[tuple[dict[str, object], dict[str, object], bool]] = []
             for registration, binding in validated:
                 existing_binding = existing_bindings.get(binding.host_ref)
+                prior_epoch = epoch_history.get(binding.host_ref, 0)
                 next_epoch = binding.lease_epoch
                 if existing_binding is not None:
                     next_epoch = _generation(
@@ -438,6 +485,10 @@ class HostRegistry:
                         if next_epoch == _MAX_GENERATION:
                             raise HostRegistryError("host.identity_epoch_exhausted")
                         next_epoch += 1
+                elif prior_epoch:
+                    if prior_epoch == _MAX_GENERATION:
+                        raise HostRegistryError("host.identity_epoch_exhausted")
+                    next_epoch = prior_epoch + 1
                 if binding.lease_epoch not in {1, next_epoch}:
                     raise HostRegistryError("host.identity_invalid")
                 stored_binding = {
@@ -458,9 +509,9 @@ class HostRegistry:
 
             if not changed:
                 return
-            if current_generation == _MAX_GENERATION:
-                raise HostRegistryError("credential.generation_conflict")
-            mutation_generation = current_generation + 1
+            if document_generation == _MAX_GENERATION:
+                raise HostRegistryError("credential.generation_exhausted")
+            mutation_generation = document_generation + 1
             desired_refs = {binding.host_ref for _record, binding in validated}
             next_registrations = [
                 item for item in next_registrations if item["ref"] not in desired_refs
@@ -476,10 +527,20 @@ class HostRegistry:
                 )
                 next_registrations.append(registration)
                 next_bindings.append(stored_binding)
+                epoch_history[str(stored_binding["ref"])] = _generation(
+                    stored_binding["lease_epoch"], "control.host_store_unavailable"
+                )
+            if len(epoch_history) > MAX_HOST_RECORDS:
+                raise HostRegistryError("host.identity_history_full")
             next_registrations.sort(key=lambda item: str(item["ref"]))
             next_bindings.sort(key=lambda item: str(item["ref"]))
             self._write_locked(
-                next_registrations, ssh_bindings, next_bindings, observations
+                next_registrations,
+                ssh_bindings,
+                next_bindings,
+                observations,
+                mutation_generation,
+                epoch_history,
             )
 
     def agent_binding(self, host_ref: str) -> AgentBindingV1:
@@ -489,6 +550,8 @@ class HostRegistry:
             _ssh_bindings,
             agent_bindings,
             _observations,
+            _generation_value,
+            _epoch_history,
         ):
             for item in agent_bindings:
                 if item["ref"] == host_ref:
@@ -501,7 +564,9 @@ class HostRegistry:
             registrations,
             _ssh_bindings,
             agent_bindings,
-            observations,
+            _observations,
+            document_generation,
+            _epoch_history,
         ):
             matches = [
                 item
@@ -517,7 +582,7 @@ class HostRegistry:
                 raise HostRegistryError("host.identity_not_found")
             return AgentPrincipalV1(
                 str(binding["ref"]),
-                _document_generation(registrations, observations),
+                document_generation,
                 _generation(binding["lease_epoch"], "control.host_store_unavailable"),
             )
 
@@ -541,6 +606,8 @@ class HostRegistry:
             ssh_bindings,
             agent_bindings,
             observations,
+            document_generation,
+            epoch_history,
         ):
             existing = next((item for item in observations if item["ref"] == ref), None)
             if existing is not None:
@@ -561,19 +628,46 @@ class HostRegistry:
             ssh_bindings[ref] = binding
             observations.sort(key=lambda item: str(item["ref"]))
             registrations.sort(key=lambda item: str(item["ref"]))
-            self._write_locked(registrations, ssh_bindings, agent_bindings, observations)
+            self._write_locked(
+                registrations,
+                ssh_bindings,
+                agent_bindings,
+                observations,
+                max(document_generation, generation),
+                epoch_history,
+            )
             return self._host(record)
 
     @contextlib.contextmanager
     def _locked_state(self) -> Any:
         try:
             with self._state.locked():
-                hosts, ssh_bindings, agent_bindings, observations, migrated = (
-                    self._read_locked()
-                )
+                (
+                    hosts,
+                    ssh_bindings,
+                    agent_bindings,
+                    observations,
+                    generation,
+                    epoch_history,
+                    migrated,
+                ) = self._read_locked()
                 if migrated:
-                    self._write_locked(hosts, ssh_bindings, agent_bindings, observations)
-                yield hosts, ssh_bindings, agent_bindings, observations
+                    self._write_locked(
+                        hosts,
+                        ssh_bindings,
+                        agent_bindings,
+                        observations,
+                        generation,
+                        epoch_history,
+                    )
+                yield (
+                    hosts,
+                    ssh_bindings,
+                    agent_bindings,
+                    observations,
+                    generation,
+                    epoch_history,
+                )
         except HostRegistryError:
             raise
         except (HiveStateError, OSError, TypeError, ValueError, RecursionError):
@@ -586,6 +680,8 @@ class HostRegistry:
         dict[str, dict[str, object]],
         builtins.list[dict[str, object]],
         builtins.list[dict[str, object]],
+        int,
+        dict[str, int],
         bool,
     ]:
         try:
@@ -594,7 +690,7 @@ class HostRegistry:
             )
         except HiveStateError as exc:
             if exc.args == ("state_not_found",):
-                return [], {}, [], [], False
+                return [], {}, [], [], 0, {}, False
             raise HostRegistryError("control.host_store_unavailable") from None
         try:
             document = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
@@ -614,7 +710,10 @@ class HostRegistry:
             return self._read_legacy(document)
         if version == 2:
             return self._read_v2(document)
-        if version != _SCHEMA_VERSION or set(document) != _SCHEMA3_FIELDS:
+        legacy_schema3 = set(document) == _LEGACY_SCHEMA3_FIELDS
+        if version != _SCHEMA_VERSION or not (
+            legacy_schema3 or set(document) == _SCHEMA3_FIELDS
+        ):
             raise HostRegistryError("control.host_store_unavailable")
         raw_hosts = document.get("registrations")
         raw_bindings = document.get("bindings")
@@ -657,6 +756,28 @@ class HostRegistry:
                 enabled_spkis.add(spki)
             agent_refs.add(ref)
             agent_bindings.append(normalized)
+        if legacy_schema3:
+            epoch_history = {
+                str(item["ref"]): _generation(
+                    item["lease_epoch"], "control.host_store_unavailable"
+                )
+                for item in agent_bindings
+            }
+        else:
+            raw_history = document.get("agent_epoch_history")
+            if type(raw_history) is not list or len(raw_history) > MAX_HOST_RECORDS:
+                raise HostRegistryError("control.host_store_unavailable")
+            epoch_history: dict[str, int] = {}
+            for item in raw_history:
+                if not isinstance(item, Mapping) or set(item) != _AGENT_EPOCH_FIELDS:
+                    raise HostRegistryError("control.host_store_unavailable")
+                ref = _host_ref(item["ref"], "control.host_store_unavailable")
+                epoch = _generation(
+                    item["lease_epoch"], "control.host_store_unavailable"
+                )
+                if ref in epoch_history or epoch == 0:
+                    raise HostRegistryError("control.host_store_unavailable")
+                epoch_history[ref] = epoch
         hosts: list[dict[str, object]] = []
         seen: set[str] = set()
         for item in raw_hosts:
@@ -696,7 +817,30 @@ class HostRegistry:
         hosts.sort(key=lambda item: str(item["ref"]))
         observations.sort(key=lambda item: str(item["ref"]))
         agent_bindings.sort(key=lambda item: str(item["ref"]))
-        return hosts, bindings, agent_bindings, observations, False
+        record_generation = _document_generation(hosts, observations)
+        if legacy_schema3:
+            document_generation = record_generation
+        else:
+            document_generation = _generation(
+                document.get("generation"), "control.host_store_unavailable"
+            )
+            if document_generation < record_generation:
+                raise HostRegistryError("control.host_store_unavailable")
+        if any(
+            epoch_history.get(str(item["ref"]), 0)
+            < _generation(item["lease_epoch"], "control.host_store_unavailable")
+            for item in agent_bindings
+        ):
+            raise HostRegistryError("control.host_store_unavailable")
+        return (
+            hosts,
+            bindings,
+            agent_bindings,
+            observations,
+            document_generation,
+            epoch_history,
+            legacy_schema3,
+        )
 
     def _read_v2(
         self, document: Mapping[str, object]
@@ -705,6 +849,8 @@ class HostRegistry:
         dict[str, dict[str, object]],
         builtins.list[dict[str, object]],
         builtins.list[dict[str, object]],
+        int,
+        dict[str, int],
         bool,
     ]:
         if set(document) != {"schema_version", "hosts", "bindings"}:
@@ -757,7 +903,15 @@ class HostRegistry:
             raise HostRegistryError("control.host_store_unavailable")
         registrations.sort(key=lambda item: str(item["ref"]))
         observations.sort(key=lambda item: str(item["ref"]))
-        return registrations, bindings, [], observations, True
+        return (
+            registrations,
+            bindings,
+            [],
+            observations,
+            _document_generation(registrations, observations),
+            {},
+            True,
+        )
 
     def _read_legacy(
         self, document: Mapping[str, object]
@@ -766,6 +920,8 @@ class HostRegistry:
         dict[str, dict[str, object]],
         builtins.list[dict[str, object]],
         builtins.list[dict[str, object]],
+        int,
+        dict[str, int],
         bool,
     ]:
         if set(document) != {"schema_version", "hosts"}:
@@ -794,7 +950,15 @@ class HostRegistry:
             bindings[ref] = binding
         registrations.sort(key=lambda item: str(item["ref"]))
         hosts.sort(key=lambda item: str(item["ref"]))
-        return registrations, bindings, [], hosts, True
+        return (
+            registrations,
+            bindings,
+            [],
+            hosts,
+            _document_generation(registrations, hosts),
+            {},
+            True,
+        )
 
     @staticmethod
     def _probe_record(
@@ -844,7 +1008,10 @@ class HostRegistry:
         ssh_bindings: Mapping[str, dict[str, object]],
         agent_bindings: builtins.list[dict[str, object]],
         observations: builtins.list[dict[str, object]],
+        generation: int,
+        epoch_history: Mapping[str, int],
     ) -> None:
+        generation = _generation(generation, "control.host_store_unavailable")
         try:
             validated_agent_bindings = [
                 _agent_binding_record(item, "control.host_store_unavailable")
@@ -861,10 +1028,27 @@ class HostRegistry:
             or not {str(item["ref"]) for item in agent_bindings}.issubset(
                 {str(item["ref"]) for item in registrations}
             )
+            or len(epoch_history) > MAX_HOST_RECORDS
+        ):
+            raise HostRegistryError("control.host_store_unavailable")
+        validated_history: list[dict[str, object]] = []
+        for ref in sorted(epoch_history):
+            epoch = _generation(
+                epoch_history[ref], "control.host_store_unavailable"
+            )
+            if _host_ref(ref, "control.host_store_unavailable") != ref or epoch == 0:
+                raise HostRegistryError("control.host_store_unavailable")
+            validated_history.append({"ref": ref, "lease_epoch": epoch})
+        if any(
+            epoch_history.get(str(item["ref"]), 0)
+            < _generation(item["lease_epoch"], "control.host_store_unavailable")
+            for item in validated_agent_bindings
         ):
             raise HostRegistryError("control.host_store_unavailable")
         document = {
             "schema_version": _SCHEMA_VERSION,
+            "generation": generation,
+            "agent_epoch_history": validated_history,
             "registrations": registrations,
             "bindings": {
                 "ssh": [

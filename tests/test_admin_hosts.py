@@ -632,7 +632,11 @@ def test_legacy_document_migrates_binding_into_separate_v3_state(
         "registrations",
         "bindings",
         "observations",
+        "generation",
+        "agent_epoch_history",
     }
+    assert migrated["generation"] == 4
+    assert migrated["agent_epoch_history"] == []
     assert migrated["registrations"][0]["ref"] == "worker-one"
     assert migrated["observations"][0]["ref"] == "worker-one"
     assert "binding_state" not in migrated["observations"][0]
@@ -640,6 +644,30 @@ def test_legacy_document_migrates_binding_into_separate_v3_state(
         {"ref": "worker-one", "binding_state": evidence["binding_state"]}
     ]
     assert migrated["bindings"]["agent"] == []
+
+
+def test_existing_schema3_document_migrates_private_generation_and_epoch_history(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.provision_agent_binding(
+        static_registration(), agent_binding(lease_epoch=7), expected_generation=0
+    )
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    payload = json.loads(document.read_text())
+    del payload["generation"]
+    del payload["agent_epoch_history"]
+    document.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+    document.chmod(0o600)
+
+    migrated_registry = registry_at(tmp_path)
+    migrated = json.loads(document.read_text())
+
+    assert migrated["generation"] == 1
+    assert migrated["agent_epoch_history"] == [
+        {"ref": "worker-one", "lease_epoch": 7}
+    ]
+    assert migrated_registry.resolve_agent_spki(SPKI_ONE).lease_epoch == 7
 
 
 def test_static_agent_provisioning_creates_unavailable_registration_without_probe(
@@ -744,6 +772,115 @@ def test_agent_binding_rotation_at_max_epoch_fails_without_mutation(
     assert registry_at(tmp_path).agent_binding("worker-one") == agent_binding(
         lease_epoch=2**63 - 1
     )
+
+
+def test_agent_sync_partial_removal_advances_document_generation(tmp_path: Path) -> None:
+    registry = registry_at(tmp_path)
+    desired = (
+        (static_registration("worker-one"), agent_binding("worker-one")),
+        (
+            static_registration("worker-two", label="Worker Two"),
+            agent_binding("worker-two", spki=SPKI_TWO),
+        ),
+    )
+    registry.synchronize_agent_bindings(desired, expected_generation=0)
+
+    registry.synchronize_agent_bindings((desired[1],), expected_generation=1)
+
+    document = json.loads((tmp_path / "admin-hosts" / "hosts.json").read_text())
+    assert document["generation"] == 2
+    assert registry.resolve_agent_spki(SPKI_TWO).registry_generation == 2
+    with pytest.raises(HostRegistryError, match="host.identity_not_found"):
+        registry.resolve_agent_spki(SPKI_ONE)
+
+
+def test_agent_sync_last_removal_persists_generation_and_rejects_stale_cas(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    desired = ((static_registration(), agent_binding()),)
+    registry.synchronize_agent_bindings(desired, expected_generation=0)
+    registry.synchronize_agent_bindings((), expected_generation=1)
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    payload = json.loads(document.read_text())
+    before = document.read_bytes()
+
+    assert payload["generation"] == 2
+    assert registry.list() == ()
+    with pytest.raises(HostRegistryError, match="credential.generation_conflict"):
+        registry.synchronize_agent_bindings(desired, expected_generation=1)
+    assert document.read_bytes() == before
+
+
+def test_agent_sync_readd_uses_tombstoned_epoch_and_new_generation(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.synchronize_agent_bindings(
+        ((static_registration(), agent_binding()),), expected_generation=0
+    )
+    registry.synchronize_agent_bindings((), expected_generation=1)
+
+    registry.synchronize_agent_bindings(
+        ((static_registration(), agent_binding(spki=SPKI_TWO)),),
+        expected_generation=2,
+    )
+
+    principal = registry.resolve_agent_spki(SPKI_TWO)
+    assert principal.registry_generation == 3
+    assert principal.lease_epoch == 2
+    with pytest.raises(HostRegistryError, match="host.identity_not_found"):
+        registry.resolve_agent_spki(SPKI_ONE)
+
+
+def test_agent_sync_rejects_generation_and_epoch_exhaustion_without_mutation(
+    tmp_path: Path,
+) -> None:
+    generation_root = tmp_path / "generation"
+    generation_registry = registry_at(generation_root)
+    desired = ((static_registration(), agent_binding()),)
+    generation_registry.synchronize_agent_bindings(desired, expected_generation=0)
+    generation_document = generation_root / "admin-hosts" / "hosts.json"
+    payload = json.loads(generation_document.read_text())
+    payload["generation"] = 2**63 - 1
+    generation_document.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+    generation_document.chmod(0o600)
+    before_generation = generation_document.read_bytes()
+
+    with pytest.raises(HostRegistryError, match="credential.generation_exhausted"):
+        generation_registry.synchronize_agent_bindings(
+            (), expected_generation=2**63 - 1
+        )
+    assert generation_document.read_bytes() == before_generation
+
+    epoch_root = tmp_path / "epoch"
+    epoch_registry = registry_at(epoch_root)
+    epoch_registry.synchronize_agent_bindings(
+        ((static_registration(), agent_binding(lease_epoch=2**63 - 1)),),
+        expected_generation=0,
+    )
+    epoch_registry.synchronize_agent_bindings((), expected_generation=1)
+    epoch_document = epoch_root / "admin-hosts" / "hosts.json"
+    before_epoch = epoch_document.read_bytes()
+
+    with pytest.raises(HostRegistryError, match="host.identity_epoch_exhausted"):
+        epoch_registry.synchronize_agent_bindings(
+            ((static_registration(), agent_binding(spki=SPKI_TWO)),),
+            expected_generation=2,
+        )
+    assert epoch_document.read_bytes() == before_epoch
+
+
+def test_agent_sync_identical_desired_state_is_byte_identical(tmp_path: Path) -> None:
+    registry = registry_at(tmp_path)
+    desired = ((static_registration(), agent_binding()),)
+    registry.synchronize_agent_bindings(desired, expected_generation=0)
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    before = document.read_bytes()
+
+    registry.synchronize_agent_bindings(desired, expected_generation=1)
+
+    assert document.read_bytes() == before
 
 
 @pytest.mark.parametrize(

@@ -1948,6 +1948,57 @@ def test_agent_bindings_credential_validates_all_hosts_before_atomic_commit(
     assert [host.ref for host in registry.list()] == ["worker-zero"]
 
 
+def test_agent_bindings_repeated_import_with_same_ref_probe_is_byte_identical(
+    tmp_path: Path,
+) -> None:
+    registry = HostRegistry.for_test(tmp_path)
+    registry.record_probe(
+        "worker-one",
+        generation=1,
+        evidence={
+            "label": "Observed Worker",
+            "role": "execution",
+            "transport_binding": {"kind": "ssh", "binding_ref": "worker-one-ssh"},
+            "capabilities": ["resource.probe"],
+            "reachability": {"state": "reachable", "latency_ms": 1},
+            "resource_evidence": {"cpu_threads": 1, "memory_bytes": 1024},
+            "observed_at": "2026-08-28T10:00:00Z",
+            "source": "host-agent",
+            "binding_state": {"endpoint": "ssh://127.0.0.1:22"},
+        },
+    )
+    raw = json.dumps(
+        {
+            "schema_version": 1,
+            "hosts": [
+                {
+                    "ref": "worker-one",
+                    "label": "Static Worker",
+                    "role": "worker",
+                    "capabilities": ["resource.probe"],
+                    "client_spki_sha256": "sha256:" + "a" * 64,
+                    "lease_epoch": 1,
+                    "enabled": True,
+                }
+            ],
+        },
+        separators=(",", ":"),
+    ).encode("ascii")
+
+    provision_agent_bindings_from_credential(registry, raw)
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    before = document.read_bytes()
+    provision_agent_bindings_from_credential(registry, raw)
+
+    assert document.read_bytes() == before
+    assert registry.get("worker-one").label == "Observed Worker"
+    assert registry.get("worker-one").reachability == {
+        "state": "reachable",
+        "latency_ms": 1,
+    }
+    assert registry.resolve_agent_spki("sha256:" + "a" * 64).host_ref == "worker-one"
+
+
 def test_corrupt_agent_bindings_credential_blocks_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
