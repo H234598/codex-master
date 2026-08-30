@@ -35,9 +35,27 @@ NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo-one"
     root.mkdir()
-    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
         ["git", "-C", str(root), "config", "remote.origin.url", "https://github.com/example/repo.git"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Hive Test",
+            "-c",
+            "user.email=hive-test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-q",
+            "-m",
+            "initial main",
+        ],
         check=True,
     )
     return root

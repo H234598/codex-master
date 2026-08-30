@@ -11,7 +11,7 @@ authoritative Hive runtime assembler.
 
 First produce a non-mutating plan. Both roots must be absolute, direct,
 user-owned paths; the repository must be the canonical `codex-master` Origin
-on `main`.
+checked out on `main`, with a real local `main` commit.
 
 ```sh
 ./scripts/codex-master-hive-pilot-provisioner plan \
@@ -75,6 +75,8 @@ identity, preserves Shadow first, and then removes only the validated initial
 ```
 
 All results are redacted. Symlinks, parent/config swaps, unexpected owner,
-mode, type, link-count, size, repository, Principal, journal, config, and
-state drift are rejected rather than repaired. Repeating an already committed
-`apply` is a no-op; replaying a drifted input is rejected.
+mode, type, link-count, size, repository, Origin, branch, commit, Principal,
+journal, config, and state drift are rejected rather than repaired. Every
+mutating cutover rechecks its repository and config binding while holding the
+private state lock. Repeating an already committed `apply` is a no-op;
+replaying a drifted input is rejected.

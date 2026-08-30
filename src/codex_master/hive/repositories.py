@@ -22,6 +22,16 @@ _BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,128}\Z")
 MAX_REMOTE_LENGTH = 512
 MAX_GIT_OUTPUT = 64 * 1024
 GIT_TIMEOUT_SECONDS = 5
+_GIT_ENV = {
+    "GIT_CONFIG_COUNT": "0",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": os.defpath,
+}
 
 
 class RepositoryError(ValueError):
@@ -162,6 +172,20 @@ class RepositoryRegistry:
         remote = self._git(root, "config", "--get", "remote.origin.url")
         if remote is None or _normalize_remote(remote) != _normalize_remote(binding.remote_identity):
             return RepositoryValidation(repo_id, False, "repository_remote_mismatch")
+        branch = self._git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+        if branch != binding.default_branch:
+            return RepositoryValidation(repo_id, False, "repository_branch_mismatch")
+        commit = self._git(
+            root,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{binding.default_branch}^{{commit}}",
+        )
+        if commit is None:
+            return RepositoryValidation(repo_id, False, "repository_commit_unavailable")
+        if self._git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}") != commit:
+            return RepositoryValidation(repo_id, False, "repository_branch_mismatch")
         return RepositoryValidation(repo_id, True, "repository_verified")
 
     def resolve_path(self, repo_id: str, value: str) -> Path:
@@ -214,6 +238,7 @@ class RepositoryRegistry:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
+                env=_GIT_ENV,
                 start_new_session=True,
             )
             if process.stdout is None:

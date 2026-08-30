@@ -18,7 +18,6 @@ import os
 from pathlib import Path, PurePosixPath
 import secrets
 import stat
-import subprocess
 import sys
 
 from codex_master.hive.config import (
@@ -54,15 +53,6 @@ _FEATURE_FLAGS = {
 }
 _PUBLIC_FILE_MODE = 0o644
 _REPOSITORY_MODES = frozenset({0o700, 0o750, 0o755})
-_GIT_ENV = {
-    "GIT_CONFIG_GLOBAL": os.devnull,
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_OPTIONAL_LOCKS": "0",
-    "GIT_TERMINAL_PROMPT": "0",
-    "LANG": "C",
-    "LC_ALL": "C",
-    "PATH": os.defpath,
-}
 
 
 class PilotProvisionerError(ValueError):
@@ -389,37 +379,6 @@ def _has_canonical_repository_binding(config: HiveConfig) -> bool:
     )
 
 
-def _canonical_git_branch(repository_root: Path) -> str | None:
-    try:
-        completed = subprocess.run(
-            [
-                "git",
-                "-C",
-                os.fspath(repository_root),
-                "symbolic-ref",
-                "--quiet",
-                "--short",
-                "HEAD",
-            ],
-            check=False,
-            close_fds=True,
-            env=_GIT_ENV,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0 or len(completed.stdout) > 128:
-        return None
-    try:
-        branch = completed.stdout.decode("utf-8").strip()
-    except UnicodeError:
-        return None
-    return branch or None
-
-
 def _assert_canonical_repository(
     repository_root: Path, target: HiveConfig, current: HiveConfig | None = None
 ) -> None:
@@ -431,8 +390,6 @@ def _assert_canonical_repository(
         _repository_config_digest(),
     )
     if not RepositoryRegistry((binding,)).validate(_REPOSITORY).allowed:
-        raise PilotProvisionerError("pilot_repository_invalid")
-    if _canonical_git_branch(repository_root) != binding.default_branch:
         raise PilotProvisionerError("pilot_repository_invalid")
     if not _has_canonical_repository_binding(target):
         raise PilotProvisionerError("pilot_repository_invalid")
@@ -577,24 +534,64 @@ def apply_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapp
 
     repository_root = _validate_absolute_path(repository_root, code="pilot_repository_untrusted")
     state_root = _validate_absolute_path(state_root, code="pilot_state_unavailable")
-    with _opened_inputs(repository_root) as (root_fd, root_identity, snapshot, current, config_identity, config_input_digest, catalog_input_digest, target, target_bytes):
+    with _opened_inputs(repository_root) as (
+        _root_fd,
+        _root_identity,
+        _snapshot,
+        current,
+        _config_identity,
+        _config_input_digest,
+        _catalog_input_digest,
+        target,
+        _target_bytes,
+    ):
         _assert_canonical_repository(repository_root, target, current)
-        store = _open_writable_state(state_root)
-        with store.locked():
+    store = _open_writable_state(state_root)
+    with store.locked():
+        with _opened_inputs(repository_root) as (
+            root_fd,
+            root_identity,
+            snapshot,
+            current,
+            config_identity,
+            config_input_digest,
+            catalog_input_digest,
+            target,
+            target_bytes,
+        ):
+            _assert_canonical_repository(repository_root, target, current)
             phase = _read_journal_locked(store, target)
             if phase is None:
                 if not _is_shadow_baseline(current):
                     raise PilotProvisionerError("pilot_config_drift")
                 _materialize_target(target, snapshot, repository_root, state_root, materialize=True)
                 _write_journal_locked(store, "prepared", target)
-                _replace_config_atomically(repository_root, root_fd, root_identity, config_identity, config_input_digest, catalog_input_digest, target_bytes)
+                _assert_canonical_repository(repository_root, target, current)
+                _replace_config_atomically(
+                    repository_root,
+                    root_fd,
+                    root_identity,
+                    config_identity,
+                    config_input_digest,
+                    catalog_input_digest,
+                    target_bytes,
+                )
                 _materialize_target(target, snapshot, repository_root, state_root, materialize=False)
                 _write_journal_locked(store, "committed", target)
                 applied = True
             elif phase == "prepared":
                 if _is_shadow_baseline(current):
                     _materialize_target(target, snapshot, repository_root, state_root, materialize=True)
-                    _replace_config_atomically(repository_root, root_fd, root_identity, config_identity, config_input_digest, catalog_input_digest, target_bytes)
+                    _assert_canonical_repository(repository_root, target, current)
+                    _replace_config_atomically(
+                        repository_root,
+                        root_fd,
+                        root_identity,
+                        config_identity,
+                        config_input_digest,
+                        catalog_input_digest,
+                        target_bytes,
+                    )
                 elif not _is_target(current, target):
                     raise PilotProvisionerError("pilot_config_drift")
                 _materialize_target(target, snapshot, repository_root, state_root, materialize=False)
@@ -608,7 +605,16 @@ def apply_pilot_provisioning(*, repository_root: Path, state_root: Path) -> Mapp
             elif phase == "rolled_back" and _is_shadow_baseline(current):
                 _materialize_target(target, snapshot, repository_root, state_root, materialize=True)
                 _write_journal_locked(store, "prepared", target)
-                _replace_config_atomically(repository_root, root_fd, root_identity, config_identity, config_input_digest, catalog_input_digest, target_bytes)
+                _assert_canonical_repository(repository_root, target, current)
+                _replace_config_atomically(
+                    repository_root,
+                    root_fd,
+                    root_identity,
+                    config_identity,
+                    config_input_digest,
+                    catalog_input_digest,
+                    target_bytes,
+                )
                 _materialize_target(target, snapshot, repository_root, state_root, materialize=False)
                 _write_journal_locked(store, "committed", target)
                 applied = True
@@ -664,15 +670,46 @@ def kill_switch_pilot_provisioning(*, repository_root: Path, state_root: Path) -
     repository_root = _validate_absolute_path(repository_root, code="pilot_repository_untrusted")
     state_root = _validate_absolute_path(state_root, code="pilot_state_unavailable")
     shadow_bytes = _canonical_bytes(_shadow_payload())
-    with _opened_inputs(repository_root) as (root_fd, root_identity, _snapshot, current, config_identity, config_input_digest, catalog_input_digest, target, _bytes):
+    with _opened_inputs(repository_root) as (
+        _root_fd,
+        _root_identity,
+        _snapshot,
+        current,
+        _config_identity,
+        _config_input_digest,
+        _catalog_input_digest,
+        target,
+        _target_bytes,
+    ):
         _assert_canonical_repository(repository_root, target, current)
-        store = _open_writable_state(state_root)
-        with store.locked():
+    store = _open_writable_state(state_root)
+    with store.locked():
+        with _opened_inputs(repository_root) as (
+            root_fd,
+            root_identity,
+            _snapshot,
+            current,
+            config_identity,
+            config_input_digest,
+            catalog_input_digest,
+            target,
+            _target_bytes,
+        ):
+            _assert_canonical_repository(repository_root, target, current)
             phase = _read_journal_locked(store, target)
             if phase not in {"prepared", "committed", "killed"}:
                 raise PilotProvisionerError("pilot_journal_invalid")
             if _is_target(current, target):
-                _replace_config_atomically(repository_root, root_fd, root_identity, config_identity, config_input_digest, catalog_input_digest, shadow_bytes)
+                _assert_canonical_repository(repository_root, target, current)
+                _replace_config_atomically(
+                    repository_root,
+                    root_fd,
+                    root_identity,
+                    config_identity,
+                    config_input_digest,
+                    catalog_input_digest,
+                    shadow_bytes,
+                )
                 _write_journal_locked(store, "killed", target)
                 applied = True
             elif _is_shadow_baseline(current) and phase == "killed":
@@ -693,10 +730,32 @@ def rollback_pilot_provisioning(*, repository_root: Path, state_root: Path) -> M
     repository_root = _validate_absolute_path(repository_root, code="pilot_repository_untrusted")
     state_root = _validate_absolute_path(state_root, code="pilot_state_unavailable")
     shadow_bytes = _canonical_bytes(_shadow_payload())
-    with _opened_inputs(repository_root) as (root_fd, root_identity, snapshot, current, config_identity, config_input_digest, catalog_input_digest, target, _bytes):
+    with _opened_inputs(repository_root) as (
+        _root_fd,
+        _root_identity,
+        _snapshot,
+        current,
+        _config_identity,
+        _config_input_digest,
+        _catalog_input_digest,
+        target,
+        _target_bytes,
+    ):
         _assert_canonical_repository(repository_root, target, current)
-        store = _open_writable_state(state_root)
-        with store.locked():
+    store = _open_writable_state(state_root)
+    with store.locked():
+        with _opened_inputs(repository_root) as (
+            root_fd,
+            root_identity,
+            snapshot,
+            current,
+            config_identity,
+            config_input_digest,
+            catalog_input_digest,
+            target,
+            _target_bytes,
+        ):
+            _assert_canonical_repository(repository_root, target, current)
             phase = _read_journal_locked(store, target)
             if phase not in {"prepared", "committed", "killed", "rolled_back"}:
                 raise PilotProvisionerError("pilot_journal_invalid")
@@ -704,7 +763,16 @@ def rollback_pilot_provisioning(*, repository_root: Path, state_root: Path) -> M
                 raise PilotProvisionerError("pilot_config_drift")
             if _is_target(current, target):
                 _materialize_target(target, snapshot, repository_root, state_root, materialize=False)
-                _replace_config_atomically(repository_root, root_fd, root_identity, config_identity, config_input_digest, catalog_input_digest, shadow_bytes)
+                _assert_canonical_repository(repository_root, target, current)
+                _replace_config_atomically(
+                    repository_root,
+                    root_fd,
+                    root_identity,
+                    config_identity,
+                    config_input_digest,
+                    catalog_input_digest,
+                    shadow_bytes,
+                )
             elif phase != "rolled_back":
                 try:
                     _materialize_target(target, snapshot, repository_root, state_root, materialize=False)

@@ -22,7 +22,12 @@ import codex_master.hive.pilot_provisioner as pilot_provisioner
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def make_repository(tmp_path: Path, *, remote: str = "https://github.com/H234598/codex-master.git") -> Path:
+def make_repository(
+    tmp_path: Path,
+    *,
+    remote: str = "https://github.com/H234598/codex-master.git",
+    with_commit: bool = True,
+) -> Path:
     repository = tmp_path / "repository"
     repository.mkdir(mode=0o755)
     (repository / "codex-agent-classes.json").write_bytes(
@@ -33,6 +38,25 @@ def make_repository(tmp_path: Path, *, remote: str = "https://github.com/H234598
     subprocess.run(
         ["git", "-C", str(repository), "config", "remote.origin.url", remote], check=True
     )
+    if with_commit:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "-c",
+                "user.name=Hive Test",
+                "-c",
+                "user.email=hive-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-q",
+                "-m",
+                "initial main",
+            ],
+            check=True,
+        )
     return repository
 
 
@@ -417,3 +441,93 @@ def test_plan_rejects_an_unsafe_state_parent_without_creating_state(tmp_path: Pa
         plan_pilot_provisioning(repository_root=repository, state_root=state_root)
 
     assert not state_root.exists()
+
+
+@pytest.mark.parametrize("operation", (plan_pilot_provisioning, apply_pilot_provisioning, verify_pilot_provisioning))
+def test_plan_apply_and_verify_require_a_real_local_main_commit(tmp_path: Path, operation) -> None:
+    repository = make_repository(tmp_path, with_commit=False)
+
+    with pytest.raises(PilotProvisionerError, match="pilot_repository_invalid"):
+        operation(repository_root=repository, state_root=tmp_path / "private-state")
+
+
+@pytest.mark.parametrize("environment_kind", ("config", "git_dir_and_work_tree"))
+def test_pilot_repository_validation_ignores_ambient_git_binding_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment_kind: str
+) -> None:
+    repository = make_repository(
+        tmp_path,
+        remote="https://github.com/example/other.git",
+    )
+    if environment_kind == "config":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/H234598/codex-master.git")
+    else:
+        reference_parent = tmp_path / "reference"
+        reference_parent.mkdir()
+        reference = make_repository(reference_parent)
+        monkeypatch.setenv("GIT_DIR", str(reference / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(repository))
+
+    with pytest.raises(PilotProvisionerError, match="pilot_repository_invalid"):
+        plan_pilot_provisioning(repository_root=repository, state_root=tmp_path / "private-state")
+
+
+@pytest.mark.parametrize("operation", (apply_pilot_provisioning, rollback_pilot_provisioning, kill_switch_pilot_provisioning))
+@pytest.mark.parametrize("binding_mutation", ("head", "origin"))
+def test_mutations_revalidate_the_repository_binding_inside_the_state_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation,
+    binding_mutation: str,
+) -> None:
+    repository = make_repository(tmp_path)
+    state_root = tmp_path / "private-state"
+    if operation is not apply_pilot_provisioning:
+        apply_pilot_provisioning(repository_root=repository, state_root=state_root)
+    open_writable_state = pilot_provisioner._open_writable_state
+
+    def mutate_between_initial_check_and_lock(path: Path):
+        if binding_mutation == "head":
+            _set_nonmain_head(repository, "feature")
+        else:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "config",
+                    "remote.origin.url",
+                    "https://github.com/example/other.git",
+                ],
+                check=True,
+            )
+        return open_writable_state(path)
+
+    monkeypatch.setattr(pilot_provisioner, "_open_writable_state", mutate_between_initial_check_and_lock)
+
+    with pytest.raises(PilotProvisionerError, match="pilot_repository_invalid"):
+        operation(repository_root=repository, state_root=state_root)
+
+
+@pytest.mark.parametrize("operation", (rollback_pilot_provisioning, kill_switch_pilot_provisioning))
+def test_recovery_revalidates_the_config_binding_inside_the_state_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation
+) -> None:
+    repository = make_repository(tmp_path)
+    state_root = tmp_path / "private-state"
+    apply_pilot_provisioning(repository_root=repository, state_root=state_root)
+    open_writable_state = pilot_provisioner._open_writable_state
+
+    def mutate_between_initial_check_and_lock(path: Path):
+        config_path = repository / "codex-hive.json"
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        payload["repositories"][0]["config_digest"] = "sha256:" + "b" * 64
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+        return open_writable_state(path)
+
+    monkeypatch.setattr(pilot_provisioner, "_open_writable_state", mutate_between_initial_check_and_lock)
+
+    with pytest.raises(PilotProvisionerError, match="pilot_repository_invalid"):
+        operation(repository_root=repository, state_root=state_root)
