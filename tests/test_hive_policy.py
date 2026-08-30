@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":7,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":8,"schema_version":1} -->\n'
 )
 
 
@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 7
+    assert contract.generation == 8
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -150,6 +150,31 @@ def test_common_policy_contains_complete_no_transition_semantics() -> None:
         "kein Reader, Writer, Router, Fallback oder Kompatibilitätspfad",
     ]
 
+    for meaning in required_meanings:
+        assert meaning in policy
+
+
+def test_common_policy_requires_pcloud_excluded_ripgrep_searches() -> None:
+    raw_policy = load_policy_api().load_common_policy().common_bytes.decode("utf-8")
+    policy = " ".join(raw_policy.split())
+
+    required_globs = [
+        "`--glob '!pCloudDrive/**'`",
+        "`--glob '!pCloud/**'`",
+        "`--glob '!**/pCloudDrive/**'`",
+        "`--glob '!**/pCloud/**'`",
+    ]
+    required_meanings = [
+        "Jeder normale `rg`-Lauf enthält alle vier exakten Globs",
+        "`/home/teladi/pCloud` darf nicht als Suchwurzel übergeben werden",
+        "Normales GNU `grep` nicht verwenden",
+        "GNU grep kennt `--glob` nicht",
+        "stattdessen `rg` verwenden",
+        "Explizite Suche im jeweils benannten pCloud-Namensraum ist die einzige Ausnahme",
+    ]
+
+    for glob in required_globs:
+        assert raw_policy.count(glob) == 1
     for meaning in required_meanings:
         assert meaning in policy
 

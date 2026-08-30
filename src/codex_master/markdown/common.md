@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":7,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":8,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -63,6 +63,21 @@ Follow the active class profile in this home. Do not load another bee's class
 profile or copy class-specific instructions from another home. The Hive may
 replace this file and the active class file on a safe start or class change.
 Running sessions are not modified in place.
+
+## Dateisuchen außerhalb benannter pCloud-Namensräume
+
+Jeder normale `rg`-Lauf enthält alle vier exakten Globs:
+
+- `--glob '!pCloudDrive/**'`
+- `--glob '!pCloud/**'`
+- `--glob '!**/pCloudDrive/**'`
+- `--glob '!**/pCloud/**'`
+
+`/home/teladi/pCloud` darf nicht als Suchwurzel übergeben werden. Normales GNU
+`grep` nicht verwenden: GNU grep kennt `--glob` nicht; stattdessen `rg`
+verwenden. Explizite Suche im jeweils benannten pCloud-Namensraum ist die
+einzige Ausnahme. Diese gemeinsame Regel wird für jede Klasse und jedes Home
+beim Spawn und Resume mit diesem Common Hive context materialisiert.
 
 ## OpenAI-Account- und Context-Reset-Policy
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master import fleet_markdown
+from codex_master import fleet_markdown, server as server_module
 from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from codex_master.hive_policy import (
     MAX_COMMON_POLICY_BYTES,
@@ -33,6 +33,20 @@ geladen werden, aber die Ausführung bleibt explizit
 `visual_companion_unavailable`; verwende keine Scheinfunktion oder
 Übergangslösung.
 """.encode("utf-8")
+_PCLOUD_RIPGREP_GLOBS = (
+    b"--glob '!pCloudDrive/**'",
+    b"--glob '!pCloud/**'",
+    b"--glob '!**/pCloudDrive/**'",
+    b"--glob '!**/pCloud/**'",
+)
+_PCLOUD_ROOT_RULE = (
+    "`/home/teladi/pCloud` darf nicht als Suchwurzel übergeben werden"
+).encode("utf-8")
+_PCLOUD_GREP_RULE = "Normales GNU `grep` nicht verwenden".encode("utf-8")
+_PCLOUD_EXCEPTION_RULE = (
+    "Explizite Suche im jeweils benannten pCloud-Namensraum ist die einzige "
+    "Ausnahme"
+).encode("utf-8")
 
 
 def _agent(
@@ -117,6 +131,53 @@ def test_providers_share_exact_common_prefix_and_only_reference_class_body() -> 
         assert worker_body not in primary
 
 
+def test_pcloud_search_policy_projects_to_all_effective_catalog_profiles_and_provider_homes() -> None:
+    contract = load_common_policy()
+    profiles = server_module._known_runtime_skill_profiles("test_invalid_profile")
+    assert profiles == frozenset(
+        {
+            "goettin",
+            "gottbiene",
+            "koenigin",
+            "spezialistin",
+            "teamleiterin",
+            "worker",
+        }
+    )
+
+    for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+        for profile in sorted(profiles):
+            projection = fleet_markdown.fleet_markdown_projection(
+                _agent(runner, profile)
+            )
+            primary = projection.artifacts[projection.metadata.provider_artifact_name]
+            class_artifact = projection.artifacts[
+                projection.metadata.class_artifact_name
+            ]
+            normalized_primary = b" ".join(primary.split())
+            class_name = f"AGENTS.class-{profile}.md"
+            expected_class_artifact_name = (
+                f".gemini/{class_name}"
+                if runner is RunnerKind.GEMINI_CLI
+                else class_name
+            )
+
+            assert primary.startswith(contract.common_bytes)
+            assert projection.metadata.class_profile == profile
+            assert projection.metadata.class_artifact_name == expected_class_artifact_name
+            for glob in _PCLOUD_RIPGREP_GLOBS:
+                assert primary.count(glob) == 1
+            assert _PCLOUD_GREP_RULE in normalized_primary
+            assert _PCLOUD_ROOT_RULE in normalized_primary
+            assert _PCLOUD_EXCEPTION_RULE in normalized_primary
+            assert not class_artifact.startswith(contract.common_bytes)
+            for glob in _PCLOUD_RIPGREP_GLOBS:
+                assert glob not in class_artifact
+            assert _PCLOUD_GREP_RULE not in class_artifact
+            assert _PCLOUD_ROOT_RULE not in class_artifact
+            assert _PCLOUD_EXCEPTION_RULE not in class_artifact
+
+
 def test_visual_companion_rule_is_identical_in_teamlead_profiles_and_providers() -> (
     None
 ):
@@ -161,7 +222,7 @@ def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
     primary = projection.artifacts[metadata.provider_artifact_name]
 
     assert metadata.schema_version == 1
-    assert metadata.generation == 7
+    assert metadata.generation == 8
     assert metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
     assert metadata.common_size == len(_COMMON_BYTES) <= MAX_COMMON_POLICY_BYTES
     assert metadata.provider_artifact_name == "AGENTS.md"
@@ -187,7 +248,7 @@ def test_provider_projection_digests_are_deterministic_and_distinct() -> None:
 
 def test_canonical_header_remains_first_in_both_provider_artifacts() -> None:
     expected_header = (
-        b'<!-- codex-master-common-policy:{"generation":7,"schema_version":1} -->'
+        b'<!-- codex-master-common-policy:{"generation":8,"schema_version":1} -->'
     )
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
@@ -215,7 +276,7 @@ def test_both_provider_projections_carry_same_annotation_response_policy() -> No
         assert required_inline_link in primary
         assert obsolete_line not in primary
         assert projection.metadata.common_digest == contract.common_digest
-        assert projection.metadata.generation == contract.generation == 7
+        assert projection.metadata.generation == contract.generation == 8
 
 
 def test_both_provider_projections_carry_corrected_annotation_heading_and_guards() -> (
@@ -298,14 +359,14 @@ def test_both_provider_projections_carry_identical_inline_and_multi_source_guard
         assert projection.metadata.common_digest == contract.common_digest
 
 
-def test_both_provider_projections_carry_same_generation_seven_policy_bytes() -> None:
+def test_both_provider_projections_carry_same_generation_eight_policy_bytes() -> None:
     contract = load_common_policy()
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
         projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
         primary = projection.artifacts[projection.metadata.provider_artifact_name]
         assert primary[: len(contract.common_bytes)] == contract.common_bytes
-        assert projection.metadata.generation == contract.generation == 7
+        assert projection.metadata.generation == contract.generation == 8
 
 
 def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> None:
@@ -340,7 +401,7 @@ def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> N
         assert primary.startswith(contract.common_bytes)
         for fragment in required_fragments:
             assert fragment in primary
-        assert projection.metadata.generation == contract.generation == 7
+        assert projection.metadata.generation == contract.generation == 8
 
 
 def test_both_provider_projections_carry_side_effect_free_external_plan_handoff():
@@ -368,7 +429,7 @@ def test_both_provider_projections_carry_side_effect_free_external_plan_handoff(
             assert fragment in normalized_primary
         for backend in (b"wl-copy", b"xclip", b"xsel"):
             assert backend not in primary
-        assert projection.metadata.generation == contract.generation == 7
+        assert projection.metadata.generation == contract.generation == 8
 
 
 def test_both_provider_projections_carry_unencoded_local_file_link_contract() -> None:
