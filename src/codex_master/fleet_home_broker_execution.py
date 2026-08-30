@@ -1,4 +1,4 @@
-"""Root-owned offline CHPB/2 provision execution composition.
+"""Root-owned offline CHPB/2 provision and replacement execution composition.
 
 This module is deliberately an adapter around the existing offline transaction,
 WAL, Linux-attestation, and B2a recovery contracts.  It owns no transport and
@@ -36,6 +36,7 @@ from codex_master.fleet_home_broker_protocol import (
     ChpbTransactionOperation,
     PolicyBinding,
     ProvisionHomeRequest,
+    ReplaceHomeRequest,
     TransactionBinding,
     TransactionStatus,
     b2a_phase_for_checkpoint,
@@ -54,8 +55,13 @@ from codex_master.fleet_home_broker_wal import (
 _INITIAL_PROVISION_OBSERVATION = BrokerObservation(
     BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 0
 )
+_INITIAL_REPLACEMENT_OBSERVATION = BrokerObservation(
+    BrokerObjectState.REPLACEMENT_ORIGINAL,
+    BrokerRegistryState.NOT_APPLICABLE,
+    0,
+)
 _MAX_DRIVE_STEPS = 2 * 256 + 16
-_PROVISION_CHECKPOINTS = {
+_EXECUTION_CHECKPOINTS = {
     BrokerCheckpoint.CREATE_INTENT,
     BrokerCheckpoint.STAGING_PINNED,
     BrokerCheckpoint.POPULATE_PENDING,
@@ -65,11 +71,18 @@ _PROVISION_CHECKPOINTS = {
     BrokerCheckpoint.FINALIZE_INTENT,
     BrokerCheckpoint.COMMITTED,
     BrokerCheckpoint.BLOCKED_DRIFT,
+    BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT,
+    BrokerCheckpoint.REPLACEMENT_PREPARED,
+    BrokerCheckpoint.SWITCH_INTENT,
+    BrokerCheckpoint.SWITCHED,
 }
+_SUPPORTED_OPERATIONS = frozenset(
+    (ChpbTransactionOperation.PROVISION, ChpbTransactionOperation.REPLACE)
+)
 
 
-class RootBrokerProvisionOperations(Protocol):
-    """Injected root-owned effects used by the provision recovery rules."""
+class RootBrokerExecutionOperations(Protocol):
+    """Injected root-owned effects selected by the existing B2a recovery rules."""
 
     def new_transaction_id(self) -> str: ...
 
@@ -81,6 +94,12 @@ class RootBrokerProvisionOperations(Protocol):
 
     def publish_home(self, plan: OfflineBrokerPlan) -> None: ...
 
+    def prepare_replacement(self, plan: OfflineBrokerPlan) -> None: ...
+
+    def switch_replacement(
+        self, plan: OfflineBrokerPlan, binding: TransactionBinding
+    ) -> None: ...
+
     def cas_registry(
         self, plan: OfflineBrokerPlan, binding: TransactionBinding
     ) -> None: ...
@@ -88,11 +107,16 @@ class RootBrokerProvisionOperations(Protocol):
     def close(self, fd: int) -> None: ...
 
 
+# A2's public protocol name remains an alias for compatibility while A3a adds
+# the replacement-only primitives to the same single injection boundary.
+RootBrokerProvisionOperations = RootBrokerExecutionOperations
+
+
 @dataclass(frozen=True, slots=True)
 class _FixedTransactionOperations:
     """Keep broker bootstrap bound to the caller's pre-attested transaction."""
 
-    operations: RootBrokerProvisionOperations
+    operations: RootBrokerExecutionOperations
     transaction_id: str
 
     def new_transaction_id(self) -> str:
@@ -106,11 +130,11 @@ class _FixedTransactionOperations:
 
 
 class RootBrokerExecutionComposition(BrokerDispatchOperations):
-    """The one offline provision implementation behind dispatch and intents."""
+    """The one offline provision/replacement implementation behind dispatch."""
 
     def __init__(
         self,
-        operations: RootBrokerProvisionOperations,
+        operations: RootBrokerExecutionOperations,
         linux_operations: LinuxOperations,
         wal_operations: WalOperations,
         *,
@@ -137,8 +161,12 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
             if (
                 type(command) is not BrokerDispatchCommand
                 or type(plan) is not OfflineBrokerPlan
-                or type(request) is not ProvisionHomeRequest
-                or plan.operation is not ChpbTransactionOperation.PROVISION
+                or type(request)
+                is not {
+                    ChpbTransactionOperation.PROVISION: ProvisionHomeRequest,
+                    ChpbTransactionOperation.REPLACE: ReplaceHomeRequest,
+                }.get(plan.operation)
+                or plan.operation not in _SUPPORTED_OPERATIONS
                 or not self._valid_request_id(request.request_id)
                 or command.principal != plan.expected_principal
                 or request.binding != self._binding_for(plan, request.transaction_id)
@@ -168,7 +196,9 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
             not self._plan_matches_intent(plan, intent)
             or type(context) is not BrokerIntentResumeContext
             or context.transaction_id != transaction_id
-            or not self._is_initial_provision_observation(context.initial_observation)
+            or not self._is_initial_observation(
+                plan.operation, context.initial_observation
+            )
         ):
             return self._blocked(plan, transaction_id, request_id, None)
 
@@ -267,6 +297,12 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
                 if decision.action is BrokerRecoveryAction.PUBLISH_HOME:
                     self._operations.publish_home(plan)
                     continue
+                if decision.action is BrokerRecoveryAction.PREPARE_REPLACEMENT:
+                    self._operations.prepare_replacement(plan)
+                    continue
+                if decision.action is BrokerRecoveryAction.SWITCH_REPLACEMENT:
+                    self._operations.switch_replacement(plan, status.binding)
+                    continue
                 if decision.action is BrokerRecoveryAction.CAS_REGISTRY:
                     self._operations.cas_registry(plan, status.binding)
                     continue
@@ -314,7 +350,7 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
             status = recovered.status
             if not self._matches(plan, transaction_id, status):
                 return None
-            if status.checkpoint not in _PROVISION_CHECKPOINTS:
+            if status.checkpoint not in _EXECUTION_CHECKPOINTS:
                 return None
             if recovered.decision.action is BrokerRecoveryAction.RETURN_BLOCKED:
                 return None
@@ -371,11 +407,14 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
         try:
             binding = self._binding_for(plan, transaction_id)
             total = plan.population_total
+            initial_observation = self._initial_observation(plan.operation)
+            if initial_observation is None:
+                raise ValueError("unsupported operation")
             status = TransactionStatus(
                 binding,
                 B2aRecoveryPhase.BLOCKED,
                 BrokerCheckpoint.BLOCKED_DRIFT,
-                _INITIAL_PROVISION_OBSERVATION,
+                initial_observation,
                 total,
                 BrokerResultCode.BLOCKED_DRIFT,
             )
@@ -440,11 +479,20 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
         return RootBrokerExecutionComposition._valid_transaction_id(request_id)
 
     @staticmethod
-    def _is_initial_provision_observation(value: object) -> bool:
+    def _initial_observation(operation: object) -> BrokerObservation | None:
+        return {
+            ChpbTransactionOperation.PROVISION: _INITIAL_PROVISION_OBSERVATION,
+            ChpbTransactionOperation.REPLACE: _INITIAL_REPLACEMENT_OBSERVATION,
+        }.get(operation)
+
+    @classmethod
+    def _is_initial_observation(cls, operation: object, value: object) -> bool:
+        expected = cls._initial_observation(operation)
         return (
             type(value) is BrokerObservation
-            and value.object_state is BrokerObjectState.ABSENT
-            and value.registry_state is BrokerRegistryState.NOT_APPLICABLE
+            and expected is not None
+            and value.object_state is expected.object_state
+            and value.registry_state is expected.registry_state
             and type(value.population_index) is int
             and value.population_index == 0
         )
@@ -488,7 +536,7 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
         try:
             return (
                 plan.operation is ChpbTransactionOperation(intent.operation.value)
-                and plan.operation is ChpbTransactionOperation.PROVISION
+                and plan.operation in _SUPPORTED_OPERATIONS
                 and plan.store_uuid == intent.store_uuid
                 and plan.expected_principal.agent_id == intent.agent_id
                 and plan.expected_principal.manifest_generation
@@ -509,4 +557,8 @@ class RootBrokerExecutionComposition(BrokerDispatchOperations):
             return False
 
 
-__all__ = ("RootBrokerExecutionComposition", "RootBrokerProvisionOperations")
+__all__ = (
+    "RootBrokerExecutionComposition",
+    "RootBrokerExecutionOperations",
+    "RootBrokerProvisionOperations",
+)
