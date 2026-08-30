@@ -701,6 +701,37 @@ def test_invalid_response_closes_unique_valid_fds_and_masks_close_failures():
     assert operations.closed == [74, 75]
 
 
+@pytest.mark.parametrize(
+    ("fds", "closed"),
+    (
+        ([83, 83, True, -1, "bad", 84], [83, 84]),
+        ({86, 85, True, -1}, [85, 86]),
+        (frozenset((88, 87, True, -1)), [87, 88]),
+        ({"bad": 89}, []),
+        ("not-an-fd-container", []),
+    ),
+)
+def test_invalid_response_fd_cleanup_accepts_only_explicit_safe_containers(fds, closed):
+    request = _read_request(ChpbMessageKind.QUERY_TRANSACTION)
+    invalid = BrokerTransportResponse(
+        BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            REQUEST_ID,
+            BrokerResultCode.PENDING,
+            None,
+            None,
+        ),
+        fds,
+    )
+    operations = FakeOperations((invalid,), close_error=True)
+    with pytest.raises(
+        dispatch.BrokerDispatchError, match="^invalid broker dispatch response$"
+    ):
+        dispatch.dispatch_request(PEER, request, FakeResolver(plan=_plan()), operations)
+    assert operations.closed == closed
+
+
 def test_imports_and_tokens_have_no_host_runtime_or_transaction_bootstrap_surface():
     source = inspect.getsource(dispatch)
     tree = ast.parse(source)

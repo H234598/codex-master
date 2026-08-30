@@ -158,12 +158,14 @@ def _response_fds(value: object) -> tuple[int, ...]:
         fds = value.fds
     except Exception:
         return ()
-    if type(fds) not in (tuple, list):
+    if type(fds) not in (tuple, list, set, frozenset):
         return ()
     result = []
     for fd in fds:
         if type(fd) is int and fd >= 0 and fd not in result:
             result.append(fd)
+    if type(fds) in (set, frozenset):
+        result.sort()
     return tuple(result)
 
 
