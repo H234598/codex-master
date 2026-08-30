@@ -385,6 +385,202 @@ def test_ollama_rest_queries_bind_exact_operation(tmp_path, target, operation) -
 
 
 @pytest.mark.parametrize(
+    ("target", "operation", "arguments"),
+    [
+        ("/admin/v1/hosts", "hosts.list", {}),
+        ("/admin/v1/openai/accounts", "openai.accounts.list", {}),
+        ("/admin/v1/google/accounts", "google.accounts.list", {}),
+        (
+            "/admin/v1/google/accounts/google-one",
+            "google.projects.list",
+            {"account_ref": "google-one"},
+        ),
+    ],
+)
+def test_documented_rest_queries_bind_exact_operation(
+    tmp_path, target, operation, arguments
+) -> None:
+    with _running_server(tmp_path) as (server, service):
+        status, headers, payload = _request(server, "GET", target, b"", _headers())
+
+    assert status == 200
+    assert headers["Cache-Control"] == "no-store"
+    assert json.loads(payload)["operation"] == operation
+    assert service.calls[0][1] == AdminRequestV1(
+        operation, arguments, None, None, None
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "operation", "arguments", "extra"),
+    [
+        (
+            "/admin/v1/openai/accounts",
+            "openai.accounts.add",
+            {"account_ref": "openai-two", "label": "OpenAI Two"},
+            {"expected_generation": 4, "idempotency_key": "account-add"},
+        ),
+        (
+            "/admin/v1/openai/accounts/openai-one/auth-sync-plans",
+            "openai.auth.plan",
+            {"account_ref": "openai-one"},
+            {"expected_generation": 4, "idempotency_key": "auth-plan"},
+        ),
+        (
+            f"/admin/v1/openai/accounts/openai-one/auth-sync-plans/{DIGEST}/apply",
+            "openai.auth.apply",
+            {"account_ref": "openai-one"},
+            {
+                "expected_generation": 4,
+                "idempotency_key": "auth-apply",
+                "plan_digest": DIGEST,
+            },
+        ),
+        (
+            "/admin/v1/secret-ingress-sessions",
+            "secret.ingress.create",
+            {"account_ref": "openai-one", "credential_kind": "openai.auth-json"},
+            {
+                "expected_generation": 4,
+                "idempotency_key": "ingress-create",
+                "plan_digest": DIGEST,
+            },
+        ),
+        (
+            "/admin/v1/google/oauth-transactions",
+            "google.oauth.begin",
+            {
+                "account_ref": "google-one",
+                "oauth_client_ref": "client-one",
+                "redirect_uri": "http://127.0.0.1/callback",
+                "scope_profile": "inventory",
+            },
+            {"expected_generation": 4, "idempotency_key": "oauth-begin"},
+        ),
+        (
+            "/admin/v1/google/oauth-transactions/transaction-one/complete",
+            "google.oauth.complete",
+            {
+                "account_ref": "google-one",
+                "transaction_id": "transaction-one",
+                "redirect_uri": "http://127.0.0.1/callback",
+                "state": "state-one",
+            },
+            {"expected_generation": 4},
+        ),
+        (
+            "/admin/v1/google/oauth-client-import-plans",
+            "google.oauth-client-import.plan",
+            {"account_ref": "google-one"},
+            {"expected_generation": 4, "idempotency_key": "client-plan"},
+        ),
+        (
+            f"/admin/v1/google/oauth-client-import-plans/{DIGEST}/apply",
+            "google.oauth-client-import.apply",
+            {"account_ref": "google-one"},
+            {
+                "expected_generation": 4,
+                "idempotency_key": "client-apply",
+                "plan_digest": DIGEST,
+            },
+        ),
+        (
+            "/admin/v1/google/inventory-refreshes",
+            "google.inventory.refresh",
+            {},
+            {"expected_generation": 4, "idempotency_key": "inventory-refresh"},
+        ),
+        (
+            "/admin/v1/google/provision-plans",
+            "google.provision.plan",
+            {"account_ref": "google-one"},
+            {"expected_generation": 4, "idempotency_key": "provision-plan"},
+        ),
+        (
+            f"/admin/v1/google/provision-plans/{DIGEST}/apply",
+            "google.provision.apply",
+            {"account_ref": "google-one"},
+            {
+                "expected_generation": 4,
+                "idempotency_key": "provision-apply",
+                "plan_digest": DIGEST,
+            },
+        ),
+        (
+            "/admin/v1/google/billing-bind-plans",
+            "google.billing.plan",
+            {
+                "account_ref": "google-one",
+                "project_ref": "project-one",
+                "billing_ref": "billing-one",
+            },
+            {"expected_generation": 4, "idempotency_key": "billing-plan"},
+        ),
+        (
+            "/admin/v1/google/billing-bind-plans/plan-one/apply",
+            "google.billing.apply",
+            {
+                "account_ref": "google-one",
+                "project_ref": "project-one",
+                "billing_ref": "billing-one",
+                "plan_id": "plan-one",
+            },
+            {
+                "expected_generation": 4,
+                "idempotency_key": "billing-apply",
+                "plan_digest": DIGEST,
+            },
+        ),
+    ],
+)
+def test_documented_rest_commands_bind_route_identity(
+    tmp_path, target, operation, arguments, extra
+) -> None:
+    with _running_server(tmp_path) as (server, service):
+        status, _headers_out, payload = _request(
+            server,
+            "POST",
+            target,
+            _document(operation, arguments, **extra),
+            _headers(**{"X-Masterjet-Step-Up": _totp()}),
+        )
+
+    assert status == 200
+    assert json.loads(payload)["operation"] == operation
+    assert service.calls[0][1] == AdminRequestV1(
+        operation,
+        arguments,
+        extra.get("expected_generation"),
+        extra.get("idempotency_key"),
+        extra.get("plan_digest"),
+    )
+
+
+def test_documented_rest_path_and_request_identity_cannot_diverge(tmp_path) -> None:
+    with _running_server(tmp_path) as (server, service):
+        status, _headers_out, payload = _request(
+            server,
+            "POST",
+            "/admin/v1/google/oauth-transactions/transaction-one/complete",
+            _document(
+                "google.oauth.complete",
+                {
+                    "account_ref": "google-one",
+                    "transaction_id": "transaction-two",
+                    "redirect_uri": "http://127.0.0.1/callback",
+                    "state": "state-one",
+                },
+                expected_generation=4,
+            ),
+            _headers(),
+        )
+
+    assert status == 400
+    assert json.loads(payload)["code"] == "control.request_invalid"
+    assert service.calls == []
+
+
+@pytest.mark.parametrize(
     "method", ["DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"]
 )
 def test_ollama_rest_queries_reject_unsupported_methods(tmp_path, method) -> None:
