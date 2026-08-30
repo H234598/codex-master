@@ -136,10 +136,17 @@ def test_runtime_resource_gates_validate_account_model_usage_and_lease(
     )
 
     admission = make_admission()
-    assert_decision(server._server_runtime_account_gate(admission), True, "account_ready")
-    assert_decision(server._server_runtime_model_gate(admission), True, "model_verified")
-    assert_decision(server._server_runtime_usage_gate(admission), True, "usage_verified")
-    assert_decision(server._server_runtime_lease_gate(admission), True, "lease_verified")
+    assert [
+        server._server_runtime_account_gate(admission).public(),
+        server._server_runtime_model_gate(admission).public(),
+        server._server_runtime_usage_gate(admission).public(),
+        server._server_runtime_lease_gate(admission).public(),
+    ] == [
+        {"allowed": True, "reason_code": "account_ready"},
+        {"allowed": True, "reason_code": "model_verified"},
+        {"allowed": True, "reason_code": "usage_verified"},
+        {"allowed": True, "reason_code": "lease_verified"},
+    ]
 
     assert_decision(
         server._server_runtime_account_gate(make_admission(account_key="other")),
@@ -175,9 +182,15 @@ def test_runtime_process_auth_and_config_gates_cover_codex_and_gemini(
     monkeypatch.setattr(server, "is_regular_executable_no_symlink", lambda path: True)
 
     admission = make_admission()
-    assert_decision(server._server_runtime_process_gate(admission), True, "process_verified")
-    assert_decision(server._server_runtime_auth_gate(admission), True, "auth_verified")
-    assert_decision(server._server_runtime_config_gate(admission), True, "config_verified")
+    assert [
+        server._server_runtime_process_gate(admission).public(),
+        server._server_runtime_auth_gate(admission).public(),
+        server._server_runtime_config_gate(admission).public(),
+    ] == [
+        {"allowed": True, "reason_code": "process_verified"},
+        {"allowed": True, "reason_code": "auth_verified"},
+        {"allowed": True, "reason_code": "config_verified"},
+    ]
 
     gemini = make_descriptor(
         agent_id="g1",

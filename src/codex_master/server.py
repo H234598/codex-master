@@ -42750,7 +42750,7 @@ _G_MIGRATION_CRASHED: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 
 def _g_migration_crash_point(_point: str) -> None:
-    """Private test seam; production has no crash injection."""
+    return None  # Private test seam; production has no crash injection.
 
 
 def _g_migration_checkpoint(point: str) -> None:
