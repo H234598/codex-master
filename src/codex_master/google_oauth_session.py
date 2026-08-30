@@ -594,6 +594,50 @@ class GoogleOAuthControlService:
             raise GoogleOAuthSessionError("oauth.account_mismatch") from None
         return cast(int, snapshot.generation)
 
+    def account_oauth_state(
+        self, account_ref: str, *, expected_generation: int
+    ) -> str:
+        """Project current non-secret OAuth authority state for one account."""
+
+        account_ref = self._ref(account_ref)
+        expected_generation = self._generation(expected_generation)
+        if self.account_generation(account_ref) != expected_generation:
+            raise GoogleOAuthSessionError("oauth.generation_mismatch")
+        try:
+            with self._state.locked():
+                document = self._read_locked()
+                transactions = [
+                    cast(dict[str, object], item)
+                    for item in cast(list[object], document["transactions"])
+                    if cast(dict[str, object], item)["account_ref"] == account_ref
+                    and cast(dict[str, object], item)["inventory_generation"]
+                    == expected_generation
+                ]
+                for record in reversed(transactions):
+                    if (
+                        record["state"] != "succeeded"
+                        or record["token_operation_id"] is None
+                    ):
+                        continue
+                    receipt = self._lookup_token_receipt(record)
+                    if receipt is None:
+                        return "stale"
+                    self._validate_token_receipt(record, receipt)
+                    return "ready"
+                if any(
+                    record["state"] in {"reconcile_required", "repair_required"}
+                    for record in transactions
+                ):
+                    return "repair_required"
+                if any(
+                    record["state"] in {"pending", "completing", "persisting"}
+                    for record in transactions
+                ):
+                    return "pending"
+        except (HiveStateError, OSError):
+            return "unavailable"
+        return "needs_auth"
+
     @staticmethod
     def _empty_document() -> dict[str, object]:
         return {

@@ -734,12 +734,23 @@ class CredentialQuotaCollector:
                 raise HiveStateError("invalid_google_quota_evidence") from None
         return evidence
 
-    def collect(self, account_ref: str, *, expected_generation: int) -> object:
+    def collect(
+        self, account_ref: str, *, expected_generation: int
+    ) -> GoogleQuotaEvidenceV1:
         with self._state.locked():
             evidence = self._evidence(self._read_locked()).get(account_ref)
         if evidence is None or evidence.inventory_generation != expected_generation:
             raise GoogleCloudProvisionerError("quota.evidence_invalid")
         return evidence
+
+    def quota_state(self, account_ref: str, *, expected_generation: int) -> str:
+        try:
+            evidence = self.collect(
+                account_ref, expected_generation=expected_generation
+            )
+        except (AdminAssemblyError, GoogleCloudProvisionerError, HiveStateError):
+            return "unavailable"
+        return "exhausted" if evidence.remaining == 0 else "fresh"
 
     def sync(
         self,

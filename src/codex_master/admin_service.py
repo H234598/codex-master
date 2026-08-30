@@ -26,7 +26,10 @@ from .admin_hosts import ControlHostV1, HostRegistry, HostRegistryError
 from .admin_operations import AdminOperationError, AdminOperationStore
 from .credential_vault import CredentialVault
 from .google_account_inventory import GoogleAccountInventoryError
-from .google_account_inventory_manager import GoogleAccountInventoryManager
+from .google_account_inventory_manager import (
+    GoogleAccountInventoryManager,
+    GoogleAccountInventoryStatusV1,
+)
 from .google_billing_service import (
     GoogleBillingError,
     GoogleBillingPlanV1,
@@ -103,6 +106,10 @@ _INGRESS_APPLY_KINDS = MappingProxyType(
 _CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z", re.ASCII)
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_GOOGLE_OAUTH_STATES = frozenset(
+    {"needs_auth", "pending", "ready", "repair_required", "stale", "unavailable"}
+)
+_GOOGLE_QUOTA_STATES = frozenset({"exhausted", "fresh", "unavailable"})
 _FORBIDDEN_ARGUMENT_KEYS = frozenset(
     {
         "access_token",
@@ -148,6 +155,8 @@ class AccountRegistryPort(Protocol):
 
 class QuotaCollectorPort(Protocol):
     def collect(self, account_ref: str, *, expected_generation: int) -> object: ...
+
+    def quota_state(self, account_ref: str, *, expected_generation: int) -> str: ...
 
     def sync(self, account_ref: str, **values: object) -> Mapping[str, object]: ...
 
@@ -235,10 +244,14 @@ class OpenAIAccountSummaryV1:
 class GoogleAccountSummaryV1:
     ref: str
     label: str | None
+    enabled: bool
     subject_bound: bool
+    oauth_state: str
     inventory_generation: int
+    quota_state: str
     project_count: int
     billing_count: int
+    reload_state: str
     default_oauth_client_ref: str | None
     oauth_client_availability: str
 
@@ -761,17 +774,23 @@ class MasterjetControlService:
         }
 
     def _google_accounts_list(self, *_values: object) -> dict[str, object]:
+        status = self._google_manager.status()
+        if type(status) is not GoogleAccountInventoryStatusV1:
+            raise _service_error("control.response_private")
         return {
             "accounts": [
-                _serialize_google_account(self._google_account_summary(item))
+                _serialize_google_account(self._google_account_summary(item, status))
                 for item in self._google_manager.list_accounts()
             ]
         }
 
-    def _google_account_summary(self, value: object) -> GoogleAccountSummaryV1:
+    def _google_account_summary(
+        self, value: object, status: GoogleAccountInventoryStatusV1
+    ) -> GoogleAccountSummaryV1:
         account = _google_inventory_account(value)
         account_ref = cast(str, account["ref"])
         generation = cast(int, account["inventory_generation"])
+        oauth_state = "unavailable"
         binding = GoogleOAuthClientBindingV1(
             account_ref,
             generation,
@@ -805,13 +824,35 @@ class MasterjetControlService:
                     )
                 ):
                     binding = candidate
+            try:
+                candidate_state = owner.account_oauth_state(
+                    account_ref, expected_generation=generation
+                )
+            except GoogleOAuthSessionError:
+                pass
+            else:
+                if candidate_state not in _GOOGLE_OAUTH_STATES:
+                    raise _service_error("control.response_private")
+                oauth_state = candidate_state
+        quota_state = "unavailable"
+        if self._quota_collector is not None:
+            candidate_state = self._quota_collector.quota_state(
+                account_ref, expected_generation=generation
+            )
+            if candidate_state not in _GOOGLE_QUOTA_STATES:
+                raise _service_error("control.response_private")
+            quota_state = candidate_state
         return GoogleAccountSummaryV1(
             account_ref,
             cast(str | None, account["label"]),
+            status.new_work_allowed,
             cast(bool, account["subject_bound"]),
+            oauth_state,
             generation,
+            quota_state,
             cast(int, account["project_count"]),
             cast(int, account["billing_count"]),
+            status.state.value,
             binding.default_oauth_client_ref,
             binding.availability.value,
         )
@@ -1605,10 +1646,14 @@ def _serialize_google_account(value: GoogleAccountSummaryV1) -> dict[str, object
     return {
         "ref": value.ref,
         "label": value.label,
+        "enabled": value.enabled,
         "subject_bound": value.subject_bound,
+        "oauth_state": value.oauth_state,
         "inventory_generation": value.inventory_generation,
+        "quota_state": value.quota_state,
         "project_count": value.project_count,
         "billing_count": value.billing_count,
+        "reload_state": value.reload_state,
         "default_oauth_client_ref": value.default_oauth_client_ref,
         "oauth_client_availability": value.oauth_client_availability,
     }

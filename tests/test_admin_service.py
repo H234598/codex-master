@@ -296,6 +296,21 @@ class GoogleManager:
     def inventory_generation(self) -> int:
         return self.generation
 
+    def status(self) -> GoogleAccountInventoryStatusV1:
+        return GoogleAccountInventoryStatusV1(
+            InventoryManagerStateV1.READY,
+            self.generation,
+            "2026-08-28T10:00:00Z",
+            InventorySourceTypeV1.TEST,
+            "sha256:" + "b" * 64,
+            True,
+            None,
+            1,
+            1,
+            1,
+            1,
+        )
+
     def reload(self, *, expected_generation: int) -> GoogleAccountInventoryStatusV1:
         assert expected_generation == self.generation
         self.reload_calls += 1
@@ -344,6 +359,12 @@ class GoogleOAuth:
                 admin_service_module.GoogleOAuthClientAvailabilityV1.MISSING,
             ),
         )
+
+    def account_oauth_state(
+        self, _account_ref: str, *, expected_generation: int
+    ) -> str:
+        assert expected_generation == self.generation
+        return "ready"
 
     def begin_oauth_transaction(
         self, account_ref: str, **values: object
@@ -409,6 +430,11 @@ class QuotaCollector:
                 "remaining": 3,
             }
         )
+
+    def quota_state(self, account_ref: str, *, expected_generation: int) -> str:
+        assert account_ref == "google-one"
+        assert expected_generation == 4
+        return "fresh"
 
     def sync(self, account_ref: str, **values: object) -> dict[str, object]:
         self.sync_calls.append((account_ref, values))
@@ -842,6 +868,10 @@ def test_google_inventory_query_uses_manager_once() -> None:
 
     assert result["accounts"][0]["ref"] == "google-one"  # type: ignore[index]
     assert result["accounts"][0]["inventory_generation"] == 4  # type: ignore[index]
+    assert result["accounts"][0]["enabled"] is True  # type: ignore[index]
+    assert result["accounts"][0]["oauth_state"] == "ready"  # type: ignore[index]
+    assert result["accounts"][0]["quota_state"] == "fresh"  # type: ignore[index]
+    assert result["accounts"][0]["reload_state"] == "ready"  # type: ignore[index]
     assert owners.google_manager.list_calls == 1
 
 

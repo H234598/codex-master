@@ -1054,6 +1054,7 @@ def test_quota_collector_reloads_evidence_for_every_plan(tmp_path: Path) -> None
     collector = CredentialQuotaCollector(state_root, _quota_evidence_payload(3))
 
     assert collector.collect("google-one", expected_generation=4).remaining == 3
+    assert collector.quota_state("google-one", expected_generation=4) == "fresh"
     collector.sync(
         "google-one",
         remaining=9,
@@ -1066,6 +1067,12 @@ def test_quota_collector_reloads_evidence_for_every_plan(tmp_path: Path) -> None
     assert collector.collect("google-one", expected_generation=4).remaining == 9
     restarted = CredentialQuotaCollector(state_root, _quota_evidence_payload(3))
     assert restarted.collect("google-one", expected_generation=4).remaining == 9
+
+    exhausted = CredentialQuotaCollector(
+        tmp_path / "exhausted-quota-state", _quota_evidence_payload(0)
+    )
+    assert exhausted.quota_state("google-one", expected_generation=4) == "exhausted"
+    assert exhausted.quota_state("google-one", expected_generation=5) == "unavailable"
 
 
 def test_product_service_allows_oauth_client_import_for_new_google_account(

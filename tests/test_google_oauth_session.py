@@ -678,6 +678,27 @@ def test_oauth_transaction_is_account_bound_and_code_is_consumed_once(
     assert len(exchange.calls) == 1
 
 
+def test_account_oauth_state_tracks_missing_pending_and_ready_authority(
+    tmp_path: Path,
+) -> None:
+    service, ingress, _exchange, _manager_instance = _service(tmp_path)
+    _plan, _session, imported = _import_client(service, ingress)
+
+    assert service.account_oauth_state("google-account-01", expected_generation=1) == (
+        "needs_auth"
+    )
+
+    transaction = _begin(service, imported.client_ref)
+    assert service.account_oauth_state("google-account-01", expected_generation=1) == (
+        "pending"
+    )
+
+    _complete(service, transaction)
+    assert service.account_oauth_state("google-account-01", expected_generation=1) == (
+        "ready"
+    )
+
+
 def test_provisioner_oauth_profile_is_stored_for_write_authority(
     tmp_path: Path,
 ) -> None:

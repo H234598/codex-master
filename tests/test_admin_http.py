@@ -1479,10 +1479,14 @@ def test_google_accounts_http_projects_real_bound_opaque_oauth_client_ref(
     assert set(account) == {
         "ref",
         "label",
+        "enabled",
         "subject_bound",
+        "oauth_state",
         "inventory_generation",
+        "quota_state",
         "project_count",
         "billing_count",
+        "reload_state",
         "default_oauth_client_ref",
         "oauth_client_availability",
     }
