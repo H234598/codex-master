@@ -117,6 +117,22 @@ def _active_intent_count(operations: FakeLinuxOperations) -> int:
     )
 
 
+def _admission_observation_ceiling() -> int:
+    return (
+        intent_store_module.MAX_PENDING_INTENT_RECORDS
+        + intent_store_module.MAX_TERMINAL_INTENT_RECORDS * 2
+        + intent_store_module.MAX_QUARANTINED_INTENT_RECORDS
+    )
+
+
+def _bounded_observation(
+    names: tuple[str, ...], complete: bool, overflow: bool
+) -> object:
+    return intent_store_module._BoundedIntentNameObservation(  # type: ignore[attr-defined]
+        names, complete, overflow
+    )
+
+
 def _terminal_evidence_records(
     claim_name: str, intent_payload: bytes
 ) -> tuple[str, bytes, str, bytes]:
@@ -261,6 +277,12 @@ class FakeLinuxOperations:
     def list_names(self, parent_fd: int) -> tuple[str, ...]:
         self.calls.append(("list_names", parent_fd))
         return tuple(sorted(self.files))
+
+    def observe_names_bounded(self, parent_fd: int, maximum: int) -> object:
+        self.calls.append(("observe_names_bounded", parent_fd, maximum))
+        if len(self.files) > maximum:
+            return _bounded_observation((), False, True)
+        return _bounded_observation(tuple(self.files), True, False)
 
     def read_all(self, fd: int) -> bytes:
         self.calls.append(("read_all", fd))
@@ -710,6 +732,156 @@ def test_linux_publish_admission_reports_queue_full_for_129_safe_active_entries(
     assert not any(name.startswith(".tmp-intent-") for name in operations.files)
 
 
+def test_linux_publish_admission_ceiling_is_bounded_before_active_scan() -> None:
+    operations = FakeLinuxOperations()
+    for index in range(128):
+        _add_active_intent(operations, _active_intent_name("pending", index))
+    for index in range(128):
+        _add_active_intent(operations, f".terminal-evidence-{index:032x}.json")
+        _add_active_intent(operations, f".terminal-commit-{index:032x}.json")
+        _add_active_intent(operations, f".quarantine-invalid-{index:032x}.json")
+    ceiling = _admission_observation_ceiling()
+    assert len(operations.files) == ceiling
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    calls_before_publish = len(operations.calls)
+
+    with pytest.raises(BrokerIntentError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+
+    assert raised.value.code is BrokerIntentCode.QUEUE_FULL
+    admission_calls = operations.calls[calls_before_publish:]
+    assert [call for call in admission_calls if call[0] == "observe_names_bounded"] == [
+        ("observe_names_bounded", 7, ceiling)
+    ]
+    assert not any(call[0] == "list_names" for call in admission_calls)
+    assert sum(call[0] == "openat2" for call in admission_calls) == 128
+    assert sum(call[0] == "close" for call in admission_calls) == 128
+    assert not any(
+        call[0] in {"write_all", "renameat2_noreplace", "fsync"}
+        or (call[0] == "openat2" and str(call[2]).startswith(".tmp-intent-"))
+        for call in admission_calls
+    )
+
+
+@pytest.mark.parametrize("kind", ("overflow", "incomplete"))
+def test_linux_publish_admission_rejects_nonfinal_bounded_observation(
+    kind: str,
+) -> None:
+    ceiling = _admission_observation_ceiling()
+
+    if kind == "overflow":
+        operations = FakeLinuxOperations()
+        for index in range(ceiling + 1):
+            _add_active_intent(operations, f".quarantine-overflow-{index:032x}.json")
+    else:
+
+        class IncompleteObservationOperations(FakeLinuxOperations):
+            def observe_names_bounded(self, parent_fd: int, maximum: int) -> object:
+                self.calls.append(("observe_names_bounded", parent_fd, maximum))
+                return _bounded_observation((), False, False)
+
+        operations = IncompleteObservationOperations()
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    calls_before_publish = len(operations.calls)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    admission_calls = operations.calls[calls_before_publish:]
+    assert [call for call in admission_calls if call[0] == "observe_names_bounded"] == [
+        ("observe_names_bounded", 7, ceiling)
+    ]
+    assert not any(
+        call[0]
+        in {"list_names", "openat2", "write_all", "renameat2_noreplace", "fsync"}
+        for call in admission_calls
+    )
+
+
+def test_linux_publish_admission_rejects_duplicate_bounded_observation() -> None:
+    name = _active_intent_name("pending", 0)
+
+    class DuplicateObservationOperations(FakeLinuxOperations):
+        def observe_names_bounded(self, parent_fd: int, maximum: int) -> object:
+            self.calls.append(("observe_names_bounded", parent_fd, maximum))
+            return _bounded_observation((name, name), True, False)
+
+    operations = DuplicateObservationOperations()
+    _add_active_intent(operations, name)
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    calls_before_publish = len(operations.calls)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    admission_calls = operations.calls[calls_before_publish:]
+    assert not any(
+        call[0]
+        in {"list_names", "openat2", "write_all", "renameat2_noreplace", "fsync"}
+        for call in admission_calls
+    )
+
+
+def test_linux_publish_admission_close_failure_is_not_queue_full() -> None:
+    class CloseFailureOperations(FakeLinuxOperations):
+        def close(self, fd: int) -> None:
+            self.calls.append(("close", fd))
+            raise OSError(errno.EIO, "admission-close-secret")
+
+    operations = CloseFailureOperations()
+    for index in range(128):
+        _add_active_intent(operations, _active_intent_name("pending", index))
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+
+    assert raised.value.code is LinuxBrokerCode.IO_FAILURE
+    assert not any(name.startswith(".tmp-intent-") for name in operations.files)
+
+
+def test_linux_publish_admission_preserves_identity_failure_when_active_close_fails() -> (
+    None
+):
+    class CloseFailureOperations(FakeLinuxOperations):
+        def close(self, fd: int) -> None:
+            self.calls.append(("close", fd))
+            raise OSError(errno.EIO, "admission-close-secret")
+
+    operations = CloseFailureOperations()
+    for index in range(128):
+        _add_active_intent(operations, _active_intent_name("pending", index))
+    unsafe_name = _active_intent_name("pending", 0)
+    safe_identity = operations.identities[unsafe_name]
+    operations.stat_sequences[unsafe_name] = [
+        safe_identity,
+        ObjectIdentity(8, safe_identity.ino, 0o100600, 0, 0, 2),
+    ]
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+
+    with pytest.raises(LinuxBrokerError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000128-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+
+    assert raised.value.code is LinuxBrokerCode.IDENTITY_MISMATCH
+
+
 @pytest.mark.parametrize(
     "mutate",
     (
@@ -755,8 +927,13 @@ def test_linux_publish_admission_rejects_active_entry_missing_after_listing() ->
     missing_name = _active_intent_name("pending", 128)
 
     class MissingActiveEntryOperations(FakeLinuxOperations):
-        def list_names(self, parent_fd: int) -> tuple[str, ...]:
-            return (*super().list_names(parent_fd), missing_name)
+        def observe_names_bounded(self, parent_fd: int, maximum: int) -> object:
+            observation = super().observe_names_bounded(parent_fd, maximum)
+            return _bounded_observation(
+                (*observation.names, missing_name),
+                True,
+                False,  # type: ignore[attr-defined]
+            )
 
     operations = MissingActiveEntryOperations()
     adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
@@ -1621,7 +1798,7 @@ def test_linux_publish_uses_openat2_exclusive_write_fsync_and_noreplace_rename()
         "selinux_label",
         "stat_fd",
         "selinux_label",
-        "list_names",
+        "observe_names_bounded",
         "stat_fd",
         "selinux_label",
         "openat2",

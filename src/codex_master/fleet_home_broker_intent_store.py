@@ -38,6 +38,12 @@ MAX_INTENT_STORE_CODE_BYTES = 64
 MAX_TERMINAL_INTENT_RECORDS = 128
 MAX_QUARANTINED_INTENT_RECORDS = 128
 MAX_PENDING_INTENT_RECORDS = 128
+# ponytail: This 4x ceiling covers active, terminal evidence+commit, and quarantine; increasing it needs a bounded-adapter and retention-model upgrade.
+MAX_INTENT_STORE_ADMISSION_OBSERVATION_RECORDS = (
+    MAX_PENDING_INTENT_RECORDS
+    + MAX_TERMINAL_INTENT_RECORDS * 2
+    + MAX_QUARANTINED_INTENT_RECORDS
+)
 MAX_TERMINAL_EVIDENCE_BYTES = MAX_BROKER_INTENT_BYTES * 2
 MAX_TERMINAL_COMMIT_BYTES = 256
 MAX_TERMINAL_STAGING_RECORDS = 8
@@ -169,6 +175,15 @@ class BrokerIntentClaimBytes:
     recovered: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _BoundedIntentNameObservation:
+    """Private, bounded directory observation used only for admission."""
+
+    names: tuple[str, ...]
+    complete: bool
+    overflow: bool
+
+
 class BrokerIntentStoreOperations(Protocol):
     def publish(self, payload: bytes, final_name: str) -> None: ...
 
@@ -193,6 +208,10 @@ class _LinuxIntentStoreOperations(Protocol):
     def selinux_label(self, fd: int) -> str: ...
 
     def list_names(self, parent_fd: int) -> tuple[str, ...]: ...
+
+    def observe_names_bounded(
+        self, parent_fd: int, maximum: int
+    ) -> _BoundedIntentNameObservation: ...
 
     def read_all(self, fd: int) -> bytes: ...
 
@@ -557,15 +576,30 @@ class LinuxBrokerIntentStore:
         """Safely count every visible pending or still-owned claimed intent."""
 
         self._verify_parent()
-        names = _linux_call(self._operations.list_names, self._parent_fd)
-        if type(names) is not tuple:
+        observation = _linux_call(
+            self._operations.observe_names_bounded,
+            self._parent_fd,
+            MAX_INTENT_STORE_ADMISSION_OBSERVATION_RECORDS,
+        )
+        if (
+            type(observation) is not _BoundedIntentNameObservation
+            or type(observation.names) is not tuple
+            or type(observation.complete) is not bool
+            or type(observation.overflow) is not bool
+            or observation.complete is not True
+            or observation.overflow is not False
+            or len(observation.names) > MAX_INTENT_STORE_ADMISSION_OBSERVATION_RECORDS
+            or any(
+                type(name) is not str or not _valid_name(name)
+                for name in observation.names
+            )
+        ):
             _linux_fail(LinuxBrokerCode.IO_FAILURE)
         candidates = tuple(
             sorted(
                 name
-                for name in names
-                if type(name) is str
-                and (
+                for name in observation.names
+                if (
                     _INTENT_NAME.fullmatch(name) is not None
                     or _CLAIM_NAME.fullmatch(name) is not None
                     or _RECOVERED_CLAIM_NAME.fullmatch(name) is not None
@@ -576,12 +610,20 @@ class LinuxBrokerIntentStore:
             _linux_fail(LinuxBrokerCode.IO_FAILURE)
         for name in candidates:
             fd = None
+            primary_error: BaseException | None = None
             try:
                 fd, before = self._open_file(name, self._O_RDONLY)
                 self._after_file_identity(fd, before)
+            except BaseException as error:
+                primary_error = error
+                raise
             finally:
                 if fd is not None:
-                    self._close(fd)
+                    try:
+                        _linux_call(self._operations.close, fd)
+                    except BaseException:
+                        if primary_error is None:
+                            raise
         self._verify_parent()
         return len(candidates)
 
