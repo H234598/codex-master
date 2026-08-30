@@ -683,6 +683,33 @@ def test_linux_publish_admission_allows_128th_then_rejects_full_before_file_io()
     assert not any(name.startswith(".tmp-intent-") for name in operations.files)
 
 
+def test_linux_publish_admission_reports_queue_full_for_129_safe_active_entries() -> (
+    None
+):
+    operations = FakeLinuxOperations()
+    for index in range(129):
+        _add_active_intent(operations, _active_intent_name("pending", index))
+    adapter = LinuxBrokerIntentStore(operations, 7, PARENT_IDENTITY)
+    calls_before_publish = len(operations.calls)
+
+    with pytest.raises(BrokerIntentError) as raised:
+        adapter.publish(
+            encode_broker_intent(INTENT),
+            "intent-00000000000000000129-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json",
+        )
+
+    assert raised.value.code is BrokerIntentCode.QUEUE_FULL
+    assert str(raised.value) == "queue_full"
+    assert _active_intent_count(operations) == 129
+    publication_calls = operations.calls[calls_before_publish:]
+    assert not any(
+        call[0] in {"write_all", "renameat2_noreplace", "fsync"}
+        or (call[0] == "openat2" and str(call[2]).startswith(".tmp-intent-"))
+        for call in publication_calls
+    )
+    assert not any(name.startswith(".tmp-intent-") for name in operations.files)
+
+
 @pytest.mark.parametrize(
     "mutate",
     (

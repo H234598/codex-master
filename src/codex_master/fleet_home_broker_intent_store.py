@@ -572,9 +572,7 @@ class LinuxBrokerIntentStore:
                 )
             )
         )
-        if len(candidates) > MAX_PENDING_INTENT_RECORDS or len(set(candidates)) != len(
-            candidates
-        ):
+        if len(set(candidates)) != len(candidates):
             _linux_fail(LinuxBrokerCode.IO_FAILURE)
         for name in candidates:
             fd = None
