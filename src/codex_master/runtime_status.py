@@ -22,11 +22,6 @@ _MCP_PROTOCOL_VERSION = "2024-11-05"
 _MAX_MCP_OUTPUT_BYTES = 256 * 1024
 _MCP_TIMEOUT_SECONDS = 10
 _REQUIRED_AUTONOMOUS_TOOL = "runtime_status"
-_RUNTIME_STATUS_INPUT_SCHEMA = {
-    "type": "object",
-    "properties": {},
-    "additionalProperties": False,
-}
 
 
 def _probe_payload() -> bytes:
@@ -68,31 +63,56 @@ def _run_direct_mcp(layout: RuntimeLayout) -> tuple[int, str]:
     return result.returncode, result.stdout
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Build one JSON object while rejecting duplicate member names."""
+
+    result: dict[str, object] = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("duplicate JSON member")
+        result[name] = value
+    return result
+
+
+def _is_runtime_status_input_schema(schema: object) -> bool:
+    """Require the closed, empty schema with exact JSON value types."""
+
+    return (
+        type(schema) is dict
+        and set(schema) == {"type", "properties", "additionalProperties"}
+        and schema.get("type") == "object"
+        and type(schema.get("properties")) is dict
+        and not schema["properties"]
+        and type(schema.get("additionalProperties")) is bool
+        and schema["additionalProperties"] is False
+    )
+
+
 def _mcp_surface(returncode: int, output: str) -> dict[str, object]:
     initialized = False
     tools_list = False
     tool_count = 0
     tools_contract_valid = False
     invalid = False
-    responses: set[int] = set()
-    for line in output.splitlines():
+    lines = output.splitlines()
+    if len(lines) != 2:
+        invalid = True
+    for expected_id, line in zip((1, 2), lines):
         try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
+            payload = json.loads(line, object_pairs_hook=_unique_json_object)
+        except (json.JSONDecodeError, ValueError):
             invalid = True
-            continue
+            break
         if (
             type(payload) is not dict
             or set(payload) != {"jsonrpc", "id", "result"}
             or payload.get("jsonrpc") != "2.0"
             or type(payload.get("id")) is not int
-            or payload["id"] not in {1, 2}
-            or payload["id"] in responses
+            or payload["id"] != expected_id
         ):
             invalid = True
-            continue
+            break
         response_id = payload["id"]
-        responses.add(response_id)
         if response_id == 1:
             result = payload.get("result")
             server_info = result.get("serverInfo") if isinstance(result, dict) else None
@@ -111,7 +131,8 @@ def _mcp_surface(returncode: int, output: str) -> dict[str, object]:
                 initialized = True
             else:
                 invalid = True
-        if response_id == 2:
+                break
+        else:
             result = payload.get("result")
             tools = result.get("tools") if isinstance(result, dict) else None
             if (
@@ -128,18 +149,19 @@ def _mcp_surface(returncode: int, output: str) -> dict[str, object]:
                     and tools[0].get("name") == _REQUIRED_AUTONOMOUS_TOOL
                     and isinstance(tools[0].get("description"), str)
                     and bool(tools[0]["description"])
-                    and tools[0].get("inputSchema") == _RUNTIME_STATUS_INPUT_SCHEMA
+                    and _is_runtime_status_input_schema(tools[0].get("inputSchema"))
                 )
                 if not tools_contract_valid:
                     invalid = True
             else:
                 invalid = True
+                break
     ok = (
         returncode == 0
         and initialized
         and tools_list
         and tools_contract_valid
-        and responses == {1, 2}
+        and len(lines) == 2
         and not invalid
     )
     return {

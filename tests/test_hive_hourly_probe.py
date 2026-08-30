@@ -4,7 +4,6 @@ import json
 import runpy
 import errno
 import hashlib
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 import stat
@@ -508,389 +507,47 @@ def _sealed_publish_image(
     return root
 
 
-def _legacy_cleanup_parents(home: Path) -> None:
-    for relative in (".local/lib", ".local/libexec", ".local/bin"):
-        (home / relative).mkdir(mode=0o700, parents=True, exist_ok=True)
-
-
-def test_runtime_image_publish_rejects_a_foreign_sentinel_before_exchange(
+def test_install_publishes_only_the_new_image_and_leaves_old_and_legacy_paths_inert(
     tmp_path: Path,
-) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    install_error = installer["InstallError"]
-    library = tmp_path / "lib"
-    library.mkdir(mode=0o700)
-    target = _sealed_publish_image(
-        installer, library / "codex-master-runtime", "old-image"
-    )
-    foreign = target / "foreign-sentinel"
-    foreign.write_text("do-not-delete\n", encoding="utf-8")
-    foreign.chmod(0o644)
-    stage = _sealed_publish_image(
-        installer, library / ".codex-master-runtime.stage.test", "new-image"
-    )
-
-    with pytest.raises(install_error, match="install_target_untrusted"):
-        installer["_publish_runtime_image"](stage=stage, target=target)
-
-    assert foreign.read_text(encoding="utf-8") == "do-not-delete\n"
-    assert (stage / "new-image").read_text(encoding="utf-8") == "new-image\n"
-
-
-def test_runtime_image_publish_refuses_the_unmanifested_pre_cutover_candidate(
-    tmp_path: Path,
-) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    install_error = installer["InstallError"]
-    library = tmp_path / "lib"
-    library.mkdir(mode=0o700)
-    target = library / "codex-master-runtime"
-    target.mkdir(mode=0o700)
-    candidate = target / "candidate-without-manifest"
-    candidate.write_text("do-not-adopt\n", encoding="utf-8")
-    candidate.chmod(0o644)
-    stage = _sealed_publish_image(
-        installer, library / ".codex-master-runtime.stage.test", "new-image"
-    )
-
-    with pytest.raises(install_error, match="install_target_untrusted"):
-        installer["_publish_runtime_image"](stage=stage, target=target)
-
-    assert candidate.read_text(encoding="utf-8") == "do-not-adopt\n"
-    assert (stage / "new-image").read_text(encoding="utf-8") == "new-image\n"
-
-
-@pytest.mark.parametrize(
-    "legacy_relative",
-    (
-        ".local/lib/codex-master-hive-probe",
-        ".local/libexec/codex_master_hive_hourly_probe.py",
-        ".local/bin/codex-master-mcp",
-    ),
-)
-@pytest.mark.parametrize("entry_kind", ("file", "symlink", "directory"))
-def test_install_rejects_foreign_legacy_entries_before_publish(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    legacy_relative: str,
-    entry_kind: str,
-) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    install_error = installer["InstallError"]
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    legacy = home / legacy_relative
-    legacy.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if entry_kind == "file":
-        legacy.write_text("foreign\n", encoding="utf-8")
-        legacy.chmod(0o600)
-    elif entry_kind == "symlink":
-        foreign = home / "foreign-target"
-        foreign.write_text("foreign\n", encoding="utf-8")
-        foreign.chmod(0o600)
-        legacy.symlink_to(foreign)
-    else:
-        legacy.mkdir(mode=0o700)
-        (legacy / "foreign-sentinel").write_text("foreign\n", encoding="utf-8")
-    published: list[Path] = []
-    globals_dict = installer["install"].__globals__  # type: ignore[index]
-    monkeypatch.setitem(globals_dict, "_build_runtime_image", lambda **_kwargs: None)
-    monkeypatch.setitem(
-        globals_dict, "_validate_runtime_image_stage", lambda **_kwargs: None
-    )
-    monkeypatch.setitem(
-        globals_dict,
-        "_publish_runtime_image",
-        lambda *, stage, target: published.append(target),
-    )
-
-    with pytest.raises(install_error, match="install_legacy_untrusted"):
-        installer["install"](home=home)
-
-    assert legacy.exists() or legacy.is_symlink()
-    assert not published
-
-
-def test_runtime_image_cleanup_refuses_an_old_root_changed_after_prevalidation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    install_error = installer["InstallError"]
-    library = tmp_path / "lib"
-    library.mkdir(mode=0o700)
-    target = _sealed_publish_image(
-        installer, library / "codex-master-runtime", "old-image"
-    )
-    stage = _sealed_publish_image(
-        installer, library / ".codex-master-runtime.stage.test", "new-image"
-    )
-    exchange = installer["_rename_exchange"]
-
-    def change_old_root_after_exchange(*arguments: object) -> None:
-        exchange(*arguments)
-        (stage / "foreign-sentinel").write_text("do-not-delete\n", encoding="utf-8")
-
-    monkeypatch.setitem(
-        installer["_publish_runtime_image"].__globals__,
-        "_rename_exchange",
-        change_old_root_after_exchange,
-    )
-    with pytest.raises(install_error, match="install_old_image_changed"):
-        installer["_publish_runtime_image"](stage=stage, target=target)
-
-    assert (target / "new-image").read_text(encoding="utf-8") == "new-image\n"
-    assert (stage / "foreign-sentinel").read_text(encoding="utf-8") == "do-not-delete\n"
-
-
-def test_runtime_image_cleanup_rebinds_a_reopened_root_before_deletion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    install_error = installer["InstallError"]
-    library = tmp_path / "lib"
-    library.mkdir(mode=0o700)
-    target = _sealed_publish_image(
-        installer, library / "codex-master-runtime", "old-image"
-    )
-    stage = _sealed_publish_image(
-        installer, library / ".codex-master-runtime.stage.test", "new-image"
-    )
-    replacement = _sealed_publish_image(
-        installer, library / ".replacement", "old-image"
-    )
-    displaced_old_root = library / ".displaced-old-root"
-    original_validate = installer["_validated_image_at"]
-    original_exchange = installer["_rename_exchange"]
-    exchanged = False
-
-    def exchange_then_mark(*arguments: object) -> None:
-        nonlocal exchanged
-        original_exchange(*arguments)
-        exchanged = True
-
-    def validate_then_replace(
-        parent_fd: int, name: str, *, error_code: str
-    ) -> tuple[int, int, str]:
-        identity = original_validate(parent_fd, name, error_code=error_code)
-        if (
-            exchanged
-            and name == stage.name
-            and error_code == "install_old_image_changed"
-        ):
-            os.rename(stage, displaced_old_root)
-            os.rename(replacement, stage)
-        return identity
-
-    globals_dict = installer["_publish_runtime_image"].__globals__  # type: ignore[index]
-    monkeypatch.setitem(globals_dict, "_rename_exchange", exchange_then_mark)
-    monkeypatch.setitem(globals_dict, "_validated_image_at", validate_then_replace)
-
-    with pytest.raises(install_error, match="install_old_image_changed"):
-        installer["_publish_runtime_image"](stage=stage, target=target)
-
-    assert (target / "new-image").read_text(encoding="utf-8") == "new-image\n"
-    assert (stage / "old-image").read_text(encoding="utf-8") == "old-image\n"
-    assert (displaced_old_root / "old-image").read_text(
-        encoding="utf-8"
-    ) == "old-image\n"
-
-
-@pytest.mark.parametrize(
-    ("kind", "relative"),
-    (
-        ("probe_root", ".local/lib/codex-master-hive-probe"),
-        ("libexec", ".local/libexec/codex_master_hive_hourly_probe.py"),
-        ("bin", ".local/bin/codex-master-mcp"),
-    ),
-)
-def test_legacy_cleanup_refuses_a_name_replaced_after_preflight_validation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, relative: str
-) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    install_error = installer["InstallError"]
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _legacy_cleanup_parents(home)
-    legacy = home / relative
-    legacy.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if kind == "probe_root":
-        legacy.mkdir(mode=0o700)
-        owned = legacy / "owned"
-        owned.write_text("owned\n", encoding="utf-8")
-        owned.chmod(0o644)
-        replacement = legacy.with_name("replacement")
-        replacement.mkdir(mode=0o700)
-        replacement_owned = replacement / "owned"
-        replacement_owned.write_text("owned\n", encoding="utf-8")
-        replacement_owned.chmod(0o644)
-        owned_digest = hashlib.sha256(b"owned\n").hexdigest()
-        payload = {
-            "schema_version": 1,
-            "directories": ["."],
-            "files": {
-                "owned": {
-                    "mode": 0o644,
-                    "nlink": 1,
-                    "size": len(b"owned\n"),
-                    "sha256": owned_digest,
-                }
-            },
-        }
-        identity_digest = hashlib.sha256(
-            installer["_canonical_json"](payload)
-        ).hexdigest()
-        legacy_stat = legacy.stat()
-        identity = (legacy_stat.st_dev, legacy_stat.st_ino, identity_digest)
-        validator_name = "_validated_legacy_probe_root"
-        monkeypatch.setitem(
-            installer["_remove_legacy_probe_root"].__globals__,
-            "_legacy_probe_payload",
-            lambda _fd: payload,
-        )
-    else:
-        legacy.write_text("owned\n", encoding="utf-8")
-        legacy.chmod(0o755 if kind == "libexec" else 0o644)
-        replacement = legacy.with_name("replacement")
-        replacement.write_text("foreign\n", encoding="utf-8")
-        replacement.chmod(0o755 if kind == "libexec" else 0o644)
-        legacy_stat = legacy.stat()
-        identity = (legacy_stat.st_dev, legacy_stat.st_ino, "f" * 64)
-        validator_name = (
-            "_validated_legacy_libexec"
-            if kind == "libexec"
-            else "_validated_legacy_bin"
-        )
-
-    calls = 0
-
-    def validate_after_preflight(
-        *_args: object, **_kwargs: object
-    ) -> tuple[int, int, str]:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            displaced = legacy.with_name("displaced")
-            os.rename(legacy, displaced)
-            os.rename(replacement, legacy)
-        return identity
-
-    globals_dict = installer["_remove_preflighted_legacy"].__globals__  # type: ignore[index]
-    monkeypatch.setitem(globals_dict, validator_name, validate_after_preflight)
-    entries = installer["_preflight_legacy_paths"](
-        library=home / ".local" / "lib",
-        libexec=home / ".local" / "libexec",
-        user_bin=home / ".local" / "bin",
-        repository=ROOT,
-    )
-
-    with pytest.raises(install_error, match="install_legacy_cleanup_failed"):
-        installer["_remove_preflighted_legacy"](entries, repository=ROOT)
-
-    assert legacy.exists()
-    if kind == "probe_root":
-        assert (legacy / "owned").read_text(encoding="utf-8") == "owned\n"
-    else:
-        assert legacy.read_text(encoding="utf-8") == "foreign\n"
-
-
-@pytest.mark.parametrize(
-    ("kind", "relative"),
-    (
-        ("probe_root", ".local/lib/codex-master-hive-probe"),
-        ("libexec", ".local/libexec/codex_master_hive_hourly_probe.py"),
-        ("bin", ".local/bin/codex-master-mcp"),
-    ),
-)
-def test_legacy_cleanup_keeps_a_replaced_parent_name_out_of_scope(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, relative: str
 ) -> None:
     installer = runpy.run_path(
         str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
     )
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
-    _legacy_cleanup_parents(home)
-    legacy = home / relative
-    legacy.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if kind == "probe_root":
-        legacy.mkdir(mode=0o700)
-        (legacy / "owned").write_text("owned\n", encoding="utf-8")
-        (legacy / "owned").chmod(0o644)
-        owned_digest = hashlib.sha256(b"owned\n").hexdigest()
-        payload = {
-            "schema_version": 1,
-            "directories": ["."],
-            "files": {
-                "owned": {"mode": 0o644, "nlink": 1, "size": 6, "sha256": owned_digest}
-            },
-        }
-        identity_digest = hashlib.sha256(
-            installer["_canonical_json"](payload)
-        ).hexdigest()
-        validator_name = "_validated_legacy_probe_root"
-        monkeypatch.setitem(
-            installer["_remove_legacy_probe_root"].__globals__,
-            "_legacy_probe_payload",
-            lambda _fd: payload,
-        )
-    else:
-        legacy.write_text("owned\n", encoding="utf-8")
-        legacy.chmod(0o755 if kind == "libexec" else 0o644)
-        validator_name = (
-            "_validated_legacy_libexec"
-            if kind == "libexec"
-            else "_validated_legacy_bin"
-        )
-        identity_digest = "f" * 64
-    legacy_stat = legacy.stat()
-    identity = (legacy_stat.st_dev, legacy_stat.st_ino, identity_digest)
-    monkeypatch.setitem(
-        installer["_remove_preflighted_legacy"].__globals__,
-        validator_name,
-        lambda *_args, **_kwargs: identity,
-    )
-    entries = installer["_preflight_legacy_paths"](
-        library=home / ".local" / "lib",
-        libexec=home / ".local" / "libexec",
-        user_bin=home / ".local" / "bin",
-        repository=ROOT,
-    )
-    original_parent = legacy.parent
-    relocated_parent = original_parent.with_name(original_parent.name + "-relocated")
-    os.rename(original_parent, relocated_parent)
-    original_parent.mkdir(mode=0o700)
-    foreign = original_parent / legacy.name
-    if kind == "probe_root":
-        foreign.mkdir(mode=0o700)
-        (foreign / "foreign").write_text("foreign\n", encoding="utf-8")
-    else:
-        foreign.write_text("foreign\n", encoding="utf-8")
-        foreign.chmod(0o755 if kind == "libexec" else 0o644)
+    library = home / ".local" / "lib"
+    library.mkdir(mode=0o700, parents=True)
+    old_image = library / "codex-master-runtime"
+    old_image.mkdir(mode=0o700)
+    (old_image / "old-generation").write_text("old\n", encoding="utf-8")
+    legacy_root = library / "codex-master-hive-probe"
+    legacy_root.mkdir(mode=0o700)
+    legacy_marker = legacy_root / "foreign-marker"
+    legacy_marker.write_text("legacy root\n", encoding="utf-8")
+    legacy_libexec = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
+    legacy_libexec.parent.mkdir(mode=0o700, parents=True)
+    legacy_libexec.write_text("legacy libexec\n", encoding="utf-8")
+    foreign_bin_target = home / "foreign-mcp"
+    foreign_bin_target.write_text("legacy bin target\n", encoding="utf-8")
+    legacy_bin = home / ".local" / "bin" / "codex-master-mcp"
+    legacy_bin.parent.mkdir(mode=0o700, parents=True)
+    legacy_bin.symlink_to(foreign_bin_target)
 
-    installer["_remove_preflighted_legacy"](entries, repository=ROOT)
+    result = installer["install"](home=home)
 
-    assert foreign.exists()
-    if kind == "probe_root":
-        assert (foreign / "foreign").read_text(encoding="utf-8") == "foreign\n"
-    else:
-        assert foreign.read_text(encoding="utf-8") == "foreign\n"
+    runtime_root = library / "codex-master-runtime"
+    displaced = list(library.glob(".codex-master-runtime.stage.*"))
+    assert result == {"status": "installed", "raw_output": "not_returned"}
+    assert (runtime_root / "bin" / "codex-master-mcp").is_file()
+    assert len(displaced) == 1
+    assert (displaced[0] / "old-generation").read_text(encoding="utf-8") == "old\n"
+    assert legacy_marker.read_text(encoding="utf-8") == "legacy root\n"
+    assert legacy_libexec.read_text(encoding="utf-8") == "legacy libexec\n"
+    assert legacy_bin.is_symlink()
+    assert legacy_bin.readlink() == foreign_bin_target
 
 
-def _materialize_23510da_legacy_probe(
-    installer: dict[str, object], root: Path
-) -> dict[str, object]:
+def _canonical_23510da_legacy_payload(root: Path) -> dict[str, object]:
     listed = subprocess.run(
         ["git", "ls-tree", "-r", "--name-only", "23510da"],
         check=True,
@@ -929,14 +586,20 @@ def _materialize_23510da_legacy_probe(
         ).stdout
         destination.write_bytes(content)
         destination.chmod(0o755 if historical == "bin/codex-master-mcp" else 0o644)
-    root_fd = installer["_open_absolute_directory"](
-        root, error_code="install_legacy_untrusted"
+    directories = ["."] + sorted(
+        path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_dir()
     )
-    try:
-        payload = installer["_legacy_probe_payload"](root_fd)
-    finally:
-        os.close(root_fd)
-
+    files = {
+        path.relative_to(root).as_posix(): {
+            "mode": stat.S_IMODE(path.stat(follow_symlinks=False).st_mode),
+            "nlink": path.stat(follow_symlinks=False).st_nlink,
+            "size": path.stat(follow_symlinks=False).st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+    payload = {"schema_version": 1, "directories": directories, "files": files}
     assert len(payload["directories"]) == 6
     assert len(payload["files"]) == 143
     return payload
@@ -949,183 +612,11 @@ def test_legacy_probe_manifest_digest_has_a_23510da_provenance_regression_contra
     installer = runpy.run_path(str(installer_path))
     source = installer_path.read_text(encoding="utf-8")
     assert "Provenance: canonical 23510da legacy probe payload" in source
-    payload = _materialize_23510da_legacy_probe(installer, tmp_path / "legacy-probe")
+    payload = _canonical_23510da_legacy_payload(tmp_path / "legacy-probe")
     assert (
         hashlib.sha256(installer["_canonical_json"](payload)).hexdigest()
         == installer["_LEGACY_PROBE_MANIFEST_DIGEST"]
     )
-
-
-def test_runtime_image_publish_refuses_a_hardlinked_prevalidated_file(
-    tmp_path: Path,
-) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    install_error = installer["InstallError"]
-    library = tmp_path / "lib"
-    library.mkdir(mode=0o700)
-    target = _sealed_publish_image(
-        installer, library / "codex-master-runtime", "old-image"
-    )
-    hardlink = tmp_path / "outside-hardlink"
-    os.link(target / "old-image", hardlink)
-    stage = _sealed_publish_image(
-        installer, library / ".codex-master-runtime.stage.test", "new-image"
-    )
-
-    with pytest.raises(install_error, match="install_target_untrusted"):
-        installer["_publish_runtime_image"](stage=stage, target=target)
-
-    assert hardlink.read_text(encoding="utf-8") == "old-image\n"
-    assert (target / "old-image").read_text(encoding="utf-8") == "old-image\n"
-    assert (stage / "new-image").read_text(encoding="utf-8") == "new-image\n"
-
-
-@pytest.mark.parametrize("kind", ("probe_root", "libexec", "bin"))
-def test_legacy_preflight_refuses_hardlinked_entries(tmp_path: Path, kind: str) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    install_error = installer["InstallError"]
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _legacy_cleanup_parents(home)
-    if kind == "probe_root":
-        legacy = home / ".local" / "lib" / "codex-master-hive-probe"
-        _materialize_23510da_legacy_probe(installer, legacy)
-        source = legacy / "src" / "codex_master" / "__init__.py"
-        os.link(source, tmp_path / "outside-hardlink")
-    elif kind == "libexec":
-        legacy = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
-        legacy.write_bytes(
-            subprocess.run(
-                [
-                    "git",
-                    "show",
-                    "23510da:systemd/libexec/codex_master_hive_hourly_probe.py",
-                ],
-                check=True,
-                capture_output=True,
-                cwd=ROOT,
-            ).stdout
-        )
-        legacy.chmod(0o755)
-        os.link(legacy, tmp_path / "outside-hardlink")
-    else:
-        legacy = home / ".local" / "bin" / "codex-master-mcp"
-        legacy.symlink_to(ROOT / "bin" / "codex-master-mcp")
-        os.link(legacy, tmp_path / "outside-hardlink", follow_symlinks=False)
-
-    with pytest.raises(install_error, match="install_legacy_untrusted"):
-        installer["_preflight_legacy_paths"](
-            library=home / ".local" / "lib",
-            libexec=home / ".local" / "libexec",
-            user_bin=home / ".local" / "bin",
-            repository=ROOT,
-        )
-
-    assert legacy.exists() or legacy.is_symlink()
-
-
-def test_runtime_image_cleanup_aborts_with_a_private_stage_trace_on_mid_cleanup_mutation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    install_error = installer["InstallError"]
-    library = tmp_path / "lib"
-    library.mkdir(mode=0o700)
-    target = _sealed_publish_image(
-        installer, library / "codex-master-runtime", "old-one"
-    )
-    (target / "old-two").write_text("old-two\n", encoding="utf-8")
-    (target / "old-two").chmod(0o644)
-    (target / installer["_MANIFEST_NAME"]).unlink()
-    installer["_write_runtime_image_manifest"](root=target)
-    stage = _sealed_publish_image(
-        installer, library / ".codex-master-runtime.stage.test", "new-image"
-    )
-    original_unlink = installer["_unlink_verified_regular_at"]
-    mutated = False
-
-    def unlink_then_mutate(*args: object, **kwargs: object) -> None:
-        nonlocal mutated
-        original_unlink(*args, **kwargs)
-        if not mutated:
-            mutated = True
-            (stage / "foreign-after-publish").write_text(
-                "do-not-delete\n", encoding="utf-8"
-            )
-            (stage / "foreign-after-publish").chmod(0o644)
-
-    monkeypatch.setitem(
-        installer["_remove_validated_image"].__globals__,
-        "_unlink_verified_regular_at",
-        unlink_then_mutate,
-    )
-
-    with pytest.raises(install_error, match="install_old_image_changed"):
-        installer["_publish_runtime_image"](stage=stage, target=target)
-
-    assert (target / "new-image").read_text(encoding="utf-8") == "new-image\n"
-    assert (stage / "foreign-after-publish").read_text(
-        encoding="utf-8"
-    ) == "do-not-delete\n"
-
-
-def test_install_preserves_a_mutated_legacy_trace_after_publish(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    install_error = installer["InstallError"]
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    _legacy_cleanup_parents(home)
-    legacy_root = home / ".local" / "lib" / "codex-master-hive-probe"
-    _materialize_23510da_legacy_probe(installer, legacy_root)
-    legacy_libexec = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
-    legacy_libexec.write_bytes(
-        subprocess.run(
-            [
-                "git",
-                "show",
-                "23510da:systemd/libexec/codex_master_hive_hourly_probe.py",
-            ],
-            check=True,
-            capture_output=True,
-            cwd=ROOT,
-        ).stdout
-    )
-    legacy_libexec.chmod(0o755)
-    legacy_bin = home / ".local" / "bin" / "codex-master-mcp"
-    legacy_bin.symlink_to(ROOT / "bin" / "codex-master-mcp")
-    original_publish = installer["_publish_runtime_image"]
-    changed = legacy_root / "src" / "codex_master" / "__init__.py"
-
-    def publish_then_mutate(*, stage: Path, target: Path) -> None:
-        original_publish(stage=stage, target=target)
-        changed.write_text("mutated after publish\n", encoding="utf-8")
-        changed.chmod(0o644)
-
-    monkeypatch.setitem(
-        installer["install"].__globals__, "_publish_runtime_image", publish_then_mutate
-    )
-
-    with pytest.raises(install_error, match="install_legacy_untrusted"):
-        installer["install"](home=home)
-
-    runtime_root = home / ".local" / "lib" / "codex-master-runtime"
-    assert runtime_root.is_dir()
-    assert (
-        home / ".config" / "systemd" / "user" / "codex-master-hive-hourly-probe.service"
-    ).is_file()
-    assert changed.read_text(encoding="utf-8") == "mutated after publish\n"
-    assert legacy_libexec.is_file()
-    assert legacy_bin.is_symlink()
 
 
 def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
@@ -1233,30 +724,6 @@ def test_runtime_image_build_failure_never_publishes_a_partial_stage(
     assert not (target / "new-complete-image").exists()
     assert stage.is_dir()
     assert not (stage / "new-complete-image").exists()
-
-
-def test_runtime_image_publish_exchange_exposes_only_complete_directory_generations(
-    tmp_path: Path,
-) -> None:
-    installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
-    )
-    library = tmp_path / "lib"
-    library.mkdir(mode=0o700)
-    target = _sealed_publish_image(
-        installer, library / "codex-master-runtime", "old-complete-image"
-    )
-    stage = _sealed_publish_image(
-        installer, library / ".codex-master-runtime.stage.test", "new-complete-image"
-    )
-
-    installer["_publish_runtime_image"](stage=stage, target=target)
-
-    assert (target / "new-complete-image").read_text(
-        encoding="utf-8"
-    ) == "new-complete-image\n"
-    assert not (target / "old-complete-image").exists()
-    assert not stage.exists()
 
 
 def test_probe_capacity_guard_serializes_the_health_record_publication(

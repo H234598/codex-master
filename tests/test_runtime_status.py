@@ -233,6 +233,16 @@ def test_runtime_status_rejects_any_noncanonical_runtime_status_tool_surface() -
         [{**canonical_tool}, {**canonical_tool, "name": "agent_start"}],
         [{**canonical_tool}, {**canonical_tool}],
         [{**canonical_tool, "inputSchema": {"type": "object", "properties": {}}}],
+        [
+            {
+                **canonical_tool,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": 0,
+                },
+            }
+        ],
         [{"name": "runtime_status", "inputSchema": canonical_tool["inputSchema"]}],
         [{**canonical_tool, "unexpected": True}],
     )
@@ -259,3 +269,52 @@ def test_runtime_status_rejects_any_noncanonical_runtime_status_tool_surface() -
     surface = status_module._mcp_surface(0, competing)
     assert surface["ok"] is False
     assert surface["reason_code"] == "mcp_surface_invalid"
+
+
+def test_runtime_status_rejects_out_of_order_and_duplicate_key_responses() -> None:
+    modules = _runtime_modules()
+    assert modules is not None
+    _layout_module, status_module = modules
+    initialize_result = {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+        "serverInfo": {"name": "codex-master-mcp", "version": "1"},
+    }
+    tools_result = {
+        "tools": [
+            {
+                "name": "runtime_status",
+                "description": "Runtime status",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            }
+        ]
+    }
+    initialize = json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "result": initialize_result},
+        separators=(",", ":"),
+    )
+    tools = json.dumps(
+        {"jsonrpc": "2.0", "id": 2, "result": tools_result},
+        separators=(",", ":"),
+    )
+    duplicate_key_initialize = (
+        '{"jsonrpc":"2.0","id":1,"id":1,"result":'
+        + json.dumps(initialize_result, separators=(",", ":"))
+        + "}"
+    )
+    duplicate_nested_initialize = initialize.replace(
+        '"tools":{}', '"tools":{},"tools":{}', 1
+    )
+
+    for output in (
+        "\n".join((tools, initialize)),
+        "\n".join((duplicate_key_initialize, tools)),
+        "\n".join((duplicate_nested_initialize, tools)),
+    ):
+        surface = status_module._mcp_surface(0, output)
+        assert surface["ok"] is False
+        assert surface["reason_code"] == "mcp_surface_invalid"
