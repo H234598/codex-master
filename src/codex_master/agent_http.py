@@ -1,0 +1,145 @@
+"""Bounded application boundary for the private host-agent API."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import re
+from typing import Final, Protocol, cast
+
+from .admin_hosts import AgentPrincipalV1
+from .agent_contracts import (
+    AgentContractError,
+    AgentLeaseV1,
+    AgentNoWorkV1,
+    parse_agent_poll,
+    parse_agent_receipt,
+    serialize_agent_lease,
+)
+from .agent_operations import AgentOperationError
+
+
+MAX_AGENT_BODY_BYTES: Final[int] = 64 * 1024
+MAX_AGENT_HEADER_BYTES: Final[int] = 16 * 1024
+_RECEIPT_ROUTE = re.compile(
+    r"/agent/v1/operations/([A-Za-z0-9._:-]{1,128})/receipts\Z", re.ASCII
+)
+_HEADERS = (("Content-Type", "application/json"), ("Cache-Control", "no-store"))
+
+
+class _Store(Protocol):
+    def poll(self, principal: AgentPrincipalV1, poll: object) -> object: ...
+    def complete(self, principal: AgentPrincipalV1, receipt: object) -> object: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AgentHttpResponse:
+    status: int
+    body: bytes
+    headers: tuple[tuple[str, str], ...] = _HEADERS
+
+
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def _json_body(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+
+
+def _response(status: int, value: object) -> AgentHttpResponse:
+    return AgentHttpResponse(status, _json_body(value))
+
+
+def _problem(status: int, code: str) -> AgentHttpResponse:
+    return _response(status, {"error": code})
+
+
+class AgentHttpApplication:
+    """Dispatch exactly the two agent routes to the existing operation store."""
+
+    def __init__(self, store: _Store) -> None:
+        if not hasattr(store, "poll") or not hasattr(store, "complete"):
+            raise TypeError("agent.store_invalid")
+        self._store = store
+
+    def handle(
+        self,
+        principal: AgentPrincipalV1,
+        method: str,
+        target: str,
+        body: bytes,
+    ) -> AgentHttpResponse:
+        if type(principal) is not AgentPrincipalV1:
+            return _problem(403, "agent.identity_invalid")
+        if type(method) is not str or type(target) is not str or type(body) is not bytes:
+            return _problem(400, "agent.request_invalid")
+        if len(body) > MAX_AGENT_BODY_BYTES:
+            return _problem(413, "agent.request_too_large")
+
+        receipt_match = _RECEIPT_ROUTE.fullmatch(target)
+        known_path = target == "/agent/v1/polls" or receipt_match is not None
+        if not known_path:
+            return _problem(404, "agent.route_not_found")
+        if method != "POST":
+            return _problem(405, "agent.method_not_allowed")
+        try:
+            value = json.loads(
+                body.decode("utf-8"),
+                object_pairs_hook=_strict_object,
+                parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+            )
+            if target == "/agent/v1/polls":
+                result = self._store.poll(principal, parse_agent_poll(value))
+                return _response(200, self._poll_result(result))
+            receipt = parse_agent_receipt(value)
+            if receipt.operation_id != cast(re.Match[str], receipt_match).group(1):
+                raise AgentContractError
+            self._store.complete(principal, receipt)
+            return _response(
+                200,
+                {"schema_version": 1, "operation_id": receipt.operation_id, "accepted": True},
+            )
+        except AgentOperationError as error:
+            if error.code in {
+                "host.poll_already_active",
+                "host.registry_generation_stale",
+                "host.lease_epoch_stale",
+                "host.lease_stale",
+                "host.receipt_conflict",
+            }:
+                return _problem(409, error.code)
+            if error.code == "host.operation_store_unavailable":
+                return _problem(503, "agent.temporarily_unavailable")
+            return _problem(400, "agent.request_invalid")
+        except (AgentContractError, UnicodeError, ValueError, TypeError, RecursionError):
+            return _problem(400, "agent.request_invalid")
+
+    @staticmethod
+    def _poll_result(value: object) -> dict[str, object]:
+        if type(value) is AgentLeaseV1:
+            return serialize_agent_lease(value)
+        if type(value) is AgentNoWorkV1:
+            no_work = cast(AgentNoWorkV1, value)
+            return {
+                "schema_version": 1,
+                "registry_generation": no_work.registry_generation,
+                "lease_epoch": no_work.lease_epoch,
+                "max_wait_seconds": no_work.max_wait_seconds,
+            }
+        raise AgentOperationError("host.operation_store_unavailable")
+
+
+__all__ = [
+    "AgentHttpApplication",
+    "AgentHttpResponse",
+    "MAX_AGENT_BODY_BYTES",
+    "MAX_AGENT_HEADER_BYTES",
+]

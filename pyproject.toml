@@ -28,6 +28,7 @@ test-index = [
 [project.scripts]
 codex-master-mcp = "codex_master.server:main"
 codex-master-admin = "codex_master.admin_daemon:main"
+codex-master-agent-api = "codex_master.agent_daemon:main"
 google-account-manager = "codex_master.google_account_manager_cli:main"
 
 [tool.setuptools.packages.find]
