@@ -8326,7 +8326,7 @@ def _runtime_class_projection_name(name: str) -> bool:
     return (
         name == "AGENTS.md"
         or _RUNTIME_CLASS_MARKDOWN_RE.fullmatch(name) is not None
-        or (name.startswith("skills/.portable/") and name.endswith("/SKILL.md"))
+        or _portable_skill_projection_name(name)
     )
 
 
@@ -26305,9 +26305,6 @@ def _fleet_home_policy_observation_at(
         else f"AGENTS.class-{target.effective_skill_profile}.md"
     )
 
-    def portable(name: str) -> bool:
-        return name.startswith("skills/.portable/") and name.endswith("/SKILL.md")
-
     removable_gemini_aliases = (
         marker_names & {"settings.json", "AGENTS.md"}
         if descriptor.runner is RunnerKind.GEMINI_CLI
@@ -26318,12 +26315,12 @@ def _fleet_home_policy_observation_at(
         for name in marker_names
         if name != observed_class_name
         and name not in removable_gemini_aliases
-        and not portable(name)
+        and not _portable_skill_projection_name(name)
     }
     target_core = {
         name
         for name in target_names
-        if name != target_class_name and not portable(name)
+        if name != target_class_name and not _portable_skill_projection_name(name)
     }
     if (
         observed_class_name not in marker_names
@@ -28091,9 +28088,7 @@ def _fleet_managed_home_details(
         portable_files = {
             name
             for name in marker_files
-            if isinstance(name, str)
-            and name.startswith("skills/.portable/")
-            and name.endswith("/SKILL.md")
+            if _portable_skill_projection_name(name)
         }
         if (
             not base_expected_files <= marker_files
@@ -28101,7 +28096,7 @@ def _fleet_managed_home_details(
             or len(portable_files) > MAX_PORTABLE_SKILLS
             or any(not _fleet_managed_name(name) for name in marker_files)
             or any(
-                not name.startswith("skills/.portable/")
+                not _portable_skill_projection_name(name)
                 for name in marker_files - base_expected_files - compatibility_files
             )
         ):
@@ -40134,6 +40129,16 @@ _SKILL_PROFILE_BLOCKS: dict[str, tuple[str, ...]] = {
     "admin": (),
 }
 
+_VISUAL_COMPANION_TEAMLEAD_PROFILES = frozenset({"teamlead", "teamleiterin"})
+_VISUAL_COMPANION_SOURCE = (
+    ".codex/plugins/cache/openai-curated-remote/superpowers/6.3.0/"
+    "skills/brainstorming"
+)
+_VISUAL_COMPANION_PORTABLE_ROOT = "skills/.portable/plugins/superpowers/brainstorming"
+_VISUAL_COMPANION_PORTABLE_GUIDE = (
+    f"{_VISUAL_COMPANION_PORTABLE_ROOT}/visual-companion.md"
+)
+
 
 def _skill_allowed_for_profile(skill_name: str, profile: str) -> bool:
     normalized = skill_name.strip().lower()
@@ -40141,10 +40146,50 @@ def _skill_allowed_for_profile(skill_name: str, profile: str) -> bool:
     return not any(pattern in normalized for pattern in blocked)
 
 
+def _portable_skill_projection_name(name: object) -> bool:
+    return type(name) is str and (
+        (name.startswith("skills/.portable/") and name.endswith("/SKILL.md"))
+        or name == _VISUAL_COMPANION_PORTABLE_GUIDE
+    )
+
+
+def _portable_visual_companion_artifacts(profile: str, home: Path) -> dict[str, bytes]:
+    """Return the only non-SKILL Markdown dependency required by team leads."""
+
+    if profile not in _VISUAL_COMPANION_TEAMLEAD_PROFILES:
+        return {}
+    source = home / _VISUAL_COMPANION_SOURCE
+    try:
+        skill = _fleet_peek_optional_private_text(
+            source / "SKILL.md",
+            MAX_FLEET_ARTIFACT_BYTES,
+            "portable_skill_source_invalid",
+        )
+        guide = _fleet_peek_optional_private_text(
+            source / "visual-companion.md",
+            MAX_FLEET_ARTIFACT_BYTES,
+            "portable_skill_source_invalid",
+        )
+    except AgentError:
+        return {}
+    if skill is None or guide is None:
+        return {}
+    return {
+        f"{_VISUAL_COMPANION_PORTABLE_ROOT}/SKILL.md": skill.encode("utf-8"),
+        _VISUAL_COMPANION_PORTABLE_GUIDE: guide.encode("utf-8"),
+    }
+
+
 def portable_gemini_skill_artifacts(profile: str = "generic") -> dict[str, bytes]:
     """Materialize vetted Markdown skills without copying executable plugins."""
 
     home = Path.home()
+    visual_companion = _portable_visual_companion_artifacts(profile, home)
+    if len(visual_companion) > MAX_PORTABLE_SKILLS:
+        return {}
+    other_capacity = MAX_PORTABLE_SKILLS - len(visual_companion)
+    if other_capacity == 0:
+        return visual_companion
     roots = [
         (home / ".codex-agents" / "b1" / "skills" / ".system", "system"),
         (home / ".codex-agents" / "b1" / "skills", "agents"),
@@ -40173,7 +40218,8 @@ def portable_gemini_skill_artifacts(profile: str = "generic") -> dict[str, bytes
                 continue
             target = f"skills/.portable/{namespace}/{skill_file.parent.name}/SKILL.md"
             artifacts.setdefault(target, data)
-            if len(artifacts) >= MAX_PORTABLE_SKILLS:
+            if len(artifacts) >= other_capacity:
+                artifacts.update(visual_companion)
                 return artifacts
 
     plugin_root = home / ".codex-agents" / "b1" / "plugins" / "cache"
@@ -40198,12 +40244,19 @@ def portable_gemini_skill_artifacts(profile: str = "generic") -> dict[str, bytes
                 skill_name = skill_file.parent.name
             except (ValueError, IndexError):
                 continue
+            if (
+                profile in _VISUAL_COMPANION_TEAMLEAD_PROFILES
+                and plugin == "superpowers"
+                and skill_name == "brainstorming"
+            ):
+                continue
             if not _skill_allowed_for_profile(f"{plugin}:{skill_name}", profile):
                 continue
             target = f"skills/.portable/plugins/{plugin}/{skill_name}/SKILL.md"
             artifacts.setdefault(target, data)
-            if len(artifacts) >= MAX_PORTABLE_SKILLS:
+            if len(artifacts) >= other_capacity:
                 break
+    artifacts.update(visual_companion)
     return artifacts
 
 

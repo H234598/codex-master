@@ -1370,6 +1370,191 @@ def _overview_cli_test_snapshot(*, generation: int = 9) -> Any:
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_existing_portable_skill_profile_filters_remain_in_effect(self) -> None:
+        for profile in ("generic", "worker", "teamlead", "teamleiterin", "koenigin"):
+            with self.subTest(profile=profile):
+                self.assertFalse(
+                    server_module._skill_allowed_for_profile("skill-installer", profile)
+                )
+                self.assertFalse(
+                    server_module._skill_allowed_for_profile("plugin-creator", profile)
+                )
+        self.assertTrue(
+            server_module._skill_allowed_for_profile(
+                "superpowers:brainstorming", "teamleiterin"
+            )
+        )
+
+    def test_portable_teamlead_projection_includes_only_required_visual_companion_markdown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            source = (
+                home
+                / ".codex/plugins/cache/openai-curated-remote/superpowers/6.3.0"
+                / "skills/brainstorming"
+            )
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_bytes(b"# brainstorming\n")
+            (source / "visual-companion.md").write_bytes(b"# companion\n")
+            scripts = source / "scripts"
+            scripts.mkdir()
+            (scripts / "start-server.sh").write_bytes(b"#!/bin/sh\n")
+            assets = source / "assets"
+            assets.mkdir()
+            (assets / "preview.svg").write_bytes(b"<svg/>\n")
+            (source / "notes.md").write_bytes(b"not a referenced guide\n")
+
+            with patch.object(server_module.Path, "home", return_value=home):
+                artifacts = server_module.portable_gemini_skill_artifacts("teamleiterin")
+
+        self.assertEqual(
+            artifacts,
+            {
+                "skills/.portable/plugins/superpowers/brainstorming/SKILL.md": b"# brainstorming\n",
+                "skills/.portable/plugins/superpowers/brainstorming/visual-companion.md": b"# companion\n",
+            },
+        )
+
+    def test_portable_visual_companion_reference_rejects_unsafe_sources_and_non_teamleads(
+        self,
+    ) -> None:
+        for case in ("symlink", "hardlink", "oversize"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmpdir:
+                home = Path(tmpdir) / "home"
+                source = (
+                    home
+                    / ".codex/plugins/cache/openai-curated-remote/superpowers/6.3.0"
+                    / "skills/brainstorming"
+                )
+                source.mkdir(parents=True)
+                (source / "SKILL.md").write_bytes(b"# brainstorming\n")
+                guide = source / "visual-companion.md"
+                if case == "symlink":
+                    target = source / "visual-companion-real.md"
+                    target.write_bytes(b"# companion\n")
+                    guide.symlink_to(target.name)
+                elif case == "hardlink":
+                    target = source / "visual-companion-real.md"
+                    target.write_bytes(b"# companion\n")
+                    os.link(target, guide)
+                else:
+                    guide.write_bytes(b"x" * (server_module.MAX_FLEET_ARTIFACT_BYTES + 1))
+
+                with patch.object(server_module.Path, "home", return_value=home):
+                    artifacts = server_module.portable_gemini_skill_artifacts("teamleiterin")
+
+                self.assertNotIn(
+                    "skills/.portable/plugins/superpowers/brainstorming/SKILL.md",
+                    artifacts,
+                )
+                self.assertNotIn(
+                    "skills/.portable/plugins/superpowers/brainstorming/visual-companion.md",
+                    artifacts,
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            source = (
+                home
+                / ".codex/plugins/cache/openai-curated-remote/superpowers/6.3.0"
+                / "skills/brainstorming"
+            )
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_bytes(b"# brainstorming\n")
+            (source / "visual-companion.md").write_bytes(b"# companion\n")
+
+            with patch.object(server_module.Path, "home", return_value=home):
+                for profile in ("worker", "koenigin"):
+                    artifacts = server_module.portable_gemini_skill_artifacts(profile)
+                    self.assertNotIn(
+                        "skills/.portable/plugins/superpowers/brainstorming/visual-companion.md",
+                        artifacts,
+                    )
+
+    def test_portable_teamlead_projection_reserves_capacity_for_visual_companion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            source = (
+                home
+                / ".codex/plugins/cache/openai-curated-remote/superpowers/6.3.0"
+                / "skills/brainstorming"
+            )
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_bytes(b"# brainstorming\n")
+            (source / "visual-companion.md").write_bytes(b"# companion\n")
+            for name in ("alpha", "beta"):
+                skill = home / ".codex-agents/b1/skills" / name / "SKILL.md"
+                skill.parent.mkdir(parents=True, exist_ok=True)
+                skill.write_bytes(f"# {name}\n".encode("utf-8"))
+
+            with patch.object(server_module.Path, "home", return_value=home), patch.object(
+                server_module, "MAX_PORTABLE_SKILLS", 2
+            ):
+                artifacts = server_module.portable_gemini_skill_artifacts("teamleiterin")
+
+        self.assertEqual(
+            artifacts,
+            {
+                "skills/.portable/plugins/superpowers/brainstorming/SKILL.md": b"# brainstorming\n",
+                "skills/.portable/plugins/superpowers/brainstorming/visual-companion.md": b"# companion\n",
+            },
+        )
+
+    def test_gemini_home_accepts_the_guide_but_rejects_unknown_portable_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pool, original = write_s2b1_policy_home_for_test(
+                root, server_module.RunnerKind.GEMINI_CLI
+            )
+            descriptor = dataclass_replace(original, skill_profile="teamleiterin")
+            source = (
+                root
+                / "home/.codex/plugins/cache/openai-curated-remote/superpowers/6.3.0"
+                / "skills/brainstorming"
+            )
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_bytes(b"# brainstorming\n")
+            (source / "visual-companion.md").write_bytes(b"# companion\n")
+
+            with patch.object(server_module.Path, "home", return_value=root / "home"):
+                artifacts = server_module._fleet_artifacts(
+                    descriptor, root / "gemini-native"
+                )
+            server_module._fleet_write_home(descriptor.home, artifacts)
+
+            self.assertIn(
+                "skills/.portable/plugins/superpowers/brainstorming/visual-companion.md",
+                artifacts,
+            )
+            server_module._fleet_managed_home_state(
+                pool, descriptor, strict_contents=True
+            )
+
+            unexpected = "skills/.portable/plugins/superpowers/brainstorming/assets/preview.svg"
+            unexpected_path = descriptor.home / unexpected
+            unexpected_path.parent.mkdir(parents=True)
+            unexpected_path.write_bytes(b"<svg/>\n")
+            marker_path = descriptor.home / server_module.FLEET_AGENT_MARKER_FILE
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            marker["managed_files"].append(unexpected)
+            marker["managed_files"].sort()
+            marker["files"][unexpected] = hashlib.sha256(
+                unexpected_path.read_bytes()
+            ).hexdigest()
+            marker_path.write_text(
+                json.dumps(marker, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(AgentError, "^fleet_home_content_invalid$"):
+                server_module._fleet_managed_home_state(
+                    pool, descriptor, strict_contents=True
+                )
+
     def test_v2_projection_maps_all_states_and_keeps_transient_measurements_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime = resource_runtime_for_test(Path(directory))

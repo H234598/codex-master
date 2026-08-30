@@ -16,6 +16,23 @@ from codex_master.hive_policy import (
 
 _MARKDOWN_ROOT = Path(fleet_markdown.__file__).with_name("markdown")
 _COMMON_BYTES = (_MARKDOWN_ROOT / "common.md").read_bytes()
+_VISUAL_COMPANION_RULE = """## Visual Companion
+
+Entscheide pro Frage oder Arbeitsschritt, nicht pauschal pro Session. Bei
+visuellen Inhalten oder visuellen Entscheidungen (etwa App-/Mobile-/UI-Design,
+GitHub-Docs-Webseiten, Layout, visueller Hierarchie oder visuellen
+Designvergleichen) lade zuerst `superpowers:brainstorming` und danach dessen
+`visual-companion.md` vollständig, bevor du eine visuelle Richtung festlegst
+oder visuelle Arbeit delegierst. Textuelle Anforderungen, API-, Datenmodell-
+oder Backendentscheidungen sowie reine Trade-off-Listen lösen diese Regel
+nicht aus. Fehlt die Companion-Ressource, behaupte nicht, sie sei geladen:
+blockiere oder eskaliere menschenlesbar mit
+`visual_companion_unavailable`. Wenn providerseitig die für den Companion
+erforderlichen ausführbaren Scripts nicht verfügbar sind, darf der Guide
+geladen werden, aber die Ausführung bleibt explizit
+`visual_companion_unavailable`; verwende keine Scheinfunktion oder
+Übergangslösung.
+""".encode("utf-8")
 
 
 def _agent(
@@ -98,6 +115,44 @@ def test_providers_share_exact_common_prefix_and_only_reference_class_body() -> 
         assert primary[: len(_COMMON_BYTES)] == _COMMON_BYTES
         assert suffix.count(class_name) == 1
         assert worker_body not in primary
+
+
+def test_visual_companion_rule_is_identical_in_teamlead_profiles_and_providers() -> (
+    None
+):
+    teamlead_bodies = {
+        profile: (_MARKDOWN_ROOT / "classes" / f"{profile}.md").read_bytes()
+        for profile in ("teamleiterin", "teamlead")
+    }
+
+    for body in teamlead_bodies.values():
+        assert body.count(_VISUAL_COMPANION_RULE) == 1
+
+    for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+        for profile, body in teamlead_bodies.items():
+            projection = fleet_markdown.fleet_markdown_projection(
+                _agent(runner, profile)
+            )
+            assert projection.artifacts[projection.metadata.class_artifact_name] == body
+            assert (
+                _VISUAL_COMPANION_RULE
+                in projection.artifacts[projection.metadata.class_artifact_name]
+            )
+
+
+def test_visual_companion_rule_is_absent_from_worker_and_queen_profiles() -> None:
+    for profile in ("worker", "koenigin"):
+        body = (_MARKDOWN_ROOT / "classes" / f"{profile}.md").read_bytes()
+        assert _VISUAL_COMPANION_RULE not in body
+
+        for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+            projection = fleet_markdown.fleet_markdown_projection(
+                _agent(runner, profile)
+            )
+            assert (
+                _VISUAL_COMPANION_RULE
+                not in projection.artifacts[projection.metadata.class_artifact_name]
+            )
 
 
 def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
