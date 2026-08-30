@@ -142,6 +142,9 @@ def quiescence(
 
 def test_prepare_materializes_exact_pool_only_v2_candidate() -> None:
     source = source_snapshot()
+    evidence_identity = quiescence(source)
+    assert repr(evidence_identity) == "RegistryV2QuiescenceEvidence(<redacted>)"
+    assert str(evidence_identity) == repr(evidence_identity)
     source_document_before = fleet_document(source)
     source_value_before = source
     observations = 0

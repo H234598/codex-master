@@ -265,6 +265,7 @@ def test_each_activity_has_one_owned_begin_and_terminal_end(
     active = host.snapshot()
 
     assert type(ownership) is RootRuntimeActivityOwnership
+    assert repr(ownership) == "<RootRuntimeActivityOwnership redacted>"
     assert ownership.host_generation == active.host_generation
     assert ownership.begin_epoch == before.runtime_broker_epoch + 1
     assert active.runtime_broker_epoch == ownership.begin_epoch

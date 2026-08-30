@@ -149,6 +149,98 @@ def test_upload_claim_is_restart_verifiable_and_forgery_is_denied(tmp_path) -> N
     restarted.commit_upload(replay, receipt)
 
 
+def test_upload_reservation_can_be_rolled_back_for_fresh_retry(tmp_path: Path) -> None:
+    owner = _owner(tmp_path)
+    session = _session(owner)
+    claim = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+
+    owner.rollback_upload(claim)
+    retry = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload-retry",
+    )
+
+    assert retry.session_id == session.id
+    assert retry.idempotency_key == "idem-upload-retry"
+
+
+def test_known_absent_upload_write_failure_restores_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = _owner(tmp_path)
+    session = _session(owner)
+    claim = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    monkeypatch.setattr(
+        CredentialVault,
+        "store_projection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("write failed")),
+    )
+
+    with pytest.raises(AdminSecretIngressError, match="control.owner_unavailable"):
+        owner.put_secret(
+            session.id,
+            bytearray(b"oauth-client-json"),
+            principal="operator-one",
+            upload_claim=claim,
+        )
+
+    replay = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    assert replay == claim
+
+
+def test_conflicting_projection_after_write_failure_marks_upload_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = _owner(tmp_path)
+    session = _session(owner)
+    claim = owner.reserve_upload(
+        session.id,
+        principal="operator-one",
+        expected_generation=4,
+        idempotency_key="idem-upload",
+    )
+    monkeypatch.setattr(
+        CredentialVault,
+        "store_projection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("write failed")),
+    )
+    monkeypatch.setattr(
+        CredentialVault, "projection_metadata", lambda *_args, **_kwargs: ("active", 99)
+    )
+
+    with pytest.raises(AdminSecretIngressError, match="control.owner_unavailable"):
+        owner.put_secret(
+            session.id,
+            bytearray(b"oauth-client-json"),
+            principal="operator-one",
+            upload_claim=claim,
+        )
+    with pytest.raises(AdminSecretIngressError, match="credential.upload_expired"):
+        owner.reserve_upload(
+            session.id,
+            principal="operator-one",
+            expected_generation=4,
+            idempotency_key="idem-upload",
+        )
+
+
 def test_upload_reconciles_vault_success_when_store_reports_failure(
     tmp_path, monkeypatch
 ) -> None:

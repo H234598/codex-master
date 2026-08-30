@@ -1548,6 +1548,25 @@ def test_oversized_content_length_is_rejected_without_owner_call(tmp_path) -> No
     assert service.calls == []
 
 
+def test_expect_continue_is_rejected_before_request_body(tmp_path) -> None:
+    body = _document("google.accounts.list", {})
+    with _running_server(tmp_path) as (server, service):
+        connection = http.client.HTTPConnection(*server.server_address, timeout=2)
+        connection.putrequest("POST", "/admin/v1", skip_host=True)
+        for name, value in _headers().items():
+            connection.putheader(name, value)
+        connection.putheader("Expect", "100-continue")
+        connection.putheader("Content-Length", str(len(body)))
+        connection.endheaders()
+        response = connection.getresponse()
+        payload = response.read()
+        connection.close()
+
+    assert response.status == 417
+    assert json.loads(payload)["code"] == "control.request_invalid"
+    assert service.calls == []
+
+
 def test_chunked_request_is_rejected(tmp_path) -> None:
     with _running_server(tmp_path) as (server, _service):
         client = socket.create_connection(server.server_address, timeout=2)

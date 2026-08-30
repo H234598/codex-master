@@ -107,6 +107,35 @@ class FleetSnapshotTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             snapshot.processes_by_codex_home["/home/a1"] = ()
 
+    def test_process_summary_projects_external_process_without_raw_output(self) -> None:
+        process = ProcessSnapshot(101, 1, "python", "S (sleeping)", "/home/a1", False)
+        snapshot = FleetSnapshot(
+            created_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
+            processes=[process],
+            processes_by_codex_home={"/home/a1": [process]},
+            tmux_sessions={},
+            agent_process_map={"a1": AgentProcessSnapshot(True, [process])},
+            process_scan_available=True,
+            tmux_scan_available=True,
+        )
+
+        summary = summarize_agent_processes(snapshot, "a1")
+
+        self.assertEqual(summary["external_process_count"], 1)
+        self.assertEqual(
+            summary["external_processes"],
+            [
+                {
+                    "pid": 101,
+                    "ppid": 1,
+                    "name": "python",
+                    "state": "S (sleeping)",
+                    "managed_by_masterjet": False,
+                    "raw_output": "not_returned",
+                }
+            ],
+        )
+
     def test_fleet_watchdog_reuses_one_snapshot_for_selected_agent(self) -> None:
         from codex_master import server
 

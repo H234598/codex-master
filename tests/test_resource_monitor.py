@@ -16,6 +16,7 @@ from codex_master.hive import state as hive_state_module
 from codex_master import resource_monitor as resource_monitor_module
 from codex_master.hive.state import HiveStateError, HiveStateStore
 from codex_master.resource_monitor import (
+    HostResourceInputBackend,
     ResourceClocks,
     ResourceEvidenceStateV2,
     ResourceEvidenceV2,
@@ -85,6 +86,52 @@ def resource_paths() -> ResourceInputPaths:
 
 def resource_clocks(*, monotonic_ns: int = 10_000_000_000, now_utc: datetime = NOW) -> ResourceClocks:
     return ResourceClocks(now_utc=lambda: now_utc, monotonic_ns=lambda: monotonic_ns)
+
+
+def test_host_sensor_backend_reads_bounded_stdout_from_fixed_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        def __init__(self) -> None:
+            stdout_read, stdout_write = os.pipe()
+            stderr_read, stderr_write = os.pipe()
+            os.write(stdout_write, b'{"sensor": {}}')
+            os.close(stdout_write)
+            os.close(stderr_write)
+            self.stdout = os.fdopen(stdout_read, "rb")
+            self.stderr = os.fdopen(stderr_read, "rb")
+
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is None or timeout > 0
+            return 0
+
+        def poll(self) -> int:
+            return 0
+
+        def kill(self) -> None:
+            pytest.fail("completed sensor process must not be killed")
+
+    calls: list[tuple[object, ...]] = []
+
+    def popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return Process()
+
+    monkeypatch.setattr(resource_monitor_module.subprocess, "Popen", popen)
+    backend = HostResourceInputBackend(monotonic_seconds=lambda: 0.0)
+
+    payload = backend.run_sensors_json(
+        argv=("/usr/bin/sensors", "-j"),
+        environment={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"},
+        stdin_closed=True,
+        timeout_seconds=resource_monitor_module._SENSORS_TIMEOUT_SECONDS,
+        max_stdout_bytes=resource_monitor_module._SENSORS_STDOUT_MAX_BYTES,
+        max_stderr_bytes=resource_monitor_module._SENSORS_STDERR_MAX_BYTES,
+    )
+
+    assert payload == b'{"sensor": {}}'
+    assert calls[0][0] == ("/usr/bin/sensors", "-j")
+    assert calls[0][1]["stdin"] is subprocess.DEVNULL
 
 
 def resource_kernel_document(paths: ResourceInputPaths) -> dict[Path, bytes]:
@@ -1037,6 +1084,27 @@ def _snapshot(payload: dict[str, object] | None = None) -> ResourceSnapshotV1:
 
 def _snapshot_bytes(payload: dict[str, object] | None = None) -> bytes:
     return json.dumps(snapshot_document() if payload is None else payload).encode("utf-8")
+
+
+def test_legacy_generation_reader_and_cgroup_preflight_transform_are_exact(
+    tmp_path: Path,
+) -> None:
+    store = HiveStateStore(tmp_path / "state")
+    assert resource_monitor_module._stored_resource_generation(store) == (None, 0)
+    write_resource_snapshot(store, _snapshot())
+    assert resource_monitor_module._stored_resource_generation(store) == (BOOT_ID, 7)
+
+    failed = resource_monitor_module._snapshot_with_cgroup_preflight(
+        _snapshot(), ready=False
+    )
+    restored = resource_monitor_module._snapshot_with_cgroup_preflight(
+        replace(failed, reason_codes=("cgroup_preflight_failed",)), ready=True
+    )
+
+    assert failed.cgroup_state == "preflight_failed"
+    assert restored.cgroup_state == "ready"
+    assert restored.gate_state == "ready"
+    assert restored.reason_codes == ("resource_ready",)
 
 
 def test_resource_document_reader_rejects_nonregular_mode_owner_link_partial_duplicate_key_nan_and_overlimit(

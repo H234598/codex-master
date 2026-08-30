@@ -118,6 +118,8 @@ def test_permit_rejects_subclassing() -> None:
 def test_binding_evidence_is_non_transferable_data_only_and_not_attachable() -> None:
     evidence_type = runner_module().RootDynamicTeamleadRunnerBindingEvidence
 
+    with pytest.raises(TypeError, match="binding_evidence_factory_required"):
+        evidence_type()
     with pytest.raises(TypeError):
         evidence_type(object(), object(), object(), object())
 
@@ -221,6 +223,8 @@ def test_start_composition_is_redacted_frozen_and_nontransferable() -> None:
     )
     assert composition_type is not None
 
+    with pytest.raises(TypeError, match="start_composition_factory_required"):
+        composition_type()
     with pytest.raises(TypeError):
         composition_type(*((object(),) * 8))
 

@@ -12,9 +12,11 @@ from types import SimpleNamespace
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+import codex_master.credential_vault as credential_vault
 from codex_master.credential_vault import (
     MAX_LEASE_SECONDS,
     MAX_PROJECTION_BYTES,
+    CredentialCleanupTarget,
     CredentialVault,
     CredentialVaultError,
 )
@@ -57,6 +59,73 @@ def legacy_vault_record(
     )
     ciphertext = AESGCM(KEY).encrypt(nonce, plaintext, aad)
     return struct.pack(">8sBQ12s", b"CMVAULT\0", 1, generation, nonce) + ciphertext
+
+
+def test_cleanup_target_repr_and_legacy_temporary_metadata_are_sparse_and_strict(
+    tmp_path: Path,
+) -> None:
+    temporary = tmp_path / ".auth.json.tmp"
+    temporary.write_bytes(b"legacy")
+    temporary.chmod(0o600)
+    target = CredentialCleanupTarget(
+        str(tmp_path), CredentialVault._raw_directory_metadata(tmp_path.stat()), temporary.name
+    )
+
+    assert repr(target) == "CredentialCleanupTarget(<redacted>)"
+    assert str(tmp_path) not in repr(target)
+    assert CredentialVault._safe_unbound_legacy_temporary(temporary.stat()) is True
+    temporary.chmod(0o644)
+    assert CredentialVault._safe_unbound_legacy_temporary(temporary.stat()) is False
+
+
+def test_materialization_context_releases_local_lease(tmp_path: Path) -> None:
+    vault = vault_at(tmp_path / "vault")
+    vault.store_projection("openai-one", 1, b"secret")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    temporary = runtime / (".auth.json." + "a" * 64 + ".tmp")
+    temporary.write_bytes(b"")
+    temporary.chmod(0o600)
+    target = CredentialCleanupTarget(
+        str(runtime),
+        CredentialVault._raw_directory_metadata(runtime.stat()),
+        temporary.name,
+    )
+
+    with vault.materialization_lease(
+        "openai-one",
+        expected_generation=1,
+        ttl_seconds=30,
+        invalidator=lambda: None,
+        cleanup_target=target,
+        prepare=lambda: CredentialVault._raw_file_metadata(temporary.stat()),
+    ) as (lease, plaintext):
+        assert plaintext == b"secret"
+        with pytest.raises(CredentialVaultError, match="credential.lease_consumed"):
+            vault.consume_lease(lease)
+
+    with pytest.raises(CredentialVaultError, match="credential.lease_consumed"):
+        vault.consume_lease(lease)
+
+
+def test_fork_invalidation_rotates_issuer_and_owner_liveness_is_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = vault_at(tmp_path)
+    vault.store_projection("openai-one", 1, b"secret")
+    lease = vault.lease("openai-one", expected_generation=1, ttl_seconds=30)
+    current_boot = vault._owner_boot_id
+    claim = {
+        "owner_boot_id": current_boot,
+        "owner_pid": 12345,
+        "owner_start_ticks": 7,
+    }
+    monkeypatch.setattr(CredentialVault, "_process_start_ticks", staticmethod(lambda _pid: 8))
+
+    assert vault._claim_owner_dead(claim) is True
+    credential_vault._invalidate_vaults_after_fork()
+    with pytest.raises(CredentialVaultError, match="credential.vault_request_invalid"):
+        vault.consume_lease(lease)
 
 
 def write_legacy_vault(

@@ -61,6 +61,32 @@ def no_active_metrics_source_workers() -> bool:
     )
 
 
+def test_process_source_worker_guard_cancel_releases_only_reserved_worker() -> None:
+    guard = observability_http._ProcessSourceWorkerGuard()
+    reserved = threading.Thread()
+    unrelated = threading.Thread()
+
+    assert guard.reserve(reserved, timeout_seconds=0.0) is True
+    guard.cancel(unrelated)
+    assert guard.reserve(unrelated, timeout_seconds=0.0) is False
+
+    guard.cancel(reserved)
+    assert guard.reserve(unrelated, timeout_seconds=0.0) is True
+
+
+def test_metrics_http_server_suppresses_request_error_output(capsys: pytest.CaptureFixture[str]) -> None:
+    server = MetricsHttpServer(("127.0.0.1", 0), lambda: "# EOF\n")
+    try:
+        with socket.socket() as request_socket:
+            server.handle_error(request_socket, ("127.0.0.1", 12345))
+    finally:
+        server.server_close()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
 def test_metrics_passthroughs_stale_openmetrics_body_byte_for_byte() -> None:
     payload = (
         "codex_master_snapshot_state{state=\"stale\"} 1\n"

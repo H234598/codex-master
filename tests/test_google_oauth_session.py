@@ -87,6 +87,48 @@ def test_authorization_is_bound_to_one_account_and_never_cross_written() -> None
     assert "private-access" not in repr(_persist_authorization)
 
 
+def test_module_level_oauth_helpers_delegate_exact_arguments() -> None:
+    class Service:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+        def _call(self, name: str, args: tuple[object, ...], kwargs: dict[str, object]):
+            self.calls.append((name, args, kwargs))
+            return name
+
+        def plan_oauth_client_import(self, *args: object, **kwargs: object):
+            return self._call("plan", args, kwargs)
+
+        def apply_oauth_client_import(self, *args: object, **kwargs: object):
+            return self._call("apply", args, kwargs)
+
+        def begin_oauth_transaction(self, *args: object, **kwargs: object):
+            return self._call("begin", args, kwargs)
+
+        def complete_oauth_transaction(self, *args: object, **kwargs: object):
+            return self._call("complete", args, kwargs)
+
+    service = Service()
+
+    assert oauth_session.plan_oauth_client_import(service, "account", generation=1) == "plan"
+    assert oauth_session.apply_oauth_client_import(service, "plan", ingress="cap") == "apply"
+    assert oauth_session.begin_oauth_transaction(service, "account", profile="inventory") == "begin"
+    assert oauth_session.complete_oauth_transaction(service, "txn", code="code") == "complete"
+    assert service.calls == [
+        ("plan", ("account",), {"generation": 1}),
+        ("apply", ("plan",), {"ingress": "cap"}),
+        ("begin", ("account",), {"profile": "inventory"}),
+        ("complete", ("txn",), {"code": "code"}),
+    ]
+
+
+def test_v2_migration_rejects_noncanonical_shape() -> None:
+    with pytest.raises(oauth_session.HiveStateError, match="invalid_google_oauth_control_state"):
+        oauth_session.GoogleOAuthControlService._migrate_v2(
+            {"schema_version": 2, "imports": [], "clients": []}
+        )
+
+
 def test_subject_mismatch_stops_without_auth_write() -> None:
     store = MemoryStore(_document())
 

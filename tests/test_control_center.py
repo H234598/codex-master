@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 import unittest
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 from codex_master import control_center
@@ -323,6 +324,29 @@ class ControlCenterViewModelTest(unittest.TestCase):
 
 
 class ControlCenterControllerTest(unittest.TestCase):
+    def test_backend_timeout_policy_and_prepared_abort_restore_idle_dispatcher(self) -> None:
+        self.assertEqual(
+            control_center.backend_timeout_seconds(
+                "agent_wait", {"timeout_seconds": 300}
+            ),
+            330,
+        )
+        self.assertEqual(
+            control_center.backend_timeout_seconds("agent_pool_install", {}), 600
+        )
+        self.assertEqual(
+            control_center.backend_timeout_seconds("agent_status", {}),
+            control_center.DEFAULT_BACKEND_TIMEOUT_SECONDS,
+        )
+
+        dispatcher = control_center.SubprocessToolDispatcher(
+            argv=[sys.executable, "-c", "pass"]
+        )
+        dispatcher.prepare()
+        dispatcher.abort_prepare()
+        dispatcher.prepare()
+        dispatcher.abort_prepare()
+
     def test_serializes_operations_and_refuses_close_while_busy(self) -> None:
         started = threading.Event()
         release = threading.Event()
@@ -690,6 +714,249 @@ class ControlCenterControllerTest(unittest.TestCase):
 
         view._render_tool_form.assert_called_once_with()
         view._run_selected_tool.assert_not_called()
+
+
+class ControlCenterWindowContractTest(unittest.TestCase):
+    @staticmethod
+    def _mock_gtk() -> Mock:
+        Gtk = Mock()
+        Gtk.ComboBoxText.return_value.get_active_text.return_value = "Alle"
+        Gtk.ResponseType.OK = "ok"
+        Gtk.ResponseType.CANCEL = "cancel"
+        Gtk.MessageDialog.return_value.run.return_value = "ok"
+        Gtk.Dialog.return_value.run.return_value = "ok"
+        return Gtk
+
+    def test_constructor_builds_all_pages_without_real_display(self) -> None:
+        Gtk = self._mock_gtk()
+        GLib = Mock()
+        GLib.idle_add.return_value = 1
+
+        window = control_center.ControlCenterWindow(Gtk, GLib, object())
+        try:
+            self.assertEqual(
+                window.page_names(),
+                {"Übersicht", "Werkzeuge", "Ollama/Modelle", "Ollama/Instanzen"},
+            )
+            self.assertIs(window.Gtk, Gtk)
+            self.assertGreater(len(window.tool_catalog), 0)
+            self.assertEqual(Gtk.Notebook.return_value.append_page.call_count, 5)
+        finally:
+            self.assertTrue(window.controller.close())
+
+    def test_tool_form_renders_reads_and_bounds_public_result(self) -> None:
+        Gtk = self._mock_gtk()
+        entry = Mock(spec=["get_text", "set_max_length", "set_text"])
+        entry.get_text.return_value = "a1"
+        Gtk.Entry.return_value = entry
+        view = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        view.Gtk = Gtk
+        view.tool_form = Mock()
+        view.tool_form.get_children.return_value = [Mock()]
+        view.tool_inputs = {"old": (Mock(), Mock(), Mock(), "text")}
+        view.tool_description_label = Mock()
+        view.tool_risk_label = Mock()
+        view.tool_run_button = Mock()
+        view.controller = Mock(busy=False)
+        field = control_center.FieldDescriptor(
+            "agent",
+            control_center.FieldKind.STRING,
+            True,
+            description="Konkrete Biene",
+        )
+        tool = control_center.ToolDescriptor(
+            "agent_status",
+            "Status laden",
+            control_center.Risk.READ_ONLY,
+            (field,),
+            True,
+        )
+        view.selected_tool = tool
+
+        view._render_tool_form()
+
+        self.assertEqual(view._read_tool_arguments(tool), {"agent": "a1"})
+        self.assertEqual(set(view.tool_inputs), {"agent"})
+        view.tool_result = Mock()
+        view._set_tool_result({"ok": True, "token": "not-public"})
+        rendered = view.tool_result.get_buffer.return_value.set_text.call_args.args[0]
+        self.assertIn('"ok": true', rendered)
+        self.assertNotIn("not-public", rendered)
+
+    def test_confirmation_contracts_cover_each_risk_class(self) -> None:
+        Gtk = self._mock_gtk()
+        view = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        view.Gtk = Gtk
+        view.window = Mock()
+        tool = control_center.ToolDescriptor(
+            "agent_pool_destroy_pool",
+            "Pool löschen",
+            control_center.Risk.DESTRUCTIVE,
+            (),
+            True,
+        )
+        phrase = f"AUSFÜHREN {tool.name}"
+        Gtk.Entry.return_value.get_text.return_value = phrase
+
+        self.assertTrue(view._confirm_message("Fortfahren?"))
+        self.assertTrue(view._confirm_destructive(tool))
+        self.assertTrue(
+            view._confirm_tool_run(tool, control_center.Risk.READ_ONLY, 0)
+        )
+        with patch.object(view, "_confirm_message", return_value=True) as confirm:
+            self.assertTrue(
+                view._confirm_tool_run(tool, control_center.Risk.BROAD, 2)
+            )
+            self.assertEqual(confirm.call_count, 2)
+
+    def test_tool_run_preview_and_completion_follow_risk_contract(self) -> None:
+        view = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        tool = control_center.ToolDescriptor(
+            "agent_pool_destroy_pool",
+            "Pool löschen",
+            control_center.Risk.DESTRUCTIVE,
+            (),
+            True,
+        )
+        view.selected_tool = tool
+        view._read_tool_arguments = Mock(
+            return_value={"spec": "a-series", "allow_destructive": True}
+        )
+        view._confirm_message = Mock(return_value=True)
+        view._confirm_destructive = Mock(return_value=True)
+        view._confirm_tool_run = Mock(return_value=True)
+        view._set_busy = Mock()
+        view._set_tool_result = Mock()
+        view.tool_status_label = Mock()
+        view.controller = Mock()
+        view.controller.submit.return_value = True
+        view.refresh = Mock()
+
+        view._run_selected_tool()
+        preview_callback = view.controller.submit.call_args.args[2]
+        self.assertEqual(view.controller.submit.call_args.args[0], "agent_pool_status")
+        preview_callback({"ok": True})
+        destroy_callback = view.controller.submit.call_args.args[2]
+        self.assertEqual(
+            view.controller.submit.call_args.args[0], "agent_pool_destroy_pool"
+        )
+        destroy_callback({"ok": True})
+
+        view._set_tool_result.assert_called_with({"ok": True})
+        view.refresh.assert_called_once_with()
+
+    def test_status_navigation_render_and_mutation_use_bounded_contracts(self) -> None:
+        Gtk = self._mock_gtk()
+        view = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        view.Gtk = Gtk
+        view.page = 2
+        view.last_page = None
+        view.search = Mock()
+        view.search.get_text.return_value = "a"
+        view.refresh_button = Mock()
+        view.previous_button = Mock()
+        view.next_button = Mock()
+        view.status_label = Mock()
+        view.list_box = Mock()
+        view.list_box.get_children.return_value = [Mock()]
+        view.window = Mock()
+        view.controller = Mock()
+        view.controller.busy = False
+        view.controller.submit.return_value = True
+        view.selected_tool = None
+
+        self.assertEqual(view._filter_text(), "a")
+        view.refresh()
+        self.assertEqual(
+            view.controller.submit.call_args.args[:2],
+            (
+                "agent_status",
+                {"agent": "a-series", "agents_offset": 40, "agents_limit": 20},
+            ),
+        )
+        view._apply_filter()
+        self.assertEqual(view.page, 0)
+        view._change_page(1)
+        self.assertEqual(view.page, 1)
+
+        payload = ControlCenterViewModelTest()._page(
+            ControlCenterViewModelTest()._status_result()
+        )
+        view._status_loaded(payload)
+        self.assertEqual(view.last_page.total_count, 300)
+        self.assertEqual(view.list_box.add.call_count, 1)
+
+        view._confirm_mutation("start", "a1")
+        self.assertEqual(view.controller.submit.call_args.args[0], "agent_start")
+        self.assertEqual(view.controller.submit.call_args.args[1]["agent"], "a1")
+        view._mutation_finished("stop", "a1", {"ok": True})
+        self.assertEqual(view.controller.submit.call_args.args[0], "agent_status")
+
+
+class ControlCenterGtkBoundaryTest(unittest.TestCase):
+    def test_load_gtk_returns_imported_repository_modules(self) -> None:
+        gi = ModuleType("gi")
+        gi.require_version = Mock()
+        repository = ModuleType("gi.repository")
+        repository.Gtk = object()
+        repository.GLib = object()
+        gi.repository = repository
+
+        with patch.dict(
+            sys.modules,
+            {"gi": gi, "gi.repository": repository},
+        ):
+            Gtk, GLib = control_center.load_gtk()
+
+        gi.require_version.assert_called_once_with("Gtk", "3.0")
+        self.assertIs(Gtk, repository.Gtk)
+        self.assertIs(GLib, repository.GLib)
+
+    @patch("codex_master.control_center.load_gtk")
+    def test_launch_activation_reuses_one_window_and_honors_deep_link(
+        self, mock_load
+    ) -> None:
+        Gtk = Mock()
+        Gtk.init_check.return_value = (True, [])
+        application = Mock()
+        activate = None
+
+        def connect(signal, callback):
+            nonlocal activate
+            self.assertEqual(signal, "activate")
+            activate = callback
+
+        def run(_args):
+            assert activate is not None
+            activate(application)
+            activate(application)
+            return 23
+
+        application.connect.side_effect = connect
+        application.run.side_effect = run
+        Gtk.Application.return_value = application
+        mock_load.return_value = (Gtk, Mock())
+        window = Mock()
+
+        with patch(
+            "codex_master.control_center.ControlCenterWindow",
+            return_value=window,
+        ) as window_class:
+            self.assertEqual(
+                control_center.launch_gtk_application(["--page", "ollama"]), 23
+            )
+
+        window_class.assert_called_once_with(Gtk, mock_load.return_value[1], application)
+        self.assertEqual(window.show.call_args_list[0].args, ("ollama",))
+        self.assertEqual(window.show.call_count, 2)
 
 
 class ControlCenterCliTest(unittest.TestCase):

@@ -8,6 +8,7 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
+import codex_master.fleet_runners as fleet_runners
 from codex_master.fleet_headless import HeadlessJobError, HeadlessProcessResult
 from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from codex_master.fleet_runners import (
@@ -36,8 +37,59 @@ from codex_master.fleet_runners import (
     probe_gemini_rest,
     probe_huggingface_models,
     probe_ollama_models,
+    probe_provider_models,
     validate_gemini_probe_model,
 )
+
+
+def test_probe_provider_models_dispatches_supported_lanes_and_rejects_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    sentinels = {
+        Provider.OLLAMA_LOCAL: object(),
+        Provider.HUGGINGFACE_INFERENCE: object(),
+        Provider.GEMINI_API: object(),
+    }
+    opener = object()
+    monkeypatch.setattr(
+        fleet_runners,
+        "probe_ollama_models",
+        lambda *, opener: calls.append((Provider.OLLAMA_LOCAL, opener))
+        or sentinels[Provider.OLLAMA_LOCAL],
+    )
+    monkeypatch.setattr(
+        fleet_runners,
+        "probe_huggingface_models",
+        lambda secret, *, opener: calls.append(
+            (Provider.HUGGINGFACE_INFERENCE, secret, opener)
+        )
+        or sentinels[Provider.HUGGINGFACE_INFERENCE],
+    )
+    monkeypatch.setattr(
+        fleet_runners,
+        "probe_gemini_models",
+        lambda secret, *, opener: calls.append((Provider.GEMINI_API, secret, opener))
+        or sentinels[Provider.GEMINI_API],
+    )
+
+    for provider, sentinel in sentinels.items():
+        assert probe_provider_models(provider, secret="secret", opener=opener) is sentinel
+    unsupported = probe_provider_models(Provider.OPENAI_API)
+
+    assert calls == [
+        (Provider.OLLAMA_LOCAL, opener),
+        (Provider.HUGGINGFACE_INFERENCE, "secret", opener),
+        (Provider.GEMINI_API, "secret", opener),
+    ]
+    assert unsupported.provider is Provider.OPENAI_API
+    assert unsupported.available is False
+    assert unsupported.error == "unsupported_provider"
+
+
+def test_default_provider_redirect_handler_fails_closed() -> None:
+    with pytest.raises(FleetRunnerError, match="redirect_rejected"):
+        fleet_runners._RejectRedirectHandler().redirect_request()
 
 
 class _ProbeProcess:

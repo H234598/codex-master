@@ -58,6 +58,23 @@ def auth_json(account_id: str, *, marker: str = SECRET_MARKER) -> bytes:
     ).encode("utf-8")
 
 
+def test_identity_repr_is_redacted_and_ingress_requires_authorized_issuance() -> None:
+    identity = OpenAIAccountIdentity(True, "acct-one", 2)
+
+    assert repr(identity) == "OpenAIAccountIdentity(<redacted>)"
+    assert "acct-one" not in repr(identity)
+    with pytest.raises(TypeError, match="requires authorized issuance"):
+        AuthorizedAuthIngress()
+
+
+def test_registered_account_requires_enabled_identity(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+
+    assert service._registered_account("openai-one") == "openai-one"
+    with pytest.raises(OpenAICredentialError, match="control.request_invalid"):
+        service._registered_account("missing")
+
+
 def make_service(
     tmp_path: Path,
     *,

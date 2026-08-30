@@ -788,6 +788,10 @@ def test_h4_binding_and_resumable_rollback_require_bound_capsule() -> None:
         )
         ticket = _append(module, ledger, ticket, module.SpawnPhase.OFFER_VALIDATED)
         binding = _lease_binding(module, ledger, ticket)
+        with pytest.raises(TypeError, match="internals are not serializable"):
+            copy.copy(binding)
+        with pytest.raises(TypeError, match="internals are not serializable"):
+            copy.deepcopy(binding)
         ticket = _append(
             module,
             ledger,

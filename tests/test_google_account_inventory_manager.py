@@ -209,6 +209,18 @@ def test_manager(*outcomes: object, **kwargs: object) -> GoogleAccountInventoryM
 test_manager.__test__ = False
 
 
+def test_default_manager_initializes_empty_and_reload_failure_is_redacted() -> None:
+    manager = GoogleAccountInventoryManager()
+    failure = manager_module._ReloadFailureV1("private-code")
+
+    assert manager.status().state is InventoryManagerStateV1.EMPTY
+    assert manager.status().generation is None
+    assert repr(failure) == "_ReloadFailureV1()"
+    assert "private-code" not in repr(failure)
+    with pytest.raises(TypeError, match="not serializable"):
+        pickle.dumps(failure)
+
+
 def test_reload_rejects_stale_expected_generation_before_publish(
     tmp_path: Path,
 ) -> None:

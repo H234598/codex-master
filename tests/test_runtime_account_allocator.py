@@ -1933,6 +1933,17 @@ def test_lease_binding_guard_is_single_use_bound_and_reference_is_inert() -> Non
     other[0].close_lease_binding_verification(other_verification)
 
 
+def test_private_binding_types_require_issuers_and_opaque_text_rejects_pickle() -> None:
+    module = _allocator_module()
+
+    with pytest.raises(TypeError, match="verifications are allocator-issued only"):
+        module.LeaseBindingVerificationV1()
+    with pytest.raises(TypeError, match="references use the private document codec"):
+        module.LeaseBindingReferenceV1()
+    with pytest.raises(TypeError, match="internals are not serializable"):
+        pickle.dumps(module._OpaqueText("redacted"))
+
+
 def test_lease_binding_reference_codec_is_redacted_and_cannot_cross_process() -> None:
     module = _allocator_module()
     allocator, _adapter, receipt, lease, ticket, capacity_evidence, _reservation = (

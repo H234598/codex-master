@@ -10,6 +10,7 @@ import stat
 
 import pytest
 
+import codex_master.fleet_home_recovery as recovery_module
 from codex_master.fleet_home_recovery import (
     MAX_FLEET_HOME_RECOVERY_BYTES,
     FleetHomeEntryKind,
@@ -1441,6 +1442,16 @@ def switched_observation(
             )
         ),
     )
+
+
+def test_switched_entry_requires_replacement_live_and_before_in_old_slot() -> None:
+    transaction = transaction_fixture()
+    entry = transaction.homes[0].entries[0]
+    prepared = prepared_observation(transaction).homes[0].entries[0]
+    switched = switched_observation(transaction).homes[0].entries[0]
+
+    assert recovery_module._switched_entry(entry, prepared, switched) is True
+    assert recovery_module._switched_entry(entry, prepared, prepared) is False
 
 
 def partial_switch_observation(

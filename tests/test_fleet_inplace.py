@@ -164,6 +164,22 @@ def test_public_api_is_q_specific_and_minimal() -> None:
     ]
 
 
+def test_partial_transaction_cleanup_removes_only_declared_owned_files(
+    tmp_path: Path,
+) -> None:
+    parent = private_dir(tmp_path / "transactions")
+    transaction = private_dir(parent / TX_ID)
+    write_file(transaction / "stage-a", b"stage")
+    write_file(transaction / "backup-a", b"backup")
+
+    inplace._cleanup_partial(
+        transaction, [{"stage": "stage-a", "backup": "backup-a"}]
+    )
+
+    assert not transaction.exists()
+    assert parent.exists()
+
+
 def test_q1_q3_update_uses_one_cas_and_preserves_home_and_runtime_identity(tmp_path: Path) -> None:
     homes, transactions = series(tmp_path)
     home_inodes = {item.home_id: item.home.stat().st_ino for item in homes}

@@ -231,6 +231,26 @@ def auth_fd(tmp_path: Path) -> Iterator[int]:
         os.close(fd)
 
 
+def test_server_context_manager_and_json_constant_failure_contract(
+    tmp_path: Path,
+    attestation_key_fd: int,
+) -> None:
+    path = tmp_path / "private" / "admin.sock"
+    ingress = _SecretIngress()
+    with AdminSocketServer(
+        path,
+        _service(ingress, _Hosts()),
+        lambda _peer: PRINCIPAL,
+        attestation_key_fd=attestation_key_fd,
+    ) as adapter:
+        assert adapter.path == path
+        assert path.exists()
+
+    assert path.exists() is False
+    with pytest.raises(ValueError):
+        admin_socket._raise_value_error()
+
+
 def _wire_request(request: AdminRequestV1) -> bytes:
     return (
         json.dumps(

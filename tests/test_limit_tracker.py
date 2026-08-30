@@ -46,6 +46,11 @@ def private_dir(path: Path) -> Path:
     return path
 
 
+def test_attestation_race_hooks_default_to_noop() -> None:
+    assert limit_tracker._before_release_recheck() is None
+    assert limit_tracker._before_payload_recheck(1, "active.json", 2) is None
+
+
 def test_non_finite_json_and_emergency_block_state_are_explicit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

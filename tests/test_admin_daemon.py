@@ -14,12 +14,14 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import venv
 
 from cryptography.hazmat.primitives.asymmetric import rsa
 import jwt
 import pytest
 
+import codex_master.admin_daemon as admin_daemon
 import codex_master.admin_assembly as admin_assembly
 from codex_master.admin_auth import MasterjetBearerVerifier, TotpStepUpVerifier
 from codex_master.admin_contracts import AdminPrincipalV1, AdminRequestV1
@@ -35,6 +37,7 @@ from codex_master.admin_daemon import (
 from codex_master.admin_assembly import CredentialQuotaCollector, assemble_admin_runtime
 from codex_master.admin_http import AdminHttpServer
 from codex_master.admin_service import MasterjetControlService
+from codex_master.admin_socket import UnixPeerCredentials
 from codex_master.google_oauth_authorization import GoogleOAuthProfileIdV1
 from codex_master.google_oauth_session import (
     GoogleOAuthClientMaterialV1,
@@ -177,6 +180,63 @@ def test_readiness_cannot_race_a_partially_bound_transport(
     assert daemon.ready is True
     assert notifications == ["READY=1"]
     daemon.stop()
+
+
+def test_admin_assembly_primitives_are_sparse_local_and_close_in_reverse_order() -> None:
+    assert str(admin_assembly.AdminAssemblyError()) == "control.admin_configuration_invalid"
+    leases = admin_assembly._ControlHostOllamaLeases()
+    assert leases.resolve(admin_assembly.CONTROL_HOST_REF) is not None
+    assert leases.resolve("remote-host") is None
+    with pytest.raises(admin_assembly.BrokerTransportError, match="resource.host_unreachable"):
+        admin_assembly._LocalOnlyOllamaBroker().exchange("private")
+
+    closed: list[str] = []
+    admin_assembly._close_partial(
+        [
+            lambda: closed.append("first"),
+            lambda: (_ for _ in ()).throw(RuntimeError("ignored")),
+            lambda: closed.append("last"),
+        ]
+    )
+    assert closed == ["last", "first"]
+
+
+def test_admin_runtime_run_closes_all_owned_authorities() -> None:
+    events: list[str] = []
+
+    class Daemon:
+        def run(self) -> int:
+            events.append("daemon")
+            return 0
+
+    class Closeable:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self, *_args: object) -> None:
+            events.append(self.name)
+
+    runtime = admin_assembly.AdminRuntime(
+        Daemon(),
+        object(),
+        Closeable("credentials"),
+        openai_credentials=Closeable("openai"),
+        google_manager=Closeable("google"),
+        bearer=Closeable("bearer"),
+        totp=Closeable("totp"),
+        access=Closeable("access"),
+    )
+
+    assert runtime.run() == 0
+    assert events == [
+        "daemon",
+        "openai",
+        "google",
+        "access",
+        "bearer",
+        "totp",
+        "credentials",
+    ]
 
 
 def test_immediate_http_serve_failure_never_publishes_readiness(
@@ -584,6 +644,138 @@ class _Response:
         return self._payload[:maximum]
 
 
+def test_google_billing_lease_observes_precondition_and_binds_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    documents = iter(
+        (
+            {"billingAccountName": "billingAccounts/existing"},
+            {},
+            {"billingAccountName": "billingAccounts/created"},
+        )
+    )
+    calls: list[tuple[str, bytes | None]] = []
+
+    def open_response(request: urllib.request.Request, *, timeout: float) -> _Response:
+        assert timeout == 10
+        calls.append((request.get_method(), request.data))
+        return _Response(
+            json.dumps(next(documents)).encode("ascii"), url=request.full_url
+        )
+
+    monkeypatch.setattr(admin_assembly.urllib.request, "urlopen", open_response)
+    lease = admin_assembly.GoogleBillingLease("google-one", "subject-one", "token")
+
+    observed = lease.get_project_billing_binding("project one")
+    expected = lease._precondition({})
+    bound = lease.bind_project_if_unbound(
+        "project one", "created", expected_precondition=expected
+    )
+
+    assert observed.billing_account_id == "existing"
+    assert observed.precondition.startswith("sha256:")
+    assert bound == admin_assembly.GoogleBillingBindResultV1("created", "created")
+    assert [method for method, _payload in calls] == ["GET", "GET", "PUT"]
+    assert b"billingAccounts/created" in calls[-1][1]
+
+
+def test_google_oauth_code_exchange_uses_fixed_endpoint_and_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[urllib.request.Request] = []
+
+    def open_response(request: urllib.request.Request, *, timeout: float) -> _Response:
+        assert timeout == 10
+        captured.append(request)
+        return _Response(
+            b'{"access_token":"access","refresh_token":"refresh"}',
+            url=request.full_url,
+        )
+
+    monkeypatch.setattr(admin_assembly.urllib.request, "urlopen", open_response)
+    monkeypatch.setattr(
+        admin_assembly.GoogleCloudApi, "subject_id", lambda _self: "subject-one"
+    )
+
+    result = admin_assembly.GoogleOAuthCodeExchange().exchange(
+        {
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": "client",
+            "client_secret": "secret",
+        },
+        code="code",
+        redirect_uri="http://127.0.0.1:49152/callback",
+        pkce_verifier="verifier",
+    )
+
+    assert result.subject_id == "subject-one"
+    assert result.refresh_token == bytearray(b"refresh")
+    assert captured[0].full_url == "https://oauth2.googleapis.com/token"
+
+
+def test_provisioner_marks_only_matching_running_apply_unknown(tmp_path: Path) -> None:
+    provisioner = admin_assembly.GoogleProvisioner(
+        tmp_path / "provisioner", object(), object(), object()
+    )
+    digest = "sha256:" + "a" * 64
+    with provisioner._state.locked():
+        document = provisioner._read_locked()
+        document["applies"].append(
+            {
+                "idempotency_key": "apply-one",
+                "plan_digest": digest,
+                "account_ref": "google-one",
+                "expected_generation": 1,
+                "state": "running",
+                "receipt": None,
+            }
+        )
+        provisioner._state.replace_json_locked(
+            admin_assembly._PROVISIONER_DOCUMENT, document
+        )
+
+    provisioner._mark_apply_unknown("apply-one", digest)
+
+    with provisioner._state.locked():
+        assert provisioner._read_locked()["applies"][0]["state"] == "unknown"
+
+
+def test_cloudflare_scope_resolver_binds_only_configured_remote_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    class Fetcher:
+        def __init__(self, _team: str) -> None:
+            pass
+
+        def __call__(self) -> dict[str, object]:
+            return {"keys": [_jwk(key, "one")]}
+
+    monkeypatch.setattr(admin_assembly, "CloudflareJwksFetcher", Fetcher)
+    config = admin_assembly.AdminConfig(
+        "127.0.0.1",
+        443,
+        "admin.internal",
+        "cloudflare",
+        "local",
+        ("fleet.read",),
+        "remote",
+        ("fleet.read", "fleet.google.oauth"),
+        ("127.0.0.1",),
+        "team.cloudflareaccess.com",
+        "audience",
+    )
+    verifier = admin_assembly._cloudflare_verifier(config)
+    assert verifier is not None
+    try:
+        assert verifier._principal_resolver("remote", {}) == config.remote_scopes
+        with pytest.raises(admin_assembly.AdminAuthError, match="identity_invalid"):
+            verifier._principal_resolver("other", {})
+    finally:
+        verifier.close(0.5)
+
+
 def test_jwks_fetch_uses_only_the_configured_team_certs_url_and_fixed_bounds() -> None:
     """Production break: attacker-controlled JWT metadata can redirect JWKS fetches."""
 
@@ -599,8 +791,39 @@ def test_jwks_fetch_uses_only_the_configured_team_certs_url_and_fixed_bounds() -
         open_response=open_response,
     )
 
+    assert fetcher.url == "https://team.cloudflareaccess.com/cdn-cgi/access/certs"
+    assert repr(fetcher) == (
+        "CloudflareJwksFetcher("
+        "url='https://team.cloudflareaccess.com/cdn-cgi/access/certs')"
+    )
     assert fetcher() == {"keys": [{"kid": "one"}]}
     assert calls == [("https://team.cloudflareaccess.com/cdn-cgi/access/certs", 5.0)]
+
+
+def test_default_jwks_opener_disables_redirects_and_preserves_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[tuple[urllib.request.Request, float]] = []
+    response = object()
+
+    class Opener:
+        def open(self, request: urllib.request.Request, *, timeout: float) -> object:
+            opened.append((request, timeout))
+            return response
+
+    handlers: list[object] = []
+
+    def build_opener(handler: object) -> Opener:
+        handlers.append(handler)
+        return Opener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+    request = urllib.request.Request("https://team.cloudflareaccess.com/certs")
+
+    assert admin_daemon._open_without_redirects(request, timeout=5.0) is response
+    assert opened == [(request, 5.0)]
+    assert type(handlers[0]) is admin_daemon._NoRedirectHandler
+    assert handlers[0].redirect_request(request, None, 302, "redirect", {}, "https://bad") is None
 
 
 @pytest.mark.parametrize(
@@ -690,6 +913,7 @@ def test_unknown_kid_refresh_keeps_current_and_previous_keys_as_lkg() -> None:
         refresh_timeout_seconds=0.5,
     )
 
+    assert repr(verifier) == "RefreshingCloudflareAccessVerifier(<redacted>)"
     assert verifier.verify(_token(current, "current")).subject == "operator-one"
     assert verifier.verify(_token(previous, "previous")).subject == "operator-one"
     assert loads == [1]
@@ -698,6 +922,13 @@ def test_unknown_kid_refresh_keeps_current_and_previous_keys_as_lkg() -> None:
         "previous_kids": ("previous",),
         "refreshed_at": float(NOW),
     }
+
+
+def test_main_rejects_arguments_without_assembling_runtime(capsys) -> None:
+    assert admin_daemon.main(["unexpected"]) == os.EX_USAGE
+    assert capsys.readouterr().err == (
+        "codex-master-admin: control.admin_arguments_invalid\n"
+    )
 
 
 def test_failed_jwks_refresh_never_destroys_last_known_good() -> None:
@@ -1522,6 +1753,62 @@ def test_product_assembly_owns_empty_ollama_registry(
         "instance_count": 0,
         "instances": [],
     }
+
+
+def test_product_account_registry_lists_and_disables_openai_account(
+    service: MasterjetControlService,
+) -> None:
+    registry = service._account_registry
+    generation = registry.current_generation("openai")
+
+    assert registry.list_accounts() == ()
+    registry.add_account(
+        "openai",
+        "openai-one",
+        "Primary",
+        expected_generation=generation,
+        idempotency_key="add-openai-one",
+    )
+    assert [item.ref for item in registry.list_accounts()] == ["openai-one"]
+    registry.disable_account(
+        "openai",
+        "openai-one",
+        expected_generation=generation + 1,
+        idempotency_key="disable-openai-one",
+    )
+    assert registry.list_accounts() == ()
+
+
+def test_product_factories_bind_local_authority_and_exact_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials, runtime_root, state, _port = _product_directories(tmp_path)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", os.fspath(credentials))
+    monkeypatch.setenv("RUNTIME_DIRECTORY", os.fspath(runtime_root))
+    monkeypatch.setenv("STATE_DIRECTORY", os.fspath(state))
+    runtime = assemble_admin_runtime()
+    socket_adapter = None
+    http_adapter = None
+    try:
+        socket_adapter = runtime.daemon._socket_factory(runtime.service)
+        http_adapter = runtime.daemon._http_factory(runtime.service)
+        principal = socket_adapter._authorize_peer(
+            UnixPeerCredentials(os.getpid(), os.geteuid(), os.getegid())
+        )
+
+        assert principal.subject == "local-operator"
+        assert socket_adapter._service is runtime.service
+        assert http_adapter.service is runtime.service
+        with pytest.raises(PermissionError):
+            socket_adapter._authorize_peer(
+                UnixPeerCredentials(os.getpid(), os.geteuid() + 1, os.getegid())
+            )
+    finally:
+        if http_adapter is not None:
+            http_adapter.server_close()
+        if socket_adapter is not None:
+            socket_adapter.close()
+        runtime.close()
 
 
 def test_installed_product_path_uses_credentials_both_adapters_and_sigterm(
