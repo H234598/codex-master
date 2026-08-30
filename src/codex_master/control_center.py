@@ -38,6 +38,12 @@ from codex_master.server import (
     require_teamleader_tool_access,
     teamleader_tool_catalog,
 )
+from codex_master.fleet_control import (
+    FleetControlError,
+    OllamaPageState,
+    ollama_instance_plan_args,
+    parse_ollama_page,
+)
 
 
 APPLICATION_ID = "de.teladi.CodexMaster.ControlCenter"
@@ -810,6 +816,17 @@ class ControlCenterWindow:
         self.selected_tool: ToolDescriptor | None = None
         self._suppress_tool_auto_run = False
         self._close_poll_id = 0
+        self._page_names = (
+            "Übersicht",
+            "Werkzeuge",
+            "Ollama/Modelle",
+            "Ollama/Instanzen",
+        )
+        self.ollama_state: OllamaPageState | None = None
+        self._ollama_models_payload: dict[str, object] | None = None
+        self._ollama_plan: dict[str, object] | None = None
+        self._ollama_apply_enabled = False
+        self.ollama_model_checks: dict[str, Any] = {}
         try:
             self.tool_catalog = compile_catalog(teamleader_tool_catalog())
             self.catalog_error = None
@@ -855,11 +872,322 @@ class ControlCenterWindow:
         self.notebook = Gtk.Notebook()
         self.notebook.append_page(outer, Gtk.Label(label="Übersicht"))
         self.notebook.append_page(self._build_tools_page(), Gtk.Label(label="Werkzeuge"))
+        self.notebook.append_page(self._build_ollama_page(), Gtk.Label(label="Ollama"))
         self.window.add(self.notebook)
 
     def show(self) -> None:
         self.window.show_all()
         self.refresh()
+
+    def page_names(self) -> set[str]:
+        return set(self._page_names)
+
+    def ollama_apply_sensitive(self) -> bool:
+        return bool(self._ollama_apply_enabled)
+
+    def render_ollama(self, state: OllamaPageState) -> None:
+        if not isinstance(state, OllamaPageState):
+            raise AgentError("control-center ollama page is invalid")
+        self.ollama_state = state
+        self._ollama_apply_enabled = bool(
+            state.error_code is None and getattr(self, "_ollama_plan", None) is not None
+        )
+        if hasattr(self, "ollama_apply_button"):
+            self.ollama_apply_button.set_sensitive(self._ollama_apply_enabled)
+        if not hasattr(self, "ollama_models_box"):
+            return
+        for box in (self.ollama_models_box, self.ollama_instances_box):
+            for child in box.get_children():
+                box.remove(child)
+        for row in state.models:
+            label = self.Gtk.Label(
+                label=(
+                    f"{row.model_ref} · {row.provider_model_id} · "
+                    f"installiert={row.installed} · Hive={row.hive_enabled} · "
+                    f"simple_only={row.simple_only} · {', '.join(row.capabilities)}"
+                )
+            )
+            label.set_xalign(0.0)
+            self.ollama_models_box.pack_start(label, False, False, 0)
+        self.ollama_model_checks.clear()
+        for child in self.ollama_model_selector.get_children():
+            self.ollama_model_selector.remove(child)
+        for row in state.models:
+            check = self.Gtk.CheckButton.new_with_label(row.model_ref)
+            self.ollama_model_checks[row.model_ref] = check
+            self.ollama_model_selector.pack_start(check, False, False, 0)
+        for row in state.instances:
+            label = self.Gtk.Label(
+                label=(
+                    f"{row.label} · {row.host_ref} · {row.lifecycle_state}/"
+                    f"{row.readiness_state} · Modelle {', '.join(row.selected_model_refs)} · "
+                    f"CPU {row.allowed_cpus}, Quote {row.cpu_quota_percent}%, "
+                    f"Gewicht {row.cpu_weight}"
+                )
+            )
+            label.set_xalign(0.0)
+            self.ollama_instances_box.pack_start(label, False, False, 0)
+        self.ollama_models_box.show_all()
+        self.ollama_instances_box.show_all()
+        self.ollama_model_selector.show_all()
+
+    def _build_ollama_page(self) -> Any:
+        Gtk = self.Gtk
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_border_width(12)
+        refresh = Gtk.Button.new_with_label("Ollama aktualisieren")
+        refresh.connect("clicked", lambda _button: self.refresh_ollama())
+        outer.pack_start(refresh, False, False, 0)
+        pages = Gtk.Notebook()
+
+        models_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.ollama_models_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=4
+        )
+        models_scroller = Gtk.ScrolledWindow()
+        models_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        models_scroller.add(self.ollama_models_box)
+        models_page.pack_start(models_scroller, True, True, 0)
+        pages.append_page(models_page, Gtk.Label(label="Modelle"))
+
+        instances_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.ollama_instances_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=4
+        )
+        instances_scroller = Gtk.ScrolledWindow()
+        instances_scroller.set_policy(
+            Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC
+        )
+        instances_scroller.set_min_content_height(120)
+        instances_scroller.add(self.ollama_instances_box)
+        instances_page.pack_start(instances_scroller, True, True, 0)
+
+        form = Gtk.Grid(column_spacing=8, row_spacing=6)
+        fields = (
+            ("Ref", "ollama_ref_entry", "quiet-runner"),
+            ("Name", "ollama_label_entry", "Quiet Runner"),
+            ("Executable", "ollama_executable_entry", "/usr/bin/ollama"),
+            ("Modellpfad", "ollama_models_path_entry", "/var/lib/ollama/models"),
+            ("AllowedCPUs", "ollama_cpus_entry", "0"),
+        )
+        for index, (title, attribute, default) in enumerate(fields):
+            label = Gtk.Label(label=title)
+            label.set_xalign(0.0)
+            entry = Gtk.Entry()
+            entry.set_text(default)
+            entry.set_max_length(1024 if "path" in attribute or "executable" in attribute else 128)
+            setattr(self, attribute, entry)
+            form.attach(label, 0, index, 1, 1)
+            form.attach(entry, 1, index, 1, 1)
+        host_label = Gtk.Label(label="Host")
+        host_label.set_xalign(0.0)
+        self.ollama_host_combo = Gtk.ComboBoxText()
+        self.ollama_host_combo.append("control-host", "control-host")
+        self.ollama_host_combo.set_active(0)
+        form.attach(host_label, 0, len(fields), 1, 1)
+        form.attach(self.ollama_host_combo, 1, len(fields), 1, 1)
+        self.ollama_quota_spin = Gtk.SpinButton.new_with_range(1, 10000, 1)
+        self.ollama_quota_spin.set_value(100)
+        self.ollama_weight_spin = Gtk.SpinButton.new_with_range(1, 10000, 1)
+        self.ollama_weight_spin.set_value(100)
+        form.attach(Gtk.Label(label="CPUQuota %"), 0, len(fields) + 1, 1, 1)
+        form.attach(self.ollama_quota_spin, 1, len(fields) + 1, 1, 1)
+        form.attach(Gtk.Label(label="CPUWeight"), 0, len(fields) + 2, 1, 1)
+        form.attach(self.ollama_weight_spin, 1, len(fields) + 2, 1, 1)
+        instances_page.pack_start(form, False, False, 0)
+
+        self.ollama_model_selector = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=3
+        )
+        instances_page.pack_start(
+            Gtk.Label(label="Modelle der Instanz"), False, False, 0
+        )
+        instances_page.pack_start(self.ollama_model_selector, False, False, 0)
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        probe = Gtk.Button.new_with_label("Prüfen")
+        probe.connect("clicked", lambda _button: self._probe_ollama())
+        actions.pack_start(probe, False, False, 0)
+        plan = Gtk.Button.new_with_label("Planen")
+        plan.connect("clicked", lambda _button: self._plan_ollama())
+        actions.pack_start(plan, False, False, 0)
+        self.ollama_apply_button = Gtk.Button.new_with_label("Anwenden")
+        self.ollama_apply_button.set_sensitive(False)
+        self.ollama_apply_button.connect("clicked", lambda _button: self._apply_ollama())
+        actions.pack_start(self.ollama_apply_button, False, False, 0)
+        instances_page.pack_start(actions, False, False, 0)
+        self.ollama_status_label = Gtk.Label(label="Noch nicht geladen")
+        self.ollama_status_label.set_xalign(0.0)
+        instances_page.pack_start(self.ollama_status_label, False, False, 0)
+        self.ollama_plan_view = Gtk.TextView()
+        self.ollama_plan_view.set_editable(False)
+        self.ollama_plan_view.set_monospace(True)
+        instances_page.pack_start(self.ollama_plan_view, False, True, 0)
+        pages.append_page(instances_page, Gtk.Label(label="Instanzen"))
+        outer.pack_start(pages, True, True, 0)
+        return outer
+
+    def refresh_ollama(self) -> None:
+        self._ollama_plan = None
+        self._ollama_apply_enabled = False
+        if hasattr(self, "ollama_apply_button"):
+            self.ollama_apply_button.set_sensitive(False)
+        self._set_busy(True, "Ollama-Modelle werden geladen …")
+        self.ollama_status_label.set_text("Ollama-Modelle werden geladen …")
+        if not self.controller.submit(
+            "fleet_ollama_models", {}, self._ollama_models_loaded
+        ):
+            self._set_busy(True, "Backendoperation läuft bereits")
+
+    def _ollama_models_loaded(self, result: dict[str, Any]) -> None:
+        if "error" in result:
+            self.render_ollama(OllamaPageState(0, (), (), error_code="models_unavailable"))
+            self._set_busy(False, "Ollama-Modelle nicht verfügbar")
+            self.ollama_status_label.set_text("Ollama-Modelle nicht verfügbar")
+            return
+        self._ollama_models_payload = result
+        self._set_busy(True, "Ollama-Instanzen werden geladen …")
+        if not self.controller.submit(
+            "fleet_ollama_instances", {}, self._ollama_instances_loaded
+        ):
+            self._set_busy(True, "Backendoperation läuft bereits")
+
+    def _ollama_instances_loaded(self, result: dict[str, Any]) -> None:
+        if "error" in result:
+            state = OllamaPageState(0, (), (), error_code="instances_unavailable")
+        else:
+            try:
+                state = parse_ollama_page(self._ollama_models_payload or {}, result)
+            except FleetControlError:
+                state = OllamaPageState(0, (), (), error_code="invalid_fleet_payload")
+        self.render_ollama(state)
+        if state.error_code is not None:
+            text = f"Ollama-Vertrag verletzt: {state.error_code}"
+        else:
+            text = (
+                f"Ollama: {len(state.models)} Modelle, "
+                f"{len(state.instances)} Instanzen · Generation {state.generation}"
+            )
+        self._set_busy(False, text)
+        self.ollama_status_label.set_text(text)
+
+    def _plan_ollama(self) -> None:
+        state = self.ollama_state
+        if state is None or state.error_code is not None:
+            self.ollama_status_label.set_text("Ollama-Status zuerst fehlerfrei laden")
+            return
+        host_ref = self.ollama_host_combo.get_active_id()
+        selected_models = [
+            ref for ref, check in self.ollama_model_checks.items() if check.get_active()
+        ]
+        try:
+            arguments = ollama_instance_plan_args(
+                ref=self.ollama_ref_entry.get_text(),
+                label=self.ollama_label_entry.get_text(),
+                host_ref=host_ref,
+                ollama_executable=self.ollama_executable_entry.get_text(),
+                models_directory=self.ollama_models_path_entry.get_text(),
+                selected_model_refs=selected_models,
+                allowed_cpus=self.ollama_cpus_entry.get_text(),
+                cpu_quota_percent=self.ollama_quota_spin.get_value_as_int(),
+                cpu_weight=self.ollama_weight_spin.get_value_as_int(),
+                expected_generation=state.generation,
+                idempotency_key=f"gui-plan-{secrets.token_hex(16)}",
+            )
+        except (FleetControlError, TypeError, ValueError):
+            self.ollama_status_label.set_text("Ollama-Formular ungültig")
+            return
+        self._set_busy(True, "Ollama-Instanzplan wird erstellt …")
+        if not self.controller.submit(
+            "fleet_ollama_instance_plan", arguments, self._ollama_plan_finished
+        ):
+            self._set_busy(True, "Backendoperation läuft bereits")
+
+    def _ollama_plan_finished(self, result: dict[str, Any]) -> None:
+        state = self.ollama_state
+        plan_id = result.get("plan_id")
+        digest = result.get("plan_digest")
+        generation = result.get("expected_generation")
+        if (
+            "error" in result
+            or state is None
+            or type(plan_id) is not str
+            or not 1 <= len(plan_id) <= 128
+            or type(digest) is not str
+            or not 1 <= len(digest) <= 128
+            or generation != state.generation
+        ):
+            self._ollama_plan = None
+            self._ollama_apply_enabled = False
+            self._set_busy(False, "Ollama-Instanzplan fehlgeschlagen")
+            self.ollama_status_label.set_text("Ollama-Instanzplan fehlgeschlagen")
+            return
+        self._ollama_plan = {"plan_id": plan_id, "plan_digest": digest}
+        self.ollama_plan_view.get_buffer().set_text(bounded_public_result_text(result))
+        self._set_busy(False, "Ollama-Instanzplan bereit")
+        self.ollama_status_label.set_text("Plan geprüft; Anwenden ist jetzt freigegeben")
+        self.render_ollama(state)
+
+    def _apply_ollama(self) -> None:
+        state = self.ollama_state
+        plan = self._ollama_plan
+        if state is None or state.error_code is not None or plan is None:
+            self.ollama_status_label.set_text("Kein gültiger Ollama-Plan")
+            return
+        if not self._confirm_message("Geprüften Ollama-Instanzplan jetzt anwenden?"):
+            self.ollama_status_label.set_text("Ollama-Anwendung abgebrochen")
+            return
+        arguments = {
+            "plan_id": plan["plan_id"],
+            "expected_generation": state.generation,
+            "idempotency_key": f"gui-apply-{secrets.token_hex(16)}",
+            "plan_digest": plan["plan_digest"],
+        }
+        self._set_busy(True, "Ollama-Instanzplan wird angewendet …")
+        if not self.controller.submit(
+            "fleet_ollama_instance_apply",
+            arguments,
+            lambda result: self._ollama_mutation_finished("Anwendung", result),
+        ):
+            self._set_busy(True, "Backendoperation läuft bereits")
+
+    def _probe_ollama(self) -> None:
+        state = self.ollama_state
+        instance_ref = self.ollama_ref_entry.get_text()
+        if (
+            state is None
+            or state.error_code is not None
+            or not isinstance(instance_ref, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", instance_ref) is None
+        ):
+            self.ollama_status_label.set_text("Gültige Ollama-Instanz und Status erforderlich")
+            return
+        if not self._confirm_message(f"Ollama-Instanz {instance_ref} jetzt prüfen?"):
+            self.ollama_status_label.set_text("Ollama-Prüfung abgebrochen")
+            return
+        arguments = {
+            "instance_ref": instance_ref,
+            "expected_generation": state.generation,
+            "idempotency_key": f"gui-probe-{secrets.token_hex(16)}",
+        }
+        self._set_busy(True, "Ollama-Instanz wird geprüft …")
+        if not self.controller.submit(
+            "fleet_ollama_instance_probe",
+            arguments,
+            lambda result: self._ollama_mutation_finished("Prüfung", result),
+        ):
+            self._set_busy(True, "Backendoperation läuft bereits")
+
+    def _ollama_mutation_finished(
+        self, action: str, result: dict[str, Any]
+    ) -> None:
+        if "error" in result:
+            self._set_busy(False, f"Ollama-{action} fehlgeschlagen")
+            self.ollama_status_label.set_text(f"Ollama-{action} fehlgeschlagen")
+            return
+        self._ollama_plan = None
+        self._set_busy(False, f"Ollama-{action} abgeschlossen")
+        self.ollama_status_label.set_text(f"Ollama-{action} abgeschlossen")
+        self.refresh_ollama()
 
     def _set_busy(self, busy: bool, text: str) -> None:
         self.refresh_button.set_sensitive(not busy)
@@ -869,6 +1197,10 @@ class ControlCenterWindow:
         if hasattr(self, "tool_run_button"):
             self.tool_run_button.set_sensitive(
                 not busy and bool(self.selected_tool and self.selected_tool.enabled)
+            )
+        if hasattr(self, "ollama_apply_button"):
+            self.ollama_apply_button.set_sensitive(
+                not busy and bool(getattr(self, "_ollama_apply_enabled", False))
             )
         self.status_label.set_text(text[:200])
 

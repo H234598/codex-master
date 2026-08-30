@@ -7,10 +7,30 @@ from unittest.mock import Mock, patch
 
 from codex_master import control_center
 from codex_master.control_catalog import RISK_BY_TOOL
+from codex_master.fleet_control import OllamaPageState
 from codex_master.server import AgentError
 
 
 class ControlCenterViewModelTest(unittest.TestCase):
+    @staticmethod
+    def _ollama_payloads() -> tuple[dict, dict]:
+        return (
+            {
+                "models": [
+                    {
+                        "ref": "model-a",
+                        "provider_model_id": "granite:latest",
+                        "installed": True,
+                        "hive_enabled": True,
+                        "simple_only": True,
+                        "capabilities": ["chat"],
+                        "evidence_at_utc": "2026-08-30T12:00:00Z",
+                    }
+                ]
+            },
+            {"generation": 7, "instances": []},
+        )
+
     def _status_result(self, *, running: bool = False, blocked: bool = False) -> dict:
         return {
             "agent": "a1",
@@ -121,6 +141,157 @@ class ControlCenterViewModelTest(unittest.TestCase):
             {"Aufträge", "Serien", "Auth & Limits", "Agentinnen", "Diagnose"},
         )
         self.assertEqual(control_center.tool_category("agent_pool_copy_auth"), "Auth & Limits")
+
+    def test_control_center_declares_ollama_models_and_instances_pages(self) -> None:
+        window = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        window._page_names = (
+            "Übersicht",
+            "Werkzeuge",
+            "Ollama/Modelle",
+            "Ollama/Instanzen",
+        )
+
+        self.assertGreaterEqual(
+            window.page_names(),
+            {"Übersicht", "Werkzeuge", "Ollama/Modelle", "Ollama/Instanzen"},
+        )
+
+    def test_stale_ollama_state_disables_apply(self) -> None:
+        window = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        window.ollama_apply_button = Mock()
+        state = OllamaPageState(7, (), (), error_code="control_stale")
+
+        window.render_ollama(state)
+
+        self.assertFalse(window.ollama_apply_sensitive())
+        window.ollama_apply_button.set_sensitive.assert_called_with(False)
+
+    def test_ollama_refresh_loads_models_then_instances(self) -> None:
+        window = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        window.controller = Mock()
+        window.controller.submit.return_value = True
+        window._set_busy = Mock()
+        window.ollama_status_label = Mock()
+        window.render_ollama = Mock()
+        window._ollama_plan = {"plan_id": "stale"}
+        models, instances = self._ollama_payloads()
+
+        window.refresh_ollama()
+        first_callback = window.controller.submit.call_args.args[2]
+        first_callback(models)
+        second_callback = window.controller.submit.call_args.args[2]
+        second_callback(instances)
+
+        self.assertEqual(
+            [call.args[0] for call in window.controller.submit.call_args_list],
+            ["fleet_ollama_models", "fleet_ollama_instances"],
+        )
+        state = window.render_ollama.call_args.args[0]
+        self.assertEqual((state.generation, state.models[0].model_ref), (7, "model-a"))
+        self.assertIsNone(window._ollama_plan)
+
+    def test_ollama_refresh_fails_closed_on_invalid_payload(self) -> None:
+        window = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        window._ollama_models_payload = {"models": []}
+        window._set_busy = Mock()
+        window.ollama_status_label = Mock()
+        window.render_ollama = Mock()
+
+        window._ollama_instances_loaded({"generation": "bad", "instances": []})
+
+        state = window.render_ollama.call_args.args[0]
+        self.assertEqual(state.error_code, "invalid_fleet_payload")
+
+    def test_ollama_plan_builds_typed_request_and_enables_exact_apply(self) -> None:
+        window = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        window.ollama_state = OllamaPageState(7, (), ())
+        window.ollama_ref_entry = Mock(get_text=Mock(return_value="quiet-runner"))
+        window.ollama_label_entry = Mock(get_text=Mock(return_value="Quiet Runner"))
+        window.ollama_executable_entry = Mock(get_text=Mock(return_value="/usr/bin/ollama"))
+        window.ollama_models_path_entry = Mock(get_text=Mock(return_value="/srv/ollama/models"))
+        window.ollama_cpus_entry = Mock(get_text=Mock(return_value="4-7"))
+        window.ollama_host_combo = Mock(get_active_id=Mock(return_value="control-host"))
+        window.ollama_quota_spin = Mock(get_value_as_int=Mock(return_value=350))
+        window.ollama_weight_spin = Mock(get_value_as_int=Mock(return_value=40))
+        selected = Mock(get_active=Mock(return_value=True))
+        window.ollama_model_checks = {"model-a": selected}
+        window.controller = Mock()
+        window.controller.submit.return_value = True
+        window._set_busy = Mock()
+        window.ollama_status_label = Mock()
+        window.ollama_plan_view = Mock()
+        window.ollama_apply_button = Mock()
+        window._ollama_apply_enabled = False
+
+        window._plan_ollama()
+        callback = window.controller.submit.call_args.args[2]
+        callback(
+            {
+                "plan_id": "plan-one",
+                "plan_digest": "a" * 64,
+                "expected_generation": 7,
+            }
+        )
+
+        tool, arguments, _callback = window.controller.submit.call_args.args
+        self.assertEqual(tool, "fleet_ollama_instance_plan")
+        self.assertEqual(arguments["selected_model_refs"], ["model-a"])
+        self.assertEqual(arguments["cpu_quota_percent"], 350)
+        self.assertTrue(window.ollama_apply_sensitive())
+
+    def test_ollama_apply_and_probe_use_generation_and_confirmation(self) -> None:
+        window = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        window.ollama_state = OllamaPageState(7, (), ())
+        window._ollama_plan = {"plan_id": "plan-one", "plan_digest": "a" * 64}
+        window.ollama_ref_entry = Mock(get_text=Mock(return_value="quiet-runner"))
+        window.controller = Mock()
+        window.controller.submit.return_value = True
+        window._confirm_message = Mock(return_value=True)
+        window._set_busy = Mock()
+        window.ollama_status_label = Mock()
+
+        window._apply_ollama()
+        apply = window.controller.submit.call_args
+        window._probe_ollama()
+        probe = window.controller.submit.call_args
+
+        self.assertEqual(apply.args[0], "fleet_ollama_instance_apply")
+        self.assertEqual(apply.args[1]["expected_generation"], 7)
+        self.assertEqual(apply.args[1]["plan_digest"], "a" * 64)
+        self.assertEqual(probe.args[0], "fleet_ollama_instance_probe")
+        self.assertEqual(probe.args[1]["instance_ref"], "quiet-runner")
+        self.assertEqual(probe.args[1]["expected_generation"], 7)
+
+    def test_ollama_backend_errors_fail_closed_and_success_refreshes(self) -> None:
+        window = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        window.render_ollama = Mock()
+        window._set_busy = Mock()
+        window.ollama_status_label = Mock()
+        window.refresh_ollama = Mock()
+        window._ollama_plan = {"plan_id": "plan-one"}
+
+        window._ollama_models_loaded({"error": "denied"})
+        window._ollama_mutation_finished("Prüfung", {"error": "not_ready"})
+        window._ollama_mutation_finished("Prüfung", {"ready": True})
+
+        failed_state = window.render_ollama.call_args.args[0]
+        self.assertEqual(failed_state.error_code, "models_unavailable")
+        self.assertIsNone(window._ollama_plan)
+        window.refresh_ollama.assert_called_once_with()
 
     def test_action_block_reason_explains_safety_gate(self) -> None:
         clear = control_center.normalize_status_page(self._page(self._status_result())).rows[0]
