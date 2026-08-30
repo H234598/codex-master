@@ -150,6 +150,7 @@ def apply_annotation_response_fixture(
         or _PROFILE_RE.fullmatch(annotation_id) is None
         or _ANNOTATION_FIXTURE_TARGET_RE.fullmatch(answer_target) is None
         or _PROFILE_RE.fullmatch(answer_heading) is None
+        or answer_heading != "antwort-auf-freigabe"
         or _PROFILE_RE.fullmatch(source_heading) is None
         or re.search(r"^[ ]{0,3}(?:`{3,}|~{3,})", document, re.MULTILINE) is not None
     ):

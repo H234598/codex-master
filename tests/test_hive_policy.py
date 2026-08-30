@@ -491,6 +491,40 @@ Ja, die Freigabe wird im Änderungsprotokoll dokumentiert.
     assert second == first
 
 
+def test_annotation_response_fixture_rejects_answer_heading_without_answer_anchor() -> (
+    None
+):
+    policy_api = load_policy_api()
+    fixture = """# Deployment plan
+
+## Quellabschnitt
+
+<mark data-annotation-id="frage-42">Muss die Freigabe dokumentiert werden?</mark>. Der Folgeabsatz bleibt erhalten.
+
+## Antwort auf Freigabe — [frage-42](#quellabschnitt)
+<!-- data-annotation-id="frage-42" -->
+
+Ja, die Freigabe wird im Änderungsprotokoll dokumentiert.
+"""
+    original_fixture = fixture
+
+    with pytest.raises(
+        policy_api.CommonPolicyError,
+        match="annotation_response_fixture_invalid",
+    ):
+        policy_api.apply_annotation_response_fixture(
+            fixture,
+            annotation_id="frage-42",
+            answer_target="Deployment-Plan.md",
+            answer_heading="anderer-anker",
+            source_heading="quellabschnitt",
+        )
+
+    assert fixture is original_fixture
+    assert fixture == original_fixture
+    assert fixture.count("(A)") == 0
+
+
 @pytest.mark.parametrize(
     "marker_count",
     [0, 2],
