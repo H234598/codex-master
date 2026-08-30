@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import ctypes
 import errno
 import hashlib
@@ -12,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -34,6 +34,8 @@ _MAX_STAGE_DIAGNOSTIC_BYTES = 256 * 1024
 _MAX_MANIFEST_BYTES = 512 * 1024
 _MANIFEST_NAME = ".codex-master-runtime-manifest.json"
 _MANIFEST_SCHEMA_VERSION = 1
+_RUNTIME_SPAWN_HELPER_SOURCE = "src/codex_master/runtime_spawn_helper.c"
+_RUNTIME_SPAWN_HELPER_LIBRARY = "src/codex_master/_runtime_spawn_helper.so"
 # Provenance: canonical 23510da legacy probe payload. The focused regression
 # test reconstructs this former contract from that revision; legacy paths are
 # inert and the runtime installer never invokes Git, a checkout, or a purge.
@@ -217,11 +219,6 @@ def _install_regular(source: Path, target: Path, *, mode: int) -> None:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if temporary.name:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
 
 
 def _install_tree(source_root: Path, target_root: Path) -> None:
@@ -271,6 +268,39 @@ def _fsync_tree(root: Path) -> None:
         _fsync_directory(current)
 
 
+def _compile_runtime_spawn_helper(*, stage: Path) -> None:
+    """Build the Linux/glibc spawn ABI helper inside the unpublished image."""
+
+    source = stage / _RUNTIME_SPAWN_HELPER_SOURCE
+    library = stage / _RUNTIME_SPAWN_HELPER_LIBRARY
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/cc",
+                "-std=c11",
+                "-D_GNU_SOURCE",
+                "-fPIC",
+                "-shared",
+                "-Werror",
+                "-Wall",
+                "-Wextra",
+                "-o",
+                os.fspath(library),
+                os.fspath(source),
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+        )
+        if completed.returncode != 0:
+            raise InstallError("install_runtime_helper_unavailable")
+        os.chmod(library, 0o755)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InstallError("install_runtime_helper_unavailable") from exc
+
+
 def _build_runtime_image(*, repository: Path, stage: Path) -> None:
     _directory(stage, mode=0o700, create=False)
     for source_name, target_name, mode in _RUNTIME_IMAGE_FILES:
@@ -283,6 +313,7 @@ def _build_runtime_image(*, repository: Path, stage: Path) -> None:
         target = stage / target_name
         _child_directory(stage, tuple(target.relative_to(stage).parts), mode=0o700)
         _install_tree(repository / source_name, target)
+    _compile_runtime_spawn_helper(stage=stage)
     _write_runtime_image_manifest(root=stage)
     _fsync_tree(stage)
 
@@ -300,6 +331,7 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
                 timeout_seconds=45,
                 stdout_limit=_MAX_STAGE_DIAGNOSTIC_BYTES,
                 stderr_limit=DEFAULT_STDERR_LIMIT,
+                _runtime_spawn_helper_path=(stage / _RUNTIME_SPAWN_HELPER_LIBRARY),
             )
         except BoundedProcessError as exc:
             raise InstallError("install_stage_validation_failed") from exc
@@ -478,9 +510,6 @@ def _write_runtime_image_manifest(*, root: Path) -> None:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if temporary.name:
-            with contextlib.suppress(FileNotFoundError):
-                temporary.unlink()
 
 
 def _rename_exchange(parent_fd: int, stage_name: str, target_name: str) -> None:

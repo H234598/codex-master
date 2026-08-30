@@ -4,6 +4,7 @@ import json
 import runpy
 import errno
 import hashlib
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 import stat
@@ -387,6 +388,14 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     for path, mode in (
         (installed_cli, 0o755),
         (installed_source, 0o644),
+        (
+            runtime_root / "src" / "codex_master" / "runtime_spawn_helper.c",
+            0o644,
+        ),
+        (
+            runtime_root / "src" / "codex_master" / "_runtime_spawn_helper.so",
+            0o755,
+        ),
         (runtime_root / ".codex-plugin" / "plugin.json", 0o644),
         (runtime_root / ".mcp.json", 0o644),
         (runtime_root / ".app.json", 0o644),
@@ -494,6 +503,94 @@ def test_installer_source_reader_is_no_follow_descriptor_bounded(
     assert ".read_bytes(" not in (
         ROOT / "scripts" / "codex-master-hive-hourly-probe-install"
     ).read_text(encoding="utf-8")
+
+
+def test_install_regular_failure_never_unlinks_a_swapped_foreign_unit_tempfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
+    )
+    install_error = installer["InstallError"]
+    source = tmp_path / "source.service"
+    source.write_text("[Service]\nExecStart=/bin/true\n", encoding="utf-8")
+    target = tmp_path / "units" / "codex-master-hive-hourly-probe.service"
+    target.parent.mkdir(mode=0o700)
+    displaced_private_temp = tmp_path / "displaced-private-unit-temp"
+    foreign_sentinel = b"foreign unit sentinel\n"
+    swapped: list[Path] = []
+    replace = os.replace
+
+    def swap_then_fail(source_path: Path, _target_path: Path) -> None:
+        temporary = Path(source_path)
+        replace(temporary, displaced_private_temp)
+        temporary.write_bytes(foreign_sentinel)
+        swapped.append(temporary)
+        raise OSError(errno.EIO, "injected replace failure")
+
+    monkeypatch.setattr(installer["os"], "replace", swap_then_fail)
+
+    with pytest.raises(install_error, match="install_target_untrusted"):
+        installer["_install_regular"](source, target, mode=0o644)
+
+    assert len(swapped) == 1
+    assert swapped[0].read_bytes() == foreign_sentinel
+    assert displaced_private_temp.read_text(encoding="utf-8").startswith("[Service]")
+
+
+def test_manifest_failure_never_unlinks_a_swapped_foreign_manifest_tempfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
+    )
+    install_error = installer["InstallError"]
+    root = tmp_path / "runtime-image"
+    root.mkdir(mode=0o700)
+    (root / "payload").write_text("runtime payload\n", encoding="utf-8")
+    displaced_private_temp = tmp_path / "displaced-private-manifest-temp"
+    foreign_sentinel = b"foreign manifest sentinel\n"
+    swapped: list[Path] = []
+    replace = os.replace
+
+    def swap_then_fail(source_path: Path, _target_path: Path) -> None:
+        temporary = Path(source_path)
+        replace(temporary, displaced_private_temp)
+        temporary.write_bytes(foreign_sentinel)
+        swapped.append(temporary)
+        raise OSError(errno.EIO, "injected replace failure")
+
+    monkeypatch.setattr(installer["os"], "replace", swap_then_fail)
+
+    with pytest.raises(install_error, match="install_target_untrusted"):
+        installer["_write_runtime_image_manifest"](root=root)
+
+    assert len(swapped) == 1
+    assert swapped[0].read_bytes() == foreign_sentinel
+    assert displaced_private_temp.exists()
+
+
+def test_runtime_spawn_helper_build_fails_closed_before_image_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
+    )
+    install_error = installer["InstallError"]
+    stage = tmp_path / "stage"
+    stage.mkdir(mode=0o700)
+
+    class FailedCompiler:
+        returncode = 1
+
+    monkeypatch.setattr(
+        installer["subprocess"], "run", lambda *_args, **_kwargs: FailedCompiler()
+    )
+
+    with pytest.raises(install_error, match="install_runtime_helper_unavailable"):
+        installer["_compile_runtime_spawn_helper"](stage=stage)
+
+    assert not (stage / "src" / "codex_master" / "_runtime_spawn_helper.so").exists()
 
 
 def _sealed_publish_image(

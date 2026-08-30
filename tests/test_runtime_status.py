@@ -4,6 +4,11 @@ import importlib
 import json
 from pathlib import Path
 
+import pytest
+
+
+pytestmark = pytest.mark.usefixtures("runtime_spawn_helper")
+
 
 def _runtime_modules():
     try:

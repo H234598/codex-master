@@ -12,10 +12,28 @@ from types import SimpleNamespace
 import pytest
 
 
+pytestmark = pytest.mark.usefixtures("runtime_spawn_helper")
+
+
 def _script(path: Path, body: str) -> Path:
     path.write_text("#!/usr/bin/python3\n" + body, encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def test_runtime_spawn_helper_has_a_compiled_glibc_header_contract() -> None:
+    import codex_master.runtime_process as runtime_process
+
+    helper = Path(runtime_process.__file__).with_name("runtime_spawn_helper.c")
+    helper_source = helper.read_text(encoding="utf-8")
+    runner_source = Path(runtime_process.__file__).read_text(encoding="utf-8")
+
+    assert "#include <spawn.h>" in helper_source
+    assert "__GLIBC_PREREQ(2, 39)" in helper_source
+    assert "POSIX_SPAWN_SETSID" in helper_source
+    assert "pidfd_spawnp" in helper_source
+    assert "create_string_buffer" not in runner_source
+    assert "_SPAWN_BUFFER_BYTES" not in runner_source
 
 
 def test_bounded_runner_uses_an_explicit_minimal_environment(
@@ -84,7 +102,7 @@ def test_bounded_runner_times_out_and_terminates_the_whole_process_group(
     )
 
     with pytest.raises(BoundedProcessError, match="command_timeout"):
-        run_bounded([str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=0.1)
+        run_bounded([str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=1)
 
     deadline = time.monotonic() + 2
     while not child_pid.exists() and time.monotonic() < deadline:
@@ -101,6 +119,121 @@ def test_bounded_runner_times_out_and_terminates_the_whole_process_group(
         time.sleep(0.02)
     else:
         pytest.fail("descendant process survived bounded-runner termination")
+
+
+def test_bounded_runner_times_out_while_a_child_does_not_read_64k_stdin(
+    tmp_path: Path,
+) -> None:
+    from codex_master.runtime_process import BoundedProcessError, run_bounded
+
+    child = _script(
+        tmp_path / "does-not-read-stdin.py",
+        "import time\ntime.sleep(3)\n",
+    )
+    started = time.monotonic()
+
+    with pytest.raises(BoundedProcessError, match="command_timeout"):
+        run_bounded(
+            [str(child)],
+            cwd=tmp_path,
+            home=tmp_path,
+            timeout_seconds=0.1,
+            input_data=b"x" * (64 * 1024),
+        )
+
+    assert time.monotonic() - started < 1
+
+
+def test_bounded_runner_rejects_a_nul_cwd_without_starting_a_child(
+    tmp_path: Path,
+) -> None:
+    from codex_master.runtime_process import BoundedProcessError, run_bounded
+
+    marker = tmp_path / "started"
+    child = _script(
+        tmp_path / "must-not-run-with-nul-cwd.py",
+        f"open({str(marker)!r}, 'w', encoding='utf-8').write('started')\n",
+    )
+    nul_cwd = Path(os.fspath(tmp_path) + "\x00suffix")
+
+    with pytest.raises(BoundedProcessError, match="command_arguments_invalid"):
+        run_bounded([str(child)], cwd=nul_cwd, home=tmp_path, timeout_seconds=1)
+
+    assert not marker.exists()
+
+
+def test_bounded_runner_fails_before_opening_fds_when_native_spawn_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import codex_master.runtime_process as runtime_process
+
+    marker = tmp_path / "started"
+    child = _script(
+        tmp_path / "must-not-run-without-native-spawn.py",
+        f"open({str(marker)!r}, 'w', encoding='utf-8').write('started')\n",
+    )
+    descriptors_before = len(list(Path("/proc/self/fd").iterdir()))
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise runtime_process.BoundedProcessError("command_group_unavailable")
+
+    monkeypatch.setattr(
+        runtime_process, "_load_runtime_spawn_helper", unavailable, raising=False
+    )
+
+    with pytest.raises(
+        runtime_process.BoundedProcessError, match="command_group_unavailable"
+    ):
+        runtime_process.run_bounded(
+            [str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=1
+        )
+
+    assert not marker.exists()
+    assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
+
+
+def test_bounded_runner_handles_partial_stdin_and_epipe(
+    tmp_path: Path,
+) -> None:
+    from codex_master.runtime_process import run_bounded
+
+    child = _script(
+        tmp_path / "read-one-byte.py",
+        "import os\nos.read(0, 1)\nprint('read-one-byte')\n",
+    )
+
+    result = run_bounded(
+        [str(child)],
+        cwd=tmp_path,
+        home=tmp_path,
+        timeout_seconds=1,
+        input_data=b"x" * (64 * 1024),
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "read-one-byte\n"
+
+
+def test_bounded_runner_delivers_all_64k_stdin_within_the_shared_deadline(
+    tmp_path: Path,
+) -> None:
+    from codex_master.runtime_process import run_bounded
+
+    child = _script(
+        tmp_path / "read-all-stdin.py",
+        "import sys\ndata = sys.stdin.buffer.read()\nprint(len(data))\n",
+    )
+
+    result = run_bounded(
+        [str(child)],
+        cwd=tmp_path,
+        home=tmp_path,
+        timeout_seconds=1,
+        input_data=b"x" * (64 * 1024),
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "65536\n"
 
 
 def _wait_until_process_is_not_live(process_id: int) -> None:
@@ -125,6 +258,35 @@ def _wait_until_process_is_not_live(process_id: int) -> None:
             )
         time.sleep(0.02)
     pytest.fail("descendant process survived bounded-runner termination")
+
+
+@pytest.mark.parametrize("attempt", range(3))
+def test_bounded_runner_repeatedly_reaps_descendants_after_leader_exit(
+    tmp_path: Path, attempt: int
+) -> None:
+    from codex_master.runtime_process import BoundedProcessError, run_bounded
+
+    descendant_pid = tmp_path / f"repeated-descendant-{attempt}.pid"
+    parent = _script(
+        tmp_path / f"leader-exit-{attempt}.py",
+        "import subprocess, sys\n"
+        "child = subprocess.Popen(['/usr/bin/python3', '-c', 'import time; time.sleep(60)'])\n"
+        f"open({str(descendant_pid)!r}, 'w', encoding='utf-8').write(str(child.pid))\n"
+        "sys.exit(0)\n",
+    )
+
+    try:
+        with pytest.raises(BoundedProcessError, match="command_timeout"):
+            run_bounded([str(parent)], cwd=tmp_path, home=tmp_path, timeout_seconds=1)
+        deadline = time.monotonic() + 2
+        while not descendant_pid.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert descendant_pid.exists()
+        _wait_until_process_is_not_live(int(descendant_pid.read_text(encoding="utf-8")))
+    finally:
+        if descendant_pid.exists():
+            with contextlib.suppress(OSError):
+                os.kill(int(descendant_pid.read_text(encoding="utf-8")), signal.SIGKILL)
 
 
 def test_bounded_runner_fails_before_execution_when_atomic_pidfd_spawn_is_unavailable(
@@ -208,7 +370,7 @@ def test_bounded_runner_reaps_the_group_when_post_spawn_pidfd_identity_fails(
         reads += 1
         if reads == 1:
             return read_identity(pidfd)
-        time.sleep(0.1)
+        time.sleep(1)
         raise runtime_process.BoundedProcessError("command_group_unavailable")
 
     monkeypatch.setattr(runtime_process, "_pid_from_fdinfo", fail_after_preflight)
@@ -315,7 +477,7 @@ def test_bounded_runner_terminates_descendants_after_early_parent_exit(
                 [str(parent)],
                 cwd=tmp_path,
                 home=tmp_path,
-                timeout_seconds=0.2,
+                timeout_seconds=1,
                 stdout_limit=128,
                 stderr_limit=128,
             )

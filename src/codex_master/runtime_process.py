@@ -11,16 +11,16 @@ import os
 from pathlib import Path
 import selectors
 import signal
+import stat
 import time
-from typing import BinaryIO
 
 
 DEFAULT_STDOUT_LIMIT = 256 * 1024
 DEFAULT_STDERR_LIMIT = 64 * 1024
-_POSIX_SPAWN_SETSID = 0x80
-_SPAWN_BUFFER_BYTES = 512
+_RUNTIME_SPAWN_HELPER = "_runtime_spawn_helper.so"
 _GROUP_BINDING_ERRORS = frozenset(
     {
+        errno.EAGAIN,
         errno.EINVAL,
         errno.EMFILE,
         errno.ENFILE,
@@ -46,13 +46,20 @@ class BoundedProcessResult:
     stderr: str
 
 
+@dataclass(frozen=True, slots=True)
+class _NativeSpawnHelper:
+    library: object
+    spawn: object
+    enable_subreaper: object
+
+
 @dataclass(slots=True)
 class _SpawnedProcess:
     process_group: int
     pidfd: int
-    stdin: BinaryIO
-    stdout: BinaryIO
-    stderr: BinaryIO
+    stdin_fd: int
+    stdout_fd: int
+    stderr_fd: int
     returncode: int | None = None
 
 
@@ -74,14 +81,60 @@ def minimal_environment(*, home: Path) -> dict[str, str]:
     }
 
 
-def _native_function(library: object, name: str, argtypes: list[object]) -> object:
+def _close_descriptor(descriptor: int) -> int:
+    if descriptor >= 0:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+    return -1
+
+
+def _runtime_spawn_helper_path(helper_path: Path | None = None) -> Path:
+    if helper_path is not None and (
+        not isinstance(helper_path, Path)
+        or not helper_path.is_absolute()
+        or "\x00" in os.fspath(helper_path)
+    ):
+        raise BoundedProcessError("command_group_unavailable")
+    path = (
+        Path(__file__).with_name(_RUNTIME_SPAWN_HELPER)
+        if helper_path is None
+        else helper_path
+    )
     try:
-        function = getattr(library, name)
-    except AttributeError as exc:
+        item = path.lstat()
+    except OSError as exc:
         raise BoundedProcessError("command_group_unavailable") from exc
-    function.argtypes = argtypes
-    function.restype = ctypes.c_int
-    return function
+    if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
+        raise BoundedProcessError("command_group_unavailable")
+    return path
+
+
+def _load_runtime_spawn_helper(
+    helper_path: Path | None = None,
+) -> _NativeSpawnHelper:
+    """Load the image-built helper with its checked C header/ABI contract."""
+
+    try:
+        library = ctypes.CDLL(
+            os.fspath(_runtime_spawn_helper_path(helper_path)), use_errno=True
+        )
+        spawn = library.codex_master_pidfd_spawnp
+        spawn.argtypes = (
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_char_p),
+        )
+        spawn.restype = ctypes.c_int
+        enable_subreaper = library.codex_master_enable_subreaper
+        enable_subreaper.argtypes = ()
+        enable_subreaper.restype = ctypes.c_int
+    except (AttributeError, OSError) as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    return _NativeSpawnHelper(library, spawn, enable_subreaper)
 
 
 def _pid_from_fdinfo(pidfd: int) -> int:
@@ -107,10 +160,18 @@ def _pid_from_fdinfo(pidfd: int) -> int:
     return process_group
 
 
-def _verify_pidfd_fdinfo_capability() -> None:
-    """Fail before execution unless a pidfd can supply its stable process ID."""
+def _verify_pidfd_capability(helper: _NativeSpawnHelper) -> None:
+    """Fail before opening pipes unless every process-control primitive exists."""
 
-    if not hasattr(signal, "pidfd_send_signal") or not hasattr(os, "P_PIDFD"):
+    if (
+        not hasattr(os, "P_PIDFD")
+        or not hasattr(os, "P_PGID")
+        or not hasattr(os, "O_CLOEXEC")
+        or not hasattr(os, "pipe2")
+        or not hasattr(signal, "pidfd_send_signal")
+    ):
+        raise BoundedProcessError("command_group_unavailable")
+    if helper.enable_subreaper() != 0:
         raise BoundedProcessError("command_group_unavailable")
     try:
         pidfd = os.pidfd_open(os.getpid())
@@ -120,17 +181,40 @@ def _verify_pidfd_fdinfo_capability() -> None:
         if _pid_from_fdinfo(pidfd) != os.getpid():
             raise BoundedProcessError("command_group_unavailable")
     finally:
-        with contextlib.suppress(OSError):
-            os.close(pidfd)
+        _close_descriptor(pidfd)
+
+
+def _signal_bound_group(process_group: int, pidfd: int, signal_number: int) -> bool:
+    """Signal only a process group whose leader PID remains held by pidfd."""
+
+    while True:
+        try:
+            os.killpg(process_group, signal_number)
+            return True
+        except InterruptedError:
+            continue
+        except ProcessLookupError:
+            return False
+        except OSError:
+            with contextlib.suppress(OSError):
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            return False
+
+
+def _reap_process_group(process_group: int) -> None:
+    """Reap subreaper-adopted descendants after their pinned group is killed."""
+
+    while True:
+        try:
+            os.waitid(os.P_PGID, process_group, os.WEXITED)
+        except InterruptedError:
+            continue
+        except (ChildProcessError, OSError):
+            return
 
 
 def _terminate_unbound_spawn(pidfd: int) -> None:
-    """Kill and reap an incomplete spawn without releasing its group leader PID.
-
-    `WNOWAIT` keeps the pidfd-target leader as a zombie while `killpg` uses the
-    PID reported by that same pidfd. The number therefore cannot be reused for
-    a foreign process before the group is terminated.
-    """
+    """Kill/reap a partial spawn while its leader PID cannot be reused."""
 
     with contextlib.suppress(OSError):
         signal.pidfd_send_signal(pidfd, signal.SIGKILL)
@@ -143,118 +227,60 @@ def _terminate_unbound_spawn(pidfd: int) -> None:
             continue
         except (ChildProcessError, OSError):
             break
-    if waited is not None and type(waited.si_pid) is int and waited.si_pid > 0:
-        with contextlib.suppress(OSError):
-            os.killpg(waited.si_pid, signal.SIGKILL)
+    process_group = waited.si_pid if waited is not None else None
+    if type(process_group) is int and process_group > 0:
+        _signal_bound_group(process_group, pidfd, signal.SIGKILL)
     with contextlib.suppress(ChildProcessError, OSError):
         os.waitid(os.P_PIDFD, pidfd, os.WEXITED)
+    if type(process_group) is int and process_group > 0:
+        _reap_process_group(process_group)
 
 
 def _spawn_with_pidfd(
-    arguments: Sequence[str], *, cwd: Path, environment: dict[str, str]
+    arguments: Sequence[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    helper: _NativeSpawnHelper,
 ) -> _SpawnedProcess:
-    """Spawn a new session with glibc 2.39+'s atomic pidfd_spawnp primitive."""
+    """Spawn with typed native glibc state and only raw parent pipe FDs."""
 
-    _verify_pidfd_fdinfo_capability()
+    _verify_pidfd_capability(helper)
     try:
-        library = ctypes.CDLL(None, use_errno=True)
-        spawn = _native_function(
-            library,
-            "pidfd_spawnp",
-            [
-                ctypes.POINTER(ctypes.c_int),
-                ctypes.c_char_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_char_p),
-                ctypes.POINTER(ctypes.c_char_p),
-            ],
-        )
-        attr_init = _native_function(library, "posix_spawnattr_init", [ctypes.c_void_p])
-        attr_destroy = _native_function(
-            library, "posix_spawnattr_destroy", [ctypes.c_void_p]
-        )
-        attr_setflags = _native_function(
-            library, "posix_spawnattr_setflags", [ctypes.c_void_p, ctypes.c_short]
-        )
-        actions_init = _native_function(
-            library, "posix_spawn_file_actions_init", [ctypes.c_void_p]
-        )
-        actions_destroy = _native_function(
-            library, "posix_spawn_file_actions_destroy", [ctypes.c_void_p]
-        )
-        actions_dup2 = _native_function(
-            library,
-            "posix_spawn_file_actions_adddup2",
-            [ctypes.c_void_p, ctypes.c_int, ctypes.c_int],
-        )
-        actions_chdir = _native_function(
-            library,
-            "posix_spawn_file_actions_addchdir_np",
-            [ctypes.c_void_p, ctypes.c_char_p],
-        )
-        actions_closefrom = _native_function(
-            library,
-            "posix_spawn_file_actions_addclosefrom_np",
-            [ctypes.c_void_p, ctypes.c_int],
-        )
-    except (AttributeError, OSError) as exc:
-        raise BoundedProcessError("command_group_unavailable") from exc
-
-    attr = ctypes.create_string_buffer(_SPAWN_BUFFER_BYTES)
-    actions = ctypes.create_string_buffer(_SPAWN_BUFFER_BYTES)
-    attr_initialized = False
-    actions_initialized = False
-    stdin_read = stdin_write = stdout_read = stdout_write = stderr_read = (
-        stderr_write
-    ) = -1
-    stdin: BinaryIO | None = None
-    stdout: BinaryIO | None = None
-    stderr: BinaryIO | None = None
-    pidfd = -1
-    transferred = False
-    try:
-        if attr_init(attr) != 0:
-            raise BoundedProcessError("command_group_unavailable")
-        attr_initialized = True
-        if attr_setflags(attr, _POSIX_SPAWN_SETSID) != 0:
-            raise BoundedProcessError("command_group_unavailable")
-        if actions_init(actions) != 0:
-            raise BoundedProcessError("command_group_unavailable")
-        actions_initialized = True
-        stdin_read, stdin_write = os.pipe2(os.O_CLOEXEC)
-        stdout_read, stdout_write = os.pipe2(os.O_CLOEXEC)
-        stderr_read, stderr_write = os.pipe2(os.O_CLOEXEC)
-        stdin = os.fdopen(stdin_write, "wb", buffering=0)
-        stdin_write = -1
-        stdout = os.fdopen(stdout_read, "rb", buffering=0)
-        stdout_read = -1
-        stderr = os.fdopen(stderr_read, "rb", buffering=0)
-        stderr_read = -1
-        for source, target in ((stdin_read, 0), (stdout_write, 1), (stderr_write, 2)):
-            if actions_dup2(actions, source, target) != 0:
-                raise BoundedProcessError("command_group_unavailable")
-        if (
-            actions_chdir(actions, os.fsencode(cwd)) != 0
-            or actions_closefrom(actions, 3) != 0
-        ):
-            raise BoundedProcessError("command_group_unavailable")
+        encoded_cwd = os.fsencode(cwd)
         encoded_arguments = [os.fsencode(argument) for argument in arguments]
-        argv = (ctypes.c_char_p * (len(encoded_arguments) + 1))(
-            *encoded_arguments, None
-        )
         encoded_environment = [
             os.fsencode(f"{name}={value}") for name, value in environment.items()
         ]
-        envp = (ctypes.c_char_p * (len(encoded_environment) + 1))(
-            *encoded_environment, None
-        )
+    except (TypeError, ValueError) as exc:
+        raise BoundedProcessError("command_arguments_invalid") from exc
+    if any(
+        b"\x00" in value
+        for value in (encoded_cwd, *encoded_arguments, *encoded_environment)
+    ):
+        raise BoundedProcessError("command_arguments_invalid")
+    argv = (ctypes.c_char_p * (len(encoded_arguments) + 1))(*encoded_arguments, None)
+    envp = (ctypes.c_char_p * (len(encoded_environment) + 1))(
+        *encoded_environment, None
+    )
+    stdin_child = stdin_parent = stdout_parent = stdout_child = stderr_parent = (
+        stderr_child
+    ) = -1
+    pidfd = -1
+    transferred = False
+    try:
+        stdin_child, stdin_parent = os.pipe2(os.O_CLOEXEC)
+        stdout_parent, stdout_child = os.pipe2(os.O_CLOEXEC)
+        stderr_parent, stderr_child = os.pipe2(os.O_CLOEXEC)
+        for descriptor in (stdin_parent, stdout_parent, stderr_parent):
+            os.set_blocking(descriptor, False)
         spawned_pidfd = ctypes.c_int(-1)
-        result = spawn(
+        result = helper.spawn(
             ctypes.byref(spawned_pidfd),
-            encoded_arguments[0],
-            actions,
-            attr,
+            stdin_child,
+            stdout_child,
+            stderr_child,
+            encoded_cwd,
             argv,
             envp,
         )
@@ -266,8 +292,16 @@ def _spawn_with_pidfd(
             )
             raise BoundedProcessError(code)
         pidfd = spawned_pidfd.value
-        process_group = _pid_from_fdinfo(pidfd)
-        process = _SpawnedProcess(process_group, pidfd, stdin, stdout, stderr)
+        if pidfd < 0:
+            raise BoundedProcessError("command_group_unavailable")
+        process = _SpawnedProcess(
+            _pid_from_fdinfo(pidfd),
+            pidfd,
+            stdin_parent,
+            stdout_parent,
+            stderr_parent,
+        )
+        stdin_parent = stdout_parent = stderr_parent = -1
         transferred = True
         return process
     except BoundedProcessError:
@@ -275,23 +309,14 @@ def _spawn_with_pidfd(
     except OSError as exc:
         raise BoundedProcessError("command_group_unavailable") from exc
     finally:
-        if actions_initialized:
-            actions_destroy(actions)
-        if attr_initialized:
-            attr_destroy(attr)
-        for descriptor in (stdin_read, stdout_write, stderr_write):
-            if descriptor >= 0:
-                with contextlib.suppress(OSError):
-                    os.close(descriptor)
+        for descriptor in (stdin_child, stdout_child, stderr_child):
+            _close_descriptor(descriptor)
         if not transferred:
-            for stream in (stdin, stdout, stderr):
-                if stream is not None:
-                    with contextlib.suppress(OSError):
-                        stream.close()
+            for descriptor in (stdin_parent, stdout_parent, stderr_parent):
+                _close_descriptor(descriptor)
             if pidfd >= 0:
                 _terminate_unbound_spawn(pidfd)
-                with contextlib.suppress(OSError):
-                    os.close(pidfd)
+                _close_descriptor(pidfd)
 
 
 def _process_group_exists(process_group: int) -> bool:
@@ -305,28 +330,16 @@ def _process_group_exists(process_group: int) -> bool:
 
 
 def _terminate_process_group(process: _SpawnedProcess) -> None:
-    """Terminate only the session whose group ID is pinned by atomic pidfd spawn."""
+    """Terminate only the session whose group number is held by its pidfd."""
 
-    try:
-        os.killpg(process.process_group, signal.SIGTERM)
-    except ProcessLookupError:
+    if not _signal_bound_group(process.process_group, process.pidfd, signal.SIGTERM):
         return
-    except OSError:
-        with contextlib.suppress(AttributeError, OSError):
-            signal.pidfd_send_signal(process.pidfd, signal.SIGKILL)
-        return
-    deadline = time.monotonic() + 1
+    deadline = time.monotonic() + 0.05
     while time.monotonic() < deadline:
         if not _process_group_exists(process.process_group):
             return
-        time.sleep(0.02)
-    with contextlib.suppress(OSError):
-        os.killpg(process.process_group, signal.SIGKILL)
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline:
-        if not _process_group_exists(process.process_group):
-            return
-        time.sleep(0.02)
+        time.sleep(0.005)
+    _signal_bound_group(process.process_group, process.pidfd, signal.SIGKILL)
 
 
 def _returncode(waited: object) -> int:
@@ -342,6 +355,8 @@ def _wait_for_process(process: _SpawnedProcess, timeout: float) -> int:
     while True:
         try:
             waited = os.waitid(os.P_PIDFD, process.pidfd, os.WEXITED | os.WNOHANG)
+        except InterruptedError:
+            continue
         except ChildProcessError as exc:
             raise BoundedProcessError("command_unavailable") from exc
         if waited is not None:
@@ -349,14 +364,14 @@ def _wait_for_process(process: _SpawnedProcess, timeout: float) -> int:
             return process.returncode
         if time.monotonic() >= deadline:
             raise TimeoutError
-        time.sleep(0.01)
+        time.sleep(0.005)
 
 
 def _reap_process(process: _SpawnedProcess) -> None:
     try:
         _wait_for_process(process, 1)
     except (BoundedProcessError, TimeoutError):
-        with contextlib.suppress(AttributeError, OSError):
+        with contextlib.suppress(OSError):
             signal.pidfd_send_signal(process.pidfd, signal.SIGKILL)
         with contextlib.suppress(
             BoundedProcessError, ChildProcessError, OSError, TimeoutError
@@ -364,10 +379,18 @@ def _reap_process(process: _SpawnedProcess) -> None:
             _wait_for_process(process, 1)
 
 
-def _close_process_streams(process: _SpawnedProcess) -> None:
-    for stream in (process.stdin, process.stdout, process.stderr):
-        with contextlib.suppress(OSError):
-            stream.close()
+def _close_process_descriptors(process: _SpawnedProcess) -> None:
+    process.stdin_fd = _close_descriptor(process.stdin_fd)
+    process.stdout_fd = _close_descriptor(process.stdout_fd)
+    process.stderr_fd = _close_descriptor(process.stderr_fd)
+
+
+def _close_selector_descriptor(
+    selector: selectors.BaseSelector, descriptor: int
+) -> None:
+    with contextlib.suppress(KeyError):
+        selector.unregister(descriptor)
+    _close_descriptor(descriptor)
 
 
 def run_bounded(
@@ -379,12 +402,14 @@ def run_bounded(
     stdout_limit: int = DEFAULT_STDOUT_LIMIT,
     stderr_limit: int = DEFAULT_STDERR_LIMIT,
     input_data: bytes = b"",
+    _runtime_spawn_helper_path: Path | None = None,
 ) -> BoundedProcessResult:
-    """Run one command with isolated environment, bounded pipes and group cleanup."""
+    """Run one command with bounded nonblocking I/O and pidfd-bound cleanup."""
 
     if (
         not isinstance(cwd, Path)
         or not cwd.is_absolute()
+        or "\x00" in os.fspath(cwd)
         or not arguments
         or any(
             not isinstance(argument, str) or not argument or "\x00" in argument
@@ -401,31 +426,34 @@ def run_bounded(
         or len(input_data) > 64 * 1024
     ):
         raise BoundedProcessError("command_arguments_invalid")
+    deadline = time.monotonic() + float(timeout_seconds)
+    environment = minimal_environment(home=home)
+    helper = _load_runtime_spawn_helper(_runtime_spawn_helper_path)
+    if time.monotonic() >= deadline:
+        raise BoundedProcessError("command_timeout")
     process: _SpawnedProcess | None = None
     selector: selectors.BaseSelector | None = None
-    streams: dict[int, tuple[str, BinaryIO, int]] = {}
-    output = {"stdout": bytearray(), "stderr": bytearray()}
+    outputs = {"stdout": bytearray(), "stderr": bytearray()}
     try:
         process = _spawn_with_pidfd(
-            arguments, cwd=cwd, environment=minimal_environment(home=home)
+            arguments, cwd=cwd, environment=environment, helper=helper
         )
-        try:
-            process.stdin.write(input_data)
-            process.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
-        finally:
-            process.stdin.close()
+        if time.monotonic() >= deadline:
+            raise BoundedProcessError("command_timeout")
         selector = selectors.DefaultSelector()
-        for name, stream, limit in (
-            ("stdout", process.stdout, stdout_limit),
-            ("stderr", process.stderr, stderr_limit),
-        ):
-            descriptor = stream.fileno()
-            streams[descriptor] = (name, stream, limit)
-            selector.register(stream, selectors.EVENT_READ)
-        deadline = time.monotonic() + float(timeout_seconds)
-        while streams:
+        streams = {
+            process.stdout_fd: ("stdout", stdout_limit),
+            process.stderr_fd: ("stderr", stderr_limit),
+        }
+        for descriptor, (name, _limit) in streams.items():
+            selector.register(descriptor, selectors.EVENT_READ, name)
+        pending = memoryview(input_data)
+        offset = 0
+        if pending:
+            selector.register(process.stdin_fd, selectors.EVENT_WRITE, "stdin")
+        else:
+            process.stdin_fd = _close_descriptor(process.stdin_fd)
+        while streams or process.stdin_fd >= 0:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise BoundedProcessError("command_timeout")
@@ -433,15 +461,42 @@ def run_bounded(
             if not ready:
                 raise BoundedProcessError("command_timeout")
             for key, _events in ready:
-                descriptor = key.fileobj.fileno()
-                name, stream, limit = streams[descriptor]
-                chunk = os.read(descriptor, min(8192, limit + 1 - len(output[name])))
-                if not chunk:
-                    selector.unregister(stream)
-                    streams.pop(descriptor)
+                descriptor = key.fd
+                if key.data == "stdin":
+                    try:
+                        written = os.write(descriptor, pending[offset:])
+                    except BlockingIOError:
+                        continue
+                    except OSError as exc:
+                        if exc.errno != errno.EPIPE:
+                            raise
+                        written = 0
+                    if written <= 0:
+                        _close_selector_descriptor(selector, descriptor)
+                        process.stdin_fd = -1
+                        continue
+                    offset += written
+                    if offset == len(pending):
+                        _close_selector_descriptor(selector, descriptor)
+                        process.stdin_fd = -1
                     continue
-                output[name].extend(chunk)
-                if len(output[name]) > limit:
+                name, limit = streams[descriptor]
+                try:
+                    chunk = os.read(
+                        descriptor, min(8192, limit + 1 - len(outputs[name]))
+                    )
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    _close_selector_descriptor(selector, descriptor)
+                    streams.pop(descriptor)
+                    if descriptor == process.stdout_fd:
+                        process.stdout_fd = -1
+                    else:
+                        process.stderr_fd = -1
+                    continue
+                outputs[name].extend(chunk)
+                if len(outputs[name]) > limit:
                     raise BoundedProcessError(f"command_{name}_limit")
         try:
             returncode = _wait_for_process(
@@ -450,8 +505,8 @@ def run_bounded(
         except TimeoutError as exc:
             raise BoundedProcessError("command_timeout") from exc
         try:
-            stdout = output["stdout"].decode("utf-8")
-            stderr = output["stderr"].decode("utf-8")
+            stdout = outputs["stdout"].decode("utf-8")
+            stderr = outputs["stderr"].decode("utf-8")
         except UnicodeDecodeError as exc:
             raise BoundedProcessError("command_output_invalid") from exc
         return BoundedProcessResult(returncode=returncode, stdout=stdout, stderr=stderr)
@@ -465,9 +520,9 @@ def run_bounded(
         if process is not None:
             _terminate_process_group(process)
             _reap_process(process)
-            _close_process_streams(process)
-            with contextlib.suppress(OSError):
-                os.close(process.pidfd)
+            _reap_process_group(process.process_group)
+            _close_process_descriptors(process)
+            process.pidfd = _close_descriptor(process.pidfd)
 
 
 __all__ = [
