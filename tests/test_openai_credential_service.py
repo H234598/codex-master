@@ -1005,6 +1005,9 @@ def test_public_rendering_never_contains_secret_or_backend_identity(
     receipt = service.apply_auth_sync(plan, upload)
 
     rendered = repr(service) + repr(plan) + repr(upload) + repr(receipt)
+    assert SECRET_MARKER not in rendered
+    assert "acct-one" not in rendered
+    assert str(tmp_path) not in rendered
     assert_private_values_absent(rendered, SECRET_MARKER, "acct-one", str(tmp_path))
 
 

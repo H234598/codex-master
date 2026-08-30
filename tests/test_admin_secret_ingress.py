@@ -9,11 +9,13 @@ import codex_master.admin_secret_ingress as ingress_module
 from codex_master.admin_secret_ingress import (
     AdminSecretIngressError,
     AdminSecretIngressOwner,
+    SecretResolveClaimV1,
     SecretUploadClaimV1,
 )
 from codex_master.admin_service import (
     MasterjetControlService,
     SecretIngressCapabilityV1,
+    SecretIngressResolutionV1,
 )
 from codex_master.credential_vault import CredentialVault
 from test_admin_service import command, principal, service_at
@@ -40,6 +42,20 @@ def _session(owner: AdminSecretIngressOwner):
         idempotency_key="idem-create",
         plan_digest=DIGEST,
     )
+
+
+def test_secret_ingress_claims_and_resolution_are_redacted() -> None:
+    upload_claim = SecretUploadClaimV1("private-session", "a" * 64)
+    resolve_claim = SecretResolveClaimV1("private-session", "b" * 64)
+    resolution = SecretIngressResolutionV1(
+        "private-session",
+        bytearray(b"private-secret"),
+        resolve_claim,
+    )
+
+    assert repr(upload_claim) == "SecretUploadClaimV1(<redacted>)"
+    assert repr(resolve_claim) == "SecretResolveClaimV1(<redacted>)"
+    assert repr(resolution) == "SecretIngressResolutionV1(<redacted>)"
 
 
 def test_create_replay_returns_original_session_after_clock_advance_and_restart(

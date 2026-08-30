@@ -509,6 +509,28 @@ def _service(
     return service, ingress, exchange, manager
 
 
+def test_exchange_token_receipt_and_control_service_repr_are_redacted(
+    tmp_path: Path,
+) -> None:
+    service, _ingress, _exchange, _manager = _service(tmp_path)
+    exchange = oauth_session.GoogleOAuthCodeExchangeV1(
+        "private-subject",
+        bytearray(b"private-refresh-token"),
+    )
+    receipt = oauth_session.GoogleOAuthTokenWriteReceiptV1(
+        operation_id="operation-one",
+        account_ref="google-account-01",
+        subject_id="private-subject",
+        oauth_client_fingerprint="sha256:" + "a" * 64,
+        scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+        scope_fingerprint="sha256:" + "b" * 64,
+    )
+
+    assert repr(exchange) == "GoogleOAuthCodeExchangeV1(<redacted>)"
+    assert repr(receipt) == "GoogleOAuthTokenWriteReceiptV1(<redacted>)"
+    assert repr(service) == "GoogleOAuthControlService(<redacted>)"
+
+
 def _import_client(service, ingress: _SecretIngress, *, key: str = "import-one"):
     plan = service.plan_oauth_client_import(
         "google-account-01",

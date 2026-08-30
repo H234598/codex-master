@@ -56,6 +56,29 @@ def test_builder_inventories_private_functions_tests_and_assertions(tmp_path: Pa
     assert all(item.assertion_digest.startswith("sha256:") for item in index.tests)
 
 
+def test_builder_ignores_unbound_tests_in_selected_test_files(tmp_path: Path) -> None:
+    bindings = write_project(tmp_path)
+    test_path = tmp_path / "tests/test_example.py"
+    test_path.write_text(
+        test_path.read_text(encoding="utf-8")
+        + "\ndef test_unrelated_repository_check():\n"
+        + "    assert True\n",
+        encoding="utf-8",
+    )
+
+    index = PythonTestIndexBuilder(tmp_path).build(
+        repository_id="example",
+        generation=1,
+        source_paths=("src/example.py",),
+        test_paths=("tests/test_example.py",),
+        bindings=bindings,
+    )
+
+    assert [item.test_id for item in index.tests] == sorted(
+        test_id for test_ids in bindings.values() for test_id in test_ids
+    )
+
+
 def test_builder_fails_closed_for_unindexed_function(tmp_path: Path) -> None:
     bindings = write_project(tmp_path)
     bindings.pop("python:src/example.py:_normalize")

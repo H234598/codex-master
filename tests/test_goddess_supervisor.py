@@ -38,8 +38,8 @@ def test_reporter_leader_is_single_process_scoped_and_probeable(tmp_path):
     path = tmp_path / "leader.lock"
     first = ReporterLeaderLease(path)
     second = ReporterLeaderLease(path)
-    first.acquire()
-    try:
+    with first as held:
+        assert held is first
         assert reporter_leader_active(path) is True
         try:
             second.acquire()
@@ -47,6 +47,4 @@ def test_reporter_leader_is_single_process_scoped_and_probeable(tmp_path):
             pass
         else:
             raise AssertionError("second reporter unexpectedly acquired leader lock")
-    finally:
-        first.release()
     assert reporter_leader_active(path) is False

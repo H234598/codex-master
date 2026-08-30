@@ -683,6 +683,7 @@ def test_manager_state_errors_are_typed_at_plan_boundary(tmp_path, state: str) -
     authority = FakeCredentialAuthority(lease)
     service = GoogleBillingService(manager, authority, clock=Clock())
 
+    assert repr(service) == "GoogleBillingService()"
     with pytest.raises(GoogleBillingError, match="billing.inventory_unavailable"):
         service.plan_billing_binding(
             account_ref="google-one",

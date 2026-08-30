@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,18 @@ def test_mcp_test_tools_share_service_contract_and_closed_schemas(tmp_path: Path
 
 def test_index_loader_fails_closed_for_missing_index(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="test.index_missing"):
+        load_test_index(tmp_path)
+
+
+def test_index_loader_rejects_noncanonical_json_bytes(tmp_path: Path) -> None:
+    index, _ = project(tmp_path, "    assert run() == 1\n")
+    (tmp_path / ".hive").mkdir()
+    (tmp_path / ".hive/test-index.v1.json").write_text(
+        json.dumps(index.public(), indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="test.index_invalid"):
         load_test_index(tmp_path)
 
 

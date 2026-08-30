@@ -49,6 +49,38 @@ def test_javascript_builder_indexes_functions_methods_arrows_and_node_assertions
     assert [item.test_id for item in index.tests] == sorted(tests.values())
 
 
+def test_javascript_builder_ignores_unbound_tests_in_selected_files(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src/example.js").write_text(
+        "export function add(left, right) { return left + right; }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests/test-example.mjs").write_text(
+        'import assert from "node:assert/strict";\n'
+        'import test from "node:test";\n'
+        'test("add contract", () => { assert.equal(1 + 2, 3); });\n'
+        'test("unrelated repository check", () => { assert.ok(true); });\n',
+        encoding="utf-8",
+    )
+
+    index = JavaScriptTestIndexBuilder(tmp_path).build(
+        repository_id="example",
+        generation=1,
+        source_paths=("src/example.js",),
+        test_paths=("tests/test-example.mjs",),
+        bindings={
+            "javascript:src/example.js:add": (
+                "node_test:tests/test-example.mjs:add contract",
+            )
+        },
+    )
+
+    assert [item.test_id for item in index.tests] == [
+        "node_test:tests/test-example.mjs:add contract"
+    ]
+
+
 def test_typescript_inventory_uses_pinned_grammar_and_stable_function_ids(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src/example.ts").write_text(

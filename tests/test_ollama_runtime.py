@@ -965,6 +965,101 @@ def test_scope_resolution_waits_for_pinned_target_exec(
     assert calls == 2
 
 
+def test_system_runtime_reports_sorted_affinity_and_probe_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = SystemOllamaRuntime()
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {3, 1})
+
+    assert runtime.available_cpus() == (1, 3)
+
+    def unavailable(_pid: int) -> set[int]:
+        raise OSError
+
+    monkeypatch.setattr(os, "sched_getaffinity", unavailable)
+    with pytest.raises(OllamaRuntimeError, match="resource.host_probe_unavailable"):
+        runtime.available_cpus()
+
+
+def test_system_runtime_checks_process_and_scope_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = SystemOllamaRuntime()
+    monkeypatch.setattr(ollama_runtime, "_process_start_ticks", lambda _pid: 901)
+    monkeypatch.setattr(
+        runtime,
+        "_scope_observation",
+        lambda _unit_name: (4343, "/user.slice/ollama.scope", 901),
+    )
+
+    assert runtime.process_running(FakeProcess(), 4343, 901) is True
+    assert runtime.scope_process_matches(
+        "codex-master-ollama-0123456789abcdef0123456789abcdef.scope",
+        4343,
+        "/user.slice/ollama.scope",
+        901,
+    ) is True
+    assert runtime.scope_process_matches("invalid", 4343, "/user.slice/ollama.scope", 901) is False
+
+
+def test_system_runtime_cleanup_stops_only_recorded_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stopped: list[str] = []
+    waits: list[float | None] = []
+
+    class WaitProcess(FakeProcess):
+        def wait(self, timeout: float | None = None) -> int:
+            waits.append(timeout)
+            return 0
+
+    runtime = SystemOllamaRuntime()
+    monkeypatch.setattr(runtime, "allocate_loopback_port", lambda: 11435)
+    monkeypatch.setattr(runtime, "start_scope", lambda _request: WaitProcess())
+
+    def fail_resolution(_request: object, _process: object) -> tuple[int, str, int]:
+        raise OllamaRuntimeError("resource.scope_membership_invalid")
+
+    monkeypatch.setattr(runtime, "resolve_scope", fail_resolution)
+    monkeypatch.setattr(runtime, "_stop_unit", stopped.append)
+
+    with pytest.raises(OllamaRuntimeError, match="resource.scope_membership_invalid"):
+        start_local_instance(planned(tmp_path), runtime=runtime)
+
+    assert len(stopped) == 1
+    assert re.fullmatch(r"codex-master-ollama-[0-9a-f]{32}\.scope", stopped[0])
+    assert waits == [1.0]
+
+
+def test_system_runtime_stop_and_pinned_executable_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args=(), returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    SystemOllamaRuntime()._stop_unit(
+        "codex-master-ollama-0123456789abcdef0123456789abcdef.scope"
+    )
+
+    assert calls[0][0][0] == (
+        ollama_runtime.SYSTEMCTL_PATH,
+        "--user",
+        "--no-pager",
+        "stop",
+        "codex-master-ollama-0123456789abcdef0123456789abcdef.scope",
+    )
+    assert calls[0][1]["timeout"] == 5.0
+
+    monkeypatch.setattr(os, "readlink", lambda _path: "/memfd:codex-master-ollama-executable")
+    assert ollama_runtime._process_executable_is_pinned(4343) is True
+    monkeypatch.setattr(os, "readlink", lambda _path: "/usr/bin/ollama")
+    assert ollama_runtime._process_executable_is_pinned(4343) is False
+
+
 def test_system_scope_identity_uses_single_cgroup_procs_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

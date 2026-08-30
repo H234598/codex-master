@@ -46,7 +46,10 @@ def load_test_index(repository_root: Path) -> TestIndexV1:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError, RecursionError):
         raise ValueError("test.index_invalid") from None
-    return TestIndexV1.from_mapping(value)
+    index = TestIndexV1.from_mapping(value)
+    if raw != index.canonical_bytes():
+        raise ValueError("test.index_invalid")
+    return index
 
 
 def probe_test_index(repository_root: Path | None = None) -> dict[str, object]:

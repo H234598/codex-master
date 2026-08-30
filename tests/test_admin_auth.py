@@ -329,6 +329,8 @@ def test_masterjet_bearer_is_loaded_from_private_fd_and_compared_exactly(
     finally:
         os.close(fd)
 
+    assert repr(AdminAuthError("private-marker")) == "AdminAuthError('private-marker')"
+    assert repr(verifier) == "MasterjetBearerVerifier(<redacted>)"
     assert verifier.verify("service-bearer").subject == "usage-service"
     with pytest.raises(AdminAuthError, match="authority.identity_invalid"):
         verifier.verify("service-bearer-extra")
@@ -393,6 +395,7 @@ def test_totp_accepts_once_then_rejects_replay_and_cross_subject(tmp_path) -> No
         os.close(fd)
     code = _totp(NOW // 30)
 
+    assert repr(verifier) == "TotpStepUpVerifier(<redacted>)"
     assert verifier.verify("user-one", code) == NOW // 30
     for subject in ("user-one", "user-two"):
         with pytest.raises(AdminAuthError, match="authority.step_up_replayed"):

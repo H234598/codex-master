@@ -836,7 +836,7 @@ test("ollama action opens exact control center page", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
 
-  applet.activateOllamaManage();
+  applet._ollamaManageItem.activate();
 
   assert.deepEqual(Array.from(fixture.launcherSpawns[0].argv), [
     "/home/tester/.local/bin/codex-master-mcp",
@@ -3320,6 +3320,11 @@ test("quick control preallocates fixed rows and validates one start plus safe st
   assert.equal(getMenuItemText(applet._startActionItem), "b1 starten");
   assert.equal(getMenuItemText(applet._stopActionItems[0]), "a1 stoppen");
   assert.equal(applet._stopActionItems.filter((item) => item.actor.visible).length, 1);
+
+  applet._stopActionItems[0].activate();
+  assert.equal(applet._armedAction.action, "stop");
+  assert.equal(applet._armedAction.agent, "a1");
+  assert.equal(applet._armedAction.contextToken, STOP_CONTEXT_VALUE);
 
   const duplicateStart = JSON.parse(JSON.stringify(payload));
   duplicateStart.agents[0] = {

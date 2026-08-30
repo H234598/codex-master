@@ -182,8 +182,7 @@ class PythonTestIndexBuilder:
         for function_id, bound_tests in normalized_bindings.items():
             for test_id in bound_tests:
                 covers[test_id].append(function_id)
-        if set(covers) != test_ids:
-            raise TestIndexError("test.index_invalid")
+        tests = {test_id: tests[test_id] for test_id in covers}
         function_meta = function_metadata or {}
         test_meta = test_metadata or {}
         function_entries = []
