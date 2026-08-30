@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from datetime import UTC, datetime
 import json
 import os
 import subprocess
@@ -14,20 +14,53 @@ import pytest
 from codex_master import server
 from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from codex_master.fleet_service import FleetConflictError
+from codex_master.hive.hourly_probe import run_probe
 
 
 @pytest.fixture(autouse=True)
-def fresh_green_hive_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        server,
-        "read_probe_gate",
-        lambda: {
-            "allowed": True,
-            "reason_code": "probe_ready",
-            "raw_output": "not_returned",
-        },
+def runtime_probe_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Materialize the canonical green record; never replace the gate or lock."""
+
+    state_directory = tmp_path / "probe-state"
+    repository = tmp_path / "probe-repository"
+    command = repository / "bin" / "codex-master-mcp"
+    command.parent.mkdir(parents=True)
+    runtime = {
+        "schema_version": 1,
+        "mode": "enforced",
+        "counts": {"principals": 0, "repositories": 0},
+        "checks": {"authority": "ready", "repository": "ready", "state": "ready"},
+        "config_digest": "sha256:" + "a" * 64,
+        "catalog_digest": "sha256:" + "b" * 64,
+        "repository": "ready",
+        "principal": "ready",
+        "authority": "ready",
+        "state": "ready",
+        "pilot": "ready",
+        "reason_codes": [],
+        "mutation_performed": False,
+        "raw_output": "not_returned",
+    }
+    healthy = {
+        "namespace-status": ({"ok": True, "namespace_ready": True}, True),
+        "plugin-status": ({"ok": True}, True),
+        "hive status": (runtime, True),
+        "hive doctor": (
+            {"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}},
+            True,
+        ),
+    }
+    run_probe(
+        repository=repository,
+        command=command,
+        state_directory=state_directory,
+        now=lambda: datetime.now(UTC),
+        runner=lambda _command, *arguments: healthy[" ".join(arguments)],
     )
-    monkeypatch.setattr(server, "hive_capacity_probe_guard", lambda _operation: nullcontext())
+    monkeypatch.setenv("CODEX_MASTER_MCP_STATE", str(state_directory))
+    monkeypatch.delenv("CODEX_AGENT_MCP_STATE", raising=False)
 
 
 def test_v1_series_apply_remains_compatible_with_dual_schema_reader() -> None:
@@ -386,19 +419,40 @@ CRASH_POINTS = (
 
 
 _FRESH_RECOVERY_CHILD = r'''
-from contextlib import nullcontext
+from datetime import UTC, datetime
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
 from codex_master import server
+from codex_master.hive.hourly_probe import run_probe
 
 mode, root_text, executable_text, crash_point = sys.argv[1:]
 root = Path(root_text)
 executable = Path(executable_text)
 state_root = root / "state"
 pool_root = root / "pool"
+probe_state = root / "probe-state"
+runtime = {
+    "schema_version": 1, "mode": "enforced", "counts": {"principals": 0, "repositories": 0},
+    "checks": {"authority": "ready", "repository": "ready", "state": "ready"},
+    "config_digest": "sha256:" + "a" * 64, "catalog_digest": "sha256:" + "b" * 64,
+    "repository": "ready", "principal": "ready", "authority": "ready", "state": "ready", "pilot": "ready",
+    "reason_codes": [], "mutation_performed": False, "raw_output": "not_returned",
+}
+healthy = {
+    "namespace-status": ({"ok": True, "namespace_ready": True}, True),
+    "plugin-status": ({"ok": True}, True),
+    "hive status": (runtime, True),
+    "hive doctor": ({"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}}, True),
+}
+run_probe(
+    repository=root / "probe-repository", command=executable, state_directory=probe_state,
+    now=lambda: datetime.now(UTC), runner=lambda _command, *arguments: healthy[" ".join(arguments)],
+)
+os.environ["CODEX_MASTER_MCP_STATE"] = str(probe_state)
 
 with patch.object(server, "STATE_ROOT", state_root), patch.object(
     server, "AGENT_POOL_ROOT", pool_root
@@ -420,13 +474,7 @@ with patch.object(server, "STATE_ROOT", state_root), patch.object(
         nonlocal_fired = [False]
         raised = [False]
         try:
-            with patch.object(
-                server, "require_fleet_recovery_ready", return_value=None
-            ), patch.object(
-                server, "require_resource_capacity_preflight", return_value=None
-            ), patch.object(
-                server, "hive_capacity_probe_guard", side_effect=lambda _operation: nullcontext()
-            ), patch.object(server, "_fleet_recovery_crash_point", side_effect=crash_hook):
+            with patch.object(server, "_fleet_recovery_crash_point", side_effect=crash_hook):
                 server.fleet_series_apply(
                     prefix="d", count=2 if crash_point == "between_reconciliation_actions" else 1,
                     runner="codex_cli", provider="ollama_local", model="model",

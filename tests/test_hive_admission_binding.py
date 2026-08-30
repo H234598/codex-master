@@ -229,14 +229,14 @@ def test_server_hive_assignment_bridge_binds_plan_before_selection_execution(
         budget_key="standard",
         expected_usage_micro=1,
         priority=AdmissionPriority("DP1", "selection"),
-        operations={"assign": lambda *_args: {"status": "executed"}},
-        operation="assign",
+        operations={"hive_assignment_callback": lambda *_args: {"status": "executed"}},
+        operation="hive_assignment_callback",
         now=lambda: NOW,
     )
 
     record = captured["record"]
     assert result == {"status": "planned", "admission_id": "bridge-admission"}
-    assert captured["operation"] == "assign"
+    assert captured["operation"] == "hive_assignment_callback"
     assert record.state is AdmissionState.PLANNED
     assert record.grant_digest == grant.binding_digest()
     assert callable(captured["execute"])

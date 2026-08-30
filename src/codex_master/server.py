@@ -758,7 +758,24 @@ RESOURCE_CAPACITY_PREFLIGHT_OPERATIONS = frozenset(
         "agent_assign",
         "fleet_series_apply",
         "emergency_queen_start",
-        "hive_assignment",
+    }
+)
+HIVE_ASSIGNMENT_CAPACITY_SINKS = frozenset(
+    {
+        "hive_assignment_reservation",
+        "hive_assignment_provider",
+        "hive_assignment_process_start",
+        "hive_assignment_home_create",
+        "hive_assignment_callback",
+    }
+)
+QUEEN_ASSIGNMENT_CAPACITY_SINKS = frozenset(
+    {
+        "queen_assignment_teamlead",
+        "queen_assignment_specialist",
+        "queen_assignment_grant",
+        "queen_assignment_admission",
+        "queen_assignment_assignment",
     }
 )
 POOL_DEFAULT_CODEX_BIN = "${CODEX_AGENT_BIN:-/usr/local/bin/codex}"
@@ -15782,7 +15799,6 @@ def ensure_emergency_queen(*, dry_run: bool = False) -> dict[str, Any] | None:
                 "state": state,
                 "raw_output": "not_returned",
             }
-        require_resource_capacity_preflight(operation="emergency_queen_start")
         blocked = set_emergency_queen_blocked(
             int(state["generation"]),
             "queen_spawn_unavailable:hive_queen_runtime_not_materialized",
@@ -38668,9 +38684,10 @@ def build_server_lease_executor(
 
     The returned callback is intentionally inert until a caller supplies it to
     ``ServerAdmissionRuntime``.  It never claims, releases, starts, or sends by
-    itself.  Each named operation receives the fresh private lease snapshot and
-    is responsible for calling one existing low-level operation with that
-    snapshot.  ``ServerAdmissionRuntime.execute`` remains the required outer
+    itself.  Each named operation identifies one capacity-creating sink and
+    receives the fresh private lease snapshot.  The fixed order is agent
+    mutation lock, shared probe-publication lock, canonical recheck, then the
+    callback. ``ServerAdmissionRuntime.execute`` remains the required outer
     boundary, so successful revalidation is consumed before this callback runs.
     """
 
@@ -38682,8 +38699,7 @@ def build_server_lease_executor(
     for operation, callback in operations.items():
         if (
             not isinstance(operation, str)
-            or not 1 <= len(operation) <= 128
-            or any(ord(char) < 32 for char in operation)
+            or operation not in HIVE_ASSIGNMENT_CAPACITY_SINKS
             or not callable(callback)
         ):
             raise AgentError("invalid_lease_operation")
@@ -38701,8 +38717,7 @@ def build_server_lease_executor(
             raise AgentError("invalid_admission_state")
         if (
             not isinstance(operation, str)
-            or not 1 <= len(operation) <= 128
-            or any(ord(char) < 32 for char in operation)
+            or operation not in HIVE_ASSIGNMENT_CAPACITY_SINKS
         ):
             raise AgentError("invalid_lease_operation")
         callback = normalized.get(operation)
@@ -38716,7 +38731,11 @@ def build_server_lease_executor(
             admission, lease
         ):
             raise AgentError("lease_executor_conflict")
-        result = callback(admission, MappingProxyType(dict(lease)))
+        # The bridge entry deliberately stays ungated: planning, shadow,
+        # reconciliation, compensation, and teardown are safe under red.
+        with agent_lifecycle_lock(admission.resource.agent_id):
+            with hive_capacity_probe_guard(operation):
+                result = callback(admission, MappingProxyType(dict(lease)))
         if not isinstance(result, Mapping):
             raise AgentError("lease_operation_result_invalid")
         return dict(result)
@@ -38983,7 +39002,7 @@ def execute_server_hive_assignment(
     operations: Mapping[
         str, Callable[[AdmissionRecord, Mapping[str, Any]], Mapping[str, object]]
     ],
-    operation: str = "assign",
+    operation: str = "hive_assignment_callback",
     state_path: Path | None = None,
     lock_path: Path | None = None,
     completion_journal: CompletionJournal | None = None,
@@ -39002,7 +39021,6 @@ def execute_server_hive_assignment(
     or lifecycle mutation.
     """
 
-    require_resource_capacity_preflight(operation="hive_assignment")
     if now is not None and not callable(now):
         raise AgentError("invalid_admission_clock")
     if not isinstance(admission_id, str) or not admission_id:
@@ -39093,6 +39111,26 @@ def build_server_queen_assignment_context(
     )
 
 
+def _execute_server_queen_assignment_capacity_sink(
+    step: str,
+    callback: Callable[[QueenAssignmentPlan], object],
+    plan: QueenAssignmentPlan,
+) -> object:
+    """Run one named Queen forward sink after its mutation/probe locks.
+
+    Planning and saga compensation never call this adapter.  Each forward
+    callback reacquires the mutation lock and probe lock so a fresh red record
+    blocks the next capacity sink even when the prior step observed green.
+    """
+
+    operation = f"queen_assignment_{step}"
+    if operation not in QUEEN_ASSIGNMENT_CAPACITY_SINKS or not callable(callback):
+        raise AgentError("invalid_queen_assignment_capacity_sink")
+    with agent_lifecycle_lock(plan.agent_id):
+        with hive_capacity_probe_guard(operation):
+            return callback(plan)
+
+
 def execute_server_queen_assignment(
     *,
     queen_id: str,
@@ -39103,7 +39141,6 @@ def execute_server_queen_assignment(
 ) -> Mapping[str, object]:
     """Run the shared Queen planner through the closed server-side adapter."""
 
-    require_resource_capacity_preflight(operation="hive_assignment")
     if event_store is not None and not isinstance(event_store, HiveEventStore):
         raise AgentError("invalid_hive_event_store")
     plan = plan_queen_assignment(
@@ -39120,7 +39157,13 @@ def execute_server_queen_assignment(
             )
         except HiveEventError as exc:
             raise AgentError("hive_event_persistence_failed") from exc
-    result = dict(execute_queen_assignment(plan, context))
+    result = dict(
+        execute_queen_assignment(
+            plan,
+            context,
+            step_executor=_execute_server_queen_assignment_capacity_sink,
+        )
+    )
     if event_store is None:
         return result
     reason_code = result.get("reason_code")

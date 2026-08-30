@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import runpy
 from datetime import UTC, datetime
-import os
 from pathlib import Path
 import stat
 import subprocess
 import threading
+
+import pytest
 
 from codex_master.hive import hourly_probe as hourly_probe_module
 from codex_master.hive.hourly_probe import (
@@ -234,11 +236,19 @@ def test_tracked_probe_source_and_timer_contract_are_installable() -> None:
     service_text = service.read_text(encoding="utf-8")
     assert "OnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00" in timer_text
     assert "RandomizedDelaySec" not in timer_text
-    assert "Environment=CODEX_MASTER_PROBE_REPOSITORY=%h/.local" in service_text
+    assert "CODEX_MASTER_PROBE_REPOSITORY" not in service_text
+    assert "%h/codex-master/src" not in service_text
+    assert "%h/codex-master/bin/codex-master-mcp" not in service_text
+    assert "%h/codex-master/codex-agent-classes.json" not in service_text
+    assert "%h/codex-master/codex-hive.json" not in service_text
     assert (
         "BindReadOnlyPaths=%h/.local/libexec/"
         "codex_master_hive_hourly_probe.py:%h/.local/libexec/"
         "codex_master_hive_hourly_probe.py:norbind"
+    ) in service_text
+    assert (
+        "%h/.local/lib/codex-master-hive-probe:%h/.local/lib/"
+        "codex-master-hive-probe:norbind"
     ) in service_text
     assert "BindPaths=%h/.local/state/codex-master-mcp:%h/.local/state/codex-master-mcp:norbind" in service_text
     assert "ExecStart=%h/.local/libexec/codex_master_hive_hourly_probe.py --json" in service_text
@@ -263,27 +273,11 @@ def test_hourly_probe_direct_entrypoint_requires_json_mode(
     assert capsys.readouterr().out == ""
 
 
-def test_probe_deploy_installs_a_real_executable_host_entrypoint(tmp_path: Path) -> None:
+def test_probe_cold_installer_materializes_an_autonomous_regular_host_tree(
+    tmp_path: Path,
+) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
-    repository = tmp_path / "probe-repository"
-    (repository / "bin").mkdir(parents=True)
-    (repository / "src").symlink_to(ROOT / "src", target_is_directory=True)
-    command = repository / "bin" / "codex-master-mcp"
-    command.write_text(
-        """#!/bin/sh
-case \"$*\" in
-  namespace-status) printf '%s\\n' '{\"ok\":true,\"namespace_ready\":true}' ;;
-  plugin-status) printf '%s\\n' '{\"ok\":true}' ;;
-  'hive status') printf '%s\\n' '{\"schema_version\":1,\"mode\":\"enforced\",\"counts\":{\"principals\":0,\"repositories\":0},\"checks\":{\"authority\":\"ready\",\"repository\":\"ready\",\"state\":\"ready\"},\"config_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"catalog_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"repository\":\"ready\",\"principal\":\"ready\",\"authority\":\"ready\",\"state\":\"ready\",\"pilot\":\"ready\",\"reason_codes\":[],\"mutation_performed\":false,\"raw_output\":\"not_returned\"}' ;;
-  'hive doctor') printf '%s\\n' '{\"healthy\":true,\"checks\":{\"authority\":\"ready\",\"repository\":\"ready\",\"state\":\"ready\"}}' ;;
-  *) exit 64 ;;
-esac
-""",
-        encoding="utf-8",
-    )
-    command.chmod(0o755)
-
     installed = subprocess.run(
         [ROOT / "scripts" / "codex-master-hive-hourly-probe-install", "--home", home],
         check=False,
@@ -300,10 +294,24 @@ esac
     assert stat.S_IMODE(
         (home / ".config" / "systemd" / "user" / "codex-master-hive-hourly-probe.service").stat().st_mode
     ) == 0o644
+    install_root = home / ".local" / "lib" / "codex-master-hive-probe"
+    installed_cli = install_root / "bin" / "codex-master-mcp"
+    installed_source = install_root / "src" / "codex_master" / "hive" / "hourly_probe.py"
+    for path, mode in (
+        (installed_cli, 0o755),
+        (installed_source, 0o644),
+        (install_root / "codex-hive.json", 0o644),
+        (install_root / "codex-agent-classes.json", 0o644),
+    ):
+        item = path.lstat()
+        assert stat.S_ISREG(item.st_mode)
+        assert not path.is_symlink()
+        assert stat.S_IMODE(item.st_mode) == mode
+    assert not any(path.is_symlink() for path in install_root.rglob("*"))
 
     environment = {
-        **os.environ,
-        "CODEX_MASTER_PROBE_REPOSITORY": str(repository),
+        "HOME": str(home),
+        "PATH": "/usr/bin:/bin",
         "CODEX_MASTER_MCP_STATE": str(home / ".local" / "state" / "codex-master-mcp"),
     }
     completed = subprocess.run(
@@ -312,9 +320,36 @@ esac
         capture_output=True,
         text=True,
         env=environment,
+        cwd=tmp_path,
     )
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout)["functional"] is True
+    assert completed.returncode in {0, 1}, completed.stderr
+    assert set(json.loads(completed.stdout)) == {"alarm", "checks", "functional"}
+    health = home / ".local" / "state" / "codex-master-mcp" / "hive-hourly-health.json"
+    health_stat = health.lstat()
+    assert stat.S_ISREG(health_stat.st_mode)
+    assert not health.is_symlink()
+    assert stat.S_IMODE(health_stat.st_mode) == 0o600
+
+
+def test_installer_source_reader_is_no_follow_descriptor_bounded(tmp_path: Path) -> None:
+    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
+    source_bytes = installer["_source_bytes"]
+    install_error = installer["InstallError"]
+    regular = tmp_path / "regular.py"
+    regular.write_text("x = 1\n", encoding="utf-8")
+    linked = tmp_path / "linked.py"
+    linked.symlink_to(regular)
+    oversized = tmp_path / "oversized.py"
+    oversized.write_bytes(b"x" * (installer["_MAX_SOURCE_BYTES"] + 1))
+
+    assert source_bytes(regular) == b"x = 1\n"
+    with pytest.raises(install_error, match="install_source_untrusted"):
+        source_bytes(linked)
+    with pytest.raises(install_error, match="install_source_untrusted"):
+        source_bytes(oversized)
+    assert ".read_bytes(" not in (ROOT / "scripts" / "codex-master-hive-hourly-probe-install").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_probe_capacity_guard_serializes_the_health_record_publication(
@@ -367,3 +402,37 @@ def test_probe_capacity_guard_serializes_the_health_record_publication(
     writer.join(timeout=1)
     assert writer_finished.is_set()
     assert read_probe_gate(state_file=state_file, now=NOW)["reason_code"] == "probe_red"
+
+
+@pytest.mark.parametrize("error_type", (OSError, ValueError))
+def test_probe_capacity_guard_preserves_body_exceptions(
+    tmp_path: Path, error_type: type[Exception]
+) -> None:
+    state_directory = tmp_path / "state"
+    command = tmp_path / "repository" / "bin" / "codex-master-mcp"
+    command.parent.mkdir(parents=True)
+    healthy = {
+        "namespace-status": ({"ok": True, "namespace_ready": True}, True),
+        "plugin-status": ({"ok": True}, True),
+        "hive status": (green_hive_runtime(), True),
+        "hive doctor": (
+            {"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}},
+            True,
+        ),
+    }
+    run_probe(
+        repository=tmp_path / "repository",
+        command=command,
+        state_directory=state_directory,
+        now=lambda: NOW,
+        runner=lambda _command, *arguments: healthy[" ".join(arguments)],
+    )
+    error = error_type("body failure")
+
+    with pytest.raises(error_type) as raised:
+        with hourly_probe_module.probe_capacity_guard(
+            state_file=state_directory / "hive-hourly-health.json", now=NOW
+        ):
+            raise error
+
+    assert raised.value is error

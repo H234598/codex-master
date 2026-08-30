@@ -383,7 +383,9 @@ def test_queen_assignment_enforced_runs_in_order_and_compensates_reverse_order()
         lambda _plan: events.append("assignment") or {"status": "accepted"},
         lambda name, _plan, _result: events.append(f"compensate:{name}"),
     )
-    result = execute_queen_assignment(queen_plan("enforced"), context)
+    result = execute_queen_assignment(
+        queen_plan("enforced"), context, step_executor=lambda _name, callback, plan: callback(plan)
+    )
     assert result["allowed"] is True
     assert events == ["teamlead", "specialist", "grant", "admission", "assignment"]
 
@@ -393,7 +395,9 @@ def test_queen_assignment_enforced_runs_in_order_and_compensates_reverse_order()
         context.create_teamlead_principal, context.create_specialist_principal, context.issue_grant,
         context.reserve_admission, lambda _plan: (_ for _ in ()).throw(RuntimeError("assignment")), context.compensate,
     )
-    failed = execute_queen_assignment(queen_plan("enforced"), failing)
+    failed = execute_queen_assignment(
+        queen_plan("enforced"), failing, step_executor=lambda _name, callback, plan: callback(plan)
+    )
     assert failed["reason_code"] == "assignment_transaction_failed"
     assert events[-5:] == [
         "compensate:assignment", "compensate:admission", "compensate:grant",

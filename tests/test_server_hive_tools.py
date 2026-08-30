@@ -117,9 +117,7 @@ def test_spawn_entrypoints_check_hive_probe_before_reservation_or_lease(monkeypa
     monkeypatch.setattr(
         server,
         "set_emergency_queen_blocked",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("emergency queen state changed after a red probe")
-        ),
+        lambda *_args, **_kwargs: {"state": "blocked"},
     )
 
     def blocked_recovery_gate(operation: str) -> None:
@@ -158,27 +156,7 @@ def test_spawn_entrypoints_check_hive_probe_before_reservation_or_lease(monkeypa
                 "session_id": "parent",
             }
         )
-    with pytest.raises(server.AgentError, match="hive_spawn_probe_blocked"):
-        server.ensure_emergency_queen()
-    with pytest.raises(server.AgentError, match="hive_spawn_probe_blocked"):
-        server.execute_server_queen_assignment(
-            queen_id="queen-codex-master", dispatch_id="dispatch-one", workpackage={}
-        )
-    with pytest.raises(server.AgentError, match="hive_spawn_probe_blocked"):
-        server.execute_server_hive_assignment(
-            plan=None,
-            workpackage=None,
-            intent=None,
-            grant=None,
-            authority_engine=None,
-            repository_registry=None,
-            admission_id="admission-one",
-            lease_context=None,
-            budget_key="budget-one",
-            expected_usage_micro=0,
-            priority=None,
-            operations={},
-        )
+    assert server.ensure_emergency_queen()["status"] == "blocked"
     mcp_start_result = server.call_tool("agent_start", {"agent": "a1"})
     assert mcp_start_result["results"][0]["error"] == "hive_spawn_probe_blocked"
     with pytest.raises(server.AgentError, match="hive_spawn_probe_blocked"):
@@ -195,9 +173,6 @@ def test_spawn_entrypoints_check_hive_probe_before_reservation_or_lease(monkeypa
         "managed_replacement",
         "headless_assignment",
         "native_spawn",
-        "emergency_queen_start",
-        "hive_assignment",
-        "hive_assignment",
         "agent_start",
         "agent_assign",
     ]
@@ -249,7 +224,7 @@ def test_red_probe_blocks_new_hive_side_effects_before_locks_or_services(
     assert lifecycle_lock_attempts == []
 
 
-def test_red_probe_allows_account_probe_configuration_and_skill_sync(
+def test_red_probe_allows_account_limit_auth_secret_configuration_and_skill_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Resource evidence is not an administrative or diagnostic lockout."""
@@ -258,6 +233,9 @@ def test_red_probe_allows_account_probe_configuration_and_skill_sync(
         pass
 
     class AccountConfigurationReached(RuntimeError):
+        pass
+
+    class AccountSecretReached(RuntimeError):
         pass
 
     class SkillSyncReached(RuntimeError):
@@ -272,6 +250,11 @@ def test_red_probe_allows_account_probe_configuration_and_skill_sync(
         @staticmethod
         def load() -> None:
             raise AccountConfigurationReached()
+
+    class AccountSecretService:
+        @staticmethod
+        def set_secret(*_args: object, **_kwargs: object) -> None:
+            raise AccountSecretReached()
 
     class SkillSyncService:
         @staticmethod
@@ -311,6 +294,12 @@ def test_red_probe_allows_account_probe_configuration_and_skill_sync(
             auth_kind="none",
             enabled=True,
             expected_generation=1,
+        )
+
+    monkeypatch.setattr(server, "current_fleet_service", AccountSecretService)
+    with pytest.raises(AccountSecretReached):
+        server.fleet_account_set_secret(
+            account_id="account-one", secret="test-only", expected_generation=1
         )
 
     monkeypatch.setattr(server, "current_fleet_service", SkillSyncService)
@@ -1405,7 +1394,8 @@ def queen_workpackage(mode: str = "enforced") -> dict[str, object]:
 
 
 def test_server_queen_adapter_is_closed_without_context_and_not_an_mcp_tool() -> None:
-    with patch.object(server, "require_hive_probe_for_spawn", return_value=GREEN_HIVE_PROBE):
+    with patch.object(server, "agent_lifecycle_lock", return_value=contextlib.nullcontext()), \
+         patch.object(server, "hive_capacity_probe_guard", return_value=contextlib.nullcontext()):
         result = server.execute_server_queen_assignment(
             queen_id="queen-codex-master", dispatch_id="dispatch-one", workpackage=queen_workpackage()
         )
@@ -1424,7 +1414,8 @@ def test_server_queen_adapter_accepts_only_explicit_injected_callbacks() -> None
         execute_assignment=lambda _plan: events.append("assignment") or {"status": "accepted"},
         compensate=lambda *_args: events.append("compensate"),
     )
-    with patch.object(server, "require_hive_probe_for_spawn", return_value=GREEN_HIVE_PROBE):
+    with patch.object(server, "agent_lifecycle_lock", return_value=contextlib.nullcontext()), \
+         patch.object(server, "hive_capacity_probe_guard", return_value=contextlib.nullcontext()):
         result = server.execute_server_queen_assignment(
             queen_id="queen-codex-master", dispatch_id="dispatch-one", workpackage=queen_workpackage(), context=context
         )
@@ -1435,6 +1426,48 @@ def test_server_queen_adapter_accepts_only_explicit_injected_callbacks() -> None
                 queen_id="queen-codex-master", dispatch_id="dispatch-one",
                 workpackage={**queen_workpackage(), "repo_id": "foreign-repo"}, context=context,
             )
+
+
+def test_server_queen_bridge_rechecks_each_forward_sink_after_mutation_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks: list[str] = []
+    compensated: list[str] = []
+    probe_is_green = {"value": True}
+
+    @contextlib.contextmanager
+    def mutation_lock(_agent: str):
+        probe_is_green["value"] = False
+        yield
+
+    context = server.build_server_queen_assignment_context(
+        confirmed_accounts={"sha256:" + "a" * 64}, primary_models={"gpt-primary"},
+        create_teamlead_principal=lambda _plan: callbacks.append("teamlead"),
+        create_specialist_principal=lambda _plan: callbacks.append("specialist"),
+        issue_grant=lambda _plan: callbacks.append("grant"),
+        reserve_admission=lambda _plan: callbacks.append("admission"),
+        execute_assignment=lambda _plan: callbacks.append("assignment") or {"status": "unexpected"},
+        compensate=lambda name, *_args: compensated.append(name),
+    )
+    monkeypatch.setattr(server, "agent_lifecycle_lock", mutation_lock)
+    monkeypatch.setattr(server, "probe_capacity_lock", contextlib.nullcontext)
+    monkeypatch.setattr(
+        server,
+        "read_probe_gate",
+        lambda: {
+            "allowed": probe_is_green["value"],
+            "reason_code": "probe_ready" if probe_is_green["value"] else "probe_red",
+            "raw_output": "not_returned",
+        },
+    )
+
+    result = server.execute_server_queen_assignment(
+        queen_id="queen-codex-master", dispatch_id="dispatch-one", workpackage=queen_workpackage(), context=context
+    )
+
+    assert result["reason_code"] == "assignment_transaction_failed"
+    assert callbacks == []
+    assert compensated == ["teamlead"]
 
 
 def test_server_queen_adapter_persists_queue_and_completion_events(tmp_path) -> None:
@@ -1449,7 +1482,8 @@ def test_server_queen_adapter_persists_queue_and_completion_events(tmp_path) -> 
         compensate=lambda *_args: None,
     )
 
-    with patch.object(server, "require_hive_probe_for_spawn", return_value=GREEN_HIVE_PROBE):
+    with patch.object(server, "agent_lifecycle_lock", return_value=contextlib.nullcontext()), \
+         patch.object(server, "hive_capacity_probe_guard", return_value=contextlib.nullcontext()):
         result = server.execute_server_queen_assignment(
             queen_id="queen-codex-master",
             dispatch_id="dispatch-one",

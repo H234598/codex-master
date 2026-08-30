@@ -1,5 +1,9 @@
 from datetime import datetime, timezone
 from dataclasses import replace
+import contextlib
+import fcntl
+from pathlib import Path
+import threading
 
 import pytest
 
@@ -19,11 +23,56 @@ from codex_master.admission_runtime import (
     RuntimeGateDecision,
     ServerAdmissionRuntime,
 )
+from codex_master import server
+from codex_master.hive.hourly_probe import PROBE_GATE_LOCK_NAME, run_probe
 from codex_master.server import AgentError, build_server_admission_runtime, build_server_lease_executor, build_server_selection_service
 from codex_master.selection_service import SelectionDeniedError, SelectionService
 
 
 NOW = datetime.now(timezone.utc)
+
+
+def materialize_green_probe_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    state_directory = tmp_path / "probe-state"
+    command = tmp_path / "probe-repository" / "bin" / "codex-master-mcp"
+    command.parent.mkdir(parents=True)
+    runtime = {
+        "schema_version": 1,
+        "mode": "enforced",
+        "counts": {"principals": 0, "repositories": 0},
+        "checks": {"authority": "ready", "repository": "ready", "state": "ready"},
+        "config_digest": "sha256:" + "a" * 64,
+        "catalog_digest": "sha256:" + "b" * 64,
+        "repository": "ready",
+        "principal": "ready",
+        "authority": "ready",
+        "state": "ready",
+        "pilot": "ready",
+        "reason_codes": [],
+        "mutation_performed": False,
+        "raw_output": "not_returned",
+    }
+    checks = {
+        "namespace-status": ({"ok": True, "namespace_ready": True}, True),
+        "plugin-status": ({"ok": True}, True),
+        "hive status": (runtime, True),
+        "hive doctor": (
+            {"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}},
+            True,
+        ),
+    }
+    run_probe(
+        repository=tmp_path / "probe-repository",
+        command=command,
+        state_directory=state_directory,
+        now=lambda: NOW,
+        runner=lambda _command, *arguments: checks[" ".join(arguments)],
+    )
+    monkeypatch.setenv("CODEX_MASTER_MCP_STATE", str(state_directory))
+    monkeypatch.delenv("CODEX_AGENT_MCP_STATE", raising=False)
+    return state_directory
 
 
 def admission() -> object:
@@ -162,48 +211,196 @@ def test_runtime_revalidation_is_single_use_and_executor_is_required() -> None:
         runtime.execute(executing, "start")
 
 
-def test_server_lease_executor_rechecks_binding_and_routes_only_named_operations() -> None:
+def test_server_lease_executor_rechecks_binding_and_routes_only_named_operations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     seen: list[tuple[str, dict[str, object]]] = []
     lease = {"state": "unclaimed", "held_by_this_server": False, "lease_id": None}
     executor = build_server_lease_executor(
         operations={
-            "assign": lambda record, current: seen.append((record.admission_id, dict(current))) or {"status": "ok"},
+            "hive_assignment_callback": lambda record, current: seen.append((record.admission_id, dict(current))) or {"status": "ok"},
         },
         lease_reader=lambda _agent: lease,
     )
+    monkeypatch.setattr(server, "agent_lifecycle_lock", lambda *_args: contextlib.nullcontext())
+    monkeypatch.setattr(server, "hive_capacity_probe_guard", lambda _operation: contextlib.nullcontext())
 
-    result = executor(executing_record(), "assign")
+    result = executor(executing_record(), "hive_assignment_callback")
 
     assert result == {"status": "ok"}
     assert seen == [("adm-runtime", lease)]
     with pytest.raises(AgentError, match="lease_operation_not_allowed"):
-        executor(executing_record(), "start")
+        executor(executing_record(), "hive_assignment_process_start")
 
 
-def test_server_lease_executor_composes_with_runtime_revalidation() -> None:
+def test_server_lease_executor_composes_with_runtime_revalidation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     executor = build_server_lease_executor(
-        operations={"assign": lambda _record, lease: {"lease_state": lease["state"]}},
+        operations={"hive_assignment_callback": lambda _record, lease: {"lease_state": lease["state"]}},
         lease_reader=lambda _agent: {"state": "unclaimed", "held_by_this_server": False, "lease_id": None},
     )
+    monkeypatch.setattr(server, "agent_lifecycle_lock", lambda *_args: contextlib.nullcontext())
+    monkeypatch.setattr(server, "hive_capacity_probe_guard", lambda _operation: contextlib.nullcontext())
     runtime = ServerAdmissionRuntime(allow_all([]), execute=executor, now=lambda: NOW)
     assert runtime.revalidate(revalidating_record()) is True
 
-    assert runtime.execute(executing_record(), "assign") == {"lease_state": "unclaimed"}
+    assert runtime.execute(executing_record(), "hive_assignment_callback") == {"lease_state": "unclaimed"}
+
+
+def test_server_lease_executor_rechecks_after_its_mutation_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+    probe_is_green = {"value": True}
+
+    @contextlib.contextmanager
+    def mutation_lock(_agent: str):
+        seen.append("mutation-lock")
+        probe_is_green["value"] = False
+        yield
+
+    monkeypatch.setattr(server, "agent_lifecycle_lock", mutation_lock)
+    monkeypatch.setattr(server, "probe_capacity_lock", contextlib.nullcontext)
+    monkeypatch.setattr(
+        server,
+        "read_probe_gate",
+        lambda: {
+            "allowed": probe_is_green["value"],
+            "reason_code": "probe_ready" if probe_is_green["value"] else "probe_red",
+            "raw_output": "not_returned",
+        },
+    )
+    executor = build_server_lease_executor(
+        operations={
+            "hive_assignment_callback": lambda *_args: seen.append("callback") or {"status": "unexpected"}
+        },
+        lease_reader=lambda _agent: {"state": "unclaimed", "held_by_this_server": False, "lease_id": None},
+    )
+
+    with pytest.raises(AgentError, match="hive_spawn_probe_blocked"):
+        executor(executing_record(), "hive_assignment_callback")
+
+    assert seen == ["mutation-lock"]
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "allowed"),
+    (
+        ("probe_ready", True),
+        ("probe_missing", False),
+        ("probe_invalid", False),
+        ("probe_stale", False),
+        ("probe_red", False),
+        ("shadow", False),
+        ("disabled", False),
+    ),
+)
+def test_named_hive_assignment_capacity_sink_accepts_only_fresh_green_at_callback(
+    monkeypatch: pytest.MonkeyPatch, reason_code: str, allowed: bool
+) -> None:
+    callback_calls: list[str] = []
+    monkeypatch.setattr(server, "agent_lifecycle_lock", lambda *_args: contextlib.nullcontext())
+    monkeypatch.setattr(server, "probe_capacity_lock", contextlib.nullcontext)
+    monkeypatch.setattr(
+        server,
+        "read_probe_gate",
+        lambda: {
+            "allowed": allowed,
+            "reason_code": reason_code,
+            "raw_output": "not_returned",
+        },
+    )
+    executor = build_server_lease_executor(
+        operations={
+            "hive_assignment_process_start": lambda *_args: callback_calls.append("process-start")
+            or {"status": "started"}
+        },
+        lease_reader=lambda _agent: {"state": "unclaimed", "held_by_this_server": False, "lease_id": None},
+    )
+
+    if allowed:
+        assert executor(executing_record(), "hive_assignment_process_start") == {"status": "started"}
+    else:
+        with pytest.raises(AgentError, match="hive_spawn_probe_blocked"):
+            executor(executing_record(), "hive_assignment_process_start")
+
+    assert callback_calls == (["process-start"] if allowed else [])
+
+
+@pytest.mark.parametrize("operation", sorted(server.HIVE_ASSIGNMENT_CAPACITY_SINKS))
+def test_each_hive_assignment_capacity_sink_waits_for_the_real_shared_probe_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: str
+) -> None:
+    state_directory = materialize_green_probe_record(tmp_path, monkeypatch)
+    callback_called = threading.Event()
+    completed = threading.Event()
+    monkeypatch.setattr(server, "agent_lifecycle_lock", lambda *_args: contextlib.nullcontext())
+    executor = build_server_lease_executor(
+        operations={operation: lambda *_args: callback_called.set() or {"status": "started"}},
+        lease_reader=lambda _agent: {"state": "unclaimed", "held_by_this_server": False, "lease_id": None},
+    )
+
+    def execute_sink() -> None:
+        assert executor(executing_record(), operation) == {"status": "started"}
+        completed.set()
+
+    with (state_directory / PROBE_GATE_LOCK_NAME).open("rb") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        worker = threading.Thread(target=execute_sink)
+        worker.start()
+        worker.join(timeout=0.1)
+        assert worker.is_alive()
+        assert not callback_called.is_set()
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    worker.join(timeout=1)
+    assert completed.is_set()
+    assert callback_called.is_set()
+
+
+@pytest.mark.parametrize("operation", sorted(server.QUEEN_ASSIGNMENT_CAPACITY_SINKS))
+def test_each_queen_capacity_sink_waits_for_the_real_shared_probe_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: str
+) -> None:
+    state_directory = materialize_green_probe_record(tmp_path, monkeypatch)
+    callback_called = threading.Event()
+    completed = threading.Event()
+    step = operation.removeprefix("queen_assignment_")
+    monkeypatch.setattr(server, "agent_lifecycle_lock", lambda *_args: contextlib.nullcontext())
+
+    def execute_sink() -> None:
+        plan = type("Plan", (), {"agent_id": "a1"})()
+        assert server._execute_server_queen_assignment_capacity_sink(
+            step, lambda _plan: callback_called.set() or {"status": "started"}, plan
+        ) == {"status": "started"}
+        completed.set()
+
+    with (state_directory / PROBE_GATE_LOCK_NAME).open("rb") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        worker = threading.Thread(target=execute_sink)
+        worker.start()
+        worker.join(timeout=0.1)
+        assert worker.is_alive()
+        assert not callback_called.is_set()
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    worker.join(timeout=1)
+    assert completed.is_set()
+    assert callback_called.is_set()
 
 
 def test_server_lease_executor_rejects_changed_or_non_executing_binding() -> None:
     lease = {"state": "unclaimed", "held_by_this_server": False, "lease_id": None}
     called: list[bool] = []
     executor = build_server_lease_executor(
-        operations={"assign": lambda *_args: called.append(True) or {"status": "ok"}},
+        operations={"hive_assignment_callback": lambda *_args: called.append(True) or {"status": "ok"}},
         lease_reader=lambda _agent: lease,
     )
     lease["state"] = "held"
 
     with pytest.raises(AgentError, match="lease_executor_conflict"):
-        executor(executing_record(), "assign")
+        executor(executing_record(), "hive_assignment_callback")
     with pytest.raises(AgentError, match="invalid_admission_state"):
-        executor(revalidating_record(), "assign")
+        executor(revalidating_record(), "hive_assignment_callback")
     assert called == []
 
 
@@ -212,12 +409,12 @@ def test_server_lease_executor_pins_a_claimed_lease_id() -> None:
     record = replace(record, lease_context=LeaseBinding("claimed", "lease-expected"))
     lease = {"state": "held", "held_by_this_server": True, "lease_id": "lease-other"}
     executor = build_server_lease_executor(
-        operations={"assign": lambda *_args: {"status": "must-not-run"}},
+        operations={"hive_assignment_callback": lambda *_args: {"status": "must-not-run"}},
         lease_reader=lambda _agent: lease,
     )
 
     with pytest.raises(AgentError, match="lease_executor_conflict"):
-        executor(record, "assign")
+        executor(record, "hive_assignment_callback")
 
 
 def test_runtime_gate_exception_and_unknown_completion_fail_closed() -> None:

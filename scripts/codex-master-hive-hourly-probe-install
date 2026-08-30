@@ -12,6 +12,8 @@ import tempfile
 
 
 _ENTRYPOINT_NAME = "codex_master_hive_hourly_probe.py"
+_INSTALL_ROOT_NAME = "codex-master-hive-probe"
+_MAX_SOURCE_BYTES = 2 * 1024 * 1024
 _UNIT_NAMES = (
     "codex-master-hive-hourly-probe.service",
     "codex-master-hive-hourly-probe.timer",
@@ -54,18 +56,96 @@ def _child_directory(home: Path, parts: tuple[str, ...], *, mode: int) -> Path:
 
 
 def _source_bytes(path: Path) -> bytes:
+    """Read one immutable regular source through a no-follow descriptor.
+
+    The source tree is untrusted at the filesystem boundary: validate the
+    descriptor identity before and after the bounded read so a replaced path
+    cannot become an installer input between ``lstat`` and consumption.
+    """
+
+    descriptor = -1
     try:
-        item = path.lstat()
-        if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_size <= 0
+            or before.st_size > _MAX_SOURCE_BYTES
+        ):
             raise InstallError("install_source_untrusted")
-        data = path.read_bytes()
+        chunks: list[bytes] = []
+        remaining = _MAX_SOURCE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(descriptor)
     except InstallError:
         raise
     except OSError as exc:
         raise InstallError("install_source_untrusted") from exc
-    if not data or len(data) > 512 * 1024:
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        not data
+        or len(data) > _MAX_SOURCE_BYTES
+        or (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_nlink, before.st_size)
+        != (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_nlink, after.st_size)
+    ):
         raise InstallError("install_source_untrusted")
     return data
+
+
+def _source_directory(path: Path) -> None:
+    try:
+        item = path.lstat()
+    except OSError as exc:
+        raise InstallError("install_source_untrusted") from exc
+    if (
+        stat.S_ISLNK(item.st_mode)
+        or not stat.S_ISDIR(item.st_mode)
+        or item.st_uid != os.geteuid()
+        or stat.S_IMODE(item.st_mode) & 0o022
+    ):
+        raise InstallError("install_source_untrusted")
+
+
+def _install_python_package(*, source_root: Path, install_root: Path) -> None:
+    """Materialize the closed Python package without copying checkout links."""
+
+    _source_directory(source_root)
+    copied = 0
+    for directory, child_directories, file_names in os.walk(source_root):
+        current = Path(directory)
+        _source_directory(current)
+        for name in child_directories:
+            _source_directory(current / name)
+        child_directories[:] = [
+            name for name in child_directories if name != "__pycache__"
+        ]
+        for name in sorted(file_names):
+            source = current / name
+            relative = source.relative_to(source_root)
+            if source.suffix != ".py":
+                continue
+            target = install_root / "src" / "codex_master" / relative
+            _child_directory(
+                install_root,
+                ("src", "codex_master", *relative.parts[:-1]),
+                mode=0o700,
+            )
+            _install_regular(source, target, mode=0o644)
+            copied += 1
+    if copied == 0:
+        raise InstallError("install_source_untrusted")
 
 
 def _install_regular(source: Path, target: Path, *, mode: int) -> None:
@@ -122,6 +202,9 @@ def install(*, home: Path) -> dict[str, object]:
     _directory(home, mode=0o700, create=False)
     repository = Path(__file__).resolve().parents[1]
     libexec = _child_directory(home, (".local", "libexec"), mode=0o700)
+    install_root = _child_directory(
+        home, (".local", "lib", _INSTALL_ROOT_NAME), mode=0o700
+    )
     state = _child_directory(
         home, (".local", "state", "codex-master-mcp"), mode=0o700
     )
@@ -131,6 +214,16 @@ def install(*, home: Path) -> dict[str, object]:
         libexec / _ENTRYPOINT_NAME,
         mode=0o755,
     )
+    _install_python_package(
+        source_root=repository / "src" / "codex_master", install_root=install_root
+    )
+    _install_regular(
+        repository / "bin" / "codex-master-mcp",
+        _child_directory(install_root, ("bin",), mode=0o700) / "codex-master-mcp",
+        mode=0o755,
+    )
+    for name in ("codex-hive.json", "codex-agent-classes.json"):
+        _install_regular(repository / name, install_root / name, mode=0o644)
     for name in _UNIT_NAMES:
         _install_regular(
             repository / "systemd" / "user" / name,

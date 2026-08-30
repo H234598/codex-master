@@ -713,9 +713,20 @@ def plan_queen_assignment(
 
 
 def execute_queen_assignment(
-    plan: QueenAssignmentPlan, context: QueenAssignmentExecutionContext | None = None
+    plan: QueenAssignmentPlan,
+    context: QueenAssignmentExecutionContext | None = None,
+    *,
+    step_executor: Callable[
+        [str, Callable[[QueenAssignmentPlan], object], QueenAssignmentPlan], object
+    ]
+    | None = None,
 ) -> Mapping[str, object]:
-    """Execute one pilot assignment transaction, compensating in reverse order."""
+    """Execute one pilot assignment transaction through explicit forward sinks.
+
+    The dispatch layer owns planning and compensation only.  A server-provided
+    step executor is mandatory before any enforced forward callback can run,
+    which keeps the capacity lock/recheck boundary out of shadow and rollback.
+    """
 
     if not isinstance(plan, QueenAssignmentPlan):
         raise HiveDispatchError("invalid_queen_assignment_plan")
@@ -723,6 +734,8 @@ def execute_queen_assignment(
         return {"allowed": False, "reason_code": "shadow_only", "mutation_performed": False, "plan": plan.public(), "raw_output": "not_returned"}
     if context is None or not context.ready_for(plan):
         return {"allowed": False, "reason_code": "pilot_gate_blocked", "mutation_performed": False, "plan": plan.public(), "raw_output": "not_returned"}
+    if not callable(step_executor):
+        return {"allowed": False, "reason_code": "assignment_capacity_sink_required", "mutation_performed": False, "plan": plan.public(), "raw_output": "not_returned"}
     steps: list[tuple[str, object | None]] = []
     callbacks = (
         ("teamlead", context.create_teamlead_principal),
@@ -736,7 +749,7 @@ def execute_queen_assignment(
             if not callable(callback):
                 raise HiveDispatchError("assignment_callback_unavailable")
             steps.append((name, None))
-            result = callback(plan)
+            result = step_executor(name, callback, plan)
             if name == "assignment" and not isinstance(result, Mapping):
                 raise HiveDispatchError("assignment_result_invalid")
             steps[-1] = (name, result)

@@ -4,7 +4,6 @@ Documentation=man:systemd.service(5)
 
 [Service]
 Type=oneshot
-Environment=CODEX_MASTER_PROBE_REPOSITORY=%h/.local
 CapabilityBoundingSet=
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -28,7 +27,7 @@ RestrictRealtime=yes
 SystemCallArchitectures=native
 UMask=0077
 ReadOnlyPaths=/usr/bin/python3
-BindReadOnlyPaths=%h/.local/libexec/codex_master_hive_hourly_probe.py:%h/.local/libexec/codex_master_hive_hourly_probe.py:norbind %h/codex-master/src:%h/.local/src:norbind %h/codex-master/bin/codex-master-mcp:%h/.local/bin/codex-master-mcp:norbind %h/codex-master/codex-agent-classes.json:%h/.local/codex-agent-classes.json:norbind %h/codex-master/codex-hive.json:%h/.local/codex-hive.json:norbind
+BindReadOnlyPaths=%h/.local/libexec/codex_master_hive_hourly_probe.py:%h/.local/libexec/codex_master_hive_hourly_probe.py:norbind %h/.local/lib/codex-master-hive-probe:%h/.local/lib/codex-master-hive-probe:norbind
 BindPaths=%h/.local/state/codex-master-mcp:%h/.local/state/codex-master-mcp:norbind
 ReadWritePaths=%h/.local/state/codex-master-mcp
 ExecStart=%h/.local/libexec/codex_master_hive_hourly_probe.py --json

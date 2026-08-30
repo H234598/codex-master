@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from codex_master import server
@@ -31,12 +30,25 @@ def test_emergency_queen_does_not_promote_teamleader_q_series():
     mark_blocked.assert_called_once_with(7, "queen_spawn_unavailable:hive_queen_runtime_not_materialized")
 
 
+def test_emergency_queen_no_candidate_persists_blocker_while_probe_is_red():
+    blocked = {"state": {**_requested_state(), "state": "blocked"}}
+    with patch.object(server, "emergency_queen_status", return_value=_requested_state()), \
+         patch.object(server, "require_resource_capacity_preflight", side_effect=AssertionError("blocker must not be gated")), \
+         patch.object(server, "start_agent_with_lease", side_effect=AssertionError("no candidate must not start")), \
+         patch.object(server, "set_emergency_queen_blocked", return_value=blocked) as mark_blocked:
+        result = server.ensure_emergency_queen()
+
+    assert result["status"] == "blocked"
+    mark_blocked.assert_called_once_with(7, "queen_spawn_unavailable:hive_queen_runtime_not_materialized")
+
+
 def test_emergency_queen_uses_explicit_runtime_target_only(monkeypatch):
     monkeypatch.setattr(server, "_emergency_queen_agent_candidates", lambda: ["queen-runtime-1"])
     running = {"state": {**_requested_state(), "state": "running", "queen_agent": "queen-runtime-1"}}
     with patch.object(server, "emergency_queen_status", return_value=_requested_state()), \
          patch.object(server, "start_agent_with_lease", return_value={"status": "started"}) as start, \
          patch.object(server, "set_emergency_queen_running", return_value=running) as mark_running, \
+         patch.object(server, "require_resource_capacity_preflight", return_value=None), \
          patch.object(server, "repo_root", return_value="/tmp"):
         result = server.ensure_emergency_queen()
 

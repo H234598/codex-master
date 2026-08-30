@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import tempfile
 from typing import Any
 
@@ -359,23 +360,23 @@ def probe_capacity_guard(
 ) -> object:
     """Read a fresh canonical probe while holding the shared publication lock."""
 
+    capacity_lock = probe_capacity_lock(state_file=state_file)
     try:
-        with probe_capacity_lock(state_file=state_file):
-            yield read_probe_gate(state_file=state_file, now=now)
+        capacity_lock.__enter__()
     except (OSError, ValueError):
         yield {
             "allowed": False,
             "reason_code": "probe_invalid",
             "raw_output": "not_returned",
         }
+        return
+    try:
+        yield read_probe_gate(state_file=state_file, now=now)
+    finally:
+        capacity_lock.__exit__(*sys.exc_info())
 
 
 def _repository_from_source() -> Path:
-    configured = os.environ.get("CODEX_MASTER_PROBE_REPOSITORY")
-    if configured:
-        candidate = Path(configured).expanduser()
-        if candidate.is_absolute():
-            return candidate
     return Path(__file__).resolve().parents[3]
 
 
