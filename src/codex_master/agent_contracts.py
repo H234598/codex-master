@@ -147,7 +147,12 @@ def _freeze_json(value: object) -> object:
         if not value or len(encoded) > _MAX_RESULT_BYTES or any(ord(char) < 32 for char in value):
             _invalid()
         if _UTC_TIMESTAMP.fullmatch(value) is not None:
-            parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+            try:
+                parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=UTC
+                )
+            except ValueError:
+                _invalid()
             if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
                 _invalid()
         return value

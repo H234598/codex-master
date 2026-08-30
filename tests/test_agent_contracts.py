@@ -22,6 +22,17 @@ from codex_master.agent_contracts import (
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
 DEADLINE = datetime(2026, 8, 30, 12, 0, 0, tzinfo=UTC)
+FORBIDDEN_FIELDS = (
+    "path",
+    "command",
+    "argv",
+    "shell",
+    "url",
+    "certificate",
+    "credential",
+    "token",
+    "cookie",
+)
 
 
 def valid_result_payload() -> dict[str, object]:
@@ -207,13 +218,51 @@ def test_lease_serializer_emits_exact_wire_fields_and_utc_deadline() -> None:
     }
 
 
-@pytest.mark.parametrize("field", ("command", "argv", "path", "token"))
+@pytest.mark.parametrize("field", FORBIDDEN_FIELDS)
 def test_lease_serializer_rejects_forbidden_argument_keys(field: str) -> None:
     with pytest.raises(AgentContractError, match="agent.request_invalid"):
         serialize_agent_lease(
             valid_lease(
-                arguments={field: "secret", "probe_profile": "quiescence"},
+                arguments={
+                    "probe_profile": "quiescence",
+                    "nested": {field: "secret"},
+                },
                 arguments_digest=DIGEST_A,
+            )
+        )
+
+
+@pytest.mark.parametrize("field", FORBIDDEN_FIELDS)
+def test_receipt_parser_rejects_forbidden_result_payload_keys(field: str) -> None:
+    with pytest.raises(AgentContractError, match="agent.request_invalid"):
+        parse_agent_receipt(
+            valid_receipt_wire(
+                result={
+                    "kind": "host.probe",
+                    "action": "collect",
+                    "payload": {
+                        "ready": True,
+                        "nested": {field: "secret"},
+                    },
+                },
+                result_digest=DIGEST_A,
+            )
+        )
+
+
+def test_receipt_parser_rejects_invalid_calendar_timestamp_in_payload() -> None:
+    with pytest.raises(AgentContractError, match="agent.request_invalid"):
+        parse_agent_receipt(
+            valid_receipt_wire(
+                result={
+                    "kind": "host.probe",
+                    "action": "collect",
+                    "payload": {
+                        "ready": True,
+                        "observed_at": "2026-99-99T12:00:00Z",
+                    },
+                },
+                result_digest=DIGEST_A,
             )
         )
 
