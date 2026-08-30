@@ -381,6 +381,40 @@ def test_sigterm_stops_admission_then_finishes_all_owned_lifecycles(
     assert "jwks-closed" in events
 
 
+def test_run_ignores_spurious_stop_wait_wakeup(
+    service: MasterjetControlService,
+) -> None:
+    events: list[str] = []
+    daemon = _daemon(service, events)
+
+    class SpuriousStopEvent:
+        def __init__(self) -> None:
+            self.wait_calls = 0
+            self.timeouts: list[float | None] = []
+            self.requested = False
+
+        def wait(self, timeout: float | None = None) -> bool:
+            self.wait_calls += 1
+            self.timeouts.append(timeout)
+            if self.wait_calls == 1:
+                return False
+            self.requested = True
+            return True
+
+        def set(self) -> None:
+            self.requested = True
+
+        def is_set(self) -> bool:
+            return self.requested
+
+    stop = SpuriousStopEvent()
+    daemon._stop_requested = stop  # type: ignore[assignment]
+
+    assert daemon.run() == 0
+    assert stop.wait_calls == 2
+    assert stop.timeouts == [0.1, 0.1]
+
+
 def test_blocked_socket_shutdown_is_not_reported_as_success(
     service: MasterjetControlService,
 ) -> None:

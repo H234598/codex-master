@@ -821,7 +821,8 @@ class AdminDaemon:
             for signum in (signal.SIGTERM, signal.SIGINT):
                 previous[signum] = signal.signal(signum, handle_stop)
             self.start()
-            self._stop_requested.wait()
+            while not self._stop_requested.wait(0.1):
+                pass
             self.stop()
             return 0
         except (AdminDaemonStartupError, AdminDaemonShutdownError):

@@ -140,7 +140,9 @@ def test_selection_service_persists_every_transition_with_file_store(tmp_path) -
 
 def test_runtime_missing_hive_bindings_denies_and_never_executes() -> None:
     called = []
-    runtime = build_server_admission_runtime(execute=lambda *_args: called.append(True))
+    runtime = build_server_admission_runtime(
+        execute=lambda *_args: called.append(True), now=lambda: NOW
+    )
     record = revalidating_record()
 
     assert runtime.revalidate(record) is False
@@ -223,7 +225,9 @@ def test_server_lease_executor_pins_a_claimed_lease_id() -> None:
 def test_runtime_gate_exception_and_unknown_completion_fail_closed() -> None:
     gates = allow_all([])
     gates["scope"] = lambda _record: (_ for _ in ()).throw(RuntimeError("scope unavailable"))
-    runtime = ServerAdmissionRuntime(gates, execution_completed=lambda _record: "yes")
+    runtime = ServerAdmissionRuntime(
+        gates, execution_completed=lambda _record: "yes", now=lambda: NOW
+    )
     record = revalidating_record()
 
     assert runtime.revalidate(record) is False
