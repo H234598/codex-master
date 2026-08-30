@@ -114,14 +114,28 @@ def expected(**changes):
     return BindingExpectation(**values)
 
 
-def observation(state=BrokerObjectState.ABSENT, registry=BrokerRegistryState.NOT_APPLICABLE, index=0):
+def observation(
+    state=BrokerObjectState.ABSENT, registry=BrokerRegistryState.NOT_APPLICABLE, index=0
+):
     return BrokerObservation(state, registry, index)
 
 
-def status(checkpoint=BrokerCheckpoint.CREATE_INTENT, obs=None, total=1, operation=ChpbTransactionOperation.PROVISION):
+def status(
+    checkpoint=BrokerCheckpoint.CREATE_INTENT,
+    obs=None,
+    total=1,
+    operation=ChpbTransactionOperation.PROVISION,
+):
     if obs is None:
         obs = observation()
-    return TransactionStatus(binding(operation), b2a_phase_for_checkpoint(checkpoint), checkpoint, obs, total, None)
+    return TransactionStatus(
+        binding(operation),
+        b2a_phase_for_checkpoint(checkpoint),
+        checkpoint,
+        obs,
+        total,
+        None,
+    )
 
 
 def operation_for_checkpoint(checkpoint: BrokerCheckpoint) -> ChpbTransactionOperation:
@@ -132,14 +146,19 @@ def operation_for_checkpoint(checkpoint: BrokerCheckpoint) -> ChpbTransactionOpe
         BrokerCheckpoint.SWITCHED,
     }:
         return ChpbTransactionOperation.REPLACE
-    if checkpoint in {BrokerCheckpoint.DEPROVISION_INTENT, BrokerCheckpoint.DEPROVISIONED}:
+    if checkpoint in {
+        BrokerCheckpoint.DEPROVISION_INTENT,
+        BrokerCheckpoint.DEPROVISIONED,
+    }:
         return ChpbTransactionOperation.DEPROVISION
     return ChpbTransactionOperation.PROVISION
 
 
 def attestation(bind=None):
     bind = bind or binding()
-    return HomeAttestation(bind, CANONICAL_AGENT_HOME, DirectoryIdentity(0, 1, 0o40700), A, "c0,c1")
+    return HomeAttestation(
+        bind, CANONICAL_AGENT_HOME, DirectoryIdentity(0, 1, 0o40700), A, "c0,c1"
+    )
 
 
 def request(kind=ChpbMessageKind.ATTEST_HOME, request_id=REQUEST_ID, transaction_id=T):
@@ -152,11 +171,32 @@ def request(kind=ChpbMessageKind.ATTEST_HOME, request_id=REQUEST_ID, transaction
         ChpbMessageKind.DEPROVISION_HOME: DeprovisionHomeRequest,
     }[kind]
     if kind is ChpbMessageKind.PROVISION_HOME:
-        return klass(CHPB_PROTOCOL, kind, request_id, transaction_id, expected(), binding(ChpbTransactionOperation.PROVISION))
+        return klass(
+            CHPB_PROTOCOL,
+            kind,
+            request_id,
+            transaction_id,
+            expected(),
+            binding(ChpbTransactionOperation.PROVISION),
+        )
     if kind is ChpbMessageKind.REPLACE_HOME:
-        return klass(CHPB_PROTOCOL, kind, request_id, transaction_id, expected(), binding(ChpbTransactionOperation.REPLACE))
+        return klass(
+            CHPB_PROTOCOL,
+            kind,
+            request_id,
+            transaction_id,
+            expected(),
+            binding(ChpbTransactionOperation.REPLACE),
+        )
     if kind is ChpbMessageKind.DEPROVISION_HOME:
-        return klass(CHPB_PROTOCOL, kind, request_id, transaction_id, expected(), binding(ChpbTransactionOperation.DEPROVISION))
+        return klass(
+            CHPB_PROTOCOL,
+            kind,
+            request_id,
+            transaction_id,
+            expected(),
+            binding(ChpbTransactionOperation.DEPROVISION),
+        )
     return klass(CHPB_PROTOCOL, kind, request_id, transaction_id, expected())
 
 
@@ -216,9 +256,7 @@ def agent_start_envelope(**changes):
         expected_value,
         "codex-master-agent@c0\\x2cc1.service",
         identity,
-        AgentStartExecutablePin(
-            "/usr/libexec/codex-master-agent-launcher", "e" * 64
-        ),
+        AgentStartExecutablePin("/usr/libexec/codex-master-agent-launcher", "e" * 64),
         AgentStartEnvironmentProjection(
             (
                 ("CODEX_HOME", CANONICAL_AGENT_HOME),
@@ -256,8 +294,16 @@ def test_public_contract_types_are_frozen_and_slotted():
 
 
 def test_validate_principal_binding_accepts_exact_boundaries():
-    assert validate_principal_binding(principal(manifest_generation=1, unit_generation=1, fencing_epoch=0)) == principal(manifest_generation=1, unit_generation=1, fencing_epoch=0)
-    assert validate_principal_binding(principal(manifest_generation=MAX_CHPB_GENERATION, unit_generation=MAX_CHPB_GENERATION, fencing_epoch=MAX_CHPB_GENERATION))
+    assert validate_principal_binding(
+        principal(manifest_generation=1, unit_generation=1, fencing_epoch=0)
+    ) == principal(manifest_generation=1, unit_generation=1, fencing_epoch=0)
+    assert validate_principal_binding(
+        principal(
+            manifest_generation=MAX_CHPB_GENERATION,
+            unit_generation=MAX_CHPB_GENERATION,
+            fencing_epoch=MAX_CHPB_GENERATION,
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -276,7 +322,9 @@ def test_validate_principal_binding_accepts_exact_boundaries():
         ("mcs_pair", "c2,c1"),
     ],
 )
-def test_validate_principal_binding_rejects_bool_as_int_and_each_out_of_range_field(field, value):
+def test_validate_principal_binding_rejects_bool_as_int_and_each_out_of_range_field(
+    field, value
+):
     with pytest.raises(ChpbValidationError):
         validate_principal_binding(principal(**{field: value}))
 
@@ -285,28 +333,46 @@ def test_validate_transaction_binding_binds_store_principal_policy_and_epoch():
     value = validate_transaction_binding(binding())
     assert value.store_uuid == U
     assert value.principal.fencing_epoch == 4
-    assert validate_transaction_binding(binding(principal=principal(agent_id="other"))).principal.agent_id == "other"
+    assert (
+        validate_transaction_binding(
+            binding(principal=principal(agent_id="other"))
+        ).principal.agent_id
+        == "other"
+    )
 
 
 @pytest.mark.parametrize("checkpoint", list(BrokerCheckpoint))
-def test_validate_transaction_status_requires_exact_phase_checkpoint_terminal_combination(checkpoint):
+def test_validate_transaction_status_requires_exact_phase_checkpoint_terminal_combination(
+    checkpoint,
+):
     terminal = {
         BrokerCheckpoint.COMMITTED: BrokerResultCode.COMMITTED,
         BrokerCheckpoint.DEPROVISIONED: BrokerResultCode.COMMITTED,
         BrokerCheckpoint.ROLLED_BACK: BrokerResultCode.ROLLED_BACK,
         BrokerCheckpoint.BLOCKED_DRIFT: BrokerResultCode.BLOCKED_DRIFT,
     }.get(checkpoint)
-    value = TransactionStatus(binding(operation_for_checkpoint(checkpoint)), b2a_phase_for_checkpoint(checkpoint), checkpoint, observation(), 1, terminal)
+    value = TransactionStatus(
+        binding(operation_for_checkpoint(checkpoint)),
+        b2a_phase_for_checkpoint(checkpoint),
+        checkpoint,
+        observation(),
+        1,
+        terminal,
+    )
     assert validate_transaction_status(value) == value
     if terminal is None:
         with pytest.raises(ChpbValidationError):
-            validate_transaction_status(dataclasses.replace(value, terminal_result=BrokerResultCode.COMMITTED))
+            validate_transaction_status(
+                dataclasses.replace(value, terminal_result=BrokerResultCode.COMMITTED)
+            )
 
 
 def test_all_string_and_mcs_boundaries_are_exact():
     assert validate_principal_binding(principal(agent_id="a"))
     assert validate_principal_binding(principal(agent_id="a" + "b" * 127))
-    assert validate_principal_binding(principal(mcs_pair=f"c0,c{MAX_CHPB_MCS_CATEGORY}"))
+    assert validate_principal_binding(
+        principal(mcs_pair=f"c0,c{MAX_CHPB_MCS_CATEGORY}")
+    )
     for pair in ("c0,c0", "c01,c2", "c0,c1024", "c-1,c2", "c0,c2,x"):
         with pytest.raises(ChpbValidationError):
             validate_principal_binding(principal(mcs_pair=pair))
@@ -328,7 +394,16 @@ def test_encode_each_message_variant_matches_golden_chpb2_bytes():
         ):
             raw = encode_chpb_message(request(kind))
             assert raw.endswith(b"\n")
-            assert raw == json.dumps(json.loads(raw), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+            assert (
+                raw
+                == json.dumps(
+                    json.loads(raw),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
+                + b"\n"
+            )
 
 
 def test_decode_each_golden_message_roundtrips_byte_exactly():
@@ -346,16 +421,83 @@ def test_decode_each_golden_message_roundtrips_byte_exactly():
 
 def test_reply_golden_bytes_and_roundtrips_cover_all_reply_variants():
     pending = status(BrokerCheckpoint.CREATE_INTENT)
-    committed = dataclasses.replace(status(BrokerCheckpoint.COMMITTED, observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1), 1), terminal_result=BrokerResultCode.COMMITTED)
-    rolled_back = dataclasses.replace(status(BrokerCheckpoint.ROLLED_BACK, observation(BrokerObjectState.ROLLED_BACK, BrokerRegistryState.NOT_APPLICABLE, 1), 1), terminal_result=BrokerResultCode.ROLLED_BACK)
-    blocked = dataclasses.replace(status(BrokerCheckpoint.BLOCKED_DRIFT, observation(BrokerObjectState.DRIFT, BrokerRegistryState.FOREIGN, 1), 1), terminal_result=BrokerResultCode.BLOCKED_DRIFT)
+    committed = dataclasses.replace(
+        status(
+            BrokerCheckpoint.COMMITTED,
+            observation(
+                BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1
+            ),
+            1,
+        ),
+        terminal_result=BrokerResultCode.COMMITTED,
+    )
+    rolled_back = dataclasses.replace(
+        status(
+            BrokerCheckpoint.ROLLED_BACK,
+            observation(
+                BrokerObjectState.ROLLED_BACK, BrokerRegistryState.NOT_APPLICABLE, 1
+            ),
+            1,
+        ),
+        terminal_result=BrokerResultCode.ROLLED_BACK,
+    )
+    blocked = dataclasses.replace(
+        status(
+            BrokerCheckpoint.BLOCKED_DRIFT,
+            observation(BrokerObjectState.DRIFT, BrokerRegistryState.FOREIGN, 1),
+            1,
+        ),
+        terminal_result=BrokerResultCode.BLOCKED_DRIFT,
+    )
     replies = (
-        BrokerReply(CHPB_PROTOCOL, ChpbMessageKind.REPLY, REQUEST_ID, BrokerResultCode.INVALID_MESSAGE, None, None),
-        BrokerReply(CHPB_PROTOCOL, ChpbMessageKind.REPLY, REQUEST_ID, BrokerResultCode.PENDING, pending, None),
-        BrokerReply(CHPB_PROTOCOL, ChpbMessageKind.REPLY, REQUEST_ID, BrokerResultCode.COMMITTED, committed, None),
-        BrokerReply(CHPB_PROTOCOL, ChpbMessageKind.REPLY, REQUEST_ID, BrokerResultCode.ROLLED_BACK, rolled_back, None),
-        BrokerReply(CHPB_PROTOCOL, ChpbMessageKind.REPLY, REQUEST_ID, BrokerResultCode.BLOCKED_DRIFT, blocked, None),
-        BrokerReply(CHPB_PROTOCOL, ChpbMessageKind.REPLY, REQUEST_ID, BrokerResultCode.OK, committed, attestation()),
+        BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            REQUEST_ID,
+            BrokerResultCode.INVALID_MESSAGE,
+            None,
+            None,
+        ),
+        BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            REQUEST_ID,
+            BrokerResultCode.PENDING,
+            pending,
+            None,
+        ),
+        BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            REQUEST_ID,
+            BrokerResultCode.COMMITTED,
+            committed,
+            None,
+        ),
+        BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            REQUEST_ID,
+            BrokerResultCode.ROLLED_BACK,
+            rolled_back,
+            None,
+        ),
+        BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            REQUEST_ID,
+            BrokerResultCode.BLOCKED_DRIFT,
+            blocked,
+            None,
+        ),
+        BrokerReply(
+            CHPB_PROTOCOL,
+            ChpbMessageKind.REPLY,
+            REQUEST_ID,
+            BrokerResultCode.OK,
+            committed,
+            attestation(),
+        ),
     )
     golden_error = b'{"attestation":null,"kind":"reply","protocol":"CHPB/2","request_id":"11111111111111111111111111111111","result":"invalid_message","transaction":null}\n'
     assert encode_chpb_message(replies[0]) == golden_error
@@ -366,7 +508,9 @@ def test_reply_golden_bytes_and_roundtrips_cover_all_reply_variants():
 
 
 def test_agent_start_contract_types_are_frozen_slotted_and_scalar_only():
-    claim = AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID)
+    claim = AgentStartClaim(
+        CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID
+    )
     envelope = agent_start_envelope()
 
     for value in (claim, envelope, envelope.executable, envelope.environment):
@@ -399,7 +543,9 @@ def test_agent_start_contract_types_are_frozen_slotted_and_scalar_only():
 
 
 def test_agent_start_claim_and_envelope_roundtrip_with_snapshot_generation():
-    claim = AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID)
+    claim = AgentStartClaim(
+        CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID
+    )
     envelope = agent_start_envelope()
 
     claim_raw = encode_chpb_message(claim)
@@ -432,7 +578,9 @@ def test_agent_start_claim_rejects_schema_kind_and_correlation_drift(claim):
 
 
 def test_agent_start_claim_rejects_unknown_wire_fields():
-    claim = AgentStartClaim(CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID)
+    claim = AgentStartClaim(
+        CHPB_PROTOCOL, ChpbMessageKind.AGENT_START_CLAIM, REQUEST_ID
+    )
     document = json.loads(encode_chpb_message(claim))
     document["target"] = "teamleiterin"
     raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode() + b"\n"
@@ -467,13 +615,22 @@ def test_decode_rejects_unknown_missing_and_duplicate_fields():
     with pytest.raises(ChpbValidationError):
         decode_chpb_message(raw.replace(b'"kind":', b'"extra":1,"kind":'))
     with pytest.raises(ChpbValidationError):
-        decode_chpb_message(raw.replace(b',"transaction_id"', b''))
+        decode_chpb_message(raw.replace(b',"transaction_id"', b""))
     with pytest.raises(ChpbValidationError):
         decode_chpb_message(raw.replace(b'"kind":', b'"kind":"attest_home","kind":'))
 
 
 def test_decode_rejects_bom_invalid_utf8_float_nan_array_and_bool_integer():
-    for raw in (b"\xef\xbb\xbf{}\n", b"\xff\n", b'{"expected":{},"kind":"attest_home","protocol":"CHPB/2","request_id":true,"transaction_id":"' + T.encode() + b'"}\n', b'{"x":1.0}\n', b'{"x":NaN}\n', b'[]\n'):
+    for raw in (
+        b"\xef\xbb\xbf{}\n",
+        b"\xff\n",
+        b'{"expected":{},"kind":"attest_home","protocol":"CHPB/2","request_id":true,"transaction_id":"'
+        + T.encode()
+        + b'"}\n',
+        b'{"x":1.0}\n',
+        b'{"x":NaN}\n',
+        b"[]\n",
+    ):
         with pytest.raises(ChpbValidationError):
             decode_chpb_message(raw)
 
@@ -481,9 +638,22 @@ def test_decode_rejects_bom_invalid_utf8_float_nan_array_and_bool_integer():
 def test_decode_rejects_wrong_key_order_whitespace_crlf_and_newline_variants():
     raw = encode_chpb_message(request())
     doc = json.loads(raw)
-    wrong = json.dumps(dict(reversed(tuple(doc.items()))), separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    wrong = (
+        json.dumps(
+            dict(reversed(tuple(doc.items()))),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        + b"\n"
+    )
     assert wrong != raw
-    for candidate in (wrong, raw.replace(b"\n", b"\r\n"), raw[:-1], raw + b"\n", raw.replace(b",", b", ")):
+    for candidate in (
+        wrong,
+        raw.replace(b"\n", b"\r\n"),
+        raw[:-1],
+        raw + b"\n",
+        raw.replace(b",", b", "),
+    ):
         with pytest.raises(ChpbValidationError):
             decode_chpb_message(candidate)
 
@@ -509,12 +679,22 @@ def test_decode_enforces_real_64k_and_16_field_boundaries():
     document = json.loads(valid)
     for index in range(MAX_CHPB_OBJECT_FIELDS - len(document)):
         document[f"extra_{index}"] = 0
-    sixteen = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    sixteen = (
+        json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        + b"\n"
+    )
     with pytest.raises(ChpbValidationError) as sixteen_error:
         decode_chpb_message(sixteen)
     assert sixteen_error.value.code is ChpbValidationCode.UNKNOWN_FIELD
     document["extra_over"] = 0
-    seventeen = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    seventeen = (
+        json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        + b"\n"
+    )
     with pytest.raises(ChpbValidationError) as seventeen_error:
         decode_chpb_message(seventeen)
     assert seventeen_error.value.code is ChpbValidationCode.INVALID_FIELD
@@ -522,20 +702,39 @@ def test_decode_enforces_real_64k_and_16_field_boundaries():
 
 def test_validate_chpb_message_enforces_reply_payload_combinations():
     assert validate_chpb_message(request())
-    reply = BrokerReply(CHPB_PROTOCOL, ChpbMessageKind.REPLY, REQUEST_ID, BrokerResultCode.PENDING, status(), None)
+    reply = BrokerReply(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.REPLY,
+        REQUEST_ID,
+        BrokerResultCode.PENDING,
+        status(),
+        None,
+    )
     assert validate_chpb_message(reply)
     with pytest.raises(ChpbValidationError):
-        validate_chpb_message(dataclasses.replace(reply, kind=ChpbMessageKind.ATTEST_HOME))
+        validate_chpb_message(
+            dataclasses.replace(reply, kind=ChpbMessageKind.ATTEST_HOME)
+        )
     with pytest.raises(ChpbValidationError):
-        validate_chpb_message(dataclasses.replace(reply, result=BrokerResultCode.INVALID_MESSAGE, transaction=status()))
+        validate_chpb_message(
+            dataclasses.replace(
+                reply, result=BrokerResultCode.INVALID_MESSAGE, transaction=status()
+            )
+        )
 
 
 def test_validate_mutating_requests_reject_binding_expectation_mismatch():
     assert validate_chpb_message(request(ChpbMessageKind.PROVISION_HOME))
-    wrong = dataclasses.replace(request(ChpbMessageKind.REPLACE_HOME), expected=expected(manifest_generation=4))
+    wrong = dataclasses.replace(
+        request(ChpbMessageKind.REPLACE_HOME), expected=expected(manifest_generation=4)
+    )
     with pytest.raises(ChpbValidationError):
         validate_chpb_message(wrong)
-    bad_tx_id = dataclasses.replace(request(ChpbMessageKind.DEPROVISION_HOME), transaction_id=U, binding=request(ChpbMessageKind.DEPROVISION_HOME).binding)
+    bad_tx_id = dataclasses.replace(
+        request(ChpbMessageKind.DEPROVISION_HOME),
+        transaction_id=U,
+        binding=request(ChpbMessageKind.DEPROVISION_HOME).binding,
+    )
     with pytest.raises(ChpbValidationError):
         validate_chpb_message(bad_tx_id)
 
@@ -553,13 +752,24 @@ def test_validate_mutating_requests_reject_binding_expectation_mismatch():
 )
 def test_validate_mutating_requests_reject_binding_operation_mismatch(kind, operation):
     base = request(kind)
-    wrong = dataclasses.replace(base, binding=dataclasses.replace(base.binding, operation=operation))
+    wrong = dataclasses.replace(
+        base, binding=dataclasses.replace(base.binding, operation=operation)
+    )
     with pytest.raises(ChpbValidationError):
         validate_chpb_message(wrong)
 
 
-@pytest.mark.parametrize("kind", [ChpbMessageKind.PROVISION_HOME, ChpbMessageKind.REPLACE_HOME, ChpbMessageKind.DEPROVISION_HOME])
-def test_validate_mutating_requests_fail_closed_when_binding_is_not_transaction_binding(kind):
+@pytest.mark.parametrize(
+    "kind",
+    [
+        ChpbMessageKind.PROVISION_HOME,
+        ChpbMessageKind.REPLACE_HOME,
+        ChpbMessageKind.DEPROVISION_HOME,
+    ],
+)
+def test_validate_mutating_requests_fail_closed_when_binding_is_not_transaction_binding(
+    kind,
+):
     value = request(kind)
     wrong = dataclasses.replace(value, binding="x")
     with pytest.raises(ChpbValidationError) as error:
@@ -570,7 +780,12 @@ def test_validate_mutating_requests_fail_closed_when_binding_is_not_transaction_
 def test_decode_rejects_mutation_request_without_binding_key():
     document = json.loads(encode_chpb_message(request(ChpbMessageKind.PROVISION_HOME)))
     del document["binding"]
-    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    raw = (
+        json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        + b"\n"
+    )
     with pytest.raises(ChpbValidationError) as error:
         decode_chpb_message(raw)
     assert error.value.code is ChpbValidationCode.INVALID_FIELD
@@ -579,16 +794,28 @@ def test_decode_rejects_mutation_request_without_binding_key():
 def test_decode_rejects_mutation_request_with_unknown_top_level_key():
     document = json.loads(encode_chpb_message(request(ChpbMessageKind.REPLACE_HOME)))
     document["extra"] = 1
-    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    raw = (
+        json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        + b"\n"
+    )
     with pytest.raises(ChpbValidationError) as error:
         decode_chpb_message(raw)
     assert error.value.code is ChpbValidationCode.UNKNOWN_FIELD
 
 
 def test_decode_rejects_mutation_request_with_unknown_binding_key():
-    document = json.loads(encode_chpb_message(request(ChpbMessageKind.DEPROVISION_HOME)))
+    document = json.loads(
+        encode_chpb_message(request(ChpbMessageKind.DEPROVISION_HOME))
+    )
     document["binding"]["extra"] = 1
-    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    raw = (
+        json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        + b"\n"
+    )
     with pytest.raises(ChpbValidationError) as error:
         decode_chpb_message(raw)
     assert error.value.code is ChpbValidationCode.UNKNOWN_FIELD
@@ -597,7 +824,12 @@ def test_decode_rejects_mutation_request_with_unknown_binding_key():
 def test_decode_rejects_mutation_request_with_non_string_binding_operation():
     document = json.loads(encode_chpb_message(request(ChpbMessageKind.PROVISION_HOME)))
     document["binding"]["operation"] = True
-    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    raw = (
+        json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        + b"\n"
+    )
     with pytest.raises(ChpbValidationError) as error:
         decode_chpb_message(raw)
     assert error.value.code is ChpbValidationCode.INVALID_TYPE
@@ -606,7 +838,12 @@ def test_decode_rejects_mutation_request_with_non_string_binding_operation():
 def test_decode_rejects_mutation_request_with_missing_binding_operation_key():
     document = json.loads(encode_chpb_message(request(ChpbMessageKind.PROVISION_HOME)))
     del document["binding"]["operation"]
-    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    raw = (
+        json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        + b"\n"
+    )
     with pytest.raises(ChpbValidationError) as error:
         decode_chpb_message(raw)
     assert error.value.code is ChpbValidationCode.INVALID_FIELD
@@ -615,7 +852,12 @@ def test_decode_rejects_mutation_request_with_missing_binding_operation_key():
 def test_decode_rejects_mutation_request_with_unknown_string_binding_operation():
     document = json.loads(encode_chpb_message(request(ChpbMessageKind.PROVISION_HOME)))
     document["binding"]["operation"] = "mutate"
-    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    raw = (
+        json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+        + b"\n"
+    )
     with pytest.raises(ChpbValidationError) as error:
         decode_chpb_message(raw)
     assert error.value.code is ChpbValidationCode.INVALID_FIELD
@@ -624,17 +866,21 @@ def test_decode_rejects_mutation_request_with_unknown_string_binding_operation()
 def test_decode_rejects_mutation_request_with_duplicate_binding_key():
     message = request(ChpbMessageKind.PROVISION_HOME)
     document = json.loads(encode_chpb_message(message))
-    binding_raw = json.dumps(document["binding"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    expected_raw = json.dumps(document["expected"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    binding_raw = json.dumps(
+        document["binding"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    expected_raw = json.dumps(
+        document["expected"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
     raw = (
         "{"
-        f"\"binding\":{binding_raw},"
-        f"\"binding\":{binding_raw},"
-        f"\"expected\":{expected_raw},"
-        f"\"kind\":{json.dumps(document['kind'])},"
-        f"\"protocol\":{json.dumps(document['protocol'])},"
-        f"\"request_id\":{json.dumps(document['request_id'])},"
-        f"\"transaction_id\":{json.dumps(document['transaction_id'])}"
+        f'"binding":{binding_raw},'
+        f'"binding":{binding_raw},'
+        f'"expected":{expected_raw},'
+        f'"kind":{json.dumps(document["kind"])},'
+        f'"protocol":{json.dumps(document["protocol"])},'
+        f'"request_id":{json.dumps(document["request_id"])},'
+        f'"transaction_id":{json.dumps(document["transaction_id"])}'
         "}\n"
     ).encode()
     with pytest.raises(ChpbValidationError) as error:
@@ -645,7 +891,9 @@ def test_decode_rejects_mutation_request_with_duplicate_binding_key():
 def test_b2a_mapping_is_total_bijective_and_exact_for_all_15_phases():
     assert len(B2aRecoveryPhase) == 17
     assert len(BrokerCheckpoint) == 17
-    assert {checkpoint_for_b2a_phase(p) for p in B2aRecoveryPhase} == set(BrokerCheckpoint)
+    assert {checkpoint_for_b2a_phase(p) for p in B2aRecoveryPhase} == set(
+        BrokerCheckpoint
+    )
 
 
 def test_b2a_mapping_matches_literal_brief_table_for_all_15_pairs():
@@ -678,13 +926,18 @@ def test_b2a_mapping_matches_literal_brief_table_for_all_15_pairs():
     "checkpoint,operation",
     [
         (BrokerCheckpoint.CREATE_INTENT, ChpbTransactionOperation.DEPROVISION),
-        (BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT, ChpbTransactionOperation.PROVISION),
+        (
+            BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT,
+            ChpbTransactionOperation.PROVISION,
+        ),
         (BrokerCheckpoint.REPLACEMENT_PREPARED, ChpbTransactionOperation.DEPROVISION),
         (BrokerCheckpoint.DEPROVISION_INTENT, ChpbTransactionOperation.PROVISION),
         (BrokerCheckpoint.DEPROVISION_INTENT, ChpbTransactionOperation.REPLACE),
     ],
 )
-def test_validate_transaction_status_rejects_operation_checkpoint_mismatch(checkpoint, operation):
+def test_validate_transaction_status_rejects_operation_checkpoint_mismatch(
+    checkpoint, operation
+):
     with pytest.raises(ChpbValidationError):
         validate_transaction_status(status(checkpoint=checkpoint, operation=operation))
 
@@ -693,24 +946,75 @@ def test_b2a_mapping_functions_are_exact_inverses():
     for phase in B2aRecoveryPhase:
         assert b2a_phase_for_checkpoint(checkpoint_for_b2a_phase(phase)) is phase
     for checkpoint in BrokerCheckpoint:
-        assert checkpoint_for_b2a_phase(b2a_phase_for_checkpoint(checkpoint)) is checkpoint
+        assert (
+            checkpoint_for_b2a_phase(b2a_phase_for_checkpoint(checkpoint)) is checkpoint
+        )
 
 
 def test_checkpoint_transition_table_accepts_only_documented_edges():
     allowed = {
-        BrokerCheckpoint.CREATE_INTENT: {BrokerCheckpoint.STAGING_PINNED, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.STAGING_PINNED: {BrokerCheckpoint.POPULATE_PENDING, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.POPULATE_PENDING: {BrokerCheckpoint.POPULATE_PENDING, BrokerCheckpoint.PUBLISH_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.PUBLISH_INTENT: {BrokerCheckpoint.PUBLISHED, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.PUBLISHED: {BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT: {BrokerCheckpoint.REPLACEMENT_PREPARED, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.REPLACEMENT_PREPARED: {BrokerCheckpoint.SWITCH_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.SWITCH_INTENT: {BrokerCheckpoint.SWITCHED, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.SWITCHED: {BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.REGISTRY_CAS_INTENT: {BrokerCheckpoint.FINALIZE_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.FINALIZE_INTENT: {BrokerCheckpoint.COMMITTED, BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.ROLLBACK_INTENT: {BrokerCheckpoint.ROLLED_BACK, BrokerCheckpoint.BLOCKED_DRIFT},
-        BrokerCheckpoint.DEPROVISION_INTENT: {BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
+        BrokerCheckpoint.CREATE_INTENT: {
+            BrokerCheckpoint.STAGING_PINNED,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.STAGING_PINNED: {
+            BrokerCheckpoint.POPULATE_PENDING,
+            BrokerCheckpoint.ROLLBACK_INTENT,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.POPULATE_PENDING: {
+            BrokerCheckpoint.POPULATE_PENDING,
+            BrokerCheckpoint.PUBLISH_INTENT,
+            BrokerCheckpoint.ROLLBACK_INTENT,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.PUBLISH_INTENT: {
+            BrokerCheckpoint.PUBLISHED,
+            BrokerCheckpoint.ROLLBACK_INTENT,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.PUBLISHED: {
+            BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT: {
+            BrokerCheckpoint.REPLACEMENT_PREPARED,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.REPLACEMENT_PREPARED: {
+            BrokerCheckpoint.SWITCH_INTENT,
+            BrokerCheckpoint.ROLLBACK_INTENT,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.SWITCH_INTENT: {
+            BrokerCheckpoint.SWITCHED,
+            BrokerCheckpoint.ROLLBACK_INTENT,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.SWITCHED: {
+            BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            BrokerCheckpoint.ROLLBACK_INTENT,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.REGISTRY_CAS_INTENT: {
+            BrokerCheckpoint.FINALIZE_INTENT,
+            BrokerCheckpoint.ROLLBACK_INTENT,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.FINALIZE_INTENT: {
+            BrokerCheckpoint.COMMITTED,
+            BrokerCheckpoint.DEPROVISIONED,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.ROLLBACK_INTENT: {
+            BrokerCheckpoint.ROLLED_BACK,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
+        BrokerCheckpoint.DEPROVISION_INTENT: {
+            BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            BrokerCheckpoint.DEPROVISIONED,
+            BrokerCheckpoint.BLOCKED_DRIFT,
+        },
         BrokerCheckpoint.DEPROVISIONED: {BrokerCheckpoint.DEPROVISIONED},
         BrokerCheckpoint.COMMITTED: {BrokerCheckpoint.COMMITTED},
         BrokerCheckpoint.ROLLED_BACK: {BrokerCheckpoint.ROLLED_BACK},
@@ -718,7 +1022,9 @@ def test_checkpoint_transition_table_accepts_only_documented_edges():
     }
     for source in BrokerCheckpoint:
         for target in BrokerCheckpoint:
-            assert is_checkpoint_transition_allowed(source, target) is (target in allowed[source])
+            assert is_checkpoint_transition_allowed(source, target) is (
+                target in allowed[source]
+            )
 
 
 def _decision(status_value, obs):
@@ -728,28 +1034,182 @@ def _decision(status_value, obs):
 @pytest.mark.parametrize(
     "checkpoint,obj,reg,index,action,next_checkpoint,result",
     [
-        (BrokerCheckpoint.CREATE_INTENT, BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 0, BrokerRecoveryAction.CREATE_STAGING, None, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.CREATE_INTENT, BrokerObjectState.STAGING_EMPTY, BrokerRegistryState.NOT_APPLICABLE, 0, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.STAGING_PINNED, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.STAGING_PINNED, BrokerObjectState.STAGING_EMPTY, BrokerRegistryState.NOT_APPLICABLE, 0, BrokerRecoveryAction.POPULATE_NEXT, None, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.STAGING_PINNED, BrokerObjectState.STAGING_PREFIX, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.POPULATE_PENDING, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.POPULATE_PENDING, BrokerObjectState.STAGING_PREFIX, BrokerRegistryState.NOT_APPLICABLE, 0, BrokerRecoveryAction.POPULATE_NEXT, None, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.POPULATE_PENDING, BrokerObjectState.STAGING_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.PUBLISH_INTENT, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.PUBLISH_INTENT, BrokerObjectState.STAGING_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.PUBLISH_HOME, None, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.PUBLISH_INTENT, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.PUBLISHED, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.PUBLISHED, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.OLD, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT, BrokerObjectState.REPLACEMENT_ORIGINAL, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.PREPARE_REPLACEMENT, None, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.REPLACEMENT_PREPARED, BrokerObjectState.REPLACEMENT_PREPARED, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.SWITCH_INTENT, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.SWITCH_INTENT, BrokerObjectState.REPLACEMENT_PREPARED, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.SWITCH_REPLACEMENT, None, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.SWITCHED, BrokerObjectState.REPLACEMENT_SWITCHED, BrokerRegistryState.OLD, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.OLD, 1, BrokerRecoveryAction.CAS_REGISTRY, None, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.FINALIZE_INTENT, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.FINALIZE_INTENT, BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.COMMITTED, BrokerResultCode.COMMITTED),
-        (BrokerCheckpoint.ROLLBACK_INTENT, BrokerObjectState.ROLLBACK_READY, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.ROLLBACK, None, BrokerResultCode.PENDING),
-        (BrokerCheckpoint.ROLLBACK_INTENT, BrokerObjectState.ROLLED_BACK, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.ROLLED_BACK, BrokerResultCode.ROLLED_BACK),
-        (BrokerCheckpoint.DEPROVISION_INTENT, BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1, BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.DEPROVISIONED, BrokerResultCode.COMMITTED),
+        (
+            BrokerCheckpoint.CREATE_INTENT,
+            BrokerObjectState.ABSENT,
+            BrokerRegistryState.NOT_APPLICABLE,
+            0,
+            BrokerRecoveryAction.CREATE_STAGING,
+            None,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.CREATE_INTENT,
+            BrokerObjectState.STAGING_EMPTY,
+            BrokerRegistryState.NOT_APPLICABLE,
+            0,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.STAGING_PINNED,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.STAGING_PINNED,
+            BrokerObjectState.STAGING_EMPTY,
+            BrokerRegistryState.NOT_APPLICABLE,
+            0,
+            BrokerRecoveryAction.POPULATE_NEXT,
+            None,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.STAGING_PINNED,
+            BrokerObjectState.STAGING_PREFIX,
+            BrokerRegistryState.NOT_APPLICABLE,
+            1,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.POPULATE_PENDING,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.POPULATE_PENDING,
+            BrokerObjectState.STAGING_PREFIX,
+            BrokerRegistryState.NOT_APPLICABLE,
+            0,
+            BrokerRecoveryAction.POPULATE_NEXT,
+            None,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.POPULATE_PENDING,
+            BrokerObjectState.STAGING_COMPLETE,
+            BrokerRegistryState.NOT_APPLICABLE,
+            1,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.PUBLISH_INTENT,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.PUBLISH_INTENT,
+            BrokerObjectState.STAGING_COMPLETE,
+            BrokerRegistryState.NOT_APPLICABLE,
+            1,
+            BrokerRecoveryAction.PUBLISH_HOME,
+            None,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.PUBLISH_INTENT,
+            BrokerObjectState.FINAL_COMPLETE,
+            BrokerRegistryState.NOT_APPLICABLE,
+            1,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.PUBLISHED,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.PUBLISHED,
+            BrokerObjectState.FINAL_COMPLETE,
+            BrokerRegistryState.OLD,
+            1,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT,
+            BrokerObjectState.REPLACEMENT_ORIGINAL,
+            BrokerRegistryState.NOT_APPLICABLE,
+            1,
+            BrokerRecoveryAction.PREPARE_REPLACEMENT,
+            None,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.REPLACEMENT_PREPARED,
+            BrokerObjectState.REPLACEMENT_PREPARED,
+            BrokerRegistryState.NOT_APPLICABLE,
+            1,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.SWITCH_INTENT,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.SWITCH_INTENT,
+            BrokerObjectState.REPLACEMENT_PREPARED,
+            BrokerRegistryState.NOT_APPLICABLE,
+            1,
+            BrokerRecoveryAction.SWITCH_REPLACEMENT,
+            None,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.SWITCHED,
+            BrokerObjectState.REPLACEMENT_SWITCHED,
+            BrokerRegistryState.OLD,
+            1,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            BrokerObjectState.FINAL_COMPLETE,
+            BrokerRegistryState.OLD,
+            1,
+            BrokerRecoveryAction.CAS_REGISTRY,
+            None,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            BrokerObjectState.FINAL_COMPLETE,
+            BrokerRegistryState.CURRENT,
+            1,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.FINALIZE_INTENT,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.FINALIZE_INTENT,
+            BrokerObjectState.FINAL_COMPLETE,
+            BrokerRegistryState.CURRENT,
+            1,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.COMMITTED,
+            BrokerResultCode.COMMITTED,
+        ),
+        (
+            BrokerCheckpoint.ROLLBACK_INTENT,
+            BrokerObjectState.ROLLBACK_READY,
+            BrokerRegistryState.NOT_APPLICABLE,
+            1,
+            BrokerRecoveryAction.ROLLBACK,
+            None,
+            BrokerResultCode.PENDING,
+        ),
+        (
+            BrokerCheckpoint.ROLLBACK_INTENT,
+            BrokerObjectState.ROLLED_BACK,
+            BrokerRegistryState.NOT_APPLICABLE,
+            1,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.ROLLED_BACK,
+            BrokerResultCode.ROLLED_BACK,
+        ),
+        (
+            BrokerCheckpoint.DEPROVISION_INTENT,
+            BrokerObjectState.ABSENT,
+            BrokerRegistryState.NOT_APPLICABLE,
+            1,
+            BrokerRecoveryAction.PERSIST_CHECKPOINT,
+            BrokerCheckpoint.DEPROVISIONED,
+            BrokerResultCode.COMMITTED,
+        ),
     ],
 )
-def test_recovery_decision_covers_every_documented_crash_row(checkpoint, obj, reg, index, action, next_checkpoint, result):
+def test_recovery_decision_covers_every_documented_crash_row(
+    checkpoint, obj, reg, index, action, next_checkpoint, result
+):
     total = max(1, index)
     old = status(checkpoint, observation(), total, operation_for_checkpoint(checkpoint))
     decision = _decision(old, observation(obj, reg, index))
@@ -759,19 +1219,31 @@ def test_recovery_decision_covers_every_documented_crash_row(checkpoint, obj, re
 
 
 def test_recovery_default_is_blocked_drift():
-    decision = decide_broker_recovery(status(), observation(BrokerObjectState.DRIFT, BrokerRegistryState.FOREIGN, 0))
-    assert decision == RecoveryDecision(BrokerRecoveryAction.RETURN_BLOCKED, B2aRecoveryPhase.BLOCKED, BrokerCheckpoint.BLOCKED_DRIFT, BrokerResultCode.BLOCKED_DRIFT)
+    decision = decide_broker_recovery(
+        status(), observation(BrokerObjectState.DRIFT, BrokerRegistryState.FOREIGN, 0)
+    )
+    assert decision == RecoveryDecision(
+        BrokerRecoveryAction.RETURN_BLOCKED,
+        B2aRecoveryPhase.BLOCKED,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+        BrokerResultCode.BLOCKED_DRIFT,
+    )
 
 
 def test_rollback_intent_absent_observation_is_not_terminal_rollback():
-    decision = _decision(status(BrokerCheckpoint.ROLLBACK_INTENT), observation(BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1))
+    decision = _decision(
+        status(BrokerCheckpoint.ROLLBACK_INTENT),
+        observation(BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1),
+    )
     assert decision.action is BrokerRecoveryAction.RETURN_BLOCKED
 
 
 def test_deprovision_intent_with_final_complete_not_applicable_is_blocked():
     status_value = status(
         BrokerCheckpoint.DEPROVISION_INTENT,
-        observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1),
+        observation(
+            BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1
+        ),
         1,
         ChpbTransactionOperation.DEPROVISION,
     )
@@ -800,7 +1272,9 @@ def test_deprovision_requires_durable_cas_and_finalize_intents_before_removal():
     )
     assert decide_broker_recovery(
         cas_intent,
-        observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 0),
+        observation(
+            BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 0
+        ),
     ) == RecoveryDecision(
         BrokerRecoveryAction.PERSIST_CHECKPOINT,
         B2aRecoveryPhase.COMMIT_PENDING,
@@ -811,9 +1285,13 @@ def test_deprovision_requires_durable_cas_and_finalize_intents_before_removal():
         cas_intent,
         b2a_phase=B2aRecoveryPhase.COMMIT_PENDING,
         checkpoint=BrokerCheckpoint.FINALIZE_INTENT,
-        observation=observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 0),
+        observation=observation(
+            BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 0
+        ),
     )
-    assert decide_broker_recovery(finalize_intent, finalize_intent.observation) == RecoveryDecision(
+    assert decide_broker_recovery(
+        finalize_intent, finalize_intent.observation
+    ) == RecoveryDecision(
         BrokerRecoveryAction.DEPROVISION_HOME,
         None,
         None,
@@ -822,52 +1300,150 @@ def test_deprovision_requires_durable_cas_and_finalize_intents_before_removal():
 
 
 def test_publish_intent_with_only_final_persists_published():
-    d = decide_broker_recovery(status(BrokerCheckpoint.PUBLISH_INTENT), observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1))
+    d = decide_broker_recovery(
+        status(BrokerCheckpoint.PUBLISH_INTENT),
+        observation(
+            BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 1
+        ),
+    )
     assert d.next_checkpoint is BrokerCheckpoint.PUBLISHED
 
 
 def test_publish_intent_with_staging_and_final_blocks():
-    d = decide_broker_recovery(status(BrokerCheckpoint.PUBLISH_INTENT), observation(BrokerObjectState.STAGING_AND_FINAL, BrokerRegistryState.NOT_APPLICABLE, 1))
+    d = decide_broker_recovery(
+        status(BrokerCheckpoint.PUBLISH_INTENT),
+        observation(
+            BrokerObjectState.STAGING_AND_FINAL, BrokerRegistryState.NOT_APPLICABLE, 1
+        ),
+    )
     assert d.action is BrokerRecoveryAction.RETURN_BLOCKED
 
 
 def test_registry_foreign_generation_blocks():
-    d = decide_broker_recovery(status(BrokerCheckpoint.REGISTRY_CAS_INTENT), observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.FOREIGN, 1))
+    d = decide_broker_recovery(
+        status(BrokerCheckpoint.REGISTRY_CAS_INTENT),
+        observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.FOREIGN, 1),
+    )
     assert d.action is BrokerRecoveryAction.RETURN_BLOCKED
 
 
 def test_population_index_is_monotonic_and_complete_before_publish():
-    current = status(BrokerCheckpoint.POPULATE_PENDING, observation(BrokerObjectState.STAGING_PREFIX, BrokerRegistryState.NOT_APPLICABLE, 2), 3)
-    assert decide_broker_recovery(current, observation(BrokerObjectState.STAGING_PREFIX, BrokerRegistryState.NOT_APPLICABLE, 3)).action is BrokerRecoveryAction.RETURN_BLOCKED
-    assert decide_broker_recovery(current, observation(BrokerObjectState.STAGING_PREFIX, BrokerRegistryState.NOT_APPLICABLE, 0)).action is BrokerRecoveryAction.RETURN_BLOCKED
-    assert decide_broker_recovery(current, observation(BrokerObjectState.STAGING_COMPLETE, BrokerRegistryState.NOT_APPLICABLE, 3)).next_checkpoint is BrokerCheckpoint.PUBLISH_INTENT
+    current = status(
+        BrokerCheckpoint.POPULATE_PENDING,
+        observation(
+            BrokerObjectState.STAGING_PREFIX, BrokerRegistryState.NOT_APPLICABLE, 2
+        ),
+        3,
+    )
+    assert (
+        decide_broker_recovery(
+            current,
+            observation(
+                BrokerObjectState.STAGING_PREFIX, BrokerRegistryState.NOT_APPLICABLE, 3
+            ),
+        ).action
+        is BrokerRecoveryAction.RETURN_BLOCKED
+    )
+    assert (
+        decide_broker_recovery(
+            current,
+            observation(
+                BrokerObjectState.STAGING_PREFIX, BrokerRegistryState.NOT_APPLICABLE, 0
+            ),
+        ).action
+        is BrokerRecoveryAction.RETURN_BLOCKED
+    )
+    assert (
+        decide_broker_recovery(
+            current,
+            observation(
+                BrokerObjectState.STAGING_COMPLETE,
+                BrokerRegistryState.NOT_APPLICABLE,
+                3,
+            ),
+        ).next_checkpoint
+        is BrokerCheckpoint.PUBLISH_INTENT
+    )
 
 
 def test_terminal_recovery_is_idempotent_only_for_exact_observation():
-    committed = dataclasses.replace(status(BrokerCheckpoint.COMMITTED, observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1), 1), terminal_result=BrokerResultCode.COMMITTED)
-    assert decide_broker_recovery(committed, committed.observation).action is BrokerRecoveryAction.RETURN_COMMITTED
-    assert decide_broker_recovery(committed, observation(BrokerObjectState.DRIFT, BrokerRegistryState.CURRENT, 1)).action is BrokerRecoveryAction.RETURN_BLOCKED
+    committed = dataclasses.replace(
+        status(
+            BrokerCheckpoint.COMMITTED,
+            observation(
+                BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1
+            ),
+            1,
+        ),
+        terminal_result=BrokerResultCode.COMMITTED,
+    )
+    assert (
+        decide_broker_recovery(committed, committed.observation).action
+        is BrokerRecoveryAction.RETURN_COMMITTED
+    )
+    assert (
+        decide_broker_recovery(
+            committed,
+            observation(BrokerObjectState.DRIFT, BrokerRegistryState.CURRENT, 1),
+        ).action
+        is BrokerRecoveryAction.RETURN_BLOCKED
+    )
 
 
 def test_terminal_recovery_is_idempotent_for_deprovision_only_at_absent_not_applicable():
     deprovisioned = dataclasses.replace(
         status(
             BrokerCheckpoint.DEPROVISIONED,
-            observation(BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1),
+            observation(
+                BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1
+            ),
             1,
             operation=ChpbTransactionOperation.DEPROVISION,
         ),
         terminal_result=BrokerResultCode.COMMITTED,
     )
-    assert decide_broker_recovery(deprovisioned, deprovisioned.observation).action is BrokerRecoveryAction.RETURN_COMMITTED
-    assert decide_broker_recovery(deprovisioned, observation(BrokerObjectState.STAGING_EMPTY, BrokerRegistryState.NOT_APPLICABLE, 1)).action is BrokerRecoveryAction.RETURN_BLOCKED
+    assert (
+        decide_broker_recovery(deprovisioned, deprovisioned.observation).action
+        is BrokerRecoveryAction.RETURN_COMMITTED
+    )
+    assert (
+        decide_broker_recovery(
+            deprovisioned,
+            observation(
+                BrokerObjectState.STAGING_EMPTY, BrokerRegistryState.NOT_APPLICABLE, 1
+            ),
+        ).action
+        is BrokerRecoveryAction.RETURN_BLOCKED
+    )
 
 
 def test_deprovision_commits_when_absent_is_observed():
-    d = decide_broker_recovery(status(BrokerCheckpoint.DEPROVISION_INTENT, operation=ChpbTransactionOperation.DEPROVISION), observation(BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1))
-    assert d == RecoveryDecision(BrokerRecoveryAction.PERSIST_CHECKPOINT, B2aRecoveryPhase.DEPROVISIONED, BrokerCheckpoint.DEPROVISIONED, BrokerResultCode.COMMITTED)
+    d = decide_broker_recovery(
+        status(
+            BrokerCheckpoint.DEPROVISION_INTENT,
+            operation=ChpbTransactionOperation.DEPROVISION,
+        ),
+        observation(BrokerObjectState.ABSENT, BrokerRegistryState.NOT_APPLICABLE, 1),
+    )
+    assert d == RecoveryDecision(
+        BrokerRecoveryAction.PERSIST_CHECKPOINT,
+        B2aRecoveryPhase.DEPROVISIONED,
+        BrokerCheckpoint.DEPROVISIONED,
+        BrokerResultCode.COMMITTED,
+    )
 
 
 def test_deprovision_recovery_fails_closed_for_non_absent_terminal_state():
-    current = status(BrokerCheckpoint.DEPROVISION_INTENT, operation=ChpbTransactionOperation.DEPROVISION)
-    assert decide_broker_recovery(current, observation(BrokerObjectState.STAGING_EMPTY, BrokerRegistryState.NOT_APPLICABLE, 0)).action is BrokerRecoveryAction.RETURN_BLOCKED
+    current = status(
+        BrokerCheckpoint.DEPROVISION_INTENT,
+        operation=ChpbTransactionOperation.DEPROVISION,
+    )
+    assert (
+        decide_broker_recovery(
+            current,
+            observation(
+                BrokerObjectState.STAGING_EMPTY, BrokerRegistryState.NOT_APPLICABLE, 0
+            ),
+        ).action
+        is BrokerRecoveryAction.RETURN_BLOCKED
+    )

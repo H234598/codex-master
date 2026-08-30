@@ -349,7 +349,14 @@ class RecoveryDecision:
     result: BrokerResultCode
 
 
-BrokerRequest = AttestHomeRequest | QueryTransactionRequest | GetTerminalResultRequest | ProvisionHomeRequest | ReplaceHomeRequest | DeprovisionHomeRequest
+BrokerRequest = (
+    AttestHomeRequest
+    | QueryTransactionRequest
+    | GetTerminalResultRequest
+    | ProvisionHomeRequest
+    | ReplaceHomeRequest
+    | DeprovisionHomeRequest
+)
 ChpbMessage = BrokerRequest | BrokerReply | AgentStartClaim | AgentStartEnvelope
 
 
@@ -382,7 +389,9 @@ def _fail(code: ChpbValidationCode):
     raise ChpbValidationError(code)
 
 
-def _string(value: object, pattern: re.Pattern[str], max_bytes: int | None = None) -> str:
+def _string(
+    value: object, pattern: re.Pattern[str], max_bytes: int | None = None
+) -> str:
     if type(value) is not str:
         _fail(ChpbValidationCode.INVALID_TYPE)
     if max_bytes is not None and len(value.encode("utf-8")) > max_bytes:
@@ -549,7 +558,9 @@ def _validate_attestation(value: object) -> HomeAttestation:
     validate_transaction_binding(value.binding)
     if value.canonical_path != CANONICAL_AGENT_HOME:
         _fail(ChpbValidationCode.INVALID_FIELD)
-    if type(value.canonical_path) is not str or len(value.canonical_path.encode("utf-8")) != len(CANONICAL_AGENT_HOME.encode("utf-8")):
+    if type(value.canonical_path) is not str or len(
+        value.canonical_path.encode("utf-8")
+    ) != len(CANONICAL_AGENT_HOME.encode("utf-8")):
         _fail(ChpbValidationCode.INVALID_FIELD)
     _validate_directory(value.directory)
     _digest(value.manifest_digest, 64)
@@ -733,21 +744,33 @@ def _validate_request(
     _validate_expectation(value.expected)
     if has_binding:
         validate_transaction_binding(value.binding)
-        if kind is ChpbMessageKind.PROVISION_HOME and value.binding.operation is not ChpbTransactionOperation.PROVISION:
+        if (
+            kind is ChpbMessageKind.PROVISION_HOME
+            and value.binding.operation is not ChpbTransactionOperation.PROVISION
+        ):
             _fail(ChpbValidationCode.INVALID_BINDING)
-        if kind is ChpbMessageKind.REPLACE_HOME and value.binding.operation is not ChpbTransactionOperation.REPLACE:
+        if (
+            kind is ChpbMessageKind.REPLACE_HOME
+            and value.binding.operation is not ChpbTransactionOperation.REPLACE
+        ):
             _fail(ChpbValidationCode.INVALID_BINDING)
-        if kind is ChpbMessageKind.DEPROVISION_HOME and value.binding.operation is not ChpbTransactionOperation.DEPROVISION:
+        if (
+            kind is ChpbMessageKind.DEPROVISION_HOME
+            and value.binding.operation is not ChpbTransactionOperation.DEPROVISION
+        ):
             _fail(ChpbValidationCode.INVALID_BINDING)
         if value.binding.transaction_id != value.transaction_id:
             _fail(ChpbValidationCode.INVALID_BINDING)
         if (
             value.binding.principal.agent_id != value.expected.agent_id
-            or value.binding.principal.manifest_generation != value.expected.manifest_generation
+            or value.binding.principal.manifest_generation
+            != value.expected.manifest_generation
             or value.binding.principal.unit_generation != value.expected.unit_generation
             or value.binding.principal.fencing_epoch != value.expected.fencing_epoch
-            or value.binding.policy.policy_generation != value.expected.policy_generation
-            or value.binding.policy.projection_digest != value.expected.projection_digest
+            or value.binding.policy.policy_generation
+            != value.expected.policy_generation
+            or value.binding.policy.projection_digest
+            != value.expected.projection_digest
         ):
             _fail(ChpbValidationCode.INVALID_BINDING)
     return value
@@ -757,15 +780,31 @@ def validate_chpb_message(value: object) -> ChpbMessage:
     if type(value) is AttestHomeRequest:
         return _validate_request(value, AttestHomeRequest, ChpbMessageKind.ATTEST_HOME)
     if type(value) is QueryTransactionRequest:
-        return _validate_request(value, QueryTransactionRequest, ChpbMessageKind.QUERY_TRANSACTION)
+        return _validate_request(
+            value, QueryTransactionRequest, ChpbMessageKind.QUERY_TRANSACTION
+        )
     if type(value) is GetTerminalResultRequest:
-        return _validate_request(value, GetTerminalResultRequest, ChpbMessageKind.GET_TERMINAL_RESULT)
+        return _validate_request(
+            value, GetTerminalResultRequest, ChpbMessageKind.GET_TERMINAL_RESULT
+        )
     if type(value) is ProvisionHomeRequest:
-        return _validate_request(value, ProvisionHomeRequest, ChpbMessageKind.PROVISION_HOME, has_binding=True)
+        return _validate_request(
+            value,
+            ProvisionHomeRequest,
+            ChpbMessageKind.PROVISION_HOME,
+            has_binding=True,
+        )
     if type(value) is ReplaceHomeRequest:
-        return _validate_request(value, ReplaceHomeRequest, ChpbMessageKind.REPLACE_HOME, has_binding=True)
+        return _validate_request(
+            value, ReplaceHomeRequest, ChpbMessageKind.REPLACE_HOME, has_binding=True
+        )
     if type(value) is DeprovisionHomeRequest:
-        return _validate_request(value, DeprovisionHomeRequest, ChpbMessageKind.DEPROVISION_HOME, has_binding=True)
+        return _validate_request(
+            value,
+            DeprovisionHomeRequest,
+            ChpbMessageKind.DEPROVISION_HOME,
+            has_binding=True,
+        )
     if type(value) is AgentStartClaim:
         return _validate_agent_start_claim(value)
     if type(value) is AgentStartEnvelope:
@@ -774,7 +813,10 @@ def validate_chpb_message(value: object) -> ChpbMessage:
         _fail(ChpbValidationCode.INVALID_TYPE)
     if value.protocol != CHPB_PROTOCOL:
         _fail(ChpbValidationCode.UNSUPPORTED_PROTOCOL)
-    if type(value.kind) is not ChpbMessageKind or value.kind is not ChpbMessageKind.REPLY:
+    if (
+        type(value.kind) is not ChpbMessageKind
+        or value.kind is not ChpbMessageKind.REPLY
+    ):
         _fail(ChpbValidationCode.INVALID_FIELD)
     _digest(value.request_id, 32)
     _enum(value.result, BrokerResultCode)
@@ -783,15 +825,31 @@ def validate_chpb_message(value: object) -> ChpbMessage:
     if value.attestation is not None:
         _validate_attestation(value.attestation)
     if value.result is BrokerResultCode.OK:
-        if value.transaction is None or value.attestation is None or value.transaction.checkpoint is not BrokerCheckpoint.COMMITTED:
+        if (
+            value.transaction is None
+            or value.attestation is None
+            or value.transaction.checkpoint is not BrokerCheckpoint.COMMITTED
+        ):
             _fail(ChpbValidationCode.INVALID_FIELD)
         if value.attestation.binding != value.transaction.binding:
             _fail(ChpbValidationCode.INVALID_BINDING)
     elif value.result is BrokerResultCode.PENDING:
-        if value.transaction is None or value.attestation is not None or value.transaction.terminal_result is not None:
+        if (
+            value.transaction is None
+            or value.attestation is not None
+            or value.transaction.terminal_result is not None
+        ):
             _fail(ChpbValidationCode.INVALID_FIELD)
-    elif value.result in (BrokerResultCode.COMMITTED, BrokerResultCode.ROLLED_BACK, BrokerResultCode.BLOCKED_DRIFT):
-        if value.transaction is None or value.transaction.terminal_result is not value.result or value.attestation is not None:
+    elif value.result in (
+        BrokerResultCode.COMMITTED,
+        BrokerResultCode.ROLLED_BACK,
+        BrokerResultCode.BLOCKED_DRIFT,
+    ):
+        if (
+            value.transaction is None
+            or value.transaction.terminal_result is not value.result
+            or value.attestation is not None
+        ):
             _fail(ChpbValidationCode.INVALID_FIELD)
     elif value.transaction is not None or value.attestation is not None:
         _fail(ChpbValidationCode.INVALID_FIELD)
@@ -799,19 +857,44 @@ def validate_chpb_message(value: object) -> ChpbMessage:
 
 
 def _principal_doc(value: PrincipalBinding) -> dict[str, object]:
-    return {"agent_id": value.agent_id, "cgroup_dev": value.cgroup_dev, "cgroup_ino": value.cgroup_ino, "fencing_epoch": value.fencing_epoch, "invocation_id": value.invocation_id, "manifest_generation": value.manifest_generation, "mcs_pair": value.mcs_pair, "unit_generation": value.unit_generation}
+    return {
+        "agent_id": value.agent_id,
+        "cgroup_dev": value.cgroup_dev,
+        "cgroup_ino": value.cgroup_ino,
+        "fencing_epoch": value.fencing_epoch,
+        "invocation_id": value.invocation_id,
+        "manifest_generation": value.manifest_generation,
+        "mcs_pair": value.mcs_pair,
+        "unit_generation": value.unit_generation,
+    }
 
 
 def _policy_doc(value: PolicyBinding) -> dict[str, object]:
-    return {"policy_generation": value.policy_generation, "projection_digest": value.projection_digest}
+    return {
+        "policy_generation": value.policy_generation,
+        "projection_digest": value.projection_digest,
+    }
 
 
 def _binding_doc(value: TransactionBinding) -> dict[str, object]:
-    return {"operation": value.operation.value, "policy": _policy_doc(value.policy), "principal": _principal_doc(value.principal), "store_uuid": value.store_uuid, "transaction_id": value.transaction_id}
+    return {
+        "operation": value.operation.value,
+        "policy": _policy_doc(value.policy),
+        "principal": _principal_doc(value.principal),
+        "store_uuid": value.store_uuid,
+        "transaction_id": value.transaction_id,
+    }
 
 
 def _expectation_doc(value: BindingExpectation) -> dict[str, object]:
-    return {"agent_id": value.agent_id, "fencing_epoch": value.fencing_epoch, "manifest_generation": value.manifest_generation, "policy_generation": value.policy_generation, "projection_digest": value.projection_digest, "unit_generation": value.unit_generation}
+    return {
+        "agent_id": value.agent_id,
+        "fencing_epoch": value.fencing_epoch,
+        "manifest_generation": value.manifest_generation,
+        "policy_generation": value.policy_generation,
+        "projection_digest": value.projection_digest,
+        "unit_generation": value.unit_generation,
+    }
 
 
 def _directory_doc(value: DirectoryIdentity) -> dict[str, object]:
@@ -819,15 +902,34 @@ def _directory_doc(value: DirectoryIdentity) -> dict[str, object]:
 
 
 def _observation_doc(value: BrokerObservation) -> dict[str, object]:
-    return {"object_state": value.object_state.value, "population_index": value.population_index, "registry_state": value.registry_state.value}
+    return {
+        "object_state": value.object_state.value,
+        "population_index": value.population_index,
+        "registry_state": value.registry_state.value,
+    }
 
 
 def _status_doc(value: TransactionStatus) -> dict[str, object]:
-    return {"binding": _binding_doc(value.binding), "b2a_phase": value.b2a_phase.value, "checkpoint": value.checkpoint.value, "observation": _observation_doc(value.observation), "population_total": value.population_total, "terminal_result": value.terminal_result.value if value.terminal_result is not None else None}
+    return {
+        "binding": _binding_doc(value.binding),
+        "b2a_phase": value.b2a_phase.value,
+        "checkpoint": value.checkpoint.value,
+        "observation": _observation_doc(value.observation),
+        "population_total": value.population_total,
+        "terminal_result": value.terminal_result.value
+        if value.terminal_result is not None
+        else None,
+    }
 
 
 def _attestation_doc(value: HomeAttestation) -> dict[str, object]:
-    return {"binding": _binding_doc(value.binding), "canonical_path": value.canonical_path, "directory": _directory_doc(value.directory), "manifest_digest": value.manifest_digest, "mcs_pair": value.mcs_pair}
+    return {
+        "binding": _binding_doc(value.binding),
+        "canonical_path": value.canonical_path,
+        "directory": _directory_doc(value.directory),
+        "manifest_digest": value.manifest_digest,
+        "mcs_pair": value.mcs_pair,
+    }
 
 
 def _identity_doc(value: BrokerIdentity) -> dict[str, object]:
@@ -885,19 +987,52 @@ def _message_doc(value: ChpbMessage) -> dict[str, object]:
         QueryTransactionRequest,
         GetTerminalResultRequest,
     ):
-        return {"expected": _expectation_doc(value.expected), "kind": value.kind.value, "protocol": value.protocol, "request_id": value.request_id, "transaction_id": value.transaction_id}
+        return {
+            "expected": _expectation_doc(value.expected),
+            "kind": value.kind.value,
+            "protocol": value.protocol,
+            "request_id": value.request_id,
+            "transaction_id": value.transaction_id,
+        }
     if type(value) in (
         ProvisionHomeRequest,
         ReplaceHomeRequest,
         DeprovisionHomeRequest,
     ):
-        return {"binding": _binding_doc(value.binding), "expected": _expectation_doc(value.expected), "kind": value.kind.value, "protocol": value.protocol, "request_id": value.request_id, "transaction_id": value.transaction_id}
-    return {"attestation": _attestation_doc(value.attestation) if value.attestation is not None else None, "kind": value.kind.value, "protocol": value.protocol, "request_id": value.request_id, "result": value.result.value, "transaction": _status_doc(value.transaction) if value.transaction is not None else None}
+        return {
+            "binding": _binding_doc(value.binding),
+            "expected": _expectation_doc(value.expected),
+            "kind": value.kind.value,
+            "protocol": value.protocol,
+            "request_id": value.request_id,
+            "transaction_id": value.transaction_id,
+        }
+    return {
+        "attestation": _attestation_doc(value.attestation)
+        if value.attestation is not None
+        else None,
+        "kind": value.kind.value,
+        "protocol": value.protocol,
+        "request_id": value.request_id,
+        "result": value.result.value,
+        "transaction": _status_doc(value.transaction)
+        if value.transaction is not None
+        else None,
+    }
 
 
 def encode_chpb_message(message: ChpbMessage) -> bytes:
     validate_chpb_message(message)
-    raw = (json.dumps(_message_doc(message), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+    raw = (
+        json.dumps(
+            _message_doc(message),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
     if len(raw) > MAX_CHPB_MESSAGE_BYTES:
         _fail(ChpbValidationCode.MESSAGE_TOO_LARGE)
     return raw
@@ -942,7 +1077,11 @@ def _keys(document: object, expected: set[str]) -> dict[str, object]:
         _fail(ChpbValidationCode.INVALID_TYPE)
     actual = set(document)
     if actual != expected:
-        _fail(ChpbValidationCode.UNKNOWN_FIELD if not actual <= expected else ChpbValidationCode.INVALID_FIELD)
+        _fail(
+            ChpbValidationCode.UNKNOWN_FIELD
+            if not actual <= expected
+            else ChpbValidationCode.INVALID_FIELD
+        )
     return document
 
 
@@ -956,12 +1095,35 @@ def _as_enum(value: object, klass: type[Enum]):
 
 
 def _principal_from(document: object) -> PrincipalBinding:
-    doc = _keys(document, {"agent_id", "cgroup_dev", "cgroup_ino", "fencing_epoch", "invocation_id", "manifest_generation", "mcs_pair", "unit_generation"})
-    return PrincipalBinding(doc["agent_id"], doc["manifest_generation"], doc["unit_generation"], doc["cgroup_dev"], doc["cgroup_ino"], doc["invocation_id"], doc["mcs_pair"], doc["fencing_epoch"])
+    doc = _keys(
+        document,
+        {
+            "agent_id",
+            "cgroup_dev",
+            "cgroup_ino",
+            "fencing_epoch",
+            "invocation_id",
+            "manifest_generation",
+            "mcs_pair",
+            "unit_generation",
+        },
+    )
+    return PrincipalBinding(
+        doc["agent_id"],
+        doc["manifest_generation"],
+        doc["unit_generation"],
+        doc["cgroup_dev"],
+        doc["cgroup_ino"],
+        doc["invocation_id"],
+        doc["mcs_pair"],
+        doc["fencing_epoch"],
+    )
 
 
 def _binding_from(document: object) -> TransactionBinding:
-    doc = _keys(document, {"operation", "policy", "principal", "store_uuid", "transaction_id"})
+    doc = _keys(
+        document, {"operation", "policy", "principal", "store_uuid", "transaction_id"}
+    )
     return TransactionBinding(
         _as_enum(doc["operation"], ChpbTransactionOperation),
         doc["transaction_id"],
@@ -977,8 +1139,25 @@ def _policy_from(document: object) -> PolicyBinding:
 
 
 def _expectation_from(document: object) -> BindingExpectation:
-    doc = _keys(document, {"agent_id", "fencing_epoch", "manifest_generation", "policy_generation", "projection_digest", "unit_generation"})
-    return BindingExpectation(doc["agent_id"], doc["manifest_generation"], doc["unit_generation"], doc["policy_generation"], doc["projection_digest"], doc["fencing_epoch"])
+    doc = _keys(
+        document,
+        {
+            "agent_id",
+            "fencing_epoch",
+            "manifest_generation",
+            "policy_generation",
+            "projection_digest",
+            "unit_generation",
+        },
+    )
+    return BindingExpectation(
+        doc["agent_id"],
+        doc["manifest_generation"],
+        doc["unit_generation"],
+        doc["policy_generation"],
+        doc["projection_digest"],
+        doc["fencing_epoch"],
+    )
 
 
 def _directory_from(document: object) -> DirectoryIdentity:
@@ -988,18 +1167,52 @@ def _directory_from(document: object) -> DirectoryIdentity:
 
 def _observation_from(document: object) -> BrokerObservation:
     doc = _keys(document, {"object_state", "population_index", "registry_state"})
-    return BrokerObservation(_as_enum(doc["object_state"], BrokerObjectState), _as_enum(doc["registry_state"], BrokerRegistryState), doc["population_index"])
+    return BrokerObservation(
+        _as_enum(doc["object_state"], BrokerObjectState),
+        _as_enum(doc["registry_state"], BrokerRegistryState),
+        doc["population_index"],
+    )
 
 
 def _status_from(document: object) -> TransactionStatus:
-    doc = _keys(document, {"b2a_phase", "binding", "checkpoint", "observation", "population_total", "terminal_result"})
-    terminal = None if doc["terminal_result"] is None else _as_enum(doc["terminal_result"], BrokerResultCode)
-    return TransactionStatus(_binding_from(doc["binding"]), _as_enum(doc["b2a_phase"], B2aRecoveryPhase), _as_enum(doc["checkpoint"], BrokerCheckpoint), _observation_from(doc["observation"]), doc["population_total"], terminal)
+    doc = _keys(
+        document,
+        {
+            "b2a_phase",
+            "binding",
+            "checkpoint",
+            "observation",
+            "population_total",
+            "terminal_result",
+        },
+    )
+    terminal = (
+        None
+        if doc["terminal_result"] is None
+        else _as_enum(doc["terminal_result"], BrokerResultCode)
+    )
+    return TransactionStatus(
+        _binding_from(doc["binding"]),
+        _as_enum(doc["b2a_phase"], B2aRecoveryPhase),
+        _as_enum(doc["checkpoint"], BrokerCheckpoint),
+        _observation_from(doc["observation"]),
+        doc["population_total"],
+        terminal,
+    )
 
 
 def _attestation_from(document: object) -> HomeAttestation:
-    doc = _keys(document, {"binding", "canonical_path", "directory", "manifest_digest", "mcs_pair"})
-    return HomeAttestation(_binding_from(doc["binding"]), doc["canonical_path"], _directory_from(doc["directory"]), doc["manifest_digest"], doc["mcs_pair"])
+    doc = _keys(
+        document,
+        {"binding", "canonical_path", "directory", "manifest_digest", "mcs_pair"},
+    )
+    return HomeAttestation(
+        _binding_from(doc["binding"]),
+        doc["canonical_path"],
+        _directory_from(doc["directory"]),
+        doc["manifest_digest"],
+        doc["mcs_pair"],
+    )
 
 
 def _identity_from(document: object) -> BrokerIdentity:
@@ -1052,10 +1265,26 @@ def _message_from(document: object) -> ChpbMessage:
         _fail(ChpbValidationCode.INVALID_TYPE)
     kind = _as_enum(document.get("kind"), ChpbMessageKind)
     if kind is ChpbMessageKind.REPLY:
-        doc = _keys(document, {"attestation", "kind", "protocol", "request_id", "result", "transaction"})
-        transaction = None if doc["transaction"] is None else _status_from(doc["transaction"])
-        attestation = None if doc["attestation"] is None else _attestation_from(doc["attestation"])
-        return BrokerReply(doc["protocol"], kind, doc["request_id"], _as_enum(doc["result"], BrokerResultCode), transaction, attestation)
+        doc = _keys(
+            document,
+            {"attestation", "kind", "protocol", "request_id", "result", "transaction"},
+        )
+        transaction = (
+            None if doc["transaction"] is None else _status_from(doc["transaction"])
+        )
+        attestation = (
+            None
+            if doc["attestation"] is None
+            else _attestation_from(doc["attestation"])
+        )
+        return BrokerReply(
+            doc["protocol"],
+            kind,
+            doc["request_id"],
+            _as_enum(doc["result"], BrokerResultCode),
+            transaction,
+            attestation,
+        )
     if kind is ChpbMessageKind.AGENT_START_CLAIM:
         doc = _keys(document, {"kind", "protocol", "request_id"})
         return AgentStartClaim(doc["protocol"], kind, doc["request_id"])
@@ -1112,15 +1341,42 @@ def _message_from(document: object) -> ChpbMessage:
     if klass is None:
         _fail(ChpbValidationCode.INVALID_FIELD)
     if kind is ChpbMessageKind.ATTEST_HOME:
-        doc = _keys(document, {"expected", "kind", "protocol", "request_id", "transaction_id"})
-        return klass(doc["protocol"], kind, doc["request_id"], doc["transaction_id"], _expectation_from(doc["expected"]))
+        doc = _keys(
+            document, {"expected", "kind", "protocol", "request_id", "transaction_id"}
+        )
+        return klass(
+            doc["protocol"],
+            kind,
+            doc["request_id"],
+            doc["transaction_id"],
+            _expectation_from(doc["expected"]),
+        )
     if kind is ChpbMessageKind.QUERY_TRANSACTION:
-        doc = _keys(document, {"expected", "kind", "protocol", "request_id", "transaction_id"})
-        return klass(doc["protocol"], kind, doc["request_id"], doc["transaction_id"], _expectation_from(doc["expected"]))
+        doc = _keys(
+            document, {"expected", "kind", "protocol", "request_id", "transaction_id"}
+        )
+        return klass(
+            doc["protocol"],
+            kind,
+            doc["request_id"],
+            doc["transaction_id"],
+            _expectation_from(doc["expected"]),
+        )
     if kind is ChpbMessageKind.GET_TERMINAL_RESULT:
-        doc = _keys(document, {"expected", "kind", "protocol", "request_id", "transaction_id"})
-        return klass(doc["protocol"], kind, doc["request_id"], doc["transaction_id"], _expectation_from(doc["expected"]))
-    doc = _keys(document, {"binding", "expected", "kind", "protocol", "request_id", "transaction_id"})
+        doc = _keys(
+            document, {"expected", "kind", "protocol", "request_id", "transaction_id"}
+        )
+        return klass(
+            doc["protocol"],
+            kind,
+            doc["request_id"],
+            doc["transaction_id"],
+            _expectation_from(doc["expected"]),
+        )
+    doc = _keys(
+        document,
+        {"binding", "expected", "kind", "protocol", "request_id", "transaction_id"},
+    )
     return klass(
         doc["protocol"],
         kind,
@@ -1135,7 +1391,11 @@ def decode_chpb_message(raw: bytes) -> ChpbMessage:
     if type(raw) is not bytes:
         _fail(ChpbValidationCode.INVALID_TYPE)
     if not 1 <= len(raw) <= MAX_CHPB_MESSAGE_BYTES:
-        _fail(ChpbValidationCode.MESSAGE_TOO_LARGE if len(raw) > MAX_CHPB_MESSAGE_BYTES else ChpbValidationCode.INVALID_FIELD)
+        _fail(
+            ChpbValidationCode.MESSAGE_TOO_LARGE
+            if len(raw) > MAX_CHPB_MESSAGE_BYTES
+            else ChpbValidationCode.INVALID_FIELD
+        )
     try:
         text = raw.decode("utf-8", "strict")
     except UnicodeDecodeError:
@@ -1189,19 +1449,68 @@ def b2a_phase_for_checkpoint(checkpoint: BrokerCheckpoint) -> B2aRecoveryPhase:
 
 
 _TRANSITIONS = {
-    BrokerCheckpoint.CREATE_INTENT: {BrokerCheckpoint.STAGING_PINNED, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.STAGING_PINNED: {BrokerCheckpoint.POPULATE_PENDING, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.POPULATE_PENDING: {BrokerCheckpoint.POPULATE_PENDING, BrokerCheckpoint.PUBLISH_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.PUBLISH_INTENT: {BrokerCheckpoint.PUBLISHED, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.PUBLISHED: {BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT: {BrokerCheckpoint.REPLACEMENT_PREPARED, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.REPLACEMENT_PREPARED: {BrokerCheckpoint.SWITCH_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.SWITCH_INTENT: {BrokerCheckpoint.SWITCHED, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.SWITCHED: {BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.REGISTRY_CAS_INTENT: {BrokerCheckpoint.FINALIZE_INTENT, BrokerCheckpoint.ROLLBACK_INTENT, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.FINALIZE_INTENT: {BrokerCheckpoint.COMMITTED, BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.ROLLBACK_INTENT: {BrokerCheckpoint.ROLLED_BACK, BrokerCheckpoint.BLOCKED_DRIFT},
-    BrokerCheckpoint.DEPROVISION_INTENT: {BrokerCheckpoint.REGISTRY_CAS_INTENT, BrokerCheckpoint.DEPROVISIONED, BrokerCheckpoint.BLOCKED_DRIFT},
+    BrokerCheckpoint.CREATE_INTENT: {
+        BrokerCheckpoint.STAGING_PINNED,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.STAGING_PINNED: {
+        BrokerCheckpoint.POPULATE_PENDING,
+        BrokerCheckpoint.ROLLBACK_INTENT,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.POPULATE_PENDING: {
+        BrokerCheckpoint.POPULATE_PENDING,
+        BrokerCheckpoint.PUBLISH_INTENT,
+        BrokerCheckpoint.ROLLBACK_INTENT,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.PUBLISH_INTENT: {
+        BrokerCheckpoint.PUBLISHED,
+        BrokerCheckpoint.ROLLBACK_INTENT,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.PUBLISHED: {
+        BrokerCheckpoint.REGISTRY_CAS_INTENT,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT: {
+        BrokerCheckpoint.REPLACEMENT_PREPARED,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.REPLACEMENT_PREPARED: {
+        BrokerCheckpoint.SWITCH_INTENT,
+        BrokerCheckpoint.ROLLBACK_INTENT,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.SWITCH_INTENT: {
+        BrokerCheckpoint.SWITCHED,
+        BrokerCheckpoint.ROLLBACK_INTENT,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.SWITCHED: {
+        BrokerCheckpoint.REGISTRY_CAS_INTENT,
+        BrokerCheckpoint.ROLLBACK_INTENT,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.REGISTRY_CAS_INTENT: {
+        BrokerCheckpoint.FINALIZE_INTENT,
+        BrokerCheckpoint.ROLLBACK_INTENT,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.FINALIZE_INTENT: {
+        BrokerCheckpoint.COMMITTED,
+        BrokerCheckpoint.DEPROVISIONED,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.ROLLBACK_INTENT: {
+        BrokerCheckpoint.ROLLED_BACK,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
+    BrokerCheckpoint.DEPROVISION_INTENT: {
+        BrokerCheckpoint.REGISTRY_CAS_INTENT,
+        BrokerCheckpoint.DEPROVISIONED,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+    },
     BrokerCheckpoint.DEPROVISIONED: {BrokerCheckpoint.DEPROVISIONED},
     BrokerCheckpoint.COMMITTED: {BrokerCheckpoint.COMMITTED},
     BrokerCheckpoint.ROLLED_BACK: {BrokerCheckpoint.ROLLED_BACK},
@@ -1209,7 +1518,9 @@ _TRANSITIONS = {
 }
 
 
-def is_checkpoint_transition_allowed(current: BrokerCheckpoint, target: BrokerCheckpoint) -> bool:
+def is_checkpoint_transition_allowed(
+    current: BrokerCheckpoint, target: BrokerCheckpoint
+) -> bool:
     _enum(current, BrokerCheckpoint)
     _enum(target, BrokerCheckpoint)
     return target in _TRANSITIONS[current]
@@ -1221,10 +1532,16 @@ def _decision(action, checkpoint, result=BrokerResultCode.PENDING):
 
 
 def _blocked_decision():
-    return _decision(BrokerRecoveryAction.RETURN_BLOCKED, BrokerCheckpoint.BLOCKED_DRIFT, BrokerResultCode.BLOCKED_DRIFT)
+    return _decision(
+        BrokerRecoveryAction.RETURN_BLOCKED,
+        BrokerCheckpoint.BLOCKED_DRIFT,
+        BrokerResultCode.BLOCKED_DRIFT,
+    )
 
 
-def decide_broker_recovery(status: TransactionStatus, observation: BrokerObservation) -> RecoveryDecision:
+def decide_broker_recovery(
+    status: TransactionStatus, observation: BrokerObservation
+) -> RecoveryDecision:
     try:
         validate_transaction_status(status)
         _validate_observation(observation)
@@ -1245,77 +1562,182 @@ def decide_broker_recovery(status: TransactionStatus, observation: BrokerObserva
         if obj is BrokerObjectState.ABSENT and reg is na:
             return _decision(BrokerRecoveryAction.CREATE_STAGING, None)
         if obj is BrokerObjectState.STAGING_EMPTY and reg is na:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.STAGING_PINNED)
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.STAGING_PINNED
+            )
     elif checkpoint is BrokerCheckpoint.STAGING_PINNED:
         if obj is BrokerObjectState.STAGING_EMPTY and reg is na:
             return _decision(BrokerRecoveryAction.POPULATE_NEXT, None)
         if obj is BrokerObjectState.STAGING_PREFIX and reg is na:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.POPULATE_PENDING)
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                BrokerCheckpoint.POPULATE_PENDING,
+            )
     elif checkpoint is BrokerCheckpoint.POPULATE_PENDING:
         if obj is BrokerObjectState.STAGING_PREFIX and reg is na and index < total:
             return _decision(BrokerRecoveryAction.POPULATE_NEXT, None)
         if obj is BrokerObjectState.STAGING_COMPLETE and reg is na and index == total:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.PUBLISH_INTENT)
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.PUBLISH_INTENT
+            )
     elif checkpoint is BrokerCheckpoint.PUBLISH_INTENT:
         if obj is BrokerObjectState.STAGING_COMPLETE and reg is na:
             return _decision(BrokerRecoveryAction.PUBLISH_HOME, None)
         if obj is BrokerObjectState.FINAL_COMPLETE and reg is na:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.PUBLISHED)
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.PUBLISHED
+            )
     elif checkpoint is BrokerCheckpoint.PUBLISHED:
         if obj is BrokerObjectState.FINAL_COMPLETE and reg is BrokerRegistryState.OLD:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.REGISTRY_CAS_INTENT)
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            )
     elif checkpoint is BrokerCheckpoint.REPLACEMENT_PREPARE_INTENT:
         if obj is BrokerObjectState.REPLACEMENT_ORIGINAL and reg is na:
             return _decision(BrokerRecoveryAction.PREPARE_REPLACEMENT, None)
         if obj is BrokerObjectState.REPLACEMENT_PREPARED and reg is na:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.REPLACEMENT_PREPARED)
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                BrokerCheckpoint.REPLACEMENT_PREPARED,
+            )
     elif checkpoint is BrokerCheckpoint.REPLACEMENT_PREPARED:
         if obj is BrokerObjectState.REPLACEMENT_PREPARED and reg is na:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.SWITCH_INTENT)
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.SWITCH_INTENT
+            )
     elif checkpoint is BrokerCheckpoint.SWITCH_INTENT:
         if obj is BrokerObjectState.REPLACEMENT_PREPARED and reg is na:
             return _decision(BrokerRecoveryAction.SWITCH_REPLACEMENT, None)
         if obj is BrokerObjectState.REPLACEMENT_SWITCHED and reg is na:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.SWITCHED)
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.SWITCHED
+            )
     elif checkpoint is BrokerCheckpoint.SWITCHED:
-        if obj is BrokerObjectState.REPLACEMENT_SWITCHED and reg is BrokerRegistryState.OLD:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.REGISTRY_CAS_INTENT)
+        if (
+            obj is BrokerObjectState.REPLACEMENT_SWITCHED
+            and reg is BrokerRegistryState.OLD
+        ):
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            )
     elif checkpoint is BrokerCheckpoint.REGISTRY_CAS_INTENT:
         if status.binding.operation is ChpbTransactionOperation.DEPROVISION:
-            if obj is BrokerObjectState.FINAL_COMPLETE and reg is BrokerRegistryState.CURRENT:
+            if (
+                obj is BrokerObjectState.FINAL_COMPLETE
+                and reg is BrokerRegistryState.CURRENT
+            ):
                 return _decision(BrokerRecoveryAction.CAS_REGISTRY, None)
             if obj is BrokerObjectState.FINAL_COMPLETE and reg is na:
-                return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.FINALIZE_INTENT)
+                return _decision(
+                    BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                    BrokerCheckpoint.FINALIZE_INTENT,
+                )
         else:
-            if obj in (BrokerObjectState.FINAL_COMPLETE, BrokerObjectState.REPLACEMENT_SWITCHED) and reg is BrokerRegistryState.OLD:
+            if (
+                obj
+                in (
+                    BrokerObjectState.FINAL_COMPLETE,
+                    BrokerObjectState.REPLACEMENT_SWITCHED,
+                )
+                and reg is BrokerRegistryState.OLD
+            ):
                 return _decision(BrokerRecoveryAction.CAS_REGISTRY, None)
-            if obj in (BrokerObjectState.FINAL_COMPLETE, BrokerObjectState.REPLACEMENT_SWITCHED) and reg is BrokerRegistryState.CURRENT:
-                return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.FINALIZE_INTENT)
+            if (
+                obj
+                in (
+                    BrokerObjectState.FINAL_COMPLETE,
+                    BrokerObjectState.REPLACEMENT_SWITCHED,
+                )
+                and reg is BrokerRegistryState.CURRENT
+            ):
+                return _decision(
+                    BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                    BrokerCheckpoint.FINALIZE_INTENT,
+                )
     elif checkpoint is BrokerCheckpoint.FINALIZE_INTENT:
         if status.binding.operation is ChpbTransactionOperation.DEPROVISION:
             if obj is BrokerObjectState.FINAL_COMPLETE and reg is na:
                 return _decision(BrokerRecoveryAction.DEPROVISION_HOME, None)
             if obj is BrokerObjectState.ABSENT and reg is na:
-                return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.DEPROVISIONED, BrokerResultCode.COMMITTED)
-        elif obj in (BrokerObjectState.FINAL_COMPLETE, BrokerObjectState.REPLACEMENT_SWITCHED) and reg is BrokerRegistryState.CURRENT:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.COMMITTED, BrokerResultCode.COMMITTED)
+                return _decision(
+                    BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                    BrokerCheckpoint.DEPROVISIONED,
+                    BrokerResultCode.COMMITTED,
+                )
+        elif (
+            obj
+            in (
+                BrokerObjectState.FINAL_COMPLETE,
+                BrokerObjectState.REPLACEMENT_SWITCHED,
+            )
+            and reg is BrokerRegistryState.CURRENT
+        ):
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                BrokerCheckpoint.COMMITTED,
+                BrokerResultCode.COMMITTED,
+            )
     elif checkpoint is BrokerCheckpoint.ROLLBACK_INTENT:
         if obj is BrokerObjectState.ROLLBACK_READY and reg is na:
             return _decision(BrokerRecoveryAction.ROLLBACK, None)
         if obj is BrokerObjectState.ROLLED_BACK and reg is na:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.ROLLED_BACK, BrokerResultCode.ROLLED_BACK)
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                BrokerCheckpoint.ROLLED_BACK,
+                BrokerResultCode.ROLLED_BACK,
+            )
     elif checkpoint is BrokerCheckpoint.DEPROVISION_INTENT:
-        if obj is BrokerObjectState.FINAL_COMPLETE and reg is BrokerRegistryState.CURRENT:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.REGISTRY_CAS_INTENT)
+        if (
+            obj is BrokerObjectState.FINAL_COMPLETE
+            and reg is BrokerRegistryState.CURRENT
+        ):
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                BrokerCheckpoint.REGISTRY_CAS_INTENT,
+            )
         if obj is BrokerObjectState.ABSENT and reg is na:
-            return _decision(BrokerRecoveryAction.PERSIST_CHECKPOINT, BrokerCheckpoint.DEPROVISIONED, BrokerResultCode.COMMITTED)
+            return _decision(
+                BrokerRecoveryAction.PERSIST_CHECKPOINT,
+                BrokerCheckpoint.DEPROVISIONED,
+                BrokerResultCode.COMMITTED,
+            )
     elif checkpoint is BrokerCheckpoint.COMMITTED:
-        if observation == status.observation and obj in (BrokerObjectState.FINAL_COMPLETE, BrokerObjectState.REPLACEMENT_SWITCHED) and reg is BrokerRegistryState.CURRENT:
-            return _decision(BrokerRecoveryAction.RETURN_COMMITTED, BrokerCheckpoint.COMMITTED, BrokerResultCode.COMMITTED)
+        if (
+            observation == status.observation
+            and obj
+            in (
+                BrokerObjectState.FINAL_COMPLETE,
+                BrokerObjectState.REPLACEMENT_SWITCHED,
+            )
+            and reg is BrokerRegistryState.CURRENT
+        ):
+            return _decision(
+                BrokerRecoveryAction.RETURN_COMMITTED,
+                BrokerCheckpoint.COMMITTED,
+                BrokerResultCode.COMMITTED,
+            )
     elif checkpoint is BrokerCheckpoint.ROLLED_BACK:
-        if observation == status.observation and obj is BrokerObjectState.ROLLED_BACK and reg is na:
-            return _decision(BrokerRecoveryAction.RETURN_ROLLED_BACK, BrokerCheckpoint.ROLLED_BACK, BrokerResultCode.ROLLED_BACK)
+        if (
+            observation == status.observation
+            and obj is BrokerObjectState.ROLLED_BACK
+            and reg is na
+        ):
+            return _decision(
+                BrokerRecoveryAction.RETURN_ROLLED_BACK,
+                BrokerCheckpoint.ROLLED_BACK,
+                BrokerResultCode.ROLLED_BACK,
+            )
     elif checkpoint is BrokerCheckpoint.DEPROVISIONED:
-        if observation == status.observation and obj is BrokerObjectState.ABSENT and reg is na:
-            return _decision(BrokerRecoveryAction.RETURN_COMMITTED, BrokerCheckpoint.DEPROVISIONED, BrokerResultCode.COMMITTED)
+        if (
+            observation == status.observation
+            and obj is BrokerObjectState.ABSENT
+            and reg is na
+        ):
+            return _decision(
+                BrokerRecoveryAction.RETURN_COMMITTED,
+                BrokerCheckpoint.DEPROVISIONED,
+                BrokerResultCode.COMMITTED,
+            )
     return _blocked_decision()
