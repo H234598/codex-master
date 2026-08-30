@@ -64,7 +64,7 @@ CLASSES = (
         "gottbiene", "persistent", ("persistent",), ("sol",), "max", "max", ("read", "write")
     ),
     AgentClassPolicy(
-        "koenigin", "persistent", ("persistent",), ("sol",), "xhigh", "xhigh", ("read", "write")
+        "koenigin", "persistent", ("persistent",), ("sol",), "max", "max", ("read", "write")
     ),
     AgentClassPolicy(
         "teamleiterin", "persistent", ("persistent",), ("terra",), "xhigh", "xhigh", ("read", "write"),
@@ -267,7 +267,7 @@ def test_sol_root_fixture_defaults_to_exact_profiles_green_at_baseline() -> None
     expected = {
         "goettin": "max",
         "gottbiene": "max",
-        "koenigin": "xhigh",
+        "koenigin": "max",
     }
     for class_id, reasoning in expected.items():
         decision = resolve(requested_class=class_id)
@@ -290,7 +290,7 @@ def test_goettin_fixture_defaults_to_sol_family_max_green_at_baseline() -> None:
 
 @pytest.mark.parametrize(
     ("class_id", "reasoning"),
-    (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "xhigh")),
+    (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "max")),
 )
 def test_sol_root_fixture_accepts_second_sol_family_member_green_at_baseline(
     class_id: str, reasoning: str,
@@ -326,7 +326,7 @@ def test_sol_root_fixture_accepts_second_sol_family_member_green_at_baseline(
         ("gottbiene", None, None, "xhigh"),
         ("koenigin", "ephemeral", None, None),
         ("koenigin", None, "gpt-5.6-luna", None),
-        ("koenigin", None, None, "max"),
+        ("koenigin", None, None, "xhigh"),
     ),
 )
 def test_sol_root_fixture_rejects_noncanonical_explicit_profile_red_then_green(
@@ -465,8 +465,8 @@ def test_goettin_is_never_auto_selected_from_a_goddess_only_pool() -> None:
         ("goettin", "gpt-5.6-sol-alt", "max"),
         ("gottbiene", "gpt-5.6-sol", "max"),
         ("gottbiene", "gpt-5.6-sol-alt", "max"),
-        ("koenigin", "gpt-5.6-sol", "xhigh"),
-        ("koenigin", "gpt-5.6-sol-alt", "xhigh"),
+        ("koenigin", "gpt-5.6-sol", "max"),
+        ("koenigin", "gpt-5.6-sol-alt", "max"),
         ("teamleiterin", "gpt-5.6-terra", "xhigh"),
     ),
 )
@@ -490,8 +490,8 @@ def test_validate_canonical_agent_tuple_accepts_governance_matrix_red_then_green
         ("goettin", "gpt-5.6-luna", "persistent", "max"),
         ("gottbiene", "gpt-5.6-sol", "persistent", "xhigh"),
         ("gottbiene", "gpt-5.6-luna", "persistent", "max"),
-        ("koenigin", "gpt-5.6-sol", "persistent", "max"),
-        ("koenigin", "gpt-5.6-luna", "persistent", "xhigh"),
+        ("koenigin", "gpt-5.6-sol", "persistent", "xhigh"),
+        ("koenigin", "gpt-5.6-luna", "persistent", "max"),
         ("teamleiterin", "gpt-5.6-sol", "persistent", "xhigh"),
         ("arbeitsbiene", "gpt-5.6-sol", "ephemeral", "max"),
         ("spezialistin", "gpt-5.6-sol", "binding", "max"),
@@ -661,7 +661,7 @@ def test_offer_contains_only_valid_combinations_and_public_lifecycle_names() -> 
     assert set(offer.lifecycles) == {"ephemeral", "binding", "persistent"}
     assert "invocation" not in offer.lifecycles
     assert offer.classes == ("arbeitsbiene", "goettin", "gottbiene", "koenigin", "teamleiterin")
-    for class_id, reasoning in (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "xhigh")):
+    for class_id, reasoning in (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "max")):
         options = [item for item in offer.options if item.class_id == class_id]
         assert [(item.lifecycle, item.model, item.reasoning) for item in options] == [
             ("persistent", "gpt-5.6-sol", reasoning),
@@ -762,7 +762,7 @@ def test_agent_base_args_accepts_catalog_models_and_enforces_max_exception() -> 
     terra = agent_base_args("gpt-5.6-terra", "high")
     assert terra[:2] == ["--model", "gpt-5.6-terra"]
     assert 'model_reasoning_effort="high"' in terra
-    for class_id, reasoning in (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "xhigh")):
+    for class_id, reasoning in (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "max")):
         assert agent_base_args("gpt-5.6-sol", reasoning, agent_class=class_id)[:2] == ["--model", "gpt-5.6-sol"]
     with pytest.raises(AgentError, match=r"^unsupported routed agent tuple$"):
         agent_base_args("gpt-5.6-sol", "max")
@@ -773,7 +773,7 @@ def test_agent_base_args_accepts_catalog_models_and_enforces_max_exception() -> 
     (
         ("gpt-5.6-sol", "xhigh", "goettin"),
         ("gpt-5.6-sol", "xhigh", "gottbiene"),
-        ("gpt-5.6-sol", "max", "koenigin"),
+        ("gpt-5.6-sol", "xhigh", "koenigin"),
         ("gpt-5.6-luna", "max", "goettin"),
         ("gpt-5.6-terra", "max", "gottbiene"),
         ("gpt-5.3-codex-spark", "xhigh", "koenigin"),
@@ -791,7 +791,7 @@ def test_agent_base_args_rejects_noncanonical_root_and_worker_tuples(
 
 @pytest.mark.parametrize(
     ("class_id", "reasoning"),
-    (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "xhigh")),
+    (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "max")),
 )
 def test_agent_base_args_accepts_second_sol_family_member_red_then_green(
     monkeypatch: pytest.MonkeyPatch, class_id: str, reasoning: str,

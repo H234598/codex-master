@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
+repository_root="$(cd -- "$(dirname -- "${script_path}")/.." && pwd)"
+export PYTHONPATH="${repository_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
+exec python3 -m codex_master.hive.pilot_provisioner "$@"
