@@ -39,6 +39,7 @@ from codex_master.host_agent import (
     run_poll_loop,
 )
 from codex_master.host_agent_state import HostAgentState, HostAgentStateError
+from codex_master.host_probe import LocalHostProbeCollector
 
 
 def _private_key_bytes(key: rsa.RSAPrivateKey) -> bytes:
@@ -394,8 +395,10 @@ def test_run_once_polls_executes_receipt_and_honors_idle() -> None:
         def __init__(self, response: object) -> None:
             self.response = response
             self.receipts = []
+            self.polls = []
 
         def poll(self, poll: object) -> object:
+            self.polls.append(poll)
             return self.response
 
         def put_receipt(self, receipt: object) -> None:
@@ -424,7 +427,19 @@ def test_run_once_polls_executes_receipt_and_honors_idle() -> None:
     )
     assert agent.run_once() == 0 and len(busy.receipts) == 1
 
-    wrong_generation = Client(AgentNoWorkV1(8, 3, 5))
+    advanced_generation = Client(AgentNoWorkV1(8, 3, 5))
+    agent = HostAgent(
+        client=advanced_generation,
+        executor=Executor(),
+        registry_generation=7,
+        lease_epoch=3,
+        capabilities_digest="sha256:" + "c" * 64,
+    )
+    assert agent.run_once() == 5
+    agent.run_once()
+    assert advanced_generation.polls[1].registry_generation == 8
+
+    wrong_generation = Client(AgentNoWorkV1(6, 3, 5))
     agent = HostAgent(
         client=wrong_generation,
         executor=Executor(),
@@ -734,11 +749,51 @@ def test_live_client_rejects_ambiguous_or_truncated_http_response(
 def test_host_probe_and_credentials_are_descriptor_first_and_exact(
     tmp_path: Path,
 ) -> None:
-    assert (
-        HostProbeExecutor().collect({"probe_profile": "basic"})["status"] == "collected"
+    class Kernel:
+        cpu_count = 8
+        memory_bytes = 16 * 1024**3
+
+        def uname(self) -> tuple[str, str]:
+            return "Linux", "x86_64"
+
+        def cgroup_v2(self) -> bool:
+            return True
+
+        def systemd(self) -> bool:
+            return True
+
+        def load(self) -> float:
+            return 0.5
+
+        def pressure(self) -> float:
+            return 0.0
+
+        def ollama_available(self) -> bool:
+            return False
+
+    probe = HostProbeExecutor(
+        collector=LocalHostProbeCollector(
+            lambda: datetime(2026, 8, 31, 8, 0, tzinfo=UTC)
+        ),
+        kernel=Kernel(),
     )
-    with pytest.raises(HostAgentError, match="host.arguments_invalid"):
-        HostProbeExecutor().collect({"probe_profile": "free"})
+    payload = probe.collect(
+        {"admin_operation_id": "op-one", "probe_schema": 1}
+    )
+    assert payload["evidence_digest"].startswith("sha256:")
+    assert payload["observed_at"] == "2026-08-31T08:00:00Z"
+    for invalid in (
+        {"probe_profile": "basic"},
+        {"admin_operation_id": "op-one", "probe_schema": True},
+        {"admin_operation_id": "x" * 129, "probe_schema": 1},
+        {
+            "admin_operation_id": "op-one",
+            "probe_schema": 1,
+            "command": "collect",
+        },
+    ):
+        with pytest.raises(HostAgentError, match="host.arguments_invalid"):
+            probe.collect(invalid)
     credentials = tmp_path / "credentials"
     credentials.mkdir()
     config = {

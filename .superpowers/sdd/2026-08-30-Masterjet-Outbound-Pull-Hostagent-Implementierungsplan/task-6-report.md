@@ -468,3 +468,188 @@ callback so the Host-Probe state becomes UNKNOWN; a process whose GTK main
 loop is already gone naturally cannot guarantee that the final pixels are
 painted. The pre-existing unrelated `progress.md` modification was neither
 edited nor staged.
+
+## User-authorized exceptional production-graph closure round
+
+This round is the one-time user-authorized exception after the 5/5 fix cap. It
+closes only the six production-graph findings from `task-6-rereview-5.md` and
+does not add a Task-7 public result wire or any Task-8 Ollama behavior. The
+account hardgate passed before repository inspection: `CODEX_HOME` exactly
+matched the authorized BW_Nufker profile. The governing plan/spec annotation
+sidecars were checked and remain absent. The pre-existing `progress.md` change
+was not edited.
+
+### Canonical real production graph and RED evidence
+
+The new `tests/test_host_probe_production_graph.py` crosses the actual Task-6
+graph in process. `HostRegistry` provisions two real `AgentBindingV1` hosts,
+leaving target host generation 1 and authoritative document generation 2. It
+wires real `AdminOperationStore`, `AgentOperationStore`,
+`RemoteHostProbeAdapter`, resolver-derived mTLS principal,
+`AgentHttpApplication`, `RemoteHostProbeCompletionOwner`, `HostAgent`,
+`HostAgentExecutor`, `HostAgentState`, and `HostAgentClient.poll()` /
+`put_receipt()`. `InProcessAgentClient` overrides only `_request()` to exchange
+JSON bytes with the application instead of TLS/socket bytes; the real client
+DTO parsing, application parsing, principal conversion, stores, executor,
+receipt construction, completion owner, and Registry remain in the path.
+
+The test uses deterministic kernel fact providers, but neither evidence,
+receipt, principal, Store, nor Registry state is fabricated. The target begins
+as an Agent-only registration; no SSH probe is seeded. The completed receipt's
+payload must equal the exact `HostProbeEvidenceV1.public()` projection. The
+test also proves Admin is terminal when the real Agent Store completion is
+invoked, host generation advances 1 -> 2, document generation advances 2 -> 3,
+both private binding domains remain equal to their pre-probe documents, and
+the same unchanged HostAgent polls successfully again.
+
+Before production edits, the exact canonical command was:
+
+```text
+PYTHONPATH=src pytest -q \
+  tests/test_host_probe_production_graph.py::test_real_production_graph_closes_remote_probe_and_repolls_after_generation_change
+```
+
+Progressive RED from that one graph exposed the production blockers in order:
+
+```text
+1 failed: AgentOperationError: host.operation_store_unavailable
+  AgentOperationStore._now() rejected its default microsecond clock.
+
+1 failed: TypeError: HostProbeExecutor() takes no arguments
+  The real executor had no canonical collector/fact-provider contract.
+
+1 failed: HostAgentError: resource.host_response_invalid
+  Resolver AgentPrincipalV1 could not enter the exact-type operation Store.
+
+1 failed: HostAgentError: host.arguments_invalid
+  The real lease's immutable Mapping arguments exposed the old fake executor contract.
+
+1 failed: expected Admin succeeded, got failed
+  Agent-only record_active_probe() still required an SSH binding.
+
+1 failed on the second poll: HostAgentError: resource.host_response_invalid
+  Equal current lease_epoch and the incremented authoritative generation were incoherent.
+```
+
+After the minimal production fixes, the final real-graph set is:
+
+```text
+PYTHONPATH=src pytest -q tests/test_host_probe_production_graph.py
+3 passed in 1.23s
+```
+
+The additional two tests are production-loop recovery graphs. One corrupts
+the real Registry after resolver authentication but before receipt completion,
+observes the sanitized rejected response, restores Registry bytes, reconstructs
+all Master owners, advances only the deterministic retry clock, and drives the
+ordinary HostAgent -> AgentHttpApplication -> Stores loop to convergence. The
+other rejects Agent terminalization after Registry/Admin already completed,
+then proves a later lease carries the new document generation and converges
+without a second Registry write. Neither calls the completion owner directly.
+
+### Six closure mappings
+
+1. **Default clock.** `AgentOperationStore` now supplies canonical UTC seconds
+   by default while the existing strict `_utc()` validator still rejects
+   noncanonical external/request timestamps. A real Store/adapter regression
+   uses no injected clock.
+
+2. **Principal boundary and generation coherence.** `AgentHttpApplication`
+   converts the exact resolver `admin_hosts.AgentPrincipalV1` to the distinct
+   exact Store `agent_operations.AgentPrincipalV1` for poll and ordinary
+   receipt paths. It verifies the resolver's current lease epoch exactly. A
+   HostAgent may send an older configured document generation; the resolver's
+   authenticated current generation becomes the Store poll fence and is
+   returned in no-work/new-lease responses, so the running agent learns it.
+   A future wire generation, lower/rotated epoch, stale response generation,
+   or non-exact Store principal remains rejected.
+
+3. **Real executor contract.** `HostProbeExecutor` accepts only exact private
+   `{admin_operation_id, probe_schema}` arguments with a bounded operation
+   token and exact integer schema 1. Validation does not collect twice.
+   Dispatch uses `LocalHostProbeCollector` and returns the exact canonical
+   `HostProbeEvidenceV1.public()` projection. Command, argv, shell, URL, path,
+   and extra-key ingress remain impossible.
+
+4. **Agent-only observation.** New agent registrations identify their distinct
+   public transport as `outbound-pull-mtls`. `record_active_probe()` accepts a
+   host with an SSH binding, an Agent binding, or both; it synthesizes neither.
+   Under its existing one-lock transaction it keeps static registrations,
+   SSH bindings, Agent bindings, and epoch history under their own owners and
+   writes only the active observation plus document generation. Loading accepts
+   Agent-only active observations while legacy SSH/Agent Store formats remain
+   valid. The active digest intentionally covers only fresh observation fields;
+   static registration and private binding state remain separate durable owners.
+
+5. **Production reclamation and semantic receipt redelivery.** Polling invokes
+   expired-lease reclamation. Equal current host-binding epoch is accepted;
+   lower epoch is rejected. Each lease now durably records the resolver's
+   authoritative document generation, with migration from legacy lease records.
+   A saved terminal receipt can rebind only to a different later lease with a
+   higher attempt, same operation/host/action/lease epoch/plan digest/arguments
+   digest, nondecreasing document generation, and live deadline. The rebound
+   receipt is persisted before return and preserves its terminal state, reason
+   codes, result, and result digest. Counting fact providers prove one
+   collection across rejection/reconstruction/redelivery. Ambiguous `unknown`
+   receipts remain `unknown`; production polling terminalizes exhausted attempts
+   as stable `host.attempts_exhausted` unknown.
+
+6. **GTK delayed submit.** `_poll_host_probe()` catches delayed controller
+   submission exceptions and false returns, renders `Host-Probe: UNKNOWN`,
+   clears the active operation and poll count, returns from the callback, and
+   never refreshes host data. The regression captures and invokes the actual
+   delayed callback with `fleet_operation_status` submission raising.
+
+### Final validation evidence
+
+All commands below ran after the production behavior was finalized. Matrices
+overlap intentionally; counts are invocation counts, not unique test IDs.
+
+```text
+# Six focused closures, including all three real production graphs
+8 passed in 1.36s
+
+# Unfiltered directly changed test files
+270 passed, 5 subtests passed in 117.91s
+
+# Existing Task-6 host-probe suite
+52 passed in 1.96s
+
+# Selected Task-1..5 contracts, identity and daemon dependencies
+134 passed in 21.37s
+
+# Preserved route/scope/HTTPS step-up/Unix selection
+6 passed, 243 deselected in 2.76s
+
+# Exact CLI --json / MCP caller-key / catalog contract
+3 passed in 9.06s
+```
+
+The consolidated matrices in this subsection contain 473 passing pytest
+invocations; the separately recorded standalone real-graph gate adds 3, for
+476 passing invocations across the final recorded commands, plus 5 passing
+subtests. Matrices overlap by design and include 243 explicit deselections.
+Ruff passed on every changed Python file;
+`compileall` passed on all six changed production modules; `git diff --check`
+was clean. Corrected count-only secret scans reported zero suspected matches in
+the committed Task-6 range, complete working diff (including the new untracked
+E2E), and staged diff; no matched value was printed.
+
+### CodeRabbit and remaining risk
+
+CodeRabbit CLI 0.7.5 was authenticated and run with
+`coderabbit review --agent -t uncommitted`. Its first pass suggested putting
+static metadata into the active observation digest and relaxing exact terminal
+generation fencing. Both were rejected as contrary to the preserved contracts:
+static registration/binding owners are intentionally separate from fresh
+observation digesting, and redelivery now receives a current-generation lease
+rather than accepting a stale principal. Invariant comments were added. The
+second uncommitted pass completed with **0 findings**.
+
+The canonical E2E deliberately replaces TLS/socket bytes to remain deterministic
+and in process. Separate real TLS, identity, HTTP, daemon, Store and restart
+dependency suites remain green. Retry timing is deterministic only in the two
+recovery tests; the canonical success graph uses the production Store clock
+without injection. Production reclamation is poll-driven, so a host that never
+polls cannot trigger immediate expiry maintenance; once polling resumes, the
+durable queue converges. No known Task-6 correctness risk remains.

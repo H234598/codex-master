@@ -927,7 +927,10 @@ def test_static_agent_provisioning_creates_unavailable_registration_without_prob
             "ref": "worker-one",
             "label": "Worker One",
             "role": "execution",
-            "transport_binding": {"kind": "ssh", "binding_ref": "worker-one"},
+            "transport_binding": {
+                "kind": "outbound-pull-mtls",
+                "binding_ref": "worker-one",
+            },
             "capabilities": ["resource.probe", "codex.execute"],
             "reachability": {"state": "unavailable"},
             "resource_evidence": {},
@@ -939,6 +942,39 @@ def test_static_agent_provisioning_creates_unavailable_registration_without_prob
     assert "client_spki_sha256" not in rendered
     assert SPKI_ONE not in rendered
     assert "lease_epoch" not in rendered
+
+
+def test_agent_only_active_probe_preserves_static_registration_and_binding_domains(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.provision_agent_binding(
+        static_registration(), agent_binding(), expected_generation=0
+    )
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    before = json.loads(document.read_text(encoding="utf-8"))
+
+    refreshed = registry.record_active_probe(
+        "worker-one",
+        generation=2,
+        resource_evidence={
+            "cpu_threads": 8,
+            "memory_bytes": 16_000_000_000,
+        },
+        observed_at="2026-08-31T08:00:00Z",
+    )
+
+    after = json.loads(document.read_text(encoding="utf-8"))
+    assert after["registrations"] == before["registrations"]
+    assert after["bindings"] == before["bindings"]
+    assert after["bindings"]["ssh"] == []
+    assert after["generation"] == 2
+    assert refreshed.generation == 2
+    assert refreshed.transport_binding == {
+        "kind": "outbound-pull-mtls",
+        "binding_ref": "worker-one",
+    }
+    assert registry_at(tmp_path).get("worker-one") == refreshed
 
 
 def test_agent_binding_is_private_and_legacy_ssh_is_not_resolvable(

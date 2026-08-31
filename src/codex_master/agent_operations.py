@@ -278,7 +278,7 @@ class AgentOperationStore:
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise AgentOperationError("host.operation_store_unavailable")
-        self._clock = clock or (lambda: datetime.now(UTC))
+        self._clock = clock or (lambda: datetime.now(UTC).replace(microsecond=0))
         self._root = state_root / "agent-operations"
         self._active_lock = RLock()
         self._active_polls: set[str] = set()
@@ -353,15 +353,17 @@ class AgentOperationStore:
             _raise("host.request_invalid")
         if principal.registry_generation != poll.registry_generation:
             _raise("host.registry_generation_stale")
+        self.expire_leases()
         self._begin_poll(principal.host_ref)
         try:
             with self._state.locked():
                 document = self._read_locked()
                 host_epochs = document["host_epochs"]
                 previous = host_epochs.get(principal.host_ref)
-                if previous is not None and poll.lease_epoch <= previous:
+                if previous is not None and poll.lease_epoch < previous:
                     _raise("host.lease_epoch_stale")
-                host_epochs[principal.host_ref] = poll.lease_epoch
+                if previous is None or poll.lease_epoch > previous:
+                    host_epochs[principal.host_ref] = poll.lease_epoch
                 for record in document["operations"]:
                     if record["state"] != "queued":
                         continue
@@ -386,6 +388,7 @@ class AgentOperationStore:
                     record["lease"] = {
                         "lease_id": lease_id,
                         "host_ref": principal.host_ref,
+                        "registry_generation": poll.registry_generation,
                         "lease_epoch": poll.lease_epoch,
                         "deadline": _wire_time(deadline),
                     }
@@ -396,7 +399,7 @@ class AgentOperationStore:
                         host_ref=principal.host_ref,
                         kind=record["kind"],
                         action=record["action"],
-                        registry_generation=record["registry_generation"],
+                        registry_generation=poll.registry_generation,
                         lease_epoch=poll.lease_epoch,
                         attempt=record["attempt"],
                         plan_digest=record["plan_digest"],
@@ -637,27 +640,43 @@ class AgentOperationStore:
                 if record.get("target_host_ref") is None
                 else _token(record["target_host_ref"], "host.operation_store_unavailable")
             ),
-            "lease": self._lease_doc(record["lease"]),
+            "lease": self._lease_doc(
+                record["lease"],
+                operation_generation=cast(int, record["registry_generation"]),
+            ),
             "completion": self._stored_completion_doc(record["completion"]),
         }
         if result["arguments_digest"] != _canonical_digest(result["arguments"]):
             _raise("host.operation_store_unavailable")
         return result
 
-    def _lease_doc(self, value: object) -> dict[str, object] | None:
+    def _lease_doc(
+        self, value: object, *, operation_generation: int
+    ) -> dict[str, object] | None:
         if value is None:
             return None
-        if type(value) is not dict or set(value) != {
-            "lease_id",
-            "host_ref",
-            "lease_epoch",
-            "deadline",
-        }:
+        if type(value) is not dict or set(value) not in (
+            {"lease_id", "host_ref", "lease_epoch", "deadline"},
+            {
+                "lease_id",
+                "host_ref",
+                "registry_generation",
+                "lease_epoch",
+                "deadline",
+            },
+        ):
             _raise("host.operation_store_unavailable")
         doc = cast(dict[str, object], value)
+        registry_generation = _integer(
+            doc.get("registry_generation", operation_generation),
+            "host.operation_store_unavailable",
+        )
+        if registry_generation < operation_generation:
+            _raise("host.operation_store_unavailable")
         return {
             "lease_id": _token(doc["lease_id"], "host.operation_store_unavailable"),
             "host_ref": _token(doc["host_ref"], "host.operation_store_unavailable"),
+            "registry_generation": registry_generation,
             "lease_epoch": _integer(
                 doc["lease_epoch"], "host.operation_store_unavailable"
             ),
@@ -701,7 +720,9 @@ class AgentOperationStore:
     ) -> None:
         if principal.host_ref != lease["host_ref"]:
             _raise("host.identity_mismatch")
-        if principal.registry_generation != record["registry_generation"]:
+        # Redelivery issues a new lease at the resolver's current generation.
+        # Terminal replay stays exact so an older identity document cannot complete it.
+        if principal.registry_generation != lease["registry_generation"]:
             _raise("host.registry_generation_stale")
         if receipt.lease_id != lease["lease_id"]:
             _raise("host.lease_stale")

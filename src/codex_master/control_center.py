@@ -1087,12 +1087,18 @@ class ControlCenterWindow:
         if operation_id != self._host_probe_operation_id:
             return False
         self._host_probe_poll_attempts += 1
-        if not self.controller.submit(
-            "fleet_operation_status",
-            {"operation_id": operation_id},
-            self._host_probe_started,
-        ):
+        try:
+            submitted = self.controller.submit(
+                "fleet_operation_status",
+                {"operation_id": operation_id},
+                self._host_probe_started,
+            )
+        except Exception:
+            submitted = False
+        if not submitted:
             self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
+            self._host_probe_operation_id = None
+            self._host_probe_poll_attempts = 0
         return False
 
     def refresh_host_card(self) -> bool:

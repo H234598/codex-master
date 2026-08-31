@@ -143,6 +143,19 @@ def test_operation_views_and_requests_are_frozen_and_constructible(
         view.state = "failed"  # type: ignore[misc]
 
 
+def test_default_clock_can_enqueue_without_second_aligned_injection(
+    tmp_path: Path,
+) -> None:
+    store = AgentOperationStore(tmp_path)
+    request = operation_request(
+        deadline=datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=5)
+    )
+
+    assert store.enqueue(request).state == "queued"
+    with pytest.raises(AgentOperationError, match="host.request_invalid"):
+        operation_request(deadline=NOW.replace(microsecond=1))
+
+
 def test_expired_lease_redelivers_with_incremented_attempt(tmp_path: Path) -> None:
     clock = Clock()
     store = store_at(tmp_path, clock)
@@ -151,13 +164,34 @@ def test_expired_lease_redelivers_with_incremented_attempt(tmp_path: Path) -> No
     assert isinstance(first, AgentLeaseV1)
 
     clock.advance(seconds=31)
-    assert store.expire_leases() == (queued.operation_id,)
-    second = store.poll(principal("worker-one"), poll(epoch=4))
+    second = store.poll(principal("worker-one"), poll(epoch=3))
 
     assert isinstance(second, AgentLeaseV1)
     assert second.operation_id == queued.operation_id
     assert second.attempt == first.attempt + 1
     assert second.lease_id != first.lease_id
+
+
+def test_redelivery_uses_current_document_generation_as_exact_lease_fence(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    store.enqueue(operation_request())
+    first = store.poll(principal(), poll(epoch=3))
+    assert isinstance(first, AgentLeaseV1)
+    clock.advance(seconds=31)
+    current_principal = AgentPrincipalV1("worker-one", 8)
+
+    second = store.poll(
+        current_principal,
+        poll(epoch=3, registry_generation=8),
+    )
+
+    assert isinstance(second, AgentLeaseV1)
+    assert second.registry_generation == 8
+    assert store.context(second.operation_id)["registry_generation"] == 7
+    assert store.complete(current_principal, receipt_for(second)).state == "succeeded"
 
 
 def test_cross_host_or_digest_drift_receipt_changes_nothing(tmp_path: Path) -> None:
@@ -223,8 +257,9 @@ def test_poll_no_work_and_monotone_epoch(tmp_path: Path) -> None:
     first = store.poll(principal(), poll(epoch=3))
     assert first == AgentNoWorkV1(7, 3, 0)
 
+    assert store.poll(principal(), poll(epoch=3)) == AgentNoWorkV1(7, 3, 0)
     with pytest.raises(AgentOperationError, match="host.lease_epoch_stale"):
-        store.poll(principal(), poll(epoch=3))
+        store.poll(principal(), poll(epoch=2))
 
 
 def test_only_one_active_poll_connection_per_host(tmp_path: Path) -> None:
@@ -379,6 +414,26 @@ def test_master_restart_recovers_queued_and_leased_operations(tmp_path: Path) ->
     assert restarted.get(leased.operation_id).state == "leased"
 
 
+def test_legacy_leased_record_without_lease_generation_remains_loadable(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    leased = lease_one(store)
+    document = tmp_path / "agent-operations" / "operations.json"
+    payload = json.loads(document.read_text(encoding="utf-8"))
+    payload["operations"][0]["lease"].pop("registry_generation")
+    document.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    document.chmod(0o600)
+
+    restarted = store_at(tmp_path)
+
+    assert restarted.get(leased.operation_id).state == "leased"
+    assert restarted.complete(principal(), receipt_for(leased)).state == "succeeded"
+
+
 def test_unknown_completion_is_terminal(tmp_path: Path) -> None:
     store = store_at(tmp_path)
     lease = lease_one(store)
@@ -404,15 +459,16 @@ def test_attempt_limit_transitions_expired_operation_to_unknown(
     store = store_at(tmp_path, clock)
     queued = store.enqueue(operation_request())
 
-    for epoch in range(3, 11):
-        leased = store.poll(principal(), poll(epoch=epoch))
+    for attempt in range(1, 9):
+        leased = store.poll(principal(), poll(epoch=3))
         assert isinstance(leased, AgentLeaseV1)
-        assert leased.attempt == epoch - 2
+        assert leased.attempt == attempt
         clock.advance(seconds=31)
-        assert store.expire_leases() == (queued.operation_id,)
 
-    assert store.get(queued.operation_id).state == "unknown"
-    assert isinstance(store.poll(principal(), poll(epoch=11)), AgentNoWorkV1)
+    assert isinstance(store.poll(principal(), poll(epoch=3)), AgentNoWorkV1)
+    terminal = store.get(queued.operation_id)
+    assert terminal.state == "unknown"
+    assert terminal.reason_codes == ("host.attempts_exhausted",)
 
 
 def test_recursive_private_result_fields_are_rejected(tmp_path: Path) -> None:

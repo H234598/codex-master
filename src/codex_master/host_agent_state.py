@@ -198,14 +198,24 @@ class HostAgentState:
             document = self._read_locked()
             saved = document["receipts"].get(lease.operation_id)
             if saved is not None:
-                self._check_record(saved, lease)
-                return parse_agent_receipt(saved["receipt"])
+                self._check_epoch(document, lease)
+                self._check_generation(document, lease)
+                if tuple(saved.get("fence", ())) == _lease_fence(lease):
+                    return parse_agent_receipt(saved["receipt"])
+                return self._rebind_receipt_locked(document, saved, lease)
             self._check_epoch(document, lease)
             self._check_generation(document, lease)
             accepted = document["accepted"].get(lease.operation_id)
             if accepted is not None:
                 old_lease = self._parse_lease(accepted["lease"])
                 if self._safe_rebind(accepted, old_lease, lease):
+                    document["highest_lease_epoch"] = max(
+                        document["highest_lease_epoch"], lease.lease_epoch
+                    )
+                    document["highest_registry_generation"] = max(
+                        document["highest_registry_generation"],
+                        lease.registry_generation,
+                    )
                     document["accepted"][lease.operation_id] = {
                         "fence": list(_lease_fence(lease)),
                         "lease": serialize_agent_lease(lease),
@@ -410,6 +420,65 @@ class HostAgentState:
         if tuple(record.get("fence", ())) != _lease_fence(lease):
             _fail("host.replay_conflict")
 
+    def _rebind_receipt_locked(
+        self,
+        document: dict[str, Any],
+        record: Mapping[str, Any],
+        lease: AgentLeaseV1,
+    ) -> AgentReceiptV1:
+        old = parse_agent_receipt(record["receipt"])
+        old_fence = tuple(record.get("fence", ()))
+        if len(old_fence) != 10:
+            _fail("host.replay_conflict")
+        old_semantic = (
+            old_fence[0],
+            old_fence[3],
+            old_fence[4],
+            old_fence[5],
+            old_fence[7],
+            old_fence[8],
+            old_fence[9],
+        )
+        new_semantic = (
+            lease.operation_id,
+            lease.host_ref,
+            lease.kind,
+            lease.action,
+            lease.lease_epoch,
+            lease.plan_digest,
+            lease.arguments_digest,
+        )
+        if (
+            old_semantic != new_semantic
+            or lease.registry_generation < old_fence[6]
+            or lease.attempt <= old.attempt
+            or lease.lease_id == old.lease_id
+            or lease.deadline <= _utc_now()
+        ):
+            _fail("host.replay_conflict")
+        rebound = AgentReceiptV1(
+            lease.operation_id,
+            lease.lease_id,
+            lease.lease_epoch,
+            lease.attempt,
+            lease.plan_digest,
+            lease.arguments_digest,
+            old.state,
+            old.reason_codes,
+            old.result_digest,
+            old.result,
+        )
+        document["receipts"][lease.operation_id] = {
+            "fence": list(_lease_fence(lease)),
+            "generation": lease.registry_generation,
+            "receipt": _receipt_wire(rebound),
+        }
+        document["highest_registry_generation"] = max(
+            document["highest_registry_generation"], lease.registry_generation
+        )
+        self._write_locked(document)
+        return rebound
+
     def _safe_rebind(
         self, record: Mapping[str, Any], old: AgentLeaseV1, new: AgentLeaseV1
     ) -> bool:
@@ -423,7 +492,6 @@ class HostAgentState:
                 old.host_ref,
                 old.kind,
                 old.action,
-                old.registry_generation,
                 old.lease_epoch,
                 old.plan_digest,
                 old.arguments_digest,
@@ -433,11 +501,11 @@ class HostAgentState:
                 new.host_ref,
                 new.kind,
                 new.action,
-                new.registry_generation,
                 new.lease_epoch,
                 new.plan_digest,
                 new.arguments_digest,
             )
+            and new.registry_generation >= old.registry_generation
         )
 
     def _reclaim_expired_locked(self, document: dict[str, Any]) -> bool:

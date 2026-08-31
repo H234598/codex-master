@@ -181,6 +181,35 @@ def test_host_probe_submit_and_timer_scheduling_failures_are_visible() -> None:
     )
 
 
+def test_delayed_host_probe_status_submit_exception_clears_poll_state() -> None:
+    delayed: list[tuple[object, tuple[object, ...]]] = []
+    window = object.__new__(control_center.ControlCenterWindow)
+    window._host_probe_operation_id = None
+    window._host_probe_poll_attempts = 0
+    window.host_probe_status_label = Mock()
+    window.refresh_host_card = Mock()
+    window.controller = Mock()
+    window.GLib = Mock()
+
+    def capture(_interval, callback, *arguments):  # type: ignore[no-untyped-def]
+        delayed.append((callback, arguments))
+        return 1
+
+    window.GLib.timeout_add.side_effect = capture
+    window._host_probe_started({"id": "op-one", "state": "running"})
+    callback, arguments = delayed.pop()
+    window.controller.submit.side_effect = RuntimeError("submit unavailable")
+
+    assert callback(*arguments) is False
+
+    window.host_probe_status_label.set_text.assert_called_with(
+        "Host-Probe: UNKNOWN"
+    )
+    assert window._host_probe_operation_id is None
+    assert window._host_probe_poll_attempts == 0
+    window.refresh_host_card.assert_not_called()
+
+
 def test_host_probe_unknown_terminality_follows_canonical_operation_contract() -> None:
     noncanonical = control_center.host_probe_ui_state({"state": "unknown"})
     assert noncanonical == control_center.HostProbeUiState("UNKNOWN", False)

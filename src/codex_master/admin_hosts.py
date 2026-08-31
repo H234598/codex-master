@@ -38,7 +38,7 @@ _ROLES = frozenset({"control", "execution", "worker"})
 _REACHABILITY_STATES = frozenset(
     {"reachable", "unreachable", "unknown", "unavailable"}
 )
-_TRANSPORT_KINDS = frozenset({"ssh"})
+_TRANSPORT_KINDS = frozenset({"ssh", "outbound-pull-mtls"})
 _CAPABILITY_CODES = frozenset(
     {"codex.execute", "resource.probe", "ollama.execute"}
 )
@@ -676,31 +676,18 @@ class HostRegistry:
             epoch_history,
         ):
             registration = next((item for item in registrations if item["ref"] == ref), None)
-            binding = ssh_bindings.get(ref)
-            if registration is None or binding is None:
+            has_agent_binding = any(item["ref"] == ref for item in agent_bindings)
+            if registration is None or (
+                ref not in ssh_bindings and not has_agent_binding
+            ):
                 raise HostRegistryError("host.identity_not_found")
-            evidence = {
-                "label": registration["label"],
-                "role": registration["role"],
-                "transport_binding": registration["transport_binding"],
-                "capabilities": registration["capabilities"],
-                "reachability": {"state": "reachable", "latency_ms": 0},
-                "resource_evidence": resources,
-                "observed_at": observed,
-                "source": "host-agent",
-                "binding_state": binding,
-            }
-            record, preserved_binding = _validated_probe_record(
-                ref, generation, evidence, error_code="control.host_invalid"
-            )
-            record["probe_digest"] = _digest(
-                {
-                    "ref": ref,
-                    "generation": generation,
-                    "resource_evidence": resources,
-                    "observed_at": observed,
-                    "reachability": {"state": "reachable", "latency_ms": 0},
-                }
+            record = _active_probe_record(
+                ref,
+                generation,
+                registration,
+                resource_evidence=resources,
+                observed_at=observed,
+                error_code="control.host_invalid",
             )
             existing = next((item for item in observations if item["ref"] == ref), None)
             if existing is not None:
@@ -713,11 +700,7 @@ class HostRegistry:
             if document_generation == _MAX_GENERATION:
                 raise HostRegistryError("credential.generation_exhausted")
             observations.append(record)
-            registrations[:] = [item for item in registrations if item["ref"] != ref]
-            registrations.append(_registration_from_probe(record))
-            ssh_bindings[ref] = preserved_binding
             observations.sort(key=lambda item: str(item["ref"]))
-            registrations.sort(key=lambda item: str(item["ref"]))
             self._write_locked(
                 registrations, ssh_bindings, agent_bindings, observations,
                 max(document_generation + 1, generation), epoch_history,
@@ -883,32 +866,52 @@ class HostRegistry:
             if not isinstance(item, Mapping) or set(item) != _HOST_FIELDS:
                 raise HostRegistryError("control.host_store_unavailable")
             ref = _host_ref(item["ref"], "control.host_store_unavailable")
-            if ref in observed_refs or ref not in bindings or ref not in seen:
+            if (
+                ref in observed_refs
+                or ref not in seen
+                or ref not in bindings and ref not in agent_refs
+            ):
                 raise HostRegistryError("control.host_store_unavailable")
-            evidence = {
-                key: item[key] for key in _EVIDENCE_FIELDS if key != "binding_state"
-            }
-            evidence["binding_state"] = bindings[ref]
-            record, normalized_binding = self._probe_record(
-                ref,
-                item["generation"],
-                evidence,
-                error_code="control.host_store_unavailable",
-            )
-            active_digest = _digest(
-                {
-                    "ref": ref,
-                    "generation": item["generation"],
-                    "resource_evidence": item["resource_evidence"],
-                    "observed_at": item["observed_at"],
-                    "reachability": item["reachability"],
+            if ref in bindings:
+                evidence = {
+                    key: item[key]
+                    for key in _EVIDENCE_FIELDS
+                    if key != "binding_state"
                 }
-            )
-            if item["probe_digest"] not in {record["probe_digest"], active_digest}:
-                raise HostRegistryError("control.host_store_unavailable")
-            record["probe_digest"] = item["probe_digest"]
+                evidence["binding_state"] = bindings[ref]
+                record, normalized_binding = self._probe_record(
+                    ref,
+                    item["generation"],
+                    evidence,
+                    error_code="control.host_store_unavailable",
+                )
+                if item["probe_digest"] != record["probe_digest"]:
+                    active = _active_probe_record(
+                        ref,
+                        item["generation"],
+                        item,
+                        resource_evidence=item["resource_evidence"],
+                        observed_at=item["observed_at"],
+                        error_code="control.host_store_unavailable",
+                        validate_observation=True,
+                    )
+                    if item["probe_digest"] != active["probe_digest"]:
+                        raise HostRegistryError("control.host_store_unavailable")
+                record["probe_digest"] = item["probe_digest"]
+                bindings[ref] = normalized_binding
+            else:
+                record = _active_probe_record(
+                    ref,
+                    item["generation"],
+                    item,
+                    resource_evidence=item["resource_evidence"],
+                    observed_at=item["observed_at"],
+                    error_code="control.host_store_unavailable",
+                    validate_observation=True,
+                )
+                if item["probe_digest"] != record["probe_digest"]:
+                    raise HostRegistryError("control.host_store_unavailable")
             observations.append(record)
-            bindings[ref] = normalized_binding
             observed_refs.add(ref)
         hosts.sort(key=lambda item: str(item["ref"]))
         observations.sort(key=lambda item: str(item["ref"]))
@@ -1208,6 +1211,52 @@ def _validated_probe_record(
     raise HostRegistryError(error_code)
 
 
+def _active_probe_record(
+    ref: str,
+    generation: object,
+    metadata: Mapping[str, object],
+    *,
+    resource_evidence: object,
+    observed_at: object,
+    error_code: str,
+    validate_observation: bool = False,
+) -> dict[str, object]:
+    generation_value = _generation(generation, error_code)
+    resources = _resources(resource_evidence, error_code)
+    observed = _wire_time(_parse_time(observed_at, error_code))
+    record: dict[str, object] = {
+        "ref": ref,
+        "label": _host_label(metadata["label"], error_code),
+        "role": _registered_code(metadata["role"], _ROLES, error_code),
+        "transport_binding": _transport_binding(
+            metadata["transport_binding"], error_code
+        ),
+        "capabilities": list(_capabilities(metadata["capabilities"], error_code)),
+        "reachability": {"state": "reachable", "latency_ms": 0},
+        "resource_evidence": resources,
+        "generation": generation_value,
+        "observed_at": observed,
+        "source": "host-agent",
+    }
+    if validate_observation:
+        if metadata.get("source") != "host-agent" or _reachability(
+            metadata["reachability"], error_code
+        ) != record["reachability"]:
+            raise HostRegistryError(error_code)
+    # Static registration and private bindings have separate durable owners.
+    # This digest intentionally authenticates only the fresh active observation.
+    record["probe_digest"] = _digest(
+        {
+            "ref": ref,
+            "generation": generation_value,
+            "resource_evidence": resources,
+            "observed_at": observed,
+            "reachability": record["reachability"],
+        }
+    )
+    return record
+
+
 def _agent_registration_record(
     value: Mapping[str, object], *, generation: int
 ) -> dict[str, object]:
@@ -1220,7 +1269,10 @@ def _agent_registration_record(
         "ref": ref,
         "label": _host_label(value["label"], "control.host_invalid"),
         "role": _registered_code(value["role"], _ROLES, "control.host_invalid"),
-        "transport_binding": {"kind": "ssh", "binding_ref": ref},
+        "transport_binding": {
+            "kind": "outbound-pull-mtls",
+            "binding_ref": ref,
+        },
         "capabilities": list(_capabilities(value["capabilities"], "control.host_invalid")),
         "reachability": {"state": "unavailable"},
         "resource_evidence": {},

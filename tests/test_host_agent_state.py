@@ -77,6 +77,50 @@ def test_pre_effect_crash_redelivers_and_finished_receipt_replays(
     assert restarted.accept(item) == receipt
 
 
+@pytest.mark.parametrize(
+    ("terminal_state", "reason"),
+    (
+        ("succeeded", "host.probe_complete"),
+        ("unknown", "host.operation_unknown"),
+    ),
+)
+def test_terminal_semantic_receipt_rebinds_to_later_lease_without_new_effect(
+    tmp_path: Path, terminal_state: str, reason: str
+) -> None:
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    first = lease()
+    state.accept(first)
+    saved = state.finish(
+        first,
+        state=terminal_state,  # type: ignore[arg-type]
+        reason_codes=(reason,),
+        result=result(first),
+    )
+    later = lease(lease_id="lease-two", attempt=2, registry_generation=8)
+
+    rebound = HostAgentState.for_test(
+        tmp_path, host_ref="worker-one"
+    ).recover(later)
+
+    assert rebound is not None
+    assert rebound.lease_id == later.lease_id
+    assert rebound.attempt == later.attempt
+    assert rebound.result == saved.result
+    assert rebound.result_digest == saved.result_digest
+    assert HostAgentState.for_test(
+        tmp_path, host_ref="worker-one"
+    ).recover(later) == rebound
+    with pytest.raises(HostAgentStateError, match="host.replay_conflict"):
+        state.recover(
+            lease(
+                lease_id="lease-three",
+                attempt=3,
+                registry_generation=8,
+                plan_digest="sha256:" + "b" * 64,
+            )
+        )
+
+
 def test_expired_unclaimed_same_operation_rebinds_only_safe_fence(
     tmp_path: Path,
 ) -> None:

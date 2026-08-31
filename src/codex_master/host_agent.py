@@ -43,6 +43,10 @@ from codex_master.agent_ollama import (
     ProductionAgentOllamaAdapter,
 )
 from codex_master.host_agent_state import HostAgentState
+from codex_master.host_probe import (
+    HostProbeKernel,
+    LocalHostProbeCollector,
+)
 from codex_master.ollama_registry import OllamaRegistryStore
 
 
@@ -475,17 +479,38 @@ class HostAgentClient:
 
 
 class HostProbeExecutor:
-    """Minimal bounded host capability collector for the Task 6 adapter seam."""
+    """Execute the one fixed Task-6 probe contract with canonical evidence."""
+
+    def __init__(
+        self,
+        *,
+        collector: LocalHostProbeCollector | None = None,
+        kernel: HostProbeKernel | None = None,
+    ) -> None:
+        self._collector = collector or LocalHostProbeCollector()
+        self._kernel = kernel
+
+    @staticmethod
+    def validate(value: object) -> None:
+        """Validate the exact private owner arguments without collecting facts."""
+        if not isinstance(value, Mapping) or set(value) != {
+            "admin_operation_id",
+            "probe_schema",
+        }:
+            _fail("host.arguments_invalid")
+        operation_id = value["admin_operation_id"]
+        if (
+            type(operation_id) is not str
+            or _TOKEN.fullmatch(operation_id) is None
+            or type(value["probe_schema"]) is not int
+            or value["probe_schema"] != 1
+        ):
+            _fail("host.arguments_invalid")
 
     def collect(self, value: object) -> dict[str, object]:
         """Collect only bounded, path-free local capability evidence."""
-        if (
-            type(value) is not dict
-            or set(value) != {"probe_profile"}
-            or value["probe_profile"] != "basic"
-        ):
-            _fail("host.arguments_invalid")
-        return {"cpu_count": os.cpu_count() or 1, "status": "collected"}
+        self.validate(value)
+        return self._collector.collect(self._kernel).public()
 
 
 class HostAgentExecutor:
@@ -510,7 +535,7 @@ class HostAgentExecutor:
         if kind == "ollama.instance":
             self._ollama.validate(action, arguments)
         elif kind == "host.probe" and action == "collect":
-            self._host_probe.collect(arguments)
+            self._host_probe.validate(arguments)
         else:
             _fail("host.action_unsupported")
 
@@ -637,10 +662,11 @@ class HostAgent:
         """Poll once, execute work, and durably submit its semantic receipt."""
         lease_or_idle = self._client.poll(self._poll(max_wait_seconds))
         if (
-            lease_or_idle.registry_generation != self._registry_generation
+            lease_or_idle.registry_generation < self._registry_generation
             or lease_or_idle.lease_epoch != self._lease_epoch
         ):
             _fail("host.response_fence_mismatch")
+        self._registry_generation = lease_or_idle.registry_generation
         if isinstance(lease_or_idle, AgentNoWorkV1):
             return lease_or_idle.max_wait_seconds
         receipt = self._executor.execute(lease_or_idle)

@@ -2,13 +2,25 @@ from __future__ import annotations
 
 import json
 import hashlib
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from codex_master.admin_hosts import AgentPrincipalV1
-from codex_master.agent_contracts import AgentNoWorkV1
+from codex_master.admin_hosts import AgentBindingV1, AgentPrincipalV1, HostRegistry
+from codex_master.agent_contracts import (
+    AgentLeaseV1,
+    AgentNoWorkV1,
+    AgentReceiptV1,
+    AgentResultV1,
+    serialize_agent_result,
+)
 from codex_master.agent_http import AgentHttpApplication
-from codex_master.agent_operations import AgentOperationError
+from codex_master.agent_operations import (
+    AgentOperationError,
+    AgentOperationRequestV1,
+    AgentOperationStore,
+    AgentPrincipalV1 as OperationPrincipalV1,
+)
 
 
 DIGEST = "sha256:" + "1" * 64
@@ -100,6 +112,114 @@ def test_poll_reuses_task_one_parser_and_projects_bounded_no_work(app, store) ->
         "max_wait_seconds": 0,
     }
     assert len(store.poll_calls) == 1
+    assert type(store.poll_calls[0][0]) is OperationPrincipalV1
+
+
+def test_resolver_principal_reaches_real_store_with_authoritative_fences(
+    tmp_path,
+) -> None:
+    registry = HostRegistry(tmp_path)
+    spki = "sha256:" + "a" * 64
+    registry.provision_agent_binding(
+        {
+            "ref": "worker-one",
+            "label": "Worker One",
+            "role": "execution",
+            "capabilities": ["resource.probe"],
+        },
+        AgentBindingV1("worker-one", spki, 1, True),
+        expected_generation=0,
+    )
+    resolver_principal = registry.resolve_agent_spki(spki)
+    store = AgentOperationStore(tmp_path)
+    store.enqueue(
+        AgentOperationRequestV1(
+            key="http-real-store",
+            kind="host.probe",
+            action="collect",
+            registry_generation=resolver_principal.registry_generation,
+            plan_digest=DIGEST,
+            arguments={"admin_operation_id": "op-one", "probe_schema": 1},
+            deadline=datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=5),
+            target_host_ref="worker-one",
+        )
+    )
+    application = AgentHttpApplication(store)
+
+    response = application.handle(
+        resolver_principal,
+        "POST",
+        "/agent/v1/polls",
+        poll_bytes(registry_generation=0, lease_epoch=1),
+    )
+
+    assert response.status == 200
+    lease_document = json.loads(response.body)
+    assert lease_document["host_ref"] == "worker-one"
+    deadline = datetime.strptime(
+        lease_document["deadline"], "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=UTC)
+    lease = AgentLeaseV1(
+        deadline=deadline,
+        **{
+            key: value
+            for key, value in lease_document.items()
+            if key not in {"schema_version", "deadline"}
+        },
+    )
+    result = AgentResultV1(
+        "host.probe",
+        "collect",
+        {"status": "collected"},
+    )
+    result_digest = "sha256:" + hashlib.sha256(
+        json.dumps(
+            serialize_agent_result(result),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    receipt = AgentReceiptV1(
+        lease.operation_id,
+        lease.lease_id,
+        lease.lease_epoch,
+        lease.attempt,
+        lease.plan_digest,
+        lease.arguments_digest,
+        "succeeded",
+        ("host.completed",),
+        result_digest,
+        result,
+    )
+    receipt_response = application.handle(
+        resolver_principal,
+        "POST",
+        f"/agent/v1/operations/{lease.operation_id}/receipts",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "operation_id": receipt.operation_id,
+                "lease_id": receipt.lease_id,
+                "lease_epoch": receipt.lease_epoch,
+                "attempt": receipt.attempt,
+                "plan_digest": receipt.plan_digest,
+                "arguments_digest": receipt.arguments_digest,
+                "state": receipt.state,
+                "reason_codes": list(receipt.reason_codes),
+                "result_digest": receipt.result_digest,
+                "result": serialize_agent_result(receipt.result),
+            }
+        ).encode(),
+    )
+    assert receipt_response.status == 200
+    assert store.get(lease.operation_id).state == "succeeded"
+    stale_epoch = application.handle(
+        resolver_principal,
+        "POST",
+        "/agent/v1/polls",
+        poll_bytes(registry_generation=1, lease_epoch=0),
+    )
+    assert stale_epoch.status == 409
 
 
 def test_receipt_route_binds_path_to_task_one_receipt_before_completion(app, store) -> None:

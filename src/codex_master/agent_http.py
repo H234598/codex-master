@@ -7,16 +7,22 @@ import json
 import re
 from typing import Final, Protocol, cast
 
-from .admin_hosts import AgentPrincipalV1
+from .admin_hosts import AgentPrincipalV1, HostRegistryError
+from .admin_operations import AdminOperationError
 from .agent_contracts import (
     AgentContractError,
     AgentLeaseV1,
     AgentNoWorkV1,
+    AgentPollV1,
+    AgentReceiptV1,
     parse_agent_poll,
     parse_agent_receipt,
     serialize_agent_lease,
 )
-from .agent_operations import AgentOperationError
+from .agent_operations import (
+    AgentOperationError,
+    AgentPrincipalV1 as OperationPrincipalV1,
+)
 
 
 MAX_AGENT_BODY_BYTES: Final[int] = 64 * 1024
@@ -28,8 +34,8 @@ _HEADERS = (("Content-Type", "application/json"), ("Cache-Control", "no-store"))
 
 
 class _Store(Protocol):
-    def poll(self, principal: AgentPrincipalV1, poll: object) -> object: ...
-    def complete(self, principal: AgentPrincipalV1, receipt: object) -> object: ...
+    def poll(self, principal: OperationPrincipalV1, poll: object) -> object: ...
+    def complete(self, principal: OperationPrincipalV1, receipt: object) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,16 +104,21 @@ class AgentHttpApplication:
                 parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
             )
             if target == "/agent/v1/polls":
-                result = self._store.poll(principal, parse_agent_poll(value))
+                parsed_poll = parse_agent_poll(value)
+                result = self._store.poll(
+                    _operation_principal(principal),
+                    _authoritative_poll(principal, parsed_poll),
+                )
                 return _response(200, self._poll_result(result))
             receipt = parse_agent_receipt(value)
             if receipt.operation_id != cast(re.Match[str], receipt_match).group(1):
                 raise AgentContractError
+            _validate_binding_epoch(principal, receipt)
             owner = self._completion_owner
             if receipt.result.kind == "host.probe" and callable(getattr(owner, "complete", None)):
                 owner.complete(principal, receipt)
             else:
-                self._store.complete(principal, receipt)
+                self._store.complete(_operation_principal(principal), receipt)
             return _response(
                 200,
                 {"schema_version": 1, "operation_id": receipt.operation_id, "accepted": True},
@@ -124,6 +135,8 @@ class AgentHttpApplication:
             if error.code == "host.operation_store_unavailable":
                 return _problem(503, "agent.temporarily_unavailable")
             return _problem(400, "agent.request_invalid")
+        except (AdminOperationError, HostRegistryError):
+            return _problem(503, "agent.temporarily_unavailable")
         except (AgentContractError, UnicodeError, ValueError, TypeError, RecursionError):
             return _problem(400, "agent.request_invalid")
 
@@ -140,6 +153,35 @@ class AgentHttpApplication:
                 "max_wait_seconds": no_work.max_wait_seconds,
             }
         raise AgentOperationError("host.operation_store_unavailable")
+
+
+def _operation_principal(principal: AgentPrincipalV1) -> OperationPrincipalV1:
+    return OperationPrincipalV1(
+        principal.host_ref,
+        principal.registry_generation,
+    )
+
+
+def _authoritative_poll(
+    principal: AgentPrincipalV1, poll: AgentPollV1
+) -> AgentPollV1:
+    if poll.lease_epoch != principal.lease_epoch:
+        raise AgentOperationError("host.lease_epoch_stale")
+    if poll.registry_generation > principal.registry_generation:
+        raise AgentOperationError("host.registry_generation_stale")
+    return AgentPollV1(
+        principal.registry_generation,
+        poll.lease_epoch,
+        poll.capabilities_digest,
+        poll.max_wait_seconds,
+    )
+
+
+def _validate_binding_epoch(
+    principal: AgentPrincipalV1, receipt: AgentReceiptV1
+) -> None:
+    if receipt.lease_epoch != principal.lease_epoch:
+        raise AgentOperationError("host.lease_epoch_stale")
 
 
 __all__ = [
