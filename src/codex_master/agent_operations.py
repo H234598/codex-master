@@ -114,6 +114,22 @@ def _check_kind_action(kind: object, action: object) -> tuple[str, str]:
     return kind_value, action_value
 
 
+def _host_probe_admin_operation_id(
+    arguments: object,
+    code: str = "host.request_invalid",
+) -> str:
+    """Return the exact schema-1 Admin owner bound to a fixed host probe."""
+
+    if (
+        not isinstance(arguments, Mapping)
+        or set(arguments) != {"admin_operation_id", "probe_schema"}
+        or type(arguments.get("probe_schema")) is not int
+        or arguments.get("probe_schema") != 1
+    ):
+        _raise(code)
+    return _token(arguments.get("admin_operation_id"), code)
+
+
 def _check_key(name: str) -> None:
     lowered = name.lower()
     if any(part in lowered for part in _FORBIDDEN_KEY_PARTS):
@@ -201,6 +217,8 @@ class AgentOperationRequestV1:
     def __post_init__(self) -> None:
         kind, action = _check_kind_action(self.kind, self.action)
         arguments = cast(Mapping[str, object], _freeze_json(dict(self.arguments)))
+        if (kind, action) == ("host.probe", "collect"):
+            _host_probe_admin_operation_id(arguments)
         object.__setattr__(self, "key", _token(self.key))
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "action", action)
@@ -827,6 +845,17 @@ class AgentOperationStore:
         with self._state.locked():
             bindings: list[Mapping[str, object]] = []
             for record in self._read_locked()["operations"]:
+                if (record["kind"], record["action"]) != (
+                    "host.probe",
+                    "collect",
+                ):
+                    continue
+                if record["state"] == "cancelled":
+                    continue
+                operation_id = _host_probe_admin_operation_id(
+                    record["arguments"],
+                    "host.operation_store_unavailable",
+                )
                 lifecycle_unknown = (
                     record["state"] == "unknown"
                     and record["completion"]
@@ -841,30 +870,36 @@ class AgentOperationStore:
                         },
                     )
                 )
+                completion = record["completion"]
+                receipt_terminal = (
+                    record["state"] in {"succeeded", "failed", "unknown"}
+                    and type(completion) is dict
+                    and completion["result_digest"] is not None
+                )
+                pending = record["state"] in {"queued", "leased"}
                 if (
-                    (record["kind"], record["action"])
-                    != ("host.probe", "collect")
-                    or not (
-                        record["state"] in {"queued", "leased"}
-                        or lifecycle_unknown
-                    )
+                    not (pending or lifecycle_unknown or receipt_terminal)
                     or type(record["target_host_ref"]) is not str
-                    or set(record["arguments"])
-                    != {"admin_operation_id", "probe_schema"}
-                    or record["arguments"].get("probe_schema") != 1
-                    or type(record["arguments"].get("admin_operation_id"))
-                    is not str
                 ):
-                    continue
+                    _raise("host.operation_store_unavailable")
+                lease = record["lease"]
+                if type(lease) is dict and (
+                    lease["host_ref"] != record["target_host_ref"]
+                ):
+                    _raise("host.operation_store_unavailable")
                 bindings.append(
                     MappingProxyType(
                         {
                             "operation_id": record["operation_id"],
-                            "admin_operation_id": record["arguments"][
-                                "admin_operation_id"
-                            ],
+                            "admin_operation_id": operation_id,
                             "target_host_ref": record["target_host_ref"],
                             "plan_digest": record["plan_digest"],
+                            "state": record["state"],
+                            "terminal_kind": (
+                                "lifecycle"
+                                if lifecycle_unknown
+                                else "receipt" if receipt_terminal else None
+                            ),
                         }
                     )
                 )

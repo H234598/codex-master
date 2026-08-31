@@ -887,28 +887,67 @@ class AdminOperationStore:
             if admin_operation_id in bindings_by_admin_id:
                 raise AdminOperationError("control.operation_store_unavailable")
             bindings_by_admin_id[admin_operation_id] = binding
-        changed = False
+        used_agent_ids = {owner["agent_operation_id"] for owner in owners}
+        migrated: list[dict[str, Any]] = []
         for operation_id, record in candidates.items():
             binding = bindings_by_admin_id.get(operation_id)
             if binding is None:
                 continue
             if binding["plan_digest"] != record["plan_digest"]:
                 raise AdminOperationError("control.operation_store_unavailable")
-            if len(owners) >= MAX_HOST_PROBE_LIFECYCLE_OWNERS:
+            agent_operation_id = binding["operation_id"]
+            if agent_operation_id in used_agent_ids:
+                raise AdminOperationError("control.operation_store_unavailable")
+            acknowledged = self._legacy_host_probe_binding_acknowledged(
+                record,
+                binding,
+            )
+            if len(owners) + len(migrated) >= MAX_HOST_PROBE_LIFECYCLE_OWNERS:
                 raise AdminOperationError("control.operation_limit")
-            owners.append(
+            migrated.append(
                 {
                     "operation_id": operation_id,
-                    "agent_operation_id": binding["operation_id"],
+                    "agent_operation_id": agent_operation_id,
                     "target_host_ref": binding["target_host_ref"],
                     "expected_generation": record["expected_generation"],
                     "plan_digest": record["plan_digest"],
-                    "acknowledged": False,
+                    "acknowledged": acknowledged,
                 }
             )
-            changed = True
-        if changed:
+            used_agent_ids.add(agent_operation_id)
+        if migrated:
+            owners.extend(migrated)
             self._write_host_probe_lifecycle_locked(owners)
+
+    @staticmethod
+    def _legacy_host_probe_binding_acknowledged(
+        record: Mapping[str, Any],
+        binding: Mapping[str, object],
+    ) -> bool:
+        """Classify one exact pre-sidecar pair without weakening its state fence."""
+
+        agent_state = binding["state"]
+        terminal_kind = binding["terminal_kind"]
+        if terminal_kind is None:
+            if agent_state not in {"queued", "leased"}:
+                raise AdminOperationError("control.operation_store_unavailable")
+            return False
+        if record["state"] in {"planned", "partial"}:
+            if terminal_kind == "lifecycle" and agent_state == "unknown":
+                return False
+            raise AdminOperationError("control.operation_store_unavailable")
+        if record["state"] == "succeeded":
+            if terminal_kind == "receipt" and agent_state == "succeeded":
+                return True
+            raise AdminOperationError("control.operation_store_unavailable")
+        if record["state"] == "failed" and (
+            terminal_kind == "lifecycle"
+            and agent_state == "unknown"
+            or terminal_kind == "receipt"
+            and agent_state in {"succeeded", "failed", "unknown"}
+        ):
+            return True
+        raise AdminOperationError("control.operation_store_unavailable")
 
     @staticmethod
     def _encoded_host_probe_lifecycle(owners: list[dict[str, Any]]) -> bytes:
@@ -1275,7 +1314,6 @@ class AdminOperationStore:
         if (
             record["kind"] != "hosts.probe"
             or record["owner"] is not None
-            or record["resulting_generation"] is not None
             or len(record["steps"]) != 1
             or record["steps"][0]["name"] != "host.probe.collect"
         ):
@@ -1305,12 +1343,27 @@ class AdminOperationStore:
         )
         return (
             record["state"] == "planned"
+            and record["resulting_generation"] is None
             and record["reason_codes"] == ["control.plan_ready"]
             and step["state"] == "not_attempted"
         ) or (
             record["state"] == "partial"
+            and record["resulting_generation"] is None
             and record["reason_codes"] == ["control.restart_reconciled"]
             and valid_step
+        ) or (
+            record["state"] == "failed"
+            and record["resulting_generation"] is None
+            and record["reason_codes"]
+            in (["host.probe_unknown"], ["host.probe_failed"])
+            and step["state"] == "failed"
+            and step["reason_code"] == record["reason_codes"][0]
+        ) or (
+            record["state"] == "succeeded"
+            and record["reason_codes"] == []
+            and record["resulting_generation"]
+            == record["expected_generation"] + 1
+            and step["state"] == "succeeded"
         )
 
     @staticmethod

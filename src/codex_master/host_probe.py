@@ -21,6 +21,7 @@ from .agent_operations import (
     AgentOperationRequestV1,
     AgentOperationStore,
     AgentPrincipalV1 as OperationPrincipalV1,
+    _host_probe_admin_operation_id,
 )
 from .admin_operations import AdminOperationError, AdminOperationStore
 from .admin_hosts import (
@@ -39,6 +40,16 @@ class HostProbeError(ValueError):
 
     def __init__(self, code: str = "host.probe_failed") -> None:
         super().__init__(code)
+
+
+def _probe_operation_id(arguments: object) -> str:
+    try:
+        return _host_probe_admin_operation_id(
+            arguments,
+            "host.arguments_invalid",
+        )
+    except AgentOperationError:
+        raise HostProbeError() from None
 
 
 class HostProbeKernel(Protocol):
@@ -340,13 +351,9 @@ class RemoteHostProbeCompletionOwner:
         if (
             type(target) is not str
             or exhaustion.host_ref != target
-            or set(arguments) != {"admin_operation_id", "probe_schema"}
-            or arguments.get("probe_schema") != 1
         ):
             raise HostProbeError()
-        operation_id = arguments.get("admin_operation_id")
-        if type(operation_id) is not str:
-            raise HostProbeError()
+        operation_id = _probe_operation_id(arguments)
         lifecycle = self._operations.claim_host_probe_agent(
             operation_id,
             agent_operation_id=exhaustion.operation_id,
@@ -392,13 +399,9 @@ class RemoteHostProbeCompletionOwner:
         if (
             type(target) is not str
             or expiry.host_ref != target
-            or set(arguments) != {"admin_operation_id", "probe_schema"}
-            or arguments.get("probe_schema") != 1
         ):
             raise HostProbeError()
-        operation_id = arguments.get("admin_operation_id")
-        if type(operation_id) is not str:
-            raise HostProbeError()
+        operation_id = _probe_operation_id(arguments)
         lifecycle = self._operations.claim_host_probe_agent(
             operation_id,
             agent_operation_id=expiry.operation_id,
@@ -448,13 +451,9 @@ class RemoteHostProbeCompletionOwner:
         if (
             type(target) is not str
             or lifecycle.host_ref != target
-            or set(arguments) != {"admin_operation_id", "probe_schema"}
-            or arguments.get("probe_schema") != 1
         ):
             raise HostProbeError()
-        operation_id = arguments.get("admin_operation_id")
-        if type(operation_id) is not str:
-            raise HostProbeError()
+        operation_id = _probe_operation_id(arguments)
         terminal = self._agent_operations.get(lifecycle.operation_id)
         expected_reason = (
             "host.attempts_exhausted"
@@ -487,13 +486,10 @@ class RemoteHostProbeCompletionOwner:
             raise HostProbeError()
         if operation_principal.host_ref != target:
             raise AgentOperationError("host.identity_mismatch")
-        operation_id = arguments.get("admin_operation_id")
+        operation_id = _probe_operation_id(arguments)
         document_generation = context["registry_generation"]
         if (
-            set(arguments) != {"admin_operation_id", "probe_schema"}
-            or arguments.get("probe_schema") != 1
-            or type(operation_id) is not str
-            or type(document_generation) is not int
+            type(document_generation) is not int
         ):
             raise HostProbeError()
         lifecycle = self._operations.claim_host_probe_agent(
@@ -519,6 +515,19 @@ class RemoteHostProbeCompletionOwner:
         ):
             raise HostProbeError()
         host_generation = operation.expected_generation
+        authoritative_failure = self._authoritative_restart_failure(
+            operation_id,
+            host_generation,
+            operation,
+        )
+        if authoritative_failure is not None:
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                host_generation,
+                authoritative_failure,
+            )
         try:
             host = self._registry.get(target)
         except HostRegistryError as error:
@@ -640,6 +649,34 @@ class RemoteHostProbeCompletionOwner:
             operation_id,
             target,
         )
+
+    def _authoritative_restart_failure(
+        self,
+        operation_id: str,
+        generation: int,
+        operation: OperationV1,
+    ) -> str | None:
+        if (
+            operation.state == "partial"
+            and operation.reason_codes == ("control.restart_reconciled",)
+            and operation.completed_count == 0
+            and operation.failed_count == 1
+            and operation.not_attempted_count == 0
+        ):
+            operation = self._operations.resume_host_probe(
+                operation_id,
+                expected_generation=generation,
+            )
+        if (
+            operation.state == "running"
+            and operation.completed_count == 0
+            and operation.failed_count == 1
+            and operation.not_attempted_count == 0
+            and operation.reason_codes
+            in {("host.probe_unknown",), ("host.probe_failed",)}
+        ):
+            return operation.reason_codes[0]
+        return None
 
     def _active_operation(
         self, operation_id: str, generation: int

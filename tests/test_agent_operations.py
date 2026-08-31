@@ -87,7 +87,7 @@ def operation_request(
     key: str = "request-one",
 ) -> AgentOperationRequestV1:
     payload = (
-        {"probe_profile": "quiescence", "include_metrics": True}
+        {"admin_operation_id": "operation-admin-one", "probe_schema": 1}
         if arguments is None
         else arguments
     )
@@ -156,10 +156,14 @@ def test_operation_views_and_requests_are_frozen_and_constructible(
         view.state = "failed"  # type: ignore[misc]
 
 
-@pytest.mark.parametrize("terminal_state", ("succeeded", "failed", "cancelled"))
-def test_host_probe_owner_migration_excludes_non_lifecycle_terminal_states(
+@pytest.mark.parametrize(
+    ("terminal_state", "expected_bindings"),
+    (("succeeded", 1), ("failed", 1), ("cancelled", 0)),
+)
+def test_host_probe_owner_migration_exports_exact_receipts_but_not_cancelled(
     tmp_path: Path,
     terminal_state: str,
+    expected_bindings: int,
 ) -> None:
     store = store_at(tmp_path)
     request = replace(
@@ -190,7 +194,27 @@ def test_host_probe_owner_migration_excludes_non_lifecycle_terminal_states(
             )
         store.complete(principal(), receipt)
 
-    assert store._host_probe_lifecycle_bindings() == ()
+    assert len(store._host_probe_lifecycle_bindings()) == expected_bindings
+
+
+def test_host_probe_request_rejects_boolean_schema_before_store_mutation(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    document = tmp_path / "agent-operations" / "operations.json"
+    before = document.read_bytes()
+
+    with pytest.raises(AgentOperationError, match="host.request_invalid"):
+        store.enqueue(
+            operation_request(
+                arguments={
+                    "admin_operation_id": "operation-admin-one",
+                    "probe_schema": True,
+                }
+            )
+        )
+
+    assert document.read_bytes() == before
 
 
 def test_default_clock_can_enqueue_without_second_aligned_injection(
@@ -256,8 +280,16 @@ def test_cross_host_or_digest_drift_receipt_changes_nothing(tmp_path: Path) -> N
 
     drifted = replace(
         lease,
-        arguments={"probe_profile": "other"},
-        arguments_digest=digest({"probe_profile": "other"}),
+        arguments={
+            "admin_operation_id": "operation-admin-other",
+            "probe_schema": 1,
+        },
+        arguments_digest=digest(
+            {
+                "admin_operation_id": "operation-admin-other",
+                "probe_schema": 1,
+            }
+        ),
     )
     with pytest.raises(AgentOperationError, match="host.arguments_digest_mismatch"):
         store.complete(principal("worker-one"), receipt_for(drifted))

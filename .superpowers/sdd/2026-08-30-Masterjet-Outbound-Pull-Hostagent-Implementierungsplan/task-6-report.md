@@ -1137,3 +1137,135 @@ important defect.
   application and completion owner but replace TLS/socket transport in process.
   Separate identity, HTTP client and daemon regressions passed; this is not a
   live two-daemon mTLS test.
+
+## Final Task-6 TDD closure: I1--I4
+
+This final implementation continuation started from the intentionally dirty
+TDD worktree at `09304825b552671759a618722e85dafd15f57aac`. Before touching
+the implementation, the required `RH_Privat` `CODEX_HOME`, physical SSD3
+worktree, Git toplevel and exact base HEAD were verified. The controller-owned
+`progress.md` was read for context and remained untouched and unstaged. The
+complete specification, implementation plan, Task-6 brief, constraints,
+report, prior deadline verdict and hard-deadline/tombstone verdict were read;
+the governing annotation sidecars and open relevant `codex-question` notes
+were absent. No path under the prohibited loop mount or legacy worktree was
+accessed.
+
+### I1: exact legacy terminal replay after ordinary pruning
+
+The inherited TDD change extends the private Agent-store migration inventory
+only for exact fixed `host.probe/collect` records. It distinguishes pending
+and lifecycle-terminal records from receipt-terminal records, rejects cancelled
+or malformed bindings, checks target host/plan identity, and classifies a
+terminal pair as acknowledged only when its persisted Admin and Agent terminal
+shapes agree exactly. Admin migration now writes that bounded acknowledged
+tombstone before ordinary pruning can erase the matching Admin identity. An
+unacknowledged Admin-terminal/Agent-leased split remains protected until its
+Agent lifecycle acknowledgement is durable.
+
+The regression matrix uses real Admin and Agent stores, deletes only the
+legacy-absent sidecar, invokes ordinary unrelated Admin planning after expiry,
+reconstructs both owners, and replays the exact receipt. It covers successful,
+failed and unknown receipt terminals plus mismatched state, target and digest
+negative cases. The replay leaves the Registry bytes unchanged.
+
+### I2: strict schema-1 binding before every mutation
+
+`_host_probe_admin_operation_id()` is now the single fixed binding validator:
+the arguments are exactly `admin_operation_id` and `probe_schema`, and schema
+acceptance is exactly `type(value) is int and value == 1`. The Agent request
+constructor, migration scan and every lifecycle/receipt owner boundary share
+it. The regression set proves `probe_schema: true` is rejected before Agent,
+Admin, Registry or lifecycle-sidecar mutation, including persisted legacy
+documents and both deadline lifecycle contexts.
+
+### I3: persisted restart failure is authoritative before Registry access
+
+The completion owner reopens an exact restart-reconciled partial first. A
+durably failed sole `host.probe.collect` step is then authoritative: completion
+terminalizes Admin and Agent through the existing failure path without reading
+or mutating `HostRegistry`. The regression persists a dead-owner
+`failed/host.probe_failed` step, reconstructs the owner, submits a conflicting
+successful receipt, and proves a terminal Admin failure, terminal Agent
+receipt and byte-identical Registry. Replaying the same receipt is idempotent.
+
+### I4: canonical Hive test index
+
+The index was regenerated only through the repository's
+`PythonTestIndexBuilder`, `JavaScriptTestIndexBuilder`,
+`combine_test_indexes()` and `TestIndexV1.canonical_bytes()` workflow; no JSON
+entry was hand-edited. The first strict builder pass exposed the stale IDs.
+Two obsolete Python node IDs represented three existing function bindings and
+were mapped to their current v3/scheduler-failure test nodes; the same mapping
+was applied to each branch/merge/release gate list. The source inventory now
+also contains the previously absent Task-6 modules `agent_http.py`,
+`agent_operations.py` and `host_probe.py`, and their direct test paths.
+
+Generation 5 has 5,420 indexed functions and 1,639 bound collectible tests.
+It includes all 169 formerly missing Python functions: the complete changed
+Admin lifecycle inventory and the Task-6 Agent HTTP, Agent operation and host
+probe production inventories. Each new group is bound to concrete direct
+contract/recovery/production-graph tests; lifecycle functions are labelled
+`integration`/`lifecycle`. The repository authority itself passed:
+
+```text
+PYTHONPATH=src /tmp/codex-master-test-index-venv/bin/python -m pytest -q \
+  -p no:cacheprovider tests/test_repository_hive_test_index.py
+1 passed in 12.22s
+```
+
+### Final verification
+
+All listed Python commands used `PYTHONDONTWRITEBYTECODE=1`, `PYTHONPATH=src`
+and `-p no:cacheprovider` unless the command is static.
+
+```text
+# New I1--I3 TDD nodes
+20 passed, 89 deselected in 0.79s
+
+# Complete directly affected suites
+tests/test_agent_operations.py tests/test_admin_operations.py
+tests/test_host_probe.py tests/test_host_probe_production_graph.py
+tests/test_agent_http.py
+195 passed in 54.21s
+
+# Task-1--5 dependency matrix
+tests/test_agent_contracts.py tests/test_agent_operations.py
+tests/test_agent_identity.py tests/test_agent_http.py
+tests/test_agent_daemon.py tests/test_host_agent_state.py
+tests/test_host_agent.py tests/test_agent_ollama.py tests/test_admin_daemon.py
+249 passed in 117.48s
+
+# Preserved route/scope/step-up; exact CLI/MCP; catalog/GTK gate
+6 passed, 243 deselected in 2.20s
+2 passed, 3 deselected in 4.66s
+5 passed, 54 deselected in 1.06s
+
+ruff check --no-cache <all changed Task-6 Python source/test files>
+All checks passed!
+
+PYTHONPYCACHEPREFIX=/dev/shm/task6-compile-cache-20260831 \
+  python -m compileall -q <three changed production modules>
+(clean)
+
+git diff --check
+(clean)
+
+# Count-only high-confidence value-pattern secret scan of all owned source,
+# test and index paths; no matched value was printed.
+0
+```
+
+The isolated `tests/test_admin_usage_wire_contract.py` remains uncollectable
+in this Master-only worktree because its hard import
+`codex_usage.masterjet_client` is absent. The command was rerun and failed at
+collection with that module absence before any test body; Task 6 changes no
+Usage wire surface. This known external checkout dependency is recorded rather
+than masked or worked around outside the authorized worktree.
+
+### Scope and closure
+
+The final commit stages only the owned production files, their tests, the
+canonical index and this complete report. Reviewer verdicts and the controller
+ledger remain unstaged. This is an implementation audit and verification pass,
+not a claimed independent review verdict.
