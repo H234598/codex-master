@@ -30,7 +30,7 @@ class FleetDesktopEntryTest(unittest.TestCase):
         )
 
     def test_recognizes_legacy_generated_entry_only_for_safe_cleanup(self) -> None:
-        command = Path("/home/user/.local/bin/codex-master-mcp")
+        command = Path("/home/user/.local/lib/codex-master-runtime/bin/codex-master-mcp")
         current = server.fleet_desktop_entry_bytes(command)
         legacy = current.replace(b" control-center-launch\n", b" control-center\n")
 

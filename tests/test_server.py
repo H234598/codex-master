@@ -131,7 +131,6 @@ from codex_master.server import (
     ensure_assignment_session_model,
     handle_rpc,
     install,
-    installed_source_worktree_state,
     agent_lease_status,
     public_agent_lease,
     public_error_payload,
@@ -167,8 +166,6 @@ from codex_master.server import (
     redact,
     paged_mapping,
     release_agent,
-    remove_install_symlink_if_repo_wrapper,
-    replace_install_symlink,
     replace_private_text,
     resolve_path_no_throw,
     run_command,
@@ -5633,21 +5630,22 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex-master-mcp",
                 "  enabled: true",
                 "  transport: stdio",
-                "  command: /home/teladi/.local/bin/codex-master-mcp",
+                "  command: /home/teladi/.local/lib/codex-master-runtime/bin/codex-master-mcp",
                 "  args: -",
                 "  startup_timeout_sec: 120",
                 "  remove: codex mcp remove codex-master-mcp",
             ]
         )
         suffixed = output.replace("codex-master-mcp", "codex-master-mcp-old", 1).replace(
-            "command: /home/teladi/.local/bin/codex-master-mcp",
-            "command: /home/teladi/.local/bin/codex-master-mcp-old",
+            "command: /home/teladi/.local/lib/codex-master-runtime/bin/codex-master-mcp",
+            "command: /home/teladi/.local/lib/codex-master-runtime/bin/codex-master-mcp-old",
         )
         no_command = "codex-master-mcp\n  remove: codex mcp remove codex-master-mcp\n"
 
-        self.assertTrue(mcp_registration_command_matches(output, Path("/home/teladi/.local/bin/codex-master-mcp")))
-        self.assertFalse(mcp_registration_command_matches(suffixed, Path("/home/teladi/.local/bin/codex-master-mcp")))
-        self.assertFalse(mcp_registration_command_matches(no_command, Path("/home/teladi/.local/bin/codex-master-mcp")))
+        command = Path("/home/teladi/.local/lib/codex-master-runtime/bin/codex-master-mcp")
+        self.assertTrue(mcp_registration_command_matches(output, command))
+        self.assertFalse(mcp_registration_command_matches(suffixed, command))
+        self.assertFalse(mcp_registration_command_matches(no_command, command))
         self.assertEqual(mcp_startup_timeout_seconds(output), 120)
 
     def test_redact_removes_absolute_paths(self) -> None:
@@ -7554,20 +7552,22 @@ class ServerHelpersTest(unittest.TestCase):
                     else:
                         self.assertNotIn("model_providers", config)
 
-            q_name, q_text = server_module.fleet_minimal_config(
-                AgentDescriptor(
-                    "q1", "q", 1, "Q 1", RunnerKind.CODEX_CLI,
-                    Provider.OPENAI_CHATGPT, "gpt-5.6-terra", None,
-                    root / "q1", "session-q1", True,
-                    skill_profile="teamleiterin",
+            runtime_entrypoint = root / "runtime" / "bin" / "codex-master-mcp"
+            with patch.object(server_module, "_runtime_mcp_entrypoint", return_value=runtime_entrypoint):
+                q_name, q_text = server_module.fleet_minimal_config(
+                    AgentDescriptor(
+                        "q1", "q", 1, "Q 1", RunnerKind.CODEX_CLI,
+                        Provider.OPENAI_CHATGPT, "gpt-5.6-terra", None,
+                        root / "q1", "session-q1", True,
+                        skill_profile="teamleiterin",
+                    )
                 )
-            )
             q_config = tomllib.loads(q_text)
             self.assertEqual(q_name, "config.toml")
             self.assertEqual(
                 q_config["mcp_servers"][server_module.MCP_SERVER_NAME],
                 {
-                    "command": str(server_module.DEFAULT_INSTALL_PATH),
+                    "command": str(runtime_entrypoint),
                     "startup_timeout_sec": server_module.RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
                     "default_tools_approval_mode": "approve",
                 },
@@ -16266,8 +16266,6 @@ google_accounts:
             server_module, "mcp_command_startup_self_test", return_value={"ok": True}
         ), patch.object(server_module, "plugin_cache_status", return_value={"ok": True}), patch.object(
             server_module, "codex_client_mcp_config_status", return_value={"ok": True}
-        ), patch.object(
-            server_module, "installed_source_worktree_state", return_value={"ok": True}
         ), patch.object(server_module, "codex_home_context", return_value={"ok": True}):
             result = server_module.master_plugin_status()
 
@@ -33933,7 +33931,7 @@ class CliLifecycleTest(unittest.TestCase):
         mock_popen,
         mock_access,
     ) -> None:
-        command = Path("/home/tester/.local/bin/codex-master-mcp")
+        command = Path("/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp")
         result = server_module.launch_control_center_detached(
             command_path=command,
             environ={
@@ -35305,26 +35303,6 @@ class CliLifecycleTest(unittest.TestCase):
             )
         )
 
-    @patch("codex_master.server.run_command")
-    def test_installed_source_worktree_state_warns_without_paths(self, mock_run) -> None:
-        mock_run.return_value = subprocess.CompletedProcess(
-            ["git", "status", "--porcelain=v1"],
-            0,
-            " M src/codex_master/server.py\n?? SECRET_PATH_SHOULD_NOT_RETURN\n",
-            "",
-        )
-
-        wrapper = Path("/tmp/repo/bin/codex-master-mcp")
-        result = installed_source_worktree_state(wrapper, wrapper)
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["status"], "dirty")
-        self.assertEqual(result["severity"], "warning")
-        self.assertEqual(result["tracked_change_count"], 1)
-        self.assertEqual(result["untracked_count"], 1)
-        self.assertEqual(result["raw_output"], "not_returned")
-        self.assertNotIn("SECRET_PATH_SHOULD_NOT_RETURN", json.dumps(result, sort_keys=True))
-
     def test_install_refuses_master_registration_inside_managed_agent_home(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -35646,58 +35624,6 @@ class CliLifecycleTest(unittest.TestCase):
 
         self.assertEqual(content, "keep me\n")
 
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_and_uninstall_serialize_link_mutation(self, mock_wrapper_path) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-
-            replace_entered = threading.Event()
-            release_replace = threading.Event()
-            replace_released = threading.Event()
-            uninstall_reached_remove = threading.Event()
-            original_replace = replace_install_symlink
-            original_remove = remove_install_symlink_if_repo_wrapper
-
-            def blocking_replace(path: Path, target: Path, **kwargs: Any) -> None:
-                original_replace(path, target, **kwargs)
-                replace_entered.set()
-                self.assertTrue(release_replace.wait(2))
-                replace_released.set()
-
-            def observe_remove(path: Path, target: Path, **kwargs: Any) -> str:
-                if not replace_released.is_set():
-                    uninstall_reached_remove.set()
-                return original_remove(path, target, **kwargs)
-
-            with patch("codex_master.server.replace_install_symlink", side_effect=blocking_replace), patch(
-                "codex_master.server.remove_install_symlink_if_repo_wrapper", side_effect=observe_remove
-            ):
-                install_thread = threading.Thread(
-                    target=lambda: install(register=False, install_path=install_link, sync_plugin_cache=False)
-                )
-                install_thread.start()
-                self.assertTrue(replace_entered.wait(2))
-
-                uninstall_thread = threading.Thread(
-                    target=lambda: uninstall(unregister=False, remove_symlink=True, install_path=install_link)
-                )
-                uninstall_thread.start()
-                self.assertFalse(uninstall_reached_remove.wait(0.1))
-
-                release_replace.set()
-                install_thread.join(2)
-                uninstall_thread.join(2)
-
-        self.assertFalse(install_thread.is_alive())
-        self.assertFalse(uninstall_thread.is_alive())
-        self.assertTrue(replace_released.is_set())
-        self.assertFalse(uninstall_reached_remove.is_set())
-
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
     @patch("codex_master.server.repo_wrapper_path")
     def test_uninstall_refuses_symlink_parent_without_removing_redirected_link(
@@ -35823,45 +35749,6 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["symlink"], "missing")
         self.assertFalse(parent_exists)
-
-    def test_remove_install_symlink_rejects_link_swap_before_unlink(self) -> None:
-        from codex_master import server as server_module
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            wrapper = root / "wrapper"
-            other = root / "other"
-            install_link = root / "codex-master-mcp"
-            wrapper.write_text("wrapper\n", encoding="utf-8")
-            other.write_text("other\n", encoding="utf-8")
-            install_link.symlink_to(wrapper)
-            swapped = False
-            real_readlink = server_module.os.readlink
-
-            def swap_after_readlink(name, *args, **kwargs):
-                nonlocal swapped
-                target_text = real_readlink(name, *args, **kwargs)
-                if not swapped:
-                    install_link.unlink()
-                    install_link.symlink_to(other)
-                    swapped = True
-                return target_text
-
-            with patch.object(
-                server_module,
-                "source_identity_matches",
-                return_value=True,
-            ), patch.object(
-                server_module.os,
-                "readlink",
-                side_effect=swap_after_readlink,
-            ):
-                result = server_module.remove_install_symlink_if_repo_wrapper(install_link, wrapper)
-
-            self.assertTrue(swapped)
-            self.assertEqual(result, "left_in_place_not_repo_wrapper")
-            self.assertTrue(install_link.is_symlink())
-            self.assertEqual(install_link.resolve(), other)
 
     @patch("codex_master.server.agent_home_process_summary")
     @patch("codex_master.server.tmux_alive", return_value=False)

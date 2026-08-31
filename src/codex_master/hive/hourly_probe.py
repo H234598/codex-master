@@ -1,4 +1,4 @@
-"""Deterministic, data-sparse Hive hourly self-test contract."""
+"""Deterministic, fail-closed Hive hourly Runtime Image probe (record v2)."""
 
 from __future__ import annotations
 
@@ -10,24 +10,28 @@ import json
 import os
 from pathlib import Path
 import stat
-import subprocess
 import sys
 import tempfile
 from typing import Any
 
+from codex_master.runtime_layout import LayoutError, RuntimeLayout
+from codex_master.runtime_process import (
+    BoundedProcessError,
+    DEFAULT_STDERR_LIMIT,
+    DEFAULT_STDOUT_LIMIT,
+    run_bounded,
+)
+from codex_master.runtime_status import runtime_status
+
 
 DETERMINISTIC_PROBE_HOURS_UTC = (0, 3, 6, 9, 12, 15, 18, 21)
 STATE_FILE_NAME = "hive-hourly-health.json"
-ALARM_FILE_NAME = "hive-hourly-alarm.json"
-FUNCTIONAL_MARKER_NAME = "hive-functional"
 PROBE_GATE_LOCK_NAME = ".hive-hourly-probe.lock"
 MAX_PROBE_STATE_BYTES = 64 * 1024
 MAX_PROBE_AGE_SECONDS = 4 * 60 * 60
-_BLOCKED_STATES = frozenset({"", "disabled", "fail_closed", "invalid", "missing", "not_configured", "unknown", "unavailable"})
-_ALARM_ROUTE = ("queen-codex-master", "active_queen", "native_recovery_queen")
-_PROBE_RECORD_KEYS = frozenset({"alarm", "checked_at", "checks", "commands", "functional"})
-_PROBE_CHECK_KEYS = frozenset({"namespace", "plugin", "hive_doctor", "hive_runtime"})
-_PROBE_COMMAND_KEYS = frozenset({"namespace", "plugin", "hive_status", "hive_doctor"})
+_PROBE_RECORD_KEYS = frozenset({"schema_version", "checked_at", "checks", "commands"})
+_PROBE_CHECK_KEYS = frozenset({"runtime_layout", "hive_runtime", "hive_doctor"})
+_PROBE_COMMAND_KEYS = frozenset({"runtime_status", "hive_status", "hive_doctor"})
 _HIVE_STATUS_KEYS = frozenset(
     {
         "schema_version",
@@ -90,68 +94,47 @@ def _green_hive_runtime(value: object) -> bool:
     )
 
 
-def _safe_reason(value: object) -> str | None:
-    if not isinstance(value, str) or not 1 <= len(value) <= 96:
-        return None
-    if not all(character.islower() or character.isdigit() or character in "_-" for character in value):
-        return None
-    return value
-
-
-def build_hive_probe_alarm(reason_codes: tuple[str, ...] | list[str]) -> dict[str, object]:
-    """Build the bounded Hive-wide alarm envelope for a failed self-test."""
-
-    if not isinstance(reason_codes, (tuple, list)):
-        raise ValueError("invalid_probe_alarm_reasons")
-    reasons = tuple(_safe_reason(value) for value in reason_codes)
-    if not reasons or any(value is None for value in reasons):
-        raise ValueError("invalid_probe_alarm_reasons")
-    unique = tuple(dict.fromkeys(value for value in reasons if value is not None))
-    if len(unique) > 8:
-        raise ValueError("invalid_probe_alarm_reasons")
-    return {
-        "schema_version": 1,
-        "scope": "hive",
-        "event": "hourly_probe_failed",
-        "reason_codes": list(unique),
-        "route": list(_ALARM_ROUTE),
-        "token_telemetry": "unknown",
-        "raw_output": "not_returned",
-    }
+def _green_runtime_status(value: object) -> bool:
+    if not isinstance(value, Mapping) or value.get("ok") is not True:
+        return False
+    metadata = value.get("metadata")
+    surface = value.get("mcp_surface")
+    return (
+        isinstance(metadata, Mapping)
+        and metadata.get("ok") is True
+        and metadata.get("reason_code") == "ok"
+        and isinstance(surface, Mapping)
+        and surface.get("ok") is True
+        and surface.get("initialize") is True
+        and surface.get("tools_list") is True
+        and type(surface.get("tool_count")) is int
+        and surface.get("tool_count") >= 1
+        and surface.get("reason_code") == "ok"
+        and value.get("raw_output") == "not_returned"
+    )
 
 
 def evaluate(
-    namespace: Mapping[str, Any],
-    plugin: Mapping[str, Any],
+    runtime_status: Mapping[str, Any],
     hive: Mapping[str, Any],
     doctor: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Evaluate public probe inputs without copying arbitrary input values."""
+    """Reduce direct Runtime Image and Hive diagnostics to v2 booleans."""
 
-    if not all(isinstance(value, Mapping) for value in (namespace, plugin, hive, doctor)):
-        namespace = namespace if isinstance(namespace, Mapping) else {}
-        plugin = plugin if isinstance(plugin, Mapping) else {}
-        hive = hive if isinstance(hive, Mapping) else {}
-        doctor = doctor if isinstance(doctor, Mapping) else {}
+    runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
+    hive = hive if isinstance(hive, Mapping) else {}
+    doctor = doctor if isinstance(doctor, Mapping) else {}
     doctor_checks = doctor.get("checks")
     doctor_ready = isinstance(doctor_checks, Mapping) and all(
-        _ready_state(doctor_checks.get(key)) for key in ("authority", "repository", "state")
+        _ready_state(doctor_checks.get(key))
+        for key in ("authority", "repository", "state")
     )
-    hive_runtime = _green_hive_runtime(hive)
     checks = {
-        "namespace": namespace.get("ok") is True and namespace.get("namespace_ready") is True,
-        "plugin": plugin.get("ok") is True,
-        "hive_runtime": hive_runtime,
+        "runtime_layout": _green_runtime_status(runtime_status),
+        "hive_runtime": _green_hive_runtime(hive),
         "hive_doctor": doctor.get("healthy") is True and doctor_ready,
     }
-    functional = all(checks.values())
-    result: dict[str, Any] = {"functional": functional, "checks": checks}
-    if not functional:
-        failed = tuple(f"{name}_unavailable" for name, value in checks.items() if not value)
-        result["alarm"] = build_hive_probe_alarm(failed)
-    else:
-        result["alarm"] = None
-    return result
+    return {"checks": checks}
 
 
 def probe_spawn_gate(
@@ -159,36 +142,60 @@ def probe_spawn_gate(
     *,
     now: datetime | Callable[[], datetime] | None = None,
 ) -> dict[str, object]:
-    """Accept only one fresh, unambiguous green result for Hive spawning."""
+    """Accept only one fresh, complete and green v2 result for Hive spawning."""
 
     if not isinstance(payload, Mapping) or frozenset(payload) != _PROBE_RECORD_KEYS:
-        return {"allowed": False, "reason_code": "probe_ambiguous", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_ambiguous",
+            "raw_output": "not_returned",
+        }
     checks = payload.get("checks")
     commands = payload.get("commands")
     if (
-        not isinstance(checks, Mapping)
+        payload.get("schema_version") != 2
+        or not isinstance(checks, Mapping)
         or frozenset(checks) != _PROBE_CHECK_KEYS
         or any(value is not True for value in checks.values())
         or not isinstance(commands, Mapping)
         or frozenset(commands) != _PROBE_COMMAND_KEYS
         or any(value is not True for value in commands.values())
-        or payload.get("functional") is not True
-        or payload.get("alarm") is not None
     ):
-        return {"allowed": False, "reason_code": "probe_red", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_red",
+            "raw_output": "not_returned",
+        }
     checked_at = payload.get("checked_at")
     if not isinstance(checked_at, str) or not 1 <= len(checked_at) <= 40:
-        return {"allowed": False, "reason_code": "probe_invalid", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_invalid",
+            "raw_output": "not_returned",
+        }
     try:
         observed = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
         reference = now() if callable(now) else (now or datetime.now(UTC))
-        if observed.tzinfo is None or observed.utcoffset() is None or reference.tzinfo is None or reference.utcoffset() is None:
+        if (
+            observed.tzinfo is None
+            or observed.utcoffset() is None
+            or reference.tzinfo is None
+            or reference.utcoffset() is None
+        ):
             raise ValueError
         age = (reference.astimezone(UTC) - observed.astimezone(UTC)).total_seconds()
     except (TypeError, ValueError, OverflowError):
-        return {"allowed": False, "reason_code": "probe_invalid", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_invalid",
+            "raw_output": "not_returned",
+        }
     if age < 0 or age > MAX_PROBE_AGE_SECONDS:
-        return {"allowed": False, "reason_code": "probe_stale", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_stale",
+            "raw_output": "not_returned",
+        }
     return {"allowed": True, "reason_code": "probe_ready", "raw_output": "not_returned"}
 
 
@@ -244,8 +251,7 @@ def _read_private_probe_state(path: Path) -> Mapping[str, Any]:
 
 
 def _probe_state_root() -> Path:
-    configured = os.environ.get("CODEX_MASTER_MCP_STATE") or os.environ.get("CODEX_AGENT_MCP_STATE")
-    return Path(configured or "~/.local/state/codex-master-mcp").expanduser()
+    return Path.home() / ".local" / "state" / "codex-master-mcp"
 
 
 def read_probe_gate(
@@ -253,16 +259,24 @@ def read_probe_gate(
     state_file: Path | None = None,
     now: datetime | Callable[[], datetime] | None = None,
 ) -> dict[str, object]:
-    """Read the private probe record without creating or changing any state."""
+    """Read the private v2 record without creating or changing state."""
 
     if state_file is None:
         state_file = _probe_state_root() / STATE_FILE_NAME
     try:
         payload = _read_private_probe_state(state_file)
     except FileNotFoundError:
-        return {"allowed": False, "reason_code": "probe_missing", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_missing",
+            "raw_output": "not_returned",
+        }
     except (OSError, ValueError):
-        return {"allowed": False, "reason_code": "probe_invalid", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_invalid",
+            "raw_output": "not_returned",
+        }
     return probe_spawn_gate(payload, now=now)
 
 
@@ -303,10 +317,7 @@ def _open_probe_gate_lock(state_file: Path, *, create: bool) -> int:
             or stat.S_IMODE(item.st_mode) != 0o600
         ):
             raise ValueError("probe_gate_lock_invalid")
-        descriptor = os.open(
-            lock_path,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-        )
+        descriptor = os.open(lock_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
         raise ValueError("probe_gate_lock_invalid") from exc
     try:
@@ -344,7 +355,7 @@ def _probe_gate_lock(state_file: Path, *, exclusive: bool, create: bool) -> obje
 
 @contextlib.contextmanager
 def probe_capacity_lock(*, state_file: Path | None = None) -> object:
-    """Hold the shared publication lock across one capacity-creating sink."""
+    """Hold the shared state lock across one capacity-creating sink."""
 
     if state_file is None:
         state_file = _probe_state_root() / STATE_FILE_NAME
@@ -358,7 +369,7 @@ def probe_capacity_guard(
     state_file: Path | None = None,
     now: datetime | Callable[[], datetime] | None = None,
 ) -> object:
-    """Read a fresh canonical probe while holding the shared publication lock."""
+    """Read a canonical v2 record while holding the shared publication lock."""
 
     capacity_lock = probe_capacity_lock(state_file=state_file)
     try:
@@ -376,10 +387,6 @@ def probe_capacity_guard(
         capacity_lock.__exit__(*sys.exc_info())
 
 
-def _repository_from_source() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
 def _state_directory(path: Path) -> Path:
     if not isinstance(path, Path) or not path.is_absolute():
         raise ValueError("unsafe_probe_state_directory")
@@ -394,7 +401,9 @@ def _state_directory(path: Path) -> Path:
                 item = current.lstat()
             if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
                 raise ValueError("unsafe_probe_state_directory")
-            if current == path and (item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o700):
+            if current == path and (
+                item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o700
+            ):
                 raise ValueError("unsafe_probe_state_directory")
     except (OSError, ValueError) as exc:
         raise ValueError("unsafe_probe_state_directory") from exc
@@ -403,7 +412,7 @@ def _state_directory(path: Path) -> Path:
     return path
 
 
-def _atomic_write(path: Path, payload: Mapping[str, object] | str) -> None:
+def _atomic_write(path: Path, payload: Mapping[str, object]) -> None:
     try:
         existing = path.lstat()
     except FileNotFoundError:
@@ -418,16 +427,20 @@ def _atomic_write(path: Path, payload: Mapping[str, object] | str) -> None:
         or stat.S_IMODE(existing.st_mode) != 0o600
     ):
         raise ValueError("probe_state_write_failed")
-    if isinstance(payload, str):
-        encoded = payload.encode("utf-8")
-    else:
-        try:
-            encoded = (json.dumps(dict(payload), ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-        except (TypeError, ValueError, RecursionError) as exc:
-            raise ValueError("probe_state_encode_failed") from exc
-    if len(encoded) > 64 * 1024:
+    try:
+        encoded = (
+            json.dumps(
+                dict(payload), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("probe_state_encode_failed") from exc
+    if len(encoded) > MAX_PROBE_STATE_BYTES:
         raise ValueError("probe_state_oversize")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
@@ -437,8 +450,9 @@ def _atomic_write(path: Path, payload: Mapping[str, object] | str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        temporary = Path()
-        directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        directory_descriptor = os.open(
+            path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
         try:
             os.fsync(directory_descriptor)
         finally:
@@ -448,79 +462,79 @@ def _atomic_write(path: Path, payload: Mapping[str, object] | str) -> None:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if temporary.name:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
 
 
-def _remove_probe_file(path: Path) -> None:
+def _run_json(
+    layout: RuntimeLayout, command: Path, *arguments: str
+) -> tuple[dict[str, Any], bool]:
     try:
-        item = path.lstat()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise ValueError("probe_state_write_failed") from exc
-    if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode) or item.st_nlink != 1:
-        raise ValueError("probe_state_write_failed")
-    try:
-        path.unlink()
-    except OSError as exc:
-        raise ValueError("probe_state_write_failed") from exc
-
-
-def _run_json(command: Path, *arguments: str) -> tuple[dict[str, Any], bool]:
-    try:
-        completed = subprocess.run(
+        completed = run_bounded(
             [os.fspath(command), *arguments],
             cwd=command.parent.parent,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=45,
-            check=False,
+            home=Path.home(),
+            timeout_seconds=45,
+            stdout_limit=DEFAULT_STDOUT_LIMIT,
+            stderr_limit=DEFAULT_STDERR_LIMIT,
+            runtime_layout=layout,
         )
         if completed.returncode != 0:
             return {}, False
         value = json.loads(completed.stdout)
         return (value, True) if isinstance(value, dict) else ({}, False)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, TypeError):
+    except (BoundedProcessError, json.JSONDecodeError, TypeError):
         return {}, False
+
+
+def _runtime_status_json(layout: RuntimeLayout) -> tuple[dict[str, Any], bool]:
+    """Run the one bounded MCP status check outside a bus-isolated child."""
+
+    value = runtime_status(layout=layout)
+    return (value, value.get("ok") is True)
 
 
 def run_probe(
     *,
-    repository: Path | None = None,
-    command: Path | None = None,
+    layout: RuntimeLayout | None = None,
     state_directory: Path | None = None,
     now: Callable[[], datetime] | None = None,
     runner: Callable[..., tuple[dict[str, Any], bool]] | None = None,
 ) -> dict[str, Any]:
-    """Run the probe and persist only bounded health/alarm metadata."""
+    """Run direct v2 checks and atomically publish exactly one v2 record."""
 
-    repository = repository or _repository_from_source()
-    command = command or repository / "bin" / "codex-master-mcp"
-    state_directory = state_directory or _probe_state_root()
-    if not isinstance(repository, Path) or not repository.is_absolute() or not isinstance(command, Path) or not command.is_absolute():
-        raise ValueError("probe_repository_unavailable")
-    state_directory = _state_directory(state_directory)
-    execute = runner or _run_json
-    namespace, namespace_command = execute(command, "namespace-status")
-    plugin, plugin_command = execute(command, "plugin-status")
-    hive, hive_command = execute(command, "hive", "status")
-    doctor, doctor_command = execute(command, "hive", "doctor")
-    result = evaluate(namespace, plugin, hive, doctor)
+    try:
+        active_layout = (
+            RuntimeLayout.from_module_path(Path(__file__)) if layout is None else layout
+        )
+    except LayoutError as exc:
+        raise ValueError("probe_runtime_layout_unavailable") from exc
+    if not isinstance(active_layout, RuntimeLayout):
+        raise ValueError("probe_runtime_layout_unavailable")
+    state_directory = _state_directory(state_directory or _probe_state_root())
+    runtime, runtime_command = _runtime_status_json(active_layout)
+    if runner is None:
+        hive, hive_command = _run_json(
+            active_layout, active_layout.mcp_entrypoint, "hive", "status"
+        )
+        doctor, doctor_command = _run_json(
+            active_layout, active_layout.mcp_entrypoint, "hive", "doctor"
+        )
+    else:
+        hive, hive_command = runner(active_layout.mcp_entrypoint, "hive", "status")
+        doctor, doctor_command = runner(active_layout.mcp_entrypoint, "hive", "doctor")
+    result = evaluate(runtime, hive, doctor)
     moment = (now or (lambda: datetime.now(UTC)))()
-    if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
+    if (
+        not isinstance(moment, datetime)
+        or moment.tzinfo is None
+        or moment.utcoffset() is None
+    ):
         raise ValueError("probe_clock_invalid")
-    checked_at = moment.astimezone(UTC).isoformat()
     result.update(
         {
-            "checked_at": checked_at,
+            "schema_version": 2,
+            "checked_at": moment.astimezone(UTC).isoformat(),
             "commands": {
-                "namespace": namespace_command,
-                "plugin": plugin_command,
+                "runtime_status": runtime_command,
                 "hive_status": hive_command,
                 "hive_doctor": doctor_command,
             },
@@ -529,14 +543,6 @@ def run_probe(
     state_file = state_directory / STATE_FILE_NAME
     with _probe_gate_lock(state_file, exclusive=True, create=True):
         _atomic_write(state_file, result)
-        alarm = result.get("alarm")
-        if isinstance(alarm, Mapping):
-            _atomic_write(state_directory / ALARM_FILE_NAME, alarm)
-            _remove_probe_file(state_directory / FUNCTIONAL_MARKER_NAME)
-        else:
-            _remove_probe_file(state_directory / ALARM_FILE_NAME)
-            _remove_probe_file(state_directory / FUNCTIONAL_MARKER_NAME)
-            _atomic_write(state_directory / FUNCTIONAL_MARKER_NAME, checked_at + "\n")
     return result
 
 
@@ -544,24 +550,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if tuple(arguments or ()) != ("--json",):
         return 2
     result = run_probe()
-    print(json.dumps({"functional": result["functional"], "checks": result["checks"], "alarm": result["alarm"]}, sort_keys=True))
-    return 0 if result["functional"] else 1
+    print(json.dumps({"checks": result["checks"]}, sort_keys=True))
+    return 0 if all(result["checks"].values()) else 1
 
 
 __all__ = [
-    "ALARM_FILE_NAME",
     "DETERMINISTIC_PROBE_HOURS_UTC",
-    "FUNCTIONAL_MARKER_NAME",
     "MAX_PROBE_AGE_SECONDS",
     "MAX_PROBE_STATE_BYTES",
     "PROBE_GATE_LOCK_NAME",
     "STATE_FILE_NAME",
-    "build_hive_probe_alarm",
     "evaluate",
     "main",
+    "probe_capacity_guard",
     "probe_capacity_lock",
     "probe_spawn_gate",
-    "probe_capacity_guard",
     "read_probe_gate",
     "run_probe",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

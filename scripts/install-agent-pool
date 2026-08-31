@@ -1,6 +1,5 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 set -euo pipefail
 
-script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
-repo_root="$(cd -- "$(dirname -- "${script_path}")/.." && pwd)"
-exec "${repo_root}/bin/codex-master-mcp" pool install "$@"
+[[ "${HOME:-}" == /* ]] || exit 64
+exec "${HOME}/.local/lib/codex-master-runtime/bin/codex-master-mcp" pool install "$@"

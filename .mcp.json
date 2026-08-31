@@ -2,11 +2,8 @@
   "mcpServers": {
     "codex-master-mcp": {
       "cwd": ".",
-      "command": "python3",
-      "args": [
-        "-c",
-        "import sys; sys.path.insert(0, 'src'); from codex_master.server import main; raise SystemExit(main())"
-      ],
+      "command": "./bin/codex-master-mcp",
+      "args": [],
       "startup_timeout_sec": 120,
       "note": "Local data-sparse Codex Masterjet MCP server. Controls the sleeping Agentinnen pool through tmux and does not return raw terminal output by default."
     }

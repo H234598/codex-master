@@ -692,9 +692,11 @@ Bis dahin bleibt ein VM-Backend vollstaendig weggelassen.
 
 ```sh
 cd /home/teladi/codex-master
-python3 -m codex_master.server install          # create ~/.local/bin/codex-master-mcp + codex mcp add
-python3 -m codex_master.server doctor          # smoke check (codex, tmux, state path, JSON result)
-python3 -m codex_master.server uninstall       # remove mcp registration and local symlink
+# Die interaktive Registrierung wird ausschließlich aus dem validierten Runtime-Image ausgeführt.
+# Der Checkout selbst ist kein zulässiger MCP-Entrypoint.
+~/.local/lib/codex-master-runtime/bin/codex-master-mcp install
+~/.local/lib/codex-master-runtime/bin/codex-master-mcp doctor
+~/.local/lib/codex-master-runtime/bin/codex-master-mcp uninstall
 python3 scripts/codex-master-cinnamon-applet install --dry-run
 python3 scripts/codex-master-cinnamon-applet install --no-reload
 python3 scripts/codex-master-cinnamon-applet verify
@@ -935,46 +937,19 @@ failed. Verify the installed files and CLI first; do not interpret ordinary
 ## Install-Contract (CLI)
 
 `install`
-- creates `~/.local/bin/codex-master-mcp` as symlink to `bin/codex-master-mcp`
-- verifies that the repo wrapper can answer an MCP `initialize` probe before
-  registering it with Codex
-- verifies that the installed command path also answers the same probe before
-  registration
-- registers the command via `codex mcp add codex-master-mcp -- <link>`
-- ensures the active Codex MCP config has `startup_timeout_sec = 120`
-- syncs the personal `codex-master` plugin cache from a runtime allowlist
-  (`.codex-plugin`, `.app.json`, `.mcp.json`, `bin`, `docs`, `examples`,
-  `schemas`, `scripts`, `skills`, `src`, `systemd`, README,
-  `codex-agent-pool.json`, and package metadata) while excluding `.git`, tests,
-  bytecode, test caches, hidden files, editor swap files, and backup/patch
-  leftovers
-- rejects hardlinked plugin source files and keeps only the current plus the
-  most recent valid cached plugin versions, without pruning invalid or symlinked
-  cache entries
-- copies regular plugin-cache source files through no-follow file descriptors
-  and verifies source identity after opening, so a source swap cannot redirect
-  cache contents
-- creates nonce-suffixed plugin-cache temp directories and never removes a
-  pre-existing temp directory that this sync did not create
-- refuses to register the Master MCP from a managed Agentinnen `CODEX_HOME`
-- requires the install-path parent chain to be real directories, not symlinks
-- creates or replaces the install symlink via an atomic same-directory
-  temporary symlink and directory-fd-bound rename
-- treats broken, looping, or unreadable install symlinks as non-matching instead
-  of crashing while resolving them
-- returns JSON without agent output, install path, repo-wrapper target path, or
-  plugin-cache paths
+- accepts only the immutable, validated Runtime-Image entrypoint at
+  `~/.local/lib/codex-master-runtime/bin/codex-master-mcp`
+- directly probes that entrypoint with MCP `initialize` before registering it
+- registers exactly that command via `codex mcp add codex-master-mcp -- <entrypoint>`
+- keeps the interactive Codex registration status separate from `hive runtime-status`
+- never creates, follows, or removes a user-bin symlink, and accepts no path override
+- returns JSON without raw paths, agent output, or secrets
 - accepts `--no-plugin-cache` only for explicit diagnostic installs that should
   leave the personal plugin cache untouched
 
 `uninstall`
-- unregisters from `codex mcp remove codex-master-mcp`
-- removes `~/.local/bin/codex-master-mcp`
-- requires the install-path parent chain to be real directories when removing
-- removes the install symlink through the verified parent directory fd, so a
-  parent swap after validation cannot redirect the unlink
-- leaves broken, looping, or unreadable install symlinks in place unless they
-  resolve to the repo wrapper
+- removes only a registration that exactly names the validated Runtime-Image
+  entrypoint; it never mutates image files
 - returns JSON and no raw secret material
 
 `doctor`

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from codex_master.hive.migration import migration_status, rollback_hive_state
 from codex_master.hive.runtime import HiveRuntimeEvidence
 from codex_master.hive.status import hive_doctor, hive_status, selection_status
+from codex_master.runtime_status import runtime_status
 from codex_master.selection.reset_anchor import AnchorRecord, ResetAnchorPlanner
 
 
@@ -17,7 +18,7 @@ def add_hive_cli_parsers(subparsers: object) -> None:
         raise ValueError("invalid_cli_parser")
     hive = subparsers.add_parser("hive", help="Validate or inspect Hive; DP and SP scheduling remain separate")
     hive_sub = hive.add_subparsers(dest="hive_command", required=True)
-    for name in ("validate", "status", "doctor", "migration-status"):
+    for name in ("validate", "status", "doctor", "migration-status", "runtime-status"):
         hive_sub.add_parser(name)
     rollback = hive_sub.add_parser("rollback", help="Show the reversible rollback contract without mutating state")
     rollback.add_argument("--dry-run", action="store_true", required=True)
@@ -48,6 +49,8 @@ def run_hive_cli(
         return hive_doctor(runtime_evidence=runtime_evidence)
     if command == "migration-status":
         return migration_status()
+    if command == "runtime-status":
+        return runtime_status()
     if command == "rollback":
         dry_run = args.dry_run if isinstance(args, argparse.Namespace) else args.get("dry_run")
         return rollback_hive_state(dry_run=dry_run)

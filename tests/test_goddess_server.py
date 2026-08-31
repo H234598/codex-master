@@ -192,7 +192,7 @@ def test_goddess_report_systemd_units_are_bounded_and_retryable():
     service = (root / "codex-master-goddess-report.service").read_text(encoding="utf-8")
     timer = (root / "codex-master-goddess-report.timer").read_text(encoding="utf-8")
 
-    assert "ExecStart=%h/.local/bin/codex-master-mcp goddess report run" in service
+    assert "ExecStart=%h/.local/lib/codex-master-runtime/bin/codex-master-mcp goddess report run" in service
     assert "CapabilityBoundingSet=" in service
     assert "NoNewPrivileges=yes" in service
     assert "IPAddressDeny=any" in service
