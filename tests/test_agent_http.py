@@ -111,6 +111,23 @@ def test_receipt_route_binds_path_to_task_one_receipt_before_completion(app, sto
     )
     assert response.status == 200
     assert len(store.complete_calls) == 1
+
+
+def test_host_probe_receipt_uses_task_specific_completion_owner(store) -> None:
+    calls: list[object] = []
+
+    class Owner:
+        def complete(self, principal_value, receipt) -> None:
+            calls.append((principal_value, receipt))
+
+    app = AgentHttpApplication(store, Owner())
+    response = app.handle(
+        principal(), "POST", "/agent/v1/operations/operation-one/receipts", receipt_bytes()
+    )
+
+    assert response.status == 200
+    assert len(calls) == 1
+    assert store.complete_calls == []
     mismatch = app.handle(
         principal(),
         "POST",
@@ -118,7 +135,7 @@ def test_receipt_route_binds_path_to_task_one_receipt_before_completion(app, sto
         receipt_bytes(),
     )
     assert mismatch.status == 400
-    assert len(store.complete_calls) == 1
+    assert len(store.complete_calls) == 0
 
 
 @pytest.mark.parametrize(

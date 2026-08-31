@@ -250,7 +250,21 @@ def test_assemble_server_wires_task_two_store_and_task_three_resolver(monkeypatc
     monkeypatch.setattr(agent_daemon, "HostRegistry", lambda root: ("registry", root))
     monkeypatch.setattr(agent_daemon, "AgentOperationStore", lambda root: ("store", root))
     monkeypatch.setattr(agent_daemon, "AgentIdentityResolver", lambda registry: ("resolver", registry))
-    monkeypatch.setattr(agent_daemon, "AgentHttpApplication", lambda store: ("application", store))
+    monkeypatch.setattr(
+        agent_daemon,
+        "AdminOperationStore",
+        lambda root: ("admin-operation-store", root),
+    )
+    monkeypatch.setattr(
+        agent_daemon,
+        "RemoteHostProbeCompletionOwner",
+        lambda **values: ("completion-owner", values),
+    )
+    monkeypatch.setattr(
+        agent_daemon,
+        "AgentHttpApplication",
+        lambda store, owner: ("application", store, owner),
+    )
     monkeypatch.setattr(agent_daemon, "create_agent_ssl_context", lambda fds: ("tls", fds))
     monkeypatch.setattr(
         agent_daemon,
@@ -264,6 +278,7 @@ def test_assemble_server_wires_task_two_store_and_task_three_resolver(monkeypatc
     assert result is values
     assert values["address"] == ("127.0.0.1", 9443)
     assert values["application"][0] == "application"
+    assert values["application"][2][0] == "completion-owner"
     assert values["resolver"][0] == "resolver"
     assert values["context"] == ("tls", fds)
 

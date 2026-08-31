@@ -641,6 +641,44 @@ class HostRegistry:
             )
             return self._host(record)
 
+    def record_active_probe(
+        self,
+        ref: str,
+        *,
+        generation: int,
+        resource_evidence: Mapping[str, object],
+        observed_at: str,
+    ) -> ControlHostV1:
+        """Record fresh active-probe fields without accepting registry metadata."""
+        ref = _host_ref(ref, "control.host_invalid")
+        generation = _generation(generation, "control.host_invalid")
+        resources = _resources(resource_evidence, "control.host_invalid")
+        observed = _wire_time(_parse_time(observed_at, "control.host_invalid"))
+        with self._locked_state() as (
+            registrations,
+            ssh_bindings,
+            _agent_bindings,
+            _observations,
+            _document_generation,
+            _epoch_history,
+        ):
+            registration = next((item for item in registrations if item["ref"] == ref), None)
+            binding = ssh_bindings.get(ref)
+            if registration is None or binding is None:
+                raise HostRegistryError("host.identity_not_found")
+            evidence = {
+                "label": registration["label"],
+                "role": registration["role"],
+                "transport_binding": registration["transport_binding"],
+                "capabilities": registration["capabilities"],
+                "reachability": {"state": "reachable", "latency_ms": 0},
+                "resource_evidence": resources,
+                "observed_at": observed,
+                "source": "host-agent",
+                "binding_state": binding,
+            }
+        return self.record_probe(ref, generation=generation, evidence=evidence)
+
     @contextlib.contextmanager
     def _locked_state(self) -> Any:
         try:

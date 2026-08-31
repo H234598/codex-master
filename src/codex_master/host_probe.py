@@ -105,7 +105,13 @@ class HostProbeEvidenceV1:
             raise HostProbeError()
         if self.load_class not in {"idle", "busy", "saturated"} or self.pressure_class not in {"none", "low", "elevated"}:
             raise HostProbeError()
-        if type(self.observed_at) is not str or len(self.observed_at) != 20:
+        if type(self.observed_at) is not str:
+            raise HostProbeError()
+        try:
+            observed = datetime.strptime(self.observed_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        except ValueError:
+            raise HostProbeError() from None
+        if observed.strftime("%Y-%m-%dT%H:%M:%SZ") != self.observed_at:
             raise HostProbeError()
         _integer(self.agent_generation)
 
@@ -220,24 +226,14 @@ class LocalHostProbeAdapter:
         self._operations.begin(plan.operation.id, current_generation=expected_generation)
         try:
             evidence = self._collector.collect()
-            host = next(item for item in self._registry.list() if item.ref == host_ref)
-            self._registry.record_probe(
+            self._registry.record_active_probe(
                 host_ref,
                 generation=expected_generation,
-                evidence={
-                    "label": host.label,
-                    "role": host.role,
-                    "transport_binding": dict(host.transport_binding),
-                    "capabilities": list(host.capabilities),
-                    "reachability": {"state": "reachable", "latency_ms": 0},
-                    "resource_evidence": {
-                        "cpu_threads": evidence.cpu_count,
-                        "memory_bytes": _memory_floor(evidence.memory_class),
-                    },
-                    "observed_at": evidence.observed_at,
-                    "source": "host-agent",
-                    "binding_state": "bound",
+                resource_evidence={
+                    "cpu_threads": evidence.cpu_count,
+                    "memory_bytes": _memory_floor(evidence.memory_class),
                 },
+                observed_at=evidence.observed_at,
             )
         except Exception:
             self._operations.record_step(
@@ -325,16 +321,24 @@ class RemoteHostProbeCompletionOwner:
             host = next(item for item in self._registry.list() if item.ref == target)
             if host.generation != generation or getattr(principal, "registry_generation", None) != generation:
                 raise HostProbeError()
-            completed = self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
-            self._registry.record_probe(
-                target, generation=generation,
-                evidence=_registry_evidence(self._registry, target, evidence),
-            )
+            operation = self._operations.get(operation_id)
+            if operation.state in {"succeeded", "failed", "partial", "blocked"}:
+                return self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
             self._operations.begin(operation_id, current_generation=generation)
+            self._registry.record_active_probe(
+                target,
+                generation=generation,
+                resource_evidence={
+                    "cpu_threads": evidence.cpu_count,
+                    "memory_bytes": _memory_floor(evidence.memory_class),
+                },
+                observed_at=evidence.observed_at,
+            )
             self._operations.record_step(operation_id, "host.probe.collect", succeeded=True)
             self._operations.finish(operation_id, state="succeeded", resulting_generation=generation)
-            return completed
+            return self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
         except (HostProbeError, StopIteration, ValueError):
+            self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
             return self._fail(operation_id, generation, "host.probe_failed")
 
     def _fail(self, operation_id: str, generation: int, reason: str) -> object:
@@ -378,15 +382,3 @@ def _operation_key(host_ref: str, idempotency_key: str) -> str:
     if type(host_ref) is not str or type(idempotency_key) is not str:
         raise HostProbeError()
     return "probe-" + hashlib.sha256(f"{host_ref}\0{idempotency_key}".encode("ascii")).hexdigest()
-
-
-def _registry_evidence(registry: HostRegistry, host_ref: str, evidence: HostProbeEvidenceV1) -> dict[str, object]:
-    """Preserve registry metadata; only DTO-derived fields are fresh evidence."""
-    host = next(item for item in registry.list() if item.ref == host_ref)
-    return {
-        "label": host.label, "role": host.role,
-        "transport_binding": dict(host.transport_binding), "capabilities": list(host.capabilities),
-        "reachability": {"state": "reachable", "latency_ms": 0},
-        "resource_evidence": {"cpu_threads": evidence.cpu_count, "memory_bytes": _memory_floor(evidence.memory_class)},
-        "observed_at": evidence.observed_at, "source": "host-agent", "binding_state": "bound",
-    }

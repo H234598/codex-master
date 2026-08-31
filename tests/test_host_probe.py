@@ -79,3 +79,15 @@ def test_remote_evidence_uses_the_exact_same_public_dto_validation() -> None:
 
 def test_host_bound_internal_idempotency_never_aliases_hosts() -> None:
     assert _operation_key("worker-one", "client-key") != _operation_key("worker-two", "client-key")
+
+
+@pytest.mark.parametrize(
+    "observed_at",
+    ("not-a-utc-timestamp!", "2026-08-30T12:00:00+00:00", "2026-02-30T12:00:00Z"),
+)
+def test_probe_evidence_rejects_noncanonical_observed_at(observed_at: str) -> None:
+    with pytest.raises(HostProbeError, match="host.probe_failed"):
+        HostProbeEvidenceV1(
+            "linux", "x86_64", 8, "8-31-gib", True, True, "idle", "none",
+            False, observed_at,
+        )

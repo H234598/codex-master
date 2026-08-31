@@ -115,3 +115,42 @@ git diff --check
 The fix also adds the mutating catalog entry and a headless Control Center
 state contract: `QUEUED`, `RUNNING`, `SUCCEEDED`, `UNKNOWN`; host-card refresh
 is allowed only for terminal states.
+
+## Fix round 2/5
+
+RED evidence:
+
+```text
+PYTHONPATH=src pytest -q tests/test_host_probe.py -k noncanonical
+2 failed, 1 passed: malformed and impossible observed_at values were accepted.
+```
+
+GREEN evidence:
+
+```text
+PYTHONPATH=src pytest -q tests/test_host_probe.py tests/test_agent_operations.py tests/test_agent_http.py tests/test_agent_daemon.py tests/test_admin_http.py tests/test_admin_service.py tests/test_admin_cli_mcp_integration.py tests/test_control_catalog.py tests/test_control_center.py -k 'host or probe or assemble_server or completion_owner'
+26 passed, 274 deselected in 6.17s
+
+ruff check <all changed Task-6 production modules and direct tests>
+All checks passed!
+
+python -m compileall -q <changed production modules>
+(clean)
+
+git diff --check
+(clean)
+```
+
+`HostProbeEvidenceV1` now parses and exact-round-trips canonical UTC seconds.
+The registry gained the narrow `record_active_probe()` API: adapters submit
+only fresh resource evidence and observation time; registration and binding
+metadata are read and preserved inside the registry owner.
+
+Completion ordering is explicitly recoverable rather than claimed atomic:
+all receipt fences and DTO validation happen before mutation; the admin
+operation becomes running before the registry write; registry is then written,
+admin is terminalized, and finally the agent receipt is terminalized. A retry
+of the same agent receipt after a completed admin operation only terminalizes
+the agent operation and does not write the registry again. The daemon assembly
+accepts a test state root and catches `AdminOperationError` at its stable
+startup boundary.
