@@ -1,7 +1,1 @@
-{
-  "schema_version": 1,
-  "mode": "shadow",
-  "repositories": [],
-  "principals": [],
-  "feature_flags": {"sp0_passive": false, "sp1_deadline": false, "sp2_secondary_model": false, "sp3_fairness": false}
-}
+{"feature_flags":{"sp0_passive":false,"sp1_deadline":false,"sp2_secondary_model":false,"sp3_fairness":false},"mode":"enforced","principals":[{"class_id":"gottbiene","parent_principal_id":null,"principal_id":"godbee-main","repo_id":null},{"class_id":"koenigin","parent_principal_id":"godbee-main","principal_id":"queen-codex-master","repo_id":"codex-master"}],"repositories":[{"config_digest":"sha256:d88da7c0121fcad0eac9cb11d3a884a8f41ea9cb2d708fa6142ad1bb82d3de85","default_branch":"main","remote_identity":"https://github.com/H234598/codex-master.git","repo_id":"codex-master"}],"schema_version":1}
