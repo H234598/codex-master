@@ -476,6 +476,9 @@ def test_running_reconcile_handles_absence_conflict_advance_and_rollback(
         instances=snapshot.instances,
         expected_generation=1,
     )
+    adapter.validate_running_precondition(
+        "instance-one", 1, digest, 7
+    )
     assert executor.probe(
         {"instance_ref": "instance-one", "generation": 2}, **fences
     )["ready"] is True
@@ -486,6 +489,17 @@ def test_running_reconcile_handles_absence_conflict_advance_and_rollback(
         executor.probe(
             {"instance_ref": "instance-one", "generation": 1}, **fences
         )
+    with pytest.raises(
+        agent_ollama.AgentOllamaNoEffectError,
+        match="provider.generation_stale",
+    ):
+        adapter.probe({"instance_ref": "instance-one", "generation": 1})
+    with pytest.raises(
+        agent_ollama.AgentOllamaNoEffectError,
+        match="provider.generation_stale",
+    ):
+        adapter.stop({"instance_ref": "instance-one", "generation": 1})
+    assert runtime.stopped == []
     runtime.identity_status = "conflict"
     with pytest.raises(Exception, match="provider.instance_identity_conflict"):
         executor.stop(

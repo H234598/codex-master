@@ -398,6 +398,8 @@ class ProductionAgentOllamaAdapter:
             saved = document["running"].get(instance_ref)
             if saved is None:
                 _no_effect("provider.instance_missing")
+            if generation < saved["generation"]:
+                _no_effect("provider.generation_stale")
             if (
                 saved["state"] == "stopping"
                 and self._claim_alive(saved["claim"])
@@ -473,6 +475,8 @@ class ProductionAgentOllamaAdapter:
             saved = self._read_locked()["running"].get(instance_ref)
         if saved is None:
             _no_effect("provider.instance_missing")
+        if generation < saved["generation"]:
+            _no_effect("provider.generation_stale")
         if (
             saved["state"] == "stopping"
             and not allow_stopping

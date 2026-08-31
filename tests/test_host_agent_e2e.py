@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import pytest
 
-from codex_master import agent_daemon
+from codex_master import agent_daemon, host_agent as host_agent_module
 from codex_master.admin_hosts import AgentBindingV1, AgentPrincipalV1, HostRegistry
 from codex_master.admin_auth import MasterjetBearerVerifier, TotpStepUpVerifier
 from codex_master.admin_http import AdminHttpServer
@@ -35,6 +35,7 @@ from codex_master.agent_identity import AgentIdentityResolver
 from codex_master.agent_operations import AgentOperationRequestV1, AgentOperationStore
 from codex_master.agent_contracts import (
     AgentLeaseV1,
+    AgentNoWorkV1,
     AgentPollV1,
     remote_envelope_digest,
 )
@@ -45,7 +46,6 @@ from codex_master.host_agent import (
     HostAgentClient,
     HostAgentExecutor,
     HostProbeExecutor,
-    run_poll_loop,
 )
 from codex_master.host_agent_state import HostAgentState
 from codex_master.host_probe import (
@@ -302,7 +302,7 @@ class _E2E:
         self.server.application = AgentHttpApplication(self.operations, owner)
 
     def admin_request(self, *, client: str) -> _Response:
-        """Presenting an mTLS client means no bearer/admin authority is sent."""
+        """An accepted agent certificate conveys no bearer/admin authority."""
         if client not in {"worker-one", "worker-two", "expired"}:
             raise ValueError("test client is unknown")
         bearer_path = self.root / "admin-bearer"
@@ -333,10 +333,22 @@ class _E2E:
             step_up_verifier=totp,
             origin_host="admin.test",
         )
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.load_verify_locations(cafile=str(self.pki.root / "ca.crt"))
+        context.load_cert_chain(
+            self.pki.root / "server.crt", self.pki.root / "server.key"
+        )
+        server.socket = context.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            connection = http.client.HTTPConnection(*server.server_address, timeout=2)
+            connection = http.client.HTTPSConnection(
+                *server.server_address,
+                context=self.pki.context(client),
+                timeout=2,
+            )
             connection.request(
                 "POST", "/admin/v1", body=b"{}", headers={
                     "Host": "admin.test",
@@ -829,9 +841,9 @@ def test_remote_ollama_survives_master_restart_and_only_opens_ready_lanes(
 
 
 class _BlockingProbeCollector:
-    def __init__(self) -> None:
-        self.entered = threading.Event()
-        self.release = threading.Event()
+    def __init__(self, entered: object = None, release: object = None) -> None:
+        self.entered = threading.Event() if entered is None else entered
+        self.release = threading.Event() if release is None else release
 
     def collect(self, kernel: object) -> object:
         assert self.entered.set() is None
@@ -841,80 +853,222 @@ class _BlockingProbeCollector:
         ).collect(kernel)  # type: ignore[arg-type]
 
 
-def test_sigterm_drains_listener_and_host_agent_persists_current_receipt(
+class _NoCredentials:
+    def __enter__(self) -> object:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+
+
+class _HostAgentMainConfig:
+    max_wait_seconds = 0
+
+
+def _run_host_agent_until_sigterm(
+    master_url: str,
+    pki_root: Path,
+    registry_generation: int,
+    state_root: Path,
+    entered: object,
+    release: object,
+) -> None:
+    agent = HostAgent(
+        client=HostAgentClient(
+            master_url,
+            context=_Pki(pki_root, "").context("worker-one"),
+            sleep=lambda _seconds: None,
+        ),
+        executor=HostAgentExecutor(
+            state=HostAgentState.for_test(state_root, host_ref="worker-one"),
+            ollama=object(),
+            host_probe=HostProbeExecutor(
+                collector=_BlockingProbeCollector(entered, release),
+                kernel=_Kernel(),
+            ),
+        ),
+        registry_generation=registry_generation,
+        lease_epoch=3,
+        capabilities_digest=_CAPABILITIES_DIGEST,
+    )
+    original_open = host_agent_module.open_host_agent_credentials
+    original_assemble = host_agent_module.assemble_host_agent
+    host_agent_module.open_host_agent_credentials = lambda _environment: _NoCredentials()
+    host_agent_module.assemble_host_agent = lambda _credentials: (
+        agent,
+        _HostAgentMainConfig(),
+    )
+    try:
+        raise SystemExit(host_agent_module.main([]))
+    finally:
+        host_agent_module.open_host_agent_credentials = original_open
+        host_agent_module.assemble_host_agent = original_assemble
+
+
+def _run_agent_api_until_sigterm(
+    state_root: Path,
+    pki_root: Path,
+    ready: object,
+) -> None:
+    registry = HostRegistry.for_test(state_root)
+    operations = AgentOperationStore.for_test(state_root)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.load_verify_locations(cafile=str(pki_root / "ca.crt"))
+    context.load_cert_chain(pki_root / "server.crt", pki_root / "server.key")
+    server = AgentApiServer(
+        ("127.0.0.1", 0),
+        AgentHttpApplication(operations),
+        AgentIdentityResolver(registry),
+        context,
+    )
+    ready.send(server.server_address[1])  # type: ignore[attr-defined]
+    ready.close()  # type: ignore[attr-defined]
+    agent_daemon.run_server(server)
+
+
+def test_real_sigterm_stops_agent_api_listener(e2e: _E2E) -> None:
+    """The installed SIGTERM handler must close the real TLS listener."""
+    state_root = e2e.root / "signal-agent-api"
+    registry = HostRegistry.for_test(state_root)
+    registry.provision_agent_binding(
+        {
+            "ref": "worker-one",
+            "label": "Worker One",
+            "role": "execution",
+            "capabilities": ["resource.probe", "ollama.execute"],
+        },
+        AgentBindingV1("worker-one", e2e.pki.worker_one_spki, 3, True),
+        expected_generation=0,
+    )
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_run_agent_api_until_sigterm,
+        args=(state_root, e2e.pki.root, sender),
+    )
+    process.start()
+    sender.close()
+    assert receiver.poll(5)
+    port = receiver.recv()
+    receiver.close()
+    client = HostAgentClient(
+        f"https://127.0.0.1:{port}",
+        context=e2e.pki.context("worker-one"),
+        sleep=lambda _seconds: None,
+    )
+    assert type(client.poll(AgentPollV1(1, 3, _CAPABILITIES_DIGEST, 0))) is AgentNoWorkV1
+
+    os.kill(process.pid, signal.SIGTERM)
+    process.join(7)
+    assert process.exitcode == 0
+    connection = http.client.HTTPSConnection(
+        "127.0.0.1",
+        port,
+        context=e2e.pki.context("worker-one"),
+        timeout=1,
+    )
+    try:
+        with pytest.raises(
+            (ConnectionError, OSError, ssl.SSLError, http.client.HTTPException)
+        ):
+            connection.request("POST", "/agent/v1/polls", body=b"{}")
+    finally:
+        connection.close()
+
+
+def test_real_sigterm_finishes_current_host_agent_receipt_without_repoll(
     e2e: _E2E,
 ) -> None:
-    """A SIGTERM regression could admit another poll or lose the in-flight receipt."""
+    """The packaged agent must finish one leased receipt and then stop polling."""
     e2e.server.application = AgentHttpApplication(e2e.operations)
-    e2e.operations.enqueue(
+    deadline = (datetime.now(UTC) + timedelta(minutes=5)).replace(microsecond=0)
+    first = e2e.operations.enqueue(
         AgentOperationRequestV1(
-            "drain-e2e-one",
+            "drain-e2e-first",
             "host.probe",
             "collect",
             e2e.registry.document_generation(),
             "sha256:" + "a" * 64,
-            {"admin_operation_id": "drain-e2e-one", "probe_schema": 1},
-            (datetime.now(UTC) + timedelta(minutes=5)).replace(microsecond=0),
+            {"admin_operation_id": "drain-e2e-first", "probe_schema": 1},
+            deadline,
             target_host_ref="worker-one",
         )
     )
-    collector = _BlockingProbeCollector()
+    second = e2e.operations.enqueue(
+        AgentOperationRequestV1(
+            "drain-e2e-second",
+            "host.probe",
+            "collect",
+            e2e.registry.document_generation(),
+            "sha256:" + "b" * 64,
+            {"admin_operation_id": "drain-e2e-second", "probe_schema": 1},
+            deadline,
+            target_host_ref="worker-one",
+        )
+    )
     state_root = e2e.root / "drain-agent-state"
-    client = _CapturingClient(e2e.agent_client())
-    agent = HostAgent(
-        client=client,
-        executor=HostAgentExecutor(
-            state=HostAgentState.for_test(state_root, host_ref="worker-one"),
-            ollama=object(),
-            host_probe=HostProbeExecutor(collector=collector, kernel=_Kernel()),
+    context = multiprocessing.get_context("spawn")
+    entered = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_run_host_agent_until_sigterm,
+        args=(
+            f"https://127.0.0.1:{e2e.server.server_address[1]}",
+            e2e.pki.root,
+            e2e.registry.document_generation(),
+            state_root,
+            entered,
+            release,
         ),
-        registry_generation=e2e.registry.document_generation(),
-        lease_epoch=3,
-        capabilities_digest=_CAPABILITIES_DIGEST,
     )
-    stop_event = threading.Event()
-    worker = threading.Thread(
-        target=run_poll_loop,
-        kwargs={"agent": agent, "max_wait_seconds": 0, "stop_event": stop_event},
-        daemon=True,
-    )
-    worker.start()
-    assert collector.entered.wait(2)
+    process.start()
+    assert entered.wait(5)
+    os.kill(process.pid, signal.SIGTERM)
+    release.set()
+    process.join(7)
 
-    previous = agent_daemon._active_server
-    agent_daemon._active_server = e2e.server
-    try:
-        agent_daemon._handle_signal(signal.SIGTERM, None)
-        stop_event.set()
-        collector.release.set()
-        assert e2e.server.drain(2)
-        e2e.server.server_close()
-    finally:
-        agent_daemon._active_server = previous
-    worker.join(2)
-
-    assert not worker.is_alive()
-    assert len(client.polls) == 1
-    assert len(client.receipts) == 1
+    assert process.exitcode == 0
+    assert e2e.operations.get(first.operation_id).state == "succeeded"
+    queued = e2e.operations.get(second.operation_id)
+    assert (queued.state, queued.attempt) == ("queued", 0)
     assert HostAgentState.for_test(state_root, host_ref="worker-one").receipt_count() == 1
-    assert e2e.agent_poll(client="worker-one").tls_failed
     assert all(
         ".tmp" not in path.name
         for path in (state_root / "host-agent").iterdir()
     )
 
 
+def _poll_then_crash(
+    master_url: str,
+    pki_root: Path,
+    registry_generation: int,
+) -> None:
+    client = HostAgentClient(
+        master_url,
+        context=_Pki(pki_root, "").context("worker-one"),
+        sleep=lambda _seconds: None,
+    )
+    lease = client.poll(
+        AgentPollV1(registry_generation, 3, _CAPABILITIES_DIGEST, 0)
+    )
+    if type(lease) is not AgentLeaseV1:
+        os._exit(2)
+    os._exit(23)
+
+
 def test_agent_crash_before_effect_redelivers_over_the_real_mtls_queue(
     e2e: _E2E,
 ) -> None:
-    """Dropping a leased request before local acceptance must redeliver it once."""
+    """A process death after polling but before acceptance must redeliver once."""
     now = datetime.now(UTC).replace(microsecond=0)
     clock = [now]
     operations = AgentOperationStore.for_test(
         e2e.root / "crash-before-effect", clock=lambda: clock[0]
     )
     e2e.server.application = AgentHttpApplication(operations)
-    operations.enqueue(
+    enqueued = operations.enqueue(
         AgentOperationRequestV1(
             "crash-before-effect",
             "host.probe",
@@ -926,17 +1080,30 @@ def test_agent_crash_before_effect_redelivers_over_the_real_mtls_queue(
             target_host_ref="worker-one",
         )
     )
-    client = e2e.agent_client()
-    first = client.poll(
-        AgentPollV1(e2e.registry.document_generation(), 3, _CAPABILITIES_DIGEST, 0)
+    process = multiprocessing.get_context("spawn").Process(
+        target=_poll_then_crash,
+        args=(
+            f"https://127.0.0.1:{e2e.server.server_address[1]}",
+            e2e.pki.root,
+            e2e.registry.document_generation(),
+        ),
     )
-    assert type(first) is AgentLeaseV1
+    process.start()
+    process.join(5)
+    assert process.exitcode == 23
+    leased = operations.get(enqueued.operation_id)
+    assert (leased.state, leased.attempt) == ("leased", 1)
+
     clock[0] += timedelta(minutes=2)
+    client = e2e.agent_client()
     redelivered = client.poll(
         AgentPollV1(e2e.registry.document_generation(), 3, _CAPABILITIES_DIGEST, 0)
     )
     assert type(redelivered) is AgentLeaseV1
-    assert (redelivered.operation_id, redelivered.attempt) == (first.operation_id, 2)
+    assert (redelivered.operation_id, redelivered.attempt) == (
+        enqueued.operation_id,
+        2,
+    )
 
     receipt = HostAgentExecutor(
         state=HostAgentState.for_test(e2e.root / "redelivery-state", host_ref="worker-one"),
@@ -949,7 +1116,7 @@ def test_agent_crash_before_effect_redelivers_over_the_real_mtls_queue(
         ),
     ).execute(redelivered)
     client.put_receipt(receipt)
-    assert operations.get(first.operation_id).state == "succeeded"
+    assert operations.get(redelivered.operation_id).state == "succeeded"
 
 
 class _NoEffectRuntime:
