@@ -118,6 +118,10 @@ jobs:
       - name: Check agent pool installer
         run: |
           set -eu
+          home="${RUNNER_TEMP}/codex-agent-pool-ci-home"
+          mkdir -m 700 "${home}"
+          ./scripts/codex-master-hive-hourly-probe-install --home "${home}"
+          mcp="${home}/.local/lib/codex-master-runtime/bin/codex-master-mcp"
           spec="${RUNNER_TEMP}/codex-agent-pool-ci.json"
           target="${RUNNER_TEMP}/codex-agents-ci"
           cat > "${spec}" <<'JSON'
@@ -146,7 +150,7 @@ jobs:
             }
           }
           JSON
-          ./bin/codex-master-mcp pool validate --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
-          ./scripts/install-agent-pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
-          ./bin/codex-master-mcp pool status --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
-          ./bin/codex-master-mcp pool destroy_pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo --yes --force --remove-root
+          HOME="${home}" "${mcp}" pool validate --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
+          HOME="${home}" ./scripts/install-agent-pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
+          HOME="${home}" "${mcp}" pool status --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
+          HOME="${home}" "${mcp}" pool destroy_pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo --yes --force --remove-root

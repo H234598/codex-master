@@ -5563,10 +5563,14 @@ class ServerHelpersTest(unittest.TestCase):
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
         self.assertIn("name: Check agent pool installer", workflow)
-        self.assertIn("./bin/codex-master-mcp pool validate", workflow)
-        self.assertIn("./scripts/install-agent-pool", workflow)
-        self.assertIn("./bin/codex-master-mcp pool status", workflow)
-        self.assertIn("./bin/codex-master-mcp pool destroy_pool", workflow)
+        self.assertIn(
+            "./scripts/codex-master-hive-hourly-probe-install --home \"${home}\"",
+            workflow,
+        )
+        self.assertIn('HOME="${home}" ./scripts/install-agent-pool', workflow)
+        self.assertIn('HOME="${home}" "${mcp}" pool validate', workflow)
+        self.assertIn('HOME="${home}" "${mcp}" pool status', workflow)
+        self.assertIn('HOME="${home}" "${mcp}" pool destroy_pool', workflow)
         self.assertIn("--remove-root", workflow)
 
     def test_redacts_common_secret_shapes(self) -> None:
