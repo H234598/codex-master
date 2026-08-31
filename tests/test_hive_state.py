@@ -74,6 +74,70 @@ def test_shared_state_reuses_group_owned_lock_without_chmod(
         pass
 
 
+def test_shared_state_directory_creation_race_never_chmods_other_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "agent-state"
+    original_mkdir = Path.mkdir
+    original_chmod = os.chmod
+    injected = False
+
+    def race_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal injected
+        if path == root and not injected:
+            injected = True
+            original_mkdir(path, mode=0o770)
+            original_chmod(path, 0o2770)
+        original_mkdir(path, *args, **kwargs)
+
+    def deny_foreign_chmod(path: os.PathLike[str] | str, mode: int) -> None:
+        if Path(path) == root:
+            raise PermissionError
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(Path, "mkdir", race_mkdir)
+    monkeypatch.setattr("codex_master.hive.state.os.chmod", deny_foreign_chmod)
+
+    HiveStateStore(root, shared_gid=os.getegid())
+
+
+def test_shared_state_lock_creation_race_never_fchmods_other_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "agent-state"
+    root.mkdir(mode=0o770)
+    os.chmod(root, 0o2770)
+    lock = root / ".hive-state.lock"
+    original_open = os.open
+    original_fchmod = os.fchmod
+    injected = False
+
+    def race_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal injected
+        if path == lock.name and flags & os.O_CREAT and not injected:
+            injected = True
+            foreign = original_open(
+                path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o660,
+                dir_fd=dir_fd,
+            )
+            original_fchmod(foreign, 0o660)
+            os.close(foreign)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def deny_foreign_fchmod(descriptor: int, mode: int) -> None:
+        if lock.exists() and os.fstat(descriptor).st_ino == lock.stat().st_ino:
+            raise PermissionError
+        original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr("codex_master.hive.state.os.open", race_open)
+    monkeypatch.setattr("codex_master.hive.state.os.fchmod", deny_foreign_fchmod)
+
+    with HiveStateStore(root, shared_gid=os.getegid()).locked():
+        pass
+
+
 def test_state_store_reuses_exact_0700_root_without_chmod_and_existing_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

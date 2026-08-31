@@ -249,10 +249,16 @@ class HiveStateStore:
                 try:
                     child = os.open(part, flags, dir_fd=descriptor)
                 except FileNotFoundError:
+                    created = False
                     try:
                         os.mkdir(part, self._directory_mode, dir_fd=descriptor)
+                        created = True
+                    except FileExistsError:
+                        pass
+                    try:
                         child = os.open(part, flags, dir_fd=descriptor)
-                        os.fchmod(child, self._directory_mode)
+                        if created:
+                            os.fchmod(child, self._directory_mode)
                     except OSError as exc:
                         raise HiveStateError("state_directory_unavailable") from exc
                 except OSError as exc:
@@ -313,18 +319,37 @@ class HiveStateStore:
             raise HiveStateError("state_lock_unavailable") from exc
         if existing is not None:
             self._validate_private_file(existing, MAX_HIVE_STATE_BYTES)
+        flags = (
+            os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        created = False
         try:
-            descriptor = os.open(
-                lock_name,
-                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-                self._file_mode,
-                dir_fd=root_descriptor,
-            )
+            if existing is None:
+                try:
+                    descriptor = os.open(
+                        lock_name,
+                        flags | os.O_CREAT | os.O_EXCL,
+                        self._file_mode,
+                        dir_fd=root_descriptor,
+                    )
+                    created = True
+                except FileExistsError:
+                    existing = os.stat(
+                        lock_name,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    self._validate_private_file(existing, MAX_HIVE_STATE_BYTES)
+                    descriptor = os.open(lock_name, flags, dir_fd=root_descriptor)
+            else:
+                descriptor = os.open(lock_name, flags, dir_fd=root_descriptor)
         except OSError as exc:
             raise HiveStateError("state_lock_unavailable") from exc
         try:
             opened = os.fstat(descriptor)
-            if existing is None:
+            if created:
                 os.fchmod(descriptor, self._file_mode)
                 opened = os.fstat(descriptor)
             self._validate_private_file(opened, MAX_HIVE_STATE_BYTES)
@@ -337,11 +362,21 @@ class HiveStateStore:
 
     def _ensure_directory(self, path: Path) -> None:
         try:
+            created = False
             try:
                 path.lstat()
             except FileNotFoundError:
-                path.mkdir(parents=True, exist_ok=True, mode=self._directory_mode)
-                os.chmod(path, self._directory_mode)
+                try:
+                    path.mkdir(
+                        parents=True,
+                        exist_ok=False,
+                        mode=self._directory_mode,
+                    )
+                    created = True
+                except FileExistsError:
+                    pass
+                if created:
+                    os.chmod(path, self._directory_mode)
             current = path.lstat()
         except OSError as exc:
             raise HiveStateError("state_directory_unavailable") from exc

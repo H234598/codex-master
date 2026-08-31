@@ -238,14 +238,21 @@ class OllamaRegistryStore:
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
+        descriptor: int | None = None
         try:
             mode = 0o2770 if self._shared_gid is not None else 0o700
             file_mode = 0o660 if self._shared_gid is not None else 0o600
             try:
                 parent = self._path.parent.lstat()
             except FileNotFoundError:
-                self._path.parent.mkdir(mode=mode, parents=True)
-                os.chmod(self._path.parent, mode)
+                created_parent = False
+                try:
+                    self._path.parent.mkdir(mode=mode, parents=True)
+                    created_parent = True
+                except FileExistsError:
+                    pass
+                if created_parent:
+                    os.chmod(self._path.parent, mode)
                 parent = self._path.parent.lstat()
             _validate_directory(parent, mode=mode, shared_gid=self._shared_gid)
             try:
@@ -254,18 +261,41 @@ class OllamaRegistryStore:
                 existing = None
             if existing is not None:
                 _validate_file(existing, mode=file_mode, shared_gid=self._shared_gid)
-            descriptor = os.open(
-                self._lock_path,
-                os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-                file_mode,
-            )
+            flags = os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            created_lock = False
             if existing is None:
+                try:
+                    descriptor = os.open(
+                        self._lock_path,
+                        flags | os.O_CREAT | os.O_EXCL,
+                        file_mode,
+                    )
+                    created_lock = True
+                except FileExistsError:
+                    existing = self._lock_path.lstat()
+                    _validate_file(
+                        existing,
+                        mode=file_mode,
+                        shared_gid=self._shared_gid,
+                    )
+                    descriptor = os.open(self._lock_path, flags)
+            else:
+                descriptor = os.open(self._lock_path, flags)
+            if created_lock:
                 os.fchmod(descriptor, file_mode)
             opened = os.fstat(descriptor)
             _validate_file(opened, mode=file_mode, shared_gid=self._shared_gid)
             if existing is not None and not _same_file(existing, opened):
                 _fail("ollama.registry_store_unavailable")
+        except OllamaRegistryError:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
         except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
+            _fail("ollama.registry_store_unavailable")
+        if descriptor is None:
             _fail("ollama.registry_store_unavailable")
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)

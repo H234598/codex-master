@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import threading
 
 import pytest
@@ -80,6 +81,37 @@ def test_shared_registry_reuses_group_owned_directory_and_lock_without_chmod(
 
     monkeypatch.setattr("codex_master.ollama_registry.os.chmod", deny_existing_directory_chmod)
     monkeypatch.setattr("codex_master.ollama_registry.os.fchmod", deny_existing_lock_chmod)
+
+    assert OllamaRegistryStore.for_test(root, shared_gid=os.getegid()).load().generation == 0
+
+
+def test_shared_registry_lock_creation_race_never_fchmods_other_owner(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "shared"
+    root.mkdir(mode=0o770)
+    os.chmod(root, 0o2770)
+    lock = root / ".ollama-registry.json.lock"
+    original_open = os.open
+    original_fchmod = os.fchmod
+    injected = False
+
+    def race_open(path, flags, mode=0o777):
+        nonlocal injected
+        if Path(path) == lock and flags & os.O_CREAT and not injected:
+            injected = True
+            foreign = original_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o660)
+            original_fchmod(foreign, 0o660)
+            os.close(foreign)
+        return original_open(path, flags, mode)
+
+    def deny_foreign_fchmod(descriptor, mode):
+        if lock.exists() and os.fstat(descriptor).st_ino == lock.stat().st_ino:
+            raise PermissionError
+        original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr("codex_master.ollama_registry.os.open", race_open)
+    monkeypatch.setattr("codex_master.ollama_registry.os.fchmod", deny_foreign_fchmod)
 
     assert OllamaRegistryStore.for_test(root, shared_gid=os.getegid()).load().generation == 0
 

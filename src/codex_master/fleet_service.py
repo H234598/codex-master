@@ -529,9 +529,20 @@ def _ensure_remote_state_directory(
     try:
         metadata = directory.lstat()
     except FileNotFoundError:
+        created = False
         try:
             directory.mkdir(mode=mode)
-            os.chmod(directory, mode)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise HiveStateError("state_directory_unavailable") from exc
+        if created:
+            try:
+                os.chmod(directory, mode)
+            except OSError as exc:
+                raise HiveStateError("state_directory_unavailable") from exc
+        try:
             metadata = directory.lstat()
         except OSError as exc:
             raise HiveStateError("state_directory_unavailable") from exc

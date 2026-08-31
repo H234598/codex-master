@@ -73,7 +73,7 @@ def test_unit_owns_private_runtime_and_state_write_boundaries() -> None:
     assert service["RuntimeDirectoryMode"] == ["0700"]
     assert service["StateDirectory"] == ["codex-master-admin"]
     assert service["StateDirectoryMode"] == ["0700"]
-    assert service["UMask"] == ["0077"]
+    assert service["UMask"] == ["0007"]
     assert service["SupplementaryGroups"] == ["codex-master-agent-state"]
     assert service["ReadWritePaths"] == [
         "/run/codex-master-admin /var/lib/codex-master-admin /var/lib/codex-master-agent"
@@ -151,7 +151,7 @@ def test_agent_api_unit_uses_private_tls_entrypoint_and_credentials() -> None:
     assert service["User"] == ["codex-master-agent-api"]
     assert service["Group"] == ["codex-master-agent-api"]
     assert service["WorkingDirectory"] == ["/var/empty"]
-    assert service["UMask"] == ["0077"]
+    assert service["UMask"] == ["0007"]
     assert service["SupplementaryGroups"] == ["codex-master-agent-state"]
     assert service["ReadWritePaths"] == ["/var/lib/codex-master-agent"]
     assert service["ExecStart"] == [
