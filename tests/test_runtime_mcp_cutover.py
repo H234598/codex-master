@@ -387,7 +387,7 @@ def test_force_rollback_reuses_one_pinned_cli_and_client_home_after_add_failure(
         with pytest.raises(server.AgentError, match="codex mcp add failed"):
             server.install(register=True, force=True, sync_plugin_cache=False)
 
-    bind.assert_called_once_with()
+    bind.assert_called_once_with(create_config_directory=True)
     check.assert_called_once_with(
         layout.mcp_entrypoint, include_command=True, binding=binding
     )
@@ -455,6 +455,80 @@ def test_binding_pins_cli_and_client_home_across_a_filesystem_swap(
     assert all(call.kwargs["pass_fds"] == first_pass_fds for call in run.call_args_list)
     assert (moved_home / ".codex" / "config.toml").is_file()
     assert not (home / ".codex" / "config.toml").exists()
+
+
+def test_binding_creates_a_missing_client_config_directory_through_the_pinned_home(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "main-home"
+    home.mkdir(mode=0o700)
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    with (
+        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.object(server, "_canonical_codex_cli_path", return_value=executable),
+    ):
+        with server._codex_mcp_binding(create_config_directory=True) as binding:
+            assert binding.config_path.parent.resolve() == home / ".codex"
+            assert Path(binding.environment["HOME"]).resolve() == home
+
+    config_home = home / ".codex"
+    assert config_home.is_dir()
+    assert not config_home.is_symlink()
+    assert config_home.stat().st_mode & 0o777 == 0o700
+
+
+def test_registration_inspection_does_not_create_a_missing_client_config_directory(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "main-home"
+    home.mkdir(mode=0o700)
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    with (
+        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.object(server, "_canonical_codex_cli_path", return_value=executable),
+        patch.object(server, "run_command") as run,
+    ):
+        result = server.check_mcp_registration(
+            Path("/runtime/bin/codex-master-mcp")
+        )
+
+    run.assert_not_called()
+    assert result["lookup_status"] == "unavailable"
+    assert not (home / ".codex").exists()
+
+
+def test_binding_rejects_a_symlinked_client_config_directory(tmp_path: Path) -> None:
+    home = tmp_path / "main-home"
+    home.mkdir(mode=0o700)
+    target = tmp_path / "attacker-config"
+    target.mkdir(mode=0o700)
+    (home / ".codex").symlink_to(target, target_is_directory=True)
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    with (
+        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.object(server, "_canonical_codex_cli_path", return_value=executable),
+    ):
+        with pytest.raises(server.AgentError, match="canonical_codex_mcp_binding_unavailable"):
+            with server._codex_mcp_binding():
+                pass
 
 
 def test_canonical_codex_cli_uses_the_documented_system_absolute_location() -> None:

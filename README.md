@@ -946,6 +946,8 @@ failed. Verify the installed files and CLI first; do not interpret ordinary
 - binds the effective passwd home and its real `.codex` directory once, then
   invokes Codex with a minimal fixed environment (`HOME` through that pinned
   descriptor and `PATH=/usr/bin:/bin`), never ambient `HOME` or `CODEX_HOME`
+- creates a missing private `.codex` directory only through that pinned home
+  during `install`; read-only registration inspection and `doctor` never create it
 - registers exactly that command via `codex mcp add codex-master-mcp -- <entrypoint>`
 - keeps the interactive Codex registration status separate from `hive runtime-status`
 - never creates, follows, or removes a user-bin symlink, and accepts no path override

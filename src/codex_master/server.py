@@ -2288,7 +2288,9 @@ def _canonical_codex_client_home() -> tuple[Path, os.stat_result]:
 
 
 @contextlib.contextmanager
-def _codex_mcp_binding() -> Iterator[_CodexMcpBinding]:
+def _codex_mcp_binding(
+    *, create_config_directory: bool = False
+) -> Iterator[_CodexMcpBinding]:
     executable_fd = -1
     home_fd = -1
     config_fd = -1
@@ -2313,7 +2315,16 @@ def _codex_mcp_binding() -> Iterator[_CodexMcpBinding]:
             error_text="canonical_codex_mcp_binding_unavailable",
             changed_text="canonical_codex_mcp_binding_unavailable",
         )
-        config_stat = os.stat(".codex", dir_fd=home_fd, follow_symlinks=False)
+        try:
+            config_stat = os.stat(".codex", dir_fd=home_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if not create_config_directory:
+                raise AgentError("canonical_codex_mcp_binding_unavailable")
+            try:
+                os.mkdir(".codex", 0o700, dir_fd=home_fd)
+            except FileExistsError:
+                pass
+            config_stat = os.stat(".codex", dir_fd=home_fd, follow_symlinks=False)
         if (
             stat_module.S_ISLNK(config_stat.st_mode)
             or not stat_module.S_ISDIR(config_stat.st_mode)
@@ -23729,7 +23740,7 @@ def _install_enrolled_unlocked(
     binding: _CodexMcpBinding | None = None,
 ) -> dict[str, Any]:
     if binding is None:
-        with _codex_mcp_binding() as pinned_binding:
+        with _codex_mcp_binding(create_config_directory=True) as pinned_binding:
             return _install_enrolled_unlocked(
                 register=register,
                 force=force,
@@ -23935,7 +23946,7 @@ def _install_unlocked(
     binding: _CodexMcpBinding | None = None,
 ) -> dict[str, Any]:
     if binding is None:
-        with _codex_mcp_binding() as pinned_binding:
+        with _codex_mcp_binding(create_config_directory=True) as pinned_binding:
             return _install_unlocked(
                 register=register,
                 force=force,
@@ -23972,7 +23983,7 @@ def install(
     sync_plugin_cache: bool = True,
     install_desktop: bool = False,
 ) -> dict[str, Any]:
-    binding_context: Any = _codex_mcp_binding()
+    binding_context: Any = _codex_mcp_binding(create_config_directory=True)
     with binding_context as binding:
         with install_lock():
             return _install_unlocked(
