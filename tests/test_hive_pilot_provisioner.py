@@ -20,6 +20,7 @@ import codex_master.hive.pilot_provisioner as pilot_provisioner
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SHADOW_CONFIG = ROOT / "tests" / "fixtures" / "hive" / "hive-shadow-valid.json"
 
 
 def make_repository(
@@ -33,7 +34,7 @@ def make_repository(
     (repository / "codex-agent-classes.json").write_bytes(
         (ROOT / "codex-agent-classes.json").read_bytes()
     )
-    (repository / "codex-hive.json").write_bytes((ROOT / "codex-hive.json").read_bytes())
+    (repository / "codex-hive.json").write_bytes(SHADOW_CONFIG.read_bytes())
     subprocess.run(["git", "-C", str(repository), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
         ["git", "-C", str(repository), "config", "remote.origin.url", remote], check=True

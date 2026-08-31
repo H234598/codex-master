@@ -940,6 +940,17 @@ failed. Verify the installed files and CLI first; do not interpret ordinary
 - accepts only the immutable, validated Runtime-Image entrypoint at
   `~/.local/lib/codex-master-runtime/bin/codex-master-mcp`
 - directly probes that entrypoint with MCP `initialize` before registering it
+- uses only the documented `/usr/local/bin/codex` identity for registration;
+  its source and resolved executable are validated as root- or effective-user
+  owned, then FD-pinned once for the whole
+  install/uninstall transaction
+- binds the effective passwd home and its real `.codex` directory once, then
+  invokes Codex with a minimal fixed environment (`HOME` and `CODEX_HOME`
+  through those pinned descriptors and `PATH=/usr/bin:/bin`), never ambient
+  `HOME` or `CODEX_HOME`
+- requires a pre-existing, validated private `.codex` directory; missing client
+  configuration makes `install`, registration inspection and `doctor` fail closed
+  without creating or deleting anything
 - registers exactly that command via `codex mcp add codex-master-mcp -- <entrypoint>`
 - keeps the interactive Codex registration status separate from `hive runtime-status`
 - never creates, follows, or removes a user-bin symlink, and accepts no path override

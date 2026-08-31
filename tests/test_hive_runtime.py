@@ -29,6 +29,7 @@ import codex_master.hive.runtime as hive_runtime
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SHADOW_CONFIG = ROOT / "tests" / "fixtures" / "hive" / "hive-shadow-valid.json"
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
 
 
@@ -245,7 +246,7 @@ def test_server_factory_accepts_one_bundle_and_rejects_split_authority_state(tmp
 
 def test_runtime_evidence_is_read_only_and_data_sparse_when_state_is_missing(tmp_path: Path) -> None:
     catalog = ROOT / "codex-agent-classes.json"
-    config = ROOT / "codex-hive.json"
+    config = SHADOW_CONFIG
     state_root = tmp_path / "state"
 
     evidence = read_hive_runtime_evidence(
@@ -274,7 +275,7 @@ def test_runtime_evidence_is_read_only_and_data_sparse_when_state_is_missing(tmp
 
 def test_runtime_evidence_returns_schema_complete_fail_closed_dto_for_bad_inputs(tmp_path: Path) -> None:
     catalog = ROOT / "codex-agent-classes.json"
-    config = ROOT / "codex-hive.json"
+    config = SHADOW_CONFIG
 
     for kwargs, reason in (
         ({"state_root": Path("relative-state")}, "hive_runtime_unavailable"),
@@ -375,7 +376,7 @@ def test_runtime_evidence_does_not_treat_unlocked_state_directory_as_ready(tmp_p
     state_root.mkdir(mode=0o700)
     evidence = read_hive_runtime_evidence(
         catalog_path=ROOT / "codex-agent-classes.json",
-        config_path=ROOT / "codex-hive.json",
+        config_path=SHADOW_CONFIG,
         state_root=state_root,
         now=lambda: NOW,
     )
