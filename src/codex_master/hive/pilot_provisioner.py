@@ -457,7 +457,7 @@ def _validate_state_parent(state_root: Path) -> None:
     try:
         _validate_directory_chain(parent)
         parent_info = parent.lstat()
-    except PilotProvisionerError as exc:
+    except (OSError, PilotProvisionerError) as exc:
         raise PilotProvisionerError("pilot_state_unavailable") from exc
     if (
         parent_info.st_uid != os.geteuid()

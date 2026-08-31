@@ -443,6 +443,51 @@ def test_plan_rejects_an_unsafe_state_parent_without_creating_state(tmp_path: Pa
     assert not state_root.exists()
 
 
+def test_plan_redacts_parent_io_failure_at_cli_boundary_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repository = make_repository(tmp_path)
+    state_parent = tmp_path / "state-parent"
+    state_parent.mkdir(mode=0o700)
+    state_root = state_parent / "private-state"
+    before = (repository / "codex-hive.json").read_bytes()
+    original_lstat = Path.lstat
+    parent_lstat_calls = 0
+
+    def fail_second_parent_lstat(path: Path) -> os.stat_result:
+        nonlocal parent_lstat_calls
+        if path == state_parent:
+            parent_lstat_calls += 1
+            if parent_lstat_calls == 2:
+                raise OSError("synthetic_parent_io")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_second_parent_lstat)
+
+    assert (
+        pilot_provisioner.main(
+            [
+                "plan",
+                "--repository-root",
+                str(repository),
+                "--state-root",
+                str(state_root),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "ok": False,
+        "reason_code": "pilot_state_unavailable",
+        "raw_output": "not_returned",
+    }
+    assert captured.err == ""
+    assert parent_lstat_calls == 2
+    assert not state_root.exists()
+    assert (repository / "codex-hive.json").read_bytes() == before
+
+
 @pytest.mark.parametrize("operation", (plan_pilot_provisioning, apply_pilot_provisioning, verify_pilot_provisioning))
 def test_plan_apply_and_verify_require_a_real_local_main_commit(tmp_path: Path, operation) -> None:
     repository = make_repository(tmp_path, with_commit=False)
