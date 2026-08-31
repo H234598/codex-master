@@ -2215,21 +2215,85 @@ def _runtime_mcp_entrypoint() -> Path:
     return _runtime_layout().mcp_entrypoint
 
 
-def _canonical_codex_cli_path() -> Path:
-    """Return the documented root- or effective-owner CLI for MCP registration."""
-
-    try:
-        return trusted_runner_executable(CANONICAL_CODEX_CLI_PATH)
-    except AgentError as exc:
-        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable") from exc
-
-
 class _CanonicalCodexCliUnavailable(AgentError):
     """The one permitted CLI authority could not be validated."""
 
 
 class _CodexClientBindingUnavailable(AgentError):
     """The passwd-home or .codex side of a pinned binding is unavailable."""
+
+
+def _canonical_codex_wrapper_path() -> Path:
+    """Validate the fixed wrapper as the sole package-installation authority."""
+
+    try:
+        wrapper = trusted_runner_executable(CANONICAL_CODEX_CLI_PATH)
+    except AgentError as exc:
+        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable") from exc
+    if (
+        wrapper.name != "codex.js"
+        or wrapper.parent.name != "bin"
+        or wrapper.parents[1].name != "codex"
+        or wrapper.parents[2].name != "@openai"
+        or wrapper.parents[3].name != "node_modules"
+    ):
+        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable")
+    return wrapper
+
+
+def _codex_native_install_descriptor() -> tuple[str, str]:
+    """Return the one native Codex package permitted by this POSIX runtime."""
+
+    try:
+        platform_name = os.uname().sysname
+        machine = os.uname().machine
+    except AttributeError as exc:
+        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable") from exc
+    descriptors = {
+        ("Linux", "x86_64"): ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+        ("Linux", "aarch64"): ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+    }
+    try:
+        return descriptors[(platform_name, machine)]
+    except KeyError as exc:
+        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable") from exc
+
+
+def _native_codex_cli_path_from_wrapper(wrapper: Path) -> Path:
+    """Derive one native payload from an already-attested Codex package wrapper."""
+
+    if (
+        not isinstance(wrapper, Path)
+        or not wrapper.is_absolute()
+        or wrapper.name != "codex.js"
+        or wrapper.parent.name != "bin"
+        or wrapper.parents[1].name != "codex"
+        or wrapper.parents[2].name != "@openai"
+        or wrapper.parents[3].name != "node_modules"
+    ):
+        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable")
+    package, target = _codex_native_install_descriptor()
+    return (
+        wrapper.parents[1]
+        / "node_modules"
+        / "@openai"
+        / package
+        / "vendor"
+        / target
+        / "bin"
+        / "codex"
+    )
+
+
+def _canonical_codex_cli_path() -> Path:
+    """Return the attested native Codex payload without executing its JS wrapper."""
+
+    wrapper = _canonical_codex_wrapper_path()
+    native = _native_codex_cli_path_from_wrapper(wrapper)
+    try:
+        return trusted_runner_executable(native)
+    except AgentError as exc:
+        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable") from exc
 
 
 @dataclass
