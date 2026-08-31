@@ -11,7 +11,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 import uuid
 
 from codex_master.admin_contracts import AdminContractError, OperationV1
@@ -409,6 +409,17 @@ class AdminOperationStore:
         operation_id = self._token(operation_id)
         with self._locked_records() as records:
             return self._operation(self._find(records, operation_id))
+
+    def agent_operation_id(self, operation_id: str) -> str | None:
+        """Return the fixed Agent queue ID paired with one public Admin operation."""
+
+        operation_id = self._token(operation_id)
+        with self._locked_records() as records:
+            self._find(records, operation_id)
+            owner = self._find_host_probe_lifecycle_owner(
+                self._read_host_probe_lifecycle_locked(), operation_id
+            )
+            return None if owner is None else cast(str, owner["agent_operation_id"])
 
     def bind_host_probe_agent(
         self,

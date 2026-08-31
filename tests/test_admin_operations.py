@@ -59,6 +59,26 @@ def store_at(
     return AdminOperationStore.for_test(tmp_path, clock=clock or Clock(), **kwargs)
 
 
+def test_operation_result_host_probe_binding_resolves_agent_id(tmp_path) -> None:
+    """RED: AdminOperationStore cannot yet expose its paired agent operation."""
+
+    store = store_at(tmp_path)
+    plan = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="public-result-binding",
+        steps=("host.probe.collect",),
+    )
+    store.bind_host_probe_agent(
+        plan.operation_id,
+        agent_operation_id="agent-operation-one",
+        target_host_ref="worker-one",
+        plan_digest=plan.plan_digest,
+    )
+
+    assert store.agent_operation_id(plan.operation_id) == "agent-operation-one"
+
+
 def _run_owned_operation(root: str, connection: Any) -> None:
     store = AdminOperationStore.for_test(Path(root), clock=Clock())
     plan = store.plan(

@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
+import json
 import re
 from types import MappingProxyType
 from typing import Never, cast
@@ -262,6 +263,9 @@ _MAX_COUNT = 100_000
 _MAX_OPERATION_LIFETIME = timedelta(days=1)
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+_UTC_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z"
+)
 _PRIVATE_TEXT = re.compile(
     r"\b(?:bearer|basic|(?:access|refresh)[\s_.-]*token|client[\s_.-]*secret|api[\s_.-]*key|auth(?:entication|orization)?|token|cookie|credential|passphrase|password|session|secret|jwt)\b"
     r"|(?:sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
@@ -273,6 +277,27 @@ _PRIVATE_TEXT = re.compile(
 _OPERATION_STATES = frozenset(
     {"planned", "queued", "running", "partial", "succeeded", "failed", "blocked"}
 )
+PUBLIC_AGENT_REASON_CODES = frozenset(
+    {
+        "host.unreachable",
+        "host.identity_mismatch",
+        "host.generation_stale",
+        "host.lease_expired",
+        "host.capability_mismatch",
+        "host.probe_failed",
+        "host.operation_unknown",
+        "resource.host_response_invalid",
+        "resource.host_unreachable",
+        "control.plan_stale",
+    }
+)
+_AGENT_RESULT_KINDS = {
+    ("host.probe", "collect"): "host.probe",
+    ("ollama.instance", "plan"): "ollama.instance.plan",
+    ("ollama.instance", "apply"): "ollama.instance.apply",
+    ("ollama.instance", "probe"): "ollama.instance.probe",
+    ("ollama.instance", "stop"): "ollama.instance.stop",
+}
 _PROBLEM_SEVERITIES = frozenset({"info", "warning", "error", "critical"})
 _PROBLEM_TEMPLATES = {
     "control.step_up_required": (
@@ -719,3 +744,162 @@ def public_admin_result(value: object) -> dict[str, object]:
             "plan_digest": value.plan_digest,
         }
     _private()
+
+
+def public_operation_status(
+    operation: object,
+    *,
+    result_kind: str | None = None,
+    result: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Serialize one operation with the fixed asynchronous-result envelope."""
+
+    public = public_admin_result(operation)
+    if result_kind is None and result is None:
+        return {**public, "result_kind": None, "result": None}
+    if type(result_kind) is not str or result is None:
+        raise AdminContractError("resource.host_response_invalid")
+    return {
+        **public,
+        "result_kind": result_kind,
+        "result": public_agent_result(result_kind, result),
+    }
+
+
+def public_agent_result(
+    result_kind: object, value: object
+) -> dict[str, object]:
+    """Fail closed to the five result shapes that may cross the Admin boundary."""
+
+    if type(result_kind) is not str or result_kind not in _AGENT_RESULT_KINDS.values():
+        raise AdminContractError("resource.host_response_invalid")
+    if not isinstance(value, Mapping):
+        raise AdminContractError("resource.host_response_invalid")
+    payload = dict(value)
+    if result_kind == "host.probe":
+        return _public_host_probe_result(payload)
+    if result_kind == "ollama.instance.plan":
+        _require_result_fields(payload, {"plan_ref"})
+        return {"plan_ref": _result_token(payload["plan_ref"])}
+    if result_kind == "ollama.instance.apply":
+        _require_result_fields(payload, {"instance_ref", "generation"})
+        return {
+            "instance_ref": _result_token(payload["instance_ref"]),
+            "generation": _result_generation(payload["generation"]),
+        }
+    if result_kind == "ollama.instance.probe":
+        _require_result_fields(
+            payload,
+            {
+                "ready",
+                "reason_codes",
+                "process_running",
+                "cgroup_member",
+                "loopback_endpoint_reachable",
+                "available_model_ids",
+            },
+        )
+        identifiers = payload["available_model_ids"]
+        if type(identifiers) is not list or len(identifiers) > 64:
+            raise AdminContractError("resource.host_response_invalid")
+        model_ids = [_result_token(item) for item in identifiers]
+        if len(set(model_ids)) != len(model_ids):
+            raise AdminContractError("resource.host_response_invalid")
+        return {
+            "ready": _result_bool(payload["ready"]),
+            "reason_codes": _public_agent_reason_codes(payload["reason_codes"]),
+            "process_running": _result_bool(payload["process_running"]),
+            "cgroup_member": _result_bool(payload["cgroup_member"]),
+            "loopback_endpoint_reachable": _result_bool(
+                payload["loopback_endpoint_reachable"]
+            ),
+            "available_model_ids": model_ids,
+        }
+    _require_result_fields(payload, {"stopped"})
+    return {"stopped": _result_bool(payload["stopped"])}
+
+
+def agent_result_kind(kind: object, action: object) -> str:
+    result_kind = _AGENT_RESULT_KINDS.get((kind, action))
+    if result_kind is None:
+        raise AdminContractError("resource.host_response_invalid")
+    return result_kind
+
+
+def _require_result_fields(payload: Mapping[str, object], fields: set[str]) -> None:
+    if set(payload) != fields:
+        raise AdminContractError("resource.host_response_invalid")
+
+
+def _result_token(value: object) -> str:
+    if type(value) is not str or _TOKEN.fullmatch(value) is None:
+        raise AdminContractError("resource.host_response_invalid")
+    return value
+
+
+def _result_generation(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= _MAX_GENERATION:
+        raise AdminContractError("resource.host_response_invalid")
+    return value
+
+
+def _result_bool(value: object) -> bool:
+    if type(value) is not bool:
+        raise AdminContractError("resource.host_response_invalid")
+    return value
+
+
+def _public_agent_reason_codes(value: object) -> list[str]:
+    if type(value) is not list or len(value) > 32:
+        raise AdminContractError("resource.host_response_invalid")
+    if any(type(code) is not str or code not in PUBLIC_AGENT_REASON_CODES for code in value):
+        raise AdminContractError("resource.host_response_invalid")
+    if len(set(value)) != len(value):
+        raise AdminContractError("resource.host_response_invalid")
+    return list(cast(list[str], value))
+
+
+def _public_host_probe_result(payload: Mapping[str, object]) -> dict[str, object]:
+    fields = {
+        "kernel_class",
+        "architecture_class",
+        "cpu_count",
+        "memory_class",
+        "cgroup_v2",
+        "systemd",
+        "load_class",
+        "pressure_class",
+        "ollama_capability",
+        "observed_at",
+        "agent_generation",
+        "evidence_digest",
+    }
+    _require_result_fields(payload, fields)
+    if (
+        payload["kernel_class"] not in {"linux", "other"}
+        or payload["architecture_class"] not in {"x86_64", "arm64", "other"}
+        or type(payload["cpu_count"]) is not int
+        or not 1 <= cast(int, payload["cpu_count"]) <= 2**31 - 1
+        or payload["memory_class"]
+        not in {"under-8-gib", "8-31-gib", "32-127-gib", "128-plus-gib"}
+        or payload["load_class"] not in {"idle", "busy", "saturated"}
+        or payload["pressure_class"] not in {"none", "low", "elevated"}
+        or any(
+            type(payload[field]) is not bool
+            for field in ("cgroup_v2", "systemd", "ollama_capability")
+        )
+        or type(payload["observed_at"]) is not str
+        or _UTC_TIMESTAMP.fullmatch(cast(str, payload["observed_at"])) is None
+        or type(payload["agent_generation"]) is not int
+        or not 1 <= cast(int, payload["agent_generation"]) <= _MAX_GENERATION
+        or type(payload["evidence_digest"]) is not str
+        or _DIGEST.fullmatch(cast(str, payload["evidence_digest"])) is None
+    ):
+        raise AdminContractError("resource.host_response_invalid")
+    evidence = {field: payload[field] for field in fields - {"evidence_digest"}}
+    canonical = json.dumps(
+        evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    if "sha256:" + hashlib.sha256(canonical).hexdigest() != payload["evidence_digest"]:
+        raise AdminContractError("resource.host_response_invalid")
+    return {field: payload[field] for field in fields}

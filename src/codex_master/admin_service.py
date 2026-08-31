@@ -16,14 +16,18 @@ from .admin_contracts import (
     ADMIN_OPERATION_CATALOG,
     ADMIN_OPERATION_CATALOG_DIGEST,
     ADMIN_OPERATION_METADATA,
+    AdminContractError,
     AdminPrincipalV1,
     AdminRequestV1,
     HiveProblemV1,
+    agent_result_kind,
     public_admin_result,
+    public_operation_status,
     public_admin_text,
 )
 from .admin_hosts import ControlHostV1, HostRegistry, HostRegistryError
 from .admin_operations import AdminOperationError, AdminOperationStore
+from .agent_operations import AgentOperationError, AgentOperationStore
 from .credential_vault import CredentialVault
 from .google_account_inventory import GoogleAccountInventoryError
 from .google_account_inventory_manager import (
@@ -356,6 +360,7 @@ class MasterjetControlService:
         self,
         *,
         operation_store: AdminOperationStore,
+        agent_operations: AgentOperationStore | None = None,
         openai_accounts: OpenAIAccountsPort | None,
         openai_credentials: OpenAICredentialService | None,
         google_manager: GoogleAccountInventoryManager,
@@ -370,6 +375,7 @@ class MasterjetControlService:
         host_probe: HostProbePort | None = None,
     ) -> None:
         self._operation_store = operation_store
+        self._agent_operations = agent_operations
         self._openai_accounts = openai_accounts
         self._openai_credentials = openai_credentials
         self._google_manager = google_manager
@@ -1004,7 +1010,20 @@ class MasterjetControlService:
     ) -> dict[str, object]:
         operation_id = cast(str, request.arguments["operation_id"])
         operation = self._operation_store.get(operation_id)
-        return public_admin_result(operation)
+        agent_operation_id = self._operation_store.agent_operation_id(operation_id)
+        if agent_operation_id is None or self._agent_operations is None:
+            return public_operation_status(operation)
+        try:
+            result = self._agent_operations.result(agent_operation_id)
+            if result is None:
+                return public_operation_status(operation)
+            return public_operation_status(
+                operation,
+                result_kind=agent_result_kind(result.kind, result.action),
+                result=result.payload,
+            )
+        except (AdminContractError, AgentOperationError):
+            raise _service_error("resource.host_response_invalid") from None
 
     def _openai_auth_plan(
         self,

@@ -15,10 +15,13 @@ from typing import Any, Literal, cast
 import uuid
 
 from codex_master.agent_contracts import (
+    AgentContractError,
     AgentLeaseV1,
     AgentNoWorkV1,
     AgentPollV1,
     AgentReceiptV1,
+    AgentResultV1,
+    serialize_agent_result,
 )
 from codex_master.hive.state import HiveStateError, HiveStateStore
 
@@ -826,6 +829,31 @@ class AgentOperationStore:
         with self._state.locked():
             return self._view(self._find(self._read_locked()["operations"], operation_id))
 
+    def result(self, operation_id: str) -> AgentResultV1 | None:
+        """Return only the durably accepted bounded receipt result for one ID."""
+
+        operation_id = _token(operation_id, "host.operation_not_found")
+        with self._state.locked():
+            record = self._find(self._read_locked()["operations"], operation_id)
+            completion = record["completion"]
+            if type(completion) is not dict or "result" not in completion:
+                return None
+            try:
+                result = AgentResultV1(
+                    record["kind"],
+                    record["action"],
+                    cast(dict[str, object], completion["result"])["payload"],
+                )
+                serialized = serialize_agent_result(result)
+            except (AgentContractError, KeyError, TypeError, ValueError):
+                _raise("host.operation_store_unavailable")
+            if (
+                completion["result"] != serialized
+                or completion.get("result_digest") != _canonical_digest(serialized)
+            ):
+                _raise("host.operation_store_unavailable")
+            return result
+
     def context(self, operation_id: str) -> Mapping[str, object]:
         """Private owner context for the fixed host-probe completion path."""
         operation_id = _token(operation_id, "host.operation_not_found")
@@ -1186,7 +1214,9 @@ class AgentOperationStore:
                 record["lease"],
                 operation_generation=cast(int, record["registry_generation"]),
             ),
-            "completion": self._stored_completion_doc(record["completion"]),
+            "completion": self._stored_completion_doc(
+                record["completion"], kind=kind, action=action
+            ),
         }
         if result["arguments_digest"] != _canonical_digest(result["arguments"]):
             _raise("host.operation_store_unavailable")
@@ -1225,25 +1255,47 @@ class AgentOperationStore:
             "deadline": _wire_time(_parse_time(doc["deadline"])),
         }
 
-    def _stored_completion_doc(self, value: object) -> dict[str, object] | None:
+    def _stored_completion_doc(
+        self, value: object, *, kind: str, action: str
+    ) -> dict[str, object] | None:
         if value is None:
             return None
-        if type(value) is not dict or set(value) != {
-            "reason_codes",
-            "result_digest",
-        }:
+        if type(value) is not dict or set(value) not in (
+            {"reason_codes", "result_digest"},
+            {"reason_codes", "result_digest", "result"},
+        ):
             _raise("host.operation_store_unavailable")
         doc = cast(dict[str, object], value)
         result_digest = doc["result_digest"]
         if result_digest is not None:
             result_digest = _digest(result_digest, "host.operation_store_unavailable")
-        return {
+        result = {
             "reason_codes": [
                 _token(reason, "host.operation_store_unavailable")
                 for reason in self._list(doc["reason_codes"])
             ],
             "result_digest": result_digest,
         }
+        if "result" not in doc:
+            return result
+        if result_digest is None or type(doc["result"]) is not dict:
+            _raise("host.operation_store_unavailable")
+        wire = cast(dict[str, object], doc["result"])
+        if set(wire) != {"kind", "action", "payload"}:
+            _raise("host.operation_store_unavailable")
+        try:
+            stored = AgentResultV1(wire["kind"], wire["action"], wire["payload"])
+            serialized = serialize_agent_result(stored)
+        except (AgentContractError, TypeError, ValueError):
+            _raise("host.operation_store_unavailable")
+        if (
+            stored.kind != kind
+            or stored.action != action
+            or serialized != wire
+            or _canonical_digest(serialized) != result_digest
+        ):
+            _raise("host.operation_store_unavailable")
+        return {**result, "result": serialized}
 
     @staticmethod
     def _list(value: object) -> list[object]:
@@ -1327,6 +1379,7 @@ class AgentOperationStore:
         return {
             "reason_codes": list(receipt.reason_codes),
             "result_digest": receipt.result_digest,
+            "result": serialize_agent_result(receipt.result),
         }
 
     def _view(self, record: Mapping[str, Any]) -> AgentOperationViewV1:

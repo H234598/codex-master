@@ -5,12 +5,14 @@ from pathlib import Path
 import sys
 
 USAGE_SRC = Path(
-    "/home/teladi/.codex-worktrees/codex-usage/google-control-ui-20260828/src"
+    "/run/media/teladi/SSD3/codex-worktrees/worktrees/codex-usage/"
+    "outbound-hostagent-20260830/src"
 )
 sys.path.insert(0, str(USAGE_SRC))
 
 from codex_usage.masterjet_client import _encode_request, _step_up_challenge  # noqa: E402
 from codex_usage.masterjet_contracts import (  # noqa: E402
+    parse_operation_status,
     parse_secret_ingress_receipt,
     parse_secret_ingress_session,
 )
@@ -22,7 +24,7 @@ from test_admin_http import (  # noqa: E402
     _running_server,
     _totp,
 )
-from test_admin_service import service_at  # noqa: E402
+from test_admin_service import principal, service_at  # noqa: E402
 
 
 def test_real_usage_mutation_requests_match_canonical_admin_parser() -> None:
@@ -46,6 +48,23 @@ def test_real_usage_mutation_requests_match_canonical_admin_parser() -> None:
 
     assert parse_admin_request(json.loads(openai)).operation == "openai.auth.apply"
     assert parse_admin_request(json.loads(ingress)).operation == "secret.ingress.create"
+
+
+def test_usage_parses_the_exact_running_operation_status_wire() -> None:
+    """RED: Master omits result fields and Usage has no operation-status parser."""
+
+    service, _owners = service_at()
+    payload = service.query(
+        principal("fleet.read"),
+        "operations.get",
+        {"operation_id": "operation-wire-one"},
+    )
+
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    status = parse_operation_status(json.loads(encoded))
+
+    assert status.result_kind is None
+    assert status.result is None
 
 
 def test_real_usage_parser_accepts_canonical_admin_secret_session(tmp_path) -> None:

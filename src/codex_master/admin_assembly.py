@@ -2384,8 +2384,10 @@ def assemble_admin_runtime() -> AdminRuntime:
             ollama_resource_snapshot=lambda _host_ref: None,
         )
 
+        agent_operations = AgentOperationStore(state_root)
         service = MasterjetControlService(
             operation_store=operation_store,
+            agent_operations=agent_operations,
             openai_accounts=registry,
             openai_credentials=openai_credentials,
             google_manager=google_manager,
@@ -2404,7 +2406,7 @@ def assemble_admin_runtime() -> AdminRuntime:
                 ),
                 remote=RemoteHostProbeAdapter(
                     operation_store=operation_store,
-                    agent_operations=AgentOperationStore(state_root),
+                    agent_operations=agent_operations,
                     host_registry=host_registry,
                 ),
             ),
