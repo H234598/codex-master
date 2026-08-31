@@ -471,6 +471,105 @@ def test_attempt_limit_transitions_expired_operation_to_unknown(
     assert terminal.reason_codes == ("host.attempts_exhausted",)
 
 
+def test_persisted_attempt_exhaustion_is_discovered_by_same_host_owner(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    queued = store.enqueue(
+        replace(operation_request(), target_host_ref="worker-one")
+    )
+
+    for attempt in range(1, 9):
+        leased = store.poll(principal(), poll(epoch=3))
+        assert isinstance(leased, AgentLeaseV1)
+        assert leased.attempt == attempt
+        clock.advance(seconds=31)
+    store.expire_leases()
+    persisted = store.get(queued.operation_id)
+    assert persisted.state == "unknown"
+    assert persisted.reason_codes == ("host.attempts_exhausted",)
+
+    observed: list[object] = []
+
+    def reconcile(context: object) -> bool:
+        observed.append(context)
+        assert store.get(queued.operation_id) == persisted
+        return True
+
+    restarted = store_at(tmp_path, clock)
+    assert isinstance(
+        restarted.poll(
+            principal(),
+            poll(epoch=3),
+            attempt_exhaustion_owner=reconcile,
+        ),
+        AgentNoWorkV1,
+    )
+    assert isinstance(
+        restarted.poll(
+            principal(),
+            poll(epoch=3),
+            attempt_exhaustion_owner=reconcile,
+        ),
+        AgentNoWorkV1,
+    )
+    assert len(observed) == 1
+    assert restarted.get(queued.operation_id) == persisted
+
+
+def test_operation_deadline_never_issues_a_new_lease_and_orders_owner_first(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    queued = store.enqueue(
+        replace(
+            operation_request(deadline=NOW + timedelta(minutes=5)),
+            target_host_ref="worker-one",
+        )
+    )
+    first = store.poll(principal(), poll(epoch=3))
+    assert isinstance(first, AgentLeaseV1)
+    clock.advance(seconds=301)
+    observed: list[object] = []
+
+    def reconcile(context: object) -> bool:
+        observed.append(context)
+        assert store.get(queued.operation_id).state == "leased"
+        return True
+
+    idle = store.poll(
+        principal(),
+        poll(epoch=3),
+        operation_deadline_owner=reconcile,
+    )
+
+    assert isinstance(idle, AgentNoWorkV1)
+    assert len(observed) == 1
+    terminal = store.get(queued.operation_id)
+    assert terminal.attempt == 1
+    assert terminal.state == "unknown"
+    assert terminal.reason_codes == ("host.lease_expired",)
+
+
+def test_ownerless_poll_terminalizes_queued_operation_deadline(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    queued = store.enqueue(
+        operation_request(deadline=NOW + timedelta(minutes=5))
+    )
+    clock.advance(seconds=301)
+
+    assert isinstance(store.poll(principal(), poll(epoch=3)), AgentNoWorkV1)
+    terminal = store.get(queued.operation_id)
+    assert terminal.attempt == 0
+    assert terminal.state == "unknown"
+    assert terminal.reason_codes == ("host.lease_expired",)
+
+
 def test_recursive_private_result_fields_are_rejected(tmp_path: Path) -> None:
     store = store_at(tmp_path)
     lease = lease_one(store)

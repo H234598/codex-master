@@ -16,6 +16,7 @@ from .admin_contracts import OperationV1
 from .agent_contracts import AgentReceiptV1
 from .agent_operations import (
     AgentAttemptExhaustionV1,
+    AgentOperationDeadlineExpiryV1,
     AgentOperationError,
     AgentOperationRequestV1,
     AgentOperationStore,
@@ -346,10 +347,46 @@ class RemoteHostProbeCompletionOwner:
             or operation.plan_digest != exhaustion.plan_digest
         ):
             raise HostProbeError()
-        operation = self._transition_failure(
+        operation = self._transition_lifecycle_failure(
             operation_id,
             operation.expected_generation,
-            "host.probe_unknown",
+            exhaustion.plan_digest,
+        )
+        if operation.state not in _TERMINAL_ADMIN_STATES:
+            raise AdminOperationError("control.operation_state_conflict")
+        return True
+
+    def reconcile_operation_deadline(
+        self, expiry: AgentOperationDeadlineExpiryV1
+    ) -> bool:
+        """Terminalize the exact expired Admin pair before Agent expiry."""
+
+        if type(expiry) is not AgentOperationDeadlineExpiryV1:
+            raise HostProbeError()
+        if (expiry.kind, expiry.action) != ("host.probe", "collect"):
+            return False
+        target = expiry.target_host_ref
+        arguments = expiry.arguments
+        if (
+            type(target) is not str
+            or expiry.host_ref != target
+            or set(arguments) != {"admin_operation_id", "probe_schema"}
+            or arguments.get("probe_schema") != 1
+        ):
+            raise HostProbeError()
+        operation_id = arguments.get("admin_operation_id")
+        if type(operation_id) is not str:
+            raise HostProbeError()
+        operation = self._operations.get(operation_id)
+        if (
+            operation.kind != "hosts.probe"
+            or operation.plan_digest != expiry.plan_digest
+        ):
+            raise HostProbeError()
+        operation = self._transition_lifecycle_failure(
+            operation_id,
+            operation.expected_generation,
+            expiry.plan_digest,
         )
         if operation.state not in _TERMINAL_ADMIN_STATES:
             raise AdminOperationError("control.operation_state_conflict")
@@ -508,6 +545,27 @@ class RemoteHostProbeCompletionOwner:
                 operation_id, current_generation=generation
             )
         return operation
+
+    def _transition_lifecycle_failure(
+        self,
+        operation_id: str,
+        generation: int,
+        plan_digest: str,
+    ) -> OperationV1:
+        try:
+            return self._transition_failure(
+                operation_id,
+                generation,
+                "host.probe_unknown",
+            )
+        except AdminOperationError as error:
+            if error.code != "control.plan_expired":
+                raise
+            return self._operations.expire_host_probe(
+                operation_id,
+                expected_generation=generation,
+                plan_digest=plan_digest,
+            )
 
     def _complete_failure(
         self,

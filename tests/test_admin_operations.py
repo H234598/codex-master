@@ -674,6 +674,124 @@ def test_expired_restart_reconciled_host_probe_cannot_be_resumed(tmp_path) -> No
         recovered.resume_host_probe(probe.operation_id, expected_generation=4)
 
     assert recovered.get(probe.operation_id).state == "partial"
+    terminal = recovered.expire_host_probe(
+        probe.operation_id,
+        expected_generation=4,
+        plan_digest=probe.plan_digest,
+    )
+    assert terminal.state == "failed"
+    assert terminal.reason_codes == ("host.probe_unknown",)
+
+
+def test_expired_restart_reconciled_failed_host_probe_terminalizes(
+    tmp_path,
+) -> None:
+    clock = Clock()
+    dead_probe = OwnerProbe(False)
+    store = store_at(tmp_path, clock, owner_probe=dead_probe)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="expired-failed-host-probe",
+        steps=("host.probe.collect",),
+    )
+    store.begin(probe.operation_id, current_generation=4)
+    store.record_step(
+        probe.operation_id,
+        "host.probe.collect",
+        succeeded=False,
+        reason_code="host.probe_unknown",
+    )
+    clock.now += timedelta(minutes=16)
+    recovered = store_at(tmp_path, clock, owner_probe=dead_probe)
+    assert recovered.get(probe.operation_id).state == "partial"
+
+    terminal = recovered.expire_host_probe(
+        probe.operation_id,
+        expected_generation=4,
+        plan_digest=probe.plan_digest,
+    )
+
+    assert terminal.state == "failed"
+    assert terminal.failed_count == 1
+    assert terminal.reason_codes == ("host.probe_unknown",)
+
+
+def test_expired_planned_host_probe_has_one_exact_idempotent_failure_transition(
+    tmp_path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="expired-planned-host-probe",
+        steps=("host.probe.collect",),
+    )
+
+    with pytest.raises(AdminOperationError, match="control.operation_state_conflict"):
+        store.expire_host_probe(
+            probe.operation_id,
+            expected_generation=4,
+            plan_digest=probe.plan_digest,
+        )
+    clock.now += timedelta(minutes=16)
+
+    with pytest.raises(AdminOperationError, match="control.operation_state_conflict"):
+        store.expire_host_probe(
+            probe.operation_id,
+            expected_generation=4,
+            plan_digest="sha256:" + "0" * 64,
+        )
+    terminal = store.expire_host_probe(
+        probe.operation_id,
+        expected_generation=4,
+        plan_digest=probe.plan_digest,
+    )
+
+    assert terminal.state == "failed"
+    assert terminal.failed_count == 1
+    assert terminal.not_attempted_count == 0
+    assert terminal.reason_codes == ("host.probe_unknown",)
+    assert store.expire_host_probe(
+        probe.operation_id,
+        expected_generation=4,
+        plan_digest=probe.plan_digest,
+    ) == terminal
+
+
+@pytest.mark.parametrize(
+    ("kind", "generation", "steps"),
+    (
+        ("google.provision", 4, ("host.probe.collect",)),
+        ("hosts.probe", 5, ("host.probe.collect",)),
+        ("hosts.probe", 4, ("other",)),
+    ),
+)
+def test_expired_host_probe_transition_rejects_non_exact_pair(
+    tmp_path,
+    kind: str,
+    generation: int,
+    steps: tuple[str, ...],
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    operation = store.plan(
+        kind=kind,
+        generation=generation,
+        key=f"reject-expired-{kind}-{generation}-{steps[0]}",
+        steps=steps,
+    )
+    clock.now += timedelta(minutes=16)
+
+    with pytest.raises(AdminOperationError, match="control.operation_state_conflict"):
+        store.expire_host_probe(
+            operation.operation_id,
+            expected_generation=4,
+            plan_digest=operation.plan_digest,
+        )
+
+    assert store.get(operation.operation_id).state == "planned"
 
 
 def test_unknown_owner_status_keeps_running_operation_unchanged(tmp_path) -> None:

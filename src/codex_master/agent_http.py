@@ -22,6 +22,7 @@ from .agent_contracts import (
 )
 from .agent_operations import (
     AgentAttemptExhaustionV1,
+    AgentOperationDeadlineExpiryV1,
     AgentOperationError,
     AgentPrincipalV1 as OperationPrincipalV1,
 )
@@ -42,6 +43,8 @@ class _Store(Protocol):
         poll: object,
         *,
         attempt_exhaustion_owner: Callable[[AgentAttemptExhaustionV1], bool]
+        | None = None,
+        operation_deadline_owner: Callable[[AgentOperationDeadlineExpiryV1], bool]
         | None = None,
     ) -> object: ...
     def complete(self, principal: OperationPrincipalV1, receipt: object) -> object: ...
@@ -120,7 +123,21 @@ class AgentHttpApplication:
                     "reconcile_attempt_exhaustion",
                     None,
                 )
-                if callable(exhaustion_owner):
+                deadline_owner = getattr(
+                    owner,
+                    "reconcile_operation_deadline",
+                    None,
+                )
+                if callable(deadline_owner):
+                    result = self._store.poll(
+                        _operation_principal(principal),
+                        _authoritative_poll(principal, parsed_poll),
+                        attempt_exhaustion_owner=(
+                            exhaustion_owner if callable(exhaustion_owner) else None
+                        ),
+                        operation_deadline_owner=deadline_owner,
+                    )
+                elif callable(exhaustion_owner):
                     result = self._store.poll(
                         _operation_principal(principal),
                         _authoritative_poll(principal, parsed_poll),

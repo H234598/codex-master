@@ -18,7 +18,11 @@ from codex_master.agent_contracts import (
     parse_agent_receipt,
 )
 from codex_master.agent_http import AgentHttpApplication
-from codex_master.agent_operations import AgentOperationError, AgentOperationStore
+from codex_master.agent_operations import (
+    AgentOperationError,
+    AgentOperationRequestV1,
+    AgentOperationStore,
+)
 from codex_master.host_agent import (
     HostAgent,
     HostAgentClient,
@@ -806,4 +810,255 @@ def test_attempt_exhaustion_reconciliation_is_scoped_to_polling_host(
 
     assert admin_operations.get(second_plan.id).state == "failed"
     assert agent_operations.get(second_agent_operation).state == "unknown"
+    assert registry_document.read_bytes() == registry_before
+
+
+def test_persisted_attempt_exhaustion_split_reconciles_after_reconstruction(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    registry = HostRegistry(tmp_path)
+    target = registry.provision_agent_binding(
+        _registration("worker-one", "Worker One"),
+        AgentBindingV1("worker-one", SPKI_ONE, 1, True),
+        expected_generation=0,
+    )
+    principal = registry.resolve_agent_spki(SPKI_ONE)
+    admin_operations = AdminOperationStore(tmp_path, clock=clock)
+    agent_operations = AgentOperationStore(tmp_path, clock=clock)
+    planned = RemoteHostProbeAdapter(
+        operation_store=admin_operations,
+        agent_operations=agent_operations,
+        host_registry=registry,
+        clock=clock,
+    ).probe(
+        "worker-one",
+        expected_generation=target.generation,
+        idempotency_key="persisted-attempt-exhaustion-split",
+    )
+    client = InProcessAgentClient(
+        AgentHttpApplication(agent_operations),
+        registry,
+        client_spki_sha256=SPKI_ONE,
+    )
+    agent_operation_id = _lease_probe_through_attempt_limit(
+        client,
+        principal.registry_generation,
+        principal.lease_epoch,
+        clock,
+    )
+    agent_operations.expire_leases()
+    persisted_agent = agent_operations.get(agent_operation_id)
+    assert persisted_agent.state == "unknown"
+    assert persisted_agent.reason_codes == ("host.attempts_exhausted",)
+    assert admin_operations.get(planned.id).state == "planned"
+    registry_document = tmp_path / "admin-hosts" / "hosts.json"
+    registry_before = registry_document.read_bytes()
+    clock.advance(
+        seconds=int((planned.expires_at - clock.now).total_seconds()) + 1
+    )
+    assert clock.now > planned.expires_at
+
+    admin_operations = AdminOperationStore(tmp_path, clock=clock)
+    agent_operations = AgentOperationStore(tmp_path, clock=clock)
+    registry = HostRegistry(tmp_path)
+    client = InProcessAgentClient(
+        AgentHttpApplication(
+            agent_operations,
+            RemoteHostProbeCompletionOwner(
+                operation_store=admin_operations,
+                agent_operations=agent_operations,
+                host_registry=registry,
+            ),
+        ),
+        registry,
+        client_spki_sha256=SPKI_ONE,
+    )
+    poll = AgentPollV1(
+        principal.registry_generation,
+        principal.lease_epoch,
+        CAPABILITIES_DIGEST,
+        0,
+    )
+
+    assert isinstance(client.poll(poll), AgentNoWorkV1)
+    terminal_admin = admin_operations.get(planned.id)
+    assert terminal_admin.state == "failed"
+    assert terminal_admin.reason_codes == ("host.probe_unknown",)
+    assert agent_operations.get(agent_operation_id) == persisted_agent
+    assert isinstance(client.poll(poll), AgentNoWorkV1)
+    assert admin_operations.get(planned.id) == terminal_admin
+    assert agent_operations.get(agent_operation_id) == persisted_agent
+    assert registry_document.read_bytes() == registry_before
+
+
+def test_agent_deadline_terminalizes_live_paired_admin_through_production_poll(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    registry = HostRegistry(tmp_path)
+    target = registry.provision_agent_binding(
+        _registration("worker-one", "Worker One"),
+        AgentBindingV1("worker-one", SPKI_ONE, 1, True),
+        expected_generation=0,
+    )
+    principal = registry.resolve_agent_spki(SPKI_ONE)
+    admin_operations = AdminOperationStore(tmp_path, clock=clock)
+    agent_operations = AgentOperationStore(tmp_path, clock=clock)
+    planned = RemoteHostProbeAdapter(
+        operation_store=admin_operations,
+        agent_operations=agent_operations,
+        host_registry=registry,
+        clock=clock,
+    ).probe(
+        "worker-one",
+        expected_generation=target.generation,
+        idempotency_key="live-admin-agent-deadline",
+    )
+    client = InProcessAgentClient(
+        AgentHttpApplication(
+            agent_operations,
+            RemoteHostProbeCompletionOwner(
+                operation_store=admin_operations,
+                agent_operations=agent_operations,
+                host_registry=registry,
+            ),
+        ),
+        registry,
+        client_spki_sha256=SPKI_ONE,
+    )
+    poll = AgentPollV1(
+        principal.registry_generation,
+        principal.lease_epoch,
+        CAPABILITIES_DIGEST,
+        0,
+    )
+    lease = client.poll(poll)
+    assert isinstance(lease, AgentLeaseV1)
+    clock.advance(seconds=301)
+    assert clock.now < planned.expires_at
+
+    assert isinstance(client.poll(poll), AgentNoWorkV1)
+    terminal_admin = admin_operations.get(planned.id)
+    terminal_agent = agent_operations.get(lease.operation_id)
+    assert terminal_admin.state == "failed"
+    assert terminal_admin.reason_codes == ("host.probe_unknown",)
+    assert terminal_agent.state == "unknown"
+    assert terminal_agent.reason_codes == ("host.lease_expired",)
+    assert isinstance(client.poll(poll), AgentNoWorkV1)
+    assert admin_operations.get(planned.id) == terminal_admin
+    assert agent_operations.get(lease.operation_id) == terminal_agent
+
+
+def test_slow_eighth_lease_after_plan_lifetime_expires_through_production_poll(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    registry = HostRegistry(tmp_path)
+    target = registry.provision_agent_binding(
+        _registration("worker-one", "Worker One"),
+        AgentBindingV1("worker-one", SPKI_ONE, 1, True),
+        expected_generation=0,
+    )
+    principal = registry.resolve_agent_spki(SPKI_ONE)
+    admin_operations = AdminOperationStore(tmp_path, clock=clock)
+    agent_operations = AgentOperationStore(tmp_path, clock=clock)
+    planned = admin_operations.plan(
+        kind="hosts.probe",
+        generation=target.generation,
+        key="slow-eighth-lease-admin",
+        steps=("host.probe.collect",),
+    )
+    queued = agent_operations.enqueue(
+        AgentOperationRequestV1(
+            key="slow-eighth-lease-agent",
+            kind="host.probe",
+            action="collect",
+            registry_generation=registry.document_generation(),
+            plan_digest=planned.plan_digest,
+            arguments={
+                "admin_operation_id": planned.operation_id,
+                "probe_schema": 1,
+            },
+            deadline=clock.now + timedelta(minutes=15),
+            target_host_ref="worker-one",
+        )
+    )
+    client = InProcessAgentClient(
+        AgentHttpApplication(
+            agent_operations,
+            RemoteHostProbeCompletionOwner(
+                operation_store=admin_operations,
+                agent_operations=agent_operations,
+                host_registry=registry,
+            ),
+        ),
+        registry,
+        client_spki_sha256=SPKI_ONE,
+    )
+    poll = AgentPollV1(
+        principal.registry_generation,
+        principal.lease_epoch,
+        CAPABILITIES_DIGEST,
+        0,
+    )
+    for attempt in range(1, 9):
+        lease = client.poll(poll)
+        assert isinstance(lease, AgentLeaseV1)
+        assert lease.attempt == attempt
+        clock.advance(seconds=121)
+    assert clock.now > planned.expires_at
+
+    admin_operations = AdminOperationStore(tmp_path, clock=clock)
+    agent_operations = AgentOperationStore(tmp_path, clock=clock)
+    registry = HostRegistry(tmp_path)
+    registry_document = tmp_path / "admin-hosts" / "hosts.json"
+    registry_before = registry_document.read_bytes()
+    terminal_order: list[str] = []
+    agent_terminal_recorded = False
+    original_write = agent_operations._write_locked
+
+    def ordered_agent_write(document: object) -> None:
+        nonlocal agent_terminal_recorded
+        terminal_write = isinstance(document, dict) and any(
+            isinstance(record, dict)
+            and record.get("operation_id") == queued.operation_id
+            and record.get("completion")
+            == {
+                "reason_codes": ["host.lease_expired"],
+                "result_digest": None,
+            }
+            for record in document.get("operations", ())
+        )
+        if terminal_write and not agent_terminal_recorded:
+            agent_terminal_recorded = True
+            terminal_order.append(admin_operations.get(planned.operation_id).state)
+        original_write(cast(dict[str, object], document))
+
+    agent_operations._write_locked = ordered_agent_write  # type: ignore[method-assign]
+    client = InProcessAgentClient(
+        AgentHttpApplication(
+            agent_operations,
+            RemoteHostProbeCompletionOwner(
+                operation_store=admin_operations,
+                agent_operations=agent_operations,
+                host_registry=registry,
+            ),
+        ),
+        registry,
+        client_spki_sha256=SPKI_ONE,
+    )
+
+    assert isinstance(client.poll(poll), AgentNoWorkV1)
+    terminal_admin = admin_operations.get(planned.operation_id)
+    terminal_agent = agent_operations.get(queued.operation_id)
+    assert terminal_admin.state == "failed"
+    assert terminal_admin.reason_codes == ("host.probe_unknown",)
+    assert terminal_agent.state == "unknown"
+    assert terminal_agent.reason_codes == ("host.lease_expired",)
+    assert terminal_agent.attempt == 8
+    assert terminal_order == ["failed"]
+    assert isinstance(client.poll(poll), AgentNoWorkV1)
+    assert admin_operations.get(planned.operation_id) == terminal_admin
+    assert agent_operations.get(queued.operation_id) == terminal_agent
     assert registry_document.read_bytes() == registry_before

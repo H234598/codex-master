@@ -791,3 +791,129 @@ ordinary later polls are the tested recovery mechanism. The production graph
 still replaces only TLS/socket I/O in process; the separate identity, HTTP,
 daemon, client, and restart suites passed. Independent review, not this report,
 decides Task-6 closure.
+
+## Lifecycle deadline follow-up: I2-L1 and I2-L2
+
+This continuation took over the intact TDD worktree after the original
+implementer reached an explicit account usage limit. The user-authorized
+fallback profile marker was confirmed before repository work. The worktree and
+Git toplevel were the required SSD3 path and HEAD was exactly
+`54fcc5e4087d0db58e311eba0ea3335c6834f681`. The starting SHA-256 of the
+pre-existing `progress.md` modification was
+`1e17c131349fadfb937f52806c2c74ac4c47442c88f474d8c8b46df9363021bc`;
+it remained byte-identical and was never staged.
+
+### RED and takeover evidence
+
+Before production edits, the original session ran the exact seven selected
+test nodes added for this follow-up. The three-case parametrized Admin node
+made nine invocations, all of which failed as expected: migrated terminal
+Agent operations were undiscoverable, stored operation deadlines did not stop
+new leases, the Admin Store lacked an expired-plan transition, and both real
+production graphs failed to converge.
+
+At takeover, the inherited partial GREEN passed eight of those nine
+invocations. The slow eighth-lease graph still left Admin `planned`, proving
+that detection existed but the production HTTP/owner path was not wired.
+Caller self-review added and observed further focused REDs before their fixes:
+
+- a real adapter's five-minute Agent deadline returned a retryable poll error
+  while its Admin plan was still live;
+- a migrated terminal split was offered to the owner again on every poll,
+  consuming the same bounded reconciliation slot repeatedly;
+- the migrated split still looped on `control.plan_expired` when reconstruction
+  and first polling happened after the Admin lifetime;
+- a dead-owner failure transition reconstructed after expiry could not be
+  terminalized from its exact `partial/control.restart_reconciled` state.
+
+### Closure design
+
+`AgentOperationStore` now treats the persisted operation deadline separately
+from eight-attempt exhaustion. It never leases a queued record at or after that
+deadline. Ownerless polling retains generic Store behavior and terminalizes the
+record as `unknown/host.lease_expired`. Production polling instead builds a
+frozen, fully fenced deadline context, releases the Agent state lock, invokes
+the exact host-probe owner, and only then commits the same Agent terminal state.
+Queued and leased deadline candidates share the existing maximum of eight
+owner callbacks per authenticated same-host poll.
+
+For I2-L1, same-host polling also discovers the valid base-compatible
+`unknown/host.attempts_exhausted` record while preserving its persisted view.
+Successful migrated reconciliations are remembered only within the current
+Store instance so later polls can advance beyond the first bounded batch.
+Reconstruction deliberately forgets that optimization and safely revalidates
+the idempotent Admin terminal state; no durable schema change or Registry
+mutation is introduced.
+
+`AgentHttpApplication` supplies both typed lifecycle callbacks from the one
+production `RemoteHostProbeCompletionOwner`. That owner validates exact
+`host.probe/collect`, lease host equals target, fixed arguments, paired Admin
+kind, generation owner and plan digest. A live Admin plan uses the existing
+restart-safe failure transition. If normal `begin()` correctly reports
+`control.plan_expired`, the new narrow `AdminOperationStore.expire_host_probe()`
+transition accepts only the exact expired pair: `hosts.probe`, the expected
+generation and plan digest, the one fixed step, no owner or resulting
+generation, and either the original `planned/control.plan_ready` shape or the
+two safe failure-reconstruction shapes (`not_attempted`, or already failed as
+`host.probe_unknown`). It is terminal-idempotent and does not weaken `begin()`
+or `resume_host_probe()` expiry rules.
+
+The observable terminal reasons remain distinct: Admin becomes
+`failed/host.probe_unknown`; operation-deadline expiry becomes Agent
+`unknown/host.lease_expired`; ordinary eight-attempt exhaustion remains Agent
+`unknown/host.attempts_exhausted`. No receipt or evidence is fabricated. Every
+production graph asserts Registry bytes are unchanged, and the slow graph
+observes Admin `failed` at the first Agent terminal write.
+
+### Final validation
+
+Every pytest command used
+`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src pytest -q -p no:cacheprovider`.
+
+```text
+# Complete changed and directly adjacent files
+tests/test_agent_operations.py tests/test_agent_http.py
+tests/test_admin_operations.py tests/test_host_probe.py
+tests/test_host_probe_production_graph.py
+147 passed in 51.77s
+
+# Task-1--5 contract, identity, daemon, HostAgent state/client/executor deps
+185 passed in 33.75s
+
+# Host route/scope/HTTPS step-up/Unix selection
+6 passed, 243 deselected in 1.79s
+
+# Exact CLI --json, MCP caller key, catalog, six GTK/Ollama preservation nodes
+9 passed in 3.53s
+```
+
+These non-overlapping final matrices contain 347 passing invocations plus 243
+explicit deselections. The focused lifecycle matrix also passed all inherited
+nodes and the additional live-plan branch; its invocations overlap the complete
+affected files and are not added to that total.
+
+Ruff passed all seven changed Python files. `compileall` passed the four changed
+production modules with its bytecode cache isolated in tmpfs and removed.
+`git diff --check` was clean. The count-only suspected-secret scan over all
+owned production/test/report changes reported zero matches and printed no
+matched values. No external reviewer or subagent was invoked; manual
+self-review traced every `poll()` caller, both lifecycle callbacks, all Admin
+transition callers, terminal ordering, lock boundaries, exact-host selection,
+and reconstruction paths.
+
+### Residual risks
+
+- Reconciliation remains authenticated-poll driven. A host that never polls
+  cannot reconcile its work, and another host is intentionally forbidden from
+  doing so.
+- The in-process production graphs replace TLS/socket byte transport. Separate
+  identity, HTTP, client and daemon suites passed, but this is not a live
+  two-daemon mTLS E2E.
+- Admin-before-Agent terminalization spans two durable stores. A crash can
+  expose the intended intermediate state; exact planned, running,
+  restart-reconciled and already-terminal retry shapes now converge on a later
+  ordinary poll.
+- The per-Store migrated-reconciliation memory is intentionally not durable.
+  The first poll after each reconstruction may revalidate up to eight already
+  reconciled pairs, while subsequent polls in that process advance to later
+  candidates without changing schema-v1 Agent bytes.

@@ -389,6 +389,79 @@ class AdminOperationStore:
             self._write_locked(records)
             return self._operation(record)
 
+    def expire_host_probe(
+        self,
+        operation_id: str,
+        *,
+        expected_generation: int,
+        plan_digest: str,
+    ) -> OperationV1:
+        """Fail only an exact expired or failure-reconciled host probe."""
+
+        operation_id = self._token(operation_id)
+        expected_generation = self._generation(expected_generation)
+        if type(plan_digest) is not str or _DIGEST.fullmatch(plan_digest) is None:
+            raise AdminOperationError("control.operation_invalid")
+        with self._locked_records() as records:
+            record = self._find(records, operation_id)
+            exact_pair = (
+                record["kind"] == "hosts.probe"
+                and record["expected_generation"] == expected_generation
+                and record["plan_digest"] == plan_digest
+                and tuple(step["name"] for step in record["steps"])
+                == ("host.probe.collect",)
+            )
+            not_attempted_step = [
+                {
+                    "name": "host.probe.collect",
+                    "state": "not_attempted",
+                    "reason_code": None,
+                }
+            ]
+            failed_step = [
+                {
+                    "name": "host.probe.collect",
+                    "state": "failed",
+                    "reason_code": "host.probe_unknown",
+                }
+            ]
+            terminal = (
+                record["state"] == "failed"
+                and record["owner"] is None
+                and record["resulting_generation"] is None
+                and record["reason_codes"] == ["host.probe_unknown"]
+                and record["steps"] == failed_step
+            )
+            if exact_pair and terminal:
+                return self._operation(record)
+            planned = (
+                record["state"] == "planned"
+                and record["owner"] is None
+                and record["resulting_generation"] is None
+                and record["reason_codes"] == ["control.plan_ready"]
+                and record["steps"] == not_attempted_step
+            )
+            restart_reconciled_failure = (
+                record["state"] == "partial"
+                and record["owner"] is None
+                and record["resulting_generation"] is None
+                and record["reason_codes"] == ["control.restart_reconciled"]
+                and record["steps"] in (not_attempted_step, failed_step)
+            )
+            if (
+                not exact_pair
+                or not (planned or restart_reconciled_failure)
+                or self._parse_time(record["expires_at"]) > self._now()
+            ):
+                raise AdminOperationError("control.operation_state_conflict")
+            record["state"] = "failed"
+            record["steps"][0]["state"] = "failed"
+            record["steps"][0]["reason_code"] = "host.probe_unknown"
+            record["reason_codes"] = ["host.probe_unknown"]
+            self._validate_state(record, "control.operation_invalid")
+            self._write_locked(records)
+            return self._operation(record)
+
     def _reconcile_running(self) -> None:
         with self._locked_records() as records:
             changed = False
