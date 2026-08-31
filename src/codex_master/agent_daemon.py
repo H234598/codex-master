@@ -19,6 +19,7 @@ import time
 from types import FrameType
 from typing import Iterator, Mapping, Sequence
 
+from .admin_hosts import AgentPrincipalV1 as RegistryAgentPrincipalV1
 from .admin_hosts import HostRegistry, HostRegistryError
 from .agent_http import (
     AgentHttpApplication,
@@ -28,6 +29,7 @@ from .agent_http import (
 )
 from .agent_identity import AgentIdentityResolver
 from .agent_operations import AgentOperationError, AgentOperationStore
+from .agent_operations import AgentPrincipalV1 as OperationAgentPrincipalV1
 from .admin_operations import AdminOperationStore
 from .admin_operations import AdminOperationError
 from .host_probe import RemoteHostProbeCompletionOwner
@@ -69,7 +71,9 @@ class _AgentCompletionRouter:
         if getattr(getattr(receipt, "result", None), "kind", None) == "host.probe":
             return self._host_probe.complete(principal, receipt)
         if getattr(getattr(receipt, "result", None), "kind", None) == "ollama.instance":
-            return self._ollama.accept_agent_result(principal, receipt)
+            return self._ollama.accept_agent_result(
+                _ollama_operation_principal(principal), receipt
+            )
         return self._store.complete(principal, receipt)
 
     def reconcile_attempt_exhaustion(self, value: object) -> bool:
@@ -80,6 +84,18 @@ class _AgentCompletionRouter:
 
     def acknowledge_agent_lifecycle(self, value: object) -> None:
         self._host_probe.acknowledge_agent_lifecycle(value)
+
+
+def _ollama_operation_principal(principal: object) -> OperationAgentPrincipalV1:
+    """Cross the Ollama owner boundary after Agent HTTP checked lease epoch."""
+
+    if type(principal) is not RegistryAgentPrincipalV1:
+        raise AgentOperationError("host.request_invalid")
+    registry_principal = principal
+    return OperationAgentPrincipalV1(
+        registry_principal.host_ref,
+        registry_principal.registry_generation,
+    )
 
 
 def _ollama_completion_fleet(

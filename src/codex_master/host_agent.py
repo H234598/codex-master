@@ -347,7 +347,7 @@ class HostAgentClient:
             except (TypeError, ValueError):
                 _fail("resource.host_response_invalid")
         try:
-            expected = {
+            required = {
                 "schema_version",
                 "operation_id",
                 "lease_id",
@@ -362,7 +362,12 @@ class HostAgentClient:
                 "deadline",
                 "arguments",
             }
-            if set(value) != expected or value["schema_version"] != 1:
+            optional = {"plan_precondition_digest", "resource_generation"}
+            if (
+                not required.issubset(value)
+                or set(value) - required - optional
+                or value["schema_version"] != 1
+            ):
                 _fail("resource.host_response_invalid")
             deadline = datetime.strptime(
                 cast(str, value["deadline"]), "%Y-%m-%dT%H:%M:%SZ"
@@ -540,20 +545,33 @@ class HostAgentExecutor:
             _fail("host.action_unsupported")
 
     def dispatch(
-        self, kind: str, action: str, arguments: object
+        self,
+        kind: str,
+        action: str,
+        arguments: object,
+        *,
+        plan_precondition_digest: str | None = None,
+        resource_generation: int | None = None,
     ) -> Mapping[str, object]:
         """Invoke only a statically enumerated action."""
+        if kind == "host.probe" and action == "collect":
+            return self._host_probe.collect(arguments)
+        if kind != "ollama.instance":
+            _fail("host.action_unsupported")
         executors = {
-            ("host.probe", "collect"): self._host_probe.collect,
-            ("ollama.instance", "plan"): self._ollama.plan,
-            ("ollama.instance", "apply"): self._ollama.apply,
-            ("ollama.instance", "probe"): self._ollama.probe,
-            ("ollama.instance", "stop"): self._ollama.stop,
+            "plan": self._ollama.plan,
+            "apply": self._ollama.apply,
+            "probe": self._ollama.probe,
+            "stop": self._ollama.stop,
         }
-        executor = executors.get((kind, action))
+        executor = executors.get(action)
         if executor is None:
             _fail("host.action_unsupported")
-        return executor(arguments)
+        return executor(
+            arguments,
+            plan_precondition_digest=plan_precondition_digest,
+            resource_generation=resource_generation,
+        )
 
     def execute(self, lease: AgentLeaseV1) -> AgentReceiptV1:
         """Recover/replay safely and execute one fully fenced lease."""
@@ -579,7 +597,15 @@ class HostAgentExecutor:
                 _fail("host.effect_claim_lost")
             return concurrent
         try:
-            payload = dict(self.dispatch(lease.kind, lease.action, lease.arguments))
+            payload = dict(
+                self.dispatch(
+                    lease.kind,
+                    lease.action,
+                    lease.arguments,
+                    plan_precondition_digest=lease.plan_precondition_digest,
+                    resource_generation=lease.resource_generation,
+                )
+            )
         except AgentOllamaNoEffectError:
             result = AgentResultV1(
                 lease.kind, lease.action, {"status": "failed"}

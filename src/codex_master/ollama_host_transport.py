@@ -194,6 +194,7 @@ class OllamaRemotePlanRequestV1:
     allowed_cpus: str
     cpu_quota_percent: int
     cpu_weight: int
+    resource_generation: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +206,7 @@ class OllamaRemoteApplyRequestV1:
     lease_epoch: int
     plan_digest: str
     plan_ref: str
+    plan_precondition_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +217,7 @@ class OllamaRemoteProbeRequestV1:
     resource_generation: int | None
     lease_epoch: int
     plan_digest: str
+    plan_precondition_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +228,7 @@ class OllamaRemoteStopRequestV1:
     resource_generation: int | None
     lease_epoch: int
     plan_digest: str
+    plan_precondition_digest: str | None = None
 
 
 class RemoteOllamaOperationPort(Protocol):
@@ -314,9 +318,8 @@ class AgentQueueRemoteOllamaOperationPort:
                 "host_ref": request.host_ref,
                 "lease_epoch": request.lease_epoch,
                 "plan_digest": request.plan_digest,
-                "resource_generation": request.resource_generation
-                if not isinstance(request, OllamaRemotePlanRequestV1)
-                else None,
+                "resource_generation": _request_resource_generation(request),
+                "plan_precondition_digest": _request_plan_precondition_digest(request),
             },
             ensure_ascii=True,
             sort_keys=True,
@@ -337,6 +340,11 @@ class AgentQueueRemoteOllamaOperationPort:
                     deadline=now.astimezone(UTC).replace(microsecond=0)
                     + timedelta(minutes=5),
                     target_host_ref=request.host_ref,
+                    required_registry_generation=generation,
+                    required_lease_epoch=request.lease_epoch,
+                    resource_generation=_request_resource_generation(request),
+                    plan_precondition_digest="sha256:"
+                    + _request_plan_precondition_digest(request),
                 )
             )
         except OllamaHostError:
@@ -443,7 +451,11 @@ class OllamaHostTransport:
         self._stopped: set[str] = set()
 
     def plan(
-        self, instance: OllamaInstanceV1, *, generation: int
+        self,
+        instance: OllamaInstanceV1,
+        *,
+        generation: int,
+        resource_generation: int | None = None,
     ) -> OllamaHostPlan | OperationV1:
         current = self._load_registry()
         if (
@@ -473,10 +485,18 @@ class OllamaHostTransport:
             except Exception:
                 _fail("resource.host_unreachable")
         else:
-            remote = self._remote.plan(_remote_plan_request(instance, current, lease, document))
-            if type(remote) is OperationV1:
-                return remote
-            _validate_remote_status(remote, expected_status="planned", document=document)
+            remote = self._remote.plan(
+                _remote_plan_request(
+                    instance,
+                    current,
+                    lease,
+                    document,
+                    resource_generation=resource_generation,
+                )
+            )
+            if type(remote) is not OperationV1:
+                _fail("resource.host_response_invalid")
+            return remote
         provenance = secrets.token_bytes(32)
         planned = OllamaHostPlan(
             1,
@@ -527,14 +547,9 @@ class OllamaHostTransport:
                         plan.idempotency_key,
                     )
                 )
-                if type(remote) is OperationV1:
-                    return remote
-                _validate_remote_status(
-                    remote,
-                    expected_status="running",
-                    document=_bound_document(plan, instance),
-                )
-                runtime_value = None
+                if type(remote) is not OperationV1:
+                    _fail("resource.host_response_invalid")
+                return remote
             provenance = secrets.token_bytes(32)
             execution = OllamaHostExecution(
                 plan, runtime_value, provenance, _EXECUTION_SEAL
@@ -570,7 +585,6 @@ class OllamaHostTransport:
                 raise OllamaHostError(error.code) from None
             except Exception:
                 _fail("resource.host_unreachable")
-        document = _bound_document(execution.plan, instance)
         remote = self._remote.probe(
             OllamaRemoteProbeRequestV1(
                 execution.plan.host_ref,
@@ -581,13 +595,9 @@ class OllamaHostTransport:
                 execution.plan.plan_digest,
             )
         )
-        if type(remote) is OperationV1:
-            return remote
-        return _readiness(
-            _validate_remote_status(
-                remote, expected_status=("ready", "not_ready"), document=document
-            )
-        )
+        if type(remote) is not OperationV1:
+            _fail("resource.host_response_invalid")
+        return remote
 
     def stop(
         self, execution: OllamaHostExecution, *, current_fence: int
@@ -628,13 +638,9 @@ class OllamaHostTransport:
                         execution.plan.plan_digest,
                     )
                 )
-                if type(remote) is OperationV1:
-                    return remote
-                _validate_remote_status(
-                    remote,
-                    expected_status="stopped",
-                    document=_bound_document(execution.plan, instance),
-                )
+                if type(remote) is not OperationV1:
+                    _fail("resource.host_response_invalid")
+                return remote
             self._stopped.add(key)
 
     def apply_remote(
@@ -645,6 +651,7 @@ class OllamaHostTransport:
         resource_generation: int | None,
         plan_digest: str,
         plan_ref: str,
+        plan_precondition_digest: str | None = None,
     ) -> OperationV1:
         lease = self._lease(instance.host_ref)
         result = self._remote.apply(
@@ -656,6 +663,7 @@ class OllamaHostTransport:
                 lease.fence,
                 plan_digest,
                 plan_ref,
+                plan_precondition_digest,
             )
         )
         if type(result) is not OperationV1:
@@ -669,6 +677,7 @@ class OllamaHostTransport:
         generation: int,
         resource_generation: int | None,
         plan_digest: str,
+        plan_precondition_digest: str | None = None,
     ) -> OperationV1:
         lease = self._lease(instance.host_ref)
         result = self._remote.probe(
@@ -679,6 +688,7 @@ class OllamaHostTransport:
                 resource_generation,
                 lease.fence,
                 plan_digest,
+                plan_precondition_digest,
             )
         )
         if type(result) is not OperationV1:
@@ -692,6 +702,7 @@ class OllamaHostTransport:
         generation: int,
         resource_generation: int | None,
         plan_digest: str,
+        plan_precondition_digest: str | None = None,
     ) -> OperationV1:
         lease = self._lease(instance.host_ref)
         result = self._remote.stop(
@@ -702,6 +713,7 @@ class OllamaHostTransport:
                 resource_generation,
                 lease.fence,
                 plan_digest,
+                plan_precondition_digest,
             )
         )
         if type(result) is not OperationV1:
@@ -785,6 +797,8 @@ def _remote_plan_request(
     registry: OllamaRegistryV1,
     lease: OllamaHostLease,
     document: Mapping[str, object],
+    *,
+    resource_generation: int | None,
 ) -> OllamaRemotePlanRequestV1:
     plan_digest = document.get("plan_digest")
     idempotency_key = document.get("idempotency_key")
@@ -803,6 +817,7 @@ def _remote_plan_request(
         instance.allowed_cpus,
         instance.cpu_quota_percent,
         instance.cpu_weight,
+        resource_generation,
     )
 
 
@@ -845,12 +860,58 @@ def _validate_remote_request(
             or type(request.allowed_cpus) is not str
             or type(request.cpu_quota_percent) is not int
             or type(request.cpu_weight) is not int
+            or (
+                request.resource_generation is not None
+                and (
+                    type(request.resource_generation) is not int
+                    or request.resource_generation < 0
+                )
+            )
         ):
             _fail("provider.operation_not_allowed")
     elif type(request) is OllamaRemoteApplyRequestV1 and not _safe_token(
         request.plan_ref
     ):
         _fail("provider.operation_not_allowed")
+    if (
+        not isinstance(request, OllamaRemotePlanRequestV1)
+        and request.resource_generation is not None
+        and (
+            type(request.resource_generation) is not int
+            or request.resource_generation < 0
+        )
+    ):
+        _fail("provider.operation_not_allowed")
+    if (
+        not isinstance(request, OllamaRemotePlanRequestV1)
+        and request.plan_precondition_digest is not None
+        and not _hex_token(request.plan_precondition_digest, 64)
+    ):
+        _fail("provider.operation_not_allowed")
+
+
+def _request_resource_generation(
+    request: (
+        OllamaRemotePlanRequestV1
+        | OllamaRemoteApplyRequestV1
+        | OllamaRemoteProbeRequestV1
+        | OllamaRemoteStopRequestV1
+    ),
+) -> int | None:
+    return request.resource_generation
+
+
+def _request_plan_precondition_digest(
+    request: (
+        OllamaRemotePlanRequestV1
+        | OllamaRemoteApplyRequestV1
+        | OllamaRemoteProbeRequestV1
+        | OllamaRemoteStopRequestV1
+    ),
+) -> str:
+    if isinstance(request, OllamaRemotePlanRequestV1):
+        return request.plan_digest
+    return request.plan_precondition_digest or request.plan_digest
 
 
 def _operation_from_agent_view(value: object) -> OperationV1:
@@ -894,41 +955,6 @@ def _operation_from_agent_view(value: object) -> OperationV1:
     )
 
 
-def _validate_remote_status(
-    value: object,
-    *,
-    expected_status: str | tuple[str, ...],
-    document: Mapping[str, object],
-) -> dict[str, object]:
-    statuses = (expected_status,) if type(expected_status) is str else expected_status
-    if not isinstance(value, Mapping):
-        _fail("resource.host_response_invalid")
-    result = dict(value)
-    required = {"schema_version", "status", "plan_digest"}
-    if (
-        not required.issubset(result)
-        or result.get("schema_version") != 1
-        or result.get("status") not in statuses
-        or result.get("plan_digest") != document.get("plan_digest")
-    ):
-        _fail("resource.host_response_invalid")
-    if result["status"] in {"ready", "not_ready"}:
-        expected = {
-            *required,
-            "ready",
-            "reason_codes",
-            "process_running",
-            "cgroup_member",
-            "loopback_endpoint_reachable",
-            "available_model_ids",
-        }
-        if set(result) != expected:
-            _fail("resource.host_response_invalid")
-    elif set(result) != required:
-        _fail("resource.host_response_invalid")
-    return result
-
-
 def _registry_with_instance(
     registry: OllamaRegistryV1, instance: OllamaInstanceV1
 ) -> OllamaRegistryV1:
@@ -968,65 +994,6 @@ def _plan_document(
         "fence": lease.fence,
         "idempotency_key": idempotency_key,
     }
-
-
-def _bound_document(
-    plan: OllamaHostPlan, instance: OllamaInstanceV1
-) -> dict[str, object]:
-    document = _plan_document(
-        instance,
-        plan.model_generation,
-        OllamaHostLease(
-            plan.host_ref,
-            plan.lease_id,
-            plan.runtime_generation,
-            plan.fence,
-            plan.expires_at_monotonic,
-        ),
-        plan.idempotency_key,
-    )
-    document["plan_digest"] = plan.plan_digest
-    return document
-
-
-def _readiness(document: dict[str, object]) -> OllamaReadinessStatus:
-    ready = document.get("ready")
-    reasons = document.get("reason_codes")
-    models = document.get("available_model_ids")
-    process_running = document.get("process_running")
-    cgroup_member = document.get("cgroup_member")
-    endpoint = document.get("loopback_endpoint_reachable")
-    if (
-        type(ready) is not bool
-        or type(reasons) is not list
-        or len(reasons) > 16
-        or any(not _safe_token(reason) for reason in reasons)
-        or type(models) is not list
-        or len(models) > 1024
-        or any(not _safe_model_id(model) for model in models)
-        or type(process_running) is not bool
-        or type(cgroup_member) is not bool
-        or type(endpoint) is not bool
-        or ready != (document.get("status") == "ready")
-        or (
-            ready
-            and (
-                reasons
-                or not models
-                or not all((process_running, cgroup_member, endpoint))
-            )
-        )
-        or (not ready and not reasons)
-    ):
-        _fail("resource.host_response_invalid")
-    return OllamaReadinessStatus(
-        ready,
-        tuple(reasons),
-        process_running,
-        cgroup_member,
-        endpoint,
-        tuple(models),
-    )
 
 
 def _hex_token(value: object, length: int) -> bool:

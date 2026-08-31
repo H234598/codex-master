@@ -63,8 +63,9 @@ from .selection import (
 )
 from .ollama_host_transport import CONTROL_HOST_REF
 from .admin_contracts import OperationV1
-from .agent_contracts import AgentReceiptV1
+from .agent_contracts import AgentReceiptV1, serialize_agent_result
 from .agent_operations import AgentOperationError, AgentOperationStore
+from .agent_operations import AgentPrincipalV1 as OperationAgentPrincipalV1
 from .hive.state import HiveStateError, HiveStateStore
 from .ollama_registry import (
     OllamaInstanceV1,
@@ -583,15 +584,23 @@ class FleetService:
         if state is None:
             raise FleetConflictError("ollama.transport_invalid")
         try:
+            with state.locked():
+                return self._remote_document_locked(state)
+        except HiveStateError:
+            raise FleetConflictError("resource.host_response_invalid") from None
+
+    @staticmethod
+    def _remote_document_locked(state: HiveStateStore) -> dict[str, object]:
+        try:
             document = dict(
-                state.read_json(
+                state.read_json_locked(
                     _REMOTE_OLLAMA_DOCUMENT, max_bytes=_REMOTE_OLLAMA_STATE_BYTES
                 )
             )
         except HiveStateError as error:
             if str(error) == "state_not_found":
                 return {"schema_version": 1, "operations": {}, "ready": {}}
-            raise FleetConflictError("resource.host_response_invalid") from None
+            raise
         if (
             set(document) != {"schema_version", "operations", "ready"}
             or document["schema_version"] != 1
@@ -601,14 +610,31 @@ class FleetService:
             raise FleetConflictError("resource.host_response_invalid")
         return document
 
-    def _replace_remote_document(self, document: Mapping[str, object]) -> None:
+    def _mutate_remote_document(
+        self, mutate: Callable[[dict[str, object]], None]
+    ) -> None:
         state = self._ollama_remote_state
         if state is None:
             raise FleetConflictError("ollama.transport_invalid")
         try:
-            state.replace_json(_REMOTE_OLLAMA_DOCUMENT, document)
+            with state.locked():
+                document = self._remote_document_locked(state)
+                mutate(document)
+                self._remote_document_locked_validate(document)
+                state.replace_json_locked(_REMOTE_OLLAMA_DOCUMENT, document)
         except HiveStateError:
             raise FleetConflictError("resource.host_response_invalid") from None
+
+    @staticmethod
+    def _remote_document_locked_validate(document: object) -> None:
+        if (
+            not isinstance(document, Mapping)
+            or set(document) != {"schema_version", "operations", "ready"}
+            or document["schema_version"] != 1
+            or not isinstance(document["operations"], dict)
+            or not isinstance(document["ready"], dict)
+        ):
+            raise FleetConflictError("resource.host_response_invalid")
 
     def _remote_plan_from_record(
         self, operation_id: str, record: object
@@ -626,7 +652,17 @@ class FleetService:
         if (
             not isinstance(record, Mapping)
             or not required.issubset(record)
-            or set(record) - required - {"completed", "instance_ref"}
+            or set(record) - required - {"completed", "instance_ref", "completion"}
+        ):
+            raise FleetConflictError("resource.host_response_invalid")
+        completion = record.get("completion")
+        if completion is not None and (
+            not isinstance(completion, Mapping)
+            or set(completion) != {"state", "receipt_digest", "phase"}
+            or completion.get("state") not in {"succeeded", "failed", "unknown"}
+            or not isinstance(completion.get("receipt_digest"), str)
+            or completion.get("phase")
+            not in {"prepared", "owner_applied", "queue_completed"}
         ):
             raise FleetConflictError("resource.host_response_invalid")
         if (
@@ -651,6 +687,88 @@ class FleetService:
             record["resource_generation"],
             instance,
         )
+
+    @staticmethod
+    def _completion_saga_digest(receipt: AgentReceiptV1) -> str:
+        return "sha256:" + hashlib.sha256(
+            json.dumps(
+                {
+                    "operation_id": receipt.operation_id,
+                    "lease_id": receipt.lease_id,
+                    "lease_epoch": receipt.lease_epoch,
+                    "attempt": receipt.attempt,
+                    "plan_digest": receipt.plan_digest,
+                    "arguments_digest": receipt.arguments_digest,
+                    "state": receipt.state,
+                    "reason_codes": receipt.reason_codes,
+                    "result_digest": receipt.result_digest,
+                    "result": serialize_agent_result(receipt.result),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _prepare_remote_completion(self, receipt: AgentReceiptV1) -> None:
+        digest = self._completion_saga_digest(receipt)
+
+        def prepare(document: dict[str, object]) -> None:
+            record = cast(dict[str, object], document["operations"]).get(
+                receipt.operation_id
+            )
+            if not isinstance(record, dict):
+                raise FleetConflictError("resource.host_response_invalid")
+            completion = record.get("completion")
+            expected = {"state": receipt.state, "receipt_digest": digest}
+            if completion is None:
+                record["completion"] = {**expected, "phase": "prepared"}
+                return
+            if (
+                not isinstance(completion, Mapping)
+                or completion.get("state") != receipt.state
+                or completion.get("receipt_digest") != digest
+                or completion.get("phase")
+                not in {"prepared", "owner_applied", "queue_completed"}
+            ):
+                raise FleetConflictError("resource.host_response_invalid")
+
+        self._mutate_remote_document(prepare)
+
+    def _mark_remote_owner_applied(
+        self,
+        receipt: AgentReceiptV1,
+        *,
+        instance_ref: str | None,
+        readiness: OllamaReadinessStatus | None,
+    ) -> None:
+        digest = self._completion_saga_digest(receipt)
+
+        def owner_applied(document: dict[str, object]) -> None:
+            record = cast(dict[str, object], document["operations"]).get(
+                receipt.operation_id
+            )
+            if not isinstance(record, dict):
+                raise FleetConflictError("resource.host_response_invalid")
+            completion = record.get("completion")
+            if (
+                not isinstance(completion, dict)
+                or completion.get("state") != receipt.state
+                or completion.get("receipt_digest") != digest
+                or completion.get("phase") not in {"prepared", "owner_applied", "queue_completed"}
+            ):
+                raise FleetConflictError("resource.host_response_invalid")
+            if completion["phase"] == "queue_completed":
+                return
+            completion["phase"] = "owner_applied"
+            if instance_ref is not None:
+                record["instance_ref"] = instance_ref
+                ready = cast(dict[str, object], document["ready"])
+                if readiness is None:
+                    ready.pop(instance_ref, None)
+                else:
+                    ready[instance_ref] = _readiness_document(readiness)
+
+        self._mutate_remote_document(owner_applied)
 
     def _remote_plan(self, plan_id: str) -> _RemoteOllamaPlanV1 | None:
         if self._ollama_remote_state is None:
@@ -736,8 +854,6 @@ class FleetService:
             or queued.plan_digest != "sha256:" + agent_plan_digest
         ):
             raise FleetConflictError("ollama.transport_invalid")
-        document = self._remote_document()
-        operations = dict(cast(dict[str, object], document["operations"]))
         payload = {
             "action": action,
             "plan_id": plan.operation_id,
@@ -748,37 +864,64 @@ class FleetService:
             "instance": _remote_instance_document(plan.instance),
             "arguments_digest": queued.arguments_digest,
         }
-        prior = operations.get(operation.id)
-        if prior is not None and prior != payload:
-            raise FleetConflictError("resource.host_response_invalid")
-        operations[operation.id] = payload
-        self._replace_remote_document(
-            {"schema_version": 1, "operations": operations, "ready": document["ready"]}
-        )
+        def record(document: dict[str, object]) -> None:
+            operations = cast(dict[str, object], document["operations"])
+            prior = operations.get(operation.id)
+            if prior is not None:
+                if (
+                    not isinstance(prior, Mapping)
+                    or any(prior.get(key) != value for key, value in payload.items())
+                    or set(prior) - set(payload) - {
+                        "completed",
+                        "instance_ref",
+                        "completion",
+                    }
+                ):
+                    raise FleetConflictError("resource.host_response_invalid")
+                return
+            operations[operation.id] = payload
+
+        self._mutate_remote_document(record)
 
     def _mark_remote_completed(
-        self, operation_id: str, *, instance_ref: str | None = None,
+        self,
+        receipt: AgentReceiptV1,
+        *,
+        instance_ref: str | None = None,
         readiness: OllamaReadinessStatus | None = None,
     ) -> None:
-        document = self._remote_document()
-        operations = dict(cast(dict[str, object], document["operations"]))
-        record = operations.get(operation_id)
-        if not isinstance(record, dict):
-            raise FleetConflictError("resource.host_response_invalid")
-        updated = dict(record)
-        updated["completed"] = True
-        if instance_ref is not None:
-            updated["instance_ref"] = instance_ref
-        operations[operation_id] = updated
-        ready = dict(cast(dict[str, object], document["ready"]))
-        if instance_ref is not None:
-            if readiness is None:
-                ready.pop(instance_ref, None)
-            else:
-                ready[instance_ref] = _readiness_document(readiness)
-        self._replace_remote_document(
-            {"schema_version": 1, "operations": operations, "ready": ready}
-        )
+        digest = self._completion_saga_digest(receipt)
+
+        def complete(document: dict[str, object]) -> None:
+            operations = cast(dict[str, object], document["operations"])
+            record = operations.get(receipt.operation_id)
+            if not isinstance(record, dict):
+                raise FleetConflictError("resource.host_response_invalid")
+            completion = record.get("completion")
+            if (
+                not isinstance(completion, dict)
+                or completion.get("state") != receipt.state
+                or completion.get("receipt_digest") != digest
+                or completion.get("phase")
+                not in {"prepared", "owner_applied", "queue_completed"}
+            ):
+                raise FleetConflictError("resource.host_response_invalid")
+            updated = dict(record)
+            updated["completed"] = True
+            updated_completion = dict(completion)
+            updated_completion["phase"] = "queue_completed"
+            updated["completion"] = updated_completion
+            if instance_ref is not None:
+                updated["instance_ref"] = instance_ref
+            operations[receipt.operation_id] = updated
+            ready = cast(dict[str, object], document["ready"])
+            if instance_ref is not None:
+                if readiness is None:
+                    ready.pop(instance_ref, None)
+                else:
+                    ready[instance_ref] = _readiness_document(readiness)
+
+        self._mutate_remote_document(complete)
 
     def ollama_models(self) -> tuple[OllamaModelV1, ...]:
         registry, _transport = self._require_ollama()
@@ -802,6 +945,38 @@ class FleetService:
             return "sha256:" + remote.plan_digest
         local = self._ollama_plans.get(plan_id)
         return None if local is None else "sha256:" + local.plan_digest
+
+    def _assert_remote_resource_fence(self, plan: _RemoteOllamaPlanV1) -> None:
+        """Require the exact attestation that admitted this remote plan.
+
+        The value is carried in the agent envelope as well; this check stops a
+        later master-side enqueue before an outdated headroom observation can
+        reach the host.
+        """
+
+        if plan.resource_generation is None:
+            return
+        snapshot = (
+            self._ollama_resource_snapshot(plan.instance.host_ref)
+            if self._ollama_resource_snapshot is not None
+            else None
+        )
+        if not isinstance(snapshot, OllamaResourceSnapshotV1):
+            raise FleetConflictError("ollama.resource_headroom_required")
+        now = self._io.utc_now()
+        observed = datetime.fromisoformat(snapshot.observed_at_utc.replace("Z", "+00:00"))
+        valid_until = datetime.fromisoformat(
+            snapshot.valid_until_utc.replace("Z", "+00:00")
+        )
+        if (
+            snapshot.host_ref != plan.instance.host_ref
+            or snapshot.generation != plan.resource_generation
+            or not snapshot.green
+            or snapshot.headroom_seconds < 3600
+            or not observed <= now < valid_until
+            or (valid_until - now).total_seconds() < 3600
+        ):
+            raise FleetConflictError("ollama.resource_headroom_required")
 
     def probe_ollama_instance(
         self,
@@ -830,12 +1005,14 @@ class FleetService:
             if remote_plan is not None:
                 if instance is None:
                     raise FleetConflictError("ollama.runtime_not_owned")
+                self._assert_remote_resource_fence(remote_plan)
                 try:
                     queued = transport.probe_remote(
                         remote_plan.instance,
                         generation=expected_generation,
                         resource_generation=remote_plan.resource_generation,
                         plan_digest=remote_plan.plan_digest,
+                        plan_precondition_digest=remote_plan.agent_plan_digest,
                     )
                 except AttributeError:
                     raise FleetConflictError("ollama.transport_invalid") from None
@@ -942,7 +1119,11 @@ class FleetService:
                 raise FleetConflictError("ollama.resource_headroom_required")
             resource_generation = snapshot.generation
         try:
-            host_plan = transport.plan(instance, generation=current.generation)
+            host_plan = transport.plan(
+                instance,
+                generation=current.generation,
+                resource_generation=resource_generation,
+            )
         except AttributeError:
             raise FleetConflictError("ollama.transport_invalid") from None
         plan_id = secrets.token_hex(16)
@@ -1016,6 +1197,7 @@ class FleetService:
                     or registry.load().generation != expected_generation
                 ):
                     raise FleetConflictError("control.plan_stale")
+                self._assert_remote_resource_fence(remote_plan)
                 if self._agent_operations is None:
                     raise FleetConflictError("ollama.transport_invalid")
                 try:
@@ -1041,6 +1223,7 @@ class FleetService:
                         resource_generation=remote_plan.resource_generation,
                         plan_digest=remote_plan.plan_digest,
                         plan_ref=result.payload["plan_ref"],
+                        plan_precondition_digest=remote_plan.agent_plan_digest,
                     )
                 except AttributeError:
                     raise FleetConflictError("ollama.transport_invalid") from None
@@ -1176,6 +1359,7 @@ class FleetService:
                 return transport.stop(execution, current_fence=fence)
             if registry.load().generation != expected_generation:
                 raise FleetConflictError("control.plan_stale")
+            self._assert_remote_resource_fence(remote_plan)
             if self._remote_stopped(instance_ref):
                 return None
             try:
@@ -1184,6 +1368,7 @@ class FleetService:
                     generation=expected_generation,
                     resource_generation=remote_plan.resource_generation,
                     plan_digest=remote_plan.plan_digest,
+                    plan_precondition_digest=remote_plan.agent_plan_digest,
                 )
             except AttributeError:
                 raise FleetConflictError("ollama.transport_invalid") from None
@@ -1198,14 +1383,20 @@ class FleetService:
             )
             return queued
 
-    def accept_agent_result(self, principal: object, receipt: AgentReceiptV1) -> object:
+    def accept_agent_result(
+        self, principal: OperationAgentPrincipalV1, receipt: AgentReceiptV1
+    ) -> object:
         """Complete one Ollama receipt after its typed owner fences are checked.
 
         Unknown effects deliberately complete only the durable agent operation:
         no registry row, readiness cache, or Hive lane is fabricated or retried.
         """
 
-        if type(receipt) is not AgentReceiptV1 or self._agent_operations is None:
+        if (
+            type(principal) is not OperationAgentPrincipalV1
+            or type(receipt) is not AgentReceiptV1
+            or self._agent_operations is None
+        ):
             raise FleetConflictError("ollama.transport_invalid")
         with self._ollama_lock:
             managed = self._remote_operation(receipt.operation_id)
@@ -1232,27 +1423,46 @@ class FleetService:
                 or receipt.result.action != action
             ):
                 raise FleetConflictError("resource.host_response_invalid")
+            # The receipt is the durable saga's idempotency key.  Persist it
+            # before a registry/lane side effect, then let redelivery resume
+            # the exact phase after a process interruption.
+            self._prepare_remote_completion(receipt)
+            instance_ref: str | None = None
+            readiness: OllamaReadinessStatus | None = None
             if receipt.state != "succeeded":
-                completed = self._agent_operations.complete(principal, receipt)
-                if receipt.state == "unknown":
-                    return completed
-                return completed
-            if action == "plan":
-                self._mark_remote_completed(receipt.operation_id)
+                self._mark_remote_owner_applied(
+                    receipt, instance_ref=None, readiness=None
+                )
+            elif action == "plan":
+                self._mark_remote_owner_applied(
+                    receipt, instance_ref=None, readiness=None
+                )
             elif action == "apply":
-                self._accept_remote_apply(plan, receipt)
+                instance_ref = self._accept_remote_apply(plan, receipt)
+                self._mark_remote_owner_applied(
+                    receipt, instance_ref=instance_ref, readiness=None
+                )
             elif action == "probe":
-                self._accept_remote_probe(plan, receipt)
+                instance_ref, readiness = self._accept_remote_probe(plan, receipt)
+                self._mark_remote_owner_applied(
+                    receipt, instance_ref=instance_ref, readiness=readiness
+                )
             elif action == "stop":
-                self._accept_remote_stop(plan, receipt)
+                instance_ref = self._accept_remote_stop(plan, receipt)
+                self._mark_remote_owner_applied(
+                    receipt, instance_ref=instance_ref, readiness=None
+                )
             else:
                 raise FleetConflictError("resource.host_response_invalid")
             completed = self._agent_operations.complete(principal, receipt)
+            self._mark_remote_completed(
+                receipt, instance_ref=instance_ref, readiness=readiness
+            )
             return completed
 
     def _accept_remote_apply(
         self, plan: _RemoteOllamaPlanV1, receipt: AgentReceiptV1
-    ) -> None:
+    ) -> str:
         payload = receipt.result.payload
         if (
             set(payload) != {"instance_ref", "generation"}
@@ -1263,11 +1473,19 @@ class FleetService:
             raise FleetConflictError("resource.host_response_invalid")
         registry, _transport = self._require_ollama()
         current = registry.load()
-        if current.generation != plan.registry_generation:
-            raise FleetConflictError("control.plan_stale")
         running = dataclass_replace(
             plan.instance, lifecycle_state="running", readiness_state="unknown"
         )
+        existing = next(
+            (item for item in current.instances if item.ref == running.ref), None
+        )
+        if current.generation == plan.registry_generation:
+            pass
+        elif current.generation == plan.registry_generation + 1 and existing == running:
+            self._ollama_remote_applied[running.ref] = plan
+            return running.ref
+        else:
+            raise FleetConflictError("control.plan_stale")
         instances = tuple(
             running if item.ref == running.ref else item for item in current.instances
         )
@@ -1279,11 +1497,11 @@ class FleetService:
             expected_generation=current.generation,
         )
         self._ollama_remote_applied[running.ref] = plan
-        self._mark_remote_completed(receipt.operation_id, instance_ref=running.ref)
+        return running.ref
 
     def _accept_remote_probe(
         self, plan: _RemoteOllamaPlanV1, receipt: AgentReceiptV1
-    ) -> None:
+    ) -> tuple[str, OllamaReadinessStatus | None]:
         payload = receipt.result.payload
         try:
             readiness = OllamaReadinessStatus(
@@ -1320,24 +1538,24 @@ class FleetService:
             lifecycle_state="running" if readiness.process_running else "failed",
             readiness_state="ready" if ready else "not_ready",
         )
-        registry.replace(
-            models=current.models,
-            instances=tuple(updated if item.ref == updated.ref else item for item in current.instances),
-            expected_generation=current.generation,
-        )
+        if updated != instance:
+            registry.replace(
+                models=current.models,
+                instances=tuple(
+                    updated if item.ref == updated.ref else item
+                    for item in current.instances
+                ),
+                expected_generation=current.generation,
+            )
         if ready:
             self._ollama_ready[updated.ref] = readiness
         else:
             self._ollama_ready.pop(updated.ref, None)
-        self._mark_remote_completed(
-            receipt.operation_id,
-            instance_ref=updated.ref,
-            readiness=readiness if ready else None,
-        )
+        return updated.ref, readiness if ready else None
 
     def _accept_remote_stop(
         self, plan: _RemoteOllamaPlanV1, receipt: AgentReceiptV1
-    ) -> None:
+    ) -> str:
         if receipt.result.payload != {"stopped": True}:
             raise FleetConflictError("resource.host_response_invalid")
         registry, _transport = self._require_ollama()
@@ -1348,14 +1566,18 @@ class FleetService:
         stopped = dataclass_replace(
             instance, lifecycle_state="stopped", readiness_state="unknown"
         )
-        registry.replace(
-            models=current.models,
-            instances=tuple(stopped if item.ref == stopped.ref else item for item in current.instances),
-            expected_generation=current.generation,
-        )
+        if stopped != instance:
+            registry.replace(
+                models=current.models,
+                instances=tuple(
+                    stopped if item.ref == stopped.ref else item
+                    for item in current.instances
+                ),
+                expected_generation=current.generation,
+            )
         self._ollama_ready.pop(stopped.ref, None)
         self._ollama_remote_applied.pop(stopped.ref, None)
-        self._mark_remote_completed(receipt.operation_id, instance_ref=stopped.ref)
+        return stopped.ref
 
     def _ensure_layout(self) -> None:
         self._io.ensure_dir(self._paths.root)

@@ -73,6 +73,258 @@ def _fd_is_closed(fd: int) -> bool:
     return False
 
 
+def test_ollama_receipts_cross_real_agent_http_router_and_store_for_every_action(
+    tmp_path: Path,
+) -> None:
+    """The Ollama owner receives the HTTP registry principal only at its typed edge."""
+
+
+    from codex_master.admin_contracts import OperationV1
+    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
+    from codex_master.agent_contracts import AgentResultV1
+    from codex_master.agent_http import AgentHttpApplication
+    from codex_master.agent_operations import AgentOperationStore
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.ollama_host_transport import (
+        AgentQueueRemoteOllamaOperationPort,
+        HostRegistryOllamaLeaseSource,
+        OllamaHostTransport,
+    )
+    from codex_master.ollama_registry import (
+        OllamaInstanceV1,
+        OllamaModelV1,
+        OllamaRegistryStore,
+    )
+    from codex_master.server import build_fleet_private_io
+
+    hosts = HostRegistry.for_test(tmp_path / "hosts")
+    hosts.provision_agent_binding(
+        {
+            "ref": "worker-west",
+            "label": "Worker West",
+            "role": "execution",
+            "capabilities": ["ollama.execute", "resource.probe"],
+        },
+        AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
+        expected_generation=0,
+    )
+    store = AgentOperationStore.for_test(tmp_path / "operations")
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    registry.replace(
+        models=(OllamaModelV1("model-a", "provider-a", True, True, True, "fresh"),),
+        instances=(),
+        expected_generation=0,
+    )
+    transport = OllamaHostTransport(
+        registry=registry,
+        leases=HostRegistryOllamaLeaseSource(hosts),
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=store, host_registry=hosts
+        ),
+    )
+    paths = FleetPaths.from_state_root(tmp_path / "fleet")
+    fleet = FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        agent_operations=store,
+    )
+    application = AgentHttpApplication(
+        store,
+        agent_daemon._AgentCompletionRouter(
+            store, _NoopHostProbeOwner(), fleet
+        ),
+    )
+    principal = AgentPrincipalV1("worker-west", hosts.document_generation(), 3)
+    instance = OllamaInstanceV1(
+        "remote-west",
+        "Remote West",
+        "worker-west",
+        "/private/ollama",
+        "/private/models",
+        ("model-a",),
+        "2-3",
+        200,
+        50,
+        "planned",
+        "unknown",
+    )
+
+    plan = fleet.plan_ollama_instance(instance, expected_generation=1)
+    assert type(plan) is OperationV1
+    _post_ollama_receipt(
+        application,
+        principal,
+        hosts.document_generation(),
+        plan.id,
+        AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan-one"}),
+    )
+    assert store.get(plan.id).state == "succeeded"
+
+    applied = fleet.apply_ollama_instance(plan.id, expected_generation=1)
+    assert type(applied) is OperationV1
+    _post_ollama_receipt(
+        application,
+        principal,
+        hosts.document_generation(),
+        applied.id,
+        AgentResultV1(
+            "ollama.instance", "apply", {"instance_ref": "remote-west", "generation": 1}
+        ),
+    )
+    assert store.get(applied.id).state == "succeeded"
+
+    probed = fleet.probe_ollama_instance("remote-west", expected_generation=2)
+    assert type(probed) is OperationV1
+    _post_ollama_receipt(
+        application,
+        principal,
+        hosts.document_generation(),
+        probed.id,
+        AgentResultV1(
+            "ollama.instance",
+            "probe",
+            {
+                "ready": True,
+                "reason_codes": [],
+                "process_running": True,
+                "cgroup_member": True,
+                "loopback_endpoint_reachable": True,
+                "available_model_ids": ["provider-a"],
+            },
+        ),
+    )
+    assert store.get(probed.id).state == "succeeded"
+
+    stopped = fleet.stop_ollama_instance("remote-west", expected_generation=3)
+    assert type(stopped) is OperationV1
+    stopped_receipt = _post_ollama_receipt(
+        application,
+        principal,
+        hosts.document_generation(),
+        stopped.id,
+        AgentResultV1("ollama.instance", "stop", {"stopped": True}),
+    )
+    assert store.get(stopped.id).state == "succeeded"
+    assert registry.load().instances[0].lifecycle_state == "stopped"
+
+    foreign = AgentPrincipalV1("worker-east", hosts.document_generation(), 3)
+    cross_host = application.handle(
+        foreign,
+        "POST",
+        f"/agent/v1/operations/{stopped.id}/receipts",
+        _receipt_wire(stopped_receipt),
+    )
+    assert cross_host.status == 409
+    assert store.get(stopped.id).state == "succeeded"
+
+
+class _NoopHostProbeOwner:
+    def complete(self, principal: object, receipt: object) -> object:
+        raise AssertionError((principal, receipt))
+
+    def reconcile_attempt_exhaustion(self, value: object) -> bool:
+        return False
+
+    def reconcile_operation_deadline(self, value: object) -> bool:
+        return False
+
+    def acknowledge_agent_lifecycle(self, value: object) -> None:
+        del value
+
+
+def _post_ollama_receipt(
+    application: object,
+    principal: AgentPrincipalV1,
+    registry_generation: int,
+    operation_id: str,
+    result: object,
+) -> object:
+    import hashlib
+    import json
+
+    from codex_master.agent_contracts import (
+        AgentLeaseV1,
+        AgentReceiptV1,
+        AgentResultV1,
+        serialize_agent_result,
+    )
+
+    assert isinstance(application, agent_daemon.AgentHttpApplication)
+    poll = application.handle(
+        principal,
+        "POST",
+        "/agent/v1/polls",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "registry_generation": registry_generation,
+                "lease_epoch": principal.lease_epoch,
+                "capabilities_digest": "sha256:" + "c" * 64,
+                "max_wait_seconds": 0,
+            }
+        ).encode(),
+    )
+    assert poll.status == 200
+    wire = json.loads(poll.body)
+    assert wire["operation_id"] == operation_id
+    lease = AgentLeaseV1(
+        deadline=datetime.strptime(wire["deadline"], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=UTC
+        ),
+        **{key: value for key, value in wire.items() if key not in {"schema_version", "deadline"}},
+    )
+    assert isinstance(result, AgentResultV1)
+    receipt = AgentReceiptV1(
+        lease.operation_id,
+        lease.lease_id,
+        lease.lease_epoch,
+        lease.attempt,
+        lease.plan_digest,
+        lease.arguments_digest,
+        "succeeded",
+        ("host.operation_succeeded",),
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(serialize_agent_result(result), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        result,
+    )
+    response = application.handle(
+        principal,
+        "POST",
+        f"/agent/v1/operations/{operation_id}/receipts",
+        _receipt_wire(receipt),
+    )
+    assert response.status == 200
+    return receipt
+
+
+def _receipt_wire(receipt: object) -> bytes:
+    import json
+
+    from codex_master.agent_contracts import AgentReceiptV1, serialize_agent_result
+
+    assert type(receipt) is AgentReceiptV1
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "operation_id": receipt.operation_id,
+            "lease_id": receipt.lease_id,
+            "lease_epoch": receipt.lease_epoch,
+            "attempt": receipt.attempt,
+            "plan_digest": receipt.plan_digest,
+            "arguments_digest": receipt.arguments_digest,
+            "state": receipt.state,
+            "reason_codes": list(receipt.reason_codes),
+            "result_digest": receipt.result_digest,
+            "result": serialize_agent_result(receipt.result),
+        }
+    ).encode()
+
+
 def test_tls_context_is_tls13_client_certificate_only_and_loads_fd_paths(monkeypatch) -> None:
     context = FakeContext()
     monkeypatch.setattr(agent_daemon.ssl, "SSLContext", lambda protocol: context)

@@ -197,6 +197,64 @@ def test_apply_revalidates_original_path_evidence_at_actual_consumer(
     assert runtime.started == []
 
 
+def test_agent_executor_rejects_apply_when_durable_plan_precondition_drifts(
+    tmp_path: Path,
+) -> None:
+    store, _executable = registry_at(tmp_path)
+    runtime = ControlledRuntime()
+    executor = AgentOllamaExecutor(
+        agent_ollama.ProductionAgentOllamaAdapter(
+            store, state_root=tmp_path / "state", runtime=runtime
+        )
+    )
+    expected = "sha256:" + "a" * 64
+    plan_ref = executor.plan(
+        {"instance_ref": "instance-one", "generation": 1},
+        plan_precondition_digest=expected,
+    )["plan_ref"]
+
+    with pytest.raises(
+        agent_ollama.AgentOllamaNoEffectError,
+        match="provider.plan_precondition_stale",
+    ):
+        executor.apply(
+            {"plan_ref": plan_ref},
+            plan_precondition_digest="sha256:" + "b" * 64,
+        )
+
+    assert runtime.started == []
+
+
+def test_agent_executor_rejects_apply_when_durable_resource_fence_drifts(
+    tmp_path: Path,
+) -> None:
+    store, _executable = registry_at(tmp_path)
+    runtime = ControlledRuntime()
+    executor = AgentOllamaExecutor(
+        agent_ollama.ProductionAgentOllamaAdapter(
+            store, state_root=tmp_path / "state", runtime=runtime
+        )
+    )
+    digest = "sha256:" + "a" * 64
+    plan_ref = executor.plan(
+        {"instance_ref": "instance-one", "generation": 1},
+        plan_precondition_digest=digest,
+        resource_generation=7,
+    )["plan_ref"]
+
+    with pytest.raises(
+        agent_ollama.AgentOllamaNoEffectError,
+        match="provider.resource_generation_stale",
+    ):
+        executor.apply(
+            {"plan_ref": plan_ref},
+            plan_precondition_digest=digest,
+            resource_generation=8,
+        )
+
+    assert runtime.started == []
+
+
 def test_unknown_or_stale_local_refs_prove_no_effect(tmp_path: Path) -> None:
     store, _executable = registry_at(tmp_path)
     executor = AgentOllamaExecutor(

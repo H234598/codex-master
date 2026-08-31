@@ -32,6 +32,7 @@ _DOCUMENT = PurePosixPath("host-agent.json")
 _MAX_INT = 2**63 - 1
 _MAX_LEASE_SECONDS = 30.0
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 _CLAIM_TOKEN = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 _BOOT_ID = re.compile(r"[0-9a-f-]{36}\Z", re.ASCII)
 
@@ -83,6 +84,8 @@ def _lease_fence(lease: AgentLeaseV1) -> tuple[object, ...]:
         lease.lease_epoch,
         lease.plan_digest,
         lease.arguments_digest,
+        lease.plan_precondition_digest,
+        lease.resource_generation,
     )
 
 
@@ -428,7 +431,7 @@ class HostAgentState:
     ) -> AgentReceiptV1:
         old = parse_agent_receipt(record["receipt"])
         old_fence = tuple(record.get("fence", ()))
-        if len(old_fence) != 10:
+        if len(old_fence) != 12:
             _fail("host.replay_conflict")
         old_semantic = (
             old_fence[0],
@@ -438,6 +441,8 @@ class HostAgentState:
             old_fence[7],
             old_fence[8],
             old_fence[9],
+            old_fence[10],
+            old_fence[11],
         )
         new_semantic = (
             lease.operation_id,
@@ -447,6 +452,8 @@ class HostAgentState:
             lease.lease_epoch,
             lease.plan_digest,
             lease.arguments_digest,
+            lease.plan_precondition_digest,
+            lease.resource_generation,
         )
         if (
             old_semantic != new_semantic
@@ -599,6 +606,23 @@ class HostAgentState:
                 record["deadline_clock"] = self._deadline_clock(lease)
             value["schema_version"] = 3
             migrated = True
+        if type(value) is dict and value.get("schema_version") == 3:
+            # Schema 3 predates the two envelope-only fences.  Both legacy
+            # journals and legacy in-flight receipts represent their absence
+            # explicitly, so replay can neither weaken nor invent a fence.
+            for collection in ("accepted", "receipts"):
+                records = value.get(collection)
+                if not isinstance(records, dict):
+                    _fail("host.state_unavailable")
+                for record in records.values():
+                    if (
+                        type(record) is not dict
+                        or type(record.get("fence")) is not list
+                    ):
+                        _fail("host.state_unavailable")
+                    if len(record["fence"]) == 10:
+                        record["fence"].extend((None, None))
+                        migrated = True
         if (
             type(value) is not dict
             or set(value)
@@ -647,7 +671,7 @@ class HostAgentState:
                 or set(record) != {"fence", "generation", "receipt"}
                 or not _bounded_integer(record["generation"])
                 or type(record["fence"]) is not list
-                or len(record["fence"]) != 10
+                or len(record["fence"]) != 12
             ):
                 _fail("host.state_unavailable")
             try:
@@ -667,6 +691,14 @@ class HostAgentState:
                 or fence[7] != receipt.lease_epoch
                 or fence[8] != receipt.plan_digest
                 or fence[9] != receipt.arguments_digest
+                or (
+                    fence[10] is not None
+                    and (type(fence[10]) is not str or _DIGEST.fullmatch(fence[10]) is None)
+                )
+                or (
+                    fence[11] is not None
+                    and not _bounded_integer(fence[11])
+                )
             ):
                 _fail("host.state_unavailable")
             highest_epoch = max(highest_epoch, receipt.lease_epoch)
@@ -740,8 +772,7 @@ class HostAgentState:
         doc = cast(dict[str, object], value)
         try:
             if (
-                set(doc)
-                != {
+                not {
                     "schema_version",
                     "operation_id",
                     "lease_id",
@@ -755,6 +786,24 @@ class HostAgentState:
                     "arguments_digest",
                     "deadline",
                     "arguments",
+                }.issubset(doc)
+                or set(doc)
+                - {
+                    "schema_version",
+                    "operation_id",
+                    "lease_id",
+                    "host_ref",
+                    "kind",
+                    "action",
+                    "registry_generation",
+                    "lease_epoch",
+                    "attempt",
+                    "plan_digest",
+                    "arguments_digest",
+                    "deadline",
+                    "arguments",
+                    "plan_precondition_digest",
+                    "resource_generation",
                 }
                 or doc["schema_version"] != 1
             ):

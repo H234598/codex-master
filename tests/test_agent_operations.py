@@ -416,11 +416,38 @@ def test_completion_validation_exposes_owner_context_without_mutation(
         "target_host_ref": "worker-one",
         "registry_generation": 7,
         "arguments": request.arguments,
+        "required_registry_generation": None,
+        "required_lease_epoch": None,
+        "resource_generation": None,
+        "plan_precondition_digest": None,
     }
     assert store.get(queued.operation_id).state == "leased"
     completed = store.complete(principal(), receipt)
     assert completed.state == "succeeded"
     assert store.validate_completion(principal(), receipt) == context
+
+
+def test_envelope_lease_epoch_fence_terminalizes_before_a_stale_lease(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    queued = store.enqueue(
+        replace(
+            operation_request(kind="ollama.instance", action="plan"),
+            target_host_ref="worker-one",
+            required_registry_generation=7,
+            required_lease_epoch=3,
+            resource_generation=9,
+            plan_precondition_digest=DIGEST_A,
+        )
+    )
+
+    no_work = store.poll(principal(), poll(epoch=4))
+
+    assert isinstance(no_work, AgentNoWorkV1)
+    terminal = store.get(queued.operation_id)
+    assert terminal.state == "failed"
+    assert terminal.reason_codes == ("host.lease_epoch_stale",)
 
 
 def test_terminal_completion_replay_validates_original_lease_fences(

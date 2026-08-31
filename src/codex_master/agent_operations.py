@@ -219,6 +219,10 @@ class AgentOperationRequestV1:
     arguments: Mapping[str, object]
     deadline: datetime
     target_host_ref: str | None = None
+    required_registry_generation: int | None = None
+    required_lease_epoch: int | None = None
+    resource_generation: int | None = None
+    plan_precondition_digest: str | None = None
 
     def __post_init__(self) -> None:
         kind, action = _check_kind_action(self.kind, self.action)
@@ -236,6 +240,20 @@ class AgentOperationRequestV1:
         object.__setattr__(self, "deadline", _utc(self.deadline))
         if self.target_host_ref is not None:
             object.__setattr__(self, "target_host_ref", _token(self.target_host_ref))
+        for name in (
+            "required_registry_generation",
+            "required_lease_epoch",
+            "resource_generation",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _integer(value))
+        if self.plan_precondition_digest is not None:
+            object.__setattr__(
+                self,
+                "plan_precondition_digest",
+                _digest(self.plan_precondition_digest),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,6 +487,12 @@ class AgentOperationStore:
                     or record["registry_generation"] != request.registry_generation
                     or record["plan_digest"] != request.plan_digest
                     or record["arguments_digest"] != arguments_digest
+                    or record["required_registry_generation"]
+                    != request.required_registry_generation
+                    or record["required_lease_epoch"] != request.required_lease_epoch
+                    or record["resource_generation"] != request.resource_generation
+                    or record["plan_precondition_digest"]
+                    != request.plan_precondition_digest
                 ):
                     _raise("host.idempotency_conflict")
                 return self._view(record)
@@ -488,6 +512,10 @@ class AgentOperationStore:
                 "created_at": _wire_time(now),
                 "deadline": _wire_time(request.deadline),
                 "target_host_ref": request.target_host_ref,
+                "required_registry_generation": request.required_registry_generation,
+                "required_lease_epoch": request.required_lease_epoch,
+                "resource_generation": request.resource_generation,
+                "plan_precondition_digest": request.plan_precondition_digest,
                 "lease": None,
                 "completion": None,
             }
@@ -556,6 +584,21 @@ class AgentOperationStore:
                         continue
                     if record["registry_generation"] > poll.registry_generation:
                         _raise("host.registry_generation_stale")
+                    if (
+                        record["required_registry_generation"] is not None
+                        and record["required_registry_generation"]
+                        != poll.registry_generation
+                    ):
+                        self._set_fence_stale(
+                            record, "host.registry_generation_stale"
+                        )
+                        continue
+                    if (
+                        record["required_lease_epoch"] is not None
+                        and record["required_lease_epoch"] != poll.lease_epoch
+                    ):
+                        self._set_fence_stale(record, "host.lease_epoch_stale")
+                        continue
                     operation_deadline = _parse_time(record["deadline"])
                     if now >= operation_deadline:
                         if operation_deadline_owner is None:
@@ -596,6 +639,8 @@ class AgentOperationStore:
                         arguments_digest=record["arguments_digest"],
                         deadline=deadline,
                         arguments=record["arguments"],
+                        plan_precondition_digest=record["plan_precondition_digest"],
+                        resource_generation=record["resource_generation"],
                     )
                 self._write_locked(document)
                 return AgentNoWorkV1(
@@ -650,6 +695,12 @@ class AgentOperationStore:
                     "target_host_ref": record["target_host_ref"],
                     "registry_generation": record["registry_generation"],
                     "arguments": MappingProxyType(dict(record["arguments"])),
+                    "required_registry_generation": record[
+                        "required_registry_generation"
+                    ],
+                    "required_lease_epoch": record["required_lease_epoch"],
+                    "resource_generation": record["resource_generation"],
+                    "plan_precondition_digest": record["plan_precondition_digest"],
                 }
             )
 
@@ -1121,6 +1172,11 @@ class AgentOperationStore:
             "result_digest": None,
         }
 
+    @staticmethod
+    def _set_fence_stale(record: dict[str, Any], code: str) -> None:
+        record["state"] = "failed"
+        record["completion"] = {"reason_codes": [code], "result_digest": None}
+
     def _begin_poll(self, host_ref: str) -> None:
         with self._active_lock:
             if host_ref in self._active_polls:
@@ -1209,8 +1265,7 @@ class AgentOperationStore:
         return validated
 
     def _record(self, value: object) -> dict[str, Any]:
-        if type(value) is not dict or set(value) not in (
-            {
+        required = {
             "operation_id",
             "key",
             "state",
@@ -1225,24 +1280,18 @@ class AgentOperationStore:
             "deadline",
             "lease",
             "completion",
-            },
-            {
-            "operation_id",
-            "key",
-            "state",
-            "kind",
-            "action",
-            "registry_generation",
-            "attempt",
-            "plan_digest",
-            "arguments_digest",
-            "arguments",
-            "created_at",
-            "deadline",
+        }
+        optional = {
             "target_host_ref",
-            "lease",
-            "completion",
-            },
+            "required_registry_generation",
+            "required_lease_epoch",
+            "resource_generation",
+            "plan_precondition_digest",
+        }
+        if (
+            type(value) is not dict
+            or not required.issubset(value)
+            or set(value) - required - optional
         ):
             _raise("host.operation_store_unavailable")
         record = cast(dict[str, object], value)
@@ -1277,6 +1326,18 @@ class AgentOperationStore:
                 if record.get("target_host_ref") is None
                 else _token(record["target_host_ref"], "host.operation_store_unavailable")
             ),
+            "required_registry_generation": self._optional_integer(
+                record.get("required_registry_generation")
+            ),
+            "required_lease_epoch": self._optional_integer(
+                record.get("required_lease_epoch")
+            ),
+            "resource_generation": self._optional_integer(
+                record.get("resource_generation")
+            ),
+            "plan_precondition_digest": self._optional_digest(
+                record.get("plan_precondition_digest")
+            ),
             "lease": self._lease_doc(
                 record["lease"],
                 operation_generation=cast(int, record["registry_generation"]),
@@ -1288,6 +1349,18 @@ class AgentOperationStore:
         if result["arguments_digest"] != _canonical_digest(result["arguments"]):
             _raise("host.operation_store_unavailable")
         return result
+
+    @staticmethod
+    def _optional_integer(value: object) -> int | None:
+        if value is None:
+            return None
+        return _integer(value, "host.operation_store_unavailable")
+
+    @staticmethod
+    def _optional_digest(value: object) -> str | None:
+        if value is None:
+            return None
+        return _digest(value, "host.operation_store_unavailable")
 
     def _lease_doc(
         self, value: object, *, operation_generation: int

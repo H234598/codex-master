@@ -271,6 +271,8 @@ class AgentLeaseV1:
     arguments_digest: str
     deadline: datetime
     arguments: Mapping[str, object] = field(repr=False)
+    plan_precondition_digest: str | None = None
+    resource_generation: int | None = None
 
     def __post_init__(self) -> None:
         kind, action = _check_kind_action(self.kind, self.action)
@@ -294,6 +296,18 @@ class AgentLeaseV1:
             _invalid()
         object.__setattr__(self, "deadline", _utc(self.deadline))
         object.__setattr__(self, "arguments", arguments)
+        if self.plan_precondition_digest is not None:
+            object.__setattr__(
+                self,
+                "plan_precondition_digest",
+                _digest(self.plan_precondition_digest),
+            )
+        if self.resource_generation is not None:
+            object.__setattr__(
+                self,
+                "resource_generation",
+                _integer(self.resource_generation),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,7 +402,7 @@ def serialize_agent_lease(value: object) -> dict[str, object]:
     if type(value) is not AgentLeaseV1:
         _invalid()
     lease = cast(AgentLeaseV1, value)
-    return {
+    result = {
         "schema_version": 1,
         "operation_id": lease.operation_id,
         "lease_id": lease.lease_id,
@@ -403,6 +417,11 @@ def serialize_agent_lease(value: object) -> dict[str, object]:
         "deadline": _wire_time(lease.deadline),
         "arguments": cast(dict[str, object], _public_json(lease.arguments)),
     }
+    if lease.plan_precondition_digest is not None:
+        result["plan_precondition_digest"] = lease.plan_precondition_digest
+    if lease.resource_generation is not None:
+        result["resource_generation"] = lease.resource_generation
+    return result
 
 
 __all__ = [

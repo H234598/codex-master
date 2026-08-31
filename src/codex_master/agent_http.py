@@ -188,6 +188,7 @@ class AgentHttpApplication:
                 "host.registry_generation_stale",
                 "host.lease_epoch_stale",
                 "host.lease_stale",
+                "host.identity_mismatch",
                 "host.receipt_conflict",
             }:
                 return _problem(409, error.code)
@@ -196,7 +197,15 @@ class AgentHttpApplication:
             return _problem(400, "agent.request_invalid")
         except (AdminOperationError, HostRegistryError):
             return _problem(503, "agent.temporarily_unavailable")
-        except FleetConflictError:
+        except FleetConflictError as error:
+            if error.code in {
+                "host.identity_mismatch",
+                "host.registry_generation_stale",
+                "host.lease_epoch_stale",
+                "host.lease_stale",
+                "host.receipt_conflict",
+            }:
+                return _problem(409, error.code)
             return _problem(400, "agent.request_invalid")
         except (AgentContractError, UnicodeError, ValueError, TypeError, RecursionError):
             return _problem(400, "agent.request_invalid")

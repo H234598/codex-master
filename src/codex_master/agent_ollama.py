@@ -150,6 +150,8 @@ class ProductionAgentOllamaAdapter:
                 "claim": None,
                 "unit_name": None,
                 "port": None,
+                "queue_plan_digest": None,
+                "queue_resource_generation": None,
             }
             self._write_locked(document)
         return {"plan_ref": plan_ref}
@@ -262,6 +264,10 @@ class ProductionAgentOllamaAdapter:
                     "process_start_ticks": running.process_start_ticks,
                     "state": "running",
                     "claim": None,
+                    "queue_plan_digest": saved["queue_plan_digest"],
+                    "queue_resource_generation": saved[
+                        "queue_resource_generation"
+                    ],
                 }
                 self._write_locked(document)
         if conflict:
@@ -280,6 +286,95 @@ class ProductionAgentOllamaAdapter:
             if current == saved:
                 current.update(state="ready", claim=None, unit_name=None, port=None)
                 self._write_locked(document)
+
+    def bind_plan_precondition(
+        self,
+        plan_ref: str,
+        plan_digest: object,
+        resource_generation: object = None,
+    ) -> None:
+        if (
+            type(plan_ref) is not str
+            or _PLAN_REF.fullmatch(plan_ref) is None
+            or type(plan_digest) is not str
+            or _DIGEST.fullmatch(plan_digest) is None
+            or (
+                resource_generation is not None
+                and not self._integer(resource_generation)
+            )
+        ):
+            _fail("host.arguments_invalid")
+        with self._state.locked():
+            document = self._read_locked()
+            saved = document["plans"].get(plan_ref)
+            if saved is None or saved["state"] != "ready":
+                _no_effect("provider.plan_missing")
+            if saved["queue_plan_digest"] not in {None, plan_digest}:
+                _no_effect("provider.plan_precondition_stale")
+            if saved["queue_resource_generation"] not in {
+                None,
+                resource_generation,
+            }:
+                _no_effect("provider.resource_generation_stale")
+            saved["queue_plan_digest"] = plan_digest
+            saved["queue_resource_generation"] = resource_generation
+            self._write_locked(document)
+
+    def validate_plan_precondition(
+        self,
+        plan_ref: str,
+        plan_digest: object,
+        resource_generation: object = None,
+    ) -> None:
+        if (
+            type(plan_ref) is not str
+            or _PLAN_REF.fullmatch(plan_ref) is None
+            or type(plan_digest) is not str
+            or _DIGEST.fullmatch(plan_digest) is None
+            or (
+                resource_generation is not None
+                and not self._integer(resource_generation)
+            )
+        ):
+            _fail("host.arguments_invalid")
+        with self._state.locked():
+            saved = self._read_locked()["plans"].get(plan_ref)
+        if saved is None:
+            _no_effect("provider.plan_missing")
+        if saved["queue_plan_digest"] != plan_digest:
+            _no_effect("provider.plan_precondition_stale")
+        if saved["queue_resource_generation"] != resource_generation:
+            _no_effect("provider.resource_generation_stale")
+
+    def validate_running_precondition(
+        self,
+        instance_ref: str,
+        generation: object,
+        plan_digest: object,
+        resource_generation: object = None,
+    ) -> None:
+        if (
+            type(instance_ref) is not str
+            or _TOKEN.fullmatch(instance_ref) is None
+            or not self._integer(generation)
+            or type(plan_digest) is not str
+            or _DIGEST.fullmatch(plan_digest) is None
+            or (
+                resource_generation is not None
+                and not self._integer(resource_generation)
+            )
+        ):
+            _fail("host.arguments_invalid")
+        with self._state.locked():
+            saved = self._read_locked()["running"].get(instance_ref)
+        if saved is None:
+            _no_effect("provider.instance_missing")
+        if saved["generation"] != generation:
+            _no_effect("provider.generation_stale")
+        if saved["queue_plan_digest"] != plan_digest:
+            _no_effect("provider.plan_precondition_stale")
+        if saved["queue_resource_generation"] != resource_generation:
+            _no_effect("provider.resource_generation_stale")
 
     def probe(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
         running = self._running_instance(
@@ -556,16 +651,49 @@ class ProductionAgentOllamaAdapter:
             or len(value["running"]) > 64
         ):
             _fail("provider.journal_unavailable")
+        for item in value["plans"].values():
+            if type(item) is not dict:
+                _fail("provider.journal_unavailable")
+            item.setdefault("queue_plan_digest", None)
+            item.setdefault("queue_resource_generation", None)
+        for item in value["running"].values():
+            if type(item) is not dict:
+                _fail("provider.journal_unavailable")
+            item.setdefault("queue_plan_digest", None)
+            item.setdefault("queue_resource_generation", None)
         for ref, item in value["plans"].items():
             if (
                 type(ref) is not str or _PLAN_REF.fullmatch(ref) is None
                 or type(item) is not dict
-                or set(item) != {"instance_ref", "generation", "plan_digest", "created_at", "state", "claim", "unit_name", "port"}
+                or set(item)
+                != {
+                    "instance_ref",
+                    "generation",
+                    "plan_digest",
+                    "created_at",
+                    "state",
+                    "claim",
+                    "unit_name",
+                    "port",
+                    "queue_plan_digest",
+                    "queue_resource_generation",
+                }
                 or type(item["instance_ref"]) is not str
                 or _TOKEN.fullmatch(item["instance_ref"]) is None
                 or not self._integer(item["generation"])
                 or type(item["plan_digest"]) is not str
                 or _DIGEST.fullmatch(item["plan_digest"]) is None
+                or (
+                    item["queue_plan_digest"] is not None
+                    and (
+                        type(item["queue_plan_digest"]) is not str
+                        or _DIGEST.fullmatch(item["queue_plan_digest"]) is None
+                    )
+                )
+                or (
+                    item["queue_resource_generation"] is not None
+                    and not self._integer(item["queue_resource_generation"])
+                )
                 or not self._integer(item["created_at"])
                 or item["state"] not in {"ready", "intent"}
                 or not self._valid_claim(
@@ -589,10 +717,34 @@ class ProductionAgentOllamaAdapter:
             if (
                 type(ref) is not str or _TOKEN.fullmatch(ref) is None
                 or type(item) is not dict
-                or set(item) != {"generation", "plan_digest", "unit_name", "port", "ollama_pid", "control_group", "process_start_ticks", "state", "claim"}
+                or set(item)
+                != {
+                    "generation",
+                    "plan_digest",
+                    "unit_name",
+                    "port",
+                    "ollama_pid",
+                    "control_group",
+                    "process_start_ticks",
+                    "state",
+                    "claim",
+                    "queue_plan_digest",
+                    "queue_resource_generation",
+                }
                 or not self._integer(item["generation"])
                 or type(item["plan_digest"]) is not str
                 or _DIGEST.fullmatch(item["plan_digest"]) is None
+                or (
+                    item["queue_plan_digest"] is not None
+                    and (
+                        type(item["queue_plan_digest"]) is not str
+                        or _DIGEST.fullmatch(item["queue_plan_digest"]) is None
+                    )
+                )
+                or (
+                    item["queue_resource_generation"] is not None
+                    and not self._integer(item["queue_resource_generation"])
+                )
                 or type(item["unit_name"]) is not str
                 or _UNIT.fullmatch(item["unit_name"]) is None
                 or not self._integer(item["port"], 1, 65535)
@@ -703,17 +855,86 @@ class AgentOllamaExecutor:
             _fail("host.action_unsupported")
         return _arguments(value, fields)
 
-    def plan(self, value: object) -> dict[str, object]:
-        return dict(self._operations.plan(self.validate("plan", value)))
+    def plan(
+        self,
+        value: object,
+        *,
+        plan_precondition_digest: str | None = None,
+        resource_generation: int | None = None,
+    ) -> dict[str, object]:
+        result = dict(self._operations.plan(self.validate("plan", value)))
+        if plan_precondition_digest is not None or resource_generation is not None:
+            plan_ref = result.get("plan_ref")
+            bind = getattr(self._operations, "bind_plan_precondition", None)
+            if (
+                type(plan_ref) is not str
+                or plan_precondition_digest is None
+                or not callable(bind)
+            ):
+                _fail("provider.plan_precondition_stale")
+            bind(plan_ref, plan_precondition_digest, resource_generation)
+        return result
 
-    def apply(self, value: object) -> dict[str, object]:
-        return dict(self._operations.apply(self.validate("apply", value)))
+    def apply(
+        self,
+        value: object,
+        *,
+        plan_precondition_digest: str | None = None,
+        resource_generation: int | None = None,
+    ) -> dict[str, object]:
+        arguments = self.validate("apply", value)
+        if plan_precondition_digest is not None or resource_generation is not None:
+            validate = getattr(self._operations, "validate_plan_precondition", None)
+            if plan_precondition_digest is None or not callable(validate):
+                _fail("provider.plan_precondition_stale")
+            validate(
+                arguments["plan_ref"], plan_precondition_digest, resource_generation
+            )
+        return dict(self._operations.apply(arguments))
 
-    def probe(self, value: object) -> dict[str, object]:
-        return dict(self._operations.probe(self.validate("probe", value)))
+    def probe(
+        self,
+        value: object,
+        *,
+        plan_precondition_digest: str | None = None,
+        resource_generation: int | None = None,
+    ) -> dict[str, object]:
+        arguments = self.validate("probe", value)
+        self._validate_running_precondition(
+            arguments, plan_precondition_digest, resource_generation
+        )
+        return dict(self._operations.probe(arguments))
 
-    def stop(self, value: object) -> dict[str, object]:
-        return dict(self._operations.stop(self.validate("stop", value)))
+    def stop(
+        self,
+        value: object,
+        *,
+        plan_precondition_digest: str | None = None,
+        resource_generation: int | None = None,
+    ) -> dict[str, object]:
+        arguments = self.validate("stop", value)
+        self._validate_running_precondition(
+            arguments, plan_precondition_digest, resource_generation
+        )
+        return dict(self._operations.stop(arguments))
+
+    def _validate_running_precondition(
+        self,
+        arguments: Mapping[str, object],
+        plan_precondition_digest: str | None,
+        resource_generation: int | None,
+    ) -> None:
+        if plan_precondition_digest is None and resource_generation is None:
+            return
+        validate = getattr(self._operations, "validate_running_precondition", None)
+        if plan_precondition_digest is None or not callable(validate):
+            _fail("provider.plan_precondition_stale")
+        validate(
+            arguments["instance_ref"],
+            arguments["generation"],
+            plan_precondition_digest,
+            resource_generation,
+        )
 
 
 __all__ = [
