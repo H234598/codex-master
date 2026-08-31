@@ -33,6 +33,7 @@ import codex_master.hive.runtime as hive_runtime
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SHADOW_CONFIG = ROOT / "tests" / "fixtures" / "hive" / "hive-shadow-valid.json"
 NOW = datetime(2026, 8, 31, 12, tzinfo=UTC)
 
 
@@ -42,8 +43,10 @@ def _p2_checkout(tmp_path: Path) -> Path:
     checkout = tmp_path / "p2-checkout"
     checkout.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     checkout.mkdir(mode=0o755)
-    for name in ("codex-agent-classes.json", "codex-hive.json"):
-        (checkout / name).write_bytes((ROOT / name).read_bytes())
+    (checkout / "codex-agent-classes.json").write_bytes(
+        (ROOT / "codex-agent-classes.json").read_bytes()
+    )
+    (checkout / "codex-hive.json").write_bytes(SHADOW_CONFIG.read_bytes())
     subprocess.run(["git", "-C", str(checkout), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
         [
