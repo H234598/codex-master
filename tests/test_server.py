@@ -6160,8 +6160,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(target), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.run_command")
-    @patch("codex_master.server.shutil.which", return_value="/usr/bin/codex")
-    def test_check_mcp_registration_rejects_substring_command_match(self, _mock_which, mock_run) -> None:
+    @patch(
+        "codex_master.server._canonical_codex_cli_path",
+        return_value=Path("/usr/local/bin/codex"),
+    )
+    def test_check_mcp_registration_rejects_substring_command_match(self, _mock_cli, mock_run) -> None:
         mock_run.return_value = subprocess.CompletedProcess(
             ["codex", "mcp", "get", "codex-master-mcp"],
             0,
@@ -6189,8 +6192,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("/tmp/bin/codex-master-mcp-old", result["output_excerpt"])
 
     @patch("codex_master.server.run_command")
-    @patch("codex_master.server.shutil.which", return_value="/usr/bin/codex")
-    def test_check_mcp_registration_rejects_short_startup_timeout(self, _mock_which, mock_run) -> None:
+    @patch(
+        "codex_master.server._canonical_codex_cli_path",
+        return_value=Path("/usr/local/bin/codex"),
+    )
+    def test_check_mcp_registration_rejects_short_startup_timeout(self, _mock_cli, mock_run) -> None:
         mock_run.return_value = subprocess.CompletedProcess(
             ["codex", "mcp", "get", "codex-master-mcp"],
             0,
@@ -6212,9 +6218,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["ok"])
 
     @patch("codex_master.server.run_command")
-    @patch("codex_master.server.shutil.which", return_value="/usr/bin/codex")
+    @patch(
+        "codex_master.server._canonical_codex_cli_path",
+        return_value=Path("/usr/local/bin/codex"),
+    )
     def test_check_mcp_registration_distinguishes_absent_from_lookup_failure(
-        self, _mock_which, mock_run
+        self, _mock_cli, mock_run
     ) -> None:
         mock_run.side_effect = [
             subprocess.CompletedProcess(

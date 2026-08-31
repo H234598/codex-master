@@ -21,6 +21,7 @@ import hmac
 import json
 import math
 import os
+import pwd
 import re
 import selectors
 import shutil
@@ -2210,6 +2211,25 @@ def _runtime_layout() -> Any:
 
 def _runtime_mcp_entrypoint() -> Path:
     return _runtime_layout().mcp_entrypoint
+
+
+def _canonical_codex_cli_path() -> Path:
+    """Return the one validated user CLI used for Master MCP registration."""
+
+    try:
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    except (KeyError, OSError) as exc:
+        raise AgentError("canonical_codex_cli_unavailable") from exc
+    if not home.is_absolute():
+        raise AgentError("canonical_codex_cli_unavailable")
+    try:
+        return trusted_runner_executable(home / ".local" / "bin" / "codex")
+    except AgentError as exc:
+        raise AgentError("canonical_codex_cli_unavailable") from exc
+
+
+def _codex_mcp_command(*arguments: str) -> list[str]:
+    return [str(_canonical_codex_cli_path()), "mcp", *arguments]
 
 
 def runtime_mcp_entrypoint() -> Path:
@@ -22876,15 +22896,15 @@ def check_mcp_registration(
 ) -> dict[str, Any]:
     if command_path is None:
         command_path = _runtime_mcp_entrypoint()
-    codex_path = shutil.which("codex")
-    if not codex_path:
+    try:
+        cp = run_command(_codex_mcp_command("get", MCP_SERVER_NAME))
+    except AgentError:
         return {
             "registered": False,
             "lookup_status": "unavailable",
             "ok": False,
-            "reason": "codex command not found",
+            "reason": "canonical Codex CLI unavailable",
         }
-    cp = run_command(["codex", "mcp", "get", MCP_SERVER_NAME])
     raw_output = cp.stdout + cp.stderr
     output, redacted = command_excerpt(raw_output)
     registered = cp.returncode == 0
@@ -23626,7 +23646,7 @@ def _install_enrolled_unlocked(
                         raise AgentError(
                             "MCP server registration command could not be inspected; refusing force replacement"
                         )
-                    remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
+                    remove = run_command(_codex_mcp_command("remove", MCP_SERVER_NAME))
                     if remove.returncode != 0:
                         raise AgentError("codex mcp remove failed")
                     registration_removed = True
@@ -23635,7 +23655,7 @@ def _install_enrolled_unlocked(
                         "MCP server is registered with a different command; rerun install with --force"
                     )
                 add = run_command(
-                    ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(entrypoint)]
+                    _codex_mcp_command("add", MCP_SERVER_NAME, "--", str(entrypoint))
                 )
                 if add.returncode != 0:
                     raise AgentError("codex mcp add failed")
@@ -23679,12 +23699,14 @@ def _install_enrolled_unlocked(
         if registration_added or registration_removed:
             try:
                 if registration_added:
-                    remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
+                    remove = run_command(_codex_mcp_command("remove", MCP_SERVER_NAME))
                     if remove.returncode != 0:
                         raise AgentError("codex mcp remove failed")
                 if previous_command is not None:
                     restore = run_command(
-                        ["codex", "mcp", "add", MCP_SERVER_NAME, "--", previous_command]
+                        _codex_mcp_command(
+                            "add", MCP_SERVER_NAME, "--", previous_command
+                        )
                     )
                     if restore.returncode != 0:
                         raise AgentError("codex mcp add failed")
@@ -23789,7 +23811,7 @@ def _uninstall_unlocked(
                 raise AgentError("MCP server registration could not be inspected")
             if current.get("registered"):
                 if current.get("command_matches"):
-                    remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
+                    remove = run_command(_codex_mcp_command("remove", MCP_SERVER_NAME))
                     if remove.returncode != 0:
                         raise AgentError("codex mcp remove failed")
                     mcp_status = "removed"
@@ -23813,7 +23835,7 @@ def _uninstall_unlocked(
         if registration_removed:
             try:
                 restore = run_command(
-                    ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(entrypoint)]
+                    _codex_mcp_command("add", MCP_SERVER_NAME, "--", str(entrypoint))
                 )
                 if restore.returncode != 0:
                     raise AgentError("codex mcp add failed")

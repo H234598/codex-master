@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -68,6 +69,7 @@ def test_interactive_registration_uses_the_validated_image_entrypoint(
     tmp_path: Path,
 ) -> None:
     layout = runtime_layout(tmp_path)
+    codex_cli = Path("/home/tester/.local/bin/codex")
     startup = {"ok": True, "raw_output": "not_returned"}
     current = {
         "registered": False,
@@ -87,6 +89,7 @@ def test_interactive_registration_uses_the_validated_image_entrypoint(
         patch.object(server, "ensure_applet_action_key"),
         patch.object(server, "mcp_command_startup_self_test", return_value=startup),
         patch.object(server, "check_mcp_registration", return_value=current),
+        patch.object(server, "_canonical_codex_cli_path", return_value=codex_cli),
         patch.object(
             server, "ensure_mcp_startup_timeout_configured", return_value=timeout
         ),
@@ -97,7 +100,7 @@ def test_interactive_registration_uses_the_validated_image_entrypoint(
 
     run.assert_called_once_with(
         [
-            "codex",
+            str(codex_cli),
             "mcp",
             "add",
             server.MCP_SERVER_NAME,
@@ -114,6 +117,7 @@ def test_interactive_unregistration_only_removes_matching_image_registration(
     tmp_path: Path,
 ) -> None:
     layout = runtime_layout(tmp_path)
+    codex_cli = Path("/home/tester/.local/bin/codex")
     current = {
         "registered": True,
         "lookup_status": "registered",
@@ -123,6 +127,7 @@ def test_interactive_unregistration_only_removes_matching_image_registration(
     with (
         patch.object(server, "_runtime_layout", return_value=layout),
         patch.object(server, "check_mcp_registration", return_value=current),
+        patch.object(server, "_canonical_codex_cli_path", return_value=codex_cli),
         patch.object(
             server, "revoke_current_teamleader", return_value={"changed": False}
         ),
@@ -131,9 +136,110 @@ def test_interactive_unregistration_only_removes_matching_image_registration(
         run.return_value = subprocess.CompletedProcess([], 0, "", "")
         result = server.uninstall()
 
-    run.assert_called_once_with(["codex", "mcp", "remove", server.MCP_SERVER_NAME])
+    run.assert_called_once_with(
+        [str(codex_cli), "mcp", "remove", server.MCP_SERVER_NAME]
+    )
     assert result["mcp"] == "removed"
     assert "symlink" not in result
+
+
+def test_registration_inspection_uses_canonical_cli_with_a_sterile_image_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_cli = Path("/home/tester/.local/bin/codex")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    completed = subprocess.CompletedProcess(
+        [str(codex_cli), "mcp", "get", server.MCP_SERVER_NAME],
+        0,
+        "\n".join(
+            [
+                server.MCP_SERVER_NAME,
+                "  command: /runtime/bin/codex-master-mcp",
+                "  startup_timeout_sec: 120",
+            ]
+        ),
+        "",
+    )
+
+    with (
+        patch.object(server, "_canonical_codex_cli_path", return_value=codex_cli),
+        patch.object(server, "run_command", return_value=completed) as run,
+        patch.object(
+            server.shutil,
+            "which",
+            side_effect=AssertionError("registration inspection must not resolve PATH"),
+        ),
+    ):
+        result = server.check_mcp_registration(Path("/runtime/bin/codex-master-mcp"))
+
+    run.assert_called_once_with(
+        [str(codex_cli), "mcp", "get", server.MCP_SERVER_NAME]
+    )
+    assert result["lookup_status"] == "registered"
+    assert result["ok"] is True
+
+
+def test_registration_inspection_fails_closed_without_a_valid_canonical_cli() -> None:
+    with (
+        patch.object(
+            server,
+            "_canonical_codex_cli_path",
+            side_effect=server.AgentError("canonical_codex_cli_unavailable"),
+        ),
+        patch.object(server.shutil, "which", return_value="/tmp/attacker/codex"),
+        patch.object(server, "run_command") as run,
+    ):
+        result = server.check_mcp_registration(Path("/runtime/bin/codex-master-mcp"))
+
+    run.assert_not_called()
+    assert result == {
+        "registered": False,
+        "lookup_status": "unavailable",
+        "ok": False,
+        "reason": "canonical Codex CLI unavailable",
+    }
+
+
+def test_canonical_codex_cli_uses_the_effective_users_fixed_absolute_location() -> None:
+    home = Path("/home/tester")
+    canonical = home / ".local" / "bin" / "codex"
+    resolved = Path("/opt/codex/bin/codex")
+
+    with (
+        patch.object(server.os, "geteuid", return_value=4242),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.dict(server.os.environ, {"HOME": "/tmp/attacker-home"}),
+        patch.object(
+            server, "trusted_runner_executable", return_value=resolved
+        ) as validate,
+        patch.object(
+            server.shutil,
+            "which",
+            side_effect=AssertionError("canonical CLI must not resolve PATH"),
+        ),
+    ):
+        assert server._canonical_codex_cli_path() == resolved
+
+    validate.assert_called_once_with(canonical)
+
+
+def test_canonical_codex_cli_rejects_an_untrusted_fixed_location() -> None:
+    home = Path("/home/tester")
+    with (
+        patch.object(server.os, "geteuid", return_value=4242),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.object(
+            server,
+            "trusted_runner_executable",
+            side_effect=server.AgentError("fleet_executable_invalid"),
+        ),
+    ):
+        with pytest.raises(server.AgentError, match="canonical_codex_cli_unavailable"):
+            server._canonical_codex_cli_path()
 
 
 def test_interactive_cli_exposes_no_path_or_symlink_override() -> None:
