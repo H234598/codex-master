@@ -16,7 +16,6 @@ StateDirectory=codex-master-host-agent
 StateDirectoryMode=0700
 UMask=0077
 ReadWritePaths=/var/lib/codex-master-host-agent
-ReadWritePaths=/var/lib/codex-master/ollama
 LoadCredential=agent-client-key:/etc/codex-master/agent-client.key
 LoadCredential=agent-client-cert:/etc/codex-master/agent-client.crt
 LoadCredential=agent-master-ca:/etc/codex-master/agent-master-ca.crt

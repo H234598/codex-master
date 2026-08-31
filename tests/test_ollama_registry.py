@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 
 import pytest
@@ -55,6 +56,34 @@ def test_instance_references_models_without_copying_model_metadata(tmp_path):
     assert loaded.instances[0].selected_model_refs == ("llama-small", "qwen-small")
 
 
+def test_shared_registry_reuses_group_owned_directory_and_lock_without_chmod(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "shared"
+    root.mkdir(mode=0o770)
+    os.chmod(root, 0o2770)
+    lock = root / ".ollama-registry.json.lock"
+    lock.touch(mode=0o660)
+    lock.chmod(0o660)
+    original_chmod = os.chmod
+    original_fchmod = os.fchmod
+
+    def deny_existing_directory_chmod(path, mode):
+        if os.fspath(path) == os.fspath(root):
+            raise PermissionError
+        original_chmod(path, mode)
+
+    def deny_existing_lock_chmod(descriptor, mode):
+        if os.fstat(descriptor).st_ino == lock.stat().st_ino:
+            raise PermissionError
+        original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr("codex_master.ollama_registry.os.chmod", deny_existing_directory_chmod)
+    monkeypatch.setattr("codex_master.ollama_registry.os.fchmod", deny_existing_lock_chmod)
+
+    assert OllamaRegistryStore.for_test(root, shared_gid=os.getegid()).load().generation == 0
+
+
 def test_instance_requires_at_least_one_model():
     with pytest.raises(OllamaRegistryError, match="ollama.instance_models_invalid"):
         valid_instance(selected_model_refs=())
@@ -84,10 +113,12 @@ def test_model_capabilities_survive_registry_round_trip(tmp_path):
 
 def test_registry_rejects_unknown_major_schema_version(tmp_path):
     store = OllamaRegistryStore.for_test(tmp_path)
-    (tmp_path / "ollama-registry.json").write_text(
+    document = tmp_path / "ollama-registry.json"
+    document.write_text(
         json.dumps({"schema_version": 2, "generation": 0, "models": [], "instances": []}),
         encoding="utf-8",
     )
+    document.chmod(0o600)
 
     with pytest.raises(OllamaRegistryError, match="ollama.registry_version_invalid"):
         store.load()

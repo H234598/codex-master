@@ -33,6 +33,47 @@ def test_state_store_uses_private_modes(tmp_path: Path) -> None:
     assert stat.S_IMODE((tmp_path / "state" / ".hive-state.lock").stat().st_mode) == 0o600
 
 
+def test_state_store_can_use_one_exact_group_shared_non_secret_root(tmp_path: Path) -> None:
+    """The Agent bridge is group-scoped, while the default remains private."""
+
+    root = tmp_path / "agent-state"
+    root.mkdir(mode=0o770)
+    os.chmod(root, 0o2770)
+    store = HiveStateStore(root, shared_gid=os.getegid())
+    store.replace_json(PurePosixPath("bindings.json"), {"schema_version": 1})
+
+    assert stat.S_IMODE(root.stat().st_mode) == 0o2770
+    assert stat.S_IMODE((root / "bindings.json").stat().st_mode) == 0o660
+    assert stat.S_IMODE((root / ".hive-state.lock").stat().st_mode) == 0o660
+
+    (root / "bindings.json").chmod(0o600)
+    with pytest.raises(HiveStateError, match="state_file_untrusted"):
+        store.read_private_bytes(PurePosixPath("bindings.json"), max_bytes=4096)
+
+
+def test_shared_state_reuses_group_owned_lock_without_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "agent-state"
+    root.mkdir(mode=0o770)
+    os.chmod(root, 0o2770)
+    lock = root / ".hive-state.lock"
+    lock.touch(mode=0o660)
+    lock.chmod(0o660)
+
+    original_fchmod = os.fchmod
+
+    def deny_existing_lock_chmod(descriptor: int, mode: int) -> None:
+        if os.fstat(descriptor).st_ino == lock.stat().st_ino:
+            raise PermissionError
+        original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr("codex_master.hive.state.os.fchmod", deny_existing_lock_chmod)
+
+    with HiveStateStore(root, shared_gid=os.getegid()).locked():
+        pass
+
+
 def test_state_store_reuses_exact_0700_root_without_chmod_and_existing_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

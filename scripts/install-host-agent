@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install fixed host-agent credentials and its hardened system unit."""
+"""Install the complete hardened host-agent service set from trusted inputs."""
 
 from __future__ import annotations
 
@@ -10,12 +10,20 @@ import secrets
 import stat
 import subprocess
 import sys
-from typing import Sequence
+import sysconfig
+from typing import NamedTuple, Sequence
 
 
-UNIT_NAME = "codex-master-host-agent.service"
-UNIT_SOURCE = Path(__file__).resolve().parents[1] / "systemd" / UNIT_NAME
 ROOT_UID = 0
+ROOT_GID = 0
+HOST_AGENT_UNIT = "codex-master-host-agent.service"
+UNIT_NAMES = (
+    "codex-master-admin.service",
+    "codex-master-agent-api.service",
+    HOST_AGENT_UNIT,
+)
+SYSUSERS_NAME = "codex-master-host-agent.conf"
+TMPFILES_NAME = "codex-master-host-agent.conf"
 _OPEN_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _OPEN_FILE = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
 
@@ -27,6 +35,37 @@ class InstallerError(Exception):
 class _Parser(argparse.ArgumentParser):
     def error(self, _message: str) -> None:
         raise InstallerError
+
+
+class _Source(NamedTuple):
+    descriptor: int
+    destination: str
+    mode: int
+    directory: str
+
+
+class _Staged(NamedTuple):
+    parent: int
+    name: str
+    stage: str
+
+
+def _packaged_source_directory() -> Path:
+    executable = Path(__file__).resolve()
+    candidates = [Path(sysconfig.get_path("data")) / "lib" / "codex-master"]
+    if len(executable.parents) >= 3:
+        candidates.append(executable.parents[2] / "lib" / "codex-master")
+    candidates.append(executable.parents[1])
+    for candidate in candidates:
+        if (candidate / "systemd").is_dir():
+            return candidate
+    return candidates[0]
+
+
+_SOURCE_DIRECTORY = _packaged_source_directory()
+UNIT_SOURCES = {name: _SOURCE_DIRECTORY / "systemd" / name for name in UNIT_NAMES}
+SYSUSERS_SOURCE = _SOURCE_DIRECTORY / "systemd" / "sysusers.d" / SYSUSERS_NAME
+TMPFILES_SOURCE = _SOURCE_DIRECTORY / "systemd" / "tmpfiles.d" / TMPFILES_NAME
 
 
 def _absolute_path(value: str) -> Path:
@@ -70,6 +109,16 @@ def _assert_trusted_regular(metadata: os.stat_result, mode: int) -> None:
         raise InstallerError
 
 
+def _assert_trusted_directory(metadata: os.stat_result, mode: int) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != ROOT_UID
+        or metadata.st_gid != ROOT_GID
+        or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        raise InstallerError
+
+
 def _open_directory(path: Path) -> int:
     descriptor = os.open("/", _OPEN_DIRECTORY)
     try:
@@ -81,9 +130,7 @@ def _open_directory(path: Path) -> int:
             try:
                 opened = os.fstat(child)
                 after = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
-                if not _same_metadata(before, opened) or not _same_metadata(
-                    before, after
-                ):
+                if not _same_metadata(before, opened) or not _same_metadata(before, after):
                     raise InstallerError
             except BaseException:
                 os.close(child)
@@ -122,23 +169,24 @@ def _open_or_create_directory(parent: int, name: str, mode: int) -> int:
         before = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except FileNotFoundError:
         os.mkdir(name, mode, dir_fd=parent)
-        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        created = True
-    else:
-        created = False
-    if not stat.S_ISDIR(before.st_mode):
-        raise InstallerError
+        descriptor = os.open(name, _OPEN_DIRECTORY, dir_fd=parent)
+        try:
+            os.fchown(descriptor, ROOT_UID, ROOT_GID)
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+            os.fsync(parent)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+    _assert_trusted_directory(before, mode)
     descriptor = os.open(name, _OPEN_DIRECTORY, dir_fd=parent)
     try:
         opened = os.fstat(descriptor)
         after = os.stat(name, dir_fd=parent, follow_symlinks=False)
         if not _same_metadata(before, opened) or not _same_metadata(before, after):
             raise InstallerError
-        if created:
-            os.fchown(descriptor, ROOT_UID, ROOT_UID)
-            os.fchmod(descriptor, mode)
-            os.fsync(descriptor)
-            os.fsync(parent)
+        _assert_trusted_directory(opened, mode)
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -155,7 +203,7 @@ def _copy_atomically(source: int, parent: int, name: str, mode: int) -> None:
             mode,
             dir_fd=parent,
         )
-        os.fchown(destination, ROOT_UID, ROOT_UID)
+        os.fchown(destination, ROOT_UID, ROOT_GID)
         os.fchmod(destination, mode)
         while chunk := os.read(source, 64 * 1024):
             view = memoryview(chunk)
@@ -175,45 +223,176 @@ def _copy_atomically(source: int, parent: int, name: str, mode: int) -> None:
             pass
 
 
-def _destination_directories(root: Path) -> tuple[int, int]:
+def _close_directories(directories: dict[str, int]) -> None:
+    for descriptor in directories.values():
+        os.close(descriptor)
+
+
+def _destination_directories(root: Path) -> dict[str, int]:
     destination_root = _open_directory(root)
-    etc = systemd = credentials = units = -1
+    opened: dict[str, int] = {}
     try:
-        etc = _open_or_create_directory(destination_root, "etc", 0o755)
-        credentials = _open_or_create_directory(etc, "codex-master", 0o700)
-        systemd = _open_or_create_directory(etc, "systemd", 0o755)
-        units = _open_or_create_directory(systemd, "system", 0o755)
-        return credentials, units
+        _assert_trusted_directory(os.fstat(destination_root), 0o755)
+        opened["etc"] = _open_or_create_directory(destination_root, "etc", 0o755)
+        opened["credentials"] = _open_or_create_directory(opened["etc"], "codex-master", 0o700)
+        opened["admin_credentials"] = _open_or_create_directory(
+            opened["etc"], "codex-master-admin", 0o700
+        )
+        opened["systemd"] = _open_or_create_directory(opened["etc"], "systemd", 0o755)
+        opened["units"] = _open_or_create_directory(opened["systemd"], "system", 0o755)
+        opened["usr"] = _open_or_create_directory(destination_root, "usr", 0o755)
+        opened["lib"] = _open_or_create_directory(opened["usr"], "lib", 0o755)
+        opened["sysusers"] = _open_or_create_directory(opened["lib"], "sysusers.d", 0o755)
+        opened["tmpfiles"] = _open_or_create_directory(opened["lib"], "tmpfiles.d", 0o755)
+        return opened
     except BaseException:
-        if units >= 0:
-            os.close(units)
-        if credentials >= 0:
-            os.close(credentials)
+        _close_directories(opened)
         raise
     finally:
-        if systemd >= 0:
-            os.close(systemd)
-        if etc >= 0:
-            os.close(etc)
         os.close(destination_root)
+
+
+def _stage(source: _Source, parent: int) -> _Staged:
+    stage = f".{source.destination}.stage-{secrets.token_hex(16)}"
+    _copy_atomically(source.descriptor, parent, stage, source.mode)
+    return _Staged(parent, source.destination, stage)
+
+
+def _discard_staged(staged: Sequence[_Staged]) -> None:
+    for item in staged:
+        try:
+            os.unlink(item.stage, dir_fd=item.parent)
+            os.fsync(item.parent)
+        except FileNotFoundError:
+            pass
+
+
+def _assert_existing_destination(parent: int, name: str, mode: int) -> bool:
+    try:
+        existing = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    _assert_trusted_regular(existing, mode)
+    return True
+
+
+def _commit_staged(staged: Sequence[_Staged], modes: Sequence[int]) -> None:
+    token = secrets.token_hex(16)
+    committed: list[tuple[_Staged, str | None]] = []
+    successful = False
+    try:
+        for item, mode in zip(staged, modes, strict=True):
+            backup = (
+                f".{item.name}.backup-{token}"
+                if _assert_existing_destination(item.parent, item.name, mode)
+                else None
+            )
+            if backup is not None:
+                os.replace(item.name, backup, src_dir_fd=item.parent, dst_dir_fd=item.parent)
+            committed.append((item, backup))
+            os.replace(item.stage, item.name, src_dir_fd=item.parent, dst_dir_fd=item.parent)
+            os.fsync(item.parent)
+        successful = True
+    except BaseException:
+        for item, backup in reversed(committed):
+            try:
+                os.unlink(item.name, dir_fd=item.parent)
+            except FileNotFoundError:
+                pass
+            if backup is not None:
+                os.replace(backup, item.name, src_dir_fd=item.parent, dst_dir_fd=item.parent)
+            os.fsync(item.parent)
+        raise
+    finally:
+        for item in staged:
+            try:
+                os.unlink(item.stage, dir_fd=item.parent)
+            except FileNotFoundError:
+                pass
+        if successful:
+            for item, backup in committed:
+                if backup is not None:
+                    os.unlink(backup, dir_fd=item.parent)
+                    os.fsync(item.parent)
 
 
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = _Parser(add_help=False)
-    parser.add_argument("--agent-client-key", required=True)
-    parser.add_argument("--agent-client-cert", required=True)
-    parser.add_argument("--agent-master-ca", required=True)
-    parser.add_argument("--agent-config", required=True)
+    for name in (
+        "agent-server-key",
+        "agent-server-cert",
+        "agent-client-ca",
+        "agent-bindings",
+        "agent-client-key",
+        "agent-client-cert",
+        "agent-master-ca",
+        "agent-config",
+    ):
+        parser.add_argument(f"--{name}", required=True)
     parser.add_argument("--destdir", default="/")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--enable", action="store_true")
     arguments = parser.parse_args(argv)
-    arguments.agent_client_key = _absolute_path(arguments.agent_client_key)
-    arguments.agent_client_cert = _absolute_path(arguments.agent_client_cert)
-    arguments.agent_master_ca = _absolute_path(arguments.agent_master_ca)
-    arguments.agent_config = _absolute_path(arguments.agent_config)
-    arguments.destdir = _absolute_path(arguments.destdir)
+    for name in (
+        "agent_server_key",
+        "agent_server_cert",
+        "agent_client_ca",
+        "agent_bindings",
+        "agent_client_key",
+        "agent_client_cert",
+        "agent_master_ca",
+        "agent_config",
+        "destdir",
+    ):
+        setattr(arguments, name, _absolute_path(getattr(arguments, name)))
+    if arguments.enable and (arguments.destdir != Path("/") or arguments.dry_run):
+        raise InstallerError
     return arguments
+
+
+def _sources(arguments: argparse.Namespace) -> list[_Source]:
+    credentials = (
+        (arguments.agent_server_key, "agent-server.key", 0o400, "credentials"),
+        (arguments.agent_server_cert, "agent-server.crt", 0o444, "credentials"),
+        (arguments.agent_client_ca, "agent-client-ca.crt", 0o444, "credentials"),
+        (arguments.agent_bindings, "agent-bindings.json", 0o400, "admin_credentials"),
+        (arguments.agent_client_key, "agent-client.key", 0o400, "credentials"),
+        (arguments.agent_client_cert, "agent-client.crt", 0o444, "credentials"),
+        (arguments.agent_master_ca, "agent-master-ca.crt", 0o444, "credentials"),
+        (arguments.agent_config, "agent-config.json", 0o400, "credentials"),
+    )
+    result = [
+        _Source(_open_trusted_source(path, mode), destination, mode, directory)
+        for path, destination, mode, directory in credentials
+    ]
+    for name in UNIT_NAMES:
+        result.append(
+            _Source(_open_trusted_source(UNIT_SOURCES[name], 0o644), name, 0o644, "units")
+        )
+    result.append(
+        _Source(_open_trusted_source(SYSUSERS_SOURCE, 0o644), SYSUSERS_NAME, 0o644, "sysusers")
+    )
+    result.append(
+        _Source(_open_trusted_source(TMPFILES_SOURCE, 0o644), TMPFILES_NAME, 0o644, "tmpfiles")
+    )
+    return result
+
+
+def _provision_static_layout(destination: Path) -> None:
+    sysusers = destination / "usr/lib/sysusers.d" / SYSUSERS_NAME
+    tmpfiles = destination / "usr/lib/tmpfiles.d" / TMPFILES_NAME
+    subprocess.run(
+        ["/usr/bin/systemd-sysusers", f"--root={destination}", os.fspath(sysusers)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["/usr/bin/systemd-tmpfiles", f"--root={destination}", "--create", os.fspath(tmpfiles)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def _enable_service() -> None:
@@ -224,7 +403,7 @@ def _enable_service() -> None:
         stderr=subprocess.DEVNULL,
     )
     subprocess.run(
-        ["/usr/bin/systemctl", "enable", "--now", UNIT_NAME],
+        ["/usr/bin/systemctl", "enable", "--now", HOST_AGENT_UNIT],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -232,45 +411,26 @@ def _enable_service() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    sources: list[tuple[int, str, int]] = []
+    sources: list[_Source] = []
+    directories: dict[str, int] = {}
     try:
         arguments = _parse_arguments(argv)
         if os.geteuid() != ROOT_UID:
             raise InstallerError
-        sources = [
-            (
-                _open_trusted_source(arguments.agent_client_key, 0o400),
-                "agent-client.key",
-                0o400,
-            ),
-            (
-                _open_trusted_source(arguments.agent_client_cert, 0o444),
-                "agent-client.crt",
-                0o444,
-            ),
-            (
-                _open_trusted_source(arguments.agent_master_ca, 0o444),
-                "agent-master-ca.crt",
-                0o444,
-            ),
-            (
-                _open_trusted_source(arguments.agent_config, 0o400),
-                "agent-config.json",
-                0o400,
-            ),
-            (_open_trusted_source(UNIT_SOURCE, 0o644), UNIT_NAME, 0o644),
-        ]
+        sources = _sources(arguments)
         if arguments.dry_run:
             return 0
-        credentials, units = _destination_directories(arguments.destdir)
+        directories = _destination_directories(arguments.destdir)
+        staged: list[_Staged] = []
         try:
-            for descriptor, name, mode in sources[:-1]:
-                _copy_atomically(descriptor, credentials, name, mode)
-            descriptor, name, mode = sources[-1]
-            _copy_atomically(descriptor, units, name, mode)
-        finally:
-            os.close(credentials)
-            os.close(units)
+            for source in sources:
+                staged.append(_stage(source, directories[source.directory]))
+        except BaseException:
+            _discard_staged(staged)
+            raise
+        _commit_staged(staged, [source.mode for source in sources])
+        if arguments.destdir == Path("/"):
+            _provision_static_layout(arguments.destdir)
         if arguments.enable:
             _enable_service()
         return 0
@@ -278,8 +438,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("install-host-agent: installation failed", file=sys.stderr)
         return 1
     finally:
-        for descriptor, _name, _mode in sources:
-            os.close(descriptor)
+        _close_directories(directories)
+        for source in sources:
+            os.close(source.descriptor)
 
 
 if __name__ == "__main__":

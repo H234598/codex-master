@@ -253,12 +253,12 @@ class AgentPrincipalV1:
 class HostRegistry:
     """One bounded host document guarded by Hive's durable CAS lock."""
 
-    def __init__(self, state_root: Path) -> None:
+    def __init__(self, state_root: Path, *, shared_gid: int | None = None) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise HostRegistryError("control.host_store_unavailable")
         self._root = state_root / "admin-hosts"
         try:
-            self._state = HiveStateStore(self._root)
+            self._state = HiveStateStore(self._root, shared_gid=shared_gid)
             with self._state.locked():
                 (
                     hosts,

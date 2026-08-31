@@ -9,13 +9,13 @@ StartLimitBurst=3
 Type=exec
 User=codex-master-agent-api
 Group=codex-master-agent-api
+SupplementaryGroups=codex-master-agent-state
 WorkingDirectory=/var/empty
 UMask=0077
-ReadWritePaths=/var/lib/codex-master
+ReadWritePaths=/var/lib/codex-master-agent
 LoadCredential=agent-server-key:/etc/codex-master/agent-server.key
 LoadCredential=agent-server-cert:/etc/codex-master/agent-server.crt
 LoadCredential=agent-client-ca:/etc/codex-master/agent-client-ca.crt
-LoadCredential=agent-bindings:/etc/codex-master/agent-bindings.json
 ExecStart=/usr/bin/codex-master-agent-api --listen-address=127.0.0.1 --port=9443
 Restart=on-failure
 RestartSec=5s

@@ -55,6 +55,20 @@ AUDIENCE = "application-audience"
 NOW = 2_000_000_000
 
 
+@pytest.fixture(autouse=True)
+def agent_control_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep production assembly tests on the exact non-secret shared boundary."""
+
+    root = tmp_path / "agent-control-state"
+    root.mkdir(mode=0o770)
+    os.chmod(root, 0o2770)
+    monkeypatch.setattr(
+        admin_assembly,
+        "resolve_agent_state_boundary",
+        lambda _state_root: (root, os.getegid()),
+    )
+
+
 class _Socket:
     def __init__(
         self,
@@ -1709,6 +1723,9 @@ def installed_admin_entrypoint(tmp_path_factory: pytest.TempPathFactory) -> Path
     source.mkdir(mode=0o700)
     shutil.copy2(repository / "pyproject.toml", source / "pyproject.toml")
     shutil.copytree(repository / "src", source / "src")
+    shutil.copytree(repository / "systemd", source / "systemd")
+    (source / "scripts").mkdir()
+    shutil.copy2(repository / "scripts" / "install-host-agent", source / "scripts")
     installed = subprocess.run(
         [
             os.fspath(interpreter),

@@ -169,14 +169,16 @@ def test_full_local_fleet_slice_is_idempotent_and_stops_only_failed_unit(
         def resolve(self, host_ref: str) -> OllamaHostLease | None:
             return lease if host_ref == CONTROL_HOST_REF else None
 
-    class NoRemoteBroker:
-        def exchange(self, *_args: object, **_values: object) -> object:
+    class NoRemoteOperations:
+        def plan(self, *_args: object, **_values: object) -> object:
             raise AssertionError("local fleet slice reached remote broker")
+
+        apply = probe = stop = plan
 
     transport = OllamaHostTransport(
         registry=registry,
         leases=Leases(),
-        broker=NoRemoteBroker(),
+        remote=NoRemoteOperations(),
         local=Task3LocalOllamaHostAdapter(runtime),
     )
     paths = FleetPaths.from_state_root(tmp_path / "fleet-state")

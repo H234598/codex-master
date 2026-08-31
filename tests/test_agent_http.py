@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -115,12 +116,15 @@ def test_poll_reuses_task_one_parser_and_projects_bounded_no_work(app, store) ->
     assert type(store.poll_calls[0][0]) is OperationPrincipalV1
 
 
-def test_resolver_principal_reaches_real_store_with_authoritative_fences(
+def test_admin_owned_shared_binding_reaches_real_api_poll_with_authoritative_fences(
     tmp_path,
 ) -> None:
-    registry = HostRegistry(tmp_path)
+    shared = tmp_path / "agent-state"
+    shared.mkdir(mode=0o770)
+    os.chmod(shared, 0o2770)
+    admin_registry = HostRegistry(shared, shared_gid=os.getegid())
     spki = "sha256:" + "a" * 64
-    registry.provision_agent_binding(
+    admin_registry.provision_agent_binding(
         {
             "ref": "worker-one",
             "label": "Worker One",
@@ -130,9 +134,11 @@ def test_resolver_principal_reaches_real_store_with_authoritative_fences(
         AgentBindingV1("worker-one", spki, 1, True),
         expected_generation=0,
     )
-    resolver_principal = registry.resolve_agent_spki(spki)
-    store = AgentOperationStore(tmp_path)
-    store.enqueue(
+    resolver_principal = HostRegistry(
+        shared, shared_gid=os.getegid()
+    ).resolve_agent_spki(spki)
+    admin_store = AgentOperationStore(shared, shared_gid=os.getegid())
+    admin_store.enqueue(
         AgentOperationRequestV1(
             key="http-real-store",
             kind="host.probe",
@@ -144,6 +150,7 @@ def test_resolver_principal_reaches_real_store_with_authoritative_fences(
             target_host_ref="worker-one",
         )
     )
+    store = AgentOperationStore(shared, shared_gid=os.getegid())
     application = AgentHttpApplication(store)
 
     response = application.handle(

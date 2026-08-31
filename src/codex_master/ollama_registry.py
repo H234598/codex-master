@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
 from typing import Iterator
 
 
@@ -36,6 +37,43 @@ def _required_string(value: object, code: str) -> str:
     if not isinstance(value, str) or not value:
         _fail(code)
     return value
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _validate_directory(
+    metadata: os.stat_result, *, mode: int, shared_gid: int | None
+) -> None:
+    trusted_identity = (
+        metadata.st_uid == os.geteuid()
+        if shared_gid is None
+        else metadata.st_gid == shared_gid
+    )
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != mode
+        or not trusted_identity
+    ):
+        _fail("ollama.registry_store_unavailable")
+
+
+def _validate_file(
+    metadata: os.stat_result, *, mode: int, shared_gid: int | None
+) -> None:
+    trusted_identity = (
+        metadata.st_uid == os.geteuid()
+        if shared_gid is None
+        else metadata.st_gid == shared_gid
+    )
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != mode
+        or not trusted_identity
+    ):
+        _fail("ollama.registry_store_unavailable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,15 +193,22 @@ class OllamaRegistryV1:
 class OllamaRegistryStore:
     """CAS-backed registry file using a lock plus durable atomic replacement."""
 
-    __slots__ = ("_path", "_lock_path")
+    __slots__ = ("_path", "_lock_path", "_shared_gid")
 
-    def __init__(self, path: Path = _DEFAULT_PATH) -> None:
+    def __init__(self, path: Path = _DEFAULT_PATH, *, shared_gid: int | None = None) -> None:
+        if shared_gid is not None and (
+            isinstance(shared_gid, bool) or not isinstance(shared_gid, int) or shared_gid < 0
+        ):
+            _fail("ollama.registry_store_unavailable")
         self._path = Path(path)
         self._lock_path = self._path.with_name(f".{self._path.name}.lock")
+        self._shared_gid = shared_gid
 
     @classmethod
-    def for_test(cls, directory: Path) -> OllamaRegistryStore:
-        return cls(Path(directory) / "ollama-registry.json")
+    def for_test(
+        cls, directory: Path, *, shared_gid: int | None = None
+    ) -> OllamaRegistryStore:
+        return cls(Path(directory) / "ollama-registry.json", shared_gid=shared_gid)
 
     def load(self) -> OllamaRegistryV1:
         with self._locked():
@@ -194,13 +239,32 @@ class OllamaRegistryStore:
     @contextmanager
     def _locked(self) -> Iterator[None]:
         try:
-            self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(self._path.parent, 0o700)
+            mode = 0o2770 if self._shared_gid is not None else 0o700
+            file_mode = 0o660 if self._shared_gid is not None else 0o600
+            try:
+                parent = self._path.parent.lstat()
+            except FileNotFoundError:
+                self._path.parent.mkdir(mode=mode, parents=True)
+                os.chmod(self._path.parent, mode)
+                parent = self._path.parent.lstat()
+            _validate_directory(parent, mode=mode, shared_gid=self._shared_gid)
+            try:
+                existing = self._lock_path.lstat()
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                _validate_file(existing, mode=file_mode, shared_gid=self._shared_gid)
             descriptor = os.open(
                 self._lock_path,
                 os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-                0o600,
+                file_mode,
             )
+            if existing is None:
+                os.fchmod(descriptor, file_mode)
+            opened = os.fstat(descriptor)
+            _validate_file(opened, mode=file_mode, shared_gid=self._shared_gid)
+            if existing is not None and not _same_file(existing, opened):
+                _fail("ollama.registry_store_unavailable")
         except OSError:
             _fail("ollama.registry_store_unavailable")
         try:
@@ -217,12 +281,39 @@ class OllamaRegistryStore:
                 os.close(descriptor)
 
     def _load_unlocked(self) -> OllamaRegistryV1:
+        descriptor: int | None = None
         try:
-            raw = self._path.read_bytes()
+            initial = self._path.lstat()
+            descriptor = os.open(self._path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            opened = os.fstat(descriptor)
         except FileNotFoundError:
             return OllamaRegistryV1(_SCHEMA_VERSION, 0, (), ())
         except OSError:
             _fail("ollama.registry_store_unavailable")
+        file_mode = 0o660 if self._shared_gid is not None else 0o600
+        try:
+            _validate_file(initial, mode=file_mode, shared_gid=self._shared_gid)
+            _validate_file(opened, mode=file_mode, shared_gid=self._shared_gid)
+            if not _same_file(initial, opened):
+                _fail("ollama.registry_store_unavailable")
+            chunks: list[bytes] = []
+            remaining = _MAX_DOCUMENT_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            current = self._path.lstat()
+            _validate_file(current, mode=file_mode, shared_gid=self._shared_gid)
+            if not _same_file(opened, current):
+                _fail("ollama.registry_store_unavailable")
+        except OSError:
+            _fail("ollama.registry_store_unavailable")
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
         if len(raw) > _MAX_DOCUMENT_BYTES:
             _fail("ollama.registry_schema_invalid")
         try:
@@ -241,8 +332,11 @@ class OllamaRegistryStore:
         descriptor: int | None = None
         try:
             descriptor = os.open(
-                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o660 if self._shared_gid is not None else 0o600,
             )
+            os.fchmod(descriptor, 0o660 if self._shared_gid is not None else 0o600)
             _write_all(descriptor, payload)
             os.fsync(descriptor)
             os.close(descriptor)

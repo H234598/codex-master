@@ -37,3 +37,13 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 codex_master = ["markdown/*.md", "markdown/classes/*.md"]
+
+[tool.setuptools.data-files]
+"lib/codex-master/systemd" = [
+  "systemd/codex-master-admin.service",
+  "systemd/codex-master-agent-api.service",
+  "systemd/codex-master-host-agent.service",
+]
+"lib/codex-master/systemd/sysusers.d" = ["systemd/sysusers.d/codex-master-host-agent.conf"]
+"lib/codex-master/systemd/tmpfiles.d" = ["systemd/tmpfiles.d/codex-master-host-agent.conf"]
+"libexec/codex-master" = ["scripts/install-host-agent"]

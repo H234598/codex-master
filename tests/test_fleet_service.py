@@ -75,6 +75,36 @@ def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
     assert paths.mutation_lock == tmp_path / "fleet" / "mutation.lock"
 
 
+def test_shared_remote_state_reuses_group_owned_directories_without_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.server import build_fleet_private_io
+
+    paths = FleetPaths.from_state_root(tmp_path / "shared")
+    paths.root.mkdir(parents=True)
+    os.chmod(paths.root.parent, 0o2770)
+    os.chmod(paths.root, 0o2770)
+    protected = {paths.root.parent, paths.root}
+    original_chmod = os.chmod
+
+    def deny_existing_chmod(path, mode):
+        if Path(path) in protected:
+            raise PermissionError
+        original_chmod(path, mode)
+
+    monkeypatch.setattr("codex_master.fleet_service.os.chmod", deny_existing_chmod)
+
+    FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=object(),  # type: ignore[arg-type]
+        agent_operations=object(),  # type: ignore[arg-type]
+        shared_state_gid=os.getegid(),
+    )
+
+
 def _account(
     account_id: str = "shared",
     *,

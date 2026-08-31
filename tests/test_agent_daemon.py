@@ -578,11 +578,20 @@ def test_main_assembles_from_credential_directory_without_secret_arguments(monke
     observed: dict[str, object] = {}
 
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(directory))
-    monkeypatch.setattr(agent_daemon, "assemble_server", lambda address, port, credentials: observed.update(address=address, port=port, fds=tuple(credentials)) or _StoppedServer())
+    monkeypatch.setattr(agent_daemon, "agent_state_group_id", lambda: 4321)
+    monkeypatch.setattr(
+        agent_daemon,
+        "assemble_server",
+        lambda address, port, credentials, **kwargs: observed.update(
+            address=address, port=port, fds=tuple(credentials), **kwargs
+        )
+        or _StoppedServer(),
+    )
     assert agent_daemon.main(["--listen-address", "127.0.0.1", "--port", "9443"]) == 0
     assert observed["address"] == "127.0.0.1"
     assert observed["port"] == 9443
     assert len(observed["fds"]) == 3
+    assert observed["shared_gid"] == 4321
 
 
 @pytest.mark.parametrize(

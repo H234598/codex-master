@@ -379,8 +379,10 @@ class MasterjetControlService:
         account_registry: AccountRegistryPort | None = None,
         ollama_fleet: OllamaFleetPort | None = None,
         host_probe: HostProbePort | None = None,
+        remote_operation_store: AdminOperationStore | None = None,
     ) -> None:
         self._operation_store = operation_store
+        self._remote_operation_store = remote_operation_store
         self._agent_operations = agent_operations
         self._openai_accounts = openai_accounts
         self._openai_credentials = openai_credentials
@@ -1043,13 +1045,27 @@ class MasterjetControlService:
         *_values: object,
     ) -> dict[str, object]:
         operation_id = cast(str, request.arguments["operation_id"])
+        operation_store = self._operation_store
         try:
-            operation = self._operation_store.get(operation_id)
+            operation = operation_store.get(operation_id)
         except AdminOperationError as error:
-            if error.code != "control.operation_not_found" or self._agent_operations is None:
+            remote_store = self._remote_operation_store
+            if error.code == "control.operation_not_found" and remote_store is not None:
+                try:
+                    operation = remote_store.get(operation_id)
+                    operation_store = remote_store
+                except AdminOperationError as remote_error:
+                    if (
+                        remote_error.code != "control.operation_not_found"
+                        or self._agent_operations is None
+                    ):
+                        raise
+                    return self._agent_ollama_operation_get(operation_id)
+            elif self._agent_operations is not None:
+                return self._agent_ollama_operation_get(operation_id)
+            else:
                 raise
-            return self._agent_ollama_operation_get(operation_id)
-        agent_operation_id = self._operation_store.agent_operation_id(operation_id)
+        agent_operation_id = operation_store.agent_operation_id(operation_id)
         if agent_operation_id is None:
             return public_operation_status(operation)
         if operation.state not in {"partial", "succeeded", "failed", "blocked"}:

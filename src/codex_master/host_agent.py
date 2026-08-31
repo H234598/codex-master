@@ -61,6 +61,8 @@ _CREDENTIAL_NAMES = (
     "agent-client-key",
 )
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
+_HOST_AGENT_STATE_ROOT = Path("/var/lib/codex-master-host-agent")
+_HOST_AGENT_OLLAMA_REGISTRY = _HOST_AGENT_STATE_ROOT / "ollama" / "registry.json"
 
 
 class HostAgentError(RuntimeError):
@@ -238,6 +240,8 @@ def load_host_agent_config(descriptor: int) -> HostAgentConfig:
         or _TOKEN.fullmatch(config.host_ref) is None
         or not config.state_root.is_absolute()
         or not config.ollama_registry_path.is_absolute()
+        or config.state_root != _HOST_AGENT_STATE_ROOT
+        or config.ollama_registry_path != _HOST_AGENT_OLLAMA_REGISTRY
     ):
         _fail("host.config_invalid")
     return config

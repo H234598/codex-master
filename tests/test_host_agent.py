@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import hashlib
 import ipaddress
 import json
+import os
 from pathlib import Path
 import socket
 import ssl
@@ -826,8 +827,8 @@ def test_host_probe_and_credentials_are_descriptor_first_and_exact(
         "registry_generation": 7,
         "lease_epoch": 3,
         "capabilities_digest": "sha256:" + "c" * 64,
-        "state_root": str(tmp_path / "state"),
-        "ollama_registry_path": str(tmp_path / "ollama-registry.json"),
+        "state_root": "/var/lib/codex-master-host-agent",
+        "ollama_registry_path": "/var/lib/codex-master-host-agent/ollama/registry.json",
         "max_wait_seconds": 20,
     }
     (credentials / "agent-config").write_text(json.dumps(config))
@@ -843,6 +844,32 @@ def test_host_probe_and_credentials_are_descriptor_first_and_exact(
     (credentials / "agent-client-key").symlink_to(credentials / "agent-master-ca")
     with pytest.raises(HostAgentError, match="host.credentials_invalid"):
         open_host_agent_credentials({"CREDENTIALS_DIRECTORY": str(credentials)})
+
+
+def test_host_agent_config_rejects_paths_outside_its_private_state_boundary(
+    tmp_path: Path,
+) -> None:
+    """A credential cannot redirect the sandboxed host agent into Master state."""
+
+    config = {
+        "schema_version": 1,
+        "master_url": "https://master.internal",
+        "host_ref": "worker-one",
+        "registry_generation": 7,
+        "lease_epoch": 3,
+        "capabilities_digest": "sha256:" + "c" * 64,
+        "state_root": "/var/lib/codex-master",
+        "ollama_registry_path": "/var/lib/codex-master/ollama/registry.json",
+        "max_wait_seconds": 20,
+    }
+    path = tmp_path / "agent-config"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        with pytest.raises(HostAgentError, match="host.config_invalid"):
+            load_host_agent_config(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def test_poll_loop_is_stoppable_and_cli_accepts_no_secret_arguments(

@@ -523,6 +523,34 @@ def _readiness_from_document(value: object) -> OllamaReadinessStatus:
         raise FleetConflictError("resource.host_response_invalid") from None
 
 
+def _ensure_remote_state_directory(
+    directory: Path, *, mode: int, shared_gid: int | None
+) -> None:
+    try:
+        metadata = directory.lstat()
+    except FileNotFoundError:
+        try:
+            directory.mkdir(mode=mode)
+            os.chmod(directory, mode)
+            metadata = directory.lstat()
+        except OSError as exc:
+            raise HiveStateError("state_directory_unavailable") from exc
+    except OSError as exc:
+        raise HiveStateError("state_directory_unavailable") from exc
+    trusted_identity = (
+        metadata.st_uid == os.geteuid()
+        if shared_gid is None
+        else metadata.st_gid == shared_gid
+    )
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != mode
+        or not trusted_identity
+    ):
+        raise HiveStateError("state_directory_untrusted")
+
+
 class FleetService:
     def __init__(
         self,
@@ -535,6 +563,7 @@ class FleetService:
         ollama_registry: OllamaRegistryStore | None = None,
         ollama_transport: object | None = None,
         agent_operations: AgentOperationStore | None = None,
+        shared_state_gid: int | None = None,
         ollama_resource_snapshot: Callable[
             [str], OllamaResourceSnapshotV1 | None
         ] | None = None,
@@ -558,10 +587,22 @@ class FleetService:
         self._ollama_remote_state = None
         if ollama_registry is not None and agent_operations is not None:
             try:
+                if shared_state_gid is not None and (
+                    isinstance(shared_state_gid, bool)
+                    or not isinstance(shared_state_gid, int)
+                    or shared_state_gid < 0
+                ):
+                    raise ValueError
+                directory_mode = 0o2770 if shared_state_gid is not None else 0o700
                 for directory in (paths.root.parent, paths.root):
-                    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    os.chmod(directory, 0o700)
-                self._ollama_remote_state = HiveStateStore(paths.root / "ollama-remote")
+                    _ensure_remote_state_directory(
+                        directory,
+                        mode=directory_mode,
+                        shared_gid=shared_state_gid,
+                    )
+                self._ollama_remote_state = HiveStateStore(
+                    paths.root / "ollama-remote", shared_gid=shared_state_gid
+                )
             except (HiveStateError, OSError):
                 raise ValueError("ollama.remote_state_unavailable") from None
         self._ollama_resource_snapshot = ollama_resource_snapshot

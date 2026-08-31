@@ -1087,16 +1087,46 @@ def test_operations_get_projects_a_direct_ollama_agent_result_without_probe_bind
 ) -> None:
     admin_operations = AdminOperationStore.for_test(tmp_path, clock=lambda: CREATED)
     agent_operations = AgentOperationStore.for_test(tmp_path, clock=lambda: CREATED)
+    plan_digest = "sha256:" + "a" * 64
     queued = agent_operations.enqueue(
         AgentOperationRequestV1(
             key="ollama-result-one",
             kind="ollama.instance",
             action="plan",
             registry_generation=7,
-            plan_digest="sha256:" + "a" * 64,
+            plan_digest=plan_digest,
             arguments={"instance_ref": "remote-west", "generation": 4},
             deadline=CREATED + timedelta(minutes=5),
             target_host_ref="worker-one",
+            required_registry_generation=7,
+            required_lease_epoch=3,
+            plan_precondition_digest=plan_digest,
+            owner_context={
+                "schema_version": 1,
+                "owner": "ollama.remote",
+                "action": "plan",
+                "host_ref": "worker-one",
+                "instance_ref": "remote-west",
+                "registry_generation": 7,
+                "ollama_registry_generation": 4,
+                "resource_generation": None,
+                "lease_epoch": 3,
+                "queue_plan_digest": plan_digest,
+                "plan_precondition_digest": plan_digest,
+                "instance": {
+                    "ref": "remote-west",
+                    "label": "Remote West",
+                    "host_ref": "worker-one",
+                    "ollama_executable": "/usr/bin/ollama",
+                    "models_directory": "/var/lib/ollama/models",
+                    "selected_model_refs": ["model-one"],
+                    "allowed_cpus": "0-1",
+                    "cpu_quota_percent": 200,
+                    "cpu_weight": 100,
+                    "lifecycle_state": "planned",
+                    "readiness_state": "unknown",
+                },
+            },
         )
     )
     lease = agent_operations.poll(
@@ -1126,6 +1156,7 @@ def test_operations_get_projects_a_direct_ollama_agent_result_without_probe_bind
                 ).encode("utf-8")
             ).hexdigest(),
             result,
+            lease.envelope_digest,
         ),
     )
 

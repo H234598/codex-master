@@ -168,15 +168,17 @@ class AdminOperationStore:
         *,
         clock: Callable[[], datetime] | None = None,
         owner_probe: _OwnerProbe | None = None,
+        shared_gid: int | None = None,
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise AdminOperationError("control.operation_store_unavailable")
         self._state_root = state_root
         self._root = state_root / "admin-operations"
+        self._shared_gid = shared_gid
         self._clock = clock or (lambda: datetime.now(UTC))
         self._owner_probe = owner_probe or _LinuxOwnerProbe()
         try:
-            self._state = HiveStateStore(self._root)
+            self._state = HiveStateStore(self._root, shared_gid=shared_gid)
             with self._state.locked():
                 records = self._read_locked()
                 owners = self._read_host_probe_lifecycle_locked()
@@ -207,8 +209,14 @@ class AdminOperationStore:
         *,
         clock: Callable[[], datetime] | None = None,
         owner_probe: _OwnerProbe | None = None,
+        shared_gid: int | None = None,
     ) -> AdminOperationStore:
-        return cls(state_root, clock=clock, owner_probe=owner_probe)
+        return cls(
+            state_root,
+            clock=clock,
+            owner_probe=owner_probe,
+            shared_gid=shared_gid,
+        )
 
     def plan(
         self,
@@ -886,7 +894,7 @@ class AdminOperationStore:
             )
 
             agent_bindings = AgentOperationStore(
-                self._state_root
+                self._state_root, shared_gid=self._shared_gid
             )._host_probe_lifecycle_bindings()
         except (AgentOperationError, OSError, ValueError):
             raise AdminOperationError("control.operation_store_unavailable") from None

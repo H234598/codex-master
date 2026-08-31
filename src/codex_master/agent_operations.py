@@ -559,6 +559,7 @@ class AgentOperationStore:
         state_root: Path,
         *,
         clock: Callable[[], datetime] | None = None,
+        shared_gid: int | None = None,
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise AgentOperationError("host.operation_store_unavailable")
@@ -569,7 +570,7 @@ class AgentOperationStore:
         self._reconciled_attempt_exhaustions: set[str] = set()
         self._reconciled_operation_deadlines: set[str] = set()
         try:
-            self._state = HiveStateStore(self._root)
+            self._state = HiveStateStore(self._root, shared_gid=shared_gid)
             with self._state.locked():
                 document = self._read_locked()
                 self._write_locked(document)
@@ -582,8 +583,9 @@ class AgentOperationStore:
         state_root: Path,
         *,
         clock: Callable[[], datetime] | None = None,
+        shared_gid: int | None = None,
     ) -> AgentOperationStore:
-        return cls(state_root, clock=clock)
+        return cls(state_root, clock=clock, shared_gid=shared_gid)
 
     def enqueue(self, request: AgentOperationRequestV1) -> AgentOperationViewV1:
         if type(request) is not AgentOperationRequestV1:

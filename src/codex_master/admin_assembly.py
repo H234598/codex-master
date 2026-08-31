@@ -30,6 +30,7 @@ from .admin_hosts import AgentBindingV1, HostRegistry, HostRegistryError
 from .admin_http import AdminHttpServer
 from .admin_operations import AdminOperationStore
 from .agent_operations import AgentOperationStore
+from .agent_state import resolve_agent_state_boundary
 from .admin_secret_ingress import AdminSecretIngressOwner
 from .admin_service import MasterjetControlService, OpenAIAccountSummaryV1
 from .admin_socket import AdminSocketServer, UnixPeerCredentials
@@ -2257,6 +2258,7 @@ def assemble_admin_runtime() -> AdminRuntime:
     credentials = SystemdCredentialSet(credential_directory)
     cleanup: list[Callable[[], object]] = [credentials.close]
     try:
+        agent_state_root, agent_state_gid = resolve_agent_state_boundary(state_root)
         config = parse_admin_config(credentials.read("admin-config", _CONFIG_MAX_BYTES))
         inventory_path = state_root / _INVENTORY_DOCUMENT.name
         _empty_inventory(inventory_path)
@@ -2266,7 +2268,10 @@ def assemble_admin_runtime() -> AdminRuntime:
         google_manager.reload()
 
         operation_store = AdminOperationStore(state_root)
-        host_registry = HostRegistry(state_root)
+        remote_operation_store = AdminOperationStore(
+            agent_state_root, shared_gid=agent_state_gid
+        )
+        host_registry = HostRegistry(agent_state_root, shared_gid=agent_state_gid)
         provision_agent_bindings_from_credential(
             host_registry,
             credentials.read_optional("agent-bindings", _CONFIG_MAX_BYTES),
@@ -2337,9 +2342,11 @@ def assemble_admin_runtime() -> AdminRuntime:
             state_root=state_root / "google-billing",
         )
         ollama_registry = OllamaRegistryStore(
-            state_root / "ollama" / "registry.json"
+            agent_state_root / "ollama" / "registry.json", shared_gid=agent_state_gid
         )
-        agent_operations = AgentOperationStore(state_root)
+        agent_operations = AgentOperationStore(
+            agent_state_root, shared_gid=agent_state_gid
+        )
         ollama_transport = OllamaHostTransport(
             registry=ollama_registry,
             leases=HostRegistryOllamaLeaseSource(host_registry),
@@ -2348,7 +2355,7 @@ def assemble_admin_runtime() -> AdminRuntime:
                 host_registry=host_registry,
             ),
         )
-        ollama_paths = FleetPaths.from_state_root(state_root / "ollama-owner")
+        ollama_paths = FleetPaths.from_state_root(agent_state_root / "ollama-owner")
         ollama_fleet = FleetService(
             ollama_paths,
             FleetPrivateIO(
@@ -2362,10 +2369,11 @@ def assemble_admin_runtime() -> AdminRuntime:
                 lock=contextlib.nullcontext,
                 utc_now=lambda: datetime.now(UTC),
             ),
-            pool_root=state_root / "ollama-pool",
+            pool_root=agent_state_root / "ollama-pool",
             ollama_registry=ollama_registry,
             ollama_transport=ollama_transport,
             agent_operations=agent_operations,
+            shared_state_gid=agent_state_gid,
             ollama_resource_snapshot=lambda _host_ref: None,
         )
 
@@ -2389,11 +2397,12 @@ def assemble_admin_runtime() -> AdminRuntime:
                     operation_store=operation_store, host_registry=host_registry
                 ),
                 remote=RemoteHostProbeAdapter(
-                    operation_store=operation_store,
+                    operation_store=remote_operation_store,
                     agent_operations=agent_operations,
                     host_registry=host_registry,
                 ),
             ),
+            remote_operation_store=remote_operation_store,
         )
 
         bearer = (

@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from types import FrameType
-from typing import Iterator, Mapping, Sequence
+from typing import Iterator, Mapping, Sequence, cast
 
 from .admin_hosts import AgentPrincipalV1 as RegistryAgentPrincipalV1
 from .admin_hosts import HostRegistry, HostRegistryError
@@ -32,6 +32,7 @@ from .agent_operations import AgentOperationError, AgentOperationStore
 from .agent_operations import AgentPrincipalV1 as OperationAgentPrincipalV1
 from .admin_operations import AdminOperationStore
 from .admin_operations import AdminOperationError
+from .agent_state import AGENT_STATE_ROOT, agent_state_group_id
 from .host_probe import RemoteHostProbeCompletionOwner
 from .fleet_service import FleetPaths, FleetService
 from .ollama_host_transport import (
@@ -43,7 +44,7 @@ from .ollama_registry import OllamaRegistryStore
 from .server import build_fleet_private_io
 
 
-_STATE_ROOT = Path("/var/lib/codex-master")
+_STATE_ROOT = AGENT_STATE_ROOT
 _CREDENTIAL_NAMES = ("agent-server-cert", "agent-server-key", "agent-client-ca")
 TLS_HANDSHAKE_TIMEOUT_SECONDS = 2.0
 HTTP_HEADER_TIMEOUT_SECONDS = 2.0
@@ -99,9 +100,18 @@ def _ollama_operation_principal(principal: object) -> OperationAgentPrincipalV1:
 
 
 def _ollama_completion_fleet(
-    state_root: Path, store: AgentOperationStore, registry: HostRegistry
+    state_root: Path,
+    store: AgentOperationStore,
+    registry: HostRegistry,
+    *,
+    shared_gid: int | None = None,
 ) -> FleetService:
-    ollama_registry = OllamaRegistryStore(state_root / "ollama" / "registry.json")
+    registry_path = state_root / "ollama" / "registry.json"
+    ollama_registry = (
+        OllamaRegistryStore(registry_path)
+        if shared_gid is None
+        else OllamaRegistryStore(registry_path, shared_gid=shared_gid)
+    )
     transport = OllamaHostTransport(
         registry=ollama_registry,
         leases=HostRegistryOllamaLeaseSource(registry),
@@ -110,14 +120,23 @@ def _ollama_completion_fleet(
         ),
     )
     paths = FleetPaths.from_state_root(state_root / "ollama-owner")
-    return FleetService(
-        paths,
-        build_fleet_private_io(paths),
-        pool_root=state_root / "ollama-pool",
-        ollama_registry=ollama_registry,
-        ollama_transport=transport,
-        agent_operations=store,
-    )
+    arguments = {
+        "pool_root": state_root / "ollama-pool",
+        "ollama_registry": ollama_registry,
+        "ollama_transport": transport,
+        "agent_operations": store,
+    }
+    if shared_gid is not None:
+        arguments["shared_state_gid"] = shared_gid
+    return FleetService(paths, build_fleet_private_io(paths), **arguments)
+
+
+def _state_owner(factory: object, state_root: Path, shared_gid: int | None) -> object:
+    if not callable(factory):
+        raise TypeError("agent.state_owner_invalid")
+    if shared_gid is None:
+        return factory(state_root)
+    return factory(state_root, shared_gid=shared_gid)
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,13 +406,22 @@ def assemble_server(
     credentials: AgentCredentialFds,
     *,
     state_root: Path = _STATE_ROOT,
+    shared_gid: int | None = None,
 ) -> AgentApiServer:
-    registry = HostRegistry(state_root)
-    store = AgentOperationStore(state_root)
+    registry = cast(HostRegistry, _state_owner(HostRegistry, state_root, shared_gid))
+    store = cast(AgentOperationStore, _state_owner(AgentOperationStore, state_root, shared_gid))
     host_probe_owner = RemoteHostProbeCompletionOwner(
-        operation_store=AdminOperationStore(state_root),
+        operation_store=cast(
+            AdminOperationStore,
+            _state_owner(AdminOperationStore, state_root, shared_gid),
+        ),
         agent_operations=store,
         host_registry=registry,
+    )
+    ollama = (
+        _ollama_completion_fleet(state_root, store, registry)
+        if shared_gid is None
+        else _ollama_completion_fleet(state_root, store, registry, shared_gid=shared_gid)
     )
     return AgentApiServer(
         (address, port),
@@ -402,7 +430,7 @@ def assemble_server(
             _AgentCompletionRouter(
                 store,
                 host_probe_owner,
-                _ollama_completion_fleet(state_root, store, registry),
+                ollama,
             ),
         ),
         AgentIdentityResolver(registry),
@@ -445,7 +473,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return os.EX_USAGE
     try:
         with open_systemd_credentials(os.environ) as credentials:
-            run_server(assemble_server(arguments.listen_address, arguments.port, credentials))
+            run_server(
+                assemble_server(
+                    arguments.listen_address,
+                    arguments.port,
+                    credentials,
+                    shared_gid=agent_state_group_id(),
+                )
+            )
     except (
         AdminOperationError,
         AgentOperationError,
