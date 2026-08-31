@@ -207,8 +207,14 @@ _STOP_RECORDS: dict[bytes, tuple[object, tuple[object, ...]]] = {}
 _RUNNING_RECORDS: dict[
     bytes, tuple[weakref.ReferenceType[object], tuple[object, ...]]
 ] = {}
-_EXECUTABLE_IDENTITY_CACHE: dict[tuple[int, int, int, str], None] = {}
+_EXECUTABLE_IDENTITY_CACHE: dict[tuple[int, int, int, int, str], None] = {}
 _EXECUTABLE_IDENTITY_CACHE_MAX = 128
+_REQUIRED_EXECUTABLE_SEALS = (
+    fcntl.F_SEAL_SEAL
+    | fcntl.F_SEAL_SHRINK
+    | fcntl.F_SEAL_GROW
+    | fcntl.F_SEAL_WRITE
+)
 
 
 class OllamaRuntimeError(RuntimeError):
@@ -2097,29 +2103,42 @@ def _process_executable_matches_evidence(
 ) -> bool:
     if evidence.sha256 is None or evidence.size > _MAX_EXECUTABLE_BYTES:
         return False
+    descriptor = -1
     try:
-        path = Path(f"/proc/{pid}/exe")
-        target = os.readlink(path)
+        descriptor = os.open(f"/proc/{pid}/exe", os.O_RDONLY | os.O_CLOEXEC)
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
         if not target.startswith("/memfd:codex-master-ollama-executable"):
             return False
-        metadata = path.stat()
+        seals = fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+        if seals & _REQUIRED_EXECUTABLE_SEALS != _REQUIRED_EXECUTABLE_SEALS:
+            return False
+        metadata = os.fstat(descriptor)
         if metadata.st_size != evidence.size:
             return False
-        cache_key = (pid, start_ticks, metadata.st_ino, evidence.sha256)
+        cache_key = (
+            pid,
+            start_ticks,
+            metadata.st_dev,
+            metadata.st_ino,
+            evidence.sha256,
+        )
         with _RECORD_LOCK:
             if cache_key in _EXECUTABLE_IDENTITY_CACHE:
                 return True
         digest = hashlib.sha256()
         total = 0
-        with path.open("rb", buffering=0) as stream:
-            while True:
-                chunk = stream.read(min(1024 * 1024, _MAX_EXECUTABLE_BYTES + 1 - total))
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > _MAX_EXECUTABLE_BYTES:
-                    return False
-                digest.update(chunk)
+        while True:
+            chunk = os.pread(
+                descriptor,
+                min(1024 * 1024, _MAX_EXECUTABLE_BYTES + 1 - total),
+                total,
+            )
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_EXECUTABLE_BYTES:
+                return False
+            digest.update(chunk)
         if total != evidence.size or digest.hexdigest() != evidence.sha256:
             return False
         with _RECORD_LOCK:
@@ -2129,6 +2148,9 @@ def _process_executable_matches_evidence(
         return True
     except OSError:
         return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _loopback_listener_inodes(port: int) -> set[str]:

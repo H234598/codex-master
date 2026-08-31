@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import fcntl
 import gc
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -580,9 +581,60 @@ def test_isolated_helper_executes_pinned_elf_from_sealed_memfd(tmp_path: Path) -
             time.sleep(0.01)
         assert process.poll() is None
         assert "memfd:codex-master-ollama-executable" in executable
+        start_ticks = ollama_runtime._process_start_ticks(process.pid)
+        assert ollama_runtime._process_executable_matches_evidence(
+            process.pid, start_ticks, plan.executable
+        )
+        assert ollama_runtime._process_executable_matches_evidence(
+            process.pid, start_ticks, plan.executable
+        )
     finally:
         process.terminate()
         process.wait(timeout=5.0)
+
+
+def test_executable_evidence_rejects_mutable_same_name_memfd_before_and_after_cache(
+    tmp_path: Path,
+) -> None:
+    payload = Path("/usr/bin/sleep").read_bytes()
+    descriptor = os.memfd_create(
+        "codex-master-ollama-executable",
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        ollama_runtime._write_all(descriptor, payload)
+        os.fchmod(descriptor, 0o500)
+        process = subprocess.Popen(
+            (f"/proc/self/fd/{descriptor}", "30"),
+            pass_fds=(descriptor,),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        evidence = replace(
+            planned(tmp_path).executable,
+            size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        start_ticks = ollama_runtime._process_start_ticks(process.pid)
+
+        before_mutation = ollama_runtime._process_executable_matches_evidence(
+            process.pid, start_ticks, evidence
+        )
+        assert os.pwrite(descriptor, b"X" * len(payload), 0) == len(payload)
+        after_would_be_cache_hit = ollama_runtime._process_executable_matches_evidence(
+            process.pid, start_ticks, evidence
+        )
+
+        assert (before_mutation, after_would_be_cache_hit) == (False, False)
+        assert fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) == 0
+    finally:
+        if process is not None:
+            process.terminate()
+            process.wait(timeout=5.0)
+        os.close(descriptor)
 
 
 def test_system_runtime_rejects_non_allowlisted_argv_before_process_start(
