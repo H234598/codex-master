@@ -411,11 +411,6 @@ class RuntimeLayout:
             current = current.parent
         raise _invalid()
 
-    def repository_root(self) -> RuntimeImageRepositoryRoot:
-        """Return the non-Path, generation-pinned root for read-only Hive use."""
-
-        return RuntimeImageRepositoryRoot(self)
-
     def read_attested_file(self, relative_path: str) -> bytes:
         """Read one manifest-pinned image member through no-follow descriptors."""
 
@@ -439,23 +434,6 @@ class RuntimeLayout:
         validate_runtime_metadata(self)
         return raw
 
-
-@dataclass(frozen=True, slots=True)
-class RuntimeImageRepositoryRoot:
-    """Opaque, generation-pinned image root accepted only by Hive diagnostics."""
-
-    _layout: RuntimeLayout
-
-    def __post_init__(self) -> None:
-        if not isinstance(self._layout, RuntimeLayout):
-            raise _invalid()
-        validate_runtime_metadata(self._layout)
-
-    def _validated_path(self) -> Path:
-        validate_runtime_metadata(self._layout)
-        return self._layout.root
-
-
 def validate_runtime_metadata(layout: RuntimeLayout) -> None:
     """Revalidate image files and metadata immediately before an MCP probe."""
 
@@ -476,7 +454,6 @@ def validate_runtime_metadata(layout: RuntimeLayout) -> None:
 
 __all__ = [
     "LayoutError",
-    "RuntimeImageRepositoryRoot",
     "RuntimeLayout",
     "validate_runtime_metadata",
 ]

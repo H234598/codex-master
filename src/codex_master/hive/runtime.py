@@ -36,8 +36,8 @@ from codex_master.hive.repositories import RepositoryBinding, RepositoryRegistry
 from codex_master.hive.state import HiveStateError, HiveStateStore
 from codex_master.runtime_layout import (
     LayoutError,
-    RuntimeImageRepositoryRoot,
     RuntimeLayout,
+    validate_runtime_metadata,
 )
 from codex_master.usage_snapshot import (
     AccountUsageEvidenceV2,
@@ -313,12 +313,49 @@ def _existing_state_kind(path: Path) -> str:
     return "ready"
 
 
+def _validate_runtime_image_repository_evidence(
+    layout: RuntimeLayout, config: HiveConfig
+) -> None:
+    """Prove that configured logical repositories belong to one image generation.
+
+    This intentionally offers no root capability: all configuration bytes were
+    read through ``layout.read_attested_file()``, and the final revalidation
+    pins them to that same immutable image generation.
+    """
+
+    if not isinstance(layout, RuntimeLayout) or not isinstance(config, HiveConfig):
+        raise HiveRuntimeError("invalid_runtime_image_evidence")
+    for repository in config.repositories:
+        if not isinstance(repository, Mapping) or not isinstance(repository.get("repo_id"), str):
+            raise HiveRuntimeError("invalid_runtime_image_evidence")
+    validate_runtime_metadata(layout)
+
+
+def _verify_runtime_image_principal_evidence(
+    config: HiveConfig,
+    classes: Mapping[str, AgentClassProfile],
+    state_root: Path,
+) -> None:
+    """Read state/principal parity without constructing runtime authority."""
+
+    state = HiveStateStore(state_root, read_only=True)
+    principals = PrincipalRegistry(state)
+    _verify_principal_parity(principals, _expected_principals(config, classes))
+    capabilities: dict[str, frozenset[str]] = {}
+    for profile in classes.values():
+        current = frozenset(profile.capabilities)
+        previous = capabilities.get(profile.authority_profile)
+        if previous is not None and previous != current:
+            raise HiveRuntimeError("authority_profile_capability_conflict")
+        capabilities[profile.authority_profile] = current
+
+
 def read_hive_runtime_evidence(
     *,
     catalog_path: Path | None = None,
     config_path: Path | None = None,
     state_root: Path | None = None,
-    repository_roots: Mapping[str, Path | RuntimeImageRepositoryRoot] | None = None,
+    repository_roots: Mapping[str, Path] | None = None,
     dynamic_account_evidence: object | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> HiveRuntimeEvidence:
@@ -327,10 +364,11 @@ def read_hive_runtime_evidence(
     use_runtime_image = (
         catalog_path is None and config_path is None and repository_roots is None
     )
-    repository_root = _default_repository_root()
-    catalog_path = catalog_path or repository_root / "codex-agent-classes.json"
-    config_path = config_path or repository_root / "codex-hive.json"
     state_root = state_root or _default_hive_state_root()
+    if not use_runtime_image:
+        repository_root = _default_repository_root()
+        catalog_path = catalog_path or repository_root / "codex-agent-classes.json"
+        config_path = config_path or repository_root / "codex-hive.json"
     empty = {
         "schema_version": 1,
         "mode": "disabled",
@@ -346,12 +384,17 @@ def read_hive_runtime_evidence(
         "principal_count": 0,
     }
     if (
-        not isinstance(catalog_path, Path)
-        or not catalog_path.is_absolute()
-        or not isinstance(config_path, Path)
-        or not config_path.is_absolute()
-        or not isinstance(state_root, Path)
+        not isinstance(state_root, Path)
         or not state_root.is_absolute()
+        or (
+            not use_runtime_image
+            and (
+                not isinstance(catalog_path, Path)
+                or not catalog_path.is_absolute()
+                or not isinstance(config_path, Path)
+                or not config_path.is_absolute()
+            )
+        )
     ):
         return HiveRuntimeEvidence(
             **{**empty, "reason_codes": ("hive_runtime_unavailable",)}
@@ -365,26 +408,15 @@ def read_hive_runtime_evidence(
             config = load_hive_config_bytes(
                 layout.read_attested_file("codex-hive.json"), snapshot.classes
             )
-            repository_roots = {
-                str(item["repo_id"]): layout.repository_root()
-                for item in config.repositories
-            }
+            _validate_runtime_image_repository_evidence(layout, config)
         else:
+            assert isinstance(catalog_path, Path) and isinstance(config_path, Path)
             snapshot = load_agent_class_catalog_snapshot(catalog_path)
             config = load_hive_config(config_path, snapshot.classes)
     except (HiveConfigError, LayoutError, OSError, TypeError, ValueError):
-        if use_runtime_image and not (repository_root / ".codex-master-runtime-manifest.json").exists():
-            try:
-                snapshot = load_agent_class_catalog_snapshot(catalog_path)
-                config = load_hive_config(config_path, snapshot.classes)
-            except (HiveConfigError, OSError, TypeError, ValueError):
-                return HiveRuntimeEvidence(
-                    **{**empty, "reason_codes": ("hive_config_unavailable",)}
-                )
-        else:
-            return HiveRuntimeEvidence(
-                **{**empty, "reason_codes": ("hive_config_unavailable",)}
-            )
+        return HiveRuntimeEvidence(
+            **{**empty, "reason_codes": ("hive_config_unavailable",)}
+        )
 
     state_kind = _existing_state_kind(state_root)
     repository_kind = "not_configured" if not config.repositories else "unavailable"
@@ -394,7 +426,7 @@ def read_hive_runtime_evidence(
     reasons: list[str] = []
     if not config.repositories:
         reasons.append("repository_not_configured")
-    elif repository_roots is None:
+    elif not use_runtime_image and repository_roots is None:
         reasons.append("repository_root_unavailable")
     if not config.principals:
         reasons.append("principal_not_configured")
@@ -403,7 +435,9 @@ def read_hive_runtime_evidence(
     elif state_kind != "ready":
         reasons.append("state_unavailable" if state_kind == "unavailable" else "state_invalid")
 
-    if config.repositories and repository_roots is not None:
+    if config.repositories and use_runtime_image:
+        repository_kind = "ready"
+    elif config.repositories and repository_roots is not None:
         try:
             repositories = _build_repositories(config, dict(repository_roots))
             for binding in config.repositories:
@@ -415,24 +449,29 @@ def read_hive_runtime_evidence(
             repository_kind = "invalid"
             reasons.append("repository_invalid")
 
-    runtime: HiveRuntime | None = None
+    diagnostics_ready = False
     if state_kind == "ready" and repository_kind == "ready" and config.principals:
         try:
-            runtime = build_hive_runtime(
-                config,
-                snapshot.classes,
-                repository_roots=dict(repository_roots or {}),
-                state_root=state_root,
-                materialize_principals=False,
-                now=now,
-                read_only=True,
-            )
+            if use_runtime_image:
+                _verify_runtime_image_principal_evidence(
+                    config, snapshot.classes, state_root
+                )
+            else:
+                build_hive_runtime(
+                    config,
+                    snapshot.classes,
+                    repository_roots=dict(repository_roots or {}),
+                    state_root=state_root,
+                    materialize_principals=False,
+                    now=now,
+                    read_only=True,
+                )
+            diagnostics_ready = True
         except (HiveRuntimeError, HiveStateError, HiveEventError, OSError, TypeError, ValueError):
             reasons.append("hive_runtime_invalid")
             principal_kind = "invalid"
-            runtime = None
 
-    if runtime is not None:
+    if diagnostics_ready:
         repository_kind = "ready"
         principal_kind = "ready"
         state_kind = "ready"
@@ -450,7 +489,7 @@ def read_hive_runtime_evidence(
     )
     authority = (
         "ready"
-        if runtime is not None and config.mode == "enforced" and pilot["allowed"] is True
+        if diagnostics_ready and config.mode == "enforced" and pilot["allowed"] is True
         else "fail_closed"
     )
     return HiveRuntimeEvidence(
@@ -512,7 +551,7 @@ def build_hive_runtime(
     config: HiveConfig,
     classes: Mapping[str, AgentClassProfile],
     *,
-    repository_roots: Mapping[str, Path | RuntimeImageRepositoryRoot],
+    repository_roots: Mapping[str, Path],
     state_root: Path,
     materialize_principals: bool = False,
     read_only: bool = False,
@@ -541,15 +580,6 @@ def build_hive_runtime(
         raise HiveRuntimeError("invalid_hive_runtime_mode")
     if read_only and materialize_principals:
         raise HiveRuntimeError("read_only_runtime_materialization_forbidden")
-    if (
-        not read_only
-        and any(
-            isinstance(root, RuntimeImageRepositoryRoot)
-            for root in repository_roots.values()
-        )
-    ):
-        raise HiveRuntimeError("runtime_image_repository_read_only")
-
     repositories = _build_repositories(config, repository_roots)
     try:
         state = HiveStateStore(state_root, read_only=read_only)
@@ -580,7 +610,7 @@ def _compose_hive_runtime_from_catalog_snapshot(
     config: HiveConfig,
     snapshot: AgentClassCatalogSnapshot,
     *,
-    repository_roots: Mapping[str, Path | RuntimeImageRepositoryRoot],
+    repository_roots: Mapping[str, Path],
     state_root: Path,
     expected_catalog_digest: str | None = None,
     materialize_principals: bool = False,
@@ -603,9 +633,7 @@ def _compose_hive_runtime_from_catalog_snapshot(
     return replace(runtime, classes=snapshot.classes, catalog_digest=snapshot.digest)
 
 
-def _build_repositories(
-    config: HiveConfig, roots: Mapping[str, Path | RuntimeImageRepositoryRoot]
-) -> RepositoryRegistry:
+def _build_repositories(config: HiveConfig, roots: Mapping[str, Path]) -> RepositoryRegistry:
     expected_ids = {str(raw.get("repo_id")) for raw in config.repositories}
     if set(roots) != expected_ids:
         raise HiveRuntimeError("repository_root_set_mismatch")

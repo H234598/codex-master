@@ -171,6 +171,11 @@ def test_complete_p2_runtime_image_binds_its_attested_root_without_a_checkout(
         lambda *, clock: _attested_pool_evidence(clock()),
     )
 
+    def unexpected_runtime_builder(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("image diagnostics must not assemble HiveRuntime")
+
+    monkeypatch.setattr(hive_runtime, "build_hive_runtime", unexpected_runtime_builder)
+
     evidence = read_hive_runtime_evidence(now=lambda: NOW)
 
     assert isinstance(evidence, HiveRuntimeEvidence)
@@ -218,12 +223,13 @@ def test_runtime_image_binding_is_rejected_outside_read_only_diagnostics(
         layout.read_attested_file("codex-hive.json"), snapshot.classes
     )
 
-    with pytest.raises(HiveRuntimeError, match="runtime_image_repository_read_only"):
+    with pytest.raises(HiveRuntimeError, match="invalid_repository_binding"):
         build_hive_runtime(
             config,
             snapshot.classes,
-            repository_roots={"codex-master": layout.repository_root()},
+            repository_roots={"codex-master": layout},
             state_root=state_root,
+            read_only=True,
         )
 
 
@@ -248,3 +254,51 @@ def test_missing_runtime_image_config_fails_closed_without_external_checkout(
     assert str(stage) not in rendered
     assert str(state_root) not in rendered
     assert str(external_checkout) not in rendered
+
+
+def test_implicit_image_evidence_never_falls_back_to_a_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No-argument consumers require a complete attested image generation."""
+
+    external_checkout = _p2_checkout(tmp_path / "external")
+    monkeypatch.chdir(external_checkout)
+    monkeypatch.setenv("CODEX_HOME", str(external_checkout / "attacker-codex-home"))
+    monkeypatch.setenv("CODEX_MASTER_RUNTIME_ROOT", str(external_checkout))
+    monkeypatch.setattr(hive_runtime, "_default_hive_state_root", lambda: tmp_path / "state")
+
+    evidence = read_hive_runtime_evidence(now=lambda: NOW)
+
+    assert evidence.mode == "disabled"
+    assert evidence.config_digest is None
+    assert evidence.catalog_digest is None
+    assert evidence.repository == "unavailable"
+    assert evidence.reason_codes == ("hive_config_unavailable",)
+    rendered = json.dumps(evidence.public(), sort_keys=True)
+    assert str(external_checkout) not in rendered
+
+
+def test_image_diagnostics_reject_conflicting_authority_profile_capabilities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The private image path keeps the normal authority conflict contract."""
+
+    stage, state_root, installer = _p2_runtime_image(tmp_path)
+    catalog = json.loads((stage / "codex-agent-classes.json").read_text(encoding="utf-8"))
+    for item in catalog["classes"]:
+        if item["class_id"] == "teamleiterin":
+            item["authority_profile"] = "specialist"
+    (stage / "codex-agent-classes.json").write_text(json.dumps(catalog), encoding="utf-8")
+    (stage / "codex-agent-classes.json").chmod(0o644)
+    (stage / ".codex-master-runtime-manifest.json").unlink()
+    installer["_write_runtime_image_manifest"](root=stage)
+
+    monkeypatch.setattr(hive_runtime, "__file__", str(stage / "src" / "codex_master" / "hive" / "runtime.py"))
+    monkeypatch.setattr(hive_runtime, "_default_hive_state_root", lambda: state_root)
+
+    evidence = read_hive_runtime_evidence(now=lambda: NOW)
+
+    assert evidence.repository == "ready"
+    assert evidence.principal == "invalid"
+    assert evidence.authority == "fail_closed"
+    assert "hive_runtime_invalid" in evidence.reason_codes
