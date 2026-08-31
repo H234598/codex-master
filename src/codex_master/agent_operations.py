@@ -195,6 +195,7 @@ class AgentOperationRequestV1:
     plan_digest: str
     arguments: Mapping[str, object]
     deadline: datetime
+    target_host_ref: str | None = None
 
     def __post_init__(self) -> None:
         kind, action = _check_kind_action(self.kind, self.action)
@@ -208,6 +209,8 @@ class AgentOperationRequestV1:
         object.__setattr__(self, "plan_digest", _digest(self.plan_digest))
         object.__setattr__(self, "arguments", arguments)
         object.__setattr__(self, "deadline", _utc(self.deadline))
+        if self.target_host_ref is not None:
+            object.__setattr__(self, "target_host_ref", _token(self.target_host_ref))
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +338,7 @@ class AgentOperationStore:
                 "arguments": arguments,
                 "created_at": _wire_time(now),
                 "deadline": _wire_time(request.deadline),
+                "target_host_ref": request.target_host_ref,
                 "lease": None,
                 "completion": None,
             }
@@ -360,6 +364,11 @@ class AgentOperationStore:
                 host_epochs[principal.host_ref] = poll.lease_epoch
                 for record in document["operations"]:
                     if record["state"] != "queued":
+                        continue
+                    if (
+                        record["target_host_ref"] is not None
+                        and record["target_host_ref"] != principal.host_ref
+                    ):
                         continue
                     if record["registry_generation"] > poll.registry_generation:
                         _raise("host.registry_generation_stale")
@@ -481,6 +490,19 @@ class AgentOperationStore:
         with self._state.locked():
             return self._view(self._find(self._read_locked()["operations"], operation_id))
 
+    def context(self, operation_id: str) -> Mapping[str, object]:
+        """Private owner context for the fixed host-probe completion path."""
+        operation_id = _token(operation_id, "host.operation_not_found")
+        with self._state.locked():
+            record = self._find(self._read_locked()["operations"], operation_id)
+            return MappingProxyType(
+                {
+                    "target_host_ref": record["target_host_ref"],
+                    "registry_generation": record["registry_generation"],
+                    "arguments": MappingProxyType(dict(record["arguments"])),
+                }
+            )
+
     def _begin_poll(self, host_ref: str) -> None:
         with self._active_lock:
             if host_ref in self._active_polls:
@@ -543,7 +565,8 @@ class AgentOperationStore:
         return validated
 
     def _record(self, value: object) -> dict[str, Any]:
-        if type(value) is not dict or set(value) != {
+        if type(value) is not dict or set(value) not in (
+            {
             "operation_id",
             "key",
             "state",
@@ -558,7 +581,25 @@ class AgentOperationStore:
             "deadline",
             "lease",
             "completion",
-        }:
+            },
+            {
+            "operation_id",
+            "key",
+            "state",
+            "kind",
+            "action",
+            "registry_generation",
+            "attempt",
+            "plan_digest",
+            "arguments_digest",
+            "arguments",
+            "created_at",
+            "deadline",
+            "target_host_ref",
+            "lease",
+            "completion",
+            },
+        ):
             _raise("host.operation_store_unavailable")
         record = cast(dict[str, object], value)
         state = _token(record["state"], "host.operation_store_unavailable")
@@ -587,6 +628,11 @@ class AgentOperationStore:
             "arguments": cast(dict[str, object], _public_json(arguments)),
             "created_at": _wire_time(_parse_time(record["created_at"])),
             "deadline": _wire_time(_parse_time(record["deadline"])),
+            "target_host_ref": (
+                None
+                if record.get("target_host_ref") is None
+                else _token(record["target_host_ref"], "host.operation_store_unavailable")
+            ),
             "lease": self._lease_doc(record["lease"]),
             "completion": self._stored_completion_doc(record["completion"]),
         }

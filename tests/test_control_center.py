@@ -12,6 +12,13 @@ from codex_master.fleet_control import OllamaPageState
 from codex_master.server import AgentError
 
 
+def test_host_probe_ui_refreshes_only_after_terminal_result() -> None:
+    assert control_center.host_probe_ui_state({"state": "planned"}).state == "QUEUED"
+    assert control_center.host_probe_ui_state({"state": "running"}).state == "RUNNING"
+    assert control_center.host_probe_ui_state({"state": "succeeded"}).refresh_host_card is True
+    assert control_center.host_probe_ui_state({"state": "unknown"}).state == "UNKNOWN"
+
+
 class ControlCenterViewModelTest(unittest.TestCase):
     @staticmethod
     def _ollama_payloads() -> tuple[dict, dict]:

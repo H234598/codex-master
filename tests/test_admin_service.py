@@ -976,6 +976,16 @@ def test_queries_require_their_exact_scope(
     assert service.query(principal(required_scope), operation, arguments)
 
 
+def test_host_probe_requires_its_separate_scope_before_owner_dispatch() -> None:
+    service, _owners = service_at()
+
+    with pytest.raises(AdminDenied, match="authority.scope_denied"):
+        service.command(
+            principal("fleet.host.read"), "hosts.probe", {"host_ref": "worker-one"},
+            expected_generation=4, idempotency_key="probe-one",
+        )
+
+
 def test_ollama_models_and_instances_queries_keep_layers_separate() -> None:
     service, owners = service_at()
 

@@ -164,6 +164,26 @@ class StatusPage:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class HostProbeUiState:
+    state: str
+    refresh_host_card: bool
+
+
+def host_probe_ui_state(result: object) -> HostProbeUiState:
+    """Keep host cards stable until the probe operation is terminal."""
+    if type(result) is not dict or type(result.get("state")) is not str:
+        return HostProbeUiState("UNKNOWN", False)
+    state = result["state"]
+    if state in {"planned", "queued"}:
+        return HostProbeUiState("QUEUED", False)
+    if state in {"running", "leased"}:
+        return HostProbeUiState("RUNNING", False)
+    if state == "succeeded":
+        return HostProbeUiState("SUCCEEDED", True)
+    return HostProbeUiState("UNKNOWN", state in {"failed", "partial", "blocked"})
+
+
 def _non_negative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 

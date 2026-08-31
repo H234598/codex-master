@@ -72,3 +72,46 @@ hook is owned by the pre-existing agent daemon and is intentionally not changed
 in this task's permitted file set; remote collection is queued asynchronously,
 but recording a receipt into the registry requires that existing owner hook to
 call the adapter completion path. This is the remaining integration risk.
+
+## Fix round 1/5
+
+The agent-operation record now has an optional, persisted `target_host_ref`.
+The poll path skips a target-bound operation for every other principal, while
+the existing receipt lease fence continues to reject a cross-host completion.
+This is the sole supporting-owner extension; it is private, bounded, and adds
+no public result wire.
+
+`RemoteHostProbeCompletionOwner` is installed on the host-agent HTTP receipt
+path. It validates the fixed action, exact target, generation, canonical
+`HostProbeEvidenceV1` public DTO and digest before recording a probe. Invalid,
+stale, cross-host and unknown outcomes do not mutate the registry. Both probe
+adapters now derive a bounded host-bound internal operation key. The CLI keeps
+the required `--json` switch and derives its stable key from host and
+generation, so it no longer asks the operator for `--idempotency-key`.
+
+RED:
+
+```text
+PYTHONPATH=src pytest -q tests/test_agent_operations.py -k target_host_fence
+FAILED: AgentOperationRequestV1.__init__() got an unexpected keyword argument 'target_host_ref'
+```
+
+GREEN:
+
+```text
+PYTHONPATH=src pytest -q tests/test_host_probe.py tests/test_admin_contracts.py tests/test_admin_http.py tests/test_admin_service.py tests/test_admin_cli_mcp_integration.py tests/test_agent_operations.py tests/test_control_catalog.py tests/test_control_center.py -k 'host or probe'
+19 passed, 316 deselected in 5.34s
+
+ruff check <changed Task-6 modules and focused tests>
+All checks passed!
+
+python -m compileall -q <changed production modules>
+(clean)
+
+git diff --check
+(clean)
+```
+
+The fix also adds the mutating catalog entry and a headless Control Center
+state contract: `QUEUED`, `RUNNING`, `SUCCEEDED`, `UNKNOWN`; host-card refresh
+is allowed only for terminal states.

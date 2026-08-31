@@ -181,6 +181,18 @@ def test_cross_host_or_digest_drift_receipt_changes_nothing(tmp_path: Path) -> N
     assert store.get(lease.operation_id) == before
 
 
+def test_target_host_fence_never_leases_to_another_host(tmp_path: Path) -> None:
+    store = store_at(tmp_path)
+    request = operation_request()
+    request = replace(request, target_host_ref="worker-one")
+    store.enqueue(request)
+
+    no_work = store.poll(principal("worker-two"), poll())
+    assert isinstance(no_work, AgentNoWorkV1)
+    leased = store.poll(principal("worker-one"), poll(epoch=4))
+    assert isinstance(leased, AgentLeaseV1)
+    assert leased.host_ref == "worker-one"
+
 def test_queue_limit_is_1024_records(tmp_path: Path) -> None:
     store = store_at(tmp_path)
     for index in range(MAX_AGENT_OPERATION_RECORDS):

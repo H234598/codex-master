@@ -90,6 +90,7 @@ EXPECTED_RISKS = {
     "fleet_ollama_instance_plan": Risk.MUTATING,
     "fleet_ollama_instance_apply": Risk.MUTATING,
     "fleet_ollama_instance_probe": Risk.MUTATING,
+    "fleet_host_probe": Risk.MUTATING,
     "fleet_provider_models": Risk.READ_ONLY,
     "fleet_series_plan": Risk.READ_ONLY,
     "fleet_series_apply": Risk.MUTATING,

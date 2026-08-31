@@ -810,6 +810,25 @@ def test_fresh_totp_is_bound_to_only_current_request(tmp_path) -> None:
     assert json.loads(replay_payload)["code"] == "authority.step_up_replayed"
 
 
+def test_host_probe_route_requires_https_step_up_and_binds_ref(tmp_path) -> None:
+    body = _document(
+        "hosts.probe", {"host_ref": "worker-one"},
+        expected_generation=4, idempotency_key="probe-one",
+    )
+    with _running_server(tmp_path) as (server, service):
+        denied, _headers_out, _payload = _request(
+            server, "POST", "/admin/v1/hosts/worker-one/probe", body, _headers()
+        )
+        accepted, _headers_out, _payload = _request(
+            server, "POST", "/admin/v1/hosts/worker-one/probe", body,
+            _headers(**{"X-Masterjet-Step-Up": _totp()}),
+        )
+
+    assert denied == 403
+    assert accepted == 200
+    assert service.calls[-1][1].operation == "hosts.probe"
+
+
 def test_secret_ingress_flow_grant_covers_only_put_and_matching_apply(tmp_path) -> None:
     with _running_server(tmp_path) as (server, service):
         created, _headers_out, create_payload = _request(

@@ -34416,6 +34416,8 @@ def _add_masterjet_admin_cli_command(
 ) -> None:
     parser = subparsers.add_parser(command)
     required, optional = _masterjet_admin_operation_fields(operation)
+    if operation == "hosts.probe":
+        required = tuple(field for field in required if field != "idempotency_key")
     if alternate_operation is not None:
         alternate_required, alternate_optional = _masterjet_admin_operation_fields(
             alternate_operation
@@ -34460,6 +34462,14 @@ def _masterjet_admin_cli_call(args: argparse.Namespace) -> dict[str, Any]:
         for field in (*required, *optional)
         if (value := getattr(args, field, None)) is not None
     }
+    if operation == "hosts.probe":
+        host_ref = arguments.get("host_ref")
+        generation = arguments.get("expected_generation")
+        if type(host_ref) is not str or type(generation) is not int:
+            raise AgentError("control.service_unavailable")
+        arguments["idempotency_key"] = "cli-probe-" + hashlib.sha256(
+            f"{host_ref}\0{generation}".encode("ascii")
+        ).hexdigest()
     return _masterjet_admin_operation_call(operation, arguments)
 
 

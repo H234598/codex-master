@@ -5,7 +5,12 @@ from datetime import UTC, datetime
 
 import pytest
 
-from codex_master.host_probe import HostProbeError, LocalHostProbeCollector
+from codex_master.host_probe import (
+    HostProbeError,
+    HostProbeEvidenceV1,
+    LocalHostProbeCollector,
+    _operation_key,
+)
 
 
 class Kernel:
@@ -60,3 +65,17 @@ def test_local_probe_maps_collector_failure_to_stable_code() -> None:
 
     with pytest.raises(HostProbeError, match="host.probe_failed"):
         LocalHostProbeCollector().collect(Broken())
+
+
+def test_remote_evidence_uses_the_exact_same_public_dto_validation() -> None:
+    local = LocalHostProbeCollector(lambda: datetime(2026, 8, 30, tzinfo=UTC)).collect(Kernel())
+
+    assert HostProbeEvidenceV1.from_public(local.public()).public() == local.public()
+    tampered = local.public()
+    tampered["evidence_digest"] = "sha256:" + "0" * 64
+    with pytest.raises(HostProbeError, match="host.probe_failed"):
+        HostProbeEvidenceV1.from_public(tampered)
+
+
+def test_host_bound_internal_idempotency_never_aliases_hosts() -> None:
+    assert _operation_key("worker-one", "client-key") != _operation_key("worker-two", "client-key")

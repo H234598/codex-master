@@ -65,10 +65,11 @@ def _problem(status: int, code: str) -> AgentHttpResponse:
 class AgentHttpApplication:
     """Dispatch exactly the two agent routes to the existing operation store."""
 
-    def __init__(self, store: _Store) -> None:
+    def __init__(self, store: _Store, completion_owner: object | None = None) -> None:
         if not hasattr(store, "poll") or not hasattr(store, "complete"):
             raise TypeError("agent.store_invalid")
         self._store = store
+        self._completion_owner = completion_owner
 
     def handle(
         self,
@@ -102,7 +103,11 @@ class AgentHttpApplication:
             receipt = parse_agent_receipt(value)
             if receipt.operation_id != cast(re.Match[str], receipt_match).group(1):
                 raise AgentContractError
-            self._store.complete(principal, receipt)
+            owner = self._completion_owner
+            if receipt.result.kind == "host.probe" and callable(getattr(owner, "complete", None)):
+                owner.complete(principal, receipt)
+            else:
+                self._store.complete(principal, receipt)
             return _response(
                 200,
                 {"schema_version": 1, "operation_id": receipt.operation_id, "accepted": True},

@@ -28,6 +28,8 @@ from .agent_http import (
 )
 from .agent_identity import AgentIdentityResolver
 from .agent_operations import AgentOperationStore
+from .admin_operations import AdminOperationStore
+from .host_probe import RemoteHostProbeCompletionOwner
 
 
 _STATE_ROOT = Path("/var/lib/codex-master")
@@ -305,7 +307,14 @@ def assemble_server(address: str, port: int, credentials: AgentCredentialFds) ->
     store = AgentOperationStore(_STATE_ROOT)
     return AgentApiServer(
         (address, port),
-        AgentHttpApplication(store),
+        AgentHttpApplication(
+            store,
+            RemoteHostProbeCompletionOwner(
+                operation_store=AdminOperationStore(_STATE_ROOT),
+                agent_operations=store,
+                host_registry=registry,
+            ),
+        ),
         AgentIdentityResolver(registry),
         create_agent_ssl_context(credentials),
     )

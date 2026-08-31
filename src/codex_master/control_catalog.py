@@ -157,6 +157,7 @@ _MUTATING_TOOLS = {
     "fleet_ollama_instance_plan",
     "fleet_ollama_instance_apply",
     "fleet_ollama_instance_probe",
+    "fleet_host_probe",
     "fleet_series_apply",
     "fleet_series_disable",
     "fleet_series_delete",
