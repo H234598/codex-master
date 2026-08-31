@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -49,7 +50,10 @@ def test_effect_started_without_receipt_recovers_unknown(tmp_path: Path) -> None
         arguments_digest=digest({"plan_ref": "plan-one"}),
     )
     assert state.accept(item) is None
-    state.begin_effect(item)
+    thread = threading.Thread(target=lambda: state.begin_effect(item))
+    thread.start()
+    thread.join(2)
+    assert not thread.is_alive()
     recovered = HostAgentState.for_test(tmp_path, host_ref="worker-one").recover(item)
     assert recovered is not None and recovered.state == "unknown"
 
@@ -109,6 +113,14 @@ def test_wrong_host_stale_epoch_and_digest_conflict_fail_closed(tmp_path: Path) 
         state.accept(
             lease(operation_id="same", lease_epoch=4, plan_digest="sha256:" + "b" * 64)
         )
+    for changed in (
+        {"lease_id": "lease-two"},
+        {"attempt": 2},
+        {"registry_generation": 8},
+        {"lease_epoch": 5},
+    ):
+        with pytest.raises(HostAgentStateError, match="host.replay_conflict"):
+            state.accept(lease(**{"operation_id": "same", "lease_epoch": 4, **changed}))
 
 
 def test_receipts_are_bounded_and_only_older_generations_are_pruned(
@@ -140,3 +152,78 @@ def test_receipts_are_bounded_and_only_older_generations_are_pruned(
                 lease_epoch=4,
             )
         )
+
+
+def test_effect_claim_is_atomic_and_only_one_caller_owns_it(tmp_path: Path) -> None:
+    item = lease(
+        kind="ollama.instance",
+        action="apply",
+        arguments={"plan_ref": "plan-one"},
+        arguments_digest=digest({"plan_ref": "plan-one"}),
+    )
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    state.accept(item)
+    barrier = threading.Barrier(3)
+    claims: list[str | None] = []
+
+    def claim() -> None:
+        barrier.wait()
+        claims.append(state.begin_effect(item))
+
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(2)
+    assert all(not thread.is_alive() for thread in threads)
+    assert sum(claim is not None for claim in claims) == 1
+
+
+def test_state_rejects_duplicate_keys_and_incoherent_records(tmp_path: Path) -> None:
+    root = tmp_path / "host-agent"
+    root.mkdir(mode=0o700)
+    state_file = root / "host-agent.json"
+    state_file.write_text(
+        '{"schema_version":2,"schema_version":2,"highest_lease_epoch":0,'
+        '"highest_registry_generation":0,"accepted":{},"receipts":{}}'
+    )
+    with pytest.raises(HostAgentStateError, match="host.state_unavailable"):
+        HostAgentState.for_test(tmp_path, host_ref="worker-one")
+
+    state_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "highest_lease_epoch": 0,
+                "highest_registry_generation": 0,
+                "accepted": {"wrong-map-key": {}},
+                "receipts": {},
+            }
+        )
+    )
+    with pytest.raises(HostAgentStateError, match="host.state_unavailable"):
+        HostAgentState.for_test(tmp_path, host_ref="worker-one")
+
+
+def test_accepted_records_are_bounded_and_expired_unclaimed_work_is_reclaimed(
+    tmp_path: Path,
+) -> None:
+    state = HostAgentState.for_test(
+        tmp_path, host_ref="worker-one", max_accepted=2
+    )
+    state.accept(lease(operation_id="one", lease_id="lease-one"))
+    state.accept(lease(operation_id="two", lease_id="lease-two"))
+    with pytest.raises(HostAgentStateError, match="host.accepted_limit"):
+        state.accept(lease(operation_id="three", lease_id="lease-three"))
+
+    expired = lease(
+        operation_id="expired",
+        lease_id="lease-expired",
+        deadline=datetime(2020, 1, 1, tzinfo=UTC),
+    )
+    other = HostAgentState.for_test(
+        tmp_path / "expiry", host_ref="worker-one", max_accepted=1
+    )
+    other.accept(expired)
+    other.accept(lease(operation_id="replacement", lease_id="lease-replacement"))

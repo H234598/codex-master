@@ -1,104 +1,212 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
+import re
 
 import pytest
 
+from codex_master import agent_ollama
 from codex_master.agent_ollama import (
     AgentOllamaError,
     AgentOllamaExecutor,
-    validate_private_path,
 )
+from codex_master.ollama_registry import (
+    OllamaInstanceV1,
+    OllamaModelV1,
+    OllamaRegistryStore,
+)
+from codex_master.ollama_runtime import OllamaRuntimeError
 
 
-class Runtime:
+class FakeProcess:
+    pid = 4242
+
+    def poll(self) -> int | None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+class ControlledRuntime:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, object]] = []
+        self.started: list[object] = []
+        self.stopped: list[object] = []
+        self.process_up = True
 
-    def plan(self, arguments: object) -> dict[str, object]:
-        self.calls.append(("plan", arguments))
-        return {"plan_ref": "plan-one"}
+    def available_cpus(self) -> tuple[int, ...]:
+        return (0,)
 
-    def apply(self, arguments: object) -> dict[str, object]:
-        self.calls.append(("apply", arguments))
-        return {"instance_ref": "instance-one"}
+    def allocate_loopback_port(self) -> int:
+        return 11435
 
-    def probe(self, arguments: object) -> dict[str, object]:
-        self.calls.append(("probe", arguments))
-        return {"ready": True}
+    def start_scope(self, request: object) -> FakeProcess:
+        self.started.append(request)
+        return FakeProcess()
 
-    def stop(self, arguments: object) -> dict[str, object]:
-        self.calls.append(("stop", arguments))
-        return {"stopped": True}
+    def resolve_scope(
+        self, request: object, process: object
+    ) -> tuple[int, str, int]:
+        return 4343, "/user.slice/ollama.scope", 901
+
+    def process_running(
+        self, process: object, pid: int, start_ticks: int
+    ) -> bool:
+        return self.process_up
+
+    def scope_process_matches(
+        self,
+        unit_name: str,
+        pid: int,
+        control_group: str,
+        start_ticks: int,
+    ) -> bool:
+        return True
+
+    def listener_owned_by(self, pid: int, port: int) -> bool:
+        return True
+
+    def fetch_tags(
+        self,
+        pid: int,
+        port: int,
+        *,
+        unit_name: str,
+        control_group: str,
+        start_ticks: int,
+        timeout_seconds: float,
+        max_bytes: int,
+    ) -> set[str]:
+        return {"model-id"}
+
+    def cleanup_scope(self, request: object, process: object) -> None:
+        return None
+
+    def stop_scope(self, request: object) -> None:
+        self.stopped.append(request)
+        self.process_up = False
 
 
-def test_each_closed_action_has_exact_arguments() -> None:
-    runtime = Runtime()
-    executor = AgentOllamaExecutor(runtime)
-    assert (
-        executor.plan({"instance_ref": "one", "generation": 2})["plan_ref"]
-        == "plan-one"
+def registry_at(tmp_path: Path) -> tuple[OllamaRegistryStore, Path]:
+    executable = tmp_path / "ollama"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    models = tmp_path / "models"
+    models.mkdir(mode=0o700)
+    store = OllamaRegistryStore.for_test(tmp_path / "registry")
+    store.replace(
+        models=(
+            OllamaModelV1(
+                "model",
+                "model-id",
+                True,
+                True,
+                True,
+                None,
+            ),
+        ),
+        instances=(
+            OllamaInstanceV1(
+                "instance-one",
+                "Instance One",
+                "local",
+                str(executable),
+                str(models),
+                ("model",),
+                "0",
+                100,
+                100,
+                "planned",
+                "unknown",
+            ),
+        ),
+        expected_generation=0,
     )
-    assert executor.apply({"plan_ref": "one"})["instance_ref"] == "instance-one"
-    assert executor.probe({"instance_ref": "one", "generation": 2})["ready"] is True
-    assert executor.stop({"instance_ref": "one", "generation": 2})["stopped"] is True
-    with pytest.raises(AgentOllamaError, match="host.arguments_invalid"):
-        executor.apply({"plan_ref": "one", "free": "form"})
+    return store, executable
 
 
-def test_private_absolute_path_is_allowlisted_owned_regular_and_nofollow(
+def test_production_adapter_uses_public_runtime_plan_apply_probe_stop(
     tmp_path: Path,
 ) -> None:
-    allowed = tmp_path / "allowed"
-    allowed.mkdir()
-    target = allowed / "ollama"
-    target.write_text("binary")
-    assert (
-        validate_private_path(
-            str(target),
-            roots=(tmp_path / "missing", allowed),
-            owner_uid=os.geteuid(),
-            kind="file",
-        )
-        == target
+    store, _executable = registry_at(tmp_path)
+    runtime = ControlledRuntime()
+    executor = AgentOllamaExecutor(
+        agent_ollama.ProductionAgentOllamaAdapter(store, runtime=runtime)
     )
-    link = allowed / "link"
-    link.symlink_to(target)
-    linked_directory = allowed / "linked-directory"
-    real_directory = allowed / "real-directory"
-    real_directory.mkdir()
-    linked_directory.symlink_to(real_directory)
-    nested = linked_directory / "nested"
-    nested.write_text("data")
-    for candidate in (link, nested, tmp_path / "outside"):
-        with pytest.raises(AgentOllamaError, match="resource.path_invalid"):
-            validate_private_path(
-                str(candidate), roots=(allowed,), owner_uid=os.geteuid(), kind="file"
-            )
 
-    ancestor_link = tmp_path / "ancestor-link"
-    ancestor_link.symlink_to(tmp_path, target_is_directory=True)
-    linked_root = ancestor_link / "allowed"
-    with pytest.raises(AgentOllamaError, match="resource.path_invalid"):
-        validate_private_path(
-            str(linked_root / "ollama"),
-            roots=(linked_root,),
-            owner_uid=os.geteuid(),
-            kind="file",
-        )
+    planned = executor.plan({"instance_ref": "instance-one", "generation": 1})
+    assert re.fullmatch(r"plan-[0-9a-f]{32}", planned["plan_ref"])
+    applied = executor.apply({"plan_ref": planned["plan_ref"]})
+    assert applied == {"instance_ref": "instance-one", "generation": 1}
+    assert len(runtime.started) == 1
+
+    probed = executor.probe({"instance_ref": "instance-one", "generation": 1})
+    assert probed == {
+        "ready": True,
+        "reason_codes": [],
+        "process_running": True,
+        "cgroup_member": True,
+        "loopback_endpoint_reachable": True,
+        "available_model_ids": ["model-id"],
+    }
+    assert executor.stop(
+        {"instance_ref": "instance-one", "generation": 1}
+    ) == {"stopped": True}
+    assert len(runtime.stopped) == 1
 
 
-def test_private_directory_type_and_owner_are_checked(tmp_path: Path) -> None:
-    allowed = tmp_path / "allowed"
-    allowed.mkdir()
-    assert (
-        validate_private_path(
-            str(allowed), roots=(allowed,), owner_uid=os.geteuid(), kind="directory"
-        )
-        == allowed
+def test_apply_revalidates_original_path_evidence_at_actual_consumer(
+    tmp_path: Path,
+) -> None:
+    store, executable = registry_at(tmp_path)
+    runtime = ControlledRuntime()
+    executor = AgentOllamaExecutor(
+        agent_ollama.ProductionAgentOllamaAdapter(store, runtime=runtime)
     )
-    with pytest.raises(AgentOllamaError, match="resource.path_invalid"):
-        validate_private_path(
-            str(allowed), roots=(allowed,), owner_uid=os.geteuid() + 1, kind="directory"
+    plan_ref = executor.plan(
+        {"instance_ref": "instance-one", "generation": 1}
+    )["plan_ref"]
+    executable.rename(tmp_path / "old-ollama")
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+
+    with pytest.raises(OllamaRuntimeError, match="resource.target_path_changed"):
+        executor.apply({"plan_ref": plan_ref})
+
+    assert runtime.started == []
+
+
+def test_unknown_or_stale_local_refs_prove_no_effect(tmp_path: Path) -> None:
+    store, _executable = registry_at(tmp_path)
+    executor = AgentOllamaExecutor(
+        agent_ollama.ProductionAgentOllamaAdapter(
+            store, runtime=ControlledRuntime()
         )
+    )
+    with pytest.raises(
+        agent_ollama.AgentOllamaNoEffectError, match="provider.plan_missing"
+    ):
+        executor.apply({"plan_ref": "plan-" + "0" * 32})
+    with pytest.raises(
+        agent_ollama.AgentOllamaNoEffectError,
+        match="provider.instance_missing",
+    ):
+        executor.stop({"instance_ref": "missing", "generation": 1})
+    with pytest.raises(
+        agent_ollama.AgentOllamaNoEffectError,
+        match="provider.generation_stale",
+    ):
+        executor.plan({"instance_ref": "instance-one", "generation": 0})
+
+
+def test_each_closed_action_rejects_free_form_arguments(tmp_path: Path) -> None:
+    store, _executable = registry_at(tmp_path)
+    executor = AgentOllamaExecutor(
+        agent_ollama.ProductionAgentOllamaAdapter(
+            store, runtime=ControlledRuntime()
+        )
+    )
+    with pytest.raises(AgentOllamaError, match="host.arguments_invalid"):
+        executor.apply({"plan_ref": "one", "free": "form"})
+    with pytest.raises(AgentOllamaError, match="host.arguments_invalid"):
+        executor.probe({"instance_ref": "/absolute/path", "generation": 1})

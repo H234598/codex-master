@@ -4,15 +4,29 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import os
+from pathlib import Path
+import re
+import signal
 import ssl
+import stat
+import threading
 import time
-from typing import Protocol, cast
+from http.client import HTTPException, IncompleteRead
+from typing import Iterator, Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import HTTPSHandler, Request, build_opener
+from urllib.request import (
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 
 from codex_master.agent_contracts import (
     AgentLeaseV1,
@@ -22,12 +36,26 @@ from codex_master.agent_contracts import (
     AgentResultV1,
     serialize_agent_result,
 )
-from codex_master.agent_ollama import AgentOllamaExecutor
+from codex_master.agent_ollama import (
+    AgentOllamaExecutor,
+    AgentOllamaNoEffectError,
+    ProductionAgentOllamaAdapter,
+)
 from codex_master.host_agent_state import HostAgentState
+from codex_master.ollama_registry import OllamaRegistryStore
 
 
 BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30)
 MAX_RESPONSE_BYTES = 256 * 1024
+MAX_CONFIG_BYTES = 64 * 1024
+MAX_CREDENTIAL_BYTES = 1024 * 1024
+_CREDENTIAL_NAMES = (
+    "agent-config",
+    "agent-master-ca",
+    "agent-client-cert",
+    "agent-client-key",
+)
+_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 
 
 class HostAgentError(RuntimeError):
@@ -42,6 +70,186 @@ def _json(value: object) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("ascii")
+
+
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def _reject_constant(_value: str) -> None:
+    raise ValueError
+
+
+@dataclass(frozen=True, slots=True)
+class HostAgentConfig:
+    master_url: str
+    host_ref: str
+    registry_generation: int
+    lease_epoch: int
+    capabilities_digest: str
+    state_root: Path
+    ollama_registry_path: Path
+    max_wait_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class HostAgentCredentialFds:
+    config: int
+    trust: int
+    certificate: int
+    private_key: int
+
+    def __iter__(self) -> Iterator[int]:
+        return iter((self.config, self.trust, self.certificate, self.private_key))
+
+
+class _CredentialOwner(AbstractContextManager[HostAgentCredentialFds]):
+    def __init__(self, value: HostAgentCredentialFds) -> None:
+        self.value = value
+
+    def __enter__(self) -> HostAgentCredentialFds:
+        return self.value
+
+    def __exit__(self, *_error: object) -> None:
+        for descriptor in self.value:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def open_host_agent_credentials(
+    environment: Mapping[str, str],
+) -> _CredentialOwner:
+    """Open fixed systemd credentials relative to a verified directory FD."""
+    raw_directory = environment.get("CREDENTIALS_DIRECTORY")
+    if not raw_directory or not Path(raw_directory).is_absolute():
+        _fail("host.credentials_invalid")
+    directory_fd = -1
+    opened: list[int] = []
+    try:
+        directory_fd = os.open(
+            raw_directory,
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | os.O_DIRECTORY
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        directory_stat = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid not in {0, os.geteuid()}
+            or directory_stat.st_mode & 0o022
+        ):
+            raise OSError
+        for index, name in enumerate(_CREDENTIAL_NAMES):
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            metadata = os.fstat(descriptor)
+            limit = MAX_CONFIG_BYTES if index == 0 else MAX_CREDENTIAL_BYTES
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid not in {0, os.geteuid()}
+                or metadata.st_mode & 0o022
+                or not 1 <= metadata.st_size <= limit
+            ):
+                os.close(descriptor)
+                raise OSError
+            opened.append(descriptor)
+        return _CredentialOwner(HostAgentCredentialFds(*opened))
+    except OSError:
+        for descriptor in opened:
+            os.close(descriptor)
+        _fail("host.credentials_invalid")
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def load_host_agent_config(descriptor: int) -> HostAgentConfig:
+    """Read one bounded, exact static configuration from an already-open FD."""
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = MAX_CONFIG_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        document = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_constant,
+        )
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        _fail("host.config_invalid")
+    expected = {
+        "schema_version",
+        "master_url",
+        "host_ref",
+        "registry_generation",
+        "lease_epoch",
+        "capabilities_digest",
+        "state_root",
+        "ollama_registry_path",
+        "max_wait_seconds",
+    }
+    if type(document) is not dict or set(document) != expected:
+        _fail("host.config_invalid")
+    try:
+        config = HostAgentConfig(
+            master_url=_master_origin(document["master_url"]),
+            host_ref=cast(str, document["host_ref"]),
+            registry_generation=cast(int, document["registry_generation"]),
+            lease_epoch=cast(int, document["lease_epoch"]),
+            capabilities_digest=cast(str, document["capabilities_digest"]),
+            state_root=Path(cast(str, document["state_root"])),
+            ollama_registry_path=Path(cast(str, document["ollama_registry_path"])),
+            max_wait_seconds=cast(int, document["max_wait_seconds"]),
+        )
+        AgentPollV1(
+            config.registry_generation,
+            config.lease_epoch,
+            config.capabilities_digest,
+            config.max_wait_seconds,
+        )
+    except (TypeError, ValueError):
+        _fail("host.config_invalid")
+    if (
+        document["schema_version"] != 1
+        or type(config.host_ref) is not str
+        or _TOKEN.fullmatch(config.host_ref) is None
+        or not config.state_root.is_absolute()
+        or not config.ollama_registry_path.is_absolute()
+    ):
+        _fail("host.config_invalid")
+    return config
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: Request,
+        file_pointer: object,
+        code: int,
+        message: str,
+        headers: object,
+        new_url: str,
+    ) -> None:
+        del request, file_pointer, code, message, headers, new_url
+        return None
 
 
 def _master_origin(value: object) -> str:
@@ -92,7 +300,9 @@ class HostAgentClient:
         sleep: object = time.sleep,
     ) -> None:
         self.master_url = _master_origin(master_url)
-        self._opener = build_opener(HTTPSHandler(context=context))
+        self._opener = build_opener(
+            ProxyHandler({}), _NoRedirectHandler(), HTTPSHandler(context=context)
+        )
         if not callable(sleep):
             _fail("host.request_invalid")
         self._sleep = sleep
@@ -197,12 +407,27 @@ class HostAgentClient:
         for attempt in range(len(BACKOFF_SECONDS) + 1):
             try:
                 with self._opener.open(request, timeout=35) as response:
+                    content_types = response.headers.get_all("Content-Type") or []
+                    content_lengths = response.headers.get_all("Content-Length") or []
+                    if response.status != 200 or response.geturl() != request.full_url:
+                        _fail("resource.host_response_invalid")
+                    if content_types != ["application/json"] or len(content_lengths) != 1:
+                        _fail("resource.host_response_invalid")
+                    content_length = content_lengths[0]
                     if (
-                        response.status != 200
-                        or response.headers.get_content_type() != "application/json"
+                        type(content_length) is not str
+                        or not content_length.isascii()
+                        or not content_length.isdecimal()
+                        or not 1 <= int(content_length) <= MAX_RESPONSE_BYTES
                     ):
                         _fail("resource.host_response_invalid")
-                    raw = response.read(MAX_RESPONSE_BYTES + 1)
+                    expected_length = int(content_length)
+                    try:
+                        raw = response.read(expected_length + 1)
+                    except (IncompleteRead, HTTPException):
+                        _fail("resource.host_response_invalid")
+                    if len(raw) != expected_length:
+                        _fail("resource.host_response_invalid")
                 break
             except HostAgentError:
                 raise
@@ -217,8 +442,12 @@ class HostAgentClient:
         if len(raw) > MAX_RESPONSE_BYTES:
             _fail("resource.host_response_invalid")
         try:
-            result = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            result = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_strict_object,
+                parse_constant=_reject_constant,
+            )
+        except (UnicodeError, ValueError, TypeError, RecursionError):
             _fail("resource.host_response_invalid")
         if type(result) is not dict:
             _fail("resource.host_response_invalid")
@@ -278,17 +507,46 @@ class HostAgentExecutor:
         recovered = self._state.recover(lease)
         if recovered is not None:
             return recovered
-        if lease.action in {"apply", "stop"}:
-            self._state.begin_effect(lease)
+        if lease.kind == "ollama.instance":
+            self._ollama.validate(lease.action, lease.arguments)
+        mutating = (lease.kind, lease.action) in {
+            ("ollama.instance", "apply"),
+            ("ollama.instance", "stop"),
+        }
+        claim_token = self._state.begin_effect(lease) if mutating else None
+        if mutating and claim_token is None:
+            concurrent = self._state.recover(lease)
+            if concurrent is None:
+                _fail("host.effect_claim_lost")
+            return concurrent
         try:
             payload = dict(self.dispatch(lease.kind, lease.action, lease.arguments))
-        except Exception:
-            result = AgentResultV1(lease.kind, lease.action, {"status": "failed"})
+        except AgentOllamaNoEffectError:
+            result = AgentResultV1(
+                lease.kind, lease.action, {"status": "failed"}
+            )
             return self._state.finish(
                 lease,
                 state="failed",
                 reason_codes=("host.operation_failed",),
                 result=result,
+                claim_token=claim_token,
+            )
+        except Exception:
+            unknown = mutating
+            result = AgentResultV1(
+                lease.kind,
+                lease.action,
+                {"status": "effect_unknown" if unknown else "failed"},
+            )
+            return self._state.finish(
+                lease,
+                state="unknown" if unknown else "failed",
+                reason_codes=(
+                    "host.operation_unknown" if unknown else "host.operation_failed",
+                ),
+                result=result,
+                claim_token=claim_token,
             )
         result = AgentResultV1(lease.kind, lease.action, payload)
         return self._state.finish(
@@ -296,6 +554,7 @@ class HostAgentExecutor:
             state="succeeded",
             reason_codes=("host.operation_succeeded",),
             result=result,
+            claim_token=claim_token,
         )
 
 
@@ -349,19 +608,71 @@ class HostAgent:
         return 0
 
 
+def assemble_host_agent(
+    credentials: HostAgentCredentialFds,
+) -> tuple[HostAgent, HostAgentConfig]:
+    """Assemble all production dependencies from owned credential descriptors."""
+    config = load_host_agent_config(credentials.config)
+    context = build_tls_context(
+        trust_fd=credentials.trust,
+        certificate_fd=credentials.certificate,
+        key_fd=credentials.private_key,
+    )
+    state = HostAgentState(config.state_root, host_ref=config.host_ref)
+    registry = OllamaRegistryStore(config.ollama_registry_path)
+    executor = HostAgentExecutor(
+        state=state,
+        ollama=ProductionAgentOllamaAdapter(registry),
+    )
+    return (
+        HostAgent(
+            client=HostAgentClient(config.master_url, context=context),
+            executor=executor,
+            registry_generation=config.registry_generation,
+            lease_epoch=config.lease_epoch,
+            capabilities_digest=config.capabilities_digest,
+        ),
+        config,
+    )
+
+
+def run_poll_loop(
+    agent: HostAgent,
+    *,
+    max_wait_seconds: int,
+    stop_event: threading.Event,
+) -> None:
+    """Run until signalled, with interruptible server-requested idle waits."""
+    while not stop_event.is_set():
+        delay = agent.run_once(max_wait_seconds=max_wait_seconds)
+        if delay > 0:
+            stop_event.wait(delay)
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Validate static non-secret service configuration for the packaged entrypoint."""
+    """Run the packaged outbound agent using only fixed systemd credentials."""
     parser = argparse.ArgumentParser(prog="codex-master-host-agent")
-    parser.add_argument("--master-url", required=True)
-    parser.add_argument("--host-ref", required=True)
-    parser.add_argument("--registry-generation", required=True, type=int)
-    parser.add_argument("--lease-epoch", required=True, type=int)
-    arguments = parser.parse_args(argv)
-    _master_origin(arguments.master_url)
-    if arguments.registry_generation < 0 or arguments.lease_epoch < 0:
-        _fail("host.request_invalid")
-    if not os.environ.get("CREDENTIALS_DIRECTORY"):
-        _fail("host.credentials_invalid")
+    parser.parse_args(argv)
+    stop_event = threading.Event()
+
+    def stop(_number: int, _frame: object) -> None:
+        stop_event.set()
+
+    previous = {
+        number: signal.signal(number, stop)
+        for number in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        with open_host_agent_credentials(os.environ) as credentials:
+            agent, config = assemble_host_agent(credentials)
+            run_poll_loop(
+                agent,
+                max_wait_seconds=config.max_wait_seconds,
+                stop_event=stop_event,
+            )
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
     return 0
 
 
@@ -371,7 +682,13 @@ __all__ = [
     "HostAgentClient",
     "HostAgentError",
     "HostAgentExecutor",
+    "HostAgentConfig",
+    "HostAgentCredentialFds",
     "HostProbeExecutor",
+    "assemble_host_agent",
     "build_tls_context",
+    "load_host_agent_config",
     "main",
+    "open_host_agent_credentials",
+    "run_poll_loop",
 ]
