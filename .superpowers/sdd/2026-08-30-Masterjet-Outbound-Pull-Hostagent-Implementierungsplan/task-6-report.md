@@ -285,3 +285,186 @@ GitHub-token, OpenAI-key, Google-key, or JWT credential pattern. CodeRabbit
 0.7.5 first reported one valid major concern about immediate unbounded Control
 Center polling; bounded delayed polling and its executable test were added.
 The independent follow-up review completed with zero findings.
+
+## Fix round 5/5
+
+Round 5 closes all findings from `task-6-rereview-4.md` without adding a
+generic Task-7 result projection or broadening the host-agent action surface.
+
+### RED evidence
+
+The first focused round-5 command intentionally combined the new regressions
+before production edits:
+
+```text
+PYTHONPATH=src pytest -q tests/test_host_probe.py \
+  tests/test_admin_operations.py::test_only_restart_reconciled_host_probe_can_be_resumed \
+  tests/test_admin_hosts.py::test_active_probe_owns_one_lock_and_rejects_contending_stale_cas \
+  tests/test_control_center.py::test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal \
+  tests/test_control_center.py::test_host_probe_submit_and_timer_scheduling_failures_are_visible \
+  tests/test_control_center.py::ControlCenterViewModelTest::test_show_selects_ollama_page_before_refresh \
+  tests/test_control_center.py::ControlCenterControllerTest::test_scheduler_registration_failure_reports_visible_unknown_result \
+  tests/test_admin_cli_mcp_integration.py::test_real_host_probe_cli_uses_exact_parser_contract_and_internal_key \
+  tests/test_admin_cli_mcp_integration.py::test_real_registered_host_probe_mcp_call_forwards_caller_key \
+  tests/test_control_catalog.py::ControlCatalogTest::test_risk_registry_exactly_covers_current_tools
+
+45 failed, 13 passed in 16.35s
+```
+
+Representative failures were the missing document-generation dependency on
+`RemoteHostProbeAdapter`, missing host-probe resume API, GTK terminal refresh
+still dispatching `agent_status`, submit exceptions escaping the UI, silent
+scheduler registration failure, Ollama still selecting notebook index 2,
+`--json` omission executing a real probe instead of exiting 2, and the absent
+read-only Hosts tool.
+
+The replacement event-controlled concurrency test passed during RED. That is
+expected evidence: production already used one lock-held transaction; the old
+test was the defect because its alleged concurrent update finished before the
+probe lock was acquired.
+
+CodeRabbit's first review found that the new reclaim transition could bypass
+the original plan expiry. A dedicated regression was added before its fix:
+
+```text
+PYTHONPATH=src pytest -q \
+  tests/test_admin_operations.py::test_expired_restart_reconciled_host_probe_cannot_be_resumed
+
+1 failed: DID NOT RAISE AdminOperationError
+```
+
+### Durable and contract decisions
+
+- `HostRegistry.document_generation()` exposes only the authoritative integer
+  document generation. Remote Agent queue/principal fences use this value;
+  the Admin operation remains the separate durable owner of the per-host
+  expected generation.
+- The private Agent lease arguments remain exactly
+  `{"admin_operation_id": ..., "probe_schema": 1}`. Kind/action remain exactly
+  `host.probe/collect`, and `target_host_ref` remains the separate target fence.
+- Registry `get()` translates only definitive `control.host_not_found` or
+  `host.identity_not_found`. Store availability/corruption errors propagate
+  with Admin and Agent state unchanged so the identical receipt can retry.
+- `AdminOperationStore.resume_host_probe()` accepts only
+  `hosts.probe`, the exact `host.probe.collect` step, matching generation,
+  `partial` with exactly `control.restart_reconciled`, no owner, and an
+  unexpired plan. Every other operation and ordinary partial state retains the
+  existing contract.
+- Completion reloads/reclaims Admin state before each post-restart mutation.
+  Tests reconstruct Admin store, Agent store, Registry, and completion owner,
+  crash after each durable completion boundary (including reclaim itself),
+  and prove Admin terminal state exists before Agent terminalization.
+- Host generation exhaustion and Registry document-generation exhaustion map
+  to a bounded Admin failure; the receipt is terminalized only after Admin,
+  with no Registry mutation or permanent running/leased state.
+- The GTK Hosts page now has an explicit public Hosts-list load, renders the
+  selected HostRegistry record, captures delayed GLib poll callbacks in tests,
+  and refreshes that data only at canonical terminal states. Submit, poll
+  scheduling, host refresh, and controller delivery scheduling failures render
+  `Host-Probe: UNKNOWN`. `--page ollama` selects index 3.
+- CLI parsing requires the literal `--json` switch. Omission is proven by a
+  real subprocess to exit with argparse status 2. The CLI still has no public
+  idempotency option; MCP still forwards its caller-provided key exactly.
+- The old interleaving seam was replaced by two real threads and bounded
+  events. The contender reaches the production state-lock acquisition while
+  the probe owns it, cannot acquire early, then observes the correct stale
+  generation conflict after release. Metadata and both binding domains remain
+  unchanged by the rejected overwrite, and the probe acquires exactly one
+  public state lock.
+
+### GREEN evidence
+
+Post-CodeRabbit focused closure matrix:
+
+```text
+PYTHONPATH=src pytest -q \
+  tests/test_host_probe.py::test_registry_get_unavailability_does_not_consume_probe_receipt \
+  tests/test_host_probe.py::test_registry_get_definitive_missing_host_terminalizes_receipt \
+  tests/test_host_probe.py::test_reconstructed_probe_owners_converge_after_each_persisted_boundary \
+  tests/test_host_probe.py::test_remote_probe_separates_document_and_host_generation_without_wire_drift \
+  tests/test_host_probe.py::test_generation_exhaustion_terminalizes_without_registry_mutation \
+  tests/test_host_probe.py::test_remote_completion_stale_generation_terminalizes_without_registry_mutation \
+  tests/test_host_probe.py::test_remote_completion_running_stale_generation_cannot_overwrite_new_probe \
+  tests/test_host_probe.py::test_remote_completion_cross_host_rejection_cannot_terminalize_target_work \
+  tests/test_host_probe.py::test_remote_completion_non_success_is_terminal_without_registry_mutation \
+  tests/test_admin_operations.py::test_only_restart_reconciled_host_probe_can_be_resumed \
+  tests/test_admin_operations.py::test_expired_restart_reconciled_host_probe_cannot_be_resumed \
+  tests/test_admin_hosts.py::test_active_probe_owns_one_lock_and_rejects_contending_stale_cas \
+  tests/test_control_center.py::test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal \
+  tests/test_control_center.py::test_host_probe_submit_and_timer_scheduling_failures_are_visible \
+  tests/test_control_center.py::ControlCenterViewModelTest::test_show_selects_ollama_page_before_refresh \
+  tests/test_control_center.py::ControlCenterControllerTest::test_scheduler_registration_failure_reports_visible_unknown_result \
+  tests/test_admin_cli_mcp_integration.py::test_real_host_probe_cli_uses_exact_parser_contract_and_internal_key \
+  tests/test_admin_cli_mcp_integration.py::test_real_registered_host_probe_mcp_call_forwards_caller_key
+
+36 passed in 13.67s
+```
+
+The matrix includes success/failed/unknown Registry-read retries, definitive
+missing-host translation, all reconstructed completion boundaries, real
+document/host generation divergence, maximum generation, stale/cross-host/
+unknown byte preservation, narrow/expired reclaim, real lock contention, GTK
+states/failures/refresh/index, and real CLI/MCP subprocess contracts.
+
+Unfiltered directly changed test files:
+
+```text
+PYTHONPATH=src pytest -q tests/test_host_probe.py tests/test_admin_hosts.py \
+  tests/test_admin_operations.py tests/test_control_center.py \
+  tests/test_admin_cli_mcp_integration.py tests/test_control_catalog.py
+
+281 passed, 36 subtests passed in 50.70s
+```
+
+Earlier Task-1..5 dependency regressions:
+
+```text
+PYTHONPATH=src pytest -q tests/test_agent_contracts.py \
+  tests/test_agent_operations.py tests/test_agent_identity.py \
+  tests/test_agent_http.py tests/test_agent_daemon.py \
+  tests/test_host_agent_state.py tests/test_host_agent.py \
+  tests/test_admin_daemon.py
+
+218 passed in 170.03s
+```
+
+Preserved Host Admin route/scope/step-up selection:
+
+```text
+PYTHONPATH=src pytest -q tests/test_admin_contracts.py \
+  tests/test_admin_http.py tests/test_admin_service.py \
+  -k 'host and (probe or list or scope or step_up)'
+
+6 passed, 243 deselected in 3.47s
+```
+
+Static verification:
+
+```text
+ruff check <all changed Python files>
+All checks passed!
+
+python -m compileall -q <all changed production Python files>
+(clean)
+
+git diff --check
+(clean)
+```
+
+The exact-range and working-tree secret preflight reported zero matches before
+editing. The complete uncommitted diff was scanned again before each external
+review and reported zero matches without printing matched values.
+
+### CodeRabbit and remaining concern
+
+CodeRabbit CLI 0.7.5 was authenticated and run twice with
+`coderabbit review --agent -t uncommitted`. The first pass returned one valid
+minor expiry finding; it received a RED regression and minimal fix. The second
+pass completed with zero findings.
+
+No known Task-6 correctness concern remains. If GLib itself cannot register a
+delivery, the controller now closes and directly invokes the bounded failure
+callback so the Host-Probe state becomes UNKNOWN; a process whose GTK main
+loop is already gone naturally cannot guarantee that the final pixels are
+painted. The pre-existing unrelated `progress.md` modification was neither
+edited nor staged.

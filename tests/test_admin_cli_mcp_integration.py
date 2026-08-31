@@ -80,6 +80,7 @@ def _admin_socket(tmp_path: Path) -> Iterator[tuple[Path, Path, object]]:
         "operator-one",
         (
             "fleet.read",
+            "fleet.host.read",
             "fleet.openai.write",
             "fleet.google.oauth",
             "fleet.google.provision",
@@ -213,6 +214,20 @@ def test_real_host_probe_cli_uses_exact_parser_contract_and_internal_key(
             ],
             env=environment,
         )
+        missing_json = _run_child(
+            [
+                sys.executable,
+                "-m",
+                "codex_master.server",
+                "fleet",
+                "host",
+                "probe",
+                "worker-one",
+                "--expected-generation",
+                "4",
+            ],
+            env=environment,
+        )
         help_result = _run_child(
             [
                 sys.executable,
@@ -234,6 +249,8 @@ def test_real_host_probe_cli_uses_exact_parser_contract_and_internal_key(
     assert rejected.returncode == 2
     assert "--idempotency-key" in rejected.stderr
     assert "unrecognized arguments" in rejected.stderr
+    assert missing_json.returncode == 2
+    assert "--json" in missing_json.stderr
     assert help_result.returncode == 0
     assert "--idempotency-key" not in help_result.stdout
 
@@ -255,21 +272,37 @@ def test_real_registered_host_probe_mcp_call_forwards_caller_key(
             },
         },
     }
+    hosts_request = {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {"name": "fleet_hosts", "arguments": {}},
+    }
     with _admin_socket(tmp_path) as (socket_path, credential_directory, owners):
         completed = _run_child(
             [sys.executable, "-m", "codex_master.server"],
             input_text="\n".join(
-                (json.dumps(list_request), json.dumps(call_request), "")
+                (
+                    json.dumps(list_request),
+                    json.dumps(call_request),
+                    json.dumps(hosts_request),
+                    "",
+                )
             ),
             env=_subprocess_env(tmp_path, socket_path, credential_directory),
         )
 
     assert completed.returncode == 0, completed.stderr
-    listed, response = [json.loads(line) for line in completed.stdout.splitlines()]
+    listed, response, hosts_response = [
+        json.loads(line) for line in completed.stdout.splitlines()
+    ]
     visible_names = {tool["name"] for tool in listed["result"]["tools"]}
     assert "fleet_host_probe" in visible_names
+    assert "fleet_hosts" in visible_names
     assert response["result"]["isError"] is False
     assert json.loads(response["result"]["content"][0]["text"]) == _probe_projection()
+    assert hosts_response["result"]["isError"] is False
+    assert "hosts" in json.loads(hosts_response["result"]["content"][0]["text"])
     assert owners.host_probe.calls == [("worker-one", 4, "caller-probe-key")]
 
 

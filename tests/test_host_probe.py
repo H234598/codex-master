@@ -152,15 +152,17 @@ def _remote_scenario(
     adapter = RemoteHostProbeAdapter(
         operation_store=operations,
         agent_operations=agent_operations,
+        host_registry=registry,
         clock=lambda: NOW,
     )
     planned = adapter.probe(
         "worker-one", expected_generation=4, idempotency_key="probe-one"
     )
-    operation_principal = OperationPrincipalV1("worker-one", 4)
+    document_generation = registry.document_generation()
+    operation_principal = OperationPrincipalV1("worker-one", document_generation)
     lease = agent_operations.poll(
         operation_principal,
-        AgentPollV1(4, 1, CAPABILITIES_DIGEST, 0),
+        AgentPollV1(document_generation, 1, CAPABILITIES_DIGEST, 0),
     )
     assert isinstance(lease, AgentLeaseV1)
     operation_id = lease.arguments["admin_operation_id"]
@@ -175,7 +177,7 @@ def _remote_scenario(
         operations,
         agent_operations,
         registry,
-        RegistryPrincipalV1("worker-one", 4, 1),
+        RegistryPrincipalV1("worker-one", document_generation, 1),
         lease,
         operation_id,
     )
@@ -315,11 +317,14 @@ def test_local_adapter_collector_failure_is_terminal_without_registry_mutation(
 def test_remote_adapter_queues_exact_target_bound_collect_operation(
     tmp_path: Path,
 ) -> None:
+    registry = HostRegistry.for_test(tmp_path)
+    registry.record_probe("worker-one", generation=4, evidence=_registry_evidence())
     operations = AdminOperationStore.for_test(tmp_path, clock=lambda: NOW)
     agent_operations = AgentOperationStore.for_test(tmp_path, clock=lambda: NOW)
     adapter = RemoteHostProbeAdapter(
         operation_store=operations,
         agent_operations=agent_operations,
+        host_registry=registry,
         clock=lambda: NOW,
     )
 
@@ -346,6 +351,59 @@ def test_remote_adapter_queues_exact_target_bound_collect_operation(
     context = agent_operations.context(lease.operation_id)
     assert context["target_host_ref"] == "worker-one"
     assert operations.get(planned.id).state == "planned"
+
+
+def test_remote_probe_separates_document_and_host_generation_without_wire_drift(
+    tmp_path: Path,
+) -> None:
+    registry = HostRegistry.for_test(tmp_path)
+    registry.record_probe("worker-one", generation=1, evidence=_registry_evidence())
+    other = _registry_evidence()
+    other["label"] = "Worker Two"
+    other["transport_binding"] = {
+        "kind": "ssh",
+        "binding_ref": "worker-two-ssh",
+    }
+    other["binding_state"] = {"opaque": "binding-two"}
+    registry.record_probe("worker-two", generation=7, evidence=other)
+    operations = AdminOperationStore.for_test(tmp_path, clock=lambda: NOW)
+    agent_operations = AgentOperationStore.for_test(tmp_path, clock=lambda: NOW)
+    adapter = RemoteHostProbeAdapter(
+        operation_store=operations,
+        agent_operations=agent_operations,
+        host_registry=registry,
+        clock=lambda: NOW,
+    )
+
+    planned = adapter.probe(
+        "worker-one", expected_generation=1, idempotency_key="divergent-generation"
+    )
+    document_generation = registry.document_generation()
+    principal = OperationPrincipalV1("worker-one", document_generation)
+    lease = agent_operations.poll(
+        principal,
+        AgentPollV1(document_generation, 1, CAPABILITIES_DIGEST, 0),
+    )
+    assert isinstance(lease, AgentLeaseV1)
+    assert lease.registry_generation == 7
+    assert lease.arguments == {
+        "admin_operation_id": planned.id,
+        "probe_schema": 1,
+    }
+
+    completed = RemoteHostProbeCompletionOwner(
+        operation_store=operations,
+        agent_operations=agent_operations,
+        host_registry=registry,
+    ).complete(
+        RegistryPrincipalV1("worker-one", document_generation, 1),
+        _receipt(lease),
+    )
+
+    assert completed.state == "succeeded"
+    assert operations.get(planned.id).resulting_generation == 2
+    assert registry.get("worker-one").generation == 2
+    assert registry.document_generation() == 8
 
 
 def test_remote_completion_records_valid_dto_then_terminalizes_both_operations(
@@ -464,6 +522,120 @@ def test_remote_completion_non_success_is_terminal_without_registry_mutation(
     failed = operations.get(operation_id)
     assert failed.state == "failed"
     assert failed.reason_codes == ("host.probe_unknown",)
+    assert document.read_bytes() == before
+
+
+@pytest.mark.parametrize("receipt_state", ("succeeded", "failed", "unknown"))
+def test_registry_get_unavailability_does_not_consume_probe_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_state: str,
+) -> None:
+    owner, operations, agent_operations, registry, principal, lease, operation_id = (
+        _remote_scenario(tmp_path)
+    )
+    document = _registry_document(tmp_path)
+    before = document.read_bytes()
+    original_get = registry.get
+    attempts = 0
+
+    def unavailable_once(ref: str):  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise HostRegistryError("control.host_store_unavailable")
+        return original_get(ref)
+
+    monkeypatch.setattr(registry, "get", unavailable_once)
+    receipt = _receipt(lease, state=receipt_state)
+
+    with pytest.raises(HostRegistryError, match="control.host_store_unavailable"):
+        owner.complete(principal, receipt)
+
+    assert operations.get(operation_id).state == "planned"
+    assert agent_operations.get(lease.operation_id).state == "leased"
+    assert document.read_bytes() == before
+
+    completed = owner.complete(principal, receipt)
+
+    assert completed.state == receipt_state
+    assert agent_operations.get(lease.operation_id).state == receipt_state
+    if receipt_state == "succeeded":
+        assert operations.get(operation_id).state == "succeeded"
+        assert registry.get("worker-one").generation == 5
+    else:
+        assert operations.get(operation_id).state == "failed"
+        assert document.read_bytes() == before
+
+
+def test_registry_get_definitive_missing_host_terminalizes_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner, operations, agent_operations, registry, principal, lease, operation_id = (
+        _remote_scenario(tmp_path)
+    )
+    document = _registry_document(tmp_path)
+    before = document.read_bytes()
+
+    def missing(_ref: str):  # type: ignore[no-untyped-def]
+        raise HostRegistryError("control.host_not_found")
+
+    monkeypatch.setattr(registry, "get", missing)
+    completed = owner.complete(principal, _receipt(lease))
+
+    assert completed.state == "succeeded"
+    assert operations.get(operation_id).state == "failed"
+    assert agent_operations.get(lease.operation_id).state == "succeeded"
+    assert document.read_bytes() == before
+
+
+def test_generation_exhaustion_terminalizes_without_registry_mutation(
+    tmp_path: Path,
+) -> None:
+    maximum = 2**63 - 1
+    registry = HostRegistry.for_test(tmp_path)
+    registry.record_probe(
+        "worker-one", generation=maximum, evidence=_registry_evidence()
+    )
+    operations = AdminOperationStore.for_test(tmp_path, clock=lambda: NOW)
+    agent_operations = AgentOperationStore.for_test(tmp_path, clock=lambda: NOW)
+    planned = RemoteHostProbeAdapter(
+        operation_store=operations,
+        agent_operations=agent_operations,
+        host_registry=registry,
+        clock=lambda: NOW,
+    ).probe(
+        "worker-one", expected_generation=maximum, idempotency_key="generation-max"
+    )
+    lease = agent_operations.poll(
+        OperationPrincipalV1("worker-one", maximum),
+        AgentPollV1(maximum, 1, CAPABILITIES_DIGEST, 0),
+    )
+    assert isinstance(lease, AgentLeaseV1)
+    document = _registry_document(tmp_path)
+    before = document.read_bytes()
+    admin_states_at_agent_completion: list[str] = []
+    original_complete = agent_operations.complete
+
+    def ordered_complete(principal, receipt):  # type: ignore[no-untyped-def]
+        admin_states_at_agent_completion.append(operations.get(planned.id).state)
+        return original_complete(principal, receipt)
+
+    agent_operations.complete = ordered_complete  # type: ignore[method-assign]
+    completed = RemoteHostProbeCompletionOwner(
+        operation_store=operations,
+        agent_operations=agent_operations,
+        host_registry=registry,
+    ).complete(
+        RegistryPrincipalV1("worker-one", maximum, 1),
+        _receipt(lease),
+    )
+
+    assert completed.state == "succeeded"
+    assert operations.get(planned.id).state == "failed"
+    assert agent_operations.get(lease.operation_id).state == "succeeded"
+    assert admin_states_at_agent_completion == ["failed"]
     assert document.read_bytes() == before
 
 
@@ -603,3 +775,136 @@ def test_success_completion_store_failures_retry_without_double_registry_mutatio
     assert writes == 1
     if expected_writes:
         assert _registry_document(tmp_path).read_bytes() == first_bytes
+
+
+@pytest.mark.parametrize(
+    ("receipt_state", "boundary"),
+    (
+        ("succeeded", "begin"),
+        ("succeeded", "resume"),
+        ("succeeded", "registry"),
+        ("succeeded", "record_step"),
+        ("succeeded", "finish"),
+        ("succeeded", "agent_complete"),
+        ("failed", "begin"),
+        ("failed", "resume"),
+        ("failed", "record_step"),
+        ("failed", "finish"),
+        ("failed", "agent_complete"),
+        ("unknown", "begin"),
+        ("unknown", "resume"),
+        ("unknown", "record_step"),
+        ("unknown", "finish"),
+        ("unknown", "agent_complete"),
+    ),
+)
+def test_reconstructed_probe_owners_converge_after_each_persisted_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_state: str,
+    boundary: str,
+) -> None:
+    class DeadOwnerProbe:
+        def current(self) -> tuple[str, int, int]:
+            return ("11111111-1111-1111-1111-111111111111", 4321, 101)
+
+        def is_alive(self, _owner: tuple[str, int, int]) -> bool:
+            return False
+
+    owner_probe = DeadOwnerProbe()
+    registry = HostRegistry.for_test(tmp_path)
+    registry.record_probe("worker-one", generation=4, evidence=_registry_evidence())
+    operations = AdminOperationStore.for_test(
+        tmp_path, clock=lambda: NOW, owner_probe=owner_probe
+    )
+    agent_operations = AgentOperationStore.for_test(tmp_path, clock=lambda: NOW)
+    planned = RemoteHostProbeAdapter(
+        operation_store=operations,
+        agent_operations=agent_operations,
+        host_registry=registry,
+        clock=lambda: NOW,
+    ).probe("worker-one", expected_generation=4, idempotency_key="restart-probe")
+    document_generation = registry.document_generation()
+    lease = agent_operations.poll(
+        OperationPrincipalV1("worker-one", document_generation),
+        AgentPollV1(document_generation, 1, CAPABILITIES_DIGEST, 0),
+    )
+    assert isinstance(lease, AgentLeaseV1)
+    principal = RegistryPrincipalV1("worker-one", document_generation, 1)
+    receipt = _receipt(lease, state=receipt_state)
+    operations = AdminOperationStore.for_test(
+        tmp_path, clock=lambda: NOW, owner_probe=owner_probe
+    )
+    agent_operations = AgentOperationStore.for_test(tmp_path, clock=lambda: NOW)
+    registry = HostRegistry.for_test(tmp_path)
+    owner = RemoteHostProbeCompletionOwner(
+        operation_store=operations,
+        agent_operations=agent_operations,
+        host_registry=registry,
+    )
+    ordered_states: list[str] = []
+
+    if boundary == "resume":
+        operations.begin(planned.id, current_generation=4)
+        operations = AdminOperationStore.for_test(
+            tmp_path, clock=lambda: NOW, owner_probe=owner_probe
+        )
+        agent_operations = AgentOperationStore.for_test(tmp_path, clock=lambda: NOW)
+        registry = HostRegistry.for_test(tmp_path)
+        owner = RemoteHostProbeCompletionOwner(
+            operation_store=operations,
+            agent_operations=agent_operations,
+            host_registry=registry,
+        )
+        target = operations
+        method_name = "resume_host_probe"
+    elif boundary == "registry":
+        target = registry
+        method_name = "record_active_probe"
+    elif boundary == "agent_complete":
+        target = agent_operations
+        method_name = "complete"
+    else:
+        target = operations
+        method_name = boundary
+    original = getattr(target, method_name)
+
+    def crash_after_persist(*args: object, **kwargs: object) -> object:
+        if boundary == "agent_complete":
+            ordered_states.append(operations.get(planned.id).state)
+        original(*args, **kwargs)
+        raise RuntimeError("simulated process exit after durable boundary")
+
+    monkeypatch.setattr(target, method_name, crash_after_persist)
+
+    with pytest.raises(RuntimeError, match="simulated process exit"):
+        owner.complete(principal, receipt)
+
+    operations = AdminOperationStore.for_test(
+        tmp_path, clock=lambda: NOW, owner_probe=owner_probe
+    )
+    agent_operations = AgentOperationStore.for_test(tmp_path, clock=lambda: NOW)
+    registry = HostRegistry.for_test(tmp_path)
+    owner = RemoteHostProbeCompletionOwner(
+        operation_store=operations,
+        agent_operations=agent_operations,
+        host_registry=registry,
+    )
+    original_agent_complete = agent_operations.complete
+
+    def ordered_complete(principal_value, receipt_value):  # type: ignore[no-untyped-def]
+        ordered_states.append(operations.get(planned.id).state)
+        return original_agent_complete(principal_value, receipt_value)
+
+    monkeypatch.setattr(agent_operations, "complete", ordered_complete)
+    completed = owner.complete(principal, receipt)
+
+    expected_admin_state = "succeeded" if receipt_state == "succeeded" else "failed"
+    assert completed.state == receipt_state
+    assert operations.get(planned.id).state == expected_admin_state
+    assert agent_operations.get(lease.operation_id).state == receipt_state
+    assert ordered_states
+    assert set(ordered_states) <= {"succeeded", "failed"}
+    assert registry.get("worker-one").generation == (
+        5 if receipt_state == "succeeded" else 4
+    )

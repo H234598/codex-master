@@ -186,6 +186,58 @@ def host_probe_ui_state(result: object) -> HostProbeUiState:
     return HostProbeUiState("UNKNOWN", state in {"failed", "partial", "blocked"})
 
 
+def host_card_text(result: object, host_ref: str) -> str:
+    """Render one selected public host without accepting private fields."""
+
+    if type(result) is not dict or type(host_ref) is not str or not host_ref:
+        raise AgentError("control-center host result is invalid")
+    hosts = result.get("hosts")
+    if type(hosts) is not list or len(hosts) > 256:
+        raise AgentError("control-center host result is invalid")
+    host = next(
+        (
+            item
+            for item in hosts
+            if type(item) is dict and item.get("ref") == host_ref
+        ),
+        None,
+    )
+    if type(host) is not dict:
+        raise AgentError("control-center host result is invalid")
+    label = host.get("label")
+    role = host.get("role")
+    generation = host.get("generation")
+    reachability = host.get("reachability")
+    resources = host.get("resource_evidence")
+    observed_at = host.get("observed_at")
+    if (
+        type(label) is not str
+        or not 1 <= len(label) <= 160
+        or type(role) is not str
+        or not 1 <= len(role) <= 64
+        or not _non_negative_int(generation)
+        or type(reachability) is not dict
+        or type(resources) is not dict
+        or observed_at is not None
+        and (type(observed_at) is not str or len(observed_at) > 40)
+    ):
+        raise AgentError("control-center host result is invalid")
+    reachability_state = reachability.get("state")
+    if type(reachability_state) is not str or not 1 <= len(reachability_state) <= 64:
+        raise AgentError("control-center host result is invalid")
+    cpu_threads = resources.get("cpu_threads")
+    memory_bytes = resources.get("memory_bytes")
+    if cpu_threads is not None and not _non_negative_int(cpu_threads):
+        raise AgentError("control-center host result is invalid")
+    if memory_bytes is not None and not _non_negative_int(memory_bytes):
+        raise AgentError("control-center host result is invalid")
+    return (
+        f"{label} · {host_ref} · {role} · Generation {generation}\n"
+        f"Erreichbarkeit {reachability_state} · CPU {cpu_threads or 'unbekannt'} · "
+        f"RAM {memory_bytes or 'unbekannt'} · Beobachtet {observed_at or 'unbekannt'}"
+    )
+
+
 def _non_negative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
@@ -710,12 +762,16 @@ class OperationController:
         try:
             source_id = self._schedule(self._deliver, generation, callback, result)
         except BaseException:
-            self._close_after_schedule_failure(generation)
+            self._close_after_schedule_failure(generation, callback)
             return
         if isinstance(source_id, bool) or not isinstance(source_id, int) or source_id <= 0:
-            self._close_after_schedule_failure(generation)
+            self._close_after_schedule_failure(generation, callback)
 
-    def _close_after_schedule_failure(self, generation: int) -> None:
+    def _close_after_schedule_failure(
+        self,
+        generation: int,
+        callback: Callable[[dict[str, Any]], Any],
+    ) -> None:
         with self._lock:
             if self._closed or generation != self._generation:
                 return
@@ -724,6 +780,8 @@ class OperationController:
             self._closing = True
             self._generation += 1
         self._executor.shutdown(wait=False, cancel_futures=True)
+        with contextlib.suppress(BaseException):
+            callback({"error": "control-center delivery unavailable"})
 
     def _deliver(
         self,
@@ -911,7 +969,7 @@ class ControlCenterWindow:
     def show(self, page: str | None = None) -> None:
         self.window.show_all()
         if page == "ollama":
-            self.notebook.set_current_page(2)
+            self.notebook.set_current_page(3)
         self.refresh()
 
     def page_names(self) -> set[str]:
@@ -932,9 +990,12 @@ class ControlCenterWindow:
         )
         self._host_probe_operation_id = None
         self._host_probe_poll_attempts = 0
-        submitted = self.controller.submit(
-            "fleet_host_probe", arguments, self._host_probe_started
-        )
+        try:
+            submitted = self.controller.submit(
+                "fleet_host_probe", arguments, self._host_probe_started
+            )
+        except Exception:
+            submitted = False
         if not submitted:
             (
                 self._host_probe_operation_id,
@@ -955,6 +1016,9 @@ class ControlCenterWindow:
         form.attach(Gtk.Label(label="Host-Ref"), 0, 0, 1, 1)
         self.host_ref_entry = Gtk.Entry()
         self.host_ref_entry.set_max_length(64)
+        self.host_ref_entry.connect(
+            "activate", lambda _entry: self.refresh_host_card()
+        )
         form.attach(self.host_ref_entry, 1, 0, 1, 1)
         form.attach(Gtk.Label(label="Generation"), 0, 1, 1, 1)
         self.host_generation_spin = Gtk.SpinButton.new_with_range(
@@ -962,6 +1026,11 @@ class ControlCenterWindow:
         )
         form.attach(self.host_generation_spin, 1, 1, 1, 1)
         outer.pack_start(form, False, False, 0)
+        self.host_load_button = Gtk.Button.new_with_label("Host laden")
+        self.host_load_button.connect(
+            "clicked", lambda _button: self.refresh_host_card()
+        )
+        outer.pack_start(self.host_load_button, False, False, 0)
         self.host_probe_button = Gtk.Button.new_with_label("Host prüfen")
         self.host_probe_button.connect(
             "clicked", lambda _button: self._probe_selected_host()
@@ -1026,9 +1095,37 @@ class ControlCenterWindow:
             self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
         return False
 
-    def refresh_host_card(self) -> None:
-        """Refresh visible host-adjacent status only after a terminal probe."""
-        self.refresh()
+    def refresh_host_card(self) -> bool:
+        """Load and render the currently selected public HostRegistry record."""
+
+        host_ref = self.host_ref_entry.get_text()
+        if type(host_ref) is not str or not host_ref:
+            self.host_card_label.set_text("Hostdaten: UNKNOWN")
+            self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
+            return False
+        try:
+            submitted = self.controller.submit(
+                "fleet_hosts",
+                {},
+                lambda result, selected=host_ref: self._hosts_loaded(
+                    selected, result
+                ),
+            )
+        except Exception:
+            submitted = False
+        if not submitted:
+            self.host_card_label.set_text("Hostdaten: UNKNOWN")
+            self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
+        return submitted
+
+    def _hosts_loaded(self, host_ref: str, result: dict[str, Any]) -> None:
+        try:
+            rendered = host_card_text(result, host_ref)
+        except AgentError:
+            self.host_card_label.set_text("Hostdaten: UNKNOWN")
+            self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
+            return
+        self.host_card_label.set_text(rendered)
 
     def ollama_apply_sensitive(self) -> bool:
         return bool(self._ollama_apply_enabled)

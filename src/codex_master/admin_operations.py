@@ -362,6 +362,33 @@ class AdminOperationStore:
         with self._locked_records() as records:
             return self._operation(self._find(records, operation_id))
 
+    def resume_host_probe(
+        self, operation_id: str, *, expected_generation: int
+    ) -> OperationV1:
+        """Reclaim only a dead-owner host probe reconciled by this store."""
+
+        operation_id = self._token(operation_id)
+        expected_generation = self._generation(expected_generation)
+        with self._locked_records() as records:
+            record = self._find(records, operation_id)
+            if (
+                record["kind"] != "hosts.probe"
+                or record["expected_generation"] != expected_generation
+                or tuple(step["name"] for step in record["steps"])
+                != ("host.probe.collect",)
+                or record["state"] != "partial"
+                or record["reason_codes"] != ["control.restart_reconciled"]
+                or record["owner"] is not None
+            ):
+                raise AdminOperationError("control.operation_state_conflict")
+            if self._parse_time(record["expires_at"]) <= self._now():
+                raise AdminOperationError("control.plan_expired")
+            record["owner"] = self._owner_document(self._current_owner())
+            record["state"] = "running"
+            record["reason_codes"] = ["control.operation_running"]
+            self._write_locked(records)
+            return self._operation(record)
+
     def _reconcile_running(self) -> None:
         with self._locked_records() as records:
             changed = False

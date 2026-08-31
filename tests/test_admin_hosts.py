@@ -6,6 +6,7 @@ import json
 import multiprocessing
 from pathlib import Path
 import stat
+import threading
 from typing import Any, cast
 
 import pytest
@@ -672,60 +673,119 @@ def test_active_probe_rejects_conflicting_fresh_observation_at_same_generation(
     assert document.read_bytes() == before
 
 
-def test_active_probe_lock_transaction_preserves_interleaved_registration_update(
+def test_active_probe_owns_one_lock_and_rejects_contending_stale_cas(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = registry_at(tmp_path)
     concurrent = registry_at(tmp_path)
     original = valid_evidence()
     registry.record_probe("worker-one", generation=1, evidence=original)
-    updated = static_registration(
-        label="Worker Concurrent",
+    current = static_registration(
+        label="Worker Current",
         role="control",
     )
-    updated["capabilities"] = ["resource.probe"]
-    original_locked = registry._state.locked
-    interleaved = False
+    current["capabilities"] = ["resource.probe"]
+    registry.provision_agent_binding(
+        current,
+        agent_binding(),
+        expected_generation=1,
+    )
+    stale = static_registration(label="Worker Stale Overwrite")
+    stale["capabilities"] = ["codex.execute"]
+    probe_has_lock = threading.Event()
+    release_probe = threading.Event()
+    contender_attempted = threading.Event()
+    contender_acquired = threading.Event()
+    probe_lock_calls = 0
+    original_probe_locked = registry._state.locked
+    original_concurrent_locked = concurrent._state.locked
 
     @contextmanager
-    def locked_with_registration_update():  # type: ignore[no-untyped-def]
-        nonlocal interleaved
-        if not interleaved:
-            interleaved = True
-            concurrent.provision_agent_binding(
-                updated,
-                agent_binding(),
-                expected_generation=1,
-            )
-        with original_locked():
+    def counted_probe_lock():  # type: ignore[no-untyped-def]
+        nonlocal probe_lock_calls
+        probe_lock_calls += 1
+        with original_probe_locked():
+            probe_has_lock.set()
+            if not release_probe.wait(5):
+                raise AssertionError("probe lock release was not signalled")
             yield
 
-    monkeypatch.setattr(registry._state, "locked", locked_with_registration_update)
+    @contextmanager
+    def observed_contender_lock():  # type: ignore[no-untyped-def]
+        contender_attempted.set()
+        with original_concurrent_locked():
+            contender_acquired.set()
+            yield
 
-    refreshed = registry.record_active_probe(
-        "worker-one",
-        generation=2,
-        resource_evidence={"cpu_threads": 8, "memory_bytes": 16_000_000_000},
-        observed_at="2026-08-30T12:00:00Z",
-    )
+    monkeypatch.setattr(registry._state, "locked", counted_probe_lock)
+    monkeypatch.setattr(concurrent._state, "locked", observed_contender_lock)
+    probe_result: list[ControlHostV1] = []
+    probe_errors: list[BaseException] = []
+    contender_errors: list[BaseException] = []
+
+    def run_probe() -> None:
+        try:
+            probe_result.append(
+                registry.record_active_probe(
+                    "worker-one",
+                    generation=2,
+                    resource_evidence={
+                        "cpu_threads": 8,
+                        "memory_bytes": 16_000_000_000,
+                    },
+                    observed_at="2026-08-30T12:00:00Z",
+                )
+            )
+        except BaseException as error:
+            probe_errors.append(error)
+
+    def run_contender() -> None:
+        try:
+            concurrent.provision_agent_binding(
+                stale,
+                agent_binding(spki=SPKI_TWO),
+                expected_generation=2,
+            )
+        except BaseException as error:
+            contender_errors.append(error)
+
+    probe_thread = threading.Thread(target=run_probe, name="active-probe-test")
+    contender_thread = threading.Thread(target=run_contender, name="probe-cas-test")
+    probe_thread.start()
+    try:
+        assert probe_has_lock.wait(5)
+        contender_thread.start()
+        assert contender_attempted.wait(5)
+        assert not contender_acquired.is_set()
+    finally:
+        release_probe.set()
+        probe_thread.join(timeout=5)
+        if contender_thread.ident is not None:
+            contender_thread.join(timeout=5)
+
+    assert not probe_thread.is_alive()
+    assert not contender_thread.is_alive()
+    assert probe_errors == []
+    assert len(probe_result) == 1
+    assert probe_lock_calls == 1
+    assert contender_acquired.is_set()
+    assert len(contender_errors) == 1
+    assert isinstance(contender_errors[0], HostRegistryError)
+    assert contender_errors[0].code == "credential.generation_conflict"
+
+    refreshed = probe_result[0]
     document = tmp_path / "admin-hosts" / "hosts.json"
     after = document.read_bytes()
 
-    assert interleaved is True
     assert (refreshed.label, refreshed.role, refreshed.capabilities) == (
-        "Worker Concurrent",
+        "Worker Current",
         "control",
         ("resource.probe",),
     )
     payload = json.loads(after)
     assert payload["bindings"]["ssh"][0]["binding_state"] == original["binding_state"]
     assert payload["bindings"]["agent"][0]["client_spki_sha256"] == SPKI_ONE
-    with pytest.raises(HostRegistryError, match="credential.generation_conflict"):
-        concurrent.provision_agent_binding(
-            static_registration(label="Stale overwrite"),
-            agent_binding(spki=SPKI_TWO),
-            expected_generation=1,
-        )
+    assert payload["generation"] == 3
     assert document.read_bytes() == after
 
 def test_equal_generation_is_idempotent_only_for_identical_bound_evidence(

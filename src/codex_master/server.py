@@ -34320,6 +34320,12 @@ _MASTERJET_ADMIN_TOOL_SPECS = (
         None,
     ),
     (
+        "fleet_hosts",
+        "hosts.list",
+        "List public host registry records for the Hosts page.",
+        None,
+    ),
+    (
         "fleet_host_probe",
         "hosts.probe",
         "Queue or run one bounded active host probe.",
@@ -34428,7 +34434,7 @@ def _add_masterjet_admin_cli_command(
     positional_host_ref = operation == "hosts.probe"
     if positional_host_ref:
         parser.add_argument("host_ref")
-        parser.add_argument("--json", action="store_true")
+        parser.add_argument("--json", action="store_true", required=True)
     for field in (*required, *optional):
         if positional_host_ref and field == "host_ref":
             continue

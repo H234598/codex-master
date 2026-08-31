@@ -2405,6 +2405,7 @@ def assemble_admin_runtime() -> AdminRuntime:
                 remote=RemoteHostProbeAdapter(
                     operation_store=operation_store,
                     agent_operations=AgentOperationStore(state_root),
+                    host_registry=host_registry,
                 ),
             ),
         )

@@ -273,10 +273,12 @@ class RemoteHostProbeAdapter:
         *,
         operation_store: AdminOperationStore,
         agent_operations: AgentOperationStore,
+        host_registry: HostRegistry,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._operations = operation_store
         self._agent_operations = agent_operations
+        self._registry = host_registry
         self._clock = clock or (lambda: datetime.now(UTC).replace(microsecond=0))
 
     def probe(
@@ -288,10 +290,11 @@ class RemoteHostProbeAdapter:
         )
         if plan.operation.state != "planned":
             return plan.operation
+        document_generation = self._registry.document_generation()
         self._agent_operations.enqueue(
             AgentOperationRequestV1(
                 key=_operation_key(host_ref, idempotency_key), kind="host.probe", action="collect",
-                registry_generation=expected_generation,
+                registry_generation=document_generation,
                 plan_digest=plan.plan_digest,
                 arguments={"admin_operation_id": plan.operation_id, "probe_schema": 1},
                 deadline=(self._clock().astimezone(UTC).replace(microsecond=0) + timedelta(minutes=5)),
@@ -331,40 +334,48 @@ class RemoteHostProbeCompletionOwner:
         if operation_principal.host_ref != target:
             raise AgentOperationError("host.identity_mismatch")
         operation_id = arguments.get("admin_operation_id")
-        generation = context["registry_generation"]
+        document_generation = context["registry_generation"]
         if (
             set(arguments) != {"admin_operation_id", "probe_schema"}
             or arguments.get("probe_schema") != 1
             or type(operation_id) is not str
-            or type(generation) is not int
+            or type(document_generation) is not int
         ):
             raise HostProbeError()
         operation = self._operations.get(operation_id)
         if (
             operation.kind != "hosts.probe"
-            or operation.expected_generation != generation
             or operation.plan_digest != receipt.plan_digest
         ):
             raise HostProbeError()
+        host_generation = operation.expected_generation
         try:
             host = self._registry.get(target)
-        except HostRegistryError:
+        except HostRegistryError as error:
+            if error.code not in {"control.host_not_found", "host.identity_not_found"}:
+                raise
             return self._complete_failure(
                 operation_principal,
                 receipt,
                 operation_id,
-                generation,
+                host_generation,
                 "host.probe_failed",
             )
-        allowed_host_generations = {generation}
-        if operation.state in {"running", *_TERMINAL_ADMIN_STATES}:
-            allowed_host_generations.add(_next_generation(generation))
+        allowed_host_generations = {host_generation}
+        if (
+            host_generation < _MAX_GENERATION
+            and (
+                operation.state in {"running", *_TERMINAL_ADMIN_STATES}
+                or operation.reason_codes == ("control.restart_reconciled",)
+            )
+        ):
+            allowed_host_generations.add(host_generation + 1)
         if host.generation not in allowed_host_generations:
             return self._complete_failure(
                 operation_principal,
                 receipt,
                 operation_id,
-                generation,
+                host_generation,
                 "host.probe_failed",
             )
         if receipt.state != "succeeded":
@@ -372,7 +383,7 @@ class RemoteHostProbeCompletionOwner:
                 operation_principal,
                 receipt,
                 operation_id,
-                generation,
+                host_generation,
                 "host.probe_unknown",
             )
         try:
@@ -382,19 +393,27 @@ class RemoteHostProbeCompletionOwner:
                 operation_principal,
                 receipt,
                 operation_id,
-                generation,
+                host_generation,
                 "host.probe_failed",
             )
         operation = self._operations.get(operation_id)
-        if operation.state in _TERMINAL_ADMIN_STATES:
+        if operation.state in _TERMINAL_ADMIN_STATES and operation.reason_codes != (
+            "control.restart_reconciled",
+        ):
             return self._agent_operations.complete(operation_principal, receipt)
-        if operation.state == "planned":
-            operation = self._operations.begin(
-                operation_id, current_generation=generation
+        try:
+            resulting_generation = _next_generation(host_generation)
+        except HostProbeError:
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                host_generation,
+                "host.probe_failed",
             )
+        operation = self._active_operation(operation_id, host_generation)
         if operation.state != "running":
             raise HostProbeError()
-        resulting_generation = _next_generation(generation)
         try:
             self._registry.record_active_probe(
                 target,
@@ -406,20 +425,27 @@ class RemoteHostProbeCompletionOwner:
                 observed_at=evidence.observed_at,
             )
         except HostRegistryError as error:
-            if error.code == "credential.generation_conflict":
+            if error.code in {
+                "credential.generation_conflict",
+                "credential.generation_exhausted",
+                "host.identity_not_found",
+            }:
                 return self._complete_failure(
                     operation_principal,
                     receipt,
                     operation_id,
-                    generation,
+                    host_generation,
                     "host.probe_failed",
                 )
             raise
-        operation = self._operations.get(operation_id)
+        operation = self._active_operation(operation_id, host_generation)
+        if operation.state in _TERMINAL_ADMIN_STATES:
+            return self._agent_operations.complete(operation_principal, receipt)
         if operation.not_attempted_count:
-            operation = self._operations.record_step(
+            self._operations.record_step(
                 operation_id, "host.probe.collect", succeeded=True
             )
+        operation = self._active_operation(operation_id, host_generation)
         if operation.failed_count or operation.not_attempted_count:
             raise HostProbeError()
         if operation.state == "running":
@@ -429,6 +455,22 @@ class RemoteHostProbeCompletionOwner:
                 resulting_generation=resulting_generation,
             )
         return self._agent_operations.complete(operation_principal, receipt)
+
+    def _active_operation(
+        self, operation_id: str, generation: int
+    ) -> OperationV1:
+        operation = self._operations.get(operation_id)
+        if operation.state == "partial" and operation.reason_codes == (
+            "control.restart_reconciled",
+        ):
+            operation = self._operations.resume_host_probe(
+                operation_id, expected_generation=generation
+            )
+        if operation.state == "planned":
+            operation = self._operations.begin(
+                operation_id, current_generation=generation
+            )
+        return operation
 
     def _complete_failure(
         self,
@@ -446,22 +488,19 @@ class RemoteHostProbeCompletionOwner:
     def _transition_failure(
         self, operation_id: str, generation: int, reason: str
     ) -> OperationV1:
-        operation = self._operations.get(operation_id)
+        operation = self._active_operation(operation_id, generation)
         if operation.state in _TERMINAL_ADMIN_STATES:
             return operation
-        if operation.state == "planned":
-            operation = self._operations.begin(
-                operation_id, current_generation=generation
-            )
         if operation.state != "running":
             raise AdminOperationError("control.operation_state_conflict")
         if operation.not_attempted_count:
-            operation = self._operations.record_step(
+            self._operations.record_step(
                 operation_id,
                 "host.probe.collect",
                 succeeded=False,
                 reason_code=reason,
             )
+        operation = self._active_operation(operation_id, generation)
         if operation.state == "running":
             operation = self._operations.finish(
                 operation_id,

@@ -602,6 +602,80 @@ def test_running_operation_reconciles_only_after_owner_process_exits(tmp_path) -
             process.join(timeout=10)
 
 
+def test_only_restart_reconciled_host_probe_can_be_resumed(tmp_path) -> None:
+    dead_probe = OwnerProbe(False)
+    store = store_at(tmp_path, owner_probe=dead_probe)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="resume-host-probe",
+        steps=("host.probe.collect",),
+    )
+    store.begin(probe.operation_id, current_generation=4)
+    recovered = store_at(tmp_path, owner_probe=dead_probe)
+
+    resumed = recovered.resume_host_probe(
+        probe.operation_id, expected_generation=4
+    )
+
+    assert resumed.state == "running"
+    assert resumed.not_attempted_count == 1
+
+    other = recovered.plan(
+        kind="google.provision",
+        generation=4,
+        key="do-not-resume-other-owner",
+        steps=("host.probe.collect",),
+    )
+    recovered.begin(other.operation_id, current_generation=4)
+    restarted = store_at(tmp_path, owner_probe=dead_probe)
+    with pytest.raises(AdminOperationError, match="control.operation_state_conflict"):
+        restarted.resume_host_probe(other.operation_id, expected_generation=4)
+
+    ordinary_partial = restarted.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="do-not-resume-ordinary-partial",
+        steps=("host.probe.collect",),
+    )
+    restarted.begin(ordinary_partial.operation_id, current_generation=4)
+    restarted.record_step(
+        ordinary_partial.operation_id,
+        "host.probe.collect",
+        succeeded=False,
+        reason_code="host.probe_failed",
+    )
+    restarted.finish(
+        ordinary_partial.operation_id,
+        state="partial",
+        reason_codes=("host.probe_failed",),
+    )
+    with pytest.raises(AdminOperationError, match="control.operation_state_conflict"):
+        restarted.resume_host_probe(
+            ordinary_partial.operation_id, expected_generation=4
+        )
+
+
+def test_expired_restart_reconciled_host_probe_cannot_be_resumed(tmp_path) -> None:
+    clock = Clock()
+    dead_probe = OwnerProbe(False)
+    store = store_at(tmp_path, clock, owner_probe=dead_probe)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="expired-resume-host-probe",
+        steps=("host.probe.collect",),
+    )
+    store.begin(probe.operation_id, current_generation=4)
+    clock.now += timedelta(minutes=16)
+    recovered = store_at(tmp_path, clock, owner_probe=dead_probe)
+
+    with pytest.raises(AdminOperationError, match="control.plan_expired"):
+        recovered.resume_host_probe(probe.operation_id, expected_generation=4)
+
+    assert recovered.get(probe.operation_id).state == "partial"
+
+
 def test_unknown_owner_status_keeps_running_operation_unchanged(tmp_path) -> None:
     probe = OwnerProbe(None)
     store = store_at(tmp_path, owner_probe=probe)

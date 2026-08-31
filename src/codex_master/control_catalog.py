@@ -104,6 +104,7 @@ _READ_ONLY_TOOLS = {
     "fleet_ollama_models",
     "fleet_ollama_instances",
     "fleet_operation_status",
+    "fleet_hosts",
     "fleet_gemini_bootstrap_plan",
     "fleet_series_list",
     "fleet_provider_models",

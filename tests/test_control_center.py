@@ -15,6 +15,7 @@ from codex_master.server import AgentError
 def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal() -> None:
     calls: list[tuple[str, dict]] = []
     events: list[str] = []
+    delayed: list[tuple[object, tuple[object, ...]]] = []
     responses = [
         {"id": "op-success", "state": "planned"},
         {"id": "op-success", "state": "running"},
@@ -29,12 +30,35 @@ def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal
 
         def submit(self, name, args, callback):
             calls.append((name, args))
-            if name == "agent_status":
+            if name == "fleet_hosts":
                 events.append("backend:host-refresh")
                 callback(
-                    ControlCenterViewModelTest()._page(
-                        ControlCenterViewModelTest()._status_result()
-                    )
+                    {
+                        "hosts": [
+                            {
+                                "schema_version": 1,
+                                "ref": "worker-one",
+                                "label": "Worker One",
+                                "role": "execution",
+                                "transport_binding": {
+                                    "kind": "ssh",
+                                    "binding_ref": "worker-one-ssh",
+                                },
+                                "capabilities": ["resource.probe"],
+                                "reachability": {
+                                    "state": "reachable",
+                                    "latency_ms": 0,
+                                },
+                                "resource_evidence": {
+                                    "cpu_threads": 8,
+                                    "memory_bytes": 8 * 1024**3,
+                                },
+                                "generation": 5,
+                                "observed_at": "2026-08-30T12:00:00Z",
+                                "source": "host-agent",
+                            }
+                        ]
+                    }
                 )
                 return True
             result = responses.pop(0)
@@ -52,9 +76,12 @@ def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal
     Gtk.SpinButton.new_with_range.side_effect = lambda *_values: Mock()
     GLib = Mock()
     GLib.idle_add.return_value = 1
-    GLib.timeout_add.side_effect = (
-        lambda _interval, callback, *args: (callback(*args), 1)[1]
-    )
+
+    def capture_timeout(_interval, callback, *args):  # type: ignore[no-untyped-def]
+        delayed.append((callback, args))
+        return len(delayed)
+
+    GLib.timeout_add.side_effect = capture_timeout
     window = control_center.ControlCenterWindow(
         Gtk,
         GLib,
@@ -67,17 +94,32 @@ def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal
     clicked = window.host_probe_button.connect.call_args.args[1]
 
     clicked(window.host_probe_button)
+    assert [name for name, _args in calls] == ["fleet_host_probe"]
+    callback, arguments = delayed.pop(0)
+    callback(*arguments)
+    assert [name for name, _args in calls] == [
+        "fleet_host_probe",
+        "fleet_operation_status",
+    ]
+    callback, arguments = delayed.pop(0)
+    callback(*arguments)
+    assert calls[-1][0] == "fleet_hosts"
+
     clicked(window.host_probe_button)
+    callback, arguments = delayed.pop(0)
+    callback(*arguments)
+    callback, arguments = delayed.pop(0)
+    callback(*arguments)
 
     assert [name for name, _args in calls] == [
         "fleet_host_probe",
         "fleet_operation_status",
         "fleet_operation_status",
-        "agent_status",
+        "fleet_hosts",
         "fleet_host_probe",
         "fleet_operation_status",
         "fleet_operation_status",
-        "agent_status",
+        "fleet_hosts",
     ]
     for index, (name, arguments) in enumerate(calls):
         if name == "fleet_host_probe":
@@ -90,11 +132,7 @@ def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal
                 "operation_id": "op-success" if index < 4 else "op-failed"
             }
         else:
-            assert arguments == {
-                "agent": "all",
-                "agents_offset": 0,
-                "agents_limit": 20,
-            }
+            assert arguments == {}
     rendered = [call.args[0] for call in window.host_probe_status_label.set_text.call_args_list]
     assert "Host-Probe: QUEUED" in rendered
     assert "Host-Probe: RUNNING" in rendered
@@ -110,6 +148,37 @@ def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal
         "backend:failed",
         "backend:host-refresh",
     ]
+    host_cards = [call.args[0] for call in window.host_card_label.set_text.call_args_list]
+    assert any("Worker One" in value for value in host_cards)
+    assert any("Generation 5" in value for value in host_cards)
+
+
+def test_host_probe_submit_and_timer_scheduling_failures_are_visible() -> None:
+    window = object.__new__(control_center.ControlCenterWindow)
+    window._host_probe_operation_id = None
+    window._host_probe_poll_attempts = 0
+    window.host_ref_entry = Mock()
+    window.host_ref_entry.get_text.return_value = "worker-one"
+    window.host_generation_spin = Mock()
+    window.host_generation_spin.get_value_as_int.return_value = 4
+    window.host_probe_status_label = Mock()
+    window.controller = Mock()
+    window.controller.submit.side_effect = RuntimeError("submit unavailable")
+
+    window._probe_selected_host()
+
+    window.host_probe_status_label.set_text.assert_called_with(
+        "Host-Probe: UNKNOWN"
+    )
+
+    window.controller = Mock()
+    window.controller.submit.return_value = True
+    window.GLib = Mock()
+    window.GLib.timeout_add.return_value = 0
+    window._host_probe_started({"id": "op-one", "state": "planned"})
+    window.host_probe_status_label.set_text.assert_called_with(
+        "Host-Probe: UNKNOWN"
+    )
 
 
 def test_host_probe_unknown_terminality_follows_canonical_operation_contract() -> None:
@@ -305,7 +374,7 @@ class ControlCenterViewModelTest(unittest.TestCase):
 
         window.show("ollama")
 
-        window.notebook.set_current_page.assert_called_once_with(2)
+        window.notebook.set_current_page.assert_called_once_with(3)
         window.window.show_all.assert_called_once_with()
         window.refresh.assert_called_once_with()
 
@@ -666,7 +735,7 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertFalse(callback_called.is_set())
         self.assertTrue(controller.close())
 
-    def test_scheduler_registration_failure_releases_controller(self) -> None:
+    def test_scheduler_registration_failure_reports_visible_unknown_result(self) -> None:
         for schedule in (
             lambda _callback, *_args: 0,
             lambda _callback, *_args: (_ for _ in ()).throw(
@@ -674,6 +743,7 @@ class ControlCenterControllerTest(unittest.TestCase):
             ),
         ):
             callback_called = threading.Event()
+            results = []
             controller = control_center.OperationController(
                 dispatch=lambda _name, _args: {"ok": True},
                 schedule=schedule,
@@ -681,15 +751,15 @@ class ControlCenterControllerTest(unittest.TestCase):
 
             self.assertTrue(
                 controller.submit(
-                    "agent_status", {}, lambda _result: callback_called.set()
+                    "agent_status",
+                    {},
+                    lambda result: (results.append(result), callback_called.set()),
                 )
             )
-            deadline = time.monotonic() + 2
-            while controller.busy and time.monotonic() < deadline:
-                time.sleep(0.01)
 
+            self.assertTrue(callback_called.wait(2))
             self.assertFalse(controller.busy)
-            self.assertFalse(callback_called.is_set())
+            self.assertEqual(results, [{"error": "control-center delivery unavailable"}])
             self.assertTrue(controller.close())
 
     def test_window_close_retries_cancel_then_destroys_after_backend_cleanup(self) -> None:

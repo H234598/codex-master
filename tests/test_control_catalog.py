@@ -73,6 +73,7 @@ EXPECTED_RISKS = {
     "fleet_ollama_models": Risk.READ_ONLY,
     "fleet_ollama_instances": Risk.READ_ONLY,
     "fleet_operation_status": Risk.READ_ONLY,
+    "fleet_hosts": Risk.READ_ONLY,
     "fleet_gemini_bootstrap_plan": Risk.READ_ONLY,
     "fleet_series_list": Risk.READ_ONLY,
     "fleet_account_upsert": Risk.MUTATING,

@@ -314,6 +314,19 @@ class HostRegistry:
                     return self._host(record)
         raise HostRegistryError("control.host_not_found")
 
+    def document_generation(self) -> int:
+        """Return the authoritative generation used by agent principal fences."""
+
+        with self._locked_state() as (
+            _hosts,
+            _ssh_bindings,
+            _agent_bindings,
+            _observations,
+            generation,
+            _epoch_history,
+        ):
+            return generation
+
     def provision_agent_binding(
         self,
         registration: Mapping[str, object],
