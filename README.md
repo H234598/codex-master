@@ -940,12 +940,14 @@ failed. Verify the installed files and CLI first; do not interpret ordinary
 - accepts only the immutable, validated Runtime-Image entrypoint at
   `~/.local/lib/codex-master-runtime/bin/codex-master-mcp`
 - directly probes that entrypoint with MCP `initialize` before registering it
-- uses only the documented, root-owned `/usr/local/bin/codex` identity for
-  registration; it is validated and FD-pinned once for the whole
+- uses only the documented `/usr/local/bin/codex` identity for registration;
+  its source and resolved executable are validated as root- or effective-user
+  owned, then FD-pinned once for the whole
   install/uninstall transaction
 - binds the effective passwd home and its real `.codex` directory once, then
-  invokes Codex with a minimal fixed environment (`HOME` through that pinned
-  descriptor and `PATH=/usr/bin:/bin`), never ambient `HOME` or `CODEX_HOME`
+  invokes Codex with a minimal fixed environment (`HOME` and `CODEX_HOME`
+  through those pinned descriptors and `PATH=/usr/bin:/bin`), never ambient
+  `HOME` or `CODEX_HOME`
 - creates a missing private `.codex` directory only through that pinned home
   during `install`; read-only registration inspection and `doctor` never create it
 - registers exactly that command via `codex mcp add codex-master-mcp -- <entrypoint>`

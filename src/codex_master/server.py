@@ -2216,7 +2216,7 @@ def _runtime_mcp_entrypoint() -> Path:
 
 
 def _canonical_codex_cli_path() -> Path:
-    """Return the documented root-owned CLI used for Master MCP registration."""
+    """Return the documented root- or effective-owner CLI for MCP registration."""
 
     try:
         return trusted_runner_executable(CANONICAL_CODEX_CLI_PATH)
@@ -2247,12 +2247,13 @@ class _CodexMcpBinding:
     def environment(self) -> dict[str, str]:
         return {
             "HOME": f"/proc/self/fd/{self.home_fd}",
+            "CODEX_HOME": f"/proc/self/fd/{self.config_fd}",
             "PATH": CODEX_MCP_EXECUTION_PATH,
         }
 
     @property
-    def pass_fds(self) -> tuple[int, int]:
-        return (self.executable_fd, self.home_fd)
+    def pass_fds(self) -> tuple[int, int, int]:
+        return (self.executable_fd, self.home_fd, self.config_fd)
 
     def revalidate(self) -> None:
         try:
@@ -2287,6 +2288,63 @@ def _canonical_codex_client_home() -> tuple[Path, os.stat_result]:
     return home, metadata
 
 
+def _remove_created_empty_codex_config_directory(
+    home_fd: int,
+    expected_config_stat: os.stat_result,
+) -> None:
+    """Best-effort removal of only this call's unchanged, empty config directory."""
+
+    config_fd = -1
+    try:
+        current = os.stat(".codex", dir_fd=home_fd, follow_symlinks=False)
+        if (
+            stat_module.S_ISLNK(current.st_mode)
+            or not stat_module.S_ISDIR(current.st_mode)
+            or not source_identity_with_snapshot_matches(
+                current, expected_config_stat
+            )
+            or current.st_uid != expected_config_stat.st_uid
+            or stat_module.S_IMODE(current.st_mode)
+            != stat_module.S_IMODE(expected_config_stat.st_mode)
+            or getattr(current, "st_nlink", 1)
+            != getattr(expected_config_stat, "st_nlink", 1)
+            or current.st_ctime_ns != expected_config_stat.st_ctime_ns
+        ):
+            return
+        config_fd = os.open(
+            ".codex",
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=home_fd,
+        )
+        if not source_identity_with_snapshot_matches(
+            os.fstat(config_fd), expected_config_stat
+        ):
+            return
+        if os.listdir(config_fd):
+            return
+        current = os.stat(".codex", dir_fd=home_fd, follow_symlinks=False)
+        if (
+            not source_identity_with_snapshot_matches(current, expected_config_stat)
+            or current.st_uid != expected_config_stat.st_uid
+            or stat_module.S_IMODE(current.st_mode)
+            != stat_module.S_IMODE(expected_config_stat.st_mode)
+            or getattr(current, "st_nlink", 1)
+            != getattr(expected_config_stat, "st_nlink", 1)
+            or current.st_ctime_ns != expected_config_stat.st_ctime_ns
+        ):
+            return
+        os.rmdir(".codex", dir_fd=home_fd)
+    except OSError:
+        return
+    finally:
+        if config_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(config_fd)
+
+
 @contextlib.contextmanager
 def _codex_mcp_binding(
     *, create_config_directory: bool = False
@@ -2294,6 +2352,8 @@ def _codex_mcp_binding(
     executable_fd = -1
     home_fd = -1
     config_fd = -1
+    created_config_stat: os.stat_result | None = None
+    binding_yielded = False
     try:
         executable = _canonical_codex_cli_path()
         executable_stat = executable.lstat()
@@ -2324,7 +2384,13 @@ def _codex_mcp_binding(
                 os.mkdir(".codex", 0o700, dir_fd=home_fd)
             except FileExistsError:
                 pass
-            config_stat = os.stat(".codex", dir_fd=home_fd, follow_symlinks=False)
+            else:
+                created_config_stat = os.stat(
+                    ".codex", dir_fd=home_fd, follow_symlinks=False
+                )
+            config_stat = created_config_stat or os.stat(
+                ".codex", dir_fd=home_fd, follow_symlinks=False
+            )
         if (
             stat_module.S_ISLNK(config_stat.st_mode)
             or not stat_module.S_ISDIR(config_stat.st_mode)
@@ -2348,6 +2414,7 @@ def _codex_mcp_binding(
             config_stat,
         )
         binding.revalidate()
+        binding_yielded = True
         yield binding
         binding.revalidate()
     except AgentError:
@@ -2355,6 +2422,8 @@ def _codex_mcp_binding(
     except OSError as exc:
         raise AgentError("canonical_codex_mcp_binding_unavailable") from exc
     finally:
+        if not binding_yielded and created_config_stat is not None and home_fd >= 0:
+            _remove_created_empty_codex_config_directory(home_fd, created_config_stat)
         for descriptor in (config_fd, home_fd, executable_fd):
             if descriptor >= 0:
                 with contextlib.suppress(OSError):
@@ -20965,10 +21034,9 @@ def master_plugin_status() -> dict[str, Any]:
     mcp_manifest_declaration = plugin_declares_mcp_manifest(root)
     mcp_manifest_status = plugin_mcp_manifest_status(root)
     app_bridge = master_app_bridge_status()
-    mcp_registration = check_mcp_registration(entrypoint)
+    _, mcp_registration, client_config = _read_bound_mcp_health(entrypoint)
     startup_self_test = mcp_command_startup_self_test(entrypoint)
     cache_status = plugin_cache_status(root)
-    client_config = codex_client_mcp_config_status(command_path=entrypoint)
     return {
         "ok": (
             bool(app_bridge.get("ok"))
@@ -22823,9 +22891,7 @@ def master_watchdog_status(
 
 
 def master_timeout_policy() -> dict[str, Any]:
-    client_config = codex_client_mcp_config_status(
-        command_path=_runtime_mcp_entrypoint()
-    )
+    _, _, client_config = _read_bound_mcp_health(_runtime_mcp_entrypoint())
     startup_timeout = {
         "scope": "codex_cli_mcp_server_startup",
         "configured_seconds": client_config.get("startup_timeout_sec"),
@@ -22919,14 +22985,13 @@ def master_timeout_policy() -> dict[str, Any]:
 
 def master_namespace_status() -> dict[str, Any]:
     entrypoint = _runtime_mcp_entrypoint()
-    registration = check_mcp_registration(entrypoint)
+    _, registration, client_config = _read_bound_mcp_health(entrypoint)
     startup_self_test = mcp_command_startup_self_test(entrypoint)
     tools_list_self_test = mcp_command_tools_list_self_test(
         entrypoint,
         required_tools=("agent_assignment_report",),
     )
     cache_status = plugin_cache_status(repo_root())
-    client_config = codex_client_mcp_config_status(command_path=entrypoint)
     home_context = codex_home_context()
     tool_names = {tool["name"] for tool in TOOLS if isinstance(tool.get("name"), str)}
     local_tool_contract = {
@@ -23109,14 +23174,65 @@ def check_mcp_registration(
     return result
 
 
+def _unavailable_codex_client_mcp_config_status() -> dict[str, Any]:
+    return {
+        "name": "codex_client_mcp_config",
+        "path": PATH_NOT_RETURNED,
+        "path_state": "unavailable",
+        "exists": False,
+        "regular_file": False,
+        "symlink": False,
+        "server": MCP_SERVER_NAME,
+        "server_declared": False,
+        "command_configured": False,
+        "command_matches_runtime_entrypoint": False,
+        "startup_timeout_sec": None,
+        "startup_timeout_ok": False,
+        "startup_timeout_recommended_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+        "default_tools_approval_mode": None,
+        "default_tools_approval_mode_ok": False,
+        "ok": False,
+        "reason": "canonical Codex CLI unavailable",
+        "raw_output": "not_returned",
+    }
+
+
+def _read_bound_mcp_health(
+    entrypoint: Path,
+) -> tuple[bool, dict[str, Any], dict[str, Any]]:
+    """Read registration health through one no-create CLI/home/config binding."""
+
+    try:
+        with _codex_mcp_binding() as binding:
+            binding.revalidate()
+            registration = check_mcp_registration(entrypoint, binding=binding)
+            binding.revalidate()
+            client_config = codex_client_mcp_config_status(
+                binding.config_path, command_path=entrypoint
+            )
+            binding.revalidate()
+            return True, registration, client_config
+    except AgentError:
+        return (
+            False,
+            {
+                "registered": False,
+                "lookup_status": "unavailable",
+                "ok": False,
+                "reason": "canonical Codex CLI unavailable",
+            },
+            _unavailable_codex_client_mcp_config_status(),
+        )
+
+
 def doctor() -> dict[str, Any]:
     ensure_state()
     install_path = _runtime_mcp_entrypoint()
-    try:
-        with _codex_mcp_binding():
-            canonical_codex_cli_available = True
-    except AgentError:
-        canonical_codex_cli_available = False
+    (
+        canonical_codex_cli_available,
+        registration,
+        client_config,
+    ) = _read_bound_mcp_health(install_path)
     checks: list[dict[str, Any]] = [
         {"name": "tmux_available", "ok": shutil.which("tmux") is not None},
         {
@@ -23189,9 +23305,8 @@ def doctor() -> dict[str, Any]:
                 },
             ]
         )
-    registration = check_mcp_registration(install_path)
     checks.append({"name": "mcp_registered", **registration})
-    checks.append(codex_client_mcp_config_status(command_path=install_path))
+    checks.append(client_config)
     checks.append(
         {
             "name": "mcp_startup_timeout_configured",

@@ -71,8 +71,12 @@ class _PinnedMcpBinding:
     def __init__(self) -> None:
         self.command_path = Path("/proc/self/fd/71")
         self.config_path = Path("/proc/self/fd/73/config.toml")
-        self.environment = {"HOME": "/proc/self/fd/72", "PATH": "/usr/bin:/bin"}
-        self.pass_fds = (71, 72)
+        self.environment = {
+            "HOME": "/proc/self/fd/72",
+            "CODEX_HOME": "/proc/self/fd/73",
+            "PATH": "/usr/bin:/bin",
+        }
+        self.pass_fds = (71, 72, 73)
         self.revalidate = Mock()
 
 
@@ -265,6 +269,57 @@ def test_registration_inspection_uses_only_the_pinned_cli_and_client_home(
     assert binding.revalidate.call_count == 2
 
 
+def test_bound_mcp_health_reads_registration_and_config_through_one_no_create_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _PinnedMcpBinding()
+    entrypoint = Path("/runtime/bin/codex-master-mcp")
+    registration = {"ok": True, "registered": True}
+    client_config = {"ok": True, "server_declared": True}
+    monkeypatch.setenv("HOME", "/tmp/attacker-home")
+    monkeypatch.setenv("CODEX_HOME", "/tmp/attacker-config")
+
+    with (
+        patch.object(
+            server, "_codex_mcp_binding", return_value=contextlib.nullcontext(binding)
+        ) as bind,
+        patch.object(server, "check_mcp_registration", return_value=registration) as check,
+        patch.object(
+            server, "codex_client_mcp_config_status", return_value=client_config
+        ) as config_status,
+        patch.object(
+            server,
+            "codex_config_path",
+            side_effect=AssertionError("bound health must not read ambient CODEX_HOME"),
+        ),
+    ):
+        available, actual_registration, actual_client_config = (
+            server._read_bound_mcp_health(entrypoint)
+        )
+
+    assert available is True
+    assert actual_registration is registration
+    assert actual_client_config is client_config
+    bind.assert_called_once_with()
+    check.assert_called_once_with(entrypoint, binding=binding)
+    config_status.assert_called_once_with(binding.config_path, command_path=entrypoint)
+    assert binding.revalidate.call_count == 3
+
+
+def test_status_callers_delegate_registration_health_to_one_bound_context() -> None:
+    source = Path(server.__file__).read_text(encoding="utf-8")
+    for function_name in (
+        "master_plugin_status",
+        "master_timeout_policy",
+        "master_namespace_status",
+        "doctor",
+    ):
+        start = source.index(f"def {function_name}(")
+        next_function = source.find("\ndef ", start + 1)
+        body = source[start : None if next_function < 0 else next_function]
+        assert "_read_bound_mcp_health(" in body
+
+
 @pytest.mark.parametrize("register", (True, False))
 def test_install_rejects_unavailable_binding_before_any_applet_or_registry_mutation(
     tmp_path: Path,
@@ -401,23 +456,24 @@ def test_force_rollback_reuses_one_pinned_cli_and_client_home_after_add_failure(
     assert binding.revalidate.call_count == 6
 
 
-def test_binding_pins_cli_and_client_home_across_a_filesystem_swap(
+def test_binding_removes_only_its_new_empty_config_directory_after_pre_yield_failure(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "main-home"
     home.mkdir(mode=0o700)
-    (home / ".codex").mkdir(mode=0o700)
     executable = tmp_path / "codex"
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     executable.chmod(0o700)
-    moved_home = tmp_path / "main-home-pinned"
-    replacement_home = tmp_path / "replacement-home"
-    replacement_home.mkdir(mode=0o700)
-    (replacement_home / ".codex").mkdir(mode=0o700)
-    monkeypatch.setenv("HOME", str(replacement_home))
-    monkeypatch.setenv("CODEX_HOME", str(replacement_home / ".codex"))
-    completed = subprocess.CompletedProcess([], 0, "", "")
+    open_config_directory = server.open_directory_no_follow_matching
+
+    def fail_config_open(
+        path: Path | str,
+        expected: os.stat_result,
+        **kwargs: object,
+    ) -> int:
+        if path == ".codex":
+            raise server.AgentError("injected_config_open_failure")
+        return open_config_directory(path, expected, **kwargs)
 
     with (
         patch.object(server.os, "geteuid", return_value=1000),
@@ -425,36 +481,202 @@ def test_binding_pins_cli_and_client_home_across_a_filesystem_swap(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
         patch.object(server, "_canonical_codex_cli_path", return_value=executable),
-        patch.object(server, "run_command", return_value=completed) as run,
+        patch.object(
+            server,
+            "open_directory_no_follow_matching",
+            side_effect=fail_config_open,
+        ),
+    ):
+        with pytest.raises(server.AgentError, match="injected_config_open_failure"):
+            with server._codex_mcp_binding(create_config_directory=True):
+                pass
+
+    assert not (home / ".codex").exists()
+
+
+@pytest.mark.parametrize("case", ("nonempty", "replacement", "mode", "existing"))
+def test_binding_never_removes_foreign_changed_or_existing_config_after_pre_yield_failure(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    home = tmp_path / "main-home"
+    home.mkdir(mode=0o700)
+    if case == "existing":
+        (home / ".codex").mkdir(mode=0o700)
+        (home / ".codex" / "existing").write_text("keep", encoding="utf-8")
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    moved = tmp_path / "moved-config"
+
+    def fail_after_config_open(*args: object) -> None:
+        config = home / ".codex"
+        if case == "nonempty":
+            (config / "foreign").write_text("keep", encoding="utf-8")
+        elif case == "replacement":
+            config.rename(moved)
+            config.mkdir(mode=0o700)
+            (config / "foreign").write_text("keep", encoding="utf-8")
+        elif case == "mode":
+            config.chmod(0o755)
+        raise server.AgentError("injected_post_open_failure")
+
+    with (
+        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.object(server, "_canonical_codex_cli_path", return_value=executable),
+        patch.object(server, "_CodexMcpBinding", side_effect=fail_after_config_open),
+    ):
+        with pytest.raises(server.AgentError, match="injected_post_open_failure"):
+            with server._codex_mcp_binding(create_config_directory=True):
+                pass
+
+    if case == "replacement":
+        assert moved.is_dir()
+        assert (home / ".codex" / "foreign").is_file()
+    elif case == "nonempty":
+        assert (home / ".codex" / "foreign").is_file()
+    elif case == "mode":
+        assert (home / ".codex").stat().st_mode & 0o777 == 0o755
+    else:
+        assert (home / ".codex" / "existing").is_file()
+
+
+def test_binding_pins_cli_and_client_config_across_a_dot_codex_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "main-home"
+    home.mkdir(mode=0o700)
+    (home / ".codex").mkdir(mode=0o700)
+    (home / ".codex" / "marker").write_text("pinned", encoding="utf-8")
+    executable = tmp_path / "codex"
+    executable.write_text(
+        "#!/bin/sh\nprintf 'marker='\ncat \"${CODEX_HOME:-/missing}/marker\" 2>/dev/null || true\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    moved_config = tmp_path / "pinned-config"
+    replacement_config = home / ".codex-replacement"
+    replacement_config.mkdir(mode=0o700)
+    (replacement_config / "marker").write_text("replacement", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path / "attacker-home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "attacker-config"))
+
+    with (
+        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.object(server, "_canonical_codex_cli_path", return_value=executable),
     ):
         with server._codex_mcp_binding() as binding:
             first_home = binding.environment["HOME"]
+            first_config_home = binding.environment["CODEX_HOME"]
             first_cli = str(binding.command_path)
             first_pass_fds = binding.pass_fds
-            configured = server.ensure_mcp_startup_timeout_configured(
-                binding.config_path
-            )
-            assert configured["status"] == "updated"
-            status = server.codex_client_mcp_config_status(
-                binding.config_path,
-                command_path=Path("/runtime/bin/codex-master-mcp"),
-            )
-            assert status["path_state"] == "set"
-            server._run_bound_codex_mcp_command(
+            (home / ".codex").rename(moved_config)
+            replacement_config.rename(home / ".codex")
+            pinned_home = Path(first_home).resolve()
+            pinned_config = Path(first_config_home).resolve()
+            completed = server._run_bound_codex_mcp_command(
                 binding, "get", server.MCP_SERVER_NAME
             )
-            home.rename(moved_home)
-            replacement_home.rename(home)
-            server._run_bound_codex_mcp_command(
-                binding, "remove", server.MCP_SERVER_NAME
-            )
 
-    assert [call.args[0][0] for call in run.call_args_list] == [first_cli, first_cli]
-    assert all(call.kwargs["env"]["HOME"] == first_home for call in run.call_args_list)
-    assert all("CODEX_HOME" not in call.kwargs["env"] for call in run.call_args_list)
-    assert all(call.kwargs["pass_fds"] == first_pass_fds for call in run.call_args_list)
-    assert (moved_home / ".codex" / "config.toml").is_file()
-    assert not (home / ".codex" / "config.toml").exists()
+    assert completed.returncode == 0
+    assert completed.stdout == "marker=pinned"
+    assert first_cli.startswith("/proc/self/fd/")
+    assert pinned_home == home
+    assert pinned_config == moved_config
+    assert len(first_pass_fds) == 3
+    assert (moved_config / "marker").read_text(encoding="utf-8") == "pinned"
+    assert (home / ".codex" / "marker").read_text(encoding="utf-8") == "replacement"
+
+
+def test_force_rollback_keeps_the_pinned_dot_codex_after_a_swap(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "main-home"
+    home.mkdir(mode=0o700)
+    config = home / ".codex"
+    config.mkdir(mode=0o700)
+    (config / "marker").write_text("pinned", encoding="utf-8")
+    executable = tmp_path / "codex"
+    executable.write_text(
+        "#!/bin/sh\nprintf '%s:' \"$2\"\ncat \"${CODEX_HOME:-/missing}/marker\" 2>/dev/null || true\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    entrypoint = tmp_path / "codex-master-mcp"
+    entrypoint.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    entrypoint.chmod(0o700)
+    moved_config = tmp_path / "pinned-config"
+    replacement_config = tmp_path / "replacement-config"
+    replacement_config.mkdir(mode=0o700)
+    (replacement_config / "marker").write_text("replacement", encoding="utf-8")
+    current = {
+        "registered": True,
+        "lookup_status": "registered",
+        "command_matches": False,
+        "startup_timeout_ok": True,
+        "ok": False,
+        "_registered_command": "/previous/codex-master-mcp",
+    }
+    completed: list[subprocess.CompletedProcess[str]] = []
+
+    def run_and_swap(
+        command: list[str], *, env: dict[str, str], pass_fds: tuple[int, ...]
+    ) -> subprocess.CompletedProcess[str]:
+        actual = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            pass_fds=pass_fds,
+        )
+        completed.append(actual)
+        if len(completed) == 1:
+            config.rename(moved_config)
+            replacement_config.rename(config)
+        return subprocess.CompletedProcess(command, 1 if len(completed) == 2 else 0, actual.stdout, actual.stderr)
+
+    with (
+        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.object(server, "_canonical_codex_cli_path", return_value=executable),
+        patch.object(server, "_runtime_mcp_entrypoint", return_value=entrypoint),
+        patch.object(server, "ensure_applet_action_key"),
+        patch.object(server, "mcp_command_startup_self_test", return_value={"ok": True}),
+        patch.object(server, "check_mcp_registration", return_value=current),
+        patch.object(
+            server,
+            "codex_client_mcp_config_status",
+            return_value={
+                "startup_timeout_ok": True,
+                "default_tools_approval_mode_ok": True,
+            },
+        ),
+        patch.object(server, "run_command", side_effect=run_and_swap),
+    ):
+        with server._codex_mcp_binding() as binding:
+            first_config_home = binding.environment["CODEX_HOME"]
+            with pytest.raises(server.AgentError, match="codex mcp add failed"):
+                server._install_enrolled_unlocked(
+                    register=True,
+                    force=True,
+                    sync_plugin_cache=False,
+                    binding=binding,
+                )
+            pinned_config = Path(first_config_home).resolve()
+
+    assert [item.stdout for item in completed] == ["remove:pinned", "add:pinned", "add:pinned"]
+    assert pinned_config == moved_config
+    assert (config / "marker").read_text(encoding="utf-8") == "replacement"
 
 
 def test_binding_creates_a_missing_client_config_directory_through_the_pinned_home(
