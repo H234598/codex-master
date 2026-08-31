@@ -6160,11 +6160,16 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(target), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.run_command")
-    @patch(
-        "codex_master.server._canonical_codex_cli_path",
-        return_value=Path("/usr/local/bin/codex"),
-    )
-    def test_check_mcp_registration_rejects_substring_command_match(self, _mock_cli, mock_run) -> None:
+    @patch("codex_master.server._codex_mcp_binding")
+    def test_check_mcp_registration_rejects_substring_command_match(self, mock_binding, mock_run) -> None:
+        mock_binding.return_value = contextlib.nullcontext(
+            SimpleNamespace(
+                command_path=Path("/proc/self/fd/71"),
+                environment={"HOME": "/proc/self/fd/72", "PATH": "/usr/bin:/bin"},
+                pass_fds=(71, 72),
+                revalidate=Mock(),
+            )
+        )
         mock_run.return_value = subprocess.CompletedProcess(
             ["codex", "mcp", "get", "codex-master-mcp"],
             0,
@@ -6192,11 +6197,16 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("/tmp/bin/codex-master-mcp-old", result["output_excerpt"])
 
     @patch("codex_master.server.run_command")
-    @patch(
-        "codex_master.server._canonical_codex_cli_path",
-        return_value=Path("/usr/local/bin/codex"),
-    )
-    def test_check_mcp_registration_rejects_short_startup_timeout(self, _mock_cli, mock_run) -> None:
+    @patch("codex_master.server._codex_mcp_binding")
+    def test_check_mcp_registration_rejects_short_startup_timeout(self, mock_binding, mock_run) -> None:
+        mock_binding.return_value = contextlib.nullcontext(
+            SimpleNamespace(
+                command_path=Path("/proc/self/fd/71"),
+                environment={"HOME": "/proc/self/fd/72", "PATH": "/usr/bin:/bin"},
+                pass_fds=(71, 72),
+                revalidate=Mock(),
+            )
+        )
         mock_run.return_value = subprocess.CompletedProcess(
             ["codex", "mcp", "get", "codex-master-mcp"],
             0,
@@ -6218,13 +6228,18 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["ok"])
 
     @patch("codex_master.server.run_command")
-    @patch(
-        "codex_master.server._canonical_codex_cli_path",
-        return_value=Path("/usr/local/bin/codex"),
-    )
+    @patch("codex_master.server._codex_mcp_binding")
     def test_check_mcp_registration_distinguishes_absent_from_lookup_failure(
-        self, _mock_cli, mock_run
+        self, mock_binding, mock_run
     ) -> None:
+        mock_binding.side_effect = lambda: contextlib.nullcontext(
+            SimpleNamespace(
+                command_path=Path("/proc/self/fd/71"),
+                environment={"HOME": "/proc/self/fd/72", "PATH": "/usr/bin:/bin"},
+                pass_fds=(71, 72),
+                revalidate=Mock(),
+            )
+        )
         mock_run.side_effect = [
             subprocess.CompletedProcess(
                 ["codex", "mcp", "get", MCP_SERVER_NAME],
@@ -35830,12 +35845,27 @@ class CliLifecycleTest(unittest.TestCase):
 
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
+    @patch("codex_master.server._codex_mcp_binding")
     @patch("codex_master.server.shutil.which")
     @patch("codex_master.server.print_json")
     def test_cli_doctor_exposes_health_checks_without_secrets(
-        self, mock_print_json, mock_shutil_which, mock_check_mcp_registration, _mock_tmux_alive
+        self,
+        mock_print_json,
+        mock_shutil_which,
+        mock_binding,
+        mock_check_mcp_registration,
+        _mock_tmux_alive,
     ) -> None:
         captured_payloads = []
+
+        mock_binding.return_value = contextlib.nullcontext(
+            SimpleNamespace(
+                command_path=Path("/proc/self/fd/71"),
+                environment={"HOME": "/proc/self/fd/72", "PATH": "/usr/bin:/bin"},
+                pass_fds=(71, 72),
+                revalidate=Mock(),
+            )
+        )
 
         def _capture(payload):
             captured_payloads.append(payload)
@@ -35871,6 +35901,12 @@ class CliLifecycleTest(unittest.TestCase):
                         "codex_master.server.META_DIR", Path(tmp_home) / "state" / "meta"
                     ), patch("codex_master.server.LEGACY_STATE_ROOT", Path(tmp_home) / "legacy-state"), patch(
                         "codex_master.server.LEGACY_META_DIR", Path(tmp_home) / "legacy-state" / "meta"
+                    ), patch(
+                        "codex_master.server._runtime_mcp_entrypoint",
+                        return_value=Path("/runtime/bin/codex-master-mcp"),
+                    ), patch(
+                        "codex_master.server.mcp_command_startup_self_test",
+                        return_value={"ok": False},
                     ):
                         result = main_cli(["doctor"])
 
@@ -35882,7 +35918,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertTrue(all(isinstance(item, dict) for item in payload["checks"]))
         self.assertFalse(payload["ok"])
         self.assertTrue(any(item["name"] == "tmux_available" and item["ok"] is True for item in payload["checks"]))
-        self.assertTrue(any(item["name"] == "codex_available" and item["ok"] is True for item in payload["checks"]))
+        self.assertTrue(any(item["name"] == "canonical_codex_cli_available" and item["ok"] is True for item in payload["checks"]))
         self.assertTrue(any(item["name"] == "mcp_registered" for item in payload["checks"]))
         self.assertFalse(next(item for item in payload["checks"] if item["name"] == "mcp_registered")["ok"])
         startup_timeout = next(item for item in payload["checks"] if item["name"] == "mcp_startup_timeout_configured")

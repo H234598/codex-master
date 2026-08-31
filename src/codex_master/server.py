@@ -450,6 +450,8 @@ MAX_AGENT_LEASE_SECONDS = 7200
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 MCP_DEFAULT_TOOLS_APPROVAL_MODE = "approve"
+CANONICAL_CODEX_CLI_PATH = Path("/usr/local/bin/codex")
+CODEX_MCP_EXECUTION_PATH = "/usr/bin:/bin"
 MASTER_FLEET_HOME_V2_CUTOVER_OPERATIONS = (
     "plan",
     "apply",
@@ -2171,7 +2173,7 @@ def executable_directory_chain_is_trusted(path: Path) -> bool:
 
     if not path.is_absolute():
         return False
-    current_uid = os.getuid() if hasattr(os, "getuid") else -1
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else -1
     current = Path(path.anchor)
     for part in path.parts[1:]:
         current = current / part
@@ -2214,22 +2216,158 @@ def _runtime_mcp_entrypoint() -> Path:
 
 
 def _canonical_codex_cli_path() -> Path:
-    """Return the one validated user CLI used for Master MCP registration."""
+    """Return the documented root-owned CLI used for Master MCP registration."""
 
     try:
-        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
-    except (KeyError, OSError) as exc:
-        raise AgentError("canonical_codex_cli_unavailable") from exc
-    if not home.is_absolute():
-        raise AgentError("canonical_codex_cli_unavailable")
-    try:
-        return trusted_runner_executable(home / ".local" / "bin" / "codex")
+        return trusted_runner_executable(CANONICAL_CODEX_CLI_PATH)
     except AgentError as exc:
         raise AgentError("canonical_codex_cli_unavailable") from exc
 
 
-def _codex_mcp_command(*arguments: str) -> list[str]:
-    return [str(_canonical_codex_cli_path()), "mcp", *arguments]
+@dataclass
+class _CodexMcpBinding:
+    """One FD-pinned CLI and client-config identity for an MCP transaction."""
+
+    executable_fd: int
+    executable_stat: os.stat_result
+    home_fd: int
+    home_stat: os.stat_result
+    config_fd: int
+    config_stat: os.stat_result
+
+    @property
+    def command_path(self) -> Path:
+        return Path(f"/proc/self/fd/{self.executable_fd}")
+
+    @property
+    def config_path(self) -> Path:
+        return Path(f"/proc/self/fd/{self.config_fd}/config.toml")
+
+    @property
+    def environment(self) -> dict[str, str]:
+        return {
+            "HOME": f"/proc/self/fd/{self.home_fd}",
+            "PATH": CODEX_MCP_EXECUTION_PATH,
+        }
+
+    @property
+    def pass_fds(self) -> tuple[int, int]:
+        return (self.executable_fd, self.home_fd)
+
+    def revalidate(self) -> None:
+        try:
+            executable = os.fstat(self.executable_fd)
+            home = os.fstat(self.home_fd)
+            config = os.fstat(self.config_fd)
+        except OSError as exc:
+            raise AgentError("canonical_codex_mcp_binding_unavailable") from exc
+        if (
+            not source_identity_with_snapshot_matches(executable, self.executable_stat)
+            or not source_identity_matches(home, self.home_stat)
+            or not source_identity_matches(config, self.config_stat)
+        ):
+            raise AgentError("canonical_codex_mcp_binding_unavailable")
+
+
+def _canonical_codex_client_home() -> tuple[Path, os.stat_result]:
+    try:
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        metadata = home.lstat()
+    except (KeyError, OSError) as exc:
+        raise AgentError("canonical_codex_mcp_binding_unavailable") from exc
+    if (
+        not home.is_absolute()
+        or stat_module.S_ISLNK(metadata.st_mode)
+        or not stat_module.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+        or not executable_directory_chain_is_trusted(home)
+    ):
+        raise AgentError("canonical_codex_mcp_binding_unavailable")
+    return home, metadata
+
+
+@contextlib.contextmanager
+def _codex_mcp_binding() -> Iterator[_CodexMcpBinding]:
+    executable_fd = -1
+    home_fd = -1
+    config_fd = -1
+    try:
+        executable = _canonical_codex_cli_path()
+        executable_stat = executable.lstat()
+        executable_fd = os.open(
+            executable,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_executable = os.fstat(executable_fd)
+        if not source_identity_with_snapshot_matches(
+            opened_executable, executable_stat
+        ):
+            raise AgentError("canonical_codex_mcp_binding_unavailable")
+        home, home_stat = _canonical_codex_client_home()
+        home_fd = open_directory_chain_no_follow_matching(
+            home,
+            home_stat,
+            error_text="canonical_codex_mcp_binding_unavailable",
+            changed_text="canonical_codex_mcp_binding_unavailable",
+        )
+        config_stat = os.stat(".codex", dir_fd=home_fd, follow_symlinks=False)
+        if (
+            stat_module.S_ISLNK(config_stat.st_mode)
+            or not stat_module.S_ISDIR(config_stat.st_mode)
+            or config_stat.st_uid != os.geteuid()
+            or config_stat.st_mode & 0o022
+        ):
+            raise AgentError("canonical_codex_mcp_binding_unavailable")
+        config_fd = open_directory_no_follow_matching(
+            ".codex",
+            config_stat,
+            error_text="canonical_codex_mcp_binding_unavailable",
+            changed_text="canonical_codex_mcp_binding_unavailable",
+            dir_fd=home_fd,
+        )
+        binding = _CodexMcpBinding(
+            executable_fd,
+            opened_executable,
+            home_fd,
+            home_stat,
+            config_fd,
+            config_stat,
+        )
+        binding.revalidate()
+        yield binding
+        binding.revalidate()
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("canonical_codex_mcp_binding_unavailable") from exc
+    finally:
+        for descriptor in (config_fd, home_fd, executable_fd):
+            if descriptor >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+
+
+def _codex_mcp_command(
+    binding: _CodexMcpBinding, *arguments: str
+) -> list[str]:
+    return [str(binding.command_path), "mcp", *arguments]
+
+
+def _run_bound_codex_mcp_command(
+    binding: _CodexMcpBinding, *arguments: str
+) -> subprocess.CompletedProcess[str]:
+    binding.revalidate()
+    try:
+        return run_command(
+            _codex_mcp_command(binding, *arguments),
+            env=binding.environment,
+            pass_fds=binding.pass_fds,
+        )
+    finally:
+        binding.revalidate()
 
 
 def runtime_mcp_entrypoint() -> Path:
@@ -8069,7 +8207,7 @@ def trusted_runner_executable(path: Path) -> Path:
     if (
         not stat_module.S_ISREG(target.st_mode)
         or getattr(target, "st_nlink", 1) != 1
-        or target.st_uid not in {0, os.getuid() if hasattr(os, "getuid") else -1}
+        or target.st_uid not in {0, os.geteuid() if hasattr(os, "geteuid") else -1}
         or target.st_mode & 0o022
         or not os.access(resolved, os.X_OK)
         or not directory_chain_is_real_no_symlink(path.parent)
@@ -22893,11 +23031,27 @@ def check_mcp_registration(
     command_path: Path | None = None,
     *,
     include_command: bool = False,
+    binding: _CodexMcpBinding | None = None,
 ) -> dict[str, Any]:
     if command_path is None:
         command_path = _runtime_mcp_entrypoint()
+    if binding is None:
+        try:
+            with _codex_mcp_binding() as pinned_binding:
+                return check_mcp_registration(
+                    command_path,
+                    include_command=include_command,
+                    binding=pinned_binding,
+                )
+        except AgentError:
+            return {
+                "registered": False,
+                "lookup_status": "unavailable",
+                "ok": False,
+                "reason": "canonical Codex CLI unavailable",
+            }
     try:
-        cp = run_command(_codex_mcp_command("get", MCP_SERVER_NAME))
+        cp = _run_bound_codex_mcp_command(binding, "get", MCP_SERVER_NAME)
     except AgentError:
         return {
             "registered": False,
@@ -22947,9 +23101,17 @@ def check_mcp_registration(
 def doctor() -> dict[str, Any]:
     ensure_state()
     install_path = _runtime_mcp_entrypoint()
+    try:
+        with _codex_mcp_binding():
+            canonical_codex_cli_available = True
+    except AgentError:
+        canonical_codex_cli_available = False
     checks: list[dict[str, Any]] = [
         {"name": "tmux_available", "ok": shutil.which("tmux") is not None},
-        {"name": "codex_available", "ok": shutil.which("codex") is not None},
+        {
+            "name": "canonical_codex_cli_available",
+            "ok": canonical_codex_cli_available,
+        },
         {
             "name": "runtime_mcp_entrypoint",
             "ok": is_regular_executable_no_symlink(install_path),
@@ -23564,7 +23726,17 @@ def _install_enrolled_unlocked(
     force: bool = False,
     sync_plugin_cache: bool = True,
     install_desktop: bool = False,
+    binding: _CodexMcpBinding | None = None,
 ) -> dict[str, Any]:
+    if binding is None:
+        with _codex_mcp_binding() as pinned_binding:
+            return _install_enrolled_unlocked(
+                register=register,
+                force=force,
+                sync_plugin_cache=sync_plugin_cache,
+                install_desktop=install_desktop,
+                binding=pinned_binding,
+            )
     entrypoint = _runtime_mcp_entrypoint()
     if not path_present_no_follow(entrypoint):
         raise AgentError("runtime MCP entrypoint missing")
@@ -23626,7 +23798,10 @@ def _install_enrolled_unlocked(
             }
             if not startup_self_test["ok"]:
                 raise AgentError("runtime MCP entrypoint failed MCP startup self-test")
-            current = check_mcp_registration(entrypoint, include_command=True)
+            assert binding is not None
+            current = check_mcp_registration(
+                entrypoint, include_command=True, binding=binding
+            )
             if current.get("lookup_status") == "unavailable":
                 raise AgentError("MCP server registration could not be inspected")
             startup_timeout_config = None
@@ -23646,7 +23821,9 @@ def _install_enrolled_unlocked(
                         raise AgentError(
                             "MCP server registration command could not be inspected; refusing force replacement"
                         )
-                    remove = run_command(_codex_mcp_command("remove", MCP_SERVER_NAME))
+                    remove = _run_bound_codex_mcp_command(
+                        binding, "remove", MCP_SERVER_NAME
+                    )
                     if remove.returncode != 0:
                         raise AgentError("codex mcp remove failed")
                     registration_removed = True
@@ -23654,8 +23831,8 @@ def _install_enrolled_unlocked(
                     raise AgentError(
                         "MCP server is registered with a different command; rerun install with --force"
                     )
-                add = run_command(
-                    _codex_mcp_command("add", MCP_SERVER_NAME, "--", str(entrypoint))
+                add = _run_bound_codex_mcp_command(
+                    binding, "add", MCP_SERVER_NAME, "--", str(entrypoint)
                 )
                 if add.returncode != 0:
                     raise AgentError("codex mcp add failed")
@@ -23663,17 +23840,21 @@ def _install_enrolled_unlocked(
                 registration = {"requested": True, "status": "registered"}
             if not current.get("startup_timeout_ok"):
                 startup_timeout_config = ensure_mcp_startup_timeout_configured(
+                    binding.config_path,
                     capture_snapshot=True
                 )
                 startup_timeout_snapshot = startup_timeout_config.pop(
                     "_config_snapshot", None
                 )
             else:
-                client_config = codex_client_mcp_config_status(command_path=entrypoint)
+                client_config = codex_client_mcp_config_status(
+                    binding.config_path, command_path=entrypoint
+                )
                 if not client_config.get("startup_timeout_ok") or not client_config.get(
                     "default_tools_approval_mode_ok"
                 ):
                     startup_timeout_config = ensure_mcp_startup_timeout_configured(
+                        binding.config_path,
                         capture_snapshot=True
                     )
                     startup_timeout_snapshot = startup_timeout_config.pop(
@@ -23699,14 +23880,15 @@ def _install_enrolled_unlocked(
         if registration_added or registration_removed:
             try:
                 if registration_added:
-                    remove = run_command(_codex_mcp_command("remove", MCP_SERVER_NAME))
+                    assert binding is not None
+                    remove = _run_bound_codex_mcp_command(
+                        binding, "remove", MCP_SERVER_NAME
+                    )
                     if remove.returncode != 0:
                         raise AgentError("codex mcp remove failed")
                 if previous_command is not None:
-                    restore = run_command(
-                        _codex_mcp_command(
-                            "add", MCP_SERVER_NAME, "--", previous_command
-                        )
+                    restore = _run_bound_codex_mcp_command(
+                        binding, "add", MCP_SERVER_NAME, "--", previous_command
                     )
                     if restore.returncode != 0:
                         raise AgentError("codex mcp add failed")
@@ -23750,7 +23932,17 @@ def _install_unlocked(
     force: bool = False,
     sync_plugin_cache: bool = True,
     install_desktop: bool = False,
+    binding: _CodexMcpBinding | None = None,
 ) -> dict[str, Any]:
+    if binding is None:
+        with _codex_mcp_binding() as pinned_binding:
+            return _install_unlocked(
+                register=register,
+                force=force,
+                sync_plugin_cache=sync_plugin_cache,
+                install_desktop=install_desktop,
+                binding=pinned_binding,
+            )
     enrollment: dict[str, Any] | None = None
     if register:
         assert_install_context_allows_master_registration()
@@ -23761,6 +23953,7 @@ def _install_unlocked(
             force=force,
             sync_plugin_cache=sync_plugin_cache,
             install_desktop=install_desktop,
+            binding=binding,
         )
     except BaseException:
         if enrollment is not None and enrollment.get("changed"):
@@ -23779,19 +23972,30 @@ def install(
     sync_plugin_cache: bool = True,
     install_desktop: bool = False,
 ) -> dict[str, Any]:
-    with install_lock():
-        return _install_unlocked(
-            register=register,
-            force=force,
-            sync_plugin_cache=sync_plugin_cache,
-            install_desktop=install_desktop,
-        )
+    binding_context: Any = _codex_mcp_binding()
+    with binding_context as binding:
+        with install_lock():
+            return _install_unlocked(
+                register=register,
+                force=force,
+                sync_plugin_cache=sync_plugin_cache,
+                install_desktop=install_desktop,
+                binding=binding,
+            )
 
 
 def _uninstall_unlocked(
     unregister: bool = True,
     remove_desktop: bool = False,
+    binding: _CodexMcpBinding | None = None,
 ) -> dict[str, Any]:
+    if binding is None:
+        with _codex_mcp_binding() as pinned_binding:
+            return _uninstall_unlocked(
+                unregister=unregister,
+                remove_desktop=remove_desktop,
+                binding=pinned_binding,
+            )
     entrypoint = _runtime_mcp_entrypoint()
     mcp_status = "skipped"
     registration_removed = False
@@ -23806,12 +24010,15 @@ def _uninstall_unlocked(
                 snapshot_sink=desktop_snapshot,
             )
         if unregister:
-            current = check_mcp_registration(entrypoint)
+            assert binding is not None
+            current = check_mcp_registration(entrypoint, binding=binding)
             if current.get("lookup_status") == "unavailable":
                 raise AgentError("MCP server registration could not be inspected")
             if current.get("registered"):
                 if current.get("command_matches"):
-                    remove = run_command(_codex_mcp_command("remove", MCP_SERVER_NAME))
+                    remove = _run_bound_codex_mcp_command(
+                        binding, "remove", MCP_SERVER_NAME
+                    )
                     if remove.returncode != 0:
                         raise AgentError("codex mcp remove failed")
                     mcp_status = "removed"
@@ -23834,8 +24041,9 @@ def _uninstall_unlocked(
         registration_restore_error: Exception | None = None
         if registration_removed:
             try:
-                restore = run_command(
-                    _codex_mcp_command("add", MCP_SERVER_NAME, "--", str(entrypoint))
+                assert binding is not None
+                restore = _run_bound_codex_mcp_command(
+                    binding, "add", MCP_SERVER_NAME, "--", str(entrypoint)
                 )
                 if restore.returncode != 0:
                     raise AgentError("codex mcp add failed")
@@ -23864,11 +24072,14 @@ def uninstall(
     unregister: bool = True,
     remove_desktop: bool = False,
 ) -> dict[str, Any]:
-    with install_lock():
-        return _uninstall_unlocked(
-            unregister=unregister,
-            remove_desktop=remove_desktop,
-        )
+    binding_context: Any = _codex_mcp_binding()
+    with binding_context as binding:
+        with install_lock():
+            return _uninstall_unlocked(
+                unregister=unregister,
+                remove_desktop=remove_desktop,
+                binding=binding,
+            )
 
 
 def tui_accepts_input(text: str) -> bool:

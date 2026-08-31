@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -65,11 +67,20 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     return RuntimeLayout.from_runtime_root(root)
 
 
+class _PinnedMcpBinding:
+    def __init__(self) -> None:
+        self.command_path = Path("/proc/self/fd/71")
+        self.config_path = Path("/proc/self/fd/73/config.toml")
+        self.environment = {"HOME": "/proc/self/fd/72", "PATH": "/usr/bin:/bin"}
+        self.pass_fds = (71, 72)
+        self.revalidate = Mock()
+
+
 def test_interactive_registration_uses_the_validated_image_entrypoint(
     tmp_path: Path,
 ) -> None:
     layout = runtime_layout(tmp_path)
-    codex_cli = Path("/home/tester/.local/bin/codex")
+    binding = _PinnedMcpBinding()
     startup = {"ok": True, "raw_output": "not_returned"}
     current = {
         "registered": False,
@@ -89,7 +100,10 @@ def test_interactive_registration_uses_the_validated_image_entrypoint(
         patch.object(server, "ensure_applet_action_key"),
         patch.object(server, "mcp_command_startup_self_test", return_value=startup),
         patch.object(server, "check_mcp_registration", return_value=current),
-        patch.object(server, "_canonical_codex_cli_path", return_value=codex_cli),
+        patch.object(
+            server, "_codex_mcp_binding", return_value=contextlib.nullcontext(binding)
+        ),
+        patch.object(server, "install_lock", return_value=contextlib.nullcontext()),
         patch.object(
             server, "ensure_mcp_startup_timeout_configured", return_value=timeout
         ),
@@ -100,13 +114,15 @@ def test_interactive_registration_uses_the_validated_image_entrypoint(
 
     run.assert_called_once_with(
         [
-            str(codex_cli),
+            str(binding.command_path),
             "mcp",
             "add",
             server.MCP_SERVER_NAME,
             "--",
             str(layout.mcp_entrypoint),
-        ]
+        ],
+        env=binding.environment,
+        pass_fds=binding.pass_fds,
     )
     assert result["runtime_entrypoint"] == "not_returned"
     assert "symlink" not in result
@@ -117,7 +133,7 @@ def test_interactive_unregistration_only_removes_matching_image_registration(
     tmp_path: Path,
 ) -> None:
     layout = runtime_layout(tmp_path)
-    codex_cli = Path("/home/tester/.local/bin/codex")
+    binding = _PinnedMcpBinding()
     current = {
         "registered": True,
         "lookup_status": "registered",
@@ -127,7 +143,10 @@ def test_interactive_unregistration_only_removes_matching_image_registration(
     with (
         patch.object(server, "_runtime_layout", return_value=layout),
         patch.object(server, "check_mcp_registration", return_value=current),
-        patch.object(server, "_canonical_codex_cli_path", return_value=codex_cli),
+        patch.object(
+            server, "_codex_mcp_binding", return_value=contextlib.nullcontext(binding)
+        ),
+        patch.object(server, "install_lock", return_value=contextlib.nullcontext()),
         patch.object(
             server, "revoke_current_teamleader", return_value={"changed": False}
         ),
@@ -137,7 +156,9 @@ def test_interactive_unregistration_only_removes_matching_image_registration(
         result = server.uninstall()
 
     run.assert_called_once_with(
-        [str(codex_cli), "mcp", "remove", server.MCP_SERVER_NAME]
+        [str(binding.command_path), "mcp", "remove", server.MCP_SERVER_NAME],
+        env=binding.environment,
+        pass_fds=binding.pass_fds,
     )
     assert result["mcp"] == "removed"
     assert "symlink" not in result
@@ -146,10 +167,10 @@ def test_interactive_unregistration_only_removes_matching_image_registration(
 def test_registration_inspection_uses_canonical_cli_with_a_sterile_image_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    codex_cli = Path("/home/tester/.local/bin/codex")
+    binding = _PinnedMcpBinding()
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     completed = subprocess.CompletedProcess(
-        [str(codex_cli), "mcp", "get", server.MCP_SERVER_NAME],
+        [str(binding.command_path), "mcp", "get", server.MCP_SERVER_NAME],
         0,
         "\n".join(
             [
@@ -162,7 +183,9 @@ def test_registration_inspection_uses_canonical_cli_with_a_sterile_image_path(
     )
 
     with (
-        patch.object(server, "_canonical_codex_cli_path", return_value=codex_cli),
+        patch.object(
+            server, "_codex_mcp_binding", return_value=contextlib.nullcontext(binding)
+        ),
         patch.object(server, "run_command", return_value=completed) as run,
         patch.object(
             server.shutil,
@@ -173,7 +196,9 @@ def test_registration_inspection_uses_canonical_cli_with_a_sterile_image_path(
         result = server.check_mcp_registration(Path("/runtime/bin/codex-master-mcp"))
 
     run.assert_called_once_with(
-        [str(codex_cli), "mcp", "get", server.MCP_SERVER_NAME]
+        [str(binding.command_path), "mcp", "get", server.MCP_SERVER_NAME],
+        env=binding.environment,
+        pass_fds=binding.pass_fds,
     )
     assert result["lookup_status"] == "registered"
     assert result["ok"] is True
@@ -200,16 +225,243 @@ def test_registration_inspection_fails_closed_without_a_valid_canonical_cli() ->
     }
 
 
-def test_canonical_codex_cli_uses_the_effective_users_fixed_absolute_location() -> None:
-    home = Path("/home/tester")
-    canonical = home / ".local" / "bin" / "codex"
-    resolved = Path("/opt/codex/bin/codex")
+def test_registration_inspection_uses_only_the_pinned_cli_and_client_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _PinnedMcpBinding()
+    monkeypatch.setenv("HOME", "/tmp/attacker-home")
+    monkeypatch.setenv("CODEX_HOME", "/tmp/attacker-codex-home")
+    completed = subprocess.CompletedProcess(
+        [str(binding.command_path), "mcp", "get", server.MCP_SERVER_NAME],
+        0,
+        "\n".join(
+            [
+                server.MCP_SERVER_NAME,
+                "  command: /runtime/bin/codex-master-mcp",
+                "  startup_timeout_sec: 120",
+            ]
+        ),
+        "",
+    )
 
     with (
-        patch.object(server.os, "geteuid", return_value=4242),
+        patch.object(server, "run_command", return_value=completed) as run,
+        patch.object(
+            server,
+            "_canonical_codex_cli_path",
+            side_effect=AssertionError("a pinned binding must not resolve again"),
+        ),
+    ):
+        result = server.check_mcp_registration(
+            Path("/runtime/bin/codex-master-mcp"), binding=binding
+        )
+
+    run.assert_called_once_with(
+        [str(binding.command_path), "mcp", "get", server.MCP_SERVER_NAME],
+        env=binding.environment,
+        pass_fds=binding.pass_fds,
+    )
+    assert result["ok"] is True
+    assert binding.revalidate.call_count == 2
+
+
+@pytest.mark.parametrize("register", (True, False))
+def test_install_rejects_unavailable_binding_before_any_applet_or_registry_mutation(
+    tmp_path: Path,
+    register: bool,
+) -> None:
+    action_key = tmp_path / "state" / "applet-action.key"
+    layout = runtime_layout(tmp_path)
+    binding_error = server.AgentError("canonical_codex_cli_unavailable")
+
+    with (
+        patch.object(
+            server,
+            "_codex_mcp_binding",
+            side_effect=binding_error,
+        ),
+        patch.object(server, "install_lock") as lock,
+        patch.object(server, "assert_install_context_allows_master_registration") as context,
+        patch.object(server, "_runtime_layout", return_value=layout),
+        patch.object(server, "enroll_current_teamleader") as enroll,
+        patch.object(server, "ensure_applet_action_key") as ensure_key,
+        patch.object(
+            server,
+            "install_fleet_desktop_entry",
+            return_value=({"status": "installed"}, {"changed": False}),
+        ) as desktop,
+        patch.object(server, "ensure_mcp_startup_timeout_configured") as config,
+        patch.object(
+            server,
+            "mcp_command_startup_self_test",
+            return_value={"ok": True},
+        ),
+        patch.object(
+            server,
+            "check_mcp_registration",
+            return_value={"lookup_status": "unavailable"},
+        ),
+        patch.object(server, "APPLET_ACTION_KEY_FILE", action_key),
+    ):
+        with pytest.raises(server.AgentError):
+            server.install(register=register, install_desktop=True)
+
+    context.assert_not_called()
+    lock.assert_not_called()
+    enroll.assert_not_called()
+    ensure_key.assert_not_called()
+    desktop.assert_not_called()
+    config.assert_not_called()
+    assert not action_key.exists()
+
+
+@pytest.mark.parametrize("unregister", (True, False))
+def test_uninstall_rejects_unavailable_binding_before_desktop_or_registry_mutation(
+    unregister: bool,
+) -> None:
+    binding_error = server.AgentError("canonical_codex_mcp_binding_unavailable")
+
+    with (
+        patch.object(server, "_codex_mcp_binding", side_effect=binding_error),
+        patch.object(server, "install_lock") as lock,
+        patch.object(server, "remove_fleet_desktop_entry") as desktop,
+        patch.object(server, "revoke_current_teamleader") as revoke,
+    ):
+        with pytest.raises(server.AgentError, match="canonical_codex_mcp_binding_unavailable"):
+            server.uninstall(unregister=unregister, remove_desktop=True)
+
+    lock.assert_not_called()
+    desktop.assert_not_called()
+    revoke.assert_not_called()
+
+
+def test_force_rollback_reuses_one_pinned_cli_and_client_home_after_add_failure(
+    tmp_path: Path,
+) -> None:
+    layout = runtime_layout(tmp_path)
+    binding = _PinnedMcpBinding()
+    current = {
+        "registered": True,
+        "lookup_status": "registered",
+        "command_matches": False,
+        "startup_timeout_ok": True,
+        "ok": False,
+        "_registered_command": "/previous/codex-master-mcp",
+    }
+    completed = [
+        subprocess.CompletedProcess([], 0, "", ""),
+        subprocess.CompletedProcess([], 1, "", ""),
+        subprocess.CompletedProcess([], 0, "", ""),
+    ]
+
+    with (
+        patch.object(
+            server,
+            "_codex_mcp_binding",
+            return_value=contextlib.nullcontext(binding),
+        ) as bind,
+        patch.object(server, "install_lock", return_value=contextlib.nullcontext()),
+        patch.object(server, "_runtime_layout", return_value=layout),
+        patch.object(server, "assert_install_context_allows_master_registration"),
+        patch.object(
+            server, "enroll_current_teamleader", return_value={"changed": False}
+        ),
+        patch.object(server, "ensure_applet_action_key"),
+        patch.object(server, "mcp_command_startup_self_test", return_value={"ok": True}),
+        patch.object(server, "check_mcp_registration", return_value=current) as check,
+        patch.object(
+            server,
+            "codex_client_mcp_config_status",
+            return_value={
+                "startup_timeout_ok": True,
+                "default_tools_approval_mode_ok": True,
+            },
+        ),
+        patch.object(
+            server,
+            "_canonical_codex_cli_path",
+            side_effect=AssertionError("force transaction must not resolve again"),
+        ),
+        patch.object(server, "run_command", side_effect=completed) as run,
+    ):
+        with pytest.raises(server.AgentError, match="codex mcp add failed"):
+            server.install(register=True, force=True, sync_plugin_cache=False)
+
+    bind.assert_called_once_with()
+    check.assert_called_once_with(
+        layout.mcp_entrypoint, include_command=True, binding=binding
+    )
+    assert [call.args[0][0] for call in run.call_args_list] == [
+        str(binding.command_path),
+        str(binding.command_path),
+        str(binding.command_path),
+    ]
+    assert all(call.kwargs["env"] == binding.environment for call in run.call_args_list)
+    assert all(call.kwargs["pass_fds"] == binding.pass_fds for call in run.call_args_list)
+    assert binding.revalidate.call_count == 6
+
+
+def test_binding_pins_cli_and_client_home_across_a_filesystem_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "main-home"
+    home.mkdir(mode=0o700)
+    (home / ".codex").mkdir(mode=0o700)
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    moved_home = tmp_path / "main-home-pinned"
+    replacement_home = tmp_path / "replacement-home"
+    replacement_home.mkdir(mode=0o700)
+    (replacement_home / ".codex").mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(replacement_home))
+    monkeypatch.setenv("CODEX_HOME", str(replacement_home / ".codex"))
+    completed = subprocess.CompletedProcess([], 0, "", "")
+
+    with (
+        patch.object(server.os, "geteuid", return_value=1000),
         patch.object(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
+        patch.object(server, "_canonical_codex_cli_path", return_value=executable),
+        patch.object(server, "run_command", return_value=completed) as run,
+    ):
+        with server._codex_mcp_binding() as binding:
+            first_home = binding.environment["HOME"]
+            first_cli = str(binding.command_path)
+            first_pass_fds = binding.pass_fds
+            configured = server.ensure_mcp_startup_timeout_configured(
+                binding.config_path
+            )
+            assert configured["status"] == "updated"
+            status = server.codex_client_mcp_config_status(
+                binding.config_path,
+                command_path=Path("/runtime/bin/codex-master-mcp"),
+            )
+            assert status["path_state"] == "set"
+            server._run_bound_codex_mcp_command(
+                binding, "get", server.MCP_SERVER_NAME
+            )
+            home.rename(moved_home)
+            replacement_home.rename(home)
+            server._run_bound_codex_mcp_command(
+                binding, "remove", server.MCP_SERVER_NAME
+            )
+
+    assert [call.args[0][0] for call in run.call_args_list] == [first_cli, first_cli]
+    assert all(call.kwargs["env"]["HOME"] == first_home for call in run.call_args_list)
+    assert all("CODEX_HOME" not in call.kwargs["env"] for call in run.call_args_list)
+    assert all(call.kwargs["pass_fds"] == first_pass_fds for call in run.call_args_list)
+    assert (moved_home / ".codex" / "config.toml").is_file()
+    assert not (home / ".codex" / "config.toml").exists()
+
+
+def test_canonical_codex_cli_uses_the_documented_system_absolute_location() -> None:
+    canonical = Path("/usr/local/bin/codex")
+    resolved = Path("/opt/codex/bin/codex")
+
+    with (
         patch.dict(server.os.environ, {"HOME": "/tmp/attacker-home"}),
         patch.object(
             server, "trusted_runner_executable", return_value=resolved
@@ -226,12 +478,7 @@ def test_canonical_codex_cli_uses_the_effective_users_fixed_absolute_location() 
 
 
 def test_canonical_codex_cli_rejects_an_untrusted_fixed_location() -> None:
-    home = Path("/home/tester")
     with (
-        patch.object(server.os, "geteuid", return_value=4242),
-        patch.object(
-            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
-        ),
         patch.object(
             server,
             "trusted_runner_executable",
@@ -240,6 +487,23 @@ def test_canonical_codex_cli_rejects_an_untrusted_fixed_location() -> None:
     ):
         with pytest.raises(server.AgentError, match="canonical_codex_cli_unavailable"):
             server._canonical_codex_cli_path()
+
+
+def test_executable_directory_trust_uses_the_effective_user_identity(
+    tmp_path: Path,
+) -> None:
+    trusted = tmp_path / "trusted"
+    trusted.mkdir(mode=0o700)
+    executable = trusted / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    with (
+        patch.object(server.os, "geteuid", return_value=os.geteuid()),
+        patch.object(server.os, "getuid", return_value=os.geteuid() + 1),
+    ):
+        assert server.executable_directory_chain_is_trusted(trusted)
+        assert server.trusted_runner_executable(executable) == executable
 
 
 def test_interactive_cli_exposes_no_path_or_symlink_override() -> None:
