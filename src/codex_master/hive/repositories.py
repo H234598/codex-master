@@ -15,8 +15,6 @@ import subprocess
 import time
 
 from codex_master.hive.types import HiveValidationError, validate_identifier
-
-
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,128}\Z")
 MAX_REMOTE_LENGTH = 512

@@ -177,6 +177,10 @@ def _read_json_object(root: Path, relative_path: str) -> dict[str, Any]:
     return value
 
 
+def _manifest_digest(raw: bytes) -> str:
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
 def _exact_relative_reference(value: object, expected: str) -> None:
     if not isinstance(value, str) or value != expected:
         raise _invalid()
@@ -266,10 +270,21 @@ def _runtime_manifest_payload(root: Path) -> dict[str, object]:
     return {"schema_version": 1, "directories": directories, "files": files}
 
 
-def _validated_spawn_helper_digest(root: Path) -> str:
-    manifest = _read_json_object(root, _MANIFEST_NAME)
-    if manifest != _runtime_manifest_payload(root):
+def _validated_manifest(root: Path, *, expected_digest: str | None = None) -> tuple[dict[str, object], str]:
+    raw = _read_regular_bytes(root, _MANIFEST_NAME, max_bytes=_MAX_METADATA_BYTES)
+    digest = _manifest_digest(raw)
+    if expected_digest is not None and digest != expected_digest:
         raise _invalid()
+    try:
+        manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _invalid() from exc
+    if not isinstance(manifest, dict) or manifest != _runtime_manifest_payload(root):
+        raise _invalid()
+    return manifest, digest
+
+
+def _spawn_helper_digest(manifest: dict[str, object]) -> str:
     files = manifest["files"]
     if not isinstance(files, dict):
         raise _invalid()
@@ -293,8 +308,22 @@ def _validate_layout_values(
     metadata_root: Path,
     spawn_helper: Path,
     spawn_helper_digest: str,
+    root_device: int,
+    root_inode: int,
+    manifest_digest: str,
 ) -> None:
     _validate_root(root)
+    root_stat = _lstat(root)
+    if (
+        type(root_device) is not int
+        or type(root_inode) is not int
+        or (root_stat.st_dev, root_stat.st_ino) != (root_device, root_inode)
+        or not isinstance(manifest_digest, str)
+        or not manifest_digest.startswith("sha256:")
+        or len(manifest_digest) != 71
+        or any(character not in "0123456789abcdef" for character in manifest_digest[7:])
+    ):
+        raise _invalid()
     if (
         not isinstance(mcp_entrypoint, Path)
         or not isinstance(probe_entrypoint, Path)
@@ -308,7 +337,13 @@ def _validate_layout_values(
     for relative_path, mode in _REQUIRED_FILES:
         _validate_regular(root, relative_path, mode)
     _validate_metadata(root)
-    if spawn_helper_digest != _validated_spawn_helper_digest(root):
+    manifest, actual_manifest_digest = _validated_manifest(
+        root, expected_digest=manifest_digest
+    )
+    if (
+        actual_manifest_digest != manifest_digest
+        or spawn_helper_digest != _spawn_helper_digest(manifest)
+    ):
         raise _invalid()
 
 
@@ -322,6 +357,9 @@ class RuntimeLayout:
     metadata_root: Path
     spawn_helper: Path
     spawn_helper_digest: str
+    root_device: int
+    root_inode: int
+    manifest_digest: str
 
     def __post_init__(self) -> None:
         _validate_layout_values(
@@ -331,20 +369,28 @@ class RuntimeLayout:
             self.metadata_root,
             self.spawn_helper,
             self.spawn_helper_digest,
+            self.root_device,
+            self.root_inode,
+            self.manifest_digest,
         )
 
     @classmethod
     def from_runtime_root(cls, root: Path) -> RuntimeLayout:
         if not isinstance(root, Path) or not root.is_absolute():
             raise _invalid()
-        helper_digest = _validated_spawn_helper_digest(root)
+        _validate_root(root)
+        root_stat = _lstat(root)
+        manifest, manifest_digest = _validated_manifest(root)
         return cls(
             root=root,
             mcp_entrypoint=root / "bin" / "codex-master-mcp",
             probe_entrypoint=root / "bin" / "codex-master-hive-hourly-probe",
             metadata_root=root,
             spawn_helper=root / _RUNTIME_SPAWN_HELPER,
-            spawn_helper_digest=helper_digest,
+            spawn_helper_digest=_spawn_helper_digest(manifest),
+            root_device=root_stat.st_dev,
+            root_inode=root_stat.st_ino,
+            manifest_digest=manifest_digest,
         )
 
     @classmethod
@@ -365,6 +411,28 @@ class RuntimeLayout:
             current = current.parent
         raise _invalid()
 
+    def read_attested_file(self, relative_path: str) -> bytes:
+        """Read one manifest-pinned image member through no-follow descriptors."""
+
+        manifest, _digest = _validated_manifest(
+            self.root, expected_digest=self.manifest_digest
+        )
+        files = manifest.get("files")
+        entry = files.get(relative_path) if isinstance(files, dict) else None
+        expected = entry.get("sha256") if isinstance(entry, dict) else None
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or any(character not in "0123456789abcdef" for character in expected)
+        ):
+            raise _invalid()
+        raw = _read_regular_bytes(
+            self.root, relative_path, max_bytes=_MAX_IMAGE_FILE_BYTES
+        )
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise _invalid()
+        validate_runtime_metadata(self)
+        return raw
 
 def validate_runtime_metadata(layout: RuntimeLayout) -> None:
     """Revalidate image files and metadata immediately before an MCP probe."""
@@ -378,7 +446,14 @@ def validate_runtime_metadata(layout: RuntimeLayout) -> None:
         layout.metadata_root,
         layout.spawn_helper,
         layout.spawn_helper_digest,
+        layout.root_device,
+        layout.root_inode,
+        layout.manifest_digest,
     )
 
 
-__all__ = ["LayoutError", "RuntimeLayout", "validate_runtime_metadata"]
+__all__ = [
+    "LayoutError",
+    "RuntimeLayout",
+    "validate_runtime_metadata",
+]
