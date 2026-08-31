@@ -451,7 +451,7 @@ def test_hard_crash_after_start_recovers_durable_intent_without_second_start(
     assert len(runtime.started) == 1
 
 
-def test_running_reconcile_handles_absence_conflict_and_generation_advance(
+def test_running_reconcile_handles_absence_conflict_advance_and_rollback(
     tmp_path: Path,
 ) -> None:
     store, _executable = registry_at(tmp_path)
@@ -460,25 +460,40 @@ def test_running_reconcile_handles_absence_conflict_and_generation_advance(
     adapter = agent_ollama.ProductionAgentOllamaAdapter(
         store, state_root=state_root, runtime=runtime
     )
-    plan_ref = adapter.plan(
-        {"instance_ref": "instance-one", "generation": 1}
+    executor = AgentOllamaExecutor(adapter)
+    digest = "sha256:" + "a" * 64
+    fences = {
+        "plan_precondition_digest": digest,
+        "resource_generation": 7,
+    }
+    plan_ref = executor.plan(
+        {"instance_ref": "instance-one", "generation": 1}, **fences
     )["plan_ref"]
-    adapter.apply({"plan_ref": plan_ref})
+    executor.apply({"plan_ref": plan_ref}, **fences)
     snapshot = store.load()
     store.replace(
         models=snapshot.models,
         instances=snapshot.instances,
         expected_generation=1,
     )
-    assert adapter.probe(
-        {"instance_ref": "instance-one", "generation": 2}
+    assert executor.probe(
+        {"instance_ref": "instance-one", "generation": 2}, **fences
     )["ready"] is True
+    with pytest.raises(
+        agent_ollama.AgentOllamaNoEffectError,
+        match="provider.generation_stale",
+    ):
+        executor.probe(
+            {"instance_ref": "instance-one", "generation": 1}, **fences
+        )
     runtime.identity_status = "conflict"
     with pytest.raises(Exception, match="provider.instance_identity_conflict"):
-        adapter.stop({"instance_ref": "instance-one", "generation": 2})
+        executor.stop(
+            {"instance_ref": "instance-one", "generation": 2}, **fences
+        )
     runtime.identity_status = "absent"
-    assert adapter.stop(
-        {"instance_ref": "instance-one", "generation": 2}
+    assert executor.stop(
+        {"instance_ref": "instance-one", "generation": 2}, **fences
     ) == {"stopped": True}
     assert runtime.stopped == []
 
