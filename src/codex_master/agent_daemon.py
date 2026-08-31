@@ -44,7 +44,7 @@ from .server import build_fleet_private_io
 
 
 _STATE_ROOT = Path("/var/lib/codex-master")
-_CREDENTIAL_NAMES = ("agent-server.crt", "agent-server.key", "agent-ca.crt")
+_CREDENTIAL_NAMES = ("agent-server-cert", "agent-server-key", "agent-client-ca")
 TLS_HANDSHAKE_TIMEOUT_SECONDS = 2.0
 HTTP_HEADER_TIMEOUT_SECONDS = 2.0
 HTTP_BODY_TIMEOUT_SECONDS = 2.0

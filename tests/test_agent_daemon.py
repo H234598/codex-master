@@ -48,7 +48,7 @@ class FakeContext:
 def _credential_directory(tmp_path: Path) -> Path:
     directory = tmp_path / "credentials"
     directory.mkdir(mode=0o700)
-    for name in ("agent-server.crt", "agent-server.key", "agent-ca.crt"):
+    for name in ("agent-server-cert", "agent-server-key", "agent-client-ca"):
         (directory / name).write_bytes(name.encode())
     return directory
 
@@ -58,9 +58,9 @@ def test_systemd_credentials_are_opened_as_fds_and_names_are_fixed(tmp_path) -> 
     with open_systemd_credentials({"CREDENTIALS_DIRECTORY": str(directory)}) as credentials:
         assert isinstance(credentials, AgentCredentialFds)
         assert [os.read(fd, 64) for fd in credentials] == [
-            b"agent-server.crt",
-            b"agent-server.key",
-            b"agent-ca.crt",
+            b"agent-server-cert",
+            b"agent-server-key",
+            b"agent-client-ca",
         ]
     assert all(_fd_is_closed(fd) for fd in credentials)
 
@@ -735,11 +735,11 @@ def live_pki(tmp_path_factory):
     client_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     wrong_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     files = {
-        "agent-server.crt": _issue_certificate(
+        "agent-server-cert": _issue_certificate(
             "localhost", ca, ca_key, server_key.public_key(), client=False
         ).public_bytes(serialization.Encoding.PEM),
-        "agent-server.key": _pem_private_key(server_key),
-        "agent-ca.crt": ca.public_bytes(serialization.Encoding.PEM),
+        "agent-server-key": _pem_private_key(server_key),
+        "agent-client-ca": ca.public_bytes(serialization.Encoding.PEM),
         "agent-client.crt": _issue_certificate(
             "agent", ca, ca_key, client_key.public_key(), client=True
         ).public_bytes(serialization.Encoding.PEM),
@@ -786,7 +786,7 @@ def _live_server(live_pki: Path, application=None):
 
 
 def _client_context(live_pki: Path, *, certificate: str | None = "agent-client"):
-    context = ssl.create_default_context(cafile=str(live_pki / "agent-ca.crt"))
+    context = ssl.create_default_context(cafile=str(live_pki / "agent-client-ca"))
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     if certificate is not None:
         context.load_cert_chain(

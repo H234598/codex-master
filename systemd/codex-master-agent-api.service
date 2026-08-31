@@ -1,0 +1,41 @@
+[Unit]
+Description=Codex Master isolated host-agent TLS API
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=codex-master-agent-api
+Group=codex-master-agent-api
+WorkingDirectory=/var/empty
+UMask=0077
+ReadWritePaths=/var/lib/codex-master
+LoadCredential=agent-server-key:/etc/codex-master/agent-server.key
+LoadCredential=agent-server-cert:/etc/codex-master/agent-server.crt
+LoadCredential=agent-client-ca:/etc/codex-master/agent-client-ca.crt
+LoadCredential=agent-bindings:/etc/codex-master/agent-bindings.json
+ExecStart=/usr/bin/codex-master-agent-api --listen-address=127.0.0.1 --port=9443
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateMounts=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

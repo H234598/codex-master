@@ -6,12 +6,16 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "systemd" / "codex-master-admin.service"
+AGENT_API_UNIT = ROOT / "systemd" / "codex-master-agent-api.service"
+HOST_AGENT_UNIT = ROOT / "systemd" / "codex-master-host-agent.service"
 
 
-def _directives(section: str) -> dict[str, list[str]]:
+def _directives(
+    section: str, unit: Path = UNIT
+) -> dict[str, list[str]]:
     current = ""
     result: dict[str, list[str]] = {}
-    for raw_line in UNIT.read_text(encoding="utf-8").splitlines():
+    for raw_line in unit.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1]
@@ -104,3 +108,99 @@ def test_unit_hardening_is_fail_closed_and_has_no_http_health_probe() -> None:
     assert "health" not in unit_text
     assert "curl" not in unit_text
     assert "wget" not in unit_text
+
+
+def _assert_hardening(service: dict[str, list[str]]) -> None:
+    expected = {
+        "Restart": ["on-failure"],
+        "RestartSec": ["5s"],
+        "NoNewPrivileges": ["yes"],
+        "ProtectSystem": ["strict"],
+        "ProtectHome": ["yes"],
+        "PrivateTmp": ["yes"],
+        "PrivateDevices": ["yes"],
+        "PrivateMounts": ["yes"],
+        "ProtectKernelTunables": ["yes"],
+        "ProtectKernelModules": ["yes"],
+        "ProtectKernelLogs": ["yes"],
+        "ProtectControlGroups": ["yes"],
+        "LockPersonality": ["yes"],
+        "RestrictRealtime": ["yes"],
+        "RestrictSUIDSGID": ["yes"],
+        "CapabilityBoundingSet": [""],
+        "AmbientCapabilities": [""],
+        "RestrictAddressFamilies": ["AF_INET AF_INET6 AF_UNIX"],
+    }
+    assert {key: service.get(key) for key in expected} == expected
+
+
+def test_agent_api_unit_uses_private_tls_entrypoint_and_credentials() -> None:
+    """Production break: the API can accidentally expose Admin or plaintext HTTP."""
+
+    document = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    service = _directives("Service", AGENT_API_UNIT)
+
+    assert document["project"]["scripts"]["codex-master-agent-api"] == (
+        "codex_master.agent_daemon:main"
+    )
+    assert service["Type"] == ["exec"]
+    assert service["User"] == ["codex-master-agent-api"]
+    assert service["Group"] == ["codex-master-agent-api"]
+    assert service["WorkingDirectory"] == ["/var/empty"]
+    assert service["UMask"] == ["0077"]
+    assert service["ReadWritePaths"] == ["/var/lib/codex-master"]
+    assert service["ExecStart"] == [
+        "/usr/bin/codex-master-agent-api --listen-address=127.0.0.1 --port=9443"
+    ]
+    assert service["TimeoutStopSec"] == ["10s"]
+    assert service["LoadCredential"] == [
+        "agent-server-key:/etc/codex-master/agent-server.key",
+        "agent-server-cert:/etc/codex-master/agent-server.crt",
+        "agent-client-ca:/etc/codex-master/agent-client-ca.crt",
+        "agent-bindings:/etc/codex-master/agent-bindings.json",
+    ]
+    assert "BindPaths" not in service
+    assert "BindReadOnlyPaths" not in service
+    assert "Environment" not in service
+    assert "EnvironmentFile" not in service
+    assert "DynamicUser" not in service
+    _assert_hardening(service)
+    assert "admin" not in " ".join(service["ExecStart"]).lower()
+
+
+def test_host_agent_unit_has_exact_hardening_credentials_and_write_scope() -> None:
+    """Production break: a host agent can otherwise leak keys or write broadly."""
+
+    document = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    service = _directives("Service", HOST_AGENT_UNIT)
+
+    assert document["project"]["scripts"]["codex-master-host-agent"] == (
+        "codex_master.host_agent:main"
+    )
+    assert service["Type"] == ["exec"]
+    assert service["User"] == ["codex-master-host-agent"]
+    assert service["Group"] == ["codex-master-host-agent"]
+    assert service["WorkingDirectory"] == ["/var/empty"]
+    assert service["RuntimeDirectory"] == ["codex-master-host-agent"]
+    assert service["RuntimeDirectoryMode"] == ["0700"]
+    assert service["StateDirectory"] == ["codex-master-host-agent"]
+    assert service["StateDirectoryMode"] == ["0700"]
+    assert service["UMask"] == ["0077"]
+    assert service["ReadWritePaths"] == [
+        "/var/lib/codex-master-host-agent",
+        "/var/lib/codex-master/ollama",
+    ]
+    assert service["ExecStart"] == ["/usr/bin/codex-master-host-agent"]
+    assert service["TimeoutStopSec"] == ["10s"]
+    assert set(service["LoadCredential"]) == {
+        "agent-client-key:/etc/codex-master/agent-client.key",
+        "agent-client-cert:/etc/codex-master/agent-client.crt",
+        "agent-master-ca:/etc/codex-master/agent-master-ca.crt",
+        "agent-config:/etc/codex-master/agent-config.json",
+    }
+    assert "Environment" not in service
+    assert "EnvironmentFile" not in service
+    assert "DynamicUser" not in service
+    _assert_hardening(service)
+    exec_start = " ".join(service["ExecStart"]).lower()
+    assert not any(marker in exec_start for marker in ("key", "cert", "config", "secret"))
