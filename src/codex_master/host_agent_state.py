@@ -30,6 +30,7 @@ MAX_HOST_AGENT_RECEIPTS = 1024
 MAX_HOST_AGENT_STATE_BYTES = 4 * 1024 * 1024
 _DOCUMENT = PurePosixPath("host-agent.json")
 _MAX_INT = 2**63 - 1
+_MAX_LEASE_SECONDS = 30.0
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _CLAIM_TOKEN = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 _BOOT_ID = re.compile(r"[0-9a-f-]{36}\Z", re.ASCII)
@@ -103,6 +104,14 @@ def _receipt_wire(receipt: AgentReceiptV1) -> dict[str, object]:
 
 def _bounded_integer(value: object) -> bool:
     return type(value) is int and 0 <= value <= _MAX_INT
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _monotonic() -> float:
+    return time.monotonic()
 
 
 def _process_start_ticks(pid: int) -> int | None:
@@ -201,6 +210,7 @@ class HostAgentState:
                         "fence": list(_lease_fence(lease)),
                         "lease": serialize_agent_lease(lease),
                         "effect_claim": None,
+                        "deadline_clock": self._deadline_clock(lease),
                     }
                     self._write_locked(document)
                     return None
@@ -224,6 +234,7 @@ class HostAgentState:
                 "fence": list(_lease_fence(lease)),
                 "lease": serialize_agent_lease(lease),
                 "effect_claim": None,
+                "deadline_clock": self._deadline_clock(lease),
             }
             self._write_locked(document)
         return None
@@ -276,7 +287,7 @@ class HostAgentState:
                 claim = record["effect_claim"]
                 if claim is None:
                     return None
-                expired = lease.deadline <= datetime.now(UTC)
+                expired = self._clock_expired(record["deadline_clock"])
                 if expired or not self._claim_alive(claim):
                     return self._finish_locked(
                         document,
@@ -358,7 +369,9 @@ class HostAgentState:
         claim = accepted["effect_claim"]
         if claim is not None:
             if allow_abandoned:
-                if self._claim_alive(claim) and lease.deadline > datetime.now(UTC):
+                if self._claim_alive(claim) and not self._clock_expired(
+                    accepted["deadline_clock"]
+                ):
                     _fail("host.effect_claim_active")
             elif (
                 type(claim_token) is not str
@@ -397,14 +410,13 @@ class HostAgentState:
         if tuple(record.get("fence", ())) != _lease_fence(lease):
             _fail("host.replay_conflict")
 
-    @staticmethod
     def _safe_rebind(
-        record: Mapping[str, Any], old: AgentLeaseV1, new: AgentLeaseV1
+        self, record: Mapping[str, Any], old: AgentLeaseV1, new: AgentLeaseV1
     ) -> bool:
         return (
             record.get("effect_claim") is None
-            and old.deadline <= datetime.now(UTC)
-            and new.deadline > datetime.now(UTC)
+            and self._clock_expired(record["deadline_clock"])
+            and new.deadline > _utc_now()
             and new.attempt > old.attempt
             and (
                 old.operation_id,
@@ -430,11 +442,10 @@ class HostAgentState:
 
     def _reclaim_expired_locked(self, document: dict[str, Any]) -> bool:
         changed = False
-        now = datetime.now(UTC)
         for operation_id in sorted(tuple(document["accepted"])):
             record = document["accepted"][operation_id]
             lease = self._parse_lease(record["lease"])
-            if lease.deadline > now:
+            if not self._clock_expired(record["deadline_clock"]):
                 continue
             claim = record["effect_claim"]
             if claim is None:
@@ -489,7 +500,7 @@ class HostAgentState:
         except HiveStateError as error:
             if str(error) == "state_not_found":
                 return {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "highest_lease_epoch": 0,
                     "highest_registry_generation": 0,
                     "accepted": {},
@@ -504,6 +515,22 @@ class HostAgentState:
             )
         except (UnicodeError, ValueError, TypeError, RecursionError):
             _fail("host.state_unavailable")
+        migrated = False
+        if type(value) is dict and value.get("schema_version") == 2:
+            if set(value) != {
+                "schema_version", "highest_lease_epoch",
+                "highest_registry_generation", "accepted", "receipts",
+            } or type(value.get("accepted")) is not dict:
+                _fail("host.state_unavailable")
+            for record in value["accepted"].values():
+                if type(record) is not dict or set(record) != {
+                    "fence", "lease", "effect_claim"
+                }:
+                    _fail("host.state_unavailable")
+                lease = self._parse_lease(record["lease"])
+                record["deadline_clock"] = self._deadline_clock(lease)
+            value["schema_version"] = 3
+            migrated = True
         if (
             type(value) is not dict
             or set(value)
@@ -514,7 +541,7 @@ class HostAgentState:
                 "accepted",
                 "receipts",
             }
-            or value["schema_version"] != 2
+            or value["schema_version"] != 3
             or not _bounded_integer(value["highest_lease_epoch"])
             or not _bounded_integer(value["highest_registry_generation"])
             or type(value["accepted"]) is not dict
@@ -530,7 +557,7 @@ class HostAgentState:
                 type(operation_id) is not str
                 or _TOKEN.fullmatch(operation_id) is None
                 or type(record) is not dict
-                or set(record) != {"fence", "lease", "effect_claim"}
+                or set(record) != {"fence", "lease", "effect_claim", "deadline_clock"}
             ):
                 _fail("host.state_unavailable")
             lease = self._parse_lease(record["lease"])
@@ -541,6 +568,7 @@ class HostAgentState:
             ):
                 _fail("host.state_unavailable")
             self._validate_claim(record["effect_claim"])
+            self._validate_deadline_clock(record["deadline_clock"])
             highest_epoch = max(highest_epoch, lease.lease_epoch)
             highest_generation = max(highest_generation, lease.registry_generation)
         for operation_id, record in value["receipts"].items():
@@ -580,6 +608,8 @@ class HostAgentState:
             or value["highest_registry_generation"] < highest_generation
         ):
             _fail("host.state_unavailable")
+        if migrated:
+            self._write_locked(value)
         return cast(dict[str, Any], value)
 
     @staticmethod
@@ -608,6 +638,32 @@ class HostAgentState:
             or _CLAIM_TOKEN.fullmatch(value["token"]) is None
         ):
             _fail("host.state_unavailable")
+
+    def _deadline_clock(self, lease: AgentLeaseV1) -> dict[str, object]:
+        remaining = max(0.0, (lease.deadline - _utc_now()).total_seconds())
+        return {
+            "boot_id": self._boot_id,
+            "monotonic_deadline": _monotonic() + min(remaining, _MAX_LEASE_SECONDS),
+        }
+
+    @staticmethod
+    def _validate_deadline_clock(value: object) -> None:
+        if (
+            type(value) is not dict
+            or set(value) != {"boot_id", "monotonic_deadline"}
+            or type(value["boot_id"]) is not str
+            or _BOOT_ID.fullmatch(value["boot_id"]) is None
+            or type(value["monotonic_deadline"]) not in {int, float}
+            or not 0 <= value["monotonic_deadline"] <= float(_MAX_INT)
+        ):
+            _fail("host.state_unavailable")
+
+    def _clock_expired(self, value: Mapping[str, object]) -> bool:
+        self._validate_deadline_clock(value)
+        return (
+            value["boot_id"] != self._boot_id
+            or _monotonic() >= cast(float, value["monotonic_deadline"])
+        )
 
     @staticmethod
     def _parse_lease(value: object) -> AgentLeaseV1:

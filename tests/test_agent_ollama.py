@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import multiprocessing
 import re
 import threading
 
@@ -33,6 +34,7 @@ class ControlledRuntime:
         self.started: list[object] = []
         self.stopped: list[object] = []
         self.process_up = True
+        self.identity_status: str | None = None
 
     def available_cpus(self) -> tuple[int, ...]:
         return (0,)
@@ -66,6 +68,19 @@ class ControlledRuntime:
     def listener_owned_by(self, pid: int, port: int) -> bool:
         return True
 
+    def classify_running_identity(
+        self, unit_name: str, pid: int, control_group: str,
+        start_ticks: int, port: int, executable: object,
+    ) -> str:
+        return self.identity_status or ("exact" if self.process_up else "absent")
+
+    def recover_start_intent(
+        self, unit_name: str, port: int, executable: object
+    ) -> tuple[str, int | None, str | None, int | None]:
+        if not self.started or not self.process_up:
+            return "absent", None, None, None
+        return "exact", 4343, "/user.slice/ollama.scope", 901
+
     def fetch_tags(
         self,
         pid: int,
@@ -79,8 +94,8 @@ class ControlledRuntime:
     ) -> set[str]:
         return {"model-id"}
 
-    def cleanup_scope(self, request: object, process: object) -> None:
-        return None
+    def cleanup_scope(self, request: object, process: object) -> bool:
+        return True
 
     def stop_scope(self, request: object) -> None:
         self.stopped.append(request)
@@ -331,3 +346,186 @@ def test_new_registry_generation_expires_old_plans(tmp_path: Path) -> None:
         agent_ollama.AgentOllamaNoEffectError, match="provider.plan_missing"
     ):
         adapter.apply({"plan_ref": old_ref})
+
+
+def test_hard_crash_after_start_recovers_durable_intent_without_second_start(
+    tmp_path: Path,
+) -> None:
+    store, _executable = registry_at(tmp_path)
+
+    class CrashOnce(ControlledRuntime):
+        crashed = False
+
+        def start_scope(self, request: object) -> FakeProcess:
+            self.started.append(request)
+            if not self.crashed:
+                self.crashed = True
+                raise SystemExit("hard crash")
+            return FakeProcess()
+
+    runtime = CrashOnce()
+    state_root = tmp_path / "state"
+    adapter = agent_ollama.ProductionAgentOllamaAdapter(
+        store, state_root=state_root, runtime=runtime
+    )
+    plan_ref = adapter.plan(
+        {"instance_ref": "instance-one", "generation": 1}
+    )["plan_ref"]
+    crashed: list[BaseException] = []
+
+    def apply_and_crash() -> None:
+        try:
+            adapter.apply({"plan_ref": plan_ref})
+        except BaseException as error:
+            crashed.append(error)
+
+    owner = threading.Thread(target=apply_and_crash)
+    owner.start()
+    owner.join(2)
+    assert len(crashed) == 1 and isinstance(crashed[0], SystemExit)
+    restarted = agent_ollama.ProductionAgentOllamaAdapter(
+        store, state_root=state_root, runtime=runtime
+    )
+    assert restarted.apply({"plan_ref": plan_ref}) == {
+        "instance_ref": "instance-one",
+        "generation": 1,
+    }
+    assert len(runtime.started) == 1
+
+
+def test_running_reconcile_handles_absence_conflict_and_generation_advance(
+    tmp_path: Path,
+) -> None:
+    store, _executable = registry_at(tmp_path)
+    runtime = ControlledRuntime()
+    state_root = tmp_path / "state"
+    adapter = agent_ollama.ProductionAgentOllamaAdapter(
+        store, state_root=state_root, runtime=runtime
+    )
+    plan_ref = adapter.plan(
+        {"instance_ref": "instance-one", "generation": 1}
+    )["plan_ref"]
+    adapter.apply({"plan_ref": plan_ref})
+    snapshot = store.load()
+    store.replace(
+        models=snapshot.models,
+        instances=snapshot.instances,
+        expected_generation=1,
+    )
+    assert adapter.probe(
+        {"instance_ref": "instance-one", "generation": 2}
+    )["ready"] is True
+    runtime.identity_status = "conflict"
+    with pytest.raises(Exception, match="provider.instance_identity_conflict"):
+        adapter.stop({"instance_ref": "instance-one", "generation": 2})
+    runtime.identity_status = "absent"
+    assert adapter.stop(
+        {"instance_ref": "instance-one", "generation": 2}
+    ) == {"stopped": True}
+    assert runtime.stopped == []
+
+
+def test_concurrent_stops_perform_at_most_one_runtime_effect(tmp_path: Path) -> None:
+    store, _executable = registry_at(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingStop(ControlledRuntime):
+        def stop_scope(self, request: object) -> None:
+            self.stopped.append(request)
+            entered.set()
+            assert release.wait(2)
+            self.process_up = False
+
+    runtime = BlockingStop()
+    state_root = tmp_path / "state"
+    first = agent_ollama.ProductionAgentOllamaAdapter(
+        store, state_root=state_root, runtime=runtime
+    )
+    plan_ref = first.plan(
+        {"instance_ref": "instance-one", "generation": 1}
+    )["plan_ref"]
+    first.apply({"plan_ref": plan_ref})
+    second = agent_ollama.ProductionAgentOllamaAdapter(
+        store, state_root=state_root, runtime=runtime
+    )
+    outcomes: list[str] = []
+
+    def stop(adapter: agent_ollama.ProductionAgentOllamaAdapter) -> None:
+        try:
+            adapter.stop({"instance_ref": "instance-one", "generation": 1})
+            outcomes.append("stopped")
+        except agent_ollama.AgentOllamaNoEffectError:
+            outcomes.append("waiting")
+
+    owner = threading.Thread(target=stop, args=(first,))
+    competitor = threading.Thread(target=stop, args=(second,))
+    owner.start()
+    assert entered.wait(1)
+    competitor.start()
+    competitor.join(2)
+    release.set()
+    owner.join(2)
+    competitor.join(2)
+    assert not owner.is_alive() and not competitor.is_alive()
+    assert sorted(outcomes) == ["stopped", "waiting"]
+    assert len(runtime.stopped) == 1
+
+
+def test_cross_process_stops_perform_at_most_one_runtime_effect(tmp_path: Path) -> None:
+    store, _executable = registry_at(tmp_path)
+    state_root = tmp_path / "state"
+    setup_runtime = ControlledRuntime()
+    setup = agent_ollama.ProductionAgentOllamaAdapter(
+        store, state_root=state_root, runtime=setup_runtime
+    )
+    plan_ref = setup.plan(
+        {"instance_ref": "instance-one", "generation": 1}
+    )["plan_ref"]
+    setup.apply({"plan_ref": plan_ref})
+    context = multiprocessing.get_context("fork")
+    count = context.Value("i", 0)
+    entered = context.Event()
+    release = context.Event()
+    results = context.Queue()
+
+    class ProcessRuntime(ControlledRuntime):
+        def stop_scope(self, request: object) -> None:
+            with count.get_lock():
+                count.value += 1
+            entered.set()
+            release.wait(3)
+
+    def stop() -> None:
+        adapter = agent_ollama.ProductionAgentOllamaAdapter(
+            store, state_root=state_root, runtime=ProcessRuntime()
+        )
+        try:
+            adapter.stop({"instance_ref": "instance-one", "generation": 1})
+            results.put("stopped")
+        except agent_ollama.AgentOllamaNoEffectError:
+            results.put("waiting")
+
+    first = context.Process(target=stop)
+    second = context.Process(target=stop)
+    try:
+        first.start()
+        assert entered.wait(2)
+        second.start()
+        second.join(3)
+        release.set()
+        first.join(3)
+        assert first.exitcode == 0 and second.exitcode == 0
+        assert sorted((results.get(timeout=1), results.get(timeout=1))) == [
+            "stopped",
+            "waiting",
+        ]
+        assert count.value == 1
+    finally:
+        release.set()
+        for process in (first, second):
+            if process.pid is not None:
+                process.join(1)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(2)

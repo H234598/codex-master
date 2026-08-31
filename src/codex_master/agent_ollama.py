@@ -22,12 +22,14 @@ from codex_master.ollama_runtime import (
     OllamaLocalPlan,
     OllamaRuntime,
     OllamaRuntimeError,
+    OllamaStartError,
     RunningOllamaInstance,
     adopt_running_instance,
     ollama_plan_digest,
     plan_local_instance,
     probe_instance_readiness,
     probe_ollama_host,
+    recover_started_instance,
     start_local_instance,
     stop_local_instance,
 )
@@ -129,6 +131,7 @@ class ProductionAgentOllamaAdapter:
     def plan(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
         instance_ref = cast(str, arguments["instance_ref"])
         generation = cast(int, arguments["generation"])
+        self._reap_absent_intents()
         registry, plan = self._fresh_plan(instance_ref, generation)
         del registry
         plan_ref = f"plan-{secrets.token_hex(16)}"
@@ -145,12 +148,15 @@ class ProductionAgentOllamaAdapter:
                 "created_at": now,
                 "state": "ready",
                 "claim": None,
+                "unit_name": None,
+                "port": None,
             }
             self._write_locked(document)
         return {"plan_ref": plan_ref}
 
     def apply(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
         plan_ref = cast(str, arguments["plan_ref"])
+        self._reap_absent_intents(skip_ref=plan_ref)
         with self._state.locked():
             preview = self._read_locked()["plans"].get(plan_ref)
         if preview is not None:
@@ -167,31 +173,78 @@ class ProductionAgentOllamaAdapter:
             if any(
                 ref != plan_ref
                 and value["instance_ref"] == instance_ref
-                and value["state"] == "starting"
-                and self._claim_alive(value["claim"])
+                and value["state"] == "intent"
                 for ref, value in document["plans"].items()
             ):
                 _no_effect("provider.instance_already_running")
-            if saved["state"] != "ready":
+            if saved["state"] == "intent" and self._claim_alive(saved["claim"]):
                 _no_effect("provider.instance_starting")
-            saved["state"] = "starting"
+            created_intent = saved["state"] == "ready"
+            if created_intent:
+                saved["unit_name"] = (
+                    f"codex-master-ollama-{secrets.token_hex(16)}.scope"
+                )
+                saved["port"] = (self._runtime.allocate_loopback_port()
+                    if self._runtime is not None else self._allocate_port())
+            saved["state"] = "intent"
             saved["claim"] = self._claim()
             self._write_locked(document)
         try:
-            _registry, plan = self._fresh_plan(instance_ref, saved["generation"])
+            _registry, plan = self._fresh_plan_current(instance_ref)
             if ollama_plan_digest(plan) != saved["plan_digest"]:
+                if created_intent:
+                    self._reset_plan_intent(plan_ref, saved)
                 _no_effect("provider.plan_changed")
-            running = start_local_instance(plan, runtime=self._runtime)
+            recovered = recover_started_instance(
+                plan,
+                unit_name=saved["unit_name"],
+                port=saved["port"],
+                runtime=self._runtime,
+            )
+            if recovered is not None:
+                return self._commit_running(plan_ref, saved, recovered)
+            _registry, plan = self._fresh_plan_current(instance_ref)
+            if ollama_plan_digest(plan) != saved["plan_digest"]:
+                if created_intent:
+                    self._reset_plan_intent(plan_ref, saved)
+                _no_effect("provider.plan_changed")
+            running = start_local_instance(
+                plan,
+                runtime=self._runtime,
+                unit_name=saved["unit_name"],
+                port=saved["port"],
+            )
+        except OllamaStartError as error:
+            if error.cleanup_proven:
+                self._reset_plan_intent(plan_ref, saved)
+            raise
         except Exception:
+            raise
+        try:
+            return self._commit_running(plan_ref, saved, running)
+        except Exception:
+            try:
+                stop_local_instance(running, runtime=self._runtime)
+            except Exception:
+                raise
             with self._state.locked():
                 document = self._read_locked()
                 current = document["plans"].get(plan_ref)
-                if current is not None and current["state"] == "starting":
-                    current["state"] = "ready"
-                    current["claim"] = None
+                if current == saved:
+                    current.update(
+                        state="ready", claim=None, unit_name=None, port=None
+                    )
                     self._write_locked(document)
             raise
+
+    def _commit_running(
+        self,
+        plan_ref: str,
+        saved: dict[str, Any],
+        running: RunningOllamaInstance,
+    ) -> Mapping[str, object]:
         conflict = False
+        instance_ref = saved["instance_ref"]
         with self._state.locked():
             document = self._read_locked()
             current = document["plans"].get(plan_ref)
@@ -207,12 +260,26 @@ class ProductionAgentOllamaAdapter:
                     "ollama_pid": running.ollama_pid,
                     "control_group": running.control_group,
                     "process_start_ticks": running.process_start_ticks,
+                    "state": "running",
+                    "claim": None,
                 }
                 self._write_locked(document)
         if conflict:
-            stop_local_instance(running, runtime=self._runtime)
             _fail("provider.journal_conflict")
         return {"instance_ref": instance_ref, "generation": saved["generation"]}
+
+    def _allocate_port(self) -> int:
+        from codex_master.ollama_runtime import SystemOllamaRuntime
+
+        return SystemOllamaRuntime().allocate_loopback_port()
+
+    def _reset_plan_intent(self, plan_ref: str, saved: Mapping[str, object]) -> None:
+        with self._state.locked():
+            document = self._read_locked()
+            current = document["plans"].get(plan_ref)
+            if current == saved:
+                current.update(state="ready", claim=None, unit_name=None, port=None)
+                self._write_locked(document)
 
     def probe(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
         running = self._running_instance(
@@ -231,7 +298,37 @@ class ProductionAgentOllamaAdapter:
     def stop(self, arguments: Mapping[str, object]) -> Mapping[str, object]:
         instance_ref = cast(str, arguments["instance_ref"])
         generation = cast(int, arguments["generation"])
-        running = self._running_instance(instance_ref, generation)
+        with self._state.locked():
+            document = self._read_locked()
+            saved = document["running"].get(instance_ref)
+            if saved is None:
+                _no_effect("provider.instance_missing")
+            if (
+                saved["state"] == "stopping"
+                and self._claim_alive(saved["claim"])
+                and not self._claim_owned(saved["claim"])
+            ):
+                _no_effect("provider.instance_stopping")
+            saved["state"] = "stopping"
+            saved["claim"] = self._claim()
+            self._write_locked(document)
+        try:
+            running = self._running_instance(instance_ref, generation, allow_stopping=True)
+        except OllamaRuntimeError as error:
+            if str(error) != "provider.instance_absent":
+                self._reset_stopping(instance_ref, saved)
+                raise
+            with self._state.locked():
+                document = self._read_locked()
+                if document["running"].get(instance_ref) == saved:
+                    del document["running"][instance_ref]
+                    self._write_locked(document)
+            return {"stopped": True}
+        except AgentOllamaError:
+            self._reset_stopping(instance_ref, saved)
+            raise
+        # Any error from this effect boundary is ambiguous: preserve the durable
+        # stopping claim so restart reconciliation can prove exact absence.
         stop_local_instance(running, runtime=self._runtime)
         with self._state.locked():
             document = self._read_locked()
@@ -247,6 +344,24 @@ class ProductionAgentOllamaAdapter:
             self._write_locked(document)
         return {"stopped": True}
 
+    def _reset_stopping(
+        self, instance_ref: str, saved: Mapping[str, object]
+    ) -> None:
+        with self._state.locked():
+            document = self._read_locked()
+            current = document["running"].get(instance_ref)
+            if (
+                current is not None
+                and current["state"] == "stopping"
+                and current["claim"] == saved["claim"]
+                and current["unit_name"] == saved["unit_name"]
+                and current["ollama_pid"] == saved["ollama_pid"]
+                and current["process_start_ticks"]
+                == saved["process_start_ticks"]
+            ):
+                current.update(state="running", claim=None)
+                self._write_locked(document)
+
     def _fresh_plan(
         self, instance_ref: str, generation: int
     ) -> tuple[OllamaRegistryV1, OllamaLocalPlan]:
@@ -257,32 +372,47 @@ class ProductionAgentOllamaAdapter:
         )
 
     def _running_instance(
-        self, instance_ref: str, generation: int
+        self, instance_ref: str, generation: int, *, allow_stopping: bool = False
     ) -> RunningOllamaInstance:
         with self._state.locked():
             saved = self._read_locked()["running"].get(instance_ref)
         if saved is None:
             _no_effect("provider.instance_missing")
-        if saved["generation"] != generation:
+        if (
+            saved["state"] == "stopping"
+            and not allow_stopping
+            and self._claim_alive(saved["claim"])
+        ):
+            _no_effect("provider.instance_stopping")
+        registry, plan = self._fresh_plan_current(instance_ref)
+        if registry.generation != generation:
             _no_effect("provider.generation_stale")
-        _registry, plan = self._fresh_plan(instance_ref, generation)
         if ollama_plan_digest(plan) != saved["plan_digest"]:
             _no_effect("provider.plan_changed")
-        return adopt_running_instance(plan, runtime=self._runtime, **{
+        running = adopt_running_instance(plan, runtime=self._runtime, **{
             key: saved[key]
             for key in (
                 "unit_name", "port", "ollama_pid", "control_group",
                 "process_start_ticks",
             )
         })
+        if saved["generation"] != generation:
+            with self._state.locked():
+                document = self._read_locked()
+                if document["running"].get(instance_ref) == saved:
+                    document["running"][instance_ref]["generation"] = generation
+                    self._write_locked(document)
+        return running
 
     def _reap_dead_running(self, instance_ref: str) -> None:
         with self._state.locked():
             saved = self._read_locked()["running"].get(instance_ref)
         if saved is None:
             return
+        if saved["state"] != "running":
+            return
         try:
-            _registry, plan = self._fresh_plan(instance_ref, saved["generation"])
+            _registry, plan = self._fresh_plan_current(instance_ref)
             if ollama_plan_digest(plan) != saved["plan_digest"]:
                 return
             adopt_running_instance(plan, runtime=self._runtime, **{
@@ -294,13 +424,58 @@ class ProductionAgentOllamaAdapter:
             })
             return
         except OllamaRuntimeError as error:
-            if str(error) != "provider.process_unavailable":
+            if str(error) != "provider.instance_absent":
                 return
         with self._state.locked():
             document = self._read_locked()
             if document["running"].get(instance_ref) == saved:
                 del document["running"][instance_ref]
                 self._write_locked(document)
+
+    def _fresh_plan_current(
+        self, instance_ref: str
+    ) -> tuple[OllamaRegistryV1, OllamaLocalPlan]:
+        registry = self._registry.load()
+        instance = self._local_instance(registry, instance_ref)
+        return registry, plan_local_instance(
+            instance, probe_ollama_host(runtime=self._runtime), registry=registry
+        )
+
+    def _reap_absent_intents(self, *, skip_ref: str | None = None) -> None:
+        with self._state.locked():
+            plans = dict(self._read_locked()["plans"])
+        for plan_ref in sorted(plans):
+            if plan_ref == skip_ref:
+                continue
+            saved = plans[plan_ref]
+            if (
+                saved["state"] != "intent"
+                or self._claim_alive(saved["claim"])
+            ):
+                continue
+            try:
+                _registry, plan = self._fresh_plan_current(saved["instance_ref"])
+                if ollama_plan_digest(plan) != saved["plan_digest"]:
+                    continue
+                running = recover_started_instance(
+                    plan,
+                    unit_name=saved["unit_name"],
+                    port=saved["port"],
+                    runtime=self._runtime,
+                )
+            except (AgentOllamaError, OllamaRuntimeError):
+                continue
+            if running is not None:
+                try:
+                    self._commit_running(plan_ref, saved, running)
+                except AgentOllamaError:
+                    pass
+                continue
+            with self._state.locked():
+                document = self._read_locked()
+                if document["plans"].get(plan_ref) == saved:
+                    del document["plans"][plan_ref]
+                    self._write_locked(document)
 
     def _load_generation(self, generation: int) -> OllamaRegistryV1:
         registry = self._registry.load()
@@ -328,10 +503,6 @@ class ProductionAgentOllamaAdapter:
                     now - value["created_at"] >= self._plan_max_age
                     or (generation is not None and value["generation"] != generation)
                 )
-            ) or (
-                value["state"] == "starting"
-                and now - value["created_at"] >= self._plan_max_age
-                and not self._claim_alive(value["claim"])
             )
         )
         for ref in expired:
@@ -344,16 +515,41 @@ class ProductionAgentOllamaAdapter:
             )
         except HiveStateError as error:
             if str(error) == "state_not_found":
-                return {"schema_version": 1, "plans": {}, "running": {}}
+                return {"schema_version": 2, "plans": {}, "running": {}}
             _fail("provider.journal_unavailable")
         try:
             value = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
         except (UnicodeError, ValueError, TypeError, RecursionError):
             _fail("provider.journal_unavailable")
+        if type(value) is dict and value.get("schema_version") == 1:
+            if (
+                set(value) != {"schema_version", "plans", "running"}
+                or type(value.get("plans")) is not dict
+                or type(value.get("running")) is not dict
+            ):
+                _fail("provider.journal_unavailable")
+            for item in value["plans"].values():
+                if type(item) is not dict:
+                    _fail("provider.journal_unavailable")
+                if "unit_name" not in item and "port" not in item:
+                    old_state = item.get("state")
+                    if old_state != "ready":
+                        # Schema 1 had no stable unit identity.  A dead owner may
+                        # already have started a scope, so deletion is unsafe.
+                        _fail("provider.journal_unavailable")
+                    item["state"] = "ready"
+                    item["unit_name"] = None
+                    item["port"] = None
+            for item in value["running"].values():
+                if type(item) is not dict:
+                    _fail("provider.journal_unavailable")
+                item.setdefault("state", "running")
+                item.setdefault("claim", None)
+            value["schema_version"] = 2
         if (
             type(value) is not dict
             or set(value) != {"schema_version", "plans", "running"}
-            or value["schema_version"] != 1
+            or value["schema_version"] != 2
             or type(value["plans"]) is not dict
             or type(value["running"]) is not dict
             or len(value["plans"]) > self._max_plans
@@ -364,22 +560,36 @@ class ProductionAgentOllamaAdapter:
             if (
                 type(ref) is not str or _PLAN_REF.fullmatch(ref) is None
                 or type(item) is not dict
-                or set(item) != {"instance_ref", "generation", "plan_digest", "created_at", "state", "claim"}
+                or set(item) != {"instance_ref", "generation", "plan_digest", "created_at", "state", "claim", "unit_name", "port"}
                 or type(item["instance_ref"]) is not str
                 or _TOKEN.fullmatch(item["instance_ref"]) is None
                 or not self._integer(item["generation"])
                 or type(item["plan_digest"]) is not str
                 or _DIGEST.fullmatch(item["plan_digest"]) is None
                 or not self._integer(item["created_at"])
-                or item["state"] not in {"ready", "starting"}
-                or not self._valid_claim(item["claim"], required=item["state"] == "starting")
+                or item["state"] not in {"ready", "intent"}
+                or not self._valid_claim(
+                    item["claim"], required=item["state"] == "intent"
+                )
+                or (
+                    item["state"] == "ready"
+                    and (item["unit_name"] is not None or item["port"] is not None)
+                )
+                or (
+                    item["state"] == "intent"
+                    and (
+                        type(item["unit_name"]) is not str
+                        or _UNIT.fullmatch(item["unit_name"]) is None
+                        or not self._integer(item["port"], 1, 65535)
+                    )
+                )
             ):
                 _fail("provider.journal_unavailable")
         for ref, item in value["running"].items():
             if (
                 type(ref) is not str or _TOKEN.fullmatch(ref) is None
                 or type(item) is not dict
-                or set(item) != {"generation", "plan_digest", "unit_name", "port", "ollama_pid", "control_group", "process_start_ticks"}
+                or set(item) != {"generation", "plan_digest", "unit_name", "port", "ollama_pid", "control_group", "process_start_ticks", "state", "claim"}
                 or not self._integer(item["generation"])
                 or type(item["plan_digest"]) is not str
                 or _DIGEST.fullmatch(item["plan_digest"]) is None
@@ -391,6 +601,10 @@ class ProductionAgentOllamaAdapter:
                 or not item["control_group"].startswith("/")
                 or "\n" in item["control_group"]
                 or not self._integer(item["process_start_ticks"], 1)
+                or item["state"] not in {"running", "stopping"}
+                or not self._valid_claim(
+                    item["claim"], required=item["state"] == "stopping"
+                )
             ):
                 _fail("provider.journal_unavailable")
         return cast(dict[str, Any], value)
@@ -439,6 +653,17 @@ class ProductionAgentOllamaAdapter:
             claim["boot_id"] == self._boot_id()
             and self._process_start_ticks(pid) == claim["process_start_ticks"]
             and Path(f"/proc/{pid}/task/{claim['thread_id']}").is_dir()
+        )
+
+    def _claim_owned(self, value: object) -> bool:
+        if not self._valid_claim(value, required=True):
+            return False
+        claim = cast(dict[str, object], value)
+        return (
+            claim["boot_id"] == self._boot_id()
+            and claim["pid"] == os.getpid()
+            and claim["process_start_ticks"] == self._process_start_ticks(os.getpid())
+            and claim["thread_id"] == threading.get_native_id()
         )
 
     def _valid_claim(self, value: object, *, required: bool) -> bool:

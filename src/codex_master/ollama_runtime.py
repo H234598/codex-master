@@ -207,6 +207,8 @@ _STOP_RECORDS: dict[bytes, tuple[object, tuple[object, ...]]] = {}
 _RUNNING_RECORDS: dict[
     bytes, tuple[weakref.ReferenceType[object], tuple[object, ...]]
 ] = {}
+_EXECUTABLE_IDENTITY_CACHE: dict[tuple[int, int, int, str], None] = {}
+_EXECUTABLE_IDENTITY_CACHE_MAX = 128
 
 
 class OllamaRuntimeError(RuntimeError):
@@ -217,6 +219,16 @@ class OllamaRuntimeError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class OllamaStartError(OllamaRuntimeError):
+    """Start failure carrying a runtime-owned exact-cleanup proof."""
+
+    __slots__ = ("cleanup_proven",)
+
+    def __init__(self, code: str, *, cleanup_proven: bool) -> None:
+        super().__init__(code)
+        self.cleanup_proven = cleanup_proven
 
 
 class _ObjectIdentity:
@@ -486,6 +498,20 @@ class OllamaRuntime(Protocol):
         self, unit_name: str, pid: int, control_group: str, start_ticks: int
     ) -> bool: ...
 
+    def classify_running_identity(
+        self,
+        unit_name: str,
+        pid: int,
+        control_group: str,
+        start_ticks: int,
+        port: int,
+        executable: OllamaPathEvidence,
+    ) -> str: ...
+
+    def recover_start_intent(
+        self, unit_name: str, port: int, executable: OllamaPathEvidence
+    ) -> tuple[str, int | None, str | None, int | None]: ...
+
     def listener_owned_by(self, pid: int, port: int) -> bool: ...
 
     def fetch_tags(
@@ -500,7 +526,7 @@ class OllamaRuntime(Protocol):
         max_bytes: int,
     ) -> set[str] | None: ...
 
-    def cleanup_scope(self, request: OllamaStartRequest, process: OllamaProcess) -> None: ...
+    def cleanup_scope(self, request: OllamaStartRequest, process: OllamaProcess) -> bool: ...
 
     def stop_scope(self, request: OllamaStopRequest) -> None: ...
 
@@ -570,6 +596,78 @@ class SystemOllamaRuntime:
         ):
             return False
         return self._scope_observation(unit_name) == (pid, control_group, start_ticks)
+
+    def classify_running_identity(
+        self,
+        unit_name: str,
+        pid: int,
+        control_group: str,
+        start_ticks: int,
+        port: int,
+        executable: OllamaPathEvidence,
+    ) -> str:
+        expected = (pid, control_group, start_ticks)
+        observed = self._scope_observation(unit_name)
+        if observed is None:
+            if self._scope_proven_absent(unit_name):
+                return "absent"
+            try:
+                _process_start_ticks(pid)
+            except (OSError, ValueError):
+                return "conflict"
+            return "conflict"
+        if observed != expected:
+            return "conflict"
+        if not _process_executable_matches_evidence(pid, start_ticks, executable):
+            return "conflict"
+        if not self.listener_owned_by(pid, port):
+            return "conflict"
+        return "exact" if self._scope_observation(unit_name) == expected else "conflict"
+
+    def recover_start_intent(
+        self, unit_name: str, port: int, executable: OllamaPathEvidence
+    ) -> tuple[str, int | None, str | None, int | None]:
+        observed = self._scope_observation(unit_name)
+        if observed is None:
+            return (
+                ("absent", None, None, None)
+                if self._scope_proven_absent(unit_name)
+                else ("conflict", None, None, None)
+            )
+        pid, control_group, start_ticks = observed
+        if (
+            not _process_executable_matches_evidence(pid, start_ticks, executable)
+            or not self.listener_owned_by(pid, port)
+            or self._scope_observation(unit_name) != observed
+        ):
+            return "conflict", None, None, None
+        return "exact", pid, control_group, start_ticks
+
+    def _scope_proven_absent(self, unit_name: str) -> bool:
+        if _UNIT_NAME.fullmatch(unit_name) is None:
+            return False
+        try:
+            result = subprocess.run(
+                (
+                    SYSTEMCTL_PATH,
+                    "--user",
+                    "--no-pager",
+                    "show",
+                    unit_name,
+                    "--property=LoadState",
+                ),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=PROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+            return (
+                result.returncode == 0
+                and not result.stderr
+                and result.stdout == b"LoadState=not-found\n"
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     def _scope_observation(
         self, unit_name: str, *, deadline: float | None = None
@@ -729,17 +827,18 @@ class SystemOllamaRuntime:
                 return False
             time.sleep(min(0.005, remaining))
 
-    def cleanup_scope(self, request: OllamaStartRequest, process: OllamaProcess) -> None:
+    def cleanup_scope(self, request: OllamaStartRequest, process: OllamaProcess) -> bool:
         if not _recorded_start_request(request):
-            return
+            return False
         try:
             self._stop_unit(request.unit_name)
         except OllamaRuntimeError:
-            pass
+            return False
         try:
             process.wait(timeout=1.0)
         except (OSError, subprocess.SubprocessError):
-            pass
+            return False
+        return self._scope_proven_absent(request.unit_name)
 
     def stop_scope(self, request: OllamaStopRequest) -> None:
         if not _recorded_stop_request(request):
@@ -844,7 +943,11 @@ def plan_local_instance(
 
 
 def start_local_instance(
-    plan: OllamaLocalPlan, *, runtime: OllamaRuntime | None = None
+    plan: OllamaLocalPlan,
+    *,
+    runtime: OllamaRuntime | None = None,
+    unit_name: str | None = None,
+    port: int | None = None,
 ) -> RunningOllamaInstance:
     if (
         not isinstance(plan, OllamaLocalPlan)
@@ -856,10 +959,10 @@ def start_local_instance(
     _revalidate_path(plan.executable, plan.host, kind="executable")
     _revalidate_path(plan.models_directory, plan.host, kind="models")
     adapter = runtime or SystemOllamaRuntime()
-    port = adapter.allocate_loopback_port()
+    port = adapter.allocate_loopback_port() if port is None else port
     if type(port) is not int or not 1 <= port <= 65535:
         _fail("provider.loopback_allocation_failed")
-    unit_name = f"codex-master-ollama-{secrets.token_hex(16)}.scope"
+    unit_name = unit_name or f"codex-master-ollama-{secrets.token_hex(16)}.scope"
     if not _UNIT_NAME.fullmatch(unit_name):
         _fail("resource.scope_invalid")
     properties = tuple(plan.cpu_profile.systemd_properties().items())
@@ -912,16 +1015,80 @@ def start_local_instance(
         )
         return running
     except BaseException as error:
+        cleanup_proven = False
         if process is not None:
             try:
-                adapter.cleanup_scope(request, process)
+                cleanup_proven = adapter.cleanup_scope(request, process) is True
             except BaseException:
                 pass
-        if isinstance(error, OllamaRuntimeError) or not isinstance(error, Exception):
+        else:
+            try:
+                cleanup_proven = (
+                    adapter.recover_start_intent(
+                        request.unit_name, request.port, request.executable
+                    )[0]
+                    == "absent"
+                )
+            except BaseException:
+                pass
+        if not isinstance(error, Exception):
             raise
-        _fail("provider.process_start_failed")
+        code = (
+            str(error)
+            if isinstance(error, OllamaRuntimeError)
+            else "provider.process_start_failed"
+        )
+        raise OllamaStartError(code, cleanup_proven=cleanup_proven) from None
     finally:
         _discard_strong(_START_RECORDS, request_provenance, request)
+
+
+def recover_started_instance(
+    plan: OllamaLocalPlan,
+    *,
+    unit_name: str,
+    port: int,
+    runtime: OllamaRuntime | None = None,
+) -> RunningOllamaInstance | None:
+    """Recover an exact durable start intent without forging runtime seals."""
+    if (
+        not isinstance(plan, OllamaLocalPlan)
+        or not _consume_weak(_PLAN_RECORDS, plan._provenance, plan, _plan_state(plan))
+        or _UNIT_NAME.fullmatch(unit_name) is None
+        or type(port) is not int
+        or not 1 <= port <= 65535
+    ):
+        _fail("provider.plan_invalid")
+    _revalidate_path(plan.executable, plan.host, kind="executable")
+    _revalidate_path(plan.models_directory, plan.host, kind="models")
+    adapter = runtime or SystemOllamaRuntime()
+    status, pid, control_group, start_ticks = adapter.recover_start_intent(
+        unit_name, port, plan.executable
+    )
+    if status == "absent":
+        return None
+    if (
+        status != "exact"
+        or type(pid) is not int
+        or type(control_group) is not str
+        or type(start_ticks) is not int
+    ):
+        _fail("provider.instance_identity_conflict")
+    process = _AdoptedProcess(pid, start_ticks)
+    provenance = secrets.token_bytes(32)
+    running = RunningOllamaInstance(
+        plan=plan,
+        unit_name=unit_name,
+        port=port,
+        process=process,
+        ollama_pid=pid,
+        control_group=control_group,
+        process_start_ticks=start_ticks,
+        _provenance=provenance,
+        _seal=_RUNNING_SEAL,
+    )
+    _register_weak(_RUNNING_RECORDS, provenance, running, _running_state(running))
+    return running
 
 
 def ollama_plan_digest(plan: OllamaLocalPlan) -> str:
@@ -965,15 +1132,19 @@ def adopt_running_instance(
     _revalidate_path(plan.executable, plan.host, kind="executable")
     _revalidate_path(plan.models_directory, plan.host, kind="models")
     adapter = runtime or SystemOllamaRuntime()
+    status = adapter.classify_running_identity(
+        unit_name,
+        ollama_pid,
+        control_group,
+        process_start_ticks,
+        port,
+        plan.executable,
+    )
+    if status == "absent":
+        _fail("provider.instance_absent")
+    if status != "exact":
+        _fail("provider.instance_identity_conflict")
     process = _AdoptedProcess(ollama_pid, process_start_ticks)
-    if not adapter.scope_process_matches(
-        unit_name, ollama_pid, control_group, process_start_ticks
-    ):
-        _fail("resource.scope_membership_invalid")
-    if not adapter.process_running(process, ollama_pid, process_start_ticks):
-        _fail("provider.process_unavailable")
-    if not adapter.listener_owned_by(ollama_pid, port):
-        _fail("provider.endpoint_identity_invalid")
     provenance = secrets.token_bytes(32)
     running = RunningOllamaInstance(
         plan=plan,
@@ -1919,6 +2090,45 @@ def _process_executable_is_pinned(pid: int) -> bool:
     except OSError:
         return False
     return target.startswith("/memfd:codex-master-ollama-executable")
+
+
+def _process_executable_matches_evidence(
+    pid: int, start_ticks: int, evidence: OllamaPathEvidence
+) -> bool:
+    if evidence.sha256 is None or evidence.size > _MAX_EXECUTABLE_BYTES:
+        return False
+    try:
+        path = Path(f"/proc/{pid}/exe")
+        target = os.readlink(path)
+        if not target.startswith("/memfd:codex-master-ollama-executable"):
+            return False
+        metadata = path.stat()
+        if metadata.st_size != evidence.size:
+            return False
+        cache_key = (pid, start_ticks, metadata.st_ino, evidence.sha256)
+        with _RECORD_LOCK:
+            if cache_key in _EXECUTABLE_IDENTITY_CACHE:
+                return True
+        digest = hashlib.sha256()
+        total = 0
+        with path.open("rb", buffering=0) as stream:
+            while True:
+                chunk = stream.read(min(1024 * 1024, _MAX_EXECUTABLE_BYTES + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_EXECUTABLE_BYTES:
+                    return False
+                digest.update(chunk)
+        if total != evidence.size or digest.hexdigest() != evidence.sha256:
+            return False
+        with _RECORD_LOCK:
+            _EXECUTABLE_IDENTITY_CACHE[cache_key] = None
+            while len(_EXECUTABLE_IDENTITY_CACHE) > _EXECUTABLE_IDENTITY_CACHE_MAX:
+                del _EXECUTABLE_IDENTITY_CACHE[next(iter(_EXECUTABLE_IDENTITY_CACHE))]
+        return True
+    except OSError:
+        return False
 
 
 def _loopback_listener_inodes(port: int) -> set[str]:

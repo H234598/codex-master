@@ -83,8 +83,26 @@ class FakeRuntime:
     def listener_owned_by(self, pid: int, port: int) -> bool:
         return self.listener_matches
 
-    def cleanup_scope(self, request: object, process: object) -> None:
+    def classify_running_identity(
+        self, unit_name: str, pid: int, control_group: str,
+        start_ticks: int, port: int, executable: object,
+    ) -> str:
+        if not self.process_up:
+            return "absent"
+        return "exact" if self.cgroup_matches and self.listener_matches else "conflict"
+
+    def recover_start_intent(
+        self, unit_name: str, port: int, executable: object
+    ) -> tuple[str, int | None, str | None, int | None]:
+        if not self.started or not self.process_up:
+            return "absent", None, None, None
+        if not self.cgroup_matches or not self.listener_matches:
+            return "conflict", None, None, None
+        return "exact", self.scope_pid, self.scope_control_group, self.scope_start_ticks
+
+    def cleanup_scope(self, request: object, process: object) -> bool:
         self.cleaned.append(request.unit_name)  # type: ignore[attr-defined]
+        return True
 
     def fetch_tags(
         self,
@@ -948,7 +966,7 @@ def test_public_adoption_strongly_validates_running_identity(tmp_path: Path) -> 
     second = tmp_path / "second"
     second.mkdir()
     with pytest.raises(
-        OllamaRuntimeError, match="provider.endpoint_identity_invalid"
+        OllamaRuntimeError, match="provider.instance_identity_conflict"
     ):
         adopt_running_instance(
             planned(second),
@@ -1033,6 +1051,41 @@ def test_system_runtime_checks_process_and_scope_identity(
         901,
     ) is True
     assert runtime.scope_process_matches("invalid", 4343, "/user.slice/ollama.scope", 901) is False
+
+
+def test_system_adoption_rejects_foreign_executable_and_final_pid_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = SystemOllamaRuntime()
+    evidence = planned(tmp_path).executable
+    expected = (4343, "/user.slice/ollama.scope", 901)
+    monkeypatch.setattr(runtime, "_scope_observation", lambda _unit: expected)
+    monkeypatch.setattr(runtime, "listener_owned_by", lambda _pid, _port: True)
+    monkeypatch.setattr(
+        ollama_runtime, "_process_executable_matches_evidence", lambda *_: False
+    )
+    assert runtime.classify_running_identity(
+        "codex-master-ollama-" + "a" * 32 + ".scope",
+        4343,
+        "/user.slice/ollama.scope",
+        901,
+        11435,
+        evidence,
+    ) == "conflict"
+
+    monkeypatch.setattr(
+        ollama_runtime, "_process_executable_matches_evidence", lambda *_: True
+    )
+    observations = iter((expected, (4343, "/user.slice/ollama.scope", 902)))
+    monkeypatch.setattr(runtime, "_scope_observation", lambda _unit: next(observations))
+    assert runtime.classify_running_identity(
+        "codex-master-ollama-" + "a" * 32 + ".scope",
+        4343,
+        "/user.slice/ollama.scope",
+        901,
+        11435,
+        evidence,
+    ) == "conflict"
 
 
 def test_system_runtime_cleanup_stops_only_recorded_scope(

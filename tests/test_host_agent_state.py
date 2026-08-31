@@ -9,6 +9,7 @@ import threading
 
 import pytest
 
+from codex_master import host_agent_state
 from codex_master.agent_contracts import AgentLeaseV1, AgentResultV1
 from codex_master.host_agent_state import HostAgentState, HostAgentStateError
 
@@ -153,6 +154,32 @@ def test_live_process_claim_is_bounded_by_lease_deadline(tmp_path: Path) -> None
         if process.is_alive():
             process.terminate()
             process.join(3)
+
+
+def test_claim_deadline_ignores_utc_jumps_and_uses_persisted_monotonic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    utc = datetime(2030, 1, 1, tzinfo=UTC)
+    monotonic = 100.0
+    monkeypatch.setattr(host_agent_state, "_utc_now", lambda: utc)
+    monkeypatch.setattr(host_agent_state, "_monotonic", lambda: monotonic)
+    item = lease(deadline=utc + timedelta(seconds=20))
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    state.accept(item)
+    assert state.begin_effect(item) is not None
+
+    utc += timedelta(days=30)
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(HostAgentStateError, match="host.operation_interrupted"):
+        state.recover(item, stop_event=stop)
+
+    utc -= timedelta(days=60)
+    monotonic = 121.0
+    receipt = HostAgentState.for_test(
+        tmp_path, host_ref="worker-one"
+    ).recover(item)
+    assert receipt is not None and receipt.state == "unknown"
 
 
 def test_recover_returns_receipt_completed_between_its_locked_reads(
