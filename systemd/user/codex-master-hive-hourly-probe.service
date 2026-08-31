@@ -4,6 +4,8 @@ Documentation=man:systemd.service(5)
 
 [Service]
 Type=oneshot
+# Sum of the named Runtime Image Probe contract; regression-tested at install.
+TimeoutStartSec=107s
 CapabilityBoundingSet=
 NoNewPrivileges=yes
 PrivateTmp=yes

@@ -16,12 +16,16 @@ from typing import Any
 
 from codex_master.runtime_layout import LayoutError, RuntimeLayout
 from codex_master.runtime_process import (
+    BOUNDED_PROCESS_CLEANUP_SECONDS,
     BoundedProcessError,
     DEFAULT_STDERR_LIMIT,
     DEFAULT_STDOUT_LIMIT,
     run_bounded,
 )
-from codex_master.runtime_status import runtime_status
+from codex_master.runtime_status import (
+    RUNTIME_STATUS_MCP_TIMEOUT_SECONDS,
+    runtime_status,
+)
 
 
 DETERMINISTIC_PROBE_HOURS_UTC = (0, 3, 6, 9, 12, 15, 18, 21)
@@ -50,6 +54,25 @@ _HIVE_STATUS_KEYS = frozenset(
         "raw_output",
     }
 )
+HIVE_DIAGNOSTIC_TIMEOUT_SECONDS = 45.0
+_PROBE_STARTUP_AND_PUBLISH_SLACK_SECONDS = 5.0
+# Each bounded child owns the shared cleanup allowance from runtime_process.
+# The remaining slack covers only the image wrapper's Python bootstrap, layout
+# validation, lock acquisition and atomic record publication; all diagnostic
+# subprocess time is named separately below.
+RUNTIME_IMAGE_PROBE_PHASE_TIMEOUTS = (
+    ("direct_mcp", RUNTIME_STATUS_MCP_TIMEOUT_SECONDS),
+    ("direct_mcp_cleanup", BOUNDED_PROCESS_CLEANUP_SECONDS),
+    ("hive_status", HIVE_DIAGNOSTIC_TIMEOUT_SECONDS),
+    ("hive_status_cleanup", BOUNDED_PROCESS_CLEANUP_SECONDS),
+    ("hive_doctor", HIVE_DIAGNOSTIC_TIMEOUT_SECONDS),
+    ("hive_doctor_cleanup", BOUNDED_PROCESS_CLEANUP_SECONDS),
+    ("startup_and_publish", _PROBE_STARTUP_AND_PUBLISH_SLACK_SECONDS),
+)
+RUNTIME_IMAGE_PROBE_TOTAL_TIMEOUT_SECONDS = sum(
+    seconds for _phase, seconds in RUNTIME_IMAGE_PROBE_PHASE_TIMEOUTS
+)
+_RUNTIME_IMAGE_PROBE_PHASE_LIMITS = dict(RUNTIME_IMAGE_PROBE_PHASE_TIMEOUTS)
 
 
 def _ready_state(value: object) -> bool:
@@ -464,15 +487,26 @@ def _atomic_write(path: Path, payload: Mapping[str, object]) -> None:
             os.close(descriptor)
 
 
+def _emit_phase_timeout(phase: str) -> None:
+    """Publish the bounded phase and its named limit without child output."""
+
+    print(
+        "runtime_image_probe_phase_timeout "
+        f"phase={phase} limit_seconds={_RUNTIME_IMAGE_PROBE_PHASE_LIMITS[phase]:g}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _run_json(
-    layout: RuntimeLayout, command: Path, *arguments: str
+    layout: RuntimeLayout, command: Path, *arguments: str, phase: str
 ) -> tuple[dict[str, Any], bool]:
     try:
         completed = run_bounded(
             [os.fspath(command), *arguments],
             cwd=command.parent.parent,
             home=Path.home(),
-            timeout_seconds=45,
+            timeout_seconds=HIVE_DIAGNOSTIC_TIMEOUT_SECONDS,
             stdout_limit=DEFAULT_STDOUT_LIMIT,
             stderr_limit=DEFAULT_STDERR_LIMIT,
             runtime_layout=layout,
@@ -481,7 +515,13 @@ def _run_json(
             return {}, False
         value = json.loads(completed.stdout)
         return (value, True) if isinstance(value, dict) else ({}, False)
-    except (BoundedProcessError, json.JSONDecodeError, TypeError):
+    except BoundedProcessError as exc:
+        if exc.code == "command_timeout":
+            _emit_phase_timeout(phase)
+        elif exc.code == "command_cleanup_bounded":
+            _emit_phase_timeout(f"{phase}_cleanup")
+        return {}, False
+    except (json.JSONDecodeError, TypeError):
         return {}, False
 
 
@@ -489,6 +529,11 @@ def _runtime_status_json(layout: RuntimeLayout) -> tuple[dict[str, Any], bool]:
     """Run the one bounded MCP status check outside a bus-isolated child."""
 
     value = runtime_status(layout=layout)
+    reason_code = value.get("mcp_surface", {}).get("reason_code")
+    if reason_code == "mcp_timeout":
+        _emit_phase_timeout("direct_mcp")
+    elif reason_code == "mcp_cleanup_timeout":
+        _emit_phase_timeout("direct_mcp_cleanup")
     return (value, value.get("ok") is True)
 
 
@@ -513,10 +558,18 @@ def run_probe(
     runtime, runtime_command = _runtime_status_json(active_layout)
     if runner is None:
         hive, hive_command = _run_json(
-            active_layout, active_layout.mcp_entrypoint, "hive", "status"
+            active_layout,
+            active_layout.mcp_entrypoint,
+            "hive",
+            "status",
+            phase="hive_status",
         )
         doctor, doctor_command = _run_json(
-            active_layout, active_layout.mcp_entrypoint, "hive", "doctor"
+            active_layout,
+            active_layout.mcp_entrypoint,
+            "hive",
+            "doctor",
+            phase="hive_doctor",
         )
     else:
         hive, hive_command = runner(active_layout.mcp_entrypoint, "hive", "status")
@@ -556,9 +609,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "DETERMINISTIC_PROBE_HOURS_UTC",
+    "HIVE_DIAGNOSTIC_TIMEOUT_SECONDS",
     "MAX_PROBE_AGE_SECONDS",
     "MAX_PROBE_STATE_BYTES",
     "PROBE_GATE_LOCK_NAME",
+    "RUNTIME_IMAGE_PROBE_PHASE_TIMEOUTS",
+    "RUNTIME_IMAGE_PROBE_TOTAL_TIMEOUT_SECONDS",
     "STATE_FILE_NAME",
     "evaluate",
     "main",

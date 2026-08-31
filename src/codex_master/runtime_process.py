@@ -31,7 +31,7 @@ _SYSTEMCTL = "/usr/bin/systemctl"
 _ENV = "/usr/bin/env"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _RUNTIME_DIRECTORY_ROOT = Path("/run/user")
-_CLEANUP_SECONDS = 0.5
+BOUNDED_PROCESS_CLEANUP_SECONDS = 0.5
 
 
 class BoundedProcessError(RuntimeError):
@@ -196,7 +196,9 @@ def _remaining(deadline: float) -> float:
 def _manager_runtime_limit(deadline: float) -> str:
     """Encode the absolute runner deadline plus its fixed cleanup bound."""
 
-    microseconds = int((deadline + _CLEANUP_SECONDS - time.monotonic()) * 1_000_000)
+    microseconds = int(
+        (deadline + BOUNDED_PROCESS_CLEANUP_SECONDS - time.monotonic()) * 1_000_000
+    )
     if microseconds <= 0:
         raise BoundedProcessError("command_timeout")
     return f"{microseconds}us"
@@ -761,7 +763,7 @@ def run_bounded(
         if selector is not None:
             selector.close()
         if process is not None:
-            cleanup_deadline = time.monotonic() + _CLEANUP_SECONDS
+            cleanup_deadline = time.monotonic() + BOUNDED_PROCESS_CLEANUP_SECONDS
             _close_process_descriptors(process)
             cleanup_error: BoundedProcessError | None = None
             try:
@@ -782,6 +784,7 @@ def run_bounded(
 __all__ = [
     "BoundedProcessError",
     "BoundedProcessResult",
+    "BOUNDED_PROCESS_CLEANUP_SECONDS",
     "DEFAULT_STDERR_LIMIT",
     "DEFAULT_STDOUT_LIMIT",
     "minimal_environment",

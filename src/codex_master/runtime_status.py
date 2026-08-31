@@ -20,7 +20,7 @@ from codex_master.runtime_process import (
 _MCP_SERVER_NAME = "codex-master-mcp"
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 _MAX_MCP_OUTPUT_BYTES = 256 * 1024
-_MCP_TIMEOUT_SECONDS = 10
+RUNTIME_STATUS_MCP_TIMEOUT_SECONDS = 10.0
 _REQUIRED_AUTONOMOUS_TOOL = "runtime_status"
 
 
@@ -51,7 +51,7 @@ def _run_direct_mcp(*, layout: RuntimeLayout, home: Path) -> tuple[int, str]:
             [str(layout.mcp_entrypoint)],
             cwd=layout.root,
             home=home,
-            timeout_seconds=_MCP_TIMEOUT_SECONDS,
+            timeout_seconds=RUNTIME_STATUS_MCP_TIMEOUT_SECONDS,
             stdout_limit=_MAX_MCP_OUTPUT_BYTES,
             stderr_limit=DEFAULT_STDERR_LIMIT,
             input_data=_probe_payload(),
@@ -59,7 +59,9 @@ def _run_direct_mcp(*, layout: RuntimeLayout, home: Path) -> tuple[int, str]:
         )
     except BoundedProcessError as exc:
         if exc.code == "command_timeout":
-            raise TimeoutError from exc
+            raise TimeoutError("mcp_timeout") from exc
+        if exc.code == "command_cleanup_bounded":
+            raise TimeoutError("mcp_cleanup_timeout") from exc
         raise RuntimeError from exc
     return result.returncode, result.stdout
 
@@ -205,8 +207,8 @@ def runtime_status(
         returncode, output = _run_direct_mcp(
             layout=active_layout, home=Path.home() if home is None else home
         )
-    except TimeoutError:
-        surface = _blocked_surface("mcp_timeout")
+    except TimeoutError as exc:
+        surface = _blocked_surface(str(exc) or "mcp_timeout")
     except RuntimeError:
         surface = _blocked_surface("mcp_unavailable")
     else:
@@ -219,4 +221,4 @@ def runtime_status(
     }
 
 
-__all__ = ["runtime_status"]
+__all__ = ["RUNTIME_STATUS_MCP_TIMEOUT_SECONDS", "runtime_status"]

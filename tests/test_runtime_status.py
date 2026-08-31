@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from conftest import seal_runtime_image
+from codex_master.runtime_process import BoundedProcessError
 
 
 pytestmark = pytest.mark.usefixtures("runtime_spawn_helper")
@@ -193,6 +194,32 @@ def test_runtime_status_rejects_mcp_start_and_incomplete_tools_surface(
         assert result["mcp_surface"]["ok"] is False
         assert result["mcp_surface"]["tools_list"] is False
         assert result["raw_output"] == "not_returned"
+
+
+def test_runtime_status_reports_a_bounded_direct_mcp_cleanup_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    modules = _runtime_modules()
+    assert modules is not None
+    layout_module, status_module = modules
+    layout = layout_module.RuntimeLayout.from_runtime_root(
+        materialize_runtime_image(tmp_path)
+    )
+
+    def cleanup_bounded(*_args: object, **_kwargs: object) -> object:
+        raise BoundedProcessError("command_cleanup_bounded")
+
+    monkeypatch.setattr(status_module, "run_bounded", cleanup_bounded)
+
+    result = status_module.runtime_status(layout=layout)
+
+    assert result["mcp_surface"] == {
+        "ok": False,
+        "initialize": False,
+        "tools_list": False,
+        "tool_count": 0,
+        "reason_code": "mcp_cleanup_timeout",
+    }
 
 
 def test_runtime_status_rejects_an_empty_direct_tool_list(tmp_path: Path) -> None:
