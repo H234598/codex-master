@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import runpy
 import errno
 import hashlib
@@ -24,10 +25,26 @@ from codex_master.hive.hourly_probe import (
     run_probe,
 )
 from codex_master.runtime_layout import RuntimeLayout
+from codex_master.runtime_process import BoundedProcessError, BoundedProcessResult
 
 
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
+
+
+def test_runtime_image_probe_time_contract_composes_each_bounded_phase() -> None:
+    """A complete image probe has a named total budget, never a 10-s wrapper."""
+
+    assert hourly_probe_module.RUNTIME_IMAGE_PROBE_PHASE_TIMEOUTS == (
+        ("direct_mcp", 10.0),
+        ("direct_mcp_cleanup", 0.5),
+        ("hive_status", 45.0),
+        ("hive_status_cleanup", 0.5),
+        ("hive_doctor", 45.0),
+        ("hive_doctor_cleanup", 0.5),
+        ("startup_and_publish", 5.0),
+    )
+    assert hourly_probe_module.RUNTIME_IMAGE_PROBE_TOTAL_TIMEOUT_SECONDS == 106.5
 
 
 def green_probe(checked_at: str) -> dict[str, object]:
@@ -336,16 +353,16 @@ def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics
 ) -> None:
     layout = runtime_layout(tmp_path)
     status_layouts: list[RuntimeLayout] = []
-    bounded_commands: list[tuple[str, ...]] = []
+    bounded_commands: list[tuple[tuple[str, ...], str]] = []
 
     def direct_status(*, layout: RuntimeLayout) -> dict[str, object]:
         status_layouts.append(layout)
         return green_runtime_status()
 
     def bounded(
-        _layout: RuntimeLayout, _command: Path, *arguments: str
+        _layout: RuntimeLayout, _command: Path, *arguments: str, phase: str
     ) -> tuple[dict[str, object], bool]:
-        bounded_commands.append(arguments)
+        bounded_commands.append((arguments, phase))
         if arguments == ("hive", "status"):
             return green_hive_runtime(), True
         assert arguments == ("hive", "doctor")
@@ -371,8 +388,75 @@ def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics
     )
 
     assert status_layouts == [layout]
-    assert bounded_commands == [("hive", "status"), ("hive", "doctor")]
+    assert bounded_commands == [
+        (("hive", "status"), "hive_status"),
+        (("hive", "doctor"), "hive_doctor"),
+    ]
     assert result["commands"]["runtime_status"] is True
+
+
+def test_run_probe_emits_the_named_direct_mcp_timeout_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    layout = runtime_layout(tmp_path)
+    monkeypatch.setattr(
+        hourly_probe_module,
+        "runtime_status",
+        lambda *, layout: {
+            **green_runtime_status(),
+            "ok": False,
+            "mcp_surface": {
+                **green_runtime_status()["mcp_surface"],
+                "ok": False,
+                "reason_code": "mcp_timeout",
+            },
+        },
+    )
+
+    result = run_probe(
+        layout=layout,
+        state_directory=tmp_path / "state",
+        now=lambda: NOW,
+        runner=lambda _command, *arguments: (
+            green_hive_runtime()
+            if arguments == ("hive", "status")
+            else {
+                "healthy": True,
+                "checks": {
+                    "authority": "ready",
+                    "repository": "ready",
+                    "state": "ready",
+                },
+            },
+            True,
+        ),
+    )
+
+    assert result["checks"]["runtime_layout"] is False
+    assert capsys.readouterr().err == (
+        "runtime_image_probe_phase_timeout phase=direct_mcp limit_seconds=10\n"
+    )
+
+
+def test_bounded_hive_diagnostic_names_the_timed_out_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    layout = runtime_layout(tmp_path)
+
+    def timed_out(*_args: object, **_kwargs: object) -> object:
+        raise BoundedProcessError("command_timeout")
+
+    monkeypatch.setattr(hourly_probe_module, "run_bounded", timed_out)
+
+    value, command = hourly_probe_module._run_json(
+        layout, layout.mcp_entrypoint, "hive", "doctor", phase="hive_doctor"
+    )
+
+    assert value == {}
+    assert command is False
+    assert capsys.readouterr().err == (
+        "runtime_image_probe_phase_timeout phase=hive_doctor limit_seconds=45\n"
+    )
 
 
 def test_hourly_probe_unit_runs_only_the_runtime_image_entrypoint() -> None:
@@ -459,6 +543,13 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
             .st_mode
         )
         == 0o644
+    )
+    installed_service = (
+        home / ".config" / "systemd" / "user" / "codex-master-hive-hourly-probe.service"
+    )
+    assert (
+        f"TimeoutStartSec={math.ceil(hourly_probe_module.RUNTIME_IMAGE_PROBE_TOTAL_TIMEOUT_SECONDS)}s"
+        in installed_service.read_text(encoding="utf-8")
     )
     installed_cli = runtime_root / "bin" / "codex-master-mcp"
     installed_source = (
@@ -559,6 +650,35 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     assert not list(runtime_root.rglob("__pycache__"))
 
 
+def test_stage_validation_uses_the_shared_hive_diagnostic_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
+    )
+    layout = runtime_layout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    observed_timeouts: list[float] = []
+
+    monkeypatch.setattr(
+        installer["hourly_probe"], "HIVE_DIAGNOSTIC_TIMEOUT_SECONDS", 7.25
+    )
+    installer["_validate_runtime_image_stage"].__globals__["runtime_status"] = (
+        lambda *, layout, home: {"ok": True}
+    )
+
+    def bounded(*_args: object, timeout_seconds: float, **_kwargs: object) -> object:
+        observed_timeouts.append(timeout_seconds)
+        return BoundedProcessResult(returncode=0, stdout="{}", stderr="")
+
+    installer["_validate_runtime_image_stage"].__globals__["run_bounded"] = bounded
+
+    installer["_validate_runtime_image_stage"](stage=layout.root, home=home)
+
+    assert observed_timeouts == [7.25, 7.25]
+
+
 def test_hourly_probe_from_a_complete_image_checks_runtime_status_without_recursion(
     tmp_path: Path, runtime_image
 ) -> None:
@@ -572,15 +692,22 @@ def test_hourly_probe_from_a_complete_image_checks_runtime_status_without_recurs
         "PATH": "/usr/bin:/bin",
     }
 
-    completed = subprocess.run(
-        [runtime_image.root / "bin" / "codex-master-hive-hourly-probe", "--json"],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=tmp_path,
-        env=environment,
-        timeout=10,
-    )
+    try:
+        completed = subprocess.run(
+            [runtime_image.root / "bin" / "codex-master-hive-hourly-probe", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            env=environment,
+            timeout=hourly_probe_module.RUNTIME_IMAGE_PROBE_TOTAL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        phase_limits = ", ".join(
+            f"{name}={seconds:g}s"
+            for name, seconds in hourly_probe_module.RUNTIME_IMAGE_PROBE_PHASE_TIMEOUTS
+        )
+        pytest.fail(f"runtime_image_probe_total_timeout ({phase_limits}): {exc}")
 
     assert completed.returncode in {0, 1}, completed.stderr
     assert json.loads(completed.stdout)["checks"]["runtime_layout"] is True

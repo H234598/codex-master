@@ -26,6 +26,7 @@ from codex_master.runtime_process import (  # noqa: E402
     BoundedProcessError,
     run_bounded,
 )
+from codex_master.hive import hourly_probe  # noqa: E402
 from codex_master.runtime_layout import RuntimeLayout  # noqa: E402
 from codex_master.runtime_status import runtime_status  # noqa: E402
 
@@ -337,7 +338,7 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
                 [os.fspath(command), "hive", hive_command],
                 cwd=stage,
                 home=home,
-                timeout_seconds=45,
+                timeout_seconds=hourly_probe.HIVE_DIAGNOSTIC_TIMEOUT_SECONDS,
                 stdout_limit=_MAX_STAGE_DIAGNOSTIC_BYTES,
                 stderr_limit=DEFAULT_STDERR_LIMIT,
                 runtime_layout=layout,
