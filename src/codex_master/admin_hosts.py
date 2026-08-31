@@ -657,10 +657,10 @@ class HostRegistry:
         with self._locked_state() as (
             registrations,
             ssh_bindings,
-            _agent_bindings,
-            _observations,
-            _document_generation,
-            _epoch_history,
+            agent_bindings,
+            observations,
+            document_generation,
+            epoch_history,
         ):
             registration = next((item for item in registrations if item["ref"] == ref), None)
             binding = ssh_bindings.get(ref)
@@ -677,7 +677,39 @@ class HostRegistry:
                 "source": "host-agent",
                 "binding_state": binding,
             }
-        return self.record_probe(ref, generation=generation, evidence=evidence)
+            record, preserved_binding = _validated_probe_record(
+                ref, generation, evidence, error_code="control.host_invalid"
+            )
+            record["probe_digest"] = _digest(
+                {
+                    "ref": ref,
+                    "generation": generation,
+                    "resource_evidence": resources,
+                    "observed_at": observed,
+                    "reachability": {"state": "reachable", "latency_ms": 0},
+                }
+            )
+            existing = next((item for item in observations if item["ref"] == ref), None)
+            if existing is not None:
+                current = _generation(existing["generation"], "control.host_store_unavailable")
+                if generation < current or (generation == current and record["probe_digest"] != existing["probe_digest"]):
+                    raise HostRegistryError("credential.generation_conflict")
+                if generation == current:
+                    return self._host(existing)
+                observations.remove(existing)
+            if document_generation == _MAX_GENERATION:
+                raise HostRegistryError("credential.generation_exhausted")
+            observations.append(record)
+            registrations[:] = [item for item in registrations if item["ref"] != ref]
+            registrations.append(_registration_from_probe(record))
+            ssh_bindings[ref] = preserved_binding
+            observations.sort(key=lambda item: str(item["ref"]))
+            registrations.sort(key=lambda item: str(item["ref"]))
+            self._write_locked(
+                registrations, ssh_bindings, agent_bindings, observations,
+                max(document_generation + 1, generation), epoch_history,
+            )
+            return self._host(record)
 
     @contextlib.contextmanager
     def _locked_state(self) -> Any:
@@ -850,8 +882,18 @@ class HostRegistry:
                 evidence,
                 error_code="control.host_store_unavailable",
             )
-            if item["probe_digest"] != record["probe_digest"]:
+            active_digest = _digest(
+                {
+                    "ref": ref,
+                    "generation": item["generation"],
+                    "resource_evidence": item["resource_evidence"],
+                    "observed_at": item["observed_at"],
+                    "reachability": item["reachability"],
+                }
+            )
+            if item["probe_digest"] not in {record["probe_digest"], active_digest}:
                 raise HostRegistryError("control.host_store_unavailable")
+            record["probe_digest"] = item["probe_digest"]
             observations.append(record)
             bindings[ref] = normalized_binding
             observed_refs.add(ref)

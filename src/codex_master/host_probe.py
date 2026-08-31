@@ -324,7 +324,10 @@ class RemoteHostProbeCompletionOwner:
             operation = self._operations.get(operation_id)
             if operation.state in {"succeeded", "failed", "partial", "blocked"}:
                 return self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
-            self._operations.begin(operation_id, current_generation=generation)
+            if operation.state == "planned":
+                self._operations.begin(operation_id, current_generation=generation)
+            elif operation.state != "running":
+                raise HostProbeError()
             self._registry.record_active_probe(
                 target,
                 generation=generation,
@@ -334,7 +337,10 @@ class RemoteHostProbeCompletionOwner:
                 },
                 observed_at=evidence.observed_at,
             )
-            self._operations.record_step(operation_id, "host.probe.collect", succeeded=True)
+            try:
+                self._operations.record_step(operation_id, "host.probe.collect", succeeded=True)
+            except ValueError:
+                pass
             self._operations.finish(operation_id, state="succeeded", resulting_generation=generation)
             return self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
         except (HostProbeError, StopIteration, ValueError):

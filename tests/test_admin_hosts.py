@@ -553,6 +553,23 @@ def test_stale_host_probe_does_not_replace_newer_generation(tmp_path: Path) -> N
     assert registry.get("worker-one") == newer
 
 
+def test_active_probe_digest_depends_only_on_fresh_observation(tmp_path: Path) -> None:
+    registry = registry_at(tmp_path)
+    registry.record_probe("worker-one", generation=1, evidence=valid_evidence())
+
+    first = registry.record_active_probe(
+        "worker-one", generation=2,
+        resource_evidence={"cpu_threads": 8, "memory_bytes": 16_000_000_000},
+        observed_at="2026-08-30T12:00:00Z",
+    )
+    second = registry.record_active_probe(
+        "worker-one", generation=2,
+        resource_evidence={"cpu_threads": 8, "memory_bytes": 16_000_000_000},
+        observed_at="2026-08-30T12:00:00Z",
+    )
+
+    assert first == second
+
 def test_equal_generation_is_idempotent_only_for_identical_bound_evidence(
     tmp_path: Path,
 ) -> None:

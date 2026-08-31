@@ -19,6 +19,30 @@ def test_host_probe_ui_refreshes_only_after_terminal_result() -> None:
     assert control_center.host_probe_ui_state({"state": "unknown"}).state == "UNKNOWN"
 
 
+def test_window_host_probe_polls_before_refreshing_host_card() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    class Controller:
+        def submit(self, name, args, callback):
+            calls.append((name, args))
+            callback({"id": "op-one", "state": "planned"} if name == "fleet_host_probe" else {"state": "succeeded"})
+            return True
+
+    class Label:
+        def set_text(self, _text):
+            pass
+
+    window = object.__new__(control_center.ControlCenterWindow)
+    window.controller = Controller()
+    window.status_label = Label()
+    refreshed: list[bool] = []
+    window.refresh = lambda: refreshed.append(True)
+
+    assert window.probe_host("worker-one", 4) is True
+    assert [name for name, _args in calls] == ["fleet_host_probe", "fleet_operation_status"]
+    assert refreshed == [True]
+
+
 class ControlCenterViewModelTest(unittest.TestCase):
     @staticmethod
     def _ollama_payloads() -> tuple[dict, dict]:

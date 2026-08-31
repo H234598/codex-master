@@ -14,6 +14,12 @@ from codex_master.admin_socket import AdminSocketServer
 from test_admin_service import service_at
 
 
+def test_host_probe_cli_and_mcp_publish_the_exact_contract() -> None:
+    assert server._MASTERJET_ADMIN_CLI_COMMANDS[("host", "probe")] == ("hosts.probe", None)
+    spec = next(item for item in server._MASTERJET_ADMIN_TOOL_SPECS if item[0] == "fleet_host_probe")
+    assert spec[1] == "hosts.probe"
+
+
 @contextmanager
 def _admin_socket(tmp_path: Path) -> Iterator[tuple[Path, Path, object]]:
     credential_directory = tmp_path / "credentials"

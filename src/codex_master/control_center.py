@@ -904,6 +904,28 @@ class ControlCenterWindow:
     def page_names(self) -> set[str]:
         return set(self._page_names)
 
+    def probe_host(self, host_ref: str, generation: int) -> bool:
+        """Start a host probe and refresh the host card only after terminal status."""
+        if not isinstance(host_ref, str) or not _non_negative_int(generation):
+            return False
+        arguments = {
+            "host_ref": host_ref,
+            "expected_generation": generation,
+            "idempotency_key": "gui-probe-" + secrets.token_hex(16),
+        }
+        return self.controller.submit("fleet_host_probe", arguments, self._host_probe_started)
+
+    def _host_probe_started(self, result: dict[str, Any]) -> None:
+        state = host_probe_ui_state(result)
+        self.status_label.set_text(f"Host-Probe: {state.state}")
+        operation_id = result.get("id")
+        if state.refresh_host_card:
+            self.refresh()
+        elif isinstance(operation_id, str):
+            self.controller.submit(
+                "fleet_operation_status", {"operation_id": operation_id}, self._host_probe_started
+            )
+
     def ollama_apply_sensitive(self) -> bool:
         return bool(self._ollama_apply_enabled)
 

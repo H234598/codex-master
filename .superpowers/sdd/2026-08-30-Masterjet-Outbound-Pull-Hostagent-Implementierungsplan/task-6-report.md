@@ -154,3 +154,23 @@ of the same agent receipt after a completed admin operation only terminalizes
 the agent operation and does not write the registry again. The daemon assembly
 accepts a test state root and catches `AdminOperationError` at its stable
 startup boundary.
+
+## Fix round 3/5
+
+The active-probe registry path is now one lock-held transaction. It derives its
+active observation digest from ref, generation, fresh resources, reachability
+and observed time only; registration/binding metadata stays internal to the
+registry owner. Identical generation retries return the existing observation.
+
+Completion accepts planned or already-running admin work, allowing recovery
+after a successful registry write followed by an interrupted admin step or
+finish. A terminal admin retry only completes the pending agent receipt and
+does not write the registry again. The host page now starts `fleet_host_probe`,
+polls `fleet_operation_status`, renders the probe state and refreshes only once
+the operation is terminal. The daemon startup boundary additionally handles
+`AgentOperationError`.
+
+```text
+PYTHONPATH=src pytest -q tests/test_host_probe.py tests/test_admin_hosts.py tests/test_agent_operations.py tests/test_agent_http.py tests/test_agent_daemon.py tests/test_admin_contracts.py tests/test_admin_http.py tests/test_admin_service.py tests/test_admin_cli_mcp_integration.py tests/test_control_catalog.py tests/test_control_center.py -k 'host or probe or assemble_server or startup'
+154 passed, 354 deselected in 4.28s
+```

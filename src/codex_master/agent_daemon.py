@@ -27,7 +27,7 @@ from .agent_http import (
     MAX_AGENT_HEADER_BYTES,
 )
 from .agent_identity import AgentIdentityResolver
-from .agent_operations import AgentOperationStore
+from .agent_operations import AgentOperationError, AgentOperationStore
 from .admin_operations import AdminOperationStore
 from .admin_operations import AdminOperationError
 from .host_probe import RemoteHostProbeCompletionOwner
@@ -363,7 +363,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with open_systemd_credentials(os.environ) as credentials:
             run_server(assemble_server(arguments.listen_address, arguments.port, credentials))
-    except (AdminOperationError, OSError, RuntimeError, HostRegistryError):
+    except (
+        AdminOperationError,
+        AgentOperationError,
+        OSError,
+        RuntimeError,
+        HostRegistryError,
+    ):
         print("codex-master-agent-api: agent.startup_failed", file=sys.stderr)
         return os.EX_UNAVAILABLE
     return 0

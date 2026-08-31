@@ -81,6 +81,14 @@ def test_host_bound_internal_idempotency_never_aliases_hosts() -> None:
     assert _operation_key("worker-one", "client-key") != _operation_key("worker-two", "client-key")
 
 
+def test_probe_evidence_digest_is_stable_for_completion_retry() -> None:
+    evidence = LocalHostProbeCollector(
+        lambda: datetime(2026, 8, 30, tzinfo=UTC)
+    ).collect(Kernel())
+
+    assert HostProbeEvidenceV1.from_public(evidence.public()).public() == evidence.public()
+
+
 @pytest.mark.parametrize(
     "observed_at",
     ("not-a-utc-timestamp!", "2026-08-30T12:00:00+00:00", "2026-02-30T12:00:00Z"),
