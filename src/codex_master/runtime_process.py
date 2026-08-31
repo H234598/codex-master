@@ -32,6 +32,7 @@ _ENV = "/usr/bin/env"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _RUNTIME_DIRECTORY_ROOT = Path("/run/user")
 _CLEANUP_SECONDS = 0.5
+_STOP_SECONDS = 0.2
 
 
 class BoundedProcessError(RuntimeError):
@@ -64,6 +65,7 @@ class _SpawnedProcess:
     stderr_fd: int
     cgroup: Path | None = None
     returncode: int | None = None
+    cgroup_released: bool = False
 
 
 def _runtime_directory() -> Path:
@@ -228,13 +230,20 @@ def _systemd_run_arguments(
     environment: dict[str, str],
     unit: str,
 ) -> tuple[str, ...]:
-    clean_environment = tuple(f"{name}={value}" for name, value in environment.items())
+    runtime_directory = environment["XDG_RUNTIME_DIR"]
+    clean_environment = tuple(
+        f"{name}={value}"
+        for name, value in environment.items()
+        if name != "XDG_RUNTIME_DIR"
+    )
     return (
         _SYSTEMD_RUN,
         "--user",
         f"--unit={unit}",
         "--property=Delegate=no",
         "--property=KillMode=control-group",
+        "--property=InaccessiblePaths="
+        f"{runtime_directory}/bus {runtime_directory}/systemd/private",
         "--pipe",
         "--wait",
         "--collect",
@@ -385,14 +394,57 @@ def _wait_for_cgroup_empty(cgroup: Path, deadline: float) -> bool:
     return _cgroup_is_empty(cgroup)
 
 
+def _kill_bound_cgroup(cgroup: Path) -> None:
+    """Kill only every member of the cgroup bound from this random unit."""
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            cgroup / "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        if os.write(descriptor, b"1") != 1:
+            raise BoundedProcessError("command_group_unavailable")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    finally:
+        descriptor = _close_descriptor(descriptor)
+
+
+def _wait_for_unit_resolved(
+    process: _SpawnedProcess, *, environment: dict[str, str], deadline: float
+) -> None:
+    while True:
+        output = _systemctl(
+            ("show", "--value", "--property=LoadState", process.unit),
+            environment=environment,
+            deadline=deadline,
+        )
+        if output.strip() == b"not-found":
+            return
+        time.sleep(min(0.005, _remaining(deadline)))
+
+
 def _stop_cgroup(
     process: _SpawnedProcess, *, environment: dict[str, str], deadline: float
 ) -> None:
-    with contextlib.suppress(BoundedProcessError):
-        _systemctl(("stop", process.unit), environment=environment, deadline=deadline)
+    stop_error: BoundedProcessError | None = None
+    try:
+        _systemctl(
+            ("stop", process.unit),
+            environment=environment,
+            deadline=min(deadline, time.monotonic() + _STOP_SECONDS),
+        )
+    except BoundedProcessError as exc:
+        stop_error = exc
     if process.cgroup is not None:
-        with contextlib.suppress(BoundedProcessError):
-            _wait_for_cgroup_empty(process.cgroup, deadline)
+        _kill_bound_cgroup(process.cgroup)
+        if not _wait_for_cgroup_empty(process.cgroup, deadline):
+            raise BoundedProcessError("command_timeout")
+        _wait_for_unit_resolved(process, environment=environment, deadline=deadline)
+    if stop_error is not None:
+        raise stop_error
 
 
 def _returncode(waited: object) -> int:
@@ -566,6 +618,8 @@ def run_bounded(
             process.cgroup, deadline
         ):
             raise BoundedProcessError("command_timeout")
+        _wait_for_unit_resolved(process, environment=environment, deadline=deadline)
+        process.cgroup_released = True
         try:
             stdout = outputs["stdout"].decode("utf-8")
             stderr = outputs["stderr"].decode("utf-8")
@@ -582,9 +636,19 @@ def run_bounded(
         if process is not None:
             cleanup_deadline = time.monotonic() + _CLEANUP_SECONDS
             _close_process_descriptors(process)
-            _stop_cgroup(process, environment=environment, deadline=cleanup_deadline)
-            _reap_process(process, cleanup_deadline)
-            process.pidfd = _close_descriptor(process.pidfd)
+            cleanup_error: BoundedProcessError | None = None
+            try:
+                if not process.cgroup_released:
+                    _stop_cgroup(
+                        process, environment=environment, deadline=cleanup_deadline
+                    )
+            except BoundedProcessError as exc:
+                cleanup_error = exc
+            finally:
+                _reap_process(process, cleanup_deadline)
+                process.pidfd = _close_descriptor(process.pidfd)
+            if cleanup_error is not None:
+                raise cleanup_error
 
 
 __all__ = [

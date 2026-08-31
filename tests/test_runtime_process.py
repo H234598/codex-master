@@ -5,6 +5,8 @@ import errno
 import json
 import os
 from pathlib import Path
+import secrets
+import selectors
 import signal
 import time
 from types import SimpleNamespace
@@ -19,6 +21,248 @@ def _script(path: Path, body: str) -> Path:
     path.write_text("#!/usr/bin/python3\n" + body, encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def _test_unit_cgroup(
+    runtime_process: object,
+    unit: str,
+    *,
+    environment: dict[str, str],
+    deadline: float,
+) -> Path | None:
+    try:
+        output = runtime_process._systemctl(
+            ("show", "--value", "--property=ControlGroup", unit),
+            environment=environment,
+            deadline=deadline,
+        )
+    except runtime_process.BoundedProcessError:
+        return None
+    return runtime_process._cgroup_path(output) if output.strip() else None
+
+
+def _cleanup_exact_test_unit(
+    runtime_process: object,
+    unit: str,
+    *,
+    environment: dict[str, str],
+    systemctl: object,
+) -> None:
+    """Bounded test-only cleanup for the one random unit this test created."""
+
+    deadline = time.monotonic() + 1
+    cgroup = _test_unit_cgroup(
+        runtime_process, unit, environment=environment, deadline=deadline
+    )
+    with contextlib.suppress(runtime_process.BoundedProcessError):
+        systemctl(("stop", unit), environment=environment, deadline=deadline)
+    if cgroup is not None:
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                cgroup / "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            )
+            assert os.write(descriptor, b"1") == 1
+        except FileNotFoundError:
+            pass
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    with contextlib.suppress(runtime_process.BoundedProcessError):
+        systemctl(("reset-failed", unit), environment=environment, deadline=deadline)
+
+
+def _read_fifo_event(path: Path, *, deadline: float) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(descriptor, selectors.EVENT_READ)
+            while time.monotonic() < deadline:
+                ready = selector.select(deadline - time.monotonic())
+                if not ready:
+                    break
+                event = os.read(descriptor, 5)
+                if event:
+                    return event
+    finally:
+        os.close(descriptor)
+    pytest.fail("runtime test child did not emit its readiness event")
+
+
+def test_bounded_runner_denies_a_user_manager_escape_from_the_runtime_unit(
+    tmp_path: Path,
+) -> None:
+    """A target cannot create a second same-UID user unit outside its cgroup."""
+
+    import codex_master.runtime_process as runtime_process
+
+    from codex_master.runtime_process import run_bounded
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    unit = f"codex-master-runtime-escape-{secrets.token_hex(16)}.service"
+    ready = tmp_path / "escape.ready"
+    hold = tmp_path / "escape.hold"
+    escaped_pid = tmp_path / "escape.pid"
+    os.mkfifo(ready, 0o600)
+    os.mkfifo(hold, 0o600)
+    inner = (
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path({str(escaped_pid)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+        f"ready = os.open({str(ready)!r}, os.O_WRONLY)\n"
+        "os.write(ready, b'ready')\n"
+        "os.close(ready)\n"
+        f"os.read(os.open({str(hold)!r}, os.O_RDONLY), 1)\n"
+    )
+    parent = _script(
+        tmp_path / "user-manager-escape.py",
+        "import os, selectors, subprocess, sys, time\n"
+        f"ready = {str(ready)!r}\n"
+        "manager = f'/run/user/{os.geteuid()}'\n"
+        "environment = {**os.environ, 'XDG_RUNTIME_DIR': manager, "
+        "'DBUS_SESSION_BUS_ADDRESS': f'unix:path={manager}/bus'}\n"
+        "completed = subprocess.run(\n"
+        "    ['/usr/bin/systemd-run', '--user', '--no-block', '--collect', "
+        f"'--unit={unit}', '/usr/bin/python3', '-c', {inner!r}],\n"
+        "    check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, env=environment,\n"
+        ")\n"
+        "if completed.returncode:\n"
+        "    print('blocked')\n"
+        "else:\n"
+        "    descriptor = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)\n"
+        "    try:\n"
+        "        with selectors.DefaultSelector() as selector:\n"
+        "            selector.register(descriptor, selectors.EVENT_READ)\n"
+        "            deadline = time.monotonic() + 0.5\n"
+        "            escaped = False\n"
+        "            while time.monotonic() < deadline:\n"
+        "                if not selector.select(deadline - time.monotonic()):\n"
+        "                    break\n"
+        "                if os.read(descriptor, 5) == b'ready':\n"
+        "                    escaped = True\n"
+        "                    break\n"
+        "    finally:\n"
+        "        os.close(descriptor)\n"
+        "    print('escaped' if escaped else 'blocked')\n",
+    )
+    environment = runtime_process.minimal_environment(home=home)
+    real_systemctl = runtime_process._systemctl
+
+    try:
+        result = run_bounded([str(parent)], cwd=tmp_path, home=home, timeout_seconds=2)
+
+        assert result.returncode == 0
+        assert result.stdout == "blocked\n"
+        assert not escaped_pid.exists()
+        assert (
+            real_systemctl(
+                ("show", "--value", "--property=LoadState", unit),
+                environment=environment,
+                deadline=time.monotonic() + 1,
+            ).strip()
+            == b"not-found"
+        )
+    finally:
+        _cleanup_exact_test_unit(
+            runtime_process,
+            unit,
+            environment=environment,
+            systemctl=real_systemctl,
+        )
+
+
+def test_bounded_runner_terminates_its_bound_cgroup_when_systemctl_stop_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop error cannot let a known live target child survive runner return."""
+
+    import codex_master.runtime_process as runtime_process
+
+    from codex_master.runtime_process import BoundedProcessError, run_bounded
+
+    ready = tmp_path / "stop-failure.ready"
+    hold = tmp_path / "stop-failure.hold"
+    child_pid = tmp_path / "stop-failure.pid"
+    child_cgroup = tmp_path / "stop-failure.cgroup"
+    os.mkfifo(ready, 0o600)
+    os.mkfifo(hold, 0o600)
+    child = _script(
+        tmp_path / "stop-failure-child.py",
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path({str(child_pid)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+        "cgroup = next(\n"
+        "    line.split('::', 1)[1].strip()\n"
+        "    for line in open('/proc/self/cgroup', encoding='utf-8')\n"
+        "    if line.startswith('0::')\n"
+        ")\n"
+        f"Path({str(child_cgroup)!r}).write_text(cgroup, encoding='utf-8')\n"
+        f"ready = os.open({str(ready)!r}, os.O_WRONLY)\n"
+        "os.write(ready, b'ready')\n"
+        "os.close(ready)\n"
+        f"os.read(os.open({str(hold)!r}, os.O_RDONLY), 1)\n",
+    )
+    environment = runtime_process.minimal_environment(home=tmp_path)
+    real_bind = runtime_process._bind_cgroup
+    real_systemctl = runtime_process._systemctl
+    unit = f"codex-master-runtime-stop-failure-{secrets.token_hex(16)}.service"
+    bound: dict[str, object] = {}
+
+    def bind_then_wait(
+        process: object, *, environment: dict[str, str], deadline: float
+    ) -> None:
+        real_bind(process, environment=environment, deadline=deadline)
+        bound["unit"] = process.unit
+        bound["cgroup"] = process.cgroup
+        assert _read_fifo_event(ready, deadline=deadline) == b"ready"
+
+    def fail_only_the_bound_unit_stop(
+        arguments: tuple[str, ...],
+        *,
+        environment: dict[str, str],
+        deadline: float,
+    ) -> bytes:
+        if arguments == ("stop", bound.get("unit")):
+            assert child_pid.exists()
+            os.kill(int(child_pid.read_text(encoding="utf-8")), 0)
+            raise BoundedProcessError("command_group_unavailable")
+        return real_systemctl(arguments, environment=environment, deadline=deadline)
+
+    monkeypatch.setattr(runtime_process, "_bind_cgroup", bind_then_wait)
+    monkeypatch.setattr(runtime_process, "_systemctl", fail_only_the_bound_unit_stop)
+    monkeypatch.setattr(runtime_process, "_unit_name", lambda: unit)
+
+    try:
+        with pytest.raises(BoundedProcessError, match="command_group_unavailable"):
+            run_bounded([str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=0.5)
+
+        assert bound["cgroup"] is not None
+        cgroup = Path(bound["cgroup"])
+        assert cgroup == Path("/sys/fs/cgroup") / child_cgroup.read_text(
+            encoding="utf-8"
+        ).strip().lstrip("/")
+        assert not cgroup.exists()
+        assert (
+            real_systemctl(
+                ("show", "--value", "--property=LoadState", unit),
+                environment=environment,
+                deadline=time.monotonic() + 1,
+            ).strip()
+            == b"not-found"
+        )
+        process_id = int(child_pid.read_text(encoding="utf-8"))
+        with pytest.raises(OSError) as error:
+            os.kill(process_id, 0)
+        assert error.value.errno == errno.ESRCH
+    finally:
+        _cleanup_exact_test_unit(
+            runtime_process,
+            unit,
+            environment=environment,
+            systemctl=real_systemctl,
+        )
 
 
 def test_runtime_spawn_helper_has_a_compiled_glibc_header_contract() -> None:
