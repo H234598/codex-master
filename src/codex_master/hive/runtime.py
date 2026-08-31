@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 import hmac
 import os
 from pathlib import Path
@@ -32,6 +32,11 @@ from codex_master.hive.events import HiveEventError, HiveEventStore
 from codex_master.hive.principals import Principal, PrincipalRegistry
 from codex_master.hive.repositories import RepositoryBinding, RepositoryRegistry
 from codex_master.hive.state import HiveStateError, HiveStateStore
+from codex_master.usage_snapshot import (
+    AccountUsageEvidenceV2,
+    UsageEvidenceV2,
+    read_usage_evidence_v2,
+)
 
 
 class HiveRuntimeError(ValueError):
@@ -44,6 +49,7 @@ _PILOT_REPOSITORY = "codex-master"
 _PILOT_QUEEN = "queen-codex-master"
 _PILOT_REMOTE = "https://github.com/H234598/codex-master.git"
 _PILOT_FEATURE_FLAGS = frozenset({"sp0_passive", "sp1_deadline", "sp2_secondary_model", "sp3_fairness"})
+_POOL_EVIDENCE_TTL = timedelta(seconds=900)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,12 +145,77 @@ def _bounded_reason(code: str) -> str:
     return code if re.fullmatch(r"[a-z][a-z0-9_-]{0,95}", code) else "hive_runtime_unavailable"
 
 
+def _pool_evidence_now(clock: Callable[[], datetime] | None) -> datetime | None:
+    try:
+        value = (clock or (lambda: datetime.now(UTC)))()
+    except Exception:
+        return None
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta():
+        return None
+    return value.astimezone(UTC)
+
+
+def _attested_pool_is_ready(evidence: object, *, now: datetime) -> bool:
+    """Trust only the existing V2 reader's verified source/producer/generation chain."""
+
+    if (
+        type(evidence) is not UsageEvidenceV2
+        or evidence.status != "complete"
+        or not isinstance(evidence.captured_at, datetime)
+        or not isinstance(evidence.generated_at, datetime)
+        or evidence.captured_at.tzinfo is None
+        or evidence.generated_at.tzinfo is None
+    ):
+        return False
+    captured_at = evidence.captured_at.astimezone(UTC)
+    generated_at = evidence.generated_at.astimezone(UTC)
+    if (
+        captured_at > generated_at
+        or generated_at > now
+        or now - captured_at > _POOL_EVIDENCE_TTL
+    ):
+        return False
+    for account in evidence.accounts:
+        if type(account) is not AccountUsageEvidenceV2:
+            return False
+        trends = {
+            (item.pool, item.window_seconds, item.reset_generation): item
+            for item in account.trends
+        }
+        trackers = {
+            (item.pool, item.window_seconds, item.reset_generation): item
+            for item in account.tracker_evidence
+        }
+        for limit in account.limits:
+            key = (limit.pool, limit.window_seconds, limit.reset_generation)
+            trend = trends.get(key)
+            tracker = trackers.get(key)
+            if (
+                limit.pool == "main"
+                and limit.remaining_percent > 0
+                and limit.reset_at > now
+                and trend is not None
+                and trend.coverage == "complete"
+                and trend.last_sample_at <= now
+                and now - trend.last_sample_at <= _POOL_EVIDENCE_TTL
+                and trend.projected_exhaustion_at > now
+                and tracker is not None
+                and tracker.coverage == "complete"
+                and tracker.last_sample_at <= now
+                and now - tracker.last_sample_at <= _POOL_EVIDENCE_TTL
+            ):
+                return True
+    return False
+
+
 def enforced_pilot_gate(
     config: HiveConfig,
     classes: Mapping[str, AgentClassProfile],
-    dynamic_account_evidence: Mapping[str, object] | None = None,
+    supplied_pool_attestation: object | None = None,
+    *,
+    now: Callable[[], datetime] | None = None,
 ) -> dict[str, object]:
-    """Evaluate the closed pilot allowlist without accepting an account name."""
+    """Evaluate the closed pilot allowlist using only the canonical V2 pool reader."""
 
     if not isinstance(config, HiveConfig) or not isinstance(classes, Mapping):
         return {"allowed": False, "reason_code": "pilot_config_invalid", "raw_output": "not_returned"}
@@ -189,14 +260,17 @@ def enforced_pilot_gate(
     structural_ok = repository_ok and principals_ok and flags_ok and queen_ok
     if not structural_ok:
         return {"allowed": False, "reason_code": "pilot_config_invalid", "raw_output": "not_returned"}
-    if not isinstance(dynamic_account_evidence, Mapping):
+    if supplied_pool_attestation is not None:
+        return {"allowed": False, "reason_code": "pilot_account_attestation_invalid", "raw_output": "not_returned"}
+    observed_now = _pool_evidence_now(now)
+    if observed_now is None:
         return {"allowed": False, "reason_code": "pilot_account_attestation_missing", "raw_output": "not_returned"}
-    account_ok = (
-        dynamic_account_evidence.get("fresh") is True
-        and dynamic_account_evidence.get("model_family") == "sol"
-        and dynamic_account_evidence.get("reasoning") == "max"
-        and dynamic_account_evidence.get("long_lived") is True
-    )
+    try:
+        account_ok = _attested_pool_is_ready(
+            read_usage_evidence_v2(clock=lambda: observed_now), now=observed_now
+        )
+    except Exception:
+        account_ok = False
     return {
         "allowed": account_ok,
         "reason_code": "pilot_ready" if account_ok else "pilot_account_attestation_invalid",
@@ -238,7 +312,7 @@ def read_hive_runtime_evidence(
     config_path: Path | None = None,
     state_root: Path | None = None,
     repository_roots: Mapping[str, Path] | None = None,
-    dynamic_account_evidence: Mapping[str, object] | None = None,
+    dynamic_account_evidence: object | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> HiveRuntimeEvidence:
     """Read one canonical Hive projection without creating or repairing state."""
@@ -336,7 +410,12 @@ def read_hive_runtime_evidence(
         repository_count = len(config.repositories)
         principal_count = len(config.principals) if state_kind == "ready" and config.principals else 0
     reasons = list(dict.fromkeys(reasons))
-    pilot = enforced_pilot_gate(config, snapshot.classes, dynamic_account_evidence)
+    pilot = enforced_pilot_gate(
+        config,
+        snapshot.classes,
+        dynamic_account_evidence,
+        now=now,
+    )
     authority = (
         "ready"
         if runtime is not None and config.mode == "enforced" and pilot["allowed"] is True

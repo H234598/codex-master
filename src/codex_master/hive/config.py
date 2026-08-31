@@ -139,6 +139,14 @@ def load_agent_class_catalog(path: Path) -> Mapping[str, AgentClassProfile]:
 
 def load_agent_class_catalog_snapshot(path: Path) -> AgentClassCatalogSnapshot:
     raw = _read_catalog_bytes(path)
+    return load_agent_class_catalog_snapshot_bytes(raw)
+
+
+def load_agent_class_catalog_snapshot_bytes(raw: bytes) -> AgentClassCatalogSnapshot:
+    """Build one immutable catalog snapshot from already-attested bytes."""
+
+    if type(raw) is not bytes:
+        raise HiveConfigError("class_catalog_unavailable")
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     payload = _decode_catalog_mapping(raw)
     return AgentClassCatalogSnapshot(
@@ -207,6 +215,30 @@ def load_hive_config(path: Path, classes: Mapping[str, AgentClassProfile]) -> Hi
     if not isinstance(classes, Mapping) or any(not isinstance(value, AgentClassProfile) for value in classes.values()):
         raise HiveConfigError("invalid_class_catalog")
     payload = _load(path, "hive_config")
+    return load_hive_config_payload(payload, classes)
+
+
+def load_hive_config_bytes(raw: bytes, classes: Mapping[str, AgentClassProfile]) -> HiveConfig:
+    """Parse a Hive config from bytes already read through a trusted FD."""
+
+    if type(raw) is not bytes:
+        raise HiveConfigError("hive_config_unavailable")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise HiveConfigError("hive_config_unavailable") from None
+    if not isinstance(payload, Mapping):
+        raise HiveConfigError("invalid_hive_config")
+    return load_hive_config_payload(payload, classes)
+
+
+def load_hive_config_payload(
+    payload: Mapping[str, object], classes: Mapping[str, AgentClassProfile]
+) -> HiveConfig:
+    """Validate one decoded public config without rereading its source."""
+
+    if not isinstance(classes, Mapping) or any(not isinstance(value, AgentClassProfile) for value in classes.values()):
+        raise HiveConfigError("invalid_class_catalog")
     allowed = {"schema_version", "mode", "repositories", "principals", "feature_flags"}
     if set(payload) != allowed or payload.get("schema_version") != 1 or not isinstance(payload.get("repositories"), list) or not isinstance(payload.get("principals"), list) or not isinstance(payload.get("feature_flags"), Mapping):
         raise HiveConfigError("invalid_hive_config")
@@ -261,5 +293,8 @@ __all__ = [
     "HiveConfigError",
     "load_agent_class_catalog",
     "load_agent_class_catalog_snapshot",
+    "load_agent_class_catalog_snapshot_bytes",
     "load_hive_config",
+    "load_hive_config_bytes",
+    "load_hive_config_payload",
 ]

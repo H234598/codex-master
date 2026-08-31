@@ -1,5 +1,5 @@
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 import traceback
@@ -18,6 +18,14 @@ from codex_master.hive.runtime import (
 )
 from codex_master.hive.repositories import RepositoryRegistry
 from codex_master.server import AgentError, build_server_admission_runtime
+from codex_master.usage_snapshot import (
+    AccountUsageEvidenceV2,
+    TrackerEvidenceV2,
+    UsageEvidenceV2,
+    UsageLimitV2,
+    UsageTrendV2,
+)
+import codex_master.hive.runtime as hive_runtime
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,9 +35,27 @@ NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo-one"
     root.mkdir()
-    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
         ["git", "-C", str(root), "config", "remote.origin.url", "https://github.com/example/repo.git"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Hive Test",
+            "-c",
+            "user.email=hive-test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-q",
+            "-m",
+            "initial main",
+        ],
         check=True,
     )
     return root
@@ -358,7 +384,35 @@ def test_runtime_evidence_does_not_treat_unlocked_state_directory_as_ready(tmp_p
     assert evidence.mutation_performed is False
 
 
-def test_enforced_pilot_gate_requires_closed_config_and_fresh_dynamic_sol_max_attestation() -> None:
+def _attested_usage_evidence(*, now: datetime, status: str = "complete") -> UsageEvidenceV2:
+    generation = "attested-generation"
+    return UsageEvidenceV2(
+        accounts=(
+            AccountUsageEvidenceV2(
+                "attested-pool",
+                (UsageLimitV2("main", 18000, generation, 0.0, 100.0, now + timedelta(hours=1)),),
+                (
+                    UsageTrendV2(
+                        "main",
+                        18000,
+                        generation,
+                        "complete",
+                        now,
+                        now + timedelta(hours=1),
+                    ),
+                ),
+                (TrackerEvidenceV2("main", 18000, generation, "complete", now),),
+            ),
+        ),
+        status=status,  # type: ignore[arg-type]
+        captured_at=now,
+        generated_at=now,
+    )
+
+
+def test_enforced_pilot_gate_requires_an_attested_pool_reader_not_a_dynamic_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     classes, source_config = config_bundle()
     classes = {
         **classes,
@@ -388,11 +442,32 @@ def test_enforced_pilot_gate_requires_closed_config_and_fresh_dynamic_sol_max_at
         ),
     )
 
-    assert enforced_pilot_gate(config, classes)["reason_code"] == "pilot_account_attestation_missing"
-    assert enforced_pilot_gate(config, classes, {"fresh": True, "model_family": "sol", "reasoning": "xhigh", "long_lived": True})["reason_code"] == "pilot_account_attestation_invalid"
-    ready = enforced_pilot_gate(
-        config,
-        classes,
-        {"fresh": True, "model_family": "sol", "reasoning": "max", "long_lived": True, "account_id": "secret"},
+    monkeypatch.setattr(
+        hive_runtime,
+        "read_usage_evidence_v2",
+        lambda *, clock: _attested_usage_evidence(now=NOW),
     )
+
+    assert enforced_pilot_gate(config, classes, {"fresh": True, "model_family": "sol", "reasoning": "max", "long_lived": True}) == {
+        "allowed": False,
+        "reason_code": "pilot_account_attestation_invalid",
+        "raw_output": "not_returned",
+    }
+    ready = enforced_pilot_gate(config, classes, now=lambda: NOW)
     assert ready == {"allowed": True, "reason_code": "pilot_ready", "raw_output": "not_returned"}
+    monkeypatch.setattr(
+        hive_runtime,
+        "read_usage_evidence_v2",
+        lambda *, clock: _attested_usage_evidence(now=NOW, status="stale"),
+    )
+    assert enforced_pilot_gate(config, classes, now=lambda: NOW) == {
+        "allowed": False,
+        "reason_code": "pilot_account_attestation_invalid",
+        "raw_output": "not_returned",
+    }
+    monkeypatch.setattr(hive_runtime, "read_usage_evidence_v2", lambda *, clock: {"issuer": "unknown"})
+    assert enforced_pilot_gate(config, classes, now=lambda: NOW) == {
+        "allowed": False,
+        "reason_code": "pilot_account_attestation_invalid",
+        "raw_output": "not_returned",
+    }

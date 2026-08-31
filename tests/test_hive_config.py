@@ -11,7 +11,9 @@ from codex_master.hive.config import (
     HiveConfigError,
     load_agent_class_catalog,
     load_agent_class_catalog_snapshot,
+    load_agent_class_catalog_snapshot_bytes,
     load_hive_config,
+    load_hive_config_bytes,
 )
 
 
@@ -31,7 +33,7 @@ def test_public_classes_expose_resolver_profiles() -> None:
 
     assert classes["goettin"].resolver_profile == ("persistent", ("persistent",), ("sol",), "max", "max")
     assert classes["gottbiene"].resolver_profile == ("persistent", ("persistent",), ("sol",), "max", "max")
-    assert classes["koenigin"].resolver_profile == ("persistent", ("persistent",), ("sol",), "xhigh", "xhigh")
+    assert classes["koenigin"].resolver_profile == ("persistent", ("persistent",), ("sol",), "max", "max")
     assert classes["teamleiterin"].resolver_profile == ("persistent", ("persistent",), ("terra",), "xhigh", "xhigh")
     assert classes["teamleiterin"].allowed_model_ids == ("gpt-5.6-terra",)
     assert classes["spezialistin"].resolver_profile == ("binding", ("binding",), ("spark", "luna", "terra", "sol"), "high", "xhigh")
@@ -76,6 +78,19 @@ def test_catalog_snapshot_reads_exactly_once_and_hashes_that_same_bytes(tmp_path
     assert calls == 1
     assert snapshot.digest == "sha256:" + hashlib.sha256(raw).hexdigest()
     assert snapshot.classes["teamleiterin"].class_id == "teamleiterin"
+
+
+def test_attested_catalog_and_hive_config_bytes_use_the_same_strict_contract() -> None:
+    catalog_raw = (ROOT / "codex-agent-classes.json").read_bytes()
+    config_raw = (ROOT / "codex-hive.json").read_bytes()
+
+    snapshot = load_agent_class_catalog_snapshot_bytes(catalog_raw)
+    config = load_hive_config_bytes(config_raw, snapshot.classes)
+
+    assert snapshot.digest == "sha256:" + hashlib.sha256(catalog_raw).hexdigest()
+    assert config.mode == "shadow"
+    with pytest.raises(HiveConfigError, match="hive_config_unavailable"):
+        load_hive_config_bytes(b"{", snapshot.classes)
 
 
 def test_catalog_snapshot_is_deeply_immutable_after_direct_construction() -> None:
