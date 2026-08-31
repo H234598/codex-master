@@ -2495,51 +2495,54 @@ def test_remote_completion_redelivery_recovers_every_owner_phase(
     )
     plan = service.plan_ollama_instance(instance, expected_generation=1)
     plan_lease = store.poll(principal, poll)
+    plan_receipt = _ollama_receipt(
+        plan_lease,
+        "succeeded",
+        AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"}),
+    )
     service = complete_after_interruption(
         service,
-        _ollama_receipt(
-            plan_lease,
-            "succeeded",
-            AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"}),
-        ),
+        plan_receipt,
     )
     assert store.get(plan.id).state == "succeeded"
 
     apply = service.apply_ollama_instance(plan.id, expected_generation=1)
     apply_lease = store.poll(principal, poll)
+    apply_receipt = _ollama_receipt(
+        apply_lease,
+        "succeeded",
+        AgentResultV1(
+            "ollama.instance", "apply", {"instance_ref": "remote-west", "generation": 1}
+        ),
+    )
     service = complete_after_interruption(
         service,
-        _ollama_receipt(
-            apply_lease,
-            "succeeded",
-            AgentResultV1(
-                "ollama.instance", "apply", {"instance_ref": "remote-west", "generation": 1}
-            ),
-        ),
+        apply_receipt,
     )
     assert store.get(apply.id).state == "succeeded"
     assert registry.load().generation == 2
 
     probe = service.probe_ollama_instance("remote-west", expected_generation=2)
     probe_lease = store.poll(principal, poll)
+    probe_receipt = _ollama_receipt(
+        probe_lease,
+        "succeeded",
+        AgentResultV1(
+            "ollama.instance",
+            "probe",
+            {
+                "ready": True,
+                "reason_codes": ("resource.ready",),
+                "process_running": True,
+                "cgroup_member": True,
+                "loopback_endpoint_reachable": True,
+                "available_model_ids": ("provider-a",),
+            },
+        ),
+    )
     service = complete_after_interruption(
         service,
-        _ollama_receipt(
-            probe_lease,
-            "succeeded",
-            AgentResultV1(
-                "ollama.instance",
-                "probe",
-                {
-                    "ready": True,
-                    "reason_codes": ("resource.ready",),
-                    "process_running": True,
-                    "cgroup_member": True,
-                    "loopback_endpoint_reachable": True,
-                    "available_model_ids": ("provider-a",),
-                },
-            ),
-        ),
+        probe_receipt,
     )
     assert store.get(probe.id).state == "succeeded"
     assert registry.load().generation == 3
@@ -2569,6 +2572,43 @@ def test_remote_completion_redelivery_recovers_every_owner_phase(
     assert store.get(stop.id).state == "succeeded"
     assert registry.load().generation == 4
     assert service.ollama_hive_lanes() == ()
+
+    service.plan_ollama_instance(
+        replace(instance, ref="remote-failed"), expected_generation=4
+    )
+    failed_lease = store.poll(principal, poll)
+    failed_receipt = _ollama_receipt(
+        failed_lease,
+        "failed",
+        AgentResultV1("ollama.instance", "plan", {"status": "failed"}),
+    )
+    assert service.accept_agent_result(principal, failed_receipt).state == "failed"
+    before_terminal_replays = registry.load()
+
+    def owner_effect_must_not_run(*_args, **_kwargs):
+        raise AssertionError("terminal receipt repeated an owner effect")
+
+    monkeypatch.setattr(
+        FleetService, "_mark_remote_owner_applied", owner_effect_must_not_run
+    )
+    monkeypatch.setattr(
+        FleetService, "_accept_remote_apply", owner_effect_must_not_run
+    )
+    monkeypatch.setattr(
+        FleetService, "_accept_remote_probe", owner_effect_must_not_run
+    )
+    monkeypatch.setattr(
+        FleetService, "_accept_remote_stop", owner_effect_must_not_run
+    )
+    for receipt in (
+        plan_receipt,
+        apply_receipt,
+        probe_receipt,
+        stop_receipt,
+        failed_receipt,
+    ):
+        assert new_service().accept_agent_result(principal, receipt).state == receipt.state
+    assert registry.load() == before_terminal_replays
 
 
 def test_remote_owner_index_crash_after_enqueue_recovers_every_action(
@@ -3068,3 +3108,73 @@ def test_remote_apply_prepared_phase_does_not_trust_generation_drift(
 
     assert store.get(apply.id).state == "leased"
     assert registry.load() == drifted
+
+
+def test_completed_remote_apply_receipt_ignores_later_target_instance_drift(
+    tmp_path: Path,
+) -> None:
+    """A terminal receipt is a pure no-op even after its target later changes."""
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    assert service.accept_agent_result(principal, receipt).state == "succeeded"
+    operation = service._remote_document()["operations"][apply.id]
+    assert operation["completion"]["phase"] == "queue_completed"
+    assert store.get(apply.id).state == "succeeded"
+
+    changed = replace(
+        running, lifecycle_state="failed", readiness_state="not_ready"
+    )
+    completed = registry.load()
+    drifted = registry.replace(
+        models=completed.models,
+        instances=(changed,),
+        expected_generation=completed.generation,
+    )
+
+    replay = new_service().accept_agent_result(principal, receipt)
+
+    assert replay.state == "succeeded"
+    assert store.get(apply.id).state == "succeeded"
+    assert registry.load() == drifted
+
+
+def test_completed_remote_apply_receipt_rejects_conflicting_terminal_result(
+    tmp_path: Path,
+) -> None:
+    """Terminal replay remains bound to its state, result and result digest."""
+
+    from codex_master.agent_contracts import AgentResultV1
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        _running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    assert service.accept_agent_result(principal, receipt).state == "succeeded"
+    before_queue = store.get(apply.id)
+    before_registry = registry.load()
+    conflicting = _ollama_receipt(
+        receipt,
+        "failed",
+        AgentResultV1("ollama.instance", "apply", {"status": "failed"}),
+    )
+
+    with pytest.raises(FleetConflictError, match="host.completion_conflict"):
+        new_service().accept_agent_result(principal, conflicting)
+
+    assert store.get(apply.id) == before_queue
+    assert registry.load() == before_registry

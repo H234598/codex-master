@@ -1592,6 +1592,14 @@ class FleetService:
             # before a registry/lane side effect, then let redelivery resume
             # the exact phase after a process interruption.
             completion_phase = self._prepare_remote_completion(receipt)
+            if completion_phase == "queue_completed":
+                # Receipt/principal/envelope and the receipt-digest-bound saga
+                # phase were already checked above.  A terminal replay must not
+                # revisit an owner effect: a later legitimate registry change
+                # cannot invalidate the idempotent queue acknowledgement.
+                completed = self._agent_operations.complete(principal, receipt)
+                self._mark_remote_completed(receipt)
+                return completed
             instance_ref: str | None = None
             readiness: OllamaReadinessStatus | None = None
             if receipt.state != "succeeded":
@@ -1606,8 +1614,7 @@ class FleetService:
                 instance_ref = self._accept_remote_apply(
                     plan,
                     receipt,
-                    owner_already_applied=completion_phase
-                    in {"owner_applied", "queue_completed"},
+                    owner_already_applied=completion_phase == "owner_applied",
                 )
                 self._mark_remote_owner_applied(
                     receipt, instance_ref=instance_ref, readiness=None
