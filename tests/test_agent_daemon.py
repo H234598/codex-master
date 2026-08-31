@@ -264,6 +264,16 @@ def test_assemble_server_wires_task_two_store_and_task_three_resolver(monkeypatc
     )
     monkeypatch.setattr(
         agent_daemon,
+        "_ollama_completion_fleet",
+        lambda root, store, registry: ("ollama-owner", root, store, registry),
+    )
+    monkeypatch.setattr(
+        agent_daemon,
+        "_AgentCompletionRouter",
+        lambda store, host_probe, ollama: ("completion-router", store, host_probe, ollama),
+    )
+    monkeypatch.setattr(
+        agent_daemon,
         "AgentHttpApplication",
         lambda store, owner: ("application", store, owner),
     )
@@ -283,15 +293,22 @@ def test_assemble_server_wires_task_two_store_and_task_three_resolver(monkeypatc
     assert result is values
     assert values["address"] == ("127.0.0.1", 9443)
     assert values["application"][0] == "application"
-    assert values["application"][2][0] == "completion-owner"
+    assert values["application"][2][0] == "completion-router"
     assert values["application"][1] == ("store", state_root)
-    assert values["application"][2][1]["operation_store"] == (
+    assert values["application"][2][2][0] == "completion-owner"
+    assert values["application"][2][2][1]["operation_store"] == (
         "admin-operation-store",
         state_root,
     )
-    assert values["application"][2][1]["host_registry"] == (
+    assert values["application"][2][2][1]["host_registry"] == (
         "registry",
         state_root,
+    )
+    assert values["application"][2][3] == (
+        "ollama-owner",
+        state_root,
+        ("store", state_root),
+        ("registry", state_root),
     )
     assert values["resolver"][0] == "resolver"
     assert values["context"] == ("tls", fds)

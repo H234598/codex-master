@@ -220,6 +220,13 @@ ADMIN_OPERATION_METADATA = MappingProxyType(
             requires_idempotency=True,
             generation_domain="ollama",
         ),
+        "ollama.instance.stop": AdminOperationMetadataV1(
+            "fleet.ollama.write",
+            True,
+            ("instance_ref",),
+            requires_idempotency=True,
+            generation_domain="ollama",
+        ),
     }
 )
 ADMIN_OPERATION_CATALOG = tuple(ADMIN_OPERATION_METADATA)
@@ -275,10 +282,10 @@ _PRIVATE_TEXT = re.compile(
     re.IGNORECASE,
 )
 _OPERATION_STATES = frozenset(
-    {"planned", "queued", "running", "partial", "succeeded", "failed", "blocked"}
+    {"planned", "queued", "running", "partial", "succeeded", "failed", "blocked", "unknown"}
 )
 _TERMINAL_OPERATION_STATES = frozenset(
-    {"partial", "succeeded", "failed", "blocked"}
+    {"partial", "succeeded", "failed", "blocked", "unknown"}
 )
 PUBLIC_AGENT_REASON_CODES = frozenset(
     {
@@ -288,6 +295,8 @@ PUBLIC_AGENT_REASON_CODES = frozenset(
         "host.lease_expired",
         "host.capability_mismatch",
         "host.probe_failed",
+        "host.operation_succeeded",
+        "host.operation_failed",
         "host.operation_unknown",
         "resource.host_response_invalid",
         "resource.host_unreachable",

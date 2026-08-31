@@ -195,6 +195,7 @@ class OllamaRegistryStore:
     def _locked(self) -> Iterator[None]:
         try:
             self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(self._path.parent, 0o700)
             descriptor = os.open(
                 self._lock_path,
                 os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,

@@ -31,6 +31,14 @@ from .agent_operations import AgentOperationError, AgentOperationStore
 from .admin_operations import AdminOperationStore
 from .admin_operations import AdminOperationError
 from .host_probe import RemoteHostProbeCompletionOwner
+from .fleet_service import FleetPaths, FleetService
+from .ollama_host_transport import (
+    AgentQueueRemoteOllamaOperationPort,
+    HostRegistryOllamaLeaseSource,
+    OllamaHostTransport,
+)
+from .ollama_registry import OllamaRegistryStore
+from .server import build_fleet_private_io
 
 
 _STATE_ROOT = Path("/var/lib/codex-master")
@@ -40,6 +48,60 @@ HTTP_HEADER_TIMEOUT_SECONDS = 2.0
 HTTP_BODY_TIMEOUT_SECONDS = 2.0
 AGENT_DRAIN_TIMEOUT_SECONDS = 5.0
 _active_server: object | None = None
+
+
+class _AgentCompletionRouter:
+    """Keep host-probe and Ollama receipt ownership explicitly disjoint."""
+
+    __slots__ = ("_store", "_host_probe", "_ollama")
+
+    def __init__(
+        self,
+        store: AgentOperationStore,
+        host_probe: RemoteHostProbeCompletionOwner,
+        ollama: FleetService,
+    ) -> None:
+        self._store = store
+        self._host_probe = host_probe
+        self._ollama = ollama
+
+    def complete(self, principal: object, receipt: object) -> object:
+        if getattr(getattr(receipt, "result", None), "kind", None) == "host.probe":
+            return self._host_probe.complete(principal, receipt)
+        if getattr(getattr(receipt, "result", None), "kind", None) == "ollama.instance":
+            return self._ollama.accept_agent_result(principal, receipt)
+        return self._store.complete(principal, receipt)
+
+    def reconcile_attempt_exhaustion(self, value: object) -> bool:
+        return self._host_probe.reconcile_attempt_exhaustion(value)
+
+    def reconcile_operation_deadline(self, value: object) -> bool:
+        return self._host_probe.reconcile_operation_deadline(value)
+
+    def acknowledge_agent_lifecycle(self, value: object) -> None:
+        self._host_probe.acknowledge_agent_lifecycle(value)
+
+
+def _ollama_completion_fleet(
+    state_root: Path, store: AgentOperationStore, registry: HostRegistry
+) -> FleetService:
+    ollama_registry = OllamaRegistryStore(state_root / "ollama" / "registry.json")
+    transport = OllamaHostTransport(
+        registry=ollama_registry,
+        leases=HostRegistryOllamaLeaseSource(registry),
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=store, host_registry=registry
+        ),
+    )
+    paths = FleetPaths.from_state_root(state_root / "ollama-owner")
+    return FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=state_root / "ollama-pool",
+        ollama_registry=ollama_registry,
+        ollama_transport=transport,
+        agent_operations=store,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,14 +374,19 @@ def assemble_server(
 ) -> AgentApiServer:
     registry = HostRegistry(state_root)
     store = AgentOperationStore(state_root)
+    host_probe_owner = RemoteHostProbeCompletionOwner(
+        operation_store=AdminOperationStore(state_root),
+        agent_operations=store,
+        host_registry=registry,
+    )
     return AgentApiServer(
         (address, port),
         AgentHttpApplication(
             store,
-            RemoteHostProbeCompletionOwner(
-                operation_store=AdminOperationStore(state_root),
-                agent_operations=store,
-                host_registry=registry,
+            _AgentCompletionRouter(
+                store,
+                host_probe_owner,
+                _ollama_completion_fleet(state_root, store, registry),
             ),
         ),
         AgentIdentityResolver(registry),

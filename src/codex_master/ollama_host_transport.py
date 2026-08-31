@@ -3,22 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import math
 import secrets
 import threading
 import time
-from typing import NoReturn, Protocol
+from typing import Callable, Mapping, NoReturn, Protocol
 import weakref
 
-from codex_master.fleet_home_broker_transport import (
-    BrokerOllamaInstancePayload,
-    BrokerOperationClient,
-    BrokerOperationRequest,
-    BrokerTransportError,
-    exchange_typed_operation,
-)
+from codex_master.admin_contracts import OperationV1
+from codex_master.agent_operations import AgentOperationRequestV1, AgentOperationStore
+from codex_master.admin_hosts import HostRegistry, HostRegistryError
 from codex_master.ollama_registry import (
     OllamaInstanceV1,
     OllamaRegistryV1,
@@ -181,6 +178,210 @@ class LocalOllamaHostAdapter(Protocol):
     def stop(self, running: object) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class OllamaRemotePlanRequestV1:
+    """One bounded remote plan request, without host-local paths or argv."""
+
+    host_ref: str
+    instance_ref: str
+    registry_generation: int
+    runtime_generation: int
+    fence: int
+    lease_epoch: int
+    plan_digest: str
+    idempotency_key: str
+    selected_model_refs: tuple[str, ...]
+    allowed_cpus: str
+    cpu_quota_percent: int
+    cpu_weight: int
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaRemoteApplyRequestV1:
+    host_ref: str
+    instance_ref: str
+    registry_generation: int
+    resource_generation: int | None
+    lease_epoch: int
+    plan_digest: str
+    plan_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaRemoteProbeRequestV1:
+    host_ref: str
+    instance_ref: str
+    registry_generation: int
+    resource_generation: int | None
+    lease_epoch: int
+    plan_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaRemoteStopRequestV1:
+    host_ref: str
+    instance_ref: str
+    registry_generation: int
+    resource_generation: int | None
+    lease_epoch: int
+    plan_digest: str
+
+
+class RemoteOllamaOperationPort(Protocol):
+    """The sole remote boundary: every call creates a durable agent operation."""
+
+    def plan(self, request: OllamaRemotePlanRequestV1) -> OperationV1: ...
+
+    def apply(self, request: OllamaRemoteApplyRequestV1) -> OperationV1: ...
+
+    def probe(self, request: OllamaRemoteProbeRequestV1) -> OperationV1: ...
+
+    def stop(self, request: OllamaRemoteStopRequestV1) -> OperationV1: ...
+
+
+class AgentQueueRemoteOllamaOperationPort:
+    """Enqueue the four fixed Ollama actions in the canonical agent queue.
+
+    The agent receives only the exact arguments accepted by ``AgentOllamaExecutor``.
+    Host identity, the queue generation and the lease epoch remain master-side
+    fences; the control host never reaches this object.
+    """
+
+    __slots__ = ("_agent_operations", "_hosts", "_clock")
+
+    def __init__(
+        self,
+        *,
+        agent_operations: AgentOperationStore,
+        host_registry: HostRegistry,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not isinstance(agent_operations, AgentOperationStore) or not isinstance(
+            host_registry, HostRegistry
+        ):
+            _fail("resource.host_unreachable")
+        self._agent_operations = agent_operations
+        self._hosts = host_registry
+        self._clock = clock or (lambda: datetime.now(UTC).replace(microsecond=0))
+
+    def plan(self, request: OllamaRemotePlanRequestV1) -> OperationV1:
+        arguments = {
+            "instance_ref": request.instance_ref,
+            "generation": request.registry_generation,
+        }
+        return self._enqueue("plan", request, arguments)
+
+    def apply(self, request: OllamaRemoteApplyRequestV1) -> OperationV1:
+        return self._enqueue("apply", request, {"plan_ref": request.plan_ref})
+
+    def probe(self, request: OllamaRemoteProbeRequestV1) -> OperationV1:
+        return self._enqueue(
+            "probe",
+            request,
+            {"instance_ref": request.instance_ref, "generation": request.registry_generation},
+        )
+
+    def stop(self, request: OllamaRemoteStopRequestV1) -> OperationV1:
+        return self._enqueue(
+            "stop",
+            request,
+            {"instance_ref": request.instance_ref, "generation": request.registry_generation},
+        )
+
+    def _enqueue(
+        self,
+        action: str,
+        request: (
+            OllamaRemotePlanRequestV1
+            | OllamaRemoteApplyRequestV1
+            | OllamaRemoteProbeRequestV1
+            | OllamaRemoteStopRequestV1
+        ),
+        arguments: dict[str, object],
+    ) -> OperationV1:
+        _validate_remote_request(action, request)
+        try:
+            binding = self._hosts.agent_binding(request.host_ref)
+            generation = self._hosts.document_generation()
+        except HostRegistryError as error:
+            raise OllamaHostError(error.code) from None
+        if not binding.enabled or binding.lease_epoch != request.lease_epoch:
+            _fail("control.plan_stale")
+        key_material = json.dumps(
+            {
+                "action": action,
+                "arguments": arguments,
+                "host_ref": request.host_ref,
+                "lease_epoch": request.lease_epoch,
+                "plan_digest": request.plan_digest,
+                "resource_generation": request.resource_generation
+                if not isinstance(request, OllamaRemotePlanRequestV1)
+                else None,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        try:
+            now = self._clock()
+            if type(now) is not datetime or now.tzinfo is None:
+                _fail("resource.host_unreachable")
+            queued = self._agent_operations.enqueue(
+                AgentOperationRequestV1(
+                    key="ollama-" + hashlib.sha256(key_material).hexdigest(),
+                    kind=OLLAMA_OPERATION_TYPE,
+                    action=action,  # type: ignore[arg-type]
+                    registry_generation=generation,
+                    plan_digest="sha256:" + request.plan_digest,
+                    arguments=arguments,
+                    deadline=now.astimezone(UTC).replace(microsecond=0)
+                    + timedelta(minutes=5),
+                    target_host_ref=request.host_ref,
+                )
+            )
+        except OllamaHostError:
+            raise
+        except Exception:
+            _fail("resource.host_unreachable")
+        return _operation_from_agent_view(queued)
+
+
+class HostRegistryOllamaLeaseSource:
+    """Derive one short-lived remote fence from the registered agent epoch."""
+
+    __slots__ = ("_hosts", "_monotonic", "_local")
+
+    def __init__(
+        self, hosts: HostRegistry, *, monotonic: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._hosts = hosts
+        self._monotonic = monotonic
+        self._local = OllamaHostLease(
+            CONTROL_HOST_REF,
+            "control-daemon",
+            1,
+            1,
+            monotonic() + 365 * 24 * 60 * 60,
+        )
+
+    def resolve(self, host_ref: str) -> OllamaHostLease | None:
+        if host_ref == CONTROL_HOST_REF:
+            return self._local
+        try:
+            binding = self._hosts.agent_binding(host_ref)
+        except HostRegistryError:
+            return None
+        if not binding.enabled:
+            return None
+        return OllamaHostLease(
+            host_ref,
+            "agent-" + str(binding.lease_epoch),
+            1,
+            binding.lease_epoch,
+            self._monotonic() + 15 * 60,
+        )
+
+
 class Task3LocalOllamaHostAdapter:
     """Thin control-host adapter over Task 3's hardened local runtime."""
 
@@ -213,8 +414,8 @@ class OllamaHostTransport:
     __slots__ = (
         "_registry",
         "_leases",
-        "_broker",
         "_local",
+        "_remote",
         "_monotonic",
         "_apply_lock",
         "_applied",
@@ -225,21 +426,25 @@ class OllamaHostTransport:
         self,
         *,
         registry: OllamaRegistrySource,
-        leases: OllamaHostLeaseSource,
-        broker: BrokerOperationClient,
+        leases: OllamaHostLeaseSource | None = None,
         local: LocalOllamaHostAdapter | None = None,
+        remote: RemoteOllamaOperationPort | None = None,
         monotonic=time.monotonic,
     ) -> None:
         self._registry = registry
         self._leases = leases
-        self._broker = broker
         self._local = local or Task3LocalOllamaHostAdapter()
+        if remote is None:
+            _fail("resource.host_unreachable")
+        self._remote = remote
         self._monotonic = monotonic
         self._apply_lock = threading.RLock()
         self._applied: dict[str, OllamaHostExecution] = {}
         self._stopped: set[str] = set()
 
-    def plan(self, instance: OllamaInstanceV1, *, generation: int) -> OllamaHostPlan:
+    def plan(
+        self, instance: OllamaInstanceV1, *, generation: int
+    ) -> OllamaHostPlan | OperationV1:
         current = self._load_registry()
         if (
             type(instance) is not OllamaInstanceV1
@@ -268,7 +473,10 @@ class OllamaHostTransport:
             except Exception:
                 _fail("resource.host_unreachable")
         else:
-            self._remote("plan", lease, document, expected_status="planned")
+            remote = self._remote.plan(_remote_plan_request(instance, current, lease, document))
+            if type(remote) is OperationV1:
+                return remote
+            _validate_remote_status(remote, expected_status="planned", document=document)
         provenance = secrets.token_bytes(32)
         planned = OllamaHostPlan(
             1,
@@ -292,7 +500,7 @@ class OllamaHostTransport:
 
     def apply(
         self, plan: OllamaHostPlan, *, current_fence: int
-    ) -> OllamaHostExecution:
+    ) -> OllamaHostExecution | OperationV1:
         with self._apply_lock:
             instance, lease = self._revalidate(plan, current_fence=current_fence)
             applied = self._applied.get(plan.idempotency_key)
@@ -308,11 +516,23 @@ class OllamaHostTransport:
                 except Exception:
                     _fail("resource.host_unreachable")
             else:
-                self._remote(
-                    "apply",
-                    lease,
-                    _bound_document(plan, instance),
+                remote = self._remote.apply(
+                    OllamaRemoteApplyRequestV1(
+                        plan.host_ref,
+                        plan.instance_ref,
+                        plan.model_generation,
+                        None,
+                        lease.fence,
+                        plan.plan_digest,
+                        plan.idempotency_key,
+                    )
+                )
+                if type(remote) is OperationV1:
+                    return remote
+                _validate_remote_status(
+                    remote,
                     expected_status="running",
+                    document=_bound_document(plan, instance),
                 )
                 runtime_value = None
             provenance = secrets.token_bytes(32)
@@ -330,7 +550,7 @@ class OllamaHostTransport:
 
     def probe(
         self, execution: OllamaHostExecution, *, current_fence: int
-    ) -> OllamaReadinessStatus:
+    ) -> OllamaReadinessStatus | OperationV1:
         if not _recorded(
             _EXECUTION_RECORDS,
             getattr(execution, "_provenance", b""),
@@ -350,15 +570,28 @@ class OllamaHostTransport:
                 raise OllamaHostError(error.code) from None
             except Exception:
                 _fail("resource.host_unreachable")
-        document = self._remote(
-            "probe",
-            lease,
-            _bound_document(execution.plan, instance),
-            expected_status=("ready", "not_ready"),
+        document = _bound_document(execution.plan, instance)
+        remote = self._remote.probe(
+            OllamaRemoteProbeRequestV1(
+                execution.plan.host_ref,
+                execution.plan.instance_ref,
+                execution.plan.model_generation,
+                None,
+                lease.fence,
+                execution.plan.plan_digest,
+            )
         )
-        return _readiness(document)
+        if type(remote) is OperationV1:
+            return remote
+        return _readiness(
+            _validate_remote_status(
+                remote, expected_status=("ready", "not_ready"), document=document
+            )
+        )
 
-    def stop(self, execution: OllamaHostExecution, *, current_fence: int) -> None:
+    def stop(
+        self, execution: OllamaHostExecution, *, current_fence: int
+    ) -> OperationV1 | None:
         with self._apply_lock:
             if not _recorded(
                 _EXECUTION_RECORDS,
@@ -385,13 +618,95 @@ class OllamaHostTransport:
                 except Exception:
                     _fail("resource.host_unreachable")
             else:
-                self._remote(
-                    "stop",
-                    lease,
-                    _bound_document(execution.plan, instance),
+                remote = self._remote.stop(
+                    OllamaRemoteStopRequestV1(
+                        execution.plan.host_ref,
+                        execution.plan.instance_ref,
+                        execution.plan.model_generation,
+                        None,
+                        lease.fence,
+                        execution.plan.plan_digest,
+                    )
+                )
+                if type(remote) is OperationV1:
+                    return remote
+                _validate_remote_status(
+                    remote,
                     expected_status="stopped",
+                    document=_bound_document(execution.plan, instance),
                 )
             self._stopped.add(key)
+
+    def apply_remote(
+        self,
+        instance: OllamaInstanceV1,
+        *,
+        generation: int,
+        resource_generation: int | None,
+        plan_digest: str,
+        plan_ref: str,
+    ) -> OperationV1:
+        lease = self._lease(instance.host_ref)
+        result = self._remote.apply(
+            OllamaRemoteApplyRequestV1(
+                instance.host_ref,
+                instance.ref,
+                generation,
+                resource_generation,
+                lease.fence,
+                plan_digest,
+                plan_ref,
+            )
+        )
+        if type(result) is not OperationV1:
+            _fail("resource.host_response_invalid")
+        return result
+
+    def probe_remote(
+        self,
+        instance: OllamaInstanceV1,
+        *,
+        generation: int,
+        resource_generation: int | None,
+        plan_digest: str,
+    ) -> OperationV1:
+        lease = self._lease(instance.host_ref)
+        result = self._remote.probe(
+            OllamaRemoteProbeRequestV1(
+                instance.host_ref,
+                instance.ref,
+                generation,
+                resource_generation,
+                lease.fence,
+                plan_digest,
+            )
+        )
+        if type(result) is not OperationV1:
+            _fail("resource.host_response_invalid")
+        return result
+
+    def stop_remote(
+        self,
+        instance: OllamaInstanceV1,
+        *,
+        generation: int,
+        resource_generation: int | None,
+        plan_digest: str,
+    ) -> OperationV1:
+        lease = self._lease(instance.host_ref)
+        result = self._remote.stop(
+            OllamaRemoteStopRequestV1(
+                instance.host_ref,
+                instance.ref,
+                generation,
+                resource_generation,
+                lease.fence,
+                plan_digest,
+            )
+        )
+        if type(result) is not OperationV1:
+            _fail("resource.host_response_invalid")
+        return result
 
     def _load_registry(self) -> OllamaRegistryV1:
         try:
@@ -403,6 +718,14 @@ class OllamaHostTransport:
         return current
 
     def _lease(self, host_ref: str) -> OllamaHostLease:
+        if self._leases is None:
+            return OllamaHostLease(
+                host_ref,
+                "adapter-fence",
+                1,
+                1,
+                float(self._monotonic()) + 365 * 24 * 60 * 60,
+            )
         try:
             lease = self._leases.resolve(host_ref)
             now = self._monotonic()
@@ -456,57 +779,154 @@ class OllamaHostTransport:
             _fail("control.plan_stale")
         return instance, lease
 
-    def _remote(
-        self,
-        action: str,
-        lease: OllamaHostLease,
-        document: dict[str, object],
-        *,
-        expected_status: str | tuple[str, ...],
-    ) -> dict[str, object]:
-        request = BrokerOperationRequest(
-            1,
-            OLLAMA_OPERATION_TYPE,
-            action,
-            lease.host_ref,
-            lease.lease_id,
-            secrets.token_hex(16),
-            _broker_payload(document),
-        )
-        try:
-            response = exchange_typed_operation(self._broker, request)
-        except BrokerTransportError as error:
-            raise OllamaHostError(str(error)) from None
-        try:
-            value = json.loads(response.payload.decode("ascii"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            _fail("resource.host_response_invalid")
-        statuses = (
-            (expected_status,) if isinstance(expected_status, str) else expected_status
-        )
-        required = {"schema_version", "status", "plan_digest"}
+
+def _remote_plan_request(
+    instance: OllamaInstanceV1,
+    registry: OllamaRegistryV1,
+    lease: OllamaHostLease,
+    document: Mapping[str, object],
+) -> OllamaRemotePlanRequestV1:
+    plan_digest = document.get("plan_digest")
+    idempotency_key = document.get("idempotency_key")
+    if type(plan_digest) is not str or type(idempotency_key) is not str:
+        _fail("provider.operation_not_allowed")
+    return OllamaRemotePlanRequestV1(
+        instance.host_ref,
+        instance.ref,
+        registry.generation,
+        lease.runtime_generation,
+        lease.fence,
+        lease.fence,
+        plan_digest,
+        idempotency_key,
+        instance.selected_model_refs,
+        instance.allowed_cpus,
+        instance.cpu_quota_percent,
+        instance.cpu_weight,
+    )
+
+
+def _validate_remote_request(
+    action: str,
+    request: (
+        OllamaRemotePlanRequestV1
+        | OllamaRemoteApplyRequestV1
+        | OllamaRemoteProbeRequestV1
+        | OllamaRemoteStopRequestV1
+    ),
+) -> None:
+    expected_type = {
+        "plan": OllamaRemotePlanRequestV1,
+        "apply": OllamaRemoteApplyRequestV1,
+        "probe": OllamaRemoteProbeRequestV1,
+        "stop": OllamaRemoteStopRequestV1,
+    }.get(action)
+    if type(request) is not expected_type:
+        _fail("provider.operation_not_allowed")
+    if (
+        not _safe_token(request.host_ref)
+        or not _safe_token(request.instance_ref)
+        or type(request.registry_generation) is not int
+        or request.registry_generation < 0
+        or type(request.lease_epoch) is not int
+        or request.lease_epoch <= 0
+        or not _hex_token(request.plan_digest, 64)
+    ):
+        _fail("provider.operation_not_allowed")
+    if type(request) is OllamaRemotePlanRequestV1:
         if (
-            type(value) is not dict
-            or not required.issubset(value)
-            or value["schema_version"] != 1
-            or value["status"] not in statuses
-            or value["plan_digest"] != document.get("plan_digest")
+            type(request.runtime_generation) is not int
+            or request.runtime_generation < 0
+            or type(request.fence) is not int
+            or request.fence < 0
+            or not _hex_token(request.idempotency_key, 64)
+            or not request.selected_model_refs
+            or any(not _safe_token(item) for item in request.selected_model_refs)
+            or type(request.allowed_cpus) is not str
+            or type(request.cpu_quota_percent) is not int
+            or type(request.cpu_weight) is not int
         ):
+            _fail("provider.operation_not_allowed")
+    elif type(request) is OllamaRemoteApplyRequestV1 and not _safe_token(
+        request.plan_ref
+    ):
+        _fail("provider.operation_not_allowed")
+
+
+def _operation_from_agent_view(value: object) -> OperationV1:
+    state = getattr(value, "state", None)
+    if state == "leased":
+        state = "running"
+    if state not in {"queued", "running", "succeeded", "failed", "unknown"}:
+        _fail("resource.host_response_invalid")
+    created_at = getattr(value, "created_at", None)
+    deadline = getattr(value, "deadline", None)
+    operation_id = getattr(value, "operation_id", None)
+    registry_generation = getattr(value, "registry_generation", None)
+    plan_digest = getattr(value, "plan_digest", None)
+    attempt = getattr(value, "attempt", None)
+    action = getattr(value, "action", None)
+    reasons = getattr(value, "reason_codes", ())
+    if (
+        type(created_at) is not datetime
+        or type(deadline) is not datetime
+        or type(operation_id) is not str
+        or type(registry_generation) is not int
+        or type(plan_digest) is not str
+        or type(attempt) is not int
+        or action not in {"plan", "apply", "probe", "stop"}
+        or type(reasons) is not tuple
+    ):
+        _fail("resource.host_response_invalid")
+    return OperationV1(
+        operation_id,
+        "ollama.instance." + action,
+        state,
+        registry_generation,
+        registry_generation if state == "succeeded" else None,
+        plan_digest,
+        created_at,
+        deadline,
+        1 if state == "succeeded" else 0,
+        1 if state in {"failed", "unknown"} else 0,
+        0 if state in {"succeeded", "failed", "unknown"} else 1,
+        reasons if state in {"succeeded", "failed", "unknown"} else ("control.operation_queued",),
+    )
+
+
+def _validate_remote_status(
+    value: object,
+    *,
+    expected_status: str | tuple[str, ...],
+    document: Mapping[str, object],
+) -> dict[str, object]:
+    statuses = (expected_status,) if type(expected_status) is str else expected_status
+    if not isinstance(value, Mapping):
+        _fail("resource.host_response_invalid")
+    result = dict(value)
+    required = {"schema_version", "status", "plan_digest"}
+    if (
+        not required.issubset(result)
+        or result.get("schema_version") != 1
+        or result.get("status") not in statuses
+        or result.get("plan_digest") != document.get("plan_digest")
+    ):
+        _fail("resource.host_response_invalid")
+    if result["status"] in {"ready", "not_ready"}:
+        expected = {
+            *required,
+            "ready",
+            "reason_codes",
+            "process_running",
+            "cgroup_member",
+            "loopback_endpoint_reachable",
+            "available_model_ids",
+        }
+        if set(result) != expected:
             _fail("resource.host_response_invalid")
-        if action == "probe":
-            if set(value) != {
-                *required,
-                "ready",
-                "reason_codes",
-                "process_running",
-                "cgroup_member",
-                "loopback_endpoint_reachable",
-                "available_model_ids",
-            }:
-                _fail("resource.host_response_invalid")
-        elif set(value) != required:
-            _fail("resource.host_response_invalid")
-        return value
+    elif set(result) != required:
+        _fail("resource.host_response_invalid")
+    return result
 
 
 def _registry_with_instance(
@@ -526,69 +946,6 @@ def _registry_with_instance(
         return replace(registry, instances=tuple(instances))
     except Exception:
         _fail("provider.instance_invalid")
-
-
-def _broker_payload(document: dict[str, object]) -> BrokerOllamaInstancePayload:
-    expected = {
-        "schema_version",
-        "operation_type",
-        "host_ref",
-        "instance_ref",
-        "selected_model_refs",
-        "allowed_cpus",
-        "cpu_quota_percent",
-        "cpu_weight",
-        "model_generation",
-        "runtime_generation",
-        "fence",
-        "plan_digest",
-        "idempotency_key",
-    }
-    host_ref = document.get("host_ref")
-    instance_ref = document.get("instance_ref")
-    selected = document.get("selected_model_refs")
-    allowed_cpus = document.get("allowed_cpus")
-    cpu_quota = document.get("cpu_quota_percent")
-    cpu_weight = document.get("cpu_weight")
-    model_generation = document.get("model_generation")
-    runtime_generation = document.get("runtime_generation")
-    fence = document.get("fence")
-    plan_digest = document.get("plan_digest")
-    idempotency_key = document.get("idempotency_key")
-    if (
-        set(document) != expected
-        or document.get("schema_version") != 1
-        or document.get("operation_type") != OLLAMA_OPERATION_TYPE
-        or type(host_ref) is not str
-        or type(instance_ref) is not str
-        or type(selected) is not list
-        or any(type(model_ref) is not str for model_ref in selected)
-        or type(allowed_cpus) is not str
-        or type(cpu_quota) is not int
-        or type(cpu_weight) is not int
-        or type(model_generation) is not int
-        or type(runtime_generation) is not int
-        or type(fence) is not int
-        or type(plan_digest) is not str
-        or type(idempotency_key) is not str
-    ):
-        _fail("provider.operation_not_allowed")
-    try:
-        return BrokerOllamaInstancePayload(
-            host_ref,
-            instance_ref,
-            tuple(selected),
-            allowed_cpus,
-            cpu_quota,
-            cpu_weight,
-            model_generation,
-            runtime_generation,
-            fence,
-            plan_digest,
-            idempotency_key,
-        )
-    except BrokerTransportError:
-        _fail("provider.operation_not_allowed")
 
 
 def _plan_document(
@@ -761,6 +1118,13 @@ __all__ = (
     "OllamaRegistrySource",
     "OllamaHostLeaseSource",
     "LocalOllamaHostAdapter",
+    "OllamaRemotePlanRequestV1",
+    "OllamaRemoteApplyRequestV1",
+    "OllamaRemoteProbeRequestV1",
+    "OllamaRemoteStopRequestV1",
+    "RemoteOllamaOperationPort",
+    "AgentQueueRemoteOllamaOperationPort",
+    "HostRegistryOllamaLeaseSource",
     "Task3LocalOllamaHostAdapter",
     "OllamaHostTransport",
 )

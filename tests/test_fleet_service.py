@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import json
 import importlib
 import threading
@@ -2192,3 +2193,125 @@ def test_ollama_probe_withdraws_lanes_when_runtime_loses_readiness(
     stored = registry.load()
     assert stored.generation == 3
     assert stored.instances[0].readiness_state == "not_ready"
+
+
+def test_remote_apply_unknown_never_publishes_lane_and_plan_survives_restart(
+    tmp_path: Path,
+) -> None:
+    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
+    from codex_master.agent_contracts import (
+        AgentPollV1,
+        AgentResultV1,
+    )
+    from codex_master.agent_operations import (
+        AgentOperationStore,
+        AgentPrincipalV1,
+    )
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.ollama_host_transport import (
+        AgentQueueRemoteOllamaOperationPort,
+        HostRegistryOllamaLeaseSource,
+        OllamaHostTransport,
+    )
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    hosts = HostRegistry.for_test(tmp_path / "hosts")
+    hosts.provision_agent_binding(
+        {
+            "ref": "worker-west",
+            "label": "Worker West",
+            "role": "execution",
+            "capabilities": ["ollama.execute", "resource.probe"],
+        },
+        AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
+        expected_generation=0,
+    )
+    agent_operations = AgentOperationStore.for_test(tmp_path / "agent-operations")
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    registry.replace(
+        models=(_ollama_model("model-a", "provider-a"),),
+        instances=(),
+        expected_generation=0,
+    )
+    transport = OllamaHostTransport(
+        registry=registry,
+        leases=HostRegistryOllamaLeaseSource(hosts),
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=agent_operations, host_registry=hosts
+        ),
+    )
+    paths = FleetPaths.from_state_root(tmp_path / "ollama-owner")
+    service = FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        agent_operations=agent_operations,
+    )
+    instance = replace(
+        _ollama_instance("remote-west"),
+        host_ref="worker-west",
+        selected_model_refs=("model-a",),
+    )
+    operation = service.plan_ollama_instance(instance, expected_generation=1)
+    assert operation.state == "queued"
+
+    principal = AgentPrincipalV1("worker-west", hosts.document_generation())
+    poll = AgentPollV1(
+        hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
+    )
+    plan_lease = agent_operations.poll(principal, poll)
+    plan_result = AgentResultV1(
+        "ollama.instance", "plan", {"plan_ref": "remote-plan-one"}
+    )
+    service.accept_agent_result(
+        principal,
+        _ollama_receipt(plan_lease, "succeeded", plan_result),
+    )
+    apply = service.apply_ollama_instance(operation.id, expected_generation=1)
+    assert apply.state == "queued"
+    apply_lease = agent_operations.poll(principal, poll)
+    unknown_result = AgentResultV1(
+        "ollama.instance", "apply", {"status": "effect_unknown"}
+    )
+    service.accept_agent_result(
+        principal,
+        _ollama_receipt(apply_lease, "unknown", unknown_result),
+    )
+
+    assert agent_operations.get(apply.id).state == "unknown"
+    assert registry.load().instances == ()
+    assert service.ollama_hive_lanes() == ()
+    restarted = FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        agent_operations=agent_operations,
+    )
+    assert restarted.ollama_plan_digest(operation.id) == operation.plan_digest
+
+
+def _ollama_receipt(lease, state: str, result):
+    from codex_master.agent_contracts import AgentReceiptV1, serialize_agent_result
+
+    encoded = json.dumps(
+        serialize_agent_result(result), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return AgentReceiptV1(
+        lease.operation_id,
+        lease.lease_id,
+        lease.lease_epoch,
+        lease.attempt,
+        lease.plan_digest,
+        lease.arguments_digest,
+        state,
+        ("host.operation_succeeded",)
+        if state == "succeeded"
+        else ("host.operation_unknown",),
+        "sha256:" + hashlib.sha256(encoded).hexdigest(),
+        result,
+    )

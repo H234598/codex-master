@@ -195,15 +195,21 @@ class OllamaFleetPort(Protocol):
 
     def plan_ollama_instance(
         self, instance: OllamaInstanceV1, *, expected_generation: int
-    ) -> OllamaFleetPlanV1: ...
+    ) -> OllamaFleetPlanV1 | OperationV1: ...
 
     def apply_ollama_instance(
         self, plan_id: str, *, expected_generation: int
-    ) -> OllamaApplyResultV1: ...
+    ) -> OllamaApplyResultV1 | OperationV1: ...
 
     def probe_ollama_instance(
         self, instance_ref: str, *, expected_generation: int
-    ) -> OllamaReadinessStatus: ...
+    ) -> OllamaReadinessStatus | OperationV1: ...
+
+    def stop_ollama_instance(
+        self, instance_ref: str, *, expected_generation: int
+    ) -> OperationV1 | None: ...
+
+    def ollama_plan_digest(self, plan_id: str) -> str | None: ...
 
 
 class HostProbePort(Protocol):
@@ -973,6 +979,9 @@ class MasterjetControlService:
         plan = _required(self._ollama_fleet).plan_ollama_instance(
             instance, expected_generation=_generation(request)
         )
+        if type(plan) is OperationV1:
+            self._ollama_plan_digests[plan.id] = _public_digest(plan.plan_digest)
+            return public_operation_status(plan)
         self._ollama_plan_digests[plan.plan_id] = _public_digest(plan.plan_digest)
         return _serialize_ollama_plan(plan)
 
@@ -983,11 +992,18 @@ class MasterjetControlService:
         *_values: object,
     ) -> dict[str, object]:
         plan_id = cast(str, request.arguments["plan_id"])
-        if self._ollama_plan_digests.get(plan_id) != _digest(request):
+        known_digest = self._ollama_plan_digests.get(plan_id)
+        if known_digest is None:
+            plan_digest = getattr(self._ollama_fleet, "ollama_plan_digest", None)
+            if callable(plan_digest):
+                known_digest = plan_digest(plan_id)
+        if known_digest != _digest(request):
             raise _service_error("control.plan_stale")
         result = _required(self._ollama_fleet).apply_ollama_instance(
             plan_id, expected_generation=_generation(request)
         )
+        if type(result) is OperationV1:
+            return public_operation_status(result)
         return _serialize_ollama_apply(result)
 
     def _ollama_instance_probe(
@@ -1000,7 +1016,25 @@ class MasterjetControlService:
             cast(str, request.arguments["instance_ref"]),
             expected_generation=_generation(request),
         )
+        if type(status) is OperationV1:
+            return public_operation_status(status)
         return _serialize_ollama_readiness(status)
+
+    def _ollama_instance_stop(
+        self,
+        _principal: AdminPrincipalV1,
+        request: AdminRequestV1,
+        *_values: object,
+    ) -> dict[str, object]:
+        result = _required(self._ollama_fleet).stop_ollama_instance(
+            cast(str, request.arguments["instance_ref"]),
+            expected_generation=_generation(request),
+        )
+        if type(result) is OperationV1:
+            return public_operation_status(result)
+        if result is None:
+            return {"schema_version": 1, "stopped": True}
+        raise _service_error("control.response_private")
 
     def _operation_get(
         self,
@@ -1009,7 +1043,12 @@ class MasterjetControlService:
         *_values: object,
     ) -> dict[str, object]:
         operation_id = cast(str, request.arguments["operation_id"])
-        operation = self._operation_store.get(operation_id)
+        try:
+            operation = self._operation_store.get(operation_id)
+        except AdminOperationError as error:
+            if error.code != "control.operation_not_found" or self._agent_operations is None:
+                raise
+            return self._agent_ollama_operation_get(operation_id)
         agent_operation_id = self._operation_store.agent_operation_id(operation_id)
         if agent_operation_id is None:
             return public_operation_status(operation)
@@ -1030,6 +1069,49 @@ class MasterjetControlService:
                 raise _service_error("resource.host_response_invalid")
             return public_operation_status(
                 operation,
+                result_kind=agent_result_kind(result.kind, result.action),
+                result=result.payload,
+            )
+        except (AdminContractError, AgentOperationError):
+            raise _service_error("resource.host_response_invalid") from None
+
+    def _agent_ollama_operation_get(self, operation_id: str) -> dict[str, object]:
+        """Project only Task-8 Ollama queue records; no HostProbe owner binding."""
+
+        if self._agent_operations is None:
+            raise _service_error("resource.host_response_invalid")
+        try:
+            view = self._agent_operations.get(operation_id)
+            if view.kind != "ollama.instance" or view.action not in {
+                "plan", "apply", "probe", "stop"
+            }:
+                raise _service_error("resource.host_response_invalid")
+            state = "running" if view.state == "leased" else view.state
+            if state == "cancelled":
+                state = "failed"
+            public = OperationV1(
+                view.operation_id,
+                "ollama.instance." + view.action,
+                state,
+                view.registry_generation,
+                view.registry_generation if state == "succeeded" else None,
+                view.plan_digest,
+                view.created_at,
+                view.deadline,
+                1 if state == "succeeded" else 0,
+                1 if state in {"failed", "unknown"} else 0,
+                0 if state in {"succeeded", "failed", "unknown", "cancelled"} else 1,
+                view.reason_codes
+                if state in {"succeeded", "failed", "unknown"}
+                else ("control.operation_queued",),
+            )
+            if state != "succeeded":
+                return public_operation_status(public)
+            result = self._agent_operations.result(operation_id)
+            if result is None:
+                raise _service_error("resource.host_response_invalid")
+            return public_operation_status(
+                public,
                 result_kind=agent_result_kind(result.kind, result.action),
                 result=result.payload,
             )
@@ -1439,6 +1521,7 @@ _COMMAND_HANDLERS: Mapping[str, Handler] = MappingProxyType(
         "ollama.instance.plan": MasterjetControlService._ollama_instance_plan,
         "ollama.instance.apply": MasterjetControlService._ollama_instance_apply,
         "ollama.instance.probe": MasterjetControlService._ollama_instance_probe,
+        "ollama.instance.stop": MasterjetControlService._ollama_instance_stop,
     }
 )
 

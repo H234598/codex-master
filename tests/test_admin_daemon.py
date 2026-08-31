@@ -189,11 +189,9 @@ def test_readiness_cannot_race_a_partially_bound_transport(
 
 def test_admin_assembly_primitives_are_sparse_local_and_close_in_reverse_order() -> None:
     assert str(admin_assembly.AdminAssemblyError()) == "control.admin_configuration_invalid"
-    leases = admin_assembly._ControlHostOllamaLeases()
-    assert leases.resolve(admin_assembly.CONTROL_HOST_REF) is not None
-    assert leases.resolve("remote-host") is None
-    with pytest.raises(admin_assembly.BrokerTransportError, match="resource.host_unreachable"):
-        admin_assembly._LocalOnlyOllamaBroker().exchange("private")
+    assert not hasattr(admin_assembly, "_LocalOnlyOllamaBroker")
+    assert hasattr(admin_assembly, "AgentQueueRemoteOllamaOperationPort")
+    assert hasattr(admin_assembly, "HostRegistryOllamaLeaseSource")
 
     closed: list[str] = []
     admin_assembly._close_partial(

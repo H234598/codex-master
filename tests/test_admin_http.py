@@ -660,6 +660,12 @@ def test_ollama_rest_queries_reject_unsupported_methods(tmp_path, method) -> Non
             {"instance_ref": "quiet-runner"},
             {"expected_generation": 4, "idempotency_key": "probe-one"},
         ),
+        (
+            "/admin/v1/ollama/instances/quiet-runner/stop",
+            "ollama.instance.stop",
+            {"instance_ref": "quiet-runner"},
+            {"expected_generation": 4, "idempotency_key": "stop-one"},
+        ),
     ],
 )
 def test_ollama_rest_commands_bind_route_identity(

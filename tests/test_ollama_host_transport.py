@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+import json
+from pathlib import Path
 
 import pytest
 
 from codex_master.fleet_home_broker_transport import (
+    BrokerOllamaInstancePayload,
+    BrokerOperationRequest,
     BrokerOperationResponse,
 )
 from codex_master.ollama_host_transport import (
+    AgentQueueRemoteOllamaOperationPort,
     CONTROL_HOST_REF,
+    HostRegistryOllamaLeaseSource,
     OllamaHostError,
     OllamaHostLease,
+    OllamaHostPlan,
     OllamaHostTransport,
+    OllamaRemoteApplyRequestV1,
+    OllamaRemotePlanRequestV1,
+    OllamaRemoteProbeRequestV1,
+    OllamaRemoteStopRequestV1,
     Task3LocalOllamaHostAdapter,
 )
 from codex_master.ollama_registry import (
@@ -20,6 +32,13 @@ from codex_master.ollama_registry import (
     OllamaRegistryV1,
 )
 from codex_master.ollama_runtime import OllamaReadinessStatus
+from codex_master.admin_contracts import OperationV1
+from codex_master.admin_hosts import AgentBindingV1, HostRegistry
+from codex_master.agent_operations import (
+    AgentOperationStore,
+    AgentPrincipalV1,
+)
+from codex_master.agent_contracts import AgentPollV1
 
 
 MODEL_GENERATION = 8
@@ -55,6 +74,21 @@ def instance(
 
 def registry(placed: OllamaInstanceV1) -> OllamaRegistryV1:
     return OllamaRegistryV1(1, MODEL_GENERATION, (model(),), (placed,))
+
+
+def _agent_host_registry(tmp_path: Path) -> HostRegistry:
+    hosts = HostRegistry.for_test(tmp_path / "hosts")
+    hosts.provision_agent_binding(
+        {
+            "ref": "worker-west",
+            "label": "Worker West",
+            "role": "execution",
+            "capabilities": ["ollama.execute", "resource.probe"],
+        },
+        AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
+        expected_generation=0,
+    )
+    return hosts
 
 
 @dataclass
@@ -165,6 +199,60 @@ class ProbeBroker(FakeBroker):
         )
 
 
+class _BrokerRemoteOllamaPort:
+    """Legacy wire double behind the new remote-port boundary."""
+
+    def __init__(self, broker: FakeBroker) -> None:
+        self._broker = broker
+        self._plans = {}
+
+    def plan(self, request):
+        self._plans[request.plan_digest] = request
+        return self._call("plan", request, request.plan_digest)
+
+    def apply(self, request):
+        return self._call("apply", request, request.plan_digest)
+
+    def probe(self, request):
+        return self._call("probe", request, request.plan_digest)
+
+    def stop(self, request):
+        return self._call("stop", request, request.plan_digest)
+
+    def _call(self, action, request, plan_digest):
+        try:
+            planned = self._plans[plan_digest]
+            payload = BrokerOllamaInstancePayload(
+                request.host_ref,
+                request.instance_ref,
+                planned.selected_model_refs,
+                planned.allowed_cpus,
+                planned.cpu_quota_percent,
+                planned.cpu_weight,
+                request.registry_generation,
+                planned.runtime_generation,
+                planned.fence,
+                plan_digest,
+                planned.idempotency_key,
+            )
+            response = self._broker.exchange(
+                BrokerOperationRequest(
+                    1,
+                    "ollama.instance",
+                    action,
+                    request.host_ref,
+                    "lease-" + "a" * 32,
+                    "a" * 32,
+                    payload,
+                ),
+                timeout_seconds=5,
+                max_response_bytes=64 * 1024,
+            )
+        except Exception as error:
+            raise OllamaHostError(str(error)) from None
+        return json.loads(response.payload.decode("ascii"))
+
+
 class FakeLocalAdapter:
     def __init__(self) -> None:
         self.calls = []
@@ -185,6 +273,35 @@ class FakeLocalAdapter:
 
     def stop(self, running):
         self.calls.append(("stop", running))
+
+
+class _RecordingAgentStore:
+    def __init__(self) -> None:
+        self.enqueued_actions: list[tuple[str, str]] = []
+
+
+class _QueuedRemoteOllamaPort:
+    """Real transport-shaped double: only the remote side sees the queue."""
+
+    def __init__(self) -> None:
+        self.agent_store = _RecordingAgentStore()
+
+    def plan(self, request):
+        self.agent_store.enqueued_actions.append(("ollama.instance", "plan"))
+        return OperationV1(
+            "operation-remote-plan",
+            "ollama.instance.plan",
+            "queued",
+            request.registry_generation,
+            None,
+            "sha256:" + request.plan_digest,
+            datetime(2026, 8, 30, tzinfo=UTC),
+            datetime(2026, 8, 30, tzinfo=UTC) + timedelta(minutes=5),
+            0,
+            0,
+            1,
+            ("control.operation_queued",),
+        )
 
 
 def lease(host_ref: str, *, fence: int = FENCE, expires_at: float = 200.0):
@@ -208,11 +325,131 @@ def transport_for(
     transport = OllamaHostTransport(
         registry=RegistrySource(registry(placed)),
         leases=LeaseSource(current_lease or lease(placed.host_ref)),
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=local,
         monotonic=lambda: now,
     )
     return transport, broker, local
+
+
+def test_remote_plan_enqueues_and_local_plan_stays_direct() -> None:
+    local_instance = replace(instance(CONTROL_HOST_REF), ref="ollama-control")
+    remote_instance = replace(instance("worker-west"), ref="ollama-worker-west")
+    source = RegistrySource(
+        OllamaRegistryV1(1, MODEL_GENERATION, (model(),), (local_instance, remote_instance))
+    )
+    remote = _QueuedRemoteOllamaPort()
+    local = FakeLocalAdapter()
+
+    transport = OllamaHostTransport(
+        registry=source,
+        local=local,
+        remote=remote,
+        monotonic=lambda: 100.0,
+    )
+
+    planned_local = transport.plan(local_instance, generation=MODEL_GENERATION)
+    planned_remote = transport.plan(remote_instance, generation=MODEL_GENERATION)
+
+    assert isinstance(planned_local, OllamaHostPlan)
+    assert planned_remote.state == "queued"
+    assert [call[0] for call in local.calls] == ["plan"]
+    assert remote.agent_store.enqueued_actions == [("ollama.instance", "plan")]
+
+
+def test_agent_queue_port_enqueues_only_remote_ollama_plan(tmp_path: Path) -> None:
+    hosts = _agent_host_registry(tmp_path)
+    agent_store = AgentOperationStore.for_test(tmp_path / "agent-operations")
+    local_adapter = FakeLocalAdapter()
+    local_instance = replace(instance(CONTROL_HOST_REF), ref="ollama-control")
+    remote_instance = replace(instance(), ref="ollama-worker-west")
+    transport = OllamaHostTransport(
+        registry=RegistrySource(registry(remote_instance)),
+        leases=HostRegistryOllamaLeaseSource(hosts),
+        local=local_adapter,
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=agent_store, host_registry=hosts
+        ),
+    )
+
+    local = transport.plan(local_instance, generation=MODEL_GENERATION)
+    remote = transport.plan(remote_instance, generation=MODEL_GENERATION)
+
+    assert isinstance(local, OllamaHostPlan)
+    assert remote.state == "queued"
+    assert local_adapter.calls[0][0] == "plan"
+    queued = agent_store.get(remote.id)
+    assert (queued.kind, queued.action) == (
+        "ollama.instance",
+        "plan",
+    )
+    assert queued.plan_digest == remote.plan_digest
+    leased = agent_store.poll(
+        AgentPrincipalV1("worker-west", hosts.document_generation()),
+        AgentPollV1(
+            hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
+        ),
+    )
+    assert leased.host_ref == "worker-west"
+
+
+def test_agent_queue_port_uses_the_fixed_agent_allowlist_and_epoch(tmp_path: Path) -> None:
+    hosts = _agent_host_registry(tmp_path)
+    store = AgentOperationStore.for_test(tmp_path / "agent-operations")
+    port = AgentQueueRemoteOllamaOperationPort(
+        agent_operations=store, host_registry=hosts
+    )
+    digest = "b" * 64
+    plan = port.plan(
+        OllamaRemotePlanRequestV1(
+            "worker-west", "ollama-worker-west", 8, 13, 3, 3, digest,
+            "a" * 64, ("llama-small",), "2-3", 200, 50,
+        )
+    )
+    apply = port.apply(
+        OllamaRemoteApplyRequestV1(
+            "worker-west", "ollama-worker-west", 8, None, 3, digest, "plan-one"
+        )
+    )
+    probe = port.probe(
+        OllamaRemoteProbeRequestV1(
+            "worker-west", "ollama-worker-west", 8, None, 3, digest
+        )
+    )
+    stopped = port.stop(
+        OllamaRemoteStopRequestV1(
+            "worker-west", "ollama-worker-west", 8, None, 3, digest
+        )
+    )
+
+    queued = tuple(store.get(operation.id) for operation in (plan, apply, probe, stopped))
+    assert [(item.kind, item.action) for item in queued] == [
+        ("ollama.instance", "plan"),
+        ("ollama.instance", "apply"),
+        ("ollama.instance", "probe"),
+        ("ollama.instance", "stop"),
+    ]
+    leases = tuple(
+        store.poll(
+            AgentPrincipalV1("worker-west", hosts.document_generation()),
+            AgentPollV1(
+                hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
+            ),
+        )
+        for _ in queued
+    )
+    assert [dict(item.arguments) for item in leases] == [
+        {"generation": 8, "instance_ref": "ollama-worker-west"},
+        {"plan_ref": "plan-one"},
+        {"generation": 8, "instance_ref": "ollama-worker-west"},
+        {"generation": 8, "instance_ref": "ollama-worker-west"},
+    ]
+    with pytest.raises(OllamaHostError, match=r"^control\.plan_stale$"):
+        port.probe(
+            OllamaRemoteProbeRequestV1(
+                "worker-west", "ollama-worker-west", 8, None, 4, digest
+            )
+        )
 
 
 def test_remote_plan_is_executed_on_selected_host_with_fixed_redacted_payload():
@@ -256,7 +493,7 @@ def test_plan_accepts_new_candidate_bound_to_current_model_catalog():
     transport = OllamaHostTransport(
         registry=source,
         leases=LeaseSource(lease("worker-west")),
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=FakeLocalAdapter(),
         monotonic=lambda: 100.0,
     )
@@ -331,7 +568,7 @@ def test_rotated_lease_gets_distinct_idempotency_binding_and_execution():
     transport = OllamaHostTransport(
         registry=registry_source,
         leases=leases,
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=FakeLocalAdapter(),
         monotonic=lambda: 100.0,
     )
@@ -361,7 +598,7 @@ def test_unknown_or_expired_lease_fails_before_any_host_call():
         transport = OllamaHostTransport(
             registry=RegistrySource(registry(placed)),
             leases=source,
-            broker=broker,
+            remote=_BrokerRemoteOllamaPort(broker),
             local=FakeLocalAdapter(),
             monotonic=lambda: 100.0,
         )
@@ -389,7 +626,7 @@ def test_lease_type_confusion_is_rejected_before_host_call():
                 200.0,
             )
         ),
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=FakeLocalAdapter(),
         monotonic=lambda: 100.0,
     )
@@ -407,7 +644,7 @@ def test_remote_model_refs_cannot_smuggle_paths_or_control_text(unsafe):
     transport = OllamaHostTransport(
         registry=RegistrySource(current),
         leases=LeaseSource(lease("worker-west")),
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=FakeLocalAdapter(),
         monotonic=lambda: 100.0,
     )
@@ -425,7 +662,7 @@ def test_plan_expiry_and_runtime_generation_drift_block_apply_before_effect():
     transport = OllamaHostTransport(
         registry=RegistrySource(registry(placed)),
         leases=leases,
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=FakeLocalAdapter(),
         monotonic=lambda: clock[0],
     )
@@ -451,7 +688,7 @@ def test_registry_generation_or_instance_binding_drift_blocks_apply():
     transport = OllamaHostTransport(
         registry=registry_source,
         leases=LeaseSource(lease("worker-west")),
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=FakeLocalAdapter(),
         monotonic=lambda: 100.0,
     )
@@ -485,7 +722,7 @@ def test_malformed_remote_plan_response_is_code_only_and_fail_closed():
     transport = OllamaHostTransport(
         registry=RegistrySource(registry(placed)),
         leases=LeaseSource(lease("worker-west")),
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=FakeLocalAdapter(),
         monotonic=lambda: 100.0,
     )
@@ -549,7 +786,7 @@ def test_remote_not_ready_probe_accepts_bounded_ollama_model_ids():
     transport = OllamaHostTransport(
         registry=RegistrySource(registry(placed)),
         leases=LeaseSource(lease("worker-west")),
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=FakeLocalAdapter(),
         monotonic=lambda: 100.0,
     )
@@ -586,7 +823,7 @@ def test_remote_not_ready_probe_rejects_missing_reason_or_absolute_path(
     transport = OllamaHostTransport(
         registry=RegistrySource(registry(placed)),
         leases=LeaseSource(lease("worker-west")),
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=FakeLocalAdapter(),
         monotonic=lambda: 100.0,
     )
@@ -609,7 +846,7 @@ def test_remote_ready_probe_requires_model_evidence():
     transport = OllamaHostTransport(
         registry=RegistrySource(registry(placed)),
         leases=LeaseSource(lease("worker-west")),
-        broker=broker,
+        remote=_BrokerRemoteOllamaPort(broker),
         local=FakeLocalAdapter(),
         monotonic=lambda: 100.0,
     )

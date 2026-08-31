@@ -1082,6 +1082,65 @@ def test_operations_get_resolves_only_by_opaque_operation_id() -> None:
     assert owners.operation_store.calls == 1
 
 
+def test_operations_get_projects_a_direct_ollama_agent_result_without_probe_binding(
+    tmp_path,
+) -> None:
+    admin_operations = AdminOperationStore.for_test(tmp_path, clock=lambda: CREATED)
+    agent_operations = AgentOperationStore.for_test(tmp_path, clock=lambda: CREATED)
+    queued = agent_operations.enqueue(
+        AgentOperationRequestV1(
+            key="ollama-result-one",
+            kind="ollama.instance",
+            action="plan",
+            registry_generation=7,
+            plan_digest="sha256:" + "a" * 64,
+            arguments={"instance_ref": "remote-west", "generation": 4},
+            deadline=CREATED + timedelta(minutes=5),
+            target_host_ref="worker-one",
+        )
+    )
+    lease = agent_operations.poll(
+        AgentPrincipalV1("worker-one", 7),
+        AgentPollV1(7, 3, "sha256:" + "c" * 64, 0),
+    )
+    result = AgentResultV1(
+        "ollama.instance", "plan", {"plan_ref": "remote-plan-one"}
+    )
+    agent_operations.complete(
+        AgentPrincipalV1("worker-one", 7),
+        AgentReceiptV1(
+            lease.operation_id,
+            lease.lease_id,
+            lease.lease_epoch,
+            lease.attempt,
+            lease.plan_digest,
+            lease.arguments_digest,
+            "succeeded",
+            ("host.operation_succeeded",),
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    serialize_agent_result(result),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            result,
+        ),
+    )
+
+    payload = _service_with_operation_stores(
+        admin_operations, agent_operations
+    ).query(
+        principal("fleet.read"), "operations.get", {"operation_id": queued.operation_id}
+    )
+
+    assert payload["kind"] == "ollama.instance.plan"
+    assert payload["state"] == "succeeded"
+    assert payload["result_kind"] == "ollama.instance.plan"
+    assert payload["result"] == {"plan_ref": "remote-plan-one"}
+
+
 def _bound_host_probe_stores(tmp_path, *, agent_clock=lambda: CREATED):
     admin_operations = AdminOperationStore.for_test(
         tmp_path, clock=lambda: CREATED

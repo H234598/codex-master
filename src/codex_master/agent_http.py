@@ -26,6 +26,7 @@ from .agent_operations import (
     AgentOperationError,
     AgentPrincipalV1 as OperationPrincipalV1,
 )
+from .fleet_service import FleetConflictError
 
 
 MAX_AGENT_BODY_BYTES: Final[int] = 64 * 1024
@@ -173,7 +174,7 @@ class AgentHttpApplication:
                 raise AgentContractError
             _validate_binding_epoch(principal, receipt)
             owner = self._completion_owner
-            if receipt.result.kind == "host.probe" and callable(getattr(owner, "complete", None)):
+            if callable(getattr(owner, "complete", None)):
                 owner.complete(principal, receipt)
             else:
                 self._store.complete(_operation_principal(principal), receipt)
@@ -195,6 +196,8 @@ class AgentHttpApplication:
             return _problem(400, "agent.request_invalid")
         except (AdminOperationError, HostRegistryError):
             return _problem(503, "agent.temporarily_unavailable")
+        except FleetConflictError:
+            return _problem(400, "agent.request_invalid")
         except (AgentContractError, UnicodeError, ValueError, TypeError, RecursionError):
             return _problem(400, "agent.request_invalid")
 

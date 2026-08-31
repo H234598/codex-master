@@ -59,6 +59,10 @@ _OLLAMA_PROBE_ROUTE = re.compile(
     r"/admin/v1/ollama/instances/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})/probe\Z",
     re.ASCII,
 )
+_OLLAMA_STOP_ROUTE = re.compile(
+    r"/admin/v1/ollama/instances/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})/stop\Z",
+    re.ASCII,
+)
 _HOST_PROBE_ROUTE = re.compile(
     r"/admin/v1/hosts/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})/probe\Z",
     re.ASCII,
@@ -204,6 +208,7 @@ class _AdminHandler(BaseHTTPRequestHandler):
         route_arguments: dict[str, str] = {}
         apply_match = _OLLAMA_APPLY_ROUTE.fullmatch(self.path)
         probe_match = _OLLAMA_PROBE_ROUTE.fullmatch(self.path)
+        stop_match = _OLLAMA_STOP_ROUTE.fullmatch(self.path)
         host_probe_match = _HOST_PROBE_ROUTE.fullmatch(self.path)
         if self.path == "/admin/v1":
             pass
@@ -215,6 +220,9 @@ class _AdminHandler(BaseHTTPRequestHandler):
         elif probe_match is not None:
             expected_operation = "ollama.instance.probe"
             route_arguments = {"instance_ref": probe_match.group(1)}
+        elif stop_match is not None:
+            expected_operation = "ollama.instance.stop"
+            route_arguments = {"instance_ref": stop_match.group(1)}
         elif host_probe_match is not None:
             expected_operation = "hosts.probe"
             route_arguments = {"host_ref": host_probe_match.group(1)}
