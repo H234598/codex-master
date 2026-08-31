@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sys
+
+import pytest
 
 USAGE_SRC = Path(
     "/run/media/teladi/SSD3/codex-worktrees/worktrees/codex-usage/"
@@ -12,12 +15,17 @@ sys.path.insert(0, str(USAGE_SRC))
 
 from codex_usage.masterjet_client import _encode_request, _step_up_challenge  # noqa: E402
 from codex_usage.masterjet_contracts import (  # noqa: E402
+    ControlContractError,
     parse_operation_status,
     parse_secret_ingress_receipt,
     parse_secret_ingress_session,
 )
 
-from codex_master.admin_contracts import parse_admin_request  # noqa: E402
+from codex_master.admin_contracts import (  # noqa: E402
+    AdminContractError,
+    parse_admin_request,
+    public_agent_result,
+)
 from test_admin_http import (  # noqa: E402
     _headers,
     _request,
@@ -65,6 +73,62 @@ def test_usage_parses_the_exact_running_operation_status_wire() -> None:
 
     assert status.result_kind is None
     assert status.result is None
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"observed_at": "2026-99-99T99:99:99Z"},
+        {"agent_generation": 0},
+    ],
+)
+def test_master_and_usage_reject_identical_invalid_host_probe_boundaries(
+    override,
+) -> None:
+    evidence = {
+        "kernel_class": "linux",
+        "architecture_class": "x86_64",
+        "cpu_count": 8,
+        "memory_class": "8-31-gib",
+        "cgroup_v2": True,
+        "systemd": True,
+        "load_class": "idle",
+        "pressure_class": "none",
+        "ollama_capability": True,
+        "observed_at": "2026-08-28T10:00:00Z",
+        "agent_generation": 1,
+    } | override
+    digest = "sha256:" + hashlib.sha256(
+        json.dumps(
+            evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+    ).hexdigest()
+    result = evidence | {"evidence_digest": digest}
+
+    with pytest.raises(
+        AdminContractError, match=r"resource\.host_response_invalid"
+    ):
+        public_agent_result("host.probe", result)
+    with pytest.raises(ControlContractError, match=r"control\.response_invalid"):
+        parse_operation_status(
+            {
+                "schema_version": 1,
+                "id": "operation-one",
+                "kind": "hosts.probe",
+                "state": "succeeded",
+                "expected_generation": 4,
+                "resulting_generation": 5,
+                "plan_digest": "sha256:" + "a" * 64,
+                "created_at": "2026-08-28T10:00:00Z",
+                "expires_at": "2026-08-28T10:05:00Z",
+                "completed_count": 1,
+                "failed_count": 0,
+                "not_attempted_count": 0,
+                "reason_codes": [],
+                "result_kind": "host.probe",
+                "result": result,
+            }
+        )
 
 
 def test_real_usage_parser_accepts_canonical_admin_secret_session(tmp_path) -> None:

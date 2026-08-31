@@ -15,7 +15,7 @@ from typing import Literal, cast
 _MAX_INT = 2**63 - 1
 _MAX_WAIT_SECONDS = 30
 _MAX_REASON_CODES = 32
-_MAX_RESULT_BYTES = 256 * 1024
+MAX_AGENT_RESULT_BYTES = 256 * 1024
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 _UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
@@ -144,7 +144,7 @@ def _freeze_json(value: object) -> object:
         return _integer(value)
     if type(value) is str:
         encoded = value.encode("utf-8")
-        if not value or len(encoded) > _MAX_RESULT_BYTES or any(ord(char) < 32 for char in value):
+        if not value or len(encoded) > MAX_AGENT_RESULT_BYTES or any(ord(char) < 32 for char in value):
             _invalid()
         if _UTC_TIMESTAMP.fullmatch(value) is not None:
             try:
@@ -250,7 +250,7 @@ class AgentResultV1:
         encoded = _canonical_bytes(
             {"kind": kind, "action": action, "payload": _public_json(payload)}
         )
-        if len(encoded) > _MAX_RESULT_BYTES:
+        if len(encoded) > MAX_AGENT_RESULT_BYTES:
             _invalid()
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "action", action)
@@ -412,6 +412,7 @@ __all__ = [
     "AgentPollV1",
     "AgentReceiptV1",
     "AgentResultV1",
+    "MAX_AGENT_RESULT_BYTES",
     "parse_agent_poll",
     "parse_agent_receipt",
     "serialize_agent_lease",

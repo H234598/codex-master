@@ -21,6 +21,7 @@ from codex_master.agent_contracts import (
     AgentPollV1,
     AgentReceiptV1,
     AgentResultV1,
+    MAX_AGENT_RESULT_BYTES,
     serialize_agent_result,
 )
 from codex_master.hive.state import HiveStateError, HiveStateStore
@@ -28,12 +29,14 @@ from codex_master.hive.state import HiveStateError, HiveStateStore
 
 MAX_AGENT_OPERATION_RECORDS = 1024
 MAX_AGENT_OPERATION_STATE_BYTES = 4 * 1024 * 1024
+MAX_AGENT_RESULT_DOCUMENT_BYTES = MAX_AGENT_RESULT_BYTES + 1024
 AGENT_OPERATION_LIFETIME = timedelta(minutes=15)
 AGENT_OPERATION_LEASE = timedelta(seconds=30)
 MAX_AGENT_OPERATION_ATTEMPTS = 8
 MAX_AGENT_EXHAUSTION_RECONCILIATIONS_PER_POLL = 8
 
 _DOCUMENT = PurePosixPath("operations.json")
+_RESULT_DOCUMENTS = PurePosixPath("results")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 _STATES = frozenset({"queued", "leased", "succeeded", "failed", "unknown", "cancelled"})
@@ -612,6 +615,11 @@ class AgentOperationStore:
             document = self._read_locked()
             record = self._find(document["operations"], receipt.operation_id)
             terminal = self._validate_completion_locked(principal, receipt, record)
+            self._write_result_locked(
+                receipt.operation_id,
+                receipt.result,
+                receipt.result_digest,
+            )
             if terminal:
                 return self._view(record)
             record["state"] = receipt.state
@@ -836,19 +844,45 @@ class AgentOperationStore:
         with self._state.locked():
             record = self._find(self._read_locked()["operations"], operation_id)
             completion = record["completion"]
-            if type(completion) is not dict or "result" not in completion:
+            if type(completion) is not dict:
                 return None
+            wire = completion.get("result")
+            if wire is None:
+                result_digest = completion.get("result_digest")
+                if result_digest is None:
+                    return None
+                try:
+                    raw = self._state.read_private_bytes(
+                        _RESULT_DOCUMENTS / operation_id,
+                        max_bytes=MAX_AGENT_RESULT_DOCUMENT_BYTES,
+                    )
+                except (HiveStateError, OSError):
+                    _raise("host.operation_store_unavailable")
+                try:
+                    document = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+                    _raise("host.operation_store_unavailable")
+                if (
+                    type(document) is not dict
+                    or set(document) != {"schema_version", "operation_id", "result"}
+                    or document["schema_version"] != 1
+                    or document["operation_id"] != operation_id
+                ):
+                    _raise("host.operation_store_unavailable")
+                wire = document["result"]
             try:
+                if type(wire) is not dict:
+                    _raise("host.operation_store_unavailable")
                 result = AgentResultV1(
                     record["kind"],
                     record["action"],
-                    cast(dict[str, object], completion["result"])["payload"],
+                    cast(dict[str, object], wire)["payload"],
                 )
                 serialized = serialize_agent_result(result)
             except (AgentContractError, KeyError, TypeError, ValueError):
                 _raise("host.operation_store_unavailable")
             if (
-                completion["result"] != serialized
+                wire != serialized
                 or completion.get("result_digest") != _canonical_digest(serialized)
             ):
                 _raise("host.operation_store_unavailable")
@@ -1114,6 +1148,32 @@ class AgentOperationStore:
             _raise("host.operation_store_unavailable")
         self._state.replace_private_bytes(_DOCUMENT, encoded)
 
+    def _write_result_locked(
+        self,
+        operation_id: str,
+        result: AgentResultV1,
+        result_digest: str,
+    ) -> None:
+        serialized = serialize_agent_result(result)
+        if _canonical_digest(serialized) != result_digest:
+            _raise("host.result_mismatch")
+        encoded = _canonical_bytes(
+            {
+                "schema_version": 1,
+                "operation_id": operation_id,
+                "result": serialized,
+            }
+        )
+        if len(encoded) > MAX_AGENT_RESULT_DOCUMENT_BYTES:
+            _raise("host.operation_store_unavailable")
+        try:
+            self._state.replace_private_bytes(
+                _RESULT_DOCUMENTS / operation_id,
+                encoded,
+            )
+        except (HiveStateError, OSError):
+            _raise("host.operation_store_unavailable")
+
     def _validate_document(self, payload: object) -> dict[str, Any]:
         if type(payload) is not dict or set(payload) != {
             "schema_version",
@@ -1358,7 +1418,12 @@ class AgentOperationStore:
             )
             if (
                 record["state"] != receipt.state
-                or existing != self._completion_doc(receipt)
+                or type(existing) is not dict
+                or {
+                    "reason_codes": existing["reason_codes"],
+                    "result_digest": existing["result_digest"],
+                }
+                != self._completion_doc(receipt)
             ):
                 _raise("host.completion_conflict")
             return True
@@ -1379,7 +1444,6 @@ class AgentOperationStore:
         return {
             "reason_codes": list(receipt.reason_codes),
             "result_digest": receipt.result_digest,
-            "result": serialize_agent_result(receipt.result),
         }
 
     def _view(self, record: Mapping[str, Any]) -> AgentOperationViewV1:
@@ -1429,6 +1493,7 @@ __all__ = [
     "AGENT_OPERATION_LIFETIME",
     "MAX_AGENT_OPERATION_ATTEMPTS",
     "MAX_AGENT_OPERATION_RECORDS",
+    "MAX_AGENT_RESULT_DOCUMENT_BYTES",
     "MAX_AGENT_EXHAUSTION_RECONCILIATIONS_PER_POLL",
     "AgentAttemptExhaustionV1",
     "AgentOperationDeadlineExpiryV1",

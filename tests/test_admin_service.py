@@ -10,7 +10,14 @@ from threading import Lock
 import pytest
 import codex_master.admin_service as admin_service_module
 
-from codex_master.admin_contracts import AdminPrincipalV1, AdminRequestV1, OperationV1
+from codex_master.admin_contracts import (
+    AdminContractError,
+    AdminPrincipalV1,
+    AdminRequestV1,
+    OperationV1,
+    public_agent_result,
+    public_operation_status,
+)
 from codex_master.admin_hosts import ControlHostV1
 from codex_master.admin_operations import AdminOperationPlan, AdminOperationStore
 from codex_master.agent_contracts import (
@@ -1075,14 +1082,12 @@ def test_operations_get_resolves_only_by_opaque_operation_id() -> None:
     assert owners.operation_store.calls == 1
 
 
-def test_operations_get_merges_a_terminal_agent_result_from_real_stores(tmp_path) -> None:
-    """RED: the service only serializes AdminOperationStore and drops agent output."""
-
+def _bound_host_probe_stores(tmp_path, *, agent_clock=lambda: CREATED):
     admin_operations = AdminOperationStore.for_test(
         tmp_path, clock=lambda: CREATED
     )
     agent_operations = AgentOperationStore.for_test(
-        tmp_path, clock=lambda: CREATED
+        tmp_path, clock=agent_clock
     )
     plan = admin_operations.plan(
         kind="hosts.probe",
@@ -1098,7 +1103,7 @@ def test_operations_get_merges_a_terminal_agent_result_from_real_stores(tmp_path
             registry_generation=7,
             plan_digest=plan.plan_digest,
             arguments={"admin_operation_id": plan.operation_id, "probe_schema": 1},
-            deadline=CREATED + timedelta(minutes=5),
+            deadline=CREATED + timedelta(minutes=15),
             target_host_ref="worker-one",
         )
     )
@@ -1108,6 +1113,10 @@ def test_operations_get_merges_a_terminal_agent_result_from_real_stores(tmp_path
         target_host_ref="worker-one",
         plan_digest=plan.plan_digest,
     )
+    return admin_operations, agent_operations, plan
+
+
+def _probe_receipt(agent_operations):
     lease = agent_operations.poll(
         AgentPrincipalV1("worker-one", 7),
         AgentPollV1(7, 3, "sha256:" + "c" * 64, 0),
@@ -1147,16 +1156,12 @@ def test_operations_get_merges_a_terminal_agent_result_from_real_stores(tmp_path
         ).hexdigest(),
         result,
     )
-    agent_operations.complete(AgentPrincipalV1("worker-one", 7), receipt)
-    admin_operations.begin(plan.operation_id, current_generation=4)
-    admin_operations.record_step(
-        plan.operation_id, "host.probe.collect", succeeded=True
-    )
-    admin_operations.finish(
-        plan.operation_id, state="succeeded", resulting_generation=5
-    )
+    return lease, probe_payload, receipt
+
+
+def _service_with_operation_stores(admin_operations, agent_operations):
     _unused, owners = service_at()
-    service = MasterjetControlService(
+    return MasterjetControlService(
         operation_store=admin_operations,
         agent_operations=agent_operations,
         openai_accounts=owners.openai_accounts,
@@ -1172,6 +1177,27 @@ def test_operations_get_merges_a_terminal_agent_result_from_real_stores(tmp_path
         ollama_fleet=owners.ollama_fleet,
     )
 
+
+def _finish_probe_admin_operation(admin_operations, plan, *, reason_codes=()):
+    admin_operations.begin(plan.operation_id, current_generation=4)
+    admin_operations.record_step(
+        plan.operation_id, "host.probe.collect", succeeded=True
+    )
+    admin_operations.finish(
+        plan.operation_id,
+        state="succeeded",
+        resulting_generation=5,
+        reason_codes=reason_codes,
+    )
+
+
+def test_operations_get_merges_a_terminal_agent_result_from_real_stores(tmp_path) -> None:
+    admin_operations, agent_operations, plan = _bound_host_probe_stores(tmp_path)
+    _lease, probe_payload, receipt = _probe_receipt(agent_operations)
+    agent_operations.complete(AgentPrincipalV1("worker-one", 7), receipt)
+    _finish_probe_admin_operation(admin_operations, plan)
+    service = _service_with_operation_stores(admin_operations, agent_operations)
+
     payload = service.query(
         principal("fleet.read"), "operations.get", {"operation_id": plan.operation_id}
     )
@@ -1179,6 +1205,175 @@ def test_operations_get_merges_a_terminal_agent_result_from_real_stores(tmp_path
     assert payload["result_kind"] == "host.probe"
     assert payload["result"] == probe_payload
     assert "admin_operation_id" not in payload
+
+
+def test_operations_get_hides_agent_result_until_admin_operation_is_terminal(
+    tmp_path,
+) -> None:
+    admin_operations, agent_operations, plan = _bound_host_probe_stores(tmp_path)
+    _lease, _probe_payload, receipt = _probe_receipt(agent_operations)
+    agent_operations.complete(AgentPrincipalV1("worker-one", 7), receipt)
+
+    payload = _service_with_operation_stores(
+        admin_operations, agent_operations
+    ).query(
+        principal("fleet.read"),
+        "operations.get",
+        {"operation_id": plan.operation_id},
+    )
+
+    assert payload["state"] == "planned"
+    assert payload["result_kind"] is None
+    assert payload["result"] is None
+
+
+@pytest.mark.parametrize("state", ["planned", "queued", "running"])
+def test_public_operation_status_never_projects_a_result_before_terminal(
+    state,
+) -> None:
+    operation = OperationV1(
+        "operation-one",
+        "hosts.probe",
+        state,
+        4,
+        None,
+        DIGEST,
+        CREATED,
+        CREATED + timedelta(minutes=5),
+        0,
+        0,
+        1,
+        ("control.operation_running",),
+    )
+
+    payload = public_operation_status(
+        operation,
+        result_kind="ollama.instance.plan",
+        result={"plan_ref": "plan-one"},
+    )
+
+    assert payload["result_kind"] is None
+    assert payload["result"] is None
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "sk-0123456789abcdefghijklmnop",
+        "AIza" + "a" * 24,
+        "ya29." + "a" * 24,
+        "GOCSPX-" + "a" * 24,
+        "eyJ" + "a" * 24 + "." + "b" * 12 + "." + "c" * 12,
+    ],
+)
+def test_public_agent_result_rejects_secret_shaped_values_in_allowed_fields(
+    secret,
+) -> None:
+    for result_kind, payload in (
+        ("ollama.instance.plan", {"plan_ref": secret}),
+        (
+            "ollama.instance.apply",
+            {"instance_ref": secret, "generation": 1},
+        ),
+        (
+            "ollama.instance.probe",
+            {
+                "ready": True,
+                "reason_codes": [],
+                "process_running": True,
+                "cgroup_member": True,
+                "loopback_endpoint_reachable": True,
+                "available_model_ids": [secret],
+            },
+        ),
+    ):
+        with pytest.raises(
+            AdminContractError, match=r"resource\.host_response_invalid"
+        ):
+            public_agent_result(result_kind, payload)
+
+
+def test_public_agent_result_keeps_benign_tokens_containing_sk_letters() -> None:
+    assert public_agent_result(
+        "ollama.instance.plan", {"plan_ref": "task-one"}
+    ) == {"plan_ref": "task-one"}
+
+
+def test_operations_get_rejects_non_public_admin_reason_codes(tmp_path) -> None:
+    admin_operations, agent_operations, plan = _bound_host_probe_stores(tmp_path)
+    _lease, _probe_payload, receipt = _probe_receipt(agent_operations)
+    agent_operations.complete(AgentPrincipalV1("worker-one", 7), receipt)
+    _finish_probe_admin_operation(
+        admin_operations, plan, reason_codes=("private.agent.marker",)
+    )
+
+    with pytest.raises(
+        AdminServiceError, match=r"resource\.host_response_invalid"
+    ):
+        _service_with_operation_stores(admin_operations, agent_operations).query(
+            principal("fleet.read"),
+            "operations.get",
+            {"operation_id": plan.operation_id},
+        )
+
+
+@pytest.mark.parametrize(
+    "agent_state",
+    ["queued", "cancelled", "deadline", "attempts_exhausted", "legacy_restart"],
+)
+def test_operations_get_rejects_terminal_binding_without_durable_result(
+    tmp_path, agent_state
+) -> None:
+    now = [CREATED]
+
+    def clock():
+        return now[0]
+
+    admin_operations, agent_operations, plan = _bound_host_probe_stores(
+        tmp_path, agent_clock=clock
+    )
+    agent_operation_id = admin_operations.agent_operation_id(plan.operation_id)
+    assert agent_operation_id is not None
+
+    if agent_state == "cancelled":
+        agent_operations.cancel(agent_operation_id)
+    elif agent_state == "deadline":
+        now[0] += timedelta(minutes=16)
+        agent_operations.expire_leases()
+    elif agent_state == "attempts_exhausted":
+        for _ in range(8):
+            lease = agent_operations.poll(
+                AgentPrincipalV1("worker-one", 7),
+                AgentPollV1(7, 3, "sha256:" + "c" * 64, 0),
+            )
+            assert lease.operation_id == agent_operation_id
+            now[0] += timedelta(seconds=31)
+            agent_operations.expire_leases()
+    elif agent_state == "legacy_restart":
+        document_path = tmp_path / "agent-operations" / "operations.json"
+        document = json.loads(document_path.read_text(encoding="utf-8"))
+        record = document["operations"][0]
+        record["state"] = "unknown"
+        record["completion"] = {
+            "reason_codes": ["host.operation_unknown"],
+            "result_digest": "sha256:" + "d" * 64,
+        }
+        document_path.write_text(
+            json.dumps(document, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        agent_operations = AgentOperationStore.for_test(tmp_path, clock=clock)
+
+    _finish_probe_admin_operation(admin_operations, plan)
+
+    with pytest.raises(
+        AdminServiceError, match=r"resource\.host_response_invalid"
+    ):
+        _service_with_operation_stores(admin_operations, agent_operations).query(
+            principal("fleet.read"),
+            "operations.get",
+            {"operation_id": plan.operation_id},
+        )
 
 
 @pytest.mark.parametrize(

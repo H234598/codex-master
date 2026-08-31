@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
+import codex_master.agent_operations as agent_operations_module
 
 from codex_master.agent_contracts import (
     AgentLeaseV1,
@@ -874,6 +875,34 @@ def test_recursive_private_result_fields_are_rejected(tmp_path: Path) -> None:
                 {"nested": {"absolute_path": "/secret"}},
             ),
         )
+
+
+def test_large_result_completion_survives_document_pressure_replay_and_restart(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = store_at(tmp_path)
+    lease = lease_one(store)
+    result = AgentResultV1(
+        "host.probe",
+        "collect",
+        {"data": "x" * (250 * 1024)},
+    )
+    receipt = receipt_for(lease, result=result)
+    document_path = tmp_path / "agent-operations" / "operations.json"
+    constrained_limit = len(document_path.read_bytes()) + 2048
+    monkeypatch.setattr(
+        agent_operations_module,
+        "MAX_AGENT_OPERATION_STATE_BYTES",
+        constrained_limit,
+    )
+
+    completed = store.complete(principal(), receipt)
+    replayed = store.complete(principal(), receipt)
+    restarted = store_at(tmp_path)
+
+    assert completed == replayed
+    assert len(document_path.read_bytes()) <= constrained_limit
+    assert restarted.result(lease.operation_id) == result
 
 
 def test_cancel_queued_is_terminal_and_never_polled_or_redelivered(

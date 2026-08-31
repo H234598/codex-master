@@ -268,7 +268,7 @@ _UTC_TIMESTAMP = re.compile(
 )
 _PRIVATE_TEXT = re.compile(
     r"\b(?:bearer|basic|(?:access|refresh)[\s_.-]*token|client[\s_.-]*secret|api[\s_.-]*key|auth(?:entication|orization)?|token|cookie|credential|passphrase|password|session|secret|jwt)\b"
-    r"|(?:sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
+    r"|(?:\bsk-[A-Za-z0-9_-]*|\bAIza[A-Za-z0-9_-]*|\bya29(?:\.[A-Za-z0-9._-]*)?|\b1//|\bGOCSPX-|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
     r"|file:|\\\\|\\[^\\\s]+|(?:^|[\s\"'=:(\[])/(?:[^\s]+)|[A-Za-z]:[\\/]"
     r"|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
     r"|\b(?:traceback|[A-Z][A-Z0-9_.]*(?:error|exception))\s*(?::|\()",
@@ -276,6 +276,9 @@ _PRIVATE_TEXT = re.compile(
 )
 _OPERATION_STATES = frozenset(
     {"planned", "queued", "running", "partial", "succeeded", "failed", "blocked"}
+)
+_TERMINAL_OPERATION_STATES = frozenset(
+    {"partial", "succeeded", "failed", "blocked"}
 )
 PUBLIC_AGENT_REASON_CODES = frozenset(
     {
@@ -755,9 +758,16 @@ def public_operation_status(
     """Serialize one operation with the fixed asynchronous-result envelope."""
 
     public = public_admin_result(operation)
+    if public["state"] not in _TERMINAL_OPERATION_STATES:
+        return {**public, "result_kind": None, "result": None}
     if result_kind is None and result is None:
         return {**public, "result_kind": None, "result": None}
     if type(result_kind) is not str or result is None:
+        raise AdminContractError("resource.host_response_invalid")
+    reason_codes = public["reason_codes"]
+    if type(reason_codes) is not list or any(
+        code not in PUBLIC_AGENT_REASON_CODES for code in reason_codes
+    ):
         raise AdminContractError("resource.host_response_invalid")
     return {
         **public,
@@ -832,9 +842,13 @@ def _require_result_fields(payload: Mapping[str, object], fields: set[str]) -> N
 
 
 def _result_token(value: object) -> str:
-    if type(value) is not str or _TOKEN.fullmatch(value) is None:
+    try:
+        text = _public_text(value)
+    except AdminContractError:
+        raise AdminContractError("resource.host_response_invalid") from None
+    if _TOKEN.fullmatch(text) is None:
         raise AdminContractError("resource.host_response_invalid")
-    return value
+    return text
 
 
 def _result_generation(value: object) -> int:
@@ -895,6 +909,14 @@ def _public_host_probe_result(payload: Mapping[str, object]) -> dict[str, object
         or type(payload["evidence_digest"]) is not str
         or _DIGEST.fullmatch(cast(str, payload["evidence_digest"])) is None
     ):
+        raise AdminContractError("resource.host_response_invalid")
+    try:
+        observed_at = datetime.strptime(
+            cast(str, payload["observed_at"]), "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=UTC)
+    except ValueError:
+        raise AdminContractError("resource.host_response_invalid") from None
+    if observed_at.strftime("%Y-%m-%dT%H:%M:%SZ") != payload["observed_at"]:
         raise AdminContractError("resource.host_response_invalid")
     evidence = {field: payload[field] for field in fields - {"evidence_digest"}}
     canonical = json.dumps(

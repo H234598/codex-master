@@ -1011,12 +1011,24 @@ class MasterjetControlService:
         operation_id = cast(str, request.arguments["operation_id"])
         operation = self._operation_store.get(operation_id)
         agent_operation_id = self._operation_store.agent_operation_id(operation_id)
-        if agent_operation_id is None or self._agent_operations is None:
+        if agent_operation_id is None:
             return public_operation_status(operation)
+        if operation.state not in {"partial", "succeeded", "failed", "blocked"}:
+            return public_operation_status(operation)
+        if self._agent_operations is None:
+            raise _service_error("resource.host_response_invalid")
         try:
+            agent_operation = self._agent_operations.get(agent_operation_id)
+            if agent_operation.state not in {
+                "succeeded",
+                "failed",
+                "unknown",
+                "cancelled",
+            }:
+                raise _service_error("resource.host_response_invalid")
             result = self._agent_operations.result(agent_operation_id)
             if result is None:
-                return public_operation_status(operation)
+                raise _service_error("resource.host_response_invalid")
             return public_operation_status(
                 operation,
                 result_kind=agent_result_kind(result.kind, result.action),
