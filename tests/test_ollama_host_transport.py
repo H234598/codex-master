@@ -66,6 +66,16 @@ def instance(
     )
 
 
+def owner_instance(ref: str = "ollama-worker-west") -> dict[str, object]:
+    return {
+        "ref": ref, "label": "Worker West", "host_ref": "worker-west",
+        "ollama_executable": "/private/worker/ollama", "models_directory": "/private/worker/models",
+        "selected_model_refs": ["llama-small"], "allowed_cpus": "2-3",
+        "cpu_quota_percent": 200, "cpu_weight": 50,
+        "lifecycle_state": "planned", "readiness_state": "unknown",
+    }
+
+
 def registry(placed: OllamaInstanceV1) -> OllamaRegistryV1:
     return OllamaRegistryV1(1, MODEL_GENERATION, (model(),), (placed,))
 
@@ -305,22 +315,22 @@ def test_agent_queue_port_uses_the_fixed_agent_allowlist_and_epoch(tmp_path: Pat
     plan = port.plan(
         OllamaRemotePlanRequestV1(
             "worker-west", "ollama-worker-west", 8, 13, 3, 3, digest,
-            "a" * 64, ("llama-small",), "2-3", 200, 50,
+            "a" * 64, ("llama-small",), "2-3", 200, 50, None, owner_instance(),
         )
     )
     apply = port.apply(
         OllamaRemoteApplyRequestV1(
-            "worker-west", "ollama-worker-west", 8, None, 3, digest, "plan-one"
+            "worker-west", "ollama-worker-west", 8, None, 3, digest, "plan-one", None, "plan-one", owner_instance()
         )
     )
     probe = port.probe(
         OllamaRemoteProbeRequestV1(
-            "worker-west", "ollama-worker-west", 8, None, 3, digest
+            "worker-west", "ollama-worker-west", 8, None, 3, digest, None, "plan-one", owner_instance()
         )
     )
     stopped = port.stop(
         OllamaRemoteStopRequestV1(
-            "worker-west", "ollama-worker-west", 8, None, 3, digest
+            "worker-west", "ollama-worker-west", 8, None, 3, digest, None, "plan-one", owner_instance()
         )
     )
 
@@ -349,7 +359,7 @@ def test_agent_queue_port_uses_the_fixed_agent_allowlist_and_epoch(tmp_path: Pat
     with pytest.raises(OllamaHostError, match=r"^control\.plan_stale$"):
         port.probe(
             OllamaRemoteProbeRequestV1(
-                "worker-west", "ollama-worker-west", 8, None, 4, digest
+                "worker-west", "ollama-worker-west", 8, None, 4, digest, None, "plan-one", owner_instance()
             )
         )
 
@@ -376,6 +386,8 @@ def test_remote_queue_terminalizes_epoch_rotated_operation_before_lease(
             "2-3",
             200,
             50,
+            None,
+            owner_instance(),
         )
     )
 

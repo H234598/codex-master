@@ -67,6 +67,31 @@ def digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def remote_owner_context(action: str) -> dict[str, object]:
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "owner": "ollama.remote",
+        "action": action,
+        "host_ref": "worker-one",
+        "instance_ref": "ollama-one",
+        "registry_generation": 7,
+        "ollama_registry_generation": 7,
+        "resource_generation": 9,
+        "lease_epoch": 3,
+        "queue_plan_digest": DIGEST_A,
+        "plan_precondition_digest": DIGEST_A,
+        "instance": {
+            "ref": "ollama-one", "label": "Ollama One", "host_ref": "worker-one",
+            "ollama_executable": "/private/ollama", "models_directory": "/private/models",
+            "selected_model_refs": ["model-one"], "allowed_cpus": "1", "cpu_quota_percent": 100,
+            "cpu_weight": 50, "lifecycle_state": "planned", "readiness_state": "unknown",
+        },
+    }
+    if action != "plan":
+        value["plan_id"] = "plan-one"
+    return value
+
+
 def store_at(tmp_path: Path, clock: Clock | None = None) -> AgentOperationStore:
     return AgentOperationStore.for_test(tmp_path, clock=clock or Clock())
 
@@ -100,6 +125,18 @@ def operation_request(
         plan_digest=DIGEST_A,
         arguments=payload,
         deadline=deadline or NOW + timedelta(minutes=15),
+        **(
+            {
+                "target_host_ref": "worker-one",
+                "required_registry_generation": 7,
+                "required_lease_epoch": 3,
+                "resource_generation": 9,
+                "plan_precondition_digest": DIGEST_A,
+                "owner_context": remote_owner_context(action),
+            }
+            if kind == "ollama.instance"
+            else {}
+        ),
     )
 
 
@@ -141,6 +178,7 @@ def receipt_for(
         reason_codes,
         digest(serialize_agent_result(actual_result)),
         actual_result,
+        DIGEST_A if actual_result.kind == "ollama.instance" else None,
     )
 
 
@@ -420,6 +458,7 @@ def test_completion_validation_exposes_owner_context_without_mutation(
         "required_lease_epoch": None,
         "resource_generation": None,
         "plan_precondition_digest": None,
+        "envelope_digest": None,
     }
     assert store.get(queued.operation_id).state == "leased"
     completed = store.complete(principal(), receipt)
@@ -448,6 +487,71 @@ def test_envelope_lease_epoch_fence_terminalizes_before_a_stale_lease(
     terminal = store.get(queued.operation_id)
     assert terminal.state == "failed"
     assert terminal.reason_codes == ("host.lease_epoch_stale",)
+
+
+@pytest.mark.parametrize(
+    ("action", "arguments"),
+    (
+        ("plan", {"instance_ref": "ollama-one", "generation": 7}),
+        ("apply", {"plan_ref": "plan-one"}),
+        ("probe", {"instance_ref": "ollama-one", "generation": 7}),
+        ("stop", {"instance_ref": "ollama-one", "generation": 7}),
+    ),
+)
+def test_legacy_remote_record_without_v2_envelope_terminalizes_before_lease(
+    tmp_path: Path, action: str, arguments: dict[str, object]
+) -> None:
+    store = store_at(tmp_path)
+    request = AgentOperationRequestV1(
+        key="legacy-" + action,
+        kind="ollama.instance",
+        action=action,  # type: ignore[arg-type]
+        registry_generation=7,
+        plan_digest=DIGEST_A,
+        arguments=arguments,
+        deadline=NOW + timedelta(minutes=5),
+        target_host_ref="worker-one",
+        required_registry_generation=7,
+        required_lease_epoch=3,
+        resource_generation=9,
+        plan_precondition_digest=DIGEST_A,
+        owner_context=remote_owner_context(action),
+    )
+    queued = store.enqueue(request)
+    with store._state.locked():  # noqa: SLF001 - production-format migration fixture
+        document = store._read_locked()  # noqa: SLF001
+        record = next(item for item in document["operations"] if item["operation_id"] == queued.operation_id)
+        record.pop("envelope_digest")
+        store._write_locked(document)  # noqa: SLF001
+
+    restarted = store_at(tmp_path)
+    assert isinstance(restarted.poll(principal(), poll()), AgentNoWorkV1)
+    terminal = restarted.get(queued.operation_id)
+    assert terminal.state == "failed"
+    assert terminal.reason_codes == ("host.operation_envelope_stale",)
+
+
+def test_remote_owner_context_survives_restart_before_index_projection(tmp_path: Path) -> None:
+    store = store_at(tmp_path)
+    request = AgentOperationRequestV1(
+        key="owner-crash-boundary",
+        kind="ollama.instance",
+        action="plan",
+        registry_generation=7,
+        plan_digest=DIGEST_A,
+        arguments={"instance_ref": "ollama-one", "generation": 7},
+        deadline=NOW + timedelta(minutes=5),
+        target_host_ref="worker-one",
+        required_registry_generation=7,
+        required_lease_epoch=3,
+        resource_generation=9,
+        plan_precondition_digest=DIGEST_A,
+        owner_context=remote_owner_context("plan"),
+    )
+    queued = store.enqueue(request)
+    # Simulates the owner-index write failing immediately after enqueue.
+    restarted = store_at(tmp_path)
+    assert restarted.owner_context(queued.operation_id) == request.owner_context
 
 
 def test_terminal_completion_replay_validates_original_lease_fences(

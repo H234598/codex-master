@@ -291,6 +291,7 @@ def _post_ollama_receipt(
             json.dumps(serialize_agent_result(result), sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest(),
         result,
+        lease.envelope_digest,
     )
     response = application.handle(
         principal,
@@ -308,9 +309,8 @@ def _receipt_wire(receipt: object) -> bytes:
     from codex_master.agent_contracts import AgentReceiptV1, serialize_agent_result
 
     assert type(receipt) is AgentReceiptV1
-    return json.dumps(
-        {
-            "schema_version": 1,
+    wire = {
+            "schema_version": 2 if receipt.result.kind == "ollama.instance" else 1,
             "operation_id": receipt.operation_id,
             "lease_id": receipt.lease_id,
             "lease_epoch": receipt.lease_epoch,
@@ -321,8 +321,10 @@ def _receipt_wire(receipt: object) -> bytes:
             "reason_codes": list(receipt.reason_codes),
             "result_digest": receipt.result_digest,
             "result": serialize_agent_result(receipt.result),
-        }
-    ).encode()
+    }
+    if receipt.result.kind == "ollama.instance":
+        wire["envelope_digest"] = receipt.envelope_digest
+    return json.dumps(wire).encode()
 
 
 def test_tls_context_is_tls13_client_certificate_only_and_loads_fd_paths(monkeypatch) -> None:

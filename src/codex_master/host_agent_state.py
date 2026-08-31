@@ -86,12 +86,13 @@ def _lease_fence(lease: AgentLeaseV1) -> tuple[object, ...]:
         lease.arguments_digest,
         lease.plan_precondition_digest,
         lease.resource_generation,
+        lease.envelope_digest,
     )
 
 
 def _receipt_wire(receipt: AgentReceiptV1) -> dict[str, object]:
-    return {
-        "schema_version": 1,
+    value = {
+        "schema_version": 2 if receipt.result.kind == "ollama.instance" else 1,
         "operation_id": receipt.operation_id,
         "lease_id": receipt.lease_id,
         "lease_epoch": receipt.lease_epoch,
@@ -103,6 +104,9 @@ def _receipt_wire(receipt: AgentReceiptV1) -> dict[str, object]:
         "result_digest": receipt.result_digest,
         "result": serialize_agent_result(receipt.result),
     }
+    if receipt.result.kind == "ollama.instance":
+        value["envelope_digest"] = receipt.envelope_digest
+    return value
 
 
 def _bounded_integer(value: object) -> bool:
@@ -370,6 +374,7 @@ class HostAgentState:
             reason_codes,
             _digest(serialize_agent_result(result)),
             result,
+            lease.envelope_digest,
         )
         existing = document["receipts"].get(lease.operation_id)
         if existing is not None:
@@ -431,7 +436,7 @@ class HostAgentState:
     ) -> AgentReceiptV1:
         old = parse_agent_receipt(record["receipt"])
         old_fence = tuple(record.get("fence", ()))
-        if len(old_fence) != 12:
+        if len(old_fence) != 13:
             _fail("host.replay_conflict")
         old_semantic = (
             old_fence[0],
@@ -443,6 +448,7 @@ class HostAgentState:
             old_fence[9],
             old_fence[10],
             old_fence[11],
+            old_fence[12],
         )
         new_semantic = (
             lease.operation_id,
@@ -454,6 +460,7 @@ class HostAgentState:
             lease.arguments_digest,
             lease.plan_precondition_digest,
             lease.resource_generation,
+            lease.envelope_digest,
         )
         if (
             old_semantic != new_semantic
@@ -474,6 +481,7 @@ class HostAgentState:
             old.reason_codes,
             old.result_digest,
             old.result,
+            lease.envelope_digest,
         )
         document["receipts"][lease.operation_id] = {
             "fence": list(_lease_fence(lease)),
@@ -502,6 +510,9 @@ class HostAgentState:
                 old.lease_epoch,
                 old.plan_digest,
                 old.arguments_digest,
+                old.plan_precondition_digest,
+                old.resource_generation,
+                old.envelope_digest,
             )
             == (
                 new.operation_id,
@@ -511,6 +522,9 @@ class HostAgentState:
                 new.lease_epoch,
                 new.plan_digest,
                 new.arguments_digest,
+                new.plan_precondition_digest,
+                new.resource_generation,
+                new.envelope_digest,
             )
             and new.registry_generation >= old.registry_generation
         )
@@ -575,7 +589,7 @@ class HostAgentState:
         except HiveStateError as error:
             if str(error) == "state_not_found":
                 return {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "highest_lease_epoch": 0,
                     "highest_registry_generation": 0,
                     "accepted": {},
@@ -597,11 +611,18 @@ class HostAgentState:
                 "highest_registry_generation", "accepted", "receipts",
             } or type(value.get("accepted")) is not dict:
                 _fail("host.state_unavailable")
-            for record in value["accepted"].values():
+            for operation_id, record in tuple(value["accepted"].items()):
                 if type(record) is not dict or set(record) != {
                     "fence", "lease", "effect_claim"
                 }:
                     _fail("host.state_unavailable")
+                wire = record["lease"]
+                if isinstance(wire, Mapping) and wire.get("kind") == "ollama.instance":
+                    # V2 predates the versioned remote envelope.  It cannot
+                    # be upgraded into executable work, so remove it before
+                    # the strict V2 parser can be reached.
+                    del value["accepted"][operation_id]
+                    continue
                 lease = self._parse_lease(record["lease"])
                 record["deadline_clock"] = self._deadline_clock(lease)
             value["schema_version"] = 3
@@ -621,8 +642,42 @@ class HostAgentState:
                     ):
                         _fail("host.state_unavailable")
                     if len(record["fence"]) == 10:
-                        record["fence"].extend((None, None))
+                        record["fence"].extend((None, None, None))
                         migrated = True
+                    elif len(record["fence"]) == 12:
+                        # V3 host.probe entries had the two prior optional
+                        # fences but predate the V2 remote envelope digest.
+                        # They remain loadable; an old remote lease itself is
+                        # refused by the strict V2 parser below.
+                        record["fence"].append(None)
+                        migrated = True
+            # V3 has no remote V2 envelope.  Discarding an old remote
+            # acceptance/receipt is deliberate fail-closed migration: the
+            # corresponding master queue record is terminalized before it can
+            # lease, while V1 host.probe journal state remains replayable.
+            for collection in ("accepted", "receipts"):
+                records = cast(dict[str, object], value[collection])
+                for operation_id, record in tuple(records.items()):
+                    if not isinstance(record, Mapping):
+                        continue
+                    wire = record.get("lease") if collection == "accepted" else record.get("receipt")
+                    if (
+                        isinstance(wire, Mapping)
+                        and (
+                            wire.get("kind") == "ollama.instance"
+                            or (
+                                isinstance(wire.get("result"), Mapping)
+                                and wire["result"].get("kind") == "ollama.instance"
+                            )
+                        )
+                    ):
+                        del records[operation_id]
+                        migrated = True
+            # V4 is the first persisted state shape that can contain a V2
+            # remote envelope.  V3 remote records are always legacy, while
+            # the exact V1 host.probe journals above remain replayable.
+            value["schema_version"] = 4
+            migrated = True
         if (
             type(value) is not dict
             or set(value)
@@ -633,7 +688,7 @@ class HostAgentState:
                 "accepted",
                 "receipts",
             }
-            or value["schema_version"] != 3
+            or value["schema_version"] != 4
             or not _bounded_integer(value["highest_lease_epoch"])
             or not _bounded_integer(value["highest_registry_generation"])
             or type(value["accepted"]) is not dict
@@ -671,7 +726,7 @@ class HostAgentState:
                 or set(record) != {"fence", "generation", "receipt"}
                 or not _bounded_integer(record["generation"])
                 or type(record["fence"]) is not list
-                or len(record["fence"]) != 12
+                or len(record["fence"]) != 13
             ):
                 _fail("host.state_unavailable")
             try:
@@ -699,6 +754,7 @@ class HostAgentState:
                     fence[11] is not None
                     and not _bounded_integer(fence[11])
                 )
+                or fence[12] != receipt.envelope_digest
             ):
                 _fail("host.state_unavailable")
             highest_epoch = max(highest_epoch, receipt.lease_epoch)
@@ -771,8 +827,7 @@ class HostAgentState:
             _fail("host.state_unavailable")
         doc = cast(dict[str, object], value)
         try:
-            if (
-                not {
+            required = {
                     "schema_version",
                     "operation_id",
                     "lease_id",
@@ -786,26 +841,14 @@ class HostAgentState:
                     "arguments_digest",
                     "deadline",
                     "arguments",
-                }.issubset(doc)
-                or set(doc)
-                - {
-                    "schema_version",
-                    "operation_id",
-                    "lease_id",
-                    "host_ref",
-                    "kind",
-                    "action",
-                    "registry_generation",
-                    "lease_epoch",
-                    "attempt",
-                    "plan_digest",
-                    "arguments_digest",
-                    "deadline",
-                    "arguments",
-                    "plan_precondition_digest",
-                    "resource_generation",
                 }
-                or doc["schema_version"] != 1
+            remote_fields = (
+                {"plan_precondition_digest", "resource_generation", "envelope_digest"}
+                if doc.get("kind") == "ollama.instance" else set()
+            )
+            if (
+                set(doc) != required | remote_fields
+                or doc["schema_version"] != (2 if doc.get("kind") == "ollama.instance" else 1)
             ):
                 _fail("host.state_unavailable")
             deadline = datetime.strptime(

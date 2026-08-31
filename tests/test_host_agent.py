@@ -23,6 +23,7 @@ from codex_master.agent_contracts import (
     AgentNoWorkV1,
     AgentPollV1,
     AgentResultV1,
+    remote_envelope_digest,
 )
 from codex_master.host_agent import (
     BACKOFF_SECONDS,
@@ -234,6 +235,18 @@ def lease(**changes: object) -> AgentLeaseV1:
         "arguments": args,
     }
     values.update(changes)
+    if values["kind"] == "ollama.instance":
+        values.setdefault("plan_precondition_digest", values["plan_digest"])
+        values.setdefault("resource_generation", 9)
+        values.setdefault(
+            "envelope_digest",
+            remote_envelope_digest(
+                registry_generation=values["registry_generation"],  # type: ignore[arg-type]
+                lease_epoch=values["lease_epoch"],  # type: ignore[arg-type]
+                resource_generation=values["resource_generation"],  # type: ignore[arg-type]
+                plan_precondition_digest=values["plan_precondition_digest"],  # type: ignore[arg-type]
+            ),
+        )
     return AgentLeaseV1(**values)  # type: ignore[arg-type]
 
 
@@ -241,9 +254,19 @@ class Ollama:
     def __init__(self) -> None:
         self.apply_calls = 0
 
-    def apply(self, arguments: object) -> dict[str, object]:
+    def apply(self, arguments: object, **_fences: object) -> dict[str, object]:
         self.apply_calls += 1
         return {"instance_ref": "one"}
+
+    def validate_plan_precondition(
+        self,
+        plan_ref: object,
+        plan_precondition_digest: object,
+        resource_generation: object,
+    ) -> None:
+        assert plan_ref == "plan-one"
+        assert plan_precondition_digest == "sha256:" + "a" * 64
+        assert resource_generation == 9
 
 
 def test_same_operation_returns_receipt_without_second_effect(tmp_path: Path) -> None:
@@ -265,7 +288,7 @@ def test_dispatch_is_closed_and_begin_effect_precedes_mutation(tmp_path: Path) -
             return claim
 
     class Ordered(Ollama):
-        def apply(self, arguments: object) -> dict[str, object]:
+        def apply(self, arguments: object, **_fences: object) -> dict[str, object]:
             events.append("effect")
             return super().apply(arguments)
 
@@ -310,7 +333,7 @@ def test_concurrent_mutating_execution_performs_exactly_one_effect(
     release = threading.Event()
 
     class Blocking(Ollama):
-        def apply(self, arguments: object) -> dict[str, object]:
+        def apply(self, arguments: object, **_fences: object) -> dict[str, object]:
             self.apply_calls += 1
             entered.set()
             assert release.wait(2)
@@ -349,7 +372,7 @@ def test_mutating_exception_is_unknown(
     tmp_path: Path,
 ) -> None:
     class Ambiguous(Ollama):
-        def apply(self, arguments: object) -> dict[str, object]:
+        def apply(self, arguments: object, **_fences: object) -> dict[str, object]:
             self.apply_calls += 1
             raise RuntimeError("effect may already exist")
 
@@ -363,7 +386,7 @@ def test_mutating_exception_is_unknown(
 
 def test_typed_pre_effect_rejection_is_failed(tmp_path: Path) -> None:
     class Rejected(Ollama):
-        def apply(self, arguments: object) -> dict[str, object]:
+        def apply(self, arguments: object, **_fences: object) -> dict[str, object]:
             raise AgentOllamaNoEffectError("provider.plan_missing")
 
     receipt = HostAgentExecutor(

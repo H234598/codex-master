@@ -14,6 +14,7 @@ from codex_master.agent_contracts import (
     AgentResultV1,
     parse_agent_poll,
     parse_agent_receipt,
+    remote_envelope_digest,
     serialize_agent_lease,
     serialize_agent_result,
 )
@@ -60,6 +61,18 @@ def valid_lease(**changes: object) -> AgentLeaseV1:
         "arguments": {"probe_profile": "quiescence", "include_metrics": True},
     }
     values.update(changes)
+    if values["kind"] == "ollama.instance":
+        values.setdefault("plan_precondition_digest", DIGEST_A)
+        values.setdefault("resource_generation", 9)
+        values.setdefault(
+            "envelope_digest",
+            remote_envelope_digest(
+                registry_generation=7,
+                lease_epoch=3,
+                resource_generation=values["resource_generation"],  # type: ignore[arg-type]
+                plan_precondition_digest=values["plan_precondition_digest"],  # type: ignore[arg-type]
+            ),
+        )
     return AgentLeaseV1(**values)  # type: ignore[arg-type]
 
 
@@ -198,7 +211,7 @@ def test_lease_serializer_emits_exact_wire_fields_and_utc_deadline() -> None:
     )
 
     assert payload == {
-        "schema_version": 1,
+        "schema_version": 2,
         "operation_id": "operation-one",
         "lease_id": "lease-one",
         "host_ref": "worker-one",
@@ -215,6 +228,14 @@ def test_lease_serializer_emits_exact_wire_fields_and_utc_deadline() -> None:
             "plan_id": "plan-one",
             "target_generation": 7,
         },
+        "plan_precondition_digest": DIGEST_A,
+        "resource_generation": 9,
+        "envelope_digest": remote_envelope_digest(
+            registry_generation=7,
+            lease_epoch=3,
+            resource_generation=9,
+            plan_precondition_digest=DIGEST_A,
+        ),
     }
 
 

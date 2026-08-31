@@ -22,6 +22,7 @@ from codex_master.agent_contracts import (
     AgentReceiptV1,
     AgentResultV1,
     MAX_AGENT_RESULT_BYTES,
+    remote_envelope_digest,
     serialize_agent_result,
 )
 from codex_master.hive.state import HiveStateError, HiveStateStore
@@ -55,6 +56,22 @@ _FORBIDDEN_KEY_PARTS = (
     "credential",
     "token",
     "cookie",
+)
+_REMOTE_OWNER_COMMON = frozenset(
+    {
+        "schema_version",
+        "owner",
+        "action",
+        "host_ref",
+        "instance_ref",
+        "registry_generation",
+        "ollama_registry_generation",
+        "resource_generation",
+        "lease_epoch",
+        "queue_plan_digest",
+        "plan_precondition_digest",
+        "instance",
+    }
 )
 
 
@@ -136,6 +153,84 @@ def _host_probe_admin_operation_id(
     return _token(arguments.get("admin_operation_id"), code)
 
 
+def _remote_owner_context(
+    value: object,
+    *,
+    action: str,
+    registry_generation: int,
+    lease_epoch: int,
+    resource_generation: int | None,
+    queue_plan_digest: str,
+    plan_precondition_digest: str,
+    target_host_ref: str | None,
+) -> Mapping[str, object]:
+    """Validate the bounded private recovery owner carried by a remote queue row."""
+    if not isinstance(value, Mapping):
+        _raise("host.operation_owner_invalid")
+    expected = _REMOTE_OWNER_COMMON | (
+        frozenset() if action == "plan" else frozenset({"plan_id"})
+    )
+    if set(value) != expected:
+        _raise("host.operation_owner_invalid")
+    if (
+        value.get("schema_version") != 1
+        or value.get("owner") != "ollama.remote"
+        or value.get("action") != action
+        or _token(value.get("host_ref"), "host.operation_owner_invalid")
+        != target_host_ref
+        or _integer(value.get("registry_generation"), "host.operation_owner_invalid")
+        != registry_generation
+        or _integer(value.get("ollama_registry_generation"), "host.operation_owner_invalid")
+        < 0
+        or _integer(value.get("lease_epoch"), "host.operation_owner_invalid")
+        != lease_epoch
+        or _digest(value.get("queue_plan_digest"), "host.operation_owner_invalid")
+        != queue_plan_digest
+        or _digest(value.get("plan_precondition_digest"), "host.operation_owner_invalid")
+        != plan_precondition_digest
+    ):
+        _raise("host.operation_owner_invalid")
+    context_resource = value.get("resource_generation")
+    if context_resource is not None and _integer(
+        context_resource, "host.operation_owner_invalid"
+    ) != resource_generation:
+        _raise("host.operation_owner_invalid")
+    if context_resource is None and resource_generation is not None:
+        _raise("host.operation_owner_invalid")
+    _token(value.get("instance_ref"), "host.operation_owner_invalid")
+    instance = value.get("instance")
+    instance_fields = {
+        "ref", "label", "host_ref", "ollama_executable", "models_directory",
+        "selected_model_refs", "allowed_cpus", "cpu_quota_percent", "cpu_weight",
+        "lifecycle_state", "readiness_state",
+    }
+    if (
+        not isinstance(instance, Mapping)
+        or set(instance) != instance_fields
+        or instance.get("ref") != value.get("instance_ref")
+        or instance.get("host_ref") != value.get("host_ref")
+        or any(
+            not isinstance(instance.get(key), str)
+            for key in (
+                "ref", "label", "host_ref", "ollama_executable", "models_directory",
+                "allowed_cpus", "lifecycle_state", "readiness_state",
+            )
+        )
+        or not isinstance(instance.get("selected_model_refs"), (list, tuple))
+        or not instance["selected_model_refs"]
+        or any(not isinstance(item, str) for item in instance["selected_model_refs"])
+        or type(instance.get("cpu_quota_percent")) is not int
+        or type(instance.get("cpu_weight")) is not int
+    ):
+        _raise("host.operation_owner_invalid")
+    if action != "plan":
+        _token(value.get("plan_id"), "host.operation_owner_invalid")
+    frozen = cast(Mapping[str, object], _freeze_json(dict(value)))
+    if len(_canonical_bytes(_public_json(frozen))) > 2048:
+        _raise("host.operation_owner_invalid")
+    return frozen
+
+
 def _check_key(name: str) -> None:
     lowered = name.lower()
     if any(part in lowered for part in _FORBIDDEN_KEY_PARTS):
@@ -155,9 +250,9 @@ def _freeze_json(value: object) -> object:
         return value
     if type(value) in {list, tuple}:
         return tuple(_freeze_json(item) for item in cast(list[object], value))
-    if type(value) is dict:
+    if type(value) in {dict, MappingProxyType}:
         result: dict[str, object] = {}
-        for key, item in cast(dict[object, object], value).items():
+        for key, item in cast(Mapping[object, object], value).items():
             if type(key) is not str or not key:
                 _raise("host.request_invalid")
             _check_key(key)
@@ -223,6 +318,7 @@ class AgentOperationRequestV1:
     required_lease_epoch: int | None = None
     resource_generation: int | None = None
     plan_precondition_digest: str | None = None
+    owner_context: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         kind, action = _check_kind_action(self.kind, self.action)
@@ -254,6 +350,29 @@ class AgentOperationRequestV1:
                 "plan_precondition_digest",
                 _digest(self.plan_precondition_digest),
             )
+        if kind == "ollama.instance" and (
+            self.required_registry_generation is None
+            or self.required_lease_epoch is None
+            or self.plan_precondition_digest is None
+        ):
+            _raise("host.operation_envelope_invalid")
+        if kind == "ollama.instance":
+            object.__setattr__(
+                self,
+                "owner_context",
+                _remote_owner_context(
+                    self.owner_context,
+                    action=action,
+                    registry_generation=self.required_registry_generation,
+                    lease_epoch=self.required_lease_epoch,
+                    resource_generation=self.resource_generation,
+                    queue_plan_digest=self.plan_digest,
+                    plan_precondition_digest=self.plan_precondition_digest,
+                    target_host_ref=self.target_host_ref,
+                ),
+            )
+        elif self.owner_context is not None:
+            _raise("host.operation_owner_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,6 +612,7 @@ class AgentOperationStore:
                     or record["resource_generation"] != request.resource_generation
                     or record["plan_precondition_digest"]
                     != request.plan_precondition_digest
+                    or record["owner_context"] != _public_json(request.owner_context)
                 ):
                     _raise("host.idempotency_conflict")
                 return self._view(record)
@@ -516,6 +636,16 @@ class AgentOperationStore:
                 "required_lease_epoch": request.required_lease_epoch,
                 "resource_generation": request.resource_generation,
                 "plan_precondition_digest": request.plan_precondition_digest,
+                "envelope_digest": (
+                    remote_envelope_digest(
+                        registry_generation=cast(int, request.required_registry_generation),
+                        lease_epoch=cast(int, request.required_lease_epoch),
+                        resource_generation=request.resource_generation,
+                        plan_precondition_digest=cast(str, request.plan_precondition_digest),
+                    )
+                    if request.kind == "ollama.instance" else None
+                ),
+                "owner_context": _public_json(request.owner_context),
                 "lease": None,
                 "completion": None,
             }
@@ -576,6 +706,12 @@ class AgentOperationStore:
                     host_epochs[principal.host_ref] = poll.lease_epoch
                 for record in document["operations"]:
                     if record["state"] != "queued":
+                        continue
+                    if record["kind"] == "ollama.instance" and (
+                        not self._has_remote_envelope(record)
+                        or record["owner_context"] is None
+                    ):
+                        self._set_fence_stale(record, "host.operation_envelope_stale")
                         continue
                     if (
                         record["target_host_ref"] is not None
@@ -641,6 +777,7 @@ class AgentOperationStore:
                         arguments=record["arguments"],
                         plan_precondition_digest=record["plan_precondition_digest"],
                         resource_generation=record["resource_generation"],
+                        envelope_digest=record["envelope_digest"],
                     )
                 self._write_locked(document)
                 return AgentNoWorkV1(
@@ -701,7 +838,22 @@ class AgentOperationStore:
                     "required_lease_epoch": record["required_lease_epoch"],
                     "resource_generation": record["resource_generation"],
                     "plan_precondition_digest": record["plan_precondition_digest"],
+                    "envelope_digest": record["envelope_digest"],
                 }
+            )
+
+    def owner_context(self, operation_id: str) -> Mapping[str, object] | None:
+        """Return bounded queue-owned metadata for deterministic owner recovery."""
+        operation_id = _token(operation_id, "host.operation_not_found")
+        with self._state.locked():
+            value = self._find(self._read_locked()["operations"], operation_id)["owner_context"]
+            return (
+                None
+                if value is None
+                else cast(
+                    Mapping[str, object],
+                    _freeze_json(dict(cast(Mapping[str, object], value))),
+                )
             )
 
     def cancel(self, operation_id: str) -> AgentOperationViewV1:
@@ -1287,6 +1439,8 @@ class AgentOperationStore:
             "required_lease_epoch",
             "resource_generation",
             "plan_precondition_digest",
+            "envelope_digest",
+            "owner_context",
         }
         if (
             type(value) is not dict
@@ -1338,6 +1492,8 @@ class AgentOperationStore:
             "plan_precondition_digest": self._optional_digest(
                 record.get("plan_precondition_digest")
             ),
+            "envelope_digest": self._optional_digest(record.get("envelope_digest")),
+            "owner_context": None,
             "lease": self._lease_doc(
                 record["lease"],
                 operation_generation=cast(int, record["registry_generation"]),
@@ -1348,7 +1504,41 @@ class AgentOperationStore:
         }
         if result["arguments_digest"] != _canonical_digest(result["arguments"]):
             _raise("host.operation_store_unavailable")
+        if kind == "ollama.instance" and record.get("owner_context") is not None:
+            result["owner_context"] = cast(
+                dict[str, object],
+                _public_json(
+                    _remote_owner_context(
+                        record["owner_context"],
+                        action=action,
+                        registry_generation=cast(int, result["required_registry_generation"]),
+                        lease_epoch=cast(int, result["required_lease_epoch"]),
+                        resource_generation=cast(int | None, result["resource_generation"]),
+                        queue_plan_digest=cast(str, result["plan_digest"]),
+                        plan_precondition_digest=cast(str, result["plan_precondition_digest"]),
+                        target_host_ref=cast(str | None, result["target_host_ref"]),
+                    )
+                ),
+            )
+        if kind == "ollama.instance" and self._has_remote_envelope(result):
+            expected = remote_envelope_digest(
+                registry_generation=cast(int, result["required_registry_generation"]),
+                lease_epoch=cast(int, result["required_lease_epoch"]),
+                resource_generation=cast(int | None, result["resource_generation"]),
+                plan_precondition_digest=cast(str, result["plan_precondition_digest"]),
+            )
+            if result["envelope_digest"] != expected:
+                _raise("host.operation_store_unavailable")
         return result
+
+    @staticmethod
+    def _has_remote_envelope(record: Mapping[str, object]) -> bool:
+        return (
+            record.get("required_registry_generation") is not None
+            and record.get("required_lease_epoch") is not None
+            and record.get("plan_precondition_digest") is not None
+            and record.get("envelope_digest") is not None
+        )
 
     @staticmethod
     def _optional_integer(value: object) -> int | None:
@@ -1469,6 +1659,12 @@ class AgentOperationStore:
             _raise("host.plan_digest_mismatch")
         if receipt.arguments_digest != record["arguments_digest"]:
             _raise("host.arguments_digest_mismatch")
+        if record["kind"] == "ollama.instance":
+            if (
+                not self._has_remote_envelope(record)
+                or receipt.envelope_digest != record["envelope_digest"]
+            ):
+                _raise("host.operation_envelope_stale")
         if receipt.result.kind != record["kind"] or receipt.result.action != record["action"]:
             _raise("host.result_mismatch")
         if check_deadline:

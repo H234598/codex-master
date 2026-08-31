@@ -362,11 +362,14 @@ class HostAgentClient:
                 "deadline",
                 "arguments",
             }
-            optional = {"plan_precondition_digest", "resource_generation"}
+            remote = value.get("kind") == "ollama.instance"
+            remote_fields = (
+                {"plan_precondition_digest", "resource_generation", "envelope_digest"}
+                if remote else set()
+            )
             if (
-                not required.issubset(value)
-                or set(value) - required - optional
-                or value["schema_version"] != 1
+                set(value) != required | remote_fields
+                or value["schema_version"] != (2 if remote else 1)
             ):
                 _fail("resource.host_response_invalid")
             deadline = datetime.strptime(
@@ -388,7 +391,7 @@ class HostAgentClient:
         if type(receipt) is not AgentReceiptV1:
             _fail("host.request_invalid")
         body = {
-            "schema_version": 1,
+            "schema_version": 2 if receipt.result.kind == "ollama.instance" else 1,
             "operation_id": receipt.operation_id,
             "lease_id": receipt.lease_id,
             "lease_epoch": receipt.lease_epoch,
@@ -400,6 +403,8 @@ class HostAgentClient:
             "result_digest": receipt.result_digest,
             "result": serialize_agent_result(receipt.result),
         }
+        if receipt.result.kind == "ollama.instance":
+            body["envelope_digest"] = receipt.envelope_digest
         response = self._request(
             f"/agent/v1/operations/{receipt.operation_id}/receipts", body
         )

@@ -74,6 +74,23 @@ def _digest(value: dict[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _owner_instance_document(instance: OllamaInstanceV1) -> dict[str, object]:
+    """Master-private, bounded recovery metadata; never serialized to an agent."""
+    return {
+        "ref": instance.ref,
+        "label": instance.label,
+        "host_ref": instance.host_ref,
+        "ollama_executable": instance.ollama_executable,
+        "models_directory": instance.models_directory,
+        "selected_model_refs": list(instance.selected_model_refs),
+        "allowed_cpus": instance.allowed_cpus,
+        "cpu_quota_percent": instance.cpu_quota_percent,
+        "cpu_weight": instance.cpu_weight,
+        "lifecycle_state": instance.lifecycle_state,
+        "readiness_state": instance.readiness_state,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class OllamaHostLease:
     host_ref: str
@@ -195,6 +212,7 @@ class OllamaRemotePlanRequestV1:
     cpu_quota_percent: int
     cpu_weight: int
     resource_generation: int | None = None
+    owner_instance: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +225,8 @@ class OllamaRemoteApplyRequestV1:
     plan_digest: str
     plan_ref: str
     plan_precondition_digest: str | None = None
+    owner_plan_id: str | None = None
+    owner_instance: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +238,8 @@ class OllamaRemoteProbeRequestV1:
     lease_epoch: int
     plan_digest: str
     plan_precondition_digest: str | None = None
+    owner_plan_id: str | None = None
+    owner_instance: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +251,8 @@ class OllamaRemoteStopRequestV1:
     lease_epoch: int
     plan_digest: str
     plan_precondition_digest: str | None = None
+    owner_plan_id: str | None = None
+    owner_instance: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
 
 
 class RemoteOllamaOperationPort(Protocol):
@@ -345,6 +369,29 @@ class AgentQueueRemoteOllamaOperationPort:
                     resource_generation=_request_resource_generation(request),
                     plan_precondition_digest="sha256:"
                     + _request_plan_precondition_digest(request),
+                    # This bounded master-private envelope is committed in the
+                    # queue transaction.  It lets a fresh FleetService recover
+                    # the typed owner after a crash between enqueue and index.
+                    owner_context={
+                        "schema_version": 1,
+                        "owner": "ollama.remote",
+                        "action": action,
+                        "host_ref": request.host_ref,
+                        "instance_ref": request.instance_ref,
+                        "registry_generation": generation,
+                        "ollama_registry_generation": request.registry_generation,
+                        "resource_generation": _request_resource_generation(request),
+                        "lease_epoch": request.lease_epoch,
+                        "queue_plan_digest": "sha256:" + request.plan_digest,
+                        "plan_precondition_digest": "sha256:"
+                        + _request_plan_precondition_digest(request),
+                        "instance": request.owner_instance,
+                        **(
+                            {"plan_id": request.owner_plan_id}
+                            if not isinstance(request, OllamaRemotePlanRequestV1)
+                            else {}
+                        ),
+                    },
                 )
             )
         except OllamaHostError:
@@ -545,6 +592,8 @@ class OllamaHostTransport:
                         lease.fence,
                         plan.plan_digest,
                         plan.idempotency_key,
+                        owner_plan_id=plan.idempotency_key,
+                        owner_instance=_owner_instance_document(plan._instance),
                     )
                 )
                 if type(remote) is not OperationV1:
@@ -593,6 +642,8 @@ class OllamaHostTransport:
                 None,
                 lease.fence,
                 execution.plan.plan_digest,
+                owner_plan_id=execution.plan.idempotency_key,
+                owner_instance=_owner_instance_document(execution.plan._instance),
             )
         )
         if type(remote) is not OperationV1:
@@ -636,6 +687,8 @@ class OllamaHostTransport:
                         None,
                         lease.fence,
                         execution.plan.plan_digest,
+                        owner_plan_id=execution.plan.idempotency_key,
+                        owner_instance=_owner_instance_document(execution.plan._instance),
                     )
                 )
                 if type(remote) is not OperationV1:
@@ -652,6 +705,7 @@ class OllamaHostTransport:
         plan_digest: str,
         plan_ref: str,
         plan_precondition_digest: str | None = None,
+        owner_plan_id: str | None = None,
     ) -> OperationV1:
         lease = self._lease(instance.host_ref)
         result = self._remote.apply(
@@ -664,6 +718,8 @@ class OllamaHostTransport:
                 plan_digest,
                 plan_ref,
                 plan_precondition_digest,
+                owner_plan_id,
+                _owner_instance_document(instance),
             )
         )
         if type(result) is not OperationV1:
@@ -678,6 +734,7 @@ class OllamaHostTransport:
         resource_generation: int | None,
         plan_digest: str,
         plan_precondition_digest: str | None = None,
+        owner_plan_id: str | None = None,
     ) -> OperationV1:
         lease = self._lease(instance.host_ref)
         result = self._remote.probe(
@@ -689,6 +746,8 @@ class OllamaHostTransport:
                 lease.fence,
                 plan_digest,
                 plan_precondition_digest,
+                owner_plan_id,
+                _owner_instance_document(instance),
             )
         )
         if type(result) is not OperationV1:
@@ -703,6 +762,7 @@ class OllamaHostTransport:
         resource_generation: int | None,
         plan_digest: str,
         plan_precondition_digest: str | None = None,
+        owner_plan_id: str | None = None,
     ) -> OperationV1:
         lease = self._lease(instance.host_ref)
         result = self._remote.stop(
@@ -714,6 +774,8 @@ class OllamaHostTransport:
                 lease.fence,
                 plan_digest,
                 plan_precondition_digest,
+                owner_plan_id,
+                _owner_instance_document(instance),
             )
         )
         if type(result) is not OperationV1:
@@ -818,6 +880,7 @@ def _remote_plan_request(
         instance.cpu_quota_percent,
         instance.cpu_weight,
         resource_generation,
+        _owner_instance_document(instance),
     )
 
 
@@ -871,6 +934,11 @@ def _validate_remote_request(
             _fail("provider.operation_not_allowed")
     elif type(request) is OllamaRemoteApplyRequestV1 and not _safe_token(
         request.plan_ref
+    ):
+        _fail("provider.operation_not_allowed")
+    if (
+        not isinstance(request, OllamaRemotePlanRequestV1)
+        and not _safe_token(request.owner_plan_id)
     ):
         _fail("provider.operation_not_allowed")
     if (

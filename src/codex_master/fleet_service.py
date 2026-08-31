@@ -63,7 +63,7 @@ from .selection import (
 )
 from .ollama_host_transport import CONTROL_HOST_REF
 from .admin_contracts import OperationV1
-from .agent_contracts import AgentReceiptV1, serialize_agent_result
+from .agent_contracts import AgentReceiptV1, remote_envelope_digest, serialize_agent_result
 from .agent_operations import AgentOperationError, AgentOperationStore
 from .agent_operations import AgentPrincipalV1 as OperationAgentPrincipalV1
 from .hive.state import HiveStateError, HiveStateStore
@@ -467,7 +467,9 @@ def _remote_instance_from_document(value: object) -> OllamaInstanceV1:
     if not isinstance(value, Mapping) or set(value) != required:
         raise FleetConflictError("resource.host_response_invalid")
     selected = value["selected_model_refs"]
-    if not isinstance(selected, list) or any(not isinstance(ref, str) for ref in selected):
+    if not isinstance(selected, (list, tuple)) or any(
+        not isinstance(ref, str) for ref in selected
+    ):
         raise FleetConflictError("resource.host_response_invalid")
     try:
         return OllamaInstanceV1(
@@ -699,6 +701,7 @@ class FleetService:
                     "attempt": receipt.attempt,
                     "plan_digest": receipt.plan_digest,
                     "arguments_digest": receipt.arguments_digest,
+                    "envelope_digest": receipt.envelope_digest,
                     "state": receipt.state,
                     "reason_codes": receipt.reason_codes,
                     "result_digest": receipt.result_digest,
@@ -790,7 +793,11 @@ class FleetService:
         document = self._remote_document()
         record = cast(dict[str, object], document["operations"]).get(operation_id)
         if record is None:
-            return None
+            self._recover_remote_owner_from_queue(operation_id)
+            document = self._remote_document()
+            record = cast(dict[str, object], document["operations"]).get(operation_id)
+            if record is None:
+                return None
         if not isinstance(record, Mapping):
             raise FleetConflictError("resource.host_response_invalid")
         action = record.get("action")
@@ -803,6 +810,118 @@ class FleetService:
         if plan is None:
             raise FleetConflictError("resource.host_response_invalid")
         return action, plan, record
+
+    def _recover_remote_owner_from_queue(self, operation_id: str) -> None:
+        """Rebuild any remote owner from its queue-committed bounded envelope.
+
+        The recovery lookup is one exact operation-id lookup, never an index
+        scan.  Action owners can only be reconstructed through the durable
+        plan owner named by their exact ``plan_id`` fence.
+        """
+        if self._agent_operations is None or self._ollama_registry is None:
+            return
+        try:
+            context = self._agent_operations.owner_context(operation_id)
+            queued = self._agent_operations.get(operation_id)
+        except AgentOperationError:
+            return
+        if (
+            context is None
+            or context.get("owner") != "ollama.remote"
+            or context.get("schema_version") != 1
+            or context.get("action") != queued.action
+            or context.get("queue_plan_digest") != queued.plan_digest
+            or context.get("registry_generation") != queued.registry_generation
+        ):
+            return
+        instance_ref = context.get("instance_ref")
+        host_ref = context.get("host_ref")
+        resource_generation = context.get("resource_generation")
+        if (
+            not isinstance(instance_ref, str)
+            or not isinstance(host_ref, str)
+            or (resource_generation is not None and not isinstance(resource_generation, int))
+        ):
+            return
+        try:
+            queued_instance = _remote_instance_from_document(context.get("instance"))
+        except FleetConflictError:
+            return
+        if queued_instance.ref != instance_ref or queued_instance.host_ref != host_ref:
+            return
+        action = cast(str, context["action"])
+        if action != "plan":
+            plan_id = context.get("plan_id")
+            if not isinstance(plan_id, str):
+                return
+            plan = self._remote_plan(plan_id)
+            if (
+                plan is None
+                or plan.instance.ref != instance_ref
+                or plan.instance.host_ref != host_ref
+                or _remote_instance_document(plan.instance)
+                != _remote_instance_document(queued_instance)
+                or plan.resource_generation != resource_generation
+                or context.get("plan_precondition_digest")
+                != "sha256:" + plan.agent_plan_digest
+            ):
+                return
+            payload = {
+                "action": action,
+                "plan_id": plan.operation_id,
+                "plan_digest": plan.plan_digest,
+                "agent_plan_digest": queued.plan_digest.removeprefix("sha256:"),
+                "registry_generation": context.get("ollama_registry_generation"),
+                "resource_generation": plan.resource_generation,
+                "instance": _remote_instance_document(plan.instance),
+                "arguments_digest": queued.arguments_digest,
+            }
+            self._record_recovered_remote_owner(operation_id, payload)
+            return
+        registry = self._ollama_registry.load()
+        if registry.generation != context.get("ollama_registry_generation"):
+            return
+        instance = queued_instance
+        agent_digest = queued.plan_digest.removeprefix("sha256:")
+        plan_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "instance": {
+                        "ref": instance.ref,
+                        "host_ref": instance.host_ref,
+                        "models": instance.selected_model_refs,
+                        "allowed_cpus": instance.allowed_cpus,
+                        "cpu_quota_percent": instance.cpu_quota_percent,
+                        "cpu_weight": instance.cpu_weight,
+                    },
+                    "registry_generation": registry.generation,
+                    "resource_generation": resource_generation,
+                    "host_plan_digest": "sha256:" + agent_digest,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        payload = {
+            "action": "plan", "plan_id": operation_id, "plan_digest": plan_digest,
+            "agent_plan_digest": agent_digest, "registry_generation": registry.generation,
+            "resource_generation": resource_generation,
+            "instance": _remote_instance_document(instance),
+            "arguments_digest": queued.arguments_digest,
+        }
+        self._record_recovered_remote_owner(operation_id, payload)
+
+    def _record_recovered_remote_owner(
+        self, operation_id: str, payload: dict[str, object]
+    ) -> None:
+        def record_owner(document: dict[str, object]) -> None:
+            operations = cast(dict[str, object], document["operations"])
+            prior = operations.get(operation_id)
+            if prior is None:
+                operations[operation_id] = payload
+            elif not isinstance(prior, Mapping) or any(prior.get(k) != v for k, v in payload.items()):
+                raise FleetConflictError("resource.host_response_invalid")
+        self._mutate_remote_document(record_owner)
 
     def _remote_applied(self, instance_ref: str) -> _RemoteOllamaPlanV1 | None:
         if self._ollama_remote_state is None:
@@ -846,12 +965,27 @@ class FleetService:
             raise FleetConflictError("ollama.transport_invalid")
         try:
             queued = self._agent_operations.get(operation.id)
+            owner_context = self._agent_operations.owner_context(operation.id)
         except AgentOperationError:
             raise FleetConflictError("ollama.transport_invalid") from None
         if (
             queued.kind != "ollama.instance"
             or queued.action != action
             or queued.plan_digest != "sha256:" + agent_plan_digest
+            or owner_context is None
+            or owner_context.get("action") != action
+            or owner_context.get("host_ref") != plan.instance.host_ref
+            or owner_context.get("instance_ref") != plan.instance.ref
+            or owner_context.get("registry_generation") != queued.registry_generation
+            or owner_context.get("resource_generation") != plan.resource_generation
+            or owner_context.get("queue_plan_digest") != queued.plan_digest
+            or owner_context.get("plan_precondition_digest")
+            != "sha256:"
+            + (plan.agent_plan_digest if action != "plan" else agent_plan_digest)
+            or (
+                action != "plan"
+                and owner_context.get("plan_id") != plan.operation_id
+            )
         ):
             raise FleetConflictError("ollama.transport_invalid")
         payload = {
@@ -859,7 +993,11 @@ class FleetService:
             "plan_id": plan.operation_id,
             "plan_digest": plan.plan_digest,
             "agent_plan_digest": agent_plan_digest,
-            "registry_generation": plan.registry_generation,
+            "registry_generation": (
+                plan.registry_generation
+                if action == "plan"
+                else owner_context.get("ollama_registry_generation")
+            ),
             "resource_generation": plan.resource_generation,
             "instance": _remote_instance_document(plan.instance),
             "arguments_digest": queued.arguments_digest,
@@ -1013,6 +1151,7 @@ class FleetService:
                         resource_generation=remote_plan.resource_generation,
                         plan_digest=remote_plan.plan_digest,
                         plan_precondition_digest=remote_plan.agent_plan_digest,
+                        owner_plan_id=remote_plan.operation_id,
                     )
                 except AttributeError:
                     raise FleetConflictError("ollama.transport_invalid") from None
@@ -1224,6 +1363,7 @@ class FleetService:
                         plan_digest=remote_plan.plan_digest,
                         plan_ref=result.payload["plan_ref"],
                         plan_precondition_digest=remote_plan.agent_plan_digest,
+                        owner_plan_id=remote_plan.operation_id,
                     )
                 except AttributeError:
                     raise FleetConflictError("ollama.transport_invalid") from None
@@ -1369,6 +1509,7 @@ class FleetService:
                     resource_generation=remote_plan.resource_generation,
                     plan_digest=remote_plan.plan_digest,
                     plan_precondition_digest=remote_plan.agent_plan_digest,
+                    owner_plan_id=remote_plan.operation_id,
                 )
             except AttributeError:
                 raise FleetConflictError("ollama.transport_invalid") from None
@@ -1408,6 +1549,10 @@ class FleetService:
                 queued = self._agent_operations.get(receipt.operation_id)
             except AgentOperationError as error:
                 raise FleetConflictError(error.code) from None
+            expected_precondition = "sha256:" + (
+                cast(str, record.get("agent_plan_digest"))
+                if action == "plan" else plan.agent_plan_digest
+            )
             if (
                 context.get("target_host_ref") != plan.instance.host_ref
                 or context.get("registry_generation") != queued.registry_generation
@@ -1416,6 +1561,19 @@ class FleetService:
                 or queued.arguments_digest != record.get("arguments_digest")
                 or queued.plan_digest
                 != "sha256:" + cast(str, record.get("agent_plan_digest"))
+                or context.get("required_registry_generation")
+                != queued.registry_generation
+                or context.get("resource_generation") != plan.resource_generation
+                or context.get("plan_precondition_digest")
+                != expected_precondition
+                or context.get("envelope_digest")
+                != remote_envelope_digest(
+                    registry_generation=queued.registry_generation,
+                    lease_epoch=cast(int, context.get("required_lease_epoch")),
+                    resource_generation=plan.resource_generation,
+                    plan_precondition_digest=expected_precondition,
+                )
+                or receipt.envelope_digest != context.get("envelope_digest")
             ):
                 raise FleetConflictError("resource.host_response_invalid")
             if (

@@ -10,7 +10,7 @@ import threading
 import pytest
 
 from codex_master import host_agent_state
-from codex_master.agent_contracts import AgentLeaseV1, AgentResultV1
+from codex_master.agent_contracts import AgentLeaseV1, AgentResultV1, remote_envelope_digest
 from codex_master.host_agent_state import HostAgentState, HostAgentStateError
 
 
@@ -36,6 +36,18 @@ def lease(**changes: object) -> AgentLeaseV1:
         "arguments": arguments,
     }
     values.update(changes)
+    if values["kind"] == "ollama.instance":
+        values.setdefault("plan_precondition_digest", "sha256:" + "a" * 64)
+        values.setdefault("resource_generation", 9)
+        values.setdefault(
+            "envelope_digest",
+            remote_envelope_digest(
+                registry_generation=values["registry_generation"],  # type: ignore[arg-type]
+                lease_epoch=values["lease_epoch"],  # type: ignore[arg-type]
+                resource_generation=values["resource_generation"],  # type: ignore[arg-type]
+                plan_precondition_digest=values["plan_precondition_digest"],  # type: ignore[arg-type]
+            ),
+        )
     return AgentLeaseV1(**values)  # type: ignore[arg-type]
 
 
@@ -132,6 +144,98 @@ def test_expired_unclaimed_same_operation_rebinds_only_safe_fence(
     assert state.begin_effect(renewed) is not None
     with pytest.raises(HostAgentStateError, match="host.replay_conflict"):
         state.accept(lease(lease_id="lease-three", attempt=3))
+
+
+@pytest.mark.parametrize("changed", ("resource_generation", "plan_precondition_digest"))
+def test_remote_rebind_refuses_changed_envelope_fence(
+    tmp_path: Path, changed: str
+) -> None:
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    old = lease(
+        kind="ollama.instance", action="apply", arguments={"plan_ref": "plan-one"},
+        arguments_digest=digest({"plan_ref": "plan-one"}),
+        deadline=datetime(2020, 1, 1, tzinfo=UTC),
+    )
+    state.accept(old)
+    values: dict[str, object] = {"lease_id": "lease-two", "attempt": 2}
+    values[changed] = 10 if changed == "resource_generation" else "sha256:" + "b" * 64
+    values["envelope_digest"] = remote_envelope_digest(
+        registry_generation=old.registry_generation,
+        lease_epoch=old.lease_epoch,
+        resource_generation=values.get("resource_generation", old.resource_generation),  # type: ignore[arg-type]
+        plan_precondition_digest=values.get("plan_precondition_digest", old.plan_precondition_digest),  # type: ignore[arg-type]
+    )
+    with pytest.raises(HostAgentStateError, match="host.replay_conflict"):
+        state.accept(lease(
+            kind="ollama.instance", action="apply", arguments={"plan_ref": "plan-one"},
+            arguments_digest=digest({"plan_ref": "plan-one"}), **values,
+        ))
+
+
+@pytest.mark.parametrize("changed", ("resource_generation", "plan_precondition_digest"))
+def test_remote_terminal_rebind_refuses_changed_envelope_fence(
+    tmp_path: Path, changed: str
+) -> None:
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    old = lease(
+        kind="ollama.instance", action="apply", arguments={"plan_ref": "plan-one"},
+        arguments_digest=digest({"plan_ref": "plan-one"}),
+    )
+    state.accept(old)
+    state.finish(
+        old,
+        state="succeeded",
+        reason_codes=("host.operation_succeeded",),
+        result=result(old),
+    )
+    values: dict[str, object] = {"lease_id": "lease-two", "attempt": 2}
+    values[changed] = 10 if changed == "resource_generation" else "sha256:" + "b" * 64
+    values["envelope_digest"] = remote_envelope_digest(
+        registry_generation=old.registry_generation,
+        lease_epoch=old.lease_epoch,
+        resource_generation=values.get("resource_generation", old.resource_generation),  # type: ignore[arg-type]
+        plan_precondition_digest=values.get("plan_precondition_digest", old.plan_precondition_digest),  # type: ignore[arg-type]
+    )
+    with pytest.raises(HostAgentStateError, match="host.replay_conflict"):
+        state.recover(
+            lease(
+                kind="ollama.instance", action="apply",
+                arguments={"plan_ref": "plan-one"},
+                arguments_digest=digest({"plan_ref": "plan-one"}), **values,
+            )
+        )
+
+
+def test_v3_remote_state_is_refused_while_v1_host_probe_replays(tmp_path: Path) -> None:
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    probe = lease()
+    state.accept(probe)
+    saved = state.finish(
+        probe,
+        state="succeeded",
+        reason_codes=("host.probe_complete",),
+        result=result(probe),
+    )
+    remote = lease(
+        operation_id="operation-remote", kind="ollama.instance", action="apply",
+        arguments={"plan_ref": "plan-one"}, arguments_digest=digest({"plan_ref": "plan-one"}),
+    )
+    state.accept(remote)
+    with state._state.locked():  # noqa: SLF001 - production-format V3 fixture
+        document = state._read_locked()  # noqa: SLF001
+        document["schema_version"] = 3
+        document["receipts"][probe.operation_id]["fence"] = document["receipts"][probe.operation_id]["fence"][:10]
+        legacy = document["accepted"][remote.operation_id]
+        legacy["fence"] = legacy["fence"][:10]
+        legacy["lease"]["schema_version"] = 1
+        legacy["lease"].pop("plan_precondition_digest")
+        legacy["lease"].pop("resource_generation")
+        legacy["lease"].pop("envelope_digest")
+        state._write_locked(document)  # noqa: SLF001
+
+    restarted = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    assert restarted.recover(probe) == saved
+    assert restarted.receipt_count() == 1
 
 
 def test_live_claim_deadline_terminalizes_unknown_and_late_finish_replays(

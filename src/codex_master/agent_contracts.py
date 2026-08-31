@@ -43,6 +43,7 @@ _RECEIPT_FIELDS = frozenset(
         "result",
     }
 )
+_REMOTE_RECEIPT_FIELDS = _RECEIPT_FIELDS | frozenset({"envelope_digest"})
 _RESULT_FIELDS = frozenset({"kind", "action", "payload"})
 _RECEIPT_STATES = frozenset({"succeeded", "failed", "unknown"})
 _ALLOWED_ACTIONS = {
@@ -112,6 +113,23 @@ def _utc(value: object) -> datetime:
 
 def _wire_time(value: datetime) -> str:
     return _utc(value).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def remote_envelope_digest(
+    *, registry_generation: int, lease_epoch: int,
+    resource_generation: int | None, plan_precondition_digest: str,
+) -> str:
+    """Seal the remote-only lease fences into the V2 lease/receipt contract."""
+    if resource_generation is not None:
+        resource_generation = _integer(resource_generation)
+    value = {
+        "schema_version": 1,
+        "registry_generation": _integer(registry_generation),
+        "lease_epoch": _integer(lease_epoch),
+        "resource_generation": resource_generation,
+        "plan_precondition_digest": _digest(plan_precondition_digest),
+    }
+    return _canonical_digest(value)
 
 
 def _reason_codes(value: object) -> tuple[str, ...]:
@@ -273,6 +291,7 @@ class AgentLeaseV1:
     arguments: Mapping[str, object] = field(repr=False)
     plan_precondition_digest: str | None = None
     resource_generation: int | None = None
+    envelope_digest: str | None = None
 
     def __post_init__(self) -> None:
         kind, action = _check_kind_action(self.kind, self.action)
@@ -308,6 +327,20 @@ class AgentLeaseV1:
                 "resource_generation",
                 _integer(self.resource_generation),
             )
+        if self.kind == "ollama.instance":
+            if self.plan_precondition_digest is None or self.envelope_digest is None:
+                _invalid()
+            expected = remote_envelope_digest(
+                registry_generation=self.registry_generation,
+                lease_epoch=self.lease_epoch,
+                resource_generation=self.resource_generation,
+                plan_precondition_digest=self.plan_precondition_digest,
+            )
+            if _digest(self.envelope_digest) != expected:
+                _invalid()
+            object.__setattr__(self, "envelope_digest", expected)
+        elif self.envelope_digest is not None:
+            _invalid()
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +355,7 @@ class AgentReceiptV1:
     reason_codes: tuple[str, ...]
     result_digest: str
     result: AgentResultV1
+    envelope_digest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "operation_id", _token(self.operation_id))
@@ -344,6 +378,12 @@ class AgentReceiptV1:
             _invalid()
         if self.state == "succeeded" and not self.reason_codes:
             _invalid()
+        if self.result.kind == "ollama.instance":
+            if self.envelope_digest is None:
+                _invalid()
+            object.__setattr__(self, "envelope_digest", _digest(self.envelope_digest))
+        elif self.envelope_digest is not None:
+            _invalid()
 
 
 def parse_agent_poll(value: object) -> AgentPollV1:
@@ -362,11 +402,14 @@ def parse_agent_poll(value: object) -> AgentPollV1:
 
 def parse_agent_receipt(value: object) -> AgentReceiptV1:
     payload = _mapping(value)
-    if set(payload) != _RECEIPT_FIELDS:
+    schema_version = _integer(payload.get("schema_version"))
+    result = _mapping(payload.get("result"))
+    is_remote = result.get("kind") == "ollama.instance"
+    if (
+        (is_remote and (schema_version != 2 or set(payload) != _REMOTE_RECEIPT_FIELDS))
+        or (not is_remote and (schema_version != 1 or set(payload) != _RECEIPT_FIELDS))
+    ):
         _invalid()
-    if _integer(payload.get("schema_version")) != 1:
-        _invalid()
-    result = _mapping(payload["result"])
     if set(result) != _RESULT_FIELDS:
         _invalid()
     return AgentReceiptV1(
@@ -384,6 +427,7 @@ def parse_agent_receipt(value: object) -> AgentReceiptV1:
             action=result["action"],  # type: ignore[arg-type]
             payload=_mapping(result["payload"]),
         ),
+        envelope_digest=payload.get("envelope_digest"),  # type: ignore[arg-type]
     )
 
 
@@ -403,7 +447,7 @@ def serialize_agent_lease(value: object) -> dict[str, object]:
         _invalid()
     lease = cast(AgentLeaseV1, value)
     result = {
-        "schema_version": 1,
+        "schema_version": 2 if lease.kind == "ollama.instance" else 1,
         "operation_id": lease.operation_id,
         "lease_id": lease.lease_id,
         "host_ref": lease.host_ref,
@@ -417,10 +461,11 @@ def serialize_agent_lease(value: object) -> dict[str, object]:
         "deadline": _wire_time(lease.deadline),
         "arguments": cast(dict[str, object], _public_json(lease.arguments)),
     }
-    if lease.plan_precondition_digest is not None:
+    if lease.kind == "ollama.instance":
+        # V1 host.probe remains byte-for-byte the original public wire shape.
         result["plan_precondition_digest"] = lease.plan_precondition_digest
-    if lease.resource_generation is not None:
         result["resource_generation"] = lease.resource_generation
+        result["envelope_digest"] = lease.envelope_digest
     return result
 
 
@@ -434,6 +479,7 @@ __all__ = [
     "MAX_AGENT_RESULT_BYTES",
     "parse_agent_poll",
     "parse_agent_receipt",
+    "remote_envelope_digest",
     "serialize_agent_lease",
     "serialize_agent_result",
 ]
