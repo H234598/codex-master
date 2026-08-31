@@ -41594,5 +41594,68 @@ def test_master_fleet_home_v2_cutover_is_queen_only_when_master_role_is_enforced
         item["name"] for item in response["result"]["tools"]
     }
 
+
+def test_autonomous_runtime_mcp_surface_never_reads_principal_authorization() -> None:
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+
+    with patch.object(
+        server_module,
+        "master_tool_access_status",
+        side_effect=AssertionError("autonomous runtime surface read principals"),
+    ):
+        response = server_module._sterile_runtime_surface_response(
+            request, autonomous_runtime_surface=True
+        )
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "tools": [
+                {
+                    "name": "runtime_status",
+                    "description": "Return the autonomous runtime-image health contract without principal or client integration state.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        },
+    }
+
+
+def test_regular_enforced_mcp_surfaces_remain_principal_scoped() -> None:
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    statuses = {
+        "koenigin": {
+            "authorized": True,
+            "role": "koenigin",
+            "principal_class": "koenigin",
+        },
+        "teamleiterin": {
+            "authorized": True,
+            "role": "teamleiterin",
+            "principal_class": "teamleiterin",
+        },
+        "unauthorized": {
+            "authorized": False,
+            "role": "non_teamleader",
+            "principal_class": None,
+        },
+    }
+    surfaces: dict[str, set[str]] = {}
+    for name, status in statuses.items():
+        with patch.object(server_module, "master_tool_access_status", return_value=status):
+            response = server_module.handle_rpc(request, enforce_master_role=True)
+        assert response is not None
+        surfaces[name] = {tool["name"] for tool in response["result"]["tools"]}
+
+    assert surfaces["unauthorized"] == {"runtime_status"}
+    assert surfaces["teamleiterin"] < surfaces["koenigin"]
+    assert "master_fleet_home_v2_cutover" in surfaces["koenigin"]
+    assert "master_fleet_home_v2_cutover" not in surfaces["teamleiterin"]
+
 if __name__ == "__main__":
     unittest.main()

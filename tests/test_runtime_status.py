@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 from pathlib import Path
 
@@ -101,6 +102,52 @@ def materialize_runtime_image(tmp_path: Path, *, mcp_mode: str = "healthy") -> P
             path.chmod(0o700)
     seal_runtime_image(root)
     return root
+
+
+def _write_authorized_queen_registry(home: Path) -> None:
+    """Materialize the valid principal state that previously expanded a stage."""
+
+    registry = home / ".local" / "state" / "codex-master-mcp" / "teamleaders.json"
+    registry.parent.mkdir(mode=0o700, parents=True)
+    active_home = (home / ".codex").resolve(strict=False)
+    digest = hashlib.sha256(
+        b"codex-master-teamleader-v1\0" + str(active_home).encode("utf-8")
+    ).hexdigest()
+    registry.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "principals": [
+                    {"digest": digest, "class": "koenigin", "agent_id": None}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry.chmod(0o600)
+
+
+def test_runtime_status_uses_its_sterile_surface_with_an_authorized_queen_home(
+    runtime_image, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    modules = _runtime_modules()
+    assert modules is not None
+    _layout_module, status_module = modules
+    home = tmp_path / "authorized-home"
+    home.mkdir(mode=0o700)
+    _write_authorized_queen_registry(home)
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+
+    result = status_module.runtime_status(layout=runtime_image, home=home)
+
+    assert result["ok"] is True
+    assert result["mcp_surface"] == {
+        "ok": True,
+        "initialize": True,
+        "tools_list": True,
+        "tool_count": 1,
+        "reason_code": "ok",
+    }
 
 
 def test_runtime_status_checks_validated_metadata_and_direct_mcp_surface(

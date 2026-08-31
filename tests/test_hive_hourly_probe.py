@@ -32,6 +32,27 @@ ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 
 
+def _write_authorized_queen_registry(home: Path) -> None:
+    registry = home / ".local" / "state" / "codex-master-mcp" / "teamleaders.json"
+    registry.parent.mkdir(mode=0o700, parents=True)
+    active_home = (home / ".codex").resolve(strict=False)
+    digest = hashlib.sha256(
+        b"codex-master-teamleader-v1\0" + str(active_home).encode("utf-8")
+    ).hexdigest()
+    registry.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "principals": [
+                    {"digest": digest, "class": "koenigin", "agent_id": None}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry.chmod(0o600)
+
+
 def test_runtime_image_probe_time_contract_composes_each_bounded_phase() -> None:
     """A complete image probe has a named total budget, never a 10-s wrapper."""
 
@@ -843,7 +864,7 @@ def _sealed_publish_image(
     return root
 
 
-def test_install_publishes_only_the_new_image_and_leaves_old_and_legacy_paths_inert(
+def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen_home(
     tmp_path: Path,
 ) -> None:
     installer = runpy.run_path(
@@ -851,6 +872,7 @@ def test_install_publishes_only_the_new_image_and_leaves_old_and_legacy_paths_in
     )
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    _write_authorized_queen_registry(home)
     library = home / ".local" / "lib"
     library.mkdir(mode=0o700, parents=True)
     old_image = library / "codex-master-runtime"
