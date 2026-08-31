@@ -14,9 +14,22 @@ from typing import Protocol, cast
 
 from .admin_contracts import OperationV1
 from .agent_contracts import AgentReceiptV1
-from .agent_operations import AgentOperationError, AgentOperationRequestV1, AgentOperationStore
-from .admin_operations import AdminOperationStore
-from .admin_hosts import HostRegistry
+from .agent_operations import (
+    AgentOperationError,
+    AgentOperationRequestV1,
+    AgentOperationStore,
+    AgentPrincipalV1 as OperationPrincipalV1,
+)
+from .admin_operations import AdminOperationError, AdminOperationStore
+from .admin_hosts import (
+    AgentPrincipalV1 as RegistryPrincipalV1,
+    HostRegistry,
+    HostRegistryError,
+)
+
+
+_TERMINAL_ADMIN_STATES = frozenset({"succeeded", "failed", "partial", "blocked"})
+_MAX_GENERATION = 2**63 - 1
 
 
 class HostProbeError(ValueError):
@@ -226,9 +239,10 @@ class LocalHostProbeAdapter:
         self._operations.begin(plan.operation.id, current_generation=expected_generation)
         try:
             evidence = self._collector.collect()
+            resulting_generation = _next_generation(expected_generation)
             self._registry.record_active_probe(
                 host_ref,
-                generation=expected_generation,
+                generation=resulting_generation,
                 resource_evidence={
                     "cpu_threads": evidence.cpu_count,
                     "memory_bytes": _memory_floor(evidence.memory_class),
@@ -245,7 +259,9 @@ class LocalHostProbeAdapter:
             )
         self._operations.record_step(plan.operation.id, "host.probe.collect", succeeded=True)
         return self._operations.finish(
-            plan.operation.id, state="succeeded", resulting_generation=expected_generation,
+            plan.operation.id,
+            state="succeeded",
+            resulting_generation=resulting_generation,
         )
 
 
@@ -300,60 +316,159 @@ class RemoteHostProbeCompletionOwner:
         self._registry = host_registry
 
     def complete(self, principal: object, receipt: AgentReceiptV1) -> object:
-        context = self._agent_operations.context(receipt.operation_id)
         if receipt.result.kind != "host.probe" or receipt.result.action != "collect":
-            return self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
+            return self._agent_operations.complete(
+                _operation_principal(principal), receipt
+            )
+        operation_principal = _operation_principal(principal)
+        context = self._agent_operations.validate_completion(
+            operation_principal, receipt
+        )
         target = context["target_host_ref"]
         arguments = context["arguments"]
         if type(target) is not str or not isinstance(arguments, Mapping):
             raise HostProbeError()
-        if getattr(principal, "host_ref", None) != target:
+        if operation_principal.host_ref != target:
             raise AgentOperationError("host.identity_mismatch")
         operation_id = arguments.get("admin_operation_id")
         generation = context["registry_generation"]
-        if type(operation_id) is not str or type(generation) is not int:
+        if (
+            set(arguments) != {"admin_operation_id", "probe_schema"}
+            or arguments.get("probe_schema") != 1
+            or type(operation_id) is not str
+            or type(generation) is not int
+        ):
             raise HostProbeError()
+        operation = self._operations.get(operation_id)
+        if (
+            operation.kind != "hosts.probe"
+            or operation.expected_generation != generation
+            or operation.plan_digest != receipt.plan_digest
+        ):
+            raise HostProbeError()
+        try:
+            host = self._registry.get(target)
+        except HostRegistryError:
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                generation,
+                "host.probe_failed",
+            )
+        allowed_host_generations = {generation}
+        if operation.state in {"running", *_TERMINAL_ADMIN_STATES}:
+            allowed_host_generations.add(_next_generation(generation))
+        if host.generation not in allowed_host_generations:
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                generation,
+                "host.probe_failed",
+            )
         if receipt.state != "succeeded":
-            self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
-            return self._fail(operation_id, generation, "host.probe_unknown")
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                generation,
+                "host.probe_unknown",
+            )
         try:
             evidence = HostProbeEvidenceV1.from_public(dict(receipt.result.payload))
-            host = next(item for item in self._registry.list() if item.ref == target)
-            if host.generation != generation or getattr(principal, "registry_generation", None) != generation:
-                raise HostProbeError()
-            operation = self._operations.get(operation_id)
-            if operation.state in {"succeeded", "failed", "partial", "blocked"}:
-                return self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
-            if operation.state == "planned":
-                self._operations.begin(operation_id, current_generation=generation)
-            elif operation.state != "running":
-                raise HostProbeError()
+        except HostProbeError:
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                generation,
+                "host.probe_failed",
+            )
+        operation = self._operations.get(operation_id)
+        if operation.state in _TERMINAL_ADMIN_STATES:
+            return self._agent_operations.complete(operation_principal, receipt)
+        if operation.state == "planned":
+            operation = self._operations.begin(
+                operation_id, current_generation=generation
+            )
+        if operation.state != "running":
+            raise HostProbeError()
+        resulting_generation = _next_generation(generation)
+        try:
             self._registry.record_active_probe(
                 target,
-                generation=generation,
+                generation=resulting_generation,
                 resource_evidence={
                     "cpu_threads": evidence.cpu_count,
                     "memory_bytes": _memory_floor(evidence.memory_class),
                 },
                 observed_at=evidence.observed_at,
             )
-            try:
-                self._operations.record_step(operation_id, "host.probe.collect", succeeded=True)
-            except ValueError:
-                pass
-            self._operations.finish(operation_id, state="succeeded", resulting_generation=generation)
-            return self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
-        except (HostProbeError, StopIteration, ValueError):
-            self._agent_operations.complete(principal, receipt)  # type: ignore[arg-type]
-            return self._fail(operation_id, generation, "host.probe_failed")
+        except HostRegistryError as error:
+            if error.code == "credential.generation_conflict":
+                return self._complete_failure(
+                    operation_principal,
+                    receipt,
+                    operation_id,
+                    generation,
+                    "host.probe_failed",
+                )
+            raise
+        operation = self._operations.get(operation_id)
+        if operation.not_attempted_count:
+            operation = self._operations.record_step(
+                operation_id, "host.probe.collect", succeeded=True
+            )
+        if operation.failed_count or operation.not_attempted_count:
+            raise HostProbeError()
+        if operation.state == "running":
+            self._operations.finish(
+                operation_id,
+                state="succeeded",
+                resulting_generation=resulting_generation,
+            )
+        return self._agent_operations.complete(operation_principal, receipt)
 
-    def _fail(self, operation_id: str, generation: int, reason: str) -> object:
-        try:
-            self._operations.begin(operation_id, current_generation=generation)
-            self._operations.record_step(operation_id, "host.probe.collect", succeeded=False, reason_code=reason)
-            return self._operations.finish(operation_id, state="failed", reason_codes=(reason,))
-        except Exception:
-            return self._operations.get(operation_id)
+    def _complete_failure(
+        self,
+        principal: OperationPrincipalV1,
+        receipt: AgentReceiptV1,
+        operation_id: str,
+        generation: int,
+        reason: str,
+    ) -> object:
+        operation = self._transition_failure(operation_id, generation, reason)
+        if operation.state not in _TERMINAL_ADMIN_STATES:
+            raise AdminOperationError("control.operation_state_conflict")
+        return self._agent_operations.complete(principal, receipt)
+
+    def _transition_failure(
+        self, operation_id: str, generation: int, reason: str
+    ) -> OperationV1:
+        operation = self._operations.get(operation_id)
+        if operation.state in _TERMINAL_ADMIN_STATES:
+            return operation
+        if operation.state == "planned":
+            operation = self._operations.begin(
+                operation_id, current_generation=generation
+            )
+        if operation.state != "running":
+            raise AdminOperationError("control.operation_state_conflict")
+        if operation.not_attempted_count:
+            operation = self._operations.record_step(
+                operation_id,
+                "host.probe.collect",
+                succeeded=False,
+                reason_code=reason,
+            )
+        if operation.state == "running":
+            operation = self._operations.finish(
+                operation_id,
+                state="failed",
+                reason_codes=(reason,),
+            )
+        return operation
 
 
 class HostProbeRouter:
@@ -382,6 +497,24 @@ def _memory_floor(memory_class: str) -> int:
         "under-8-gib": 1 * 1024**3, "8-31-gib": 8 * 1024**3,
         "32-127-gib": 32 * 1024**3, "128-plus-gib": 128 * 1024**3,
     }[memory_class]
+
+
+def _next_generation(generation: int) -> int:
+    if type(generation) is not int or not 0 <= generation < _MAX_GENERATION:
+        raise HostProbeError()
+    return generation + 1
+
+
+def _operation_principal(principal: object) -> OperationPrincipalV1:
+    if type(principal) is OperationPrincipalV1:
+        return cast(OperationPrincipalV1, principal)
+    if type(principal) is RegistryPrincipalV1:
+        registry_principal = cast(RegistryPrincipalV1, principal)
+        return OperationPrincipalV1(
+            registry_principal.host_ref,
+            registry_principal.registry_generation,
+        )
+    raise AgentOperationError("host.request_invalid")
 
 
 def _operation_key(host_ref: str, idempotency_key: str) -> str:

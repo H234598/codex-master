@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, datetime
 import json
 import multiprocessing
@@ -569,6 +570,163 @@ def test_active_probe_digest_depends_only_on_fresh_observation(tmp_path: Path) -
     )
 
     assert first == second
+
+
+def test_active_probe_preserves_registration_metadata_and_private_binding(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    evidence = valid_evidence(
+        label="Worker Metadata",
+        role="worker",
+        binding_ref="worker-metadata-ssh",
+    )
+    evidence["capabilities"] = ["ollama.execute", "resource.probe"]
+    evidence["binding_state"] = {
+        "endpoint": "ssh://10.0.0.19:22",
+        "credential": {"token": "private-binding-token"},
+        "root": "/srv/worker-metadata",
+    }
+    registry.record_probe("worker-one", generation=1, evidence=evidence)
+
+    refreshed = registry.record_active_probe(
+        "worker-one",
+        generation=2,
+        resource_evidence={"cpu_threads": 8, "memory_bytes": 16_000_000_000},
+        observed_at="2026-08-30T12:00:00Z",
+    )
+    document = json.loads(
+        (tmp_path / "admin-hosts" / "hosts.json").read_text(encoding="utf-8")
+    )
+
+    assert (
+        refreshed.label,
+        refreshed.role,
+        dict(refreshed.transport_binding),
+        refreshed.capabilities,
+    ) == (
+        "Worker Metadata",
+        "worker",
+        {"kind": "ssh", "binding_ref": "worker-metadata-ssh"},
+        ("ollama.execute", "resource.probe"),
+    )
+    assert document["bindings"]["ssh"] == [
+        {"ref": "worker-one", "binding_state": evidence["binding_state"]}
+    ]
+
+
+def test_active_probe_digest_is_unchanged_when_only_registry_metadata_differs(
+    tmp_path: Path,
+) -> None:
+    digests: list[str] = []
+    variants = (
+        valid_evidence(),
+        valid_evidence(
+            label="Renamed Worker",
+            role="control",
+            binding_ref="renamed-worker-ssh",
+        ),
+    )
+    variants[1]["capabilities"] = ["resource.probe"]
+    variants[1]["binding_state"] = {"opaque": "different-private-binding"}
+    for index, evidence in enumerate(variants):
+        root = tmp_path / str(index)
+        registry = registry_at(root)
+        registry.record_probe("worker-one", generation=1, evidence=evidence)
+        registry.record_active_probe(
+            "worker-one",
+            generation=2,
+            resource_evidence={"cpu_threads": 8, "memory_bytes": 16_000_000_000},
+            observed_at="2026-08-30T12:00:00Z",
+        )
+        document = json.loads(
+            (root / "admin-hosts" / "hosts.json").read_text(encoding="utf-8")
+        )
+        digests.append(document["observations"][0]["probe_digest"])
+
+    assert digests[0] == digests[1]
+
+
+def test_active_probe_rejects_conflicting_fresh_observation_at_same_generation(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.record_probe("worker-one", generation=1, evidence=valid_evidence())
+    registry.record_active_probe(
+        "worker-one",
+        generation=2,
+        resource_evidence={"cpu_threads": 8, "memory_bytes": 16_000_000_000},
+        observed_at="2026-08-30T12:00:00Z",
+    )
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    before = document.read_bytes()
+
+    with pytest.raises(HostRegistryError, match="credential.generation_conflict"):
+        registry.record_active_probe(
+            "worker-one",
+            generation=2,
+            resource_evidence={"cpu_threads": 16, "memory_bytes": 32_000_000_000},
+            observed_at="2026-08-30T12:00:01Z",
+        )
+
+    assert document.read_bytes() == before
+
+
+def test_active_probe_lock_transaction_preserves_interleaved_registration_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = registry_at(tmp_path)
+    concurrent = registry_at(tmp_path)
+    original = valid_evidence()
+    registry.record_probe("worker-one", generation=1, evidence=original)
+    updated = static_registration(
+        label="Worker Concurrent",
+        role="control",
+    )
+    updated["capabilities"] = ["resource.probe"]
+    original_locked = registry._state.locked
+    interleaved = False
+
+    @contextmanager
+    def locked_with_registration_update():  # type: ignore[no-untyped-def]
+        nonlocal interleaved
+        if not interleaved:
+            interleaved = True
+            concurrent.provision_agent_binding(
+                updated,
+                agent_binding(),
+                expected_generation=1,
+            )
+        with original_locked():
+            yield
+
+    monkeypatch.setattr(registry._state, "locked", locked_with_registration_update)
+
+    refreshed = registry.record_active_probe(
+        "worker-one",
+        generation=2,
+        resource_evidence={"cpu_threads": 8, "memory_bytes": 16_000_000_000},
+        observed_at="2026-08-30T12:00:00Z",
+    )
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    after = document.read_bytes()
+
+    assert interleaved is True
+    assert (refreshed.label, refreshed.role, refreshed.capabilities) == (
+        "Worker Concurrent",
+        "control",
+        ("resource.probe",),
+    )
+    payload = json.loads(after)
+    assert payload["bindings"]["ssh"][0]["binding_state"] == original["binding_state"]
+    assert payload["bindings"]["agent"][0]["client_spki_sha256"] == SPKI_ONE
+    with pytest.raises(HostRegistryError, match="credential.generation_conflict"):
+        concurrent.provision_agent_binding(
+            static_registration(label="Stale overwrite"),
+            agent_binding(spki=SPKI_TWO),
+            expected_generation=1,
+        )
+    assert document.read_bytes() == after
 
 def test_equal_generation_is_idempotent_only_for_identical_bound_evidence(
     tmp_path: Path,

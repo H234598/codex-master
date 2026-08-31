@@ -20,7 +20,9 @@ from codex_master import agent_daemon
 from codex_master.agent_daemon import AgentApiServer, AgentCredentialFds, open_systemd_credentials
 from codex_master.admin_hosts import HostRegistryError
 from codex_master.admin_hosts import AgentPrincipalV1
+from codex_master.admin_operations import AdminOperationError
 from codex_master.agent_http import AgentHttpResponse
+from codex_master.agent_operations import AgentOperationError
 
 
 class FakeContext:
@@ -274,11 +276,23 @@ def test_assemble_server_wires_task_two_store_and_task_three_resolver(monkeypatc
         ) or values,
     )
     fds = AgentCredentialFds(1, 2, 3)
-    result = agent_daemon.assemble_server("127.0.0.1", 9443, fds)
+    state_root = Path("/test-agent-state")
+    result = agent_daemon.assemble_server(
+        "127.0.0.1", 9443, fds, state_root=state_root
+    )
     assert result is values
     assert values["address"] == ("127.0.0.1", 9443)
     assert values["application"][0] == "application"
     assert values["application"][2][0] == "completion-owner"
+    assert values["application"][1] == ("store", state_root)
+    assert values["application"][2][1]["operation_store"] == (
+        "admin-operation-store",
+        state_root,
+    )
+    assert values["application"][2][1]["host_registry"] == (
+        "registry",
+        state_root,
+    )
     assert values["resolver"][0] == "resolver"
     assert values["context"] == ("tls", fds)
 
@@ -298,6 +312,39 @@ def test_main_assembles_from_credential_directory_without_secret_arguments(monke
     assert observed["address"] == "127.0.0.1"
     assert observed["port"] == 9443
     assert len(observed["fds"]) == 3
+
+
+@pytest.mark.parametrize(
+    ("constructor", "error"),
+    (
+        ("HostRegistry", HostRegistryError("control.host_store_unavailable")),
+        ("AgentOperationStore", AgentOperationError("host.operation_store_unavailable")),
+        ("AdminOperationStore", AdminOperationError("control.operation_store_unavailable")),
+    ),
+)
+def test_startup_maps_each_production_store_constructor_failure_to_stable_unavailable(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    constructor,
+    error,
+) -> None:
+    directory = _credential_directory(tmp_path)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(directory))
+    monkeypatch.setattr(agent_daemon, "HostRegistry", lambda _root: object())
+    monkeypatch.setattr(agent_daemon, "AgentOperationStore", lambda _root: object())
+    monkeypatch.setattr(agent_daemon, "AdminOperationStore", lambda _root: object())
+
+    def unavailable(_root):
+        raise error
+
+    monkeypatch.setattr(agent_daemon, constructor, unavailable)
+
+    assert agent_daemon.main(["--listen-address", "127.0.0.1", "--port", "9443"]) == os.EX_UNAVAILABLE
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "codex-master-agent-api: agent.startup_failed\n"
+    assert "Traceback" not in captured.err
 
 
 class _StoppedServer:

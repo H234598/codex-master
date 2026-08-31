@@ -174,3 +174,114 @@ the operation is terminal. The daemon startup boundary additionally handles
 PYTHONPATH=src pytest -q tests/test_host_probe.py tests/test_admin_hosts.py tests/test_agent_operations.py tests/test_agent_http.py tests/test_agent_daemon.py tests/test_admin_contracts.py tests/test_admin_http.py tests/test_admin_service.py tests/test_admin_cli_mcp_integration.py tests/test_control_catalog.py tests/test_control_center.py -k 'host or probe or assemble_server or startup'
 154 passed, 354 deselected in 4.28s
 ```
+
+## Fix round 4/5
+
+Executable RED coverage was added before production edits for the real local
+and remote adapters, the completion owner and all three durable stores, the
+real CLI/MCP subprocess paths, the constructed GTK host action, active-probe
+metadata/CAS behavior, and daemon startup assembly failures.
+
+RED:
+
+```text
+PYTHONPATH=src pytest -q tests/test_host_probe.py tests/test_admin_hosts.py \
+  tests/test_admin_cli_mcp_integration.py tests/test_control_center.py \
+  tests/test_agent_daemon.py -k 'host or probe or assemble_server or startup'
+
+17 failed, 147 passed, 78 deselected in 8.50s
+
+Representative exact failures:
+- LocalHostProbeAdapter returned `failed` instead of `succeeded` because the
+  fresh observation reused generation 4 instead of advancing to generation 5.
+- Valid remote completion returned a running Admin operation while the Agent
+  operation was already succeeded.
+- Injected Admin begin/record_step/finish failures on non-success completion
+  did not raise and could not resume the running operation on retry.
+- Injected Registry/Admin failures on success were swallowed instead of
+  leaving retryable durable state.
+- The real host CLI did not bind the Admin socket path.
+- ControlCenterWindow rejected the production controller seam and had no host
+  page button construction path.
+```
+
+The aggregate also caught a test-harness `FileExistsError` from constructing
+the same subprocess environment twice; the harness was corrected before the
+isolated CLI baseline was evaluated.
+
+After correcting the CLI test's one-time environment construction, the
+isolated baseline CLI RED was:
+
+```text
+PYTHONPATH=src pytest -q \
+  tests/test_admin_cli_mcp_integration.py::test_real_host_probe_cli_uses_exact_parser_contract_and_internal_key
+FAILED: expected returncode 0, got 1 with
+{"error": "control.service_unavailable"}
+1 failed in 2.75s
+```
+
+Recovery implementation:
+
+- `AgentOperationStore.validate_completion()` now validates all receipt and
+  lease fences without mutation and returns only the fixed private owner
+  context. `RemoteHostProbeCompletionOwner` validates that context, exact host,
+  exact expected generation and Admin plan before any transition.
+- Success and failure paths now share explicit `planned`/`running`/terminal
+  recovery. The Admin operation becomes terminal before the Agent receipt is
+  completed. Registry, begin, step, finish, and Agent-complete interruption
+  tests all converge on retry; Registry writes remain single-mutation.
+- Fresh active observations advance from expected generation N to N+1.
+  Planned stale results fail without Registry mutation; a running retry accepts
+  N+1 only when the active observation is idempotently identical.
+- Invalid DTO, stale, cross-host, failed, and unknown cases retain byte-exact
+  Registry state. Duplicate identical terminal receipts remain idempotent and
+  conflicting receipts remain rejected.
+- The exact host CLI now connects to the attested Admin socket. Real subprocess
+  CLI/MCP tests prove exact forwarding, bounded stable internal CLI key,
+  caller-owned MCP key, operation projection, and absence of a public CLI
+  `--idempotency-key` option.
+- The production GTK window now constructs a Hosts page/card/button signal,
+  renders QUEUED/RUNNING/SUCCEEDED/UNKNOWN, polls with a bounded delayed
+  `GLib.timeout_add` path, and refreshes only after canonical terminal states.
+- Active-probe tests prove metadata/private-binding preservation,
+  metadata-independent digesting, same-generation conflict rejection, and a
+  deterministic lock-seam interleaving that preserves a concurrent CAS update.
+- Daemon tests inject each production Host Registry, Agent operation, and Admin
+  operation constructor failure and prove the same unavailable exit/message
+  without traceback while preserving the injectable `state_root` assembly.
+
+GREEN:
+
+```text
+PYTHONPATH=src pytest -q tests/test_host_probe.py tests/test_admin_hosts.py \
+  tests/test_agent_operations.py tests/test_agent_http.py \
+  tests/test_agent_daemon.py tests/test_admin_contracts.py \
+  tests/test_admin_http.py tests/test_admin_service.py \
+  tests/test_admin_cli_mcp_integration.py tests/test_control_catalog.py \
+  tests/test_control_center.py \
+  -k 'host or probe or assemble_server or startup'
+183 passed, 355 deselected in 5.95s
+
+PYTHONPATH=src pytest -q tests/test_host_probe.py tests/test_admin_hosts.py \
+  tests/test_agent_daemon.py tests/test_admin_cli_mcp_integration.py \
+  tests/test_control_center.py
+243 passed, 5 subtests passed in 12.79s
+
+PYTHONPATH=src pytest -q tests/test_agent_operations.py
+22 passed in 80.93s
+
+ruff check <all changed Python files>
+All checks passed!
+
+python -m compileall -q <all changed production modules>
+(clean)
+
+git diff --check
+(clean)
+```
+
+Secret preflight of the exact Task-6 diff found no private-key, cloud-key,
+GitHub-token, OpenAI-key, Google-key, or JWT credential pattern. CodeRabbit
+0.7.5 first reported one valid major concern about immediate unbounded Control
+Center polling; bounded delayed polling and its executable test were added.
+The independent follow-up review completed with zero findings.

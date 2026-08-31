@@ -282,6 +282,29 @@ def test_repeated_completion_is_idempotent_but_conflict_is_rejected(
     assert store.get(lease.operation_id) == completed
 
 
+def test_completion_validation_exposes_owner_context_without_mutation(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    request = replace(operation_request(), target_host_ref="worker-one")
+    queued = store.enqueue(request)
+    lease = store.poll(principal(), poll())
+    assert isinstance(lease, AgentLeaseV1)
+    receipt = receipt_for(lease)
+
+    context = store.validate_completion(principal(), receipt)
+
+    assert context == {
+        "target_host_ref": "worker-one",
+        "registry_generation": 7,
+        "arguments": request.arguments,
+    }
+    assert store.get(queued.operation_id).state == "leased"
+    completed = store.complete(principal(), receipt)
+    assert completed.state == "succeeded"
+    assert store.validate_completion(principal(), receipt) == context
+
+
 def test_terminal_completion_replay_validates_original_lease_fences(
     tmp_path: Path,
 ) -> None:

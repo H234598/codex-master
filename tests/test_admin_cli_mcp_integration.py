@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,15 +11,58 @@ import sys
 from typing import Iterator
 
 from codex_master import server
-from codex_master.admin_contracts import AdminPrincipalV1
+from codex_master.admin_contracts import AdminPrincipalV1, OperationV1
 from codex_master.admin_socket import AdminSocketServer
 from test_admin_service import service_at
 
 
-def test_host_probe_cli_and_mcp_publish_the_exact_contract() -> None:
-    assert server._MASTERJET_ADMIN_CLI_COMMANDS[("host", "probe")] == ("hosts.probe", None)
-    spec = next(item for item in server._MASTERJET_ADMIN_TOOL_SPECS if item[0] == "fleet_host_probe")
-    assert spec[1] == "hosts.probe"
+PROBE_CREATED = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
+
+
+class _HostProbeOwner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int, str]] = []
+
+    def probe(
+        self,
+        host_ref: str,
+        *,
+        expected_generation: int,
+        idempotency_key: str,
+    ) -> OperationV1:
+        self.calls.append((host_ref, expected_generation, idempotency_key))
+        return OperationV1(
+            "op-host-probe",
+            "hosts.probe",
+            "planned",
+            expected_generation,
+            None,
+            "sha256:" + "a" * 64,
+            PROBE_CREATED,
+            PROBE_CREATED + timedelta(minutes=15),
+            0,
+            0,
+            1,
+            ("control.plan_ready",),
+        )
+
+
+def _probe_projection() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "id": "op-host-probe",
+        "kind": "hosts.probe",
+        "state": "planned",
+        "expected_generation": 4,
+        "resulting_generation": None,
+        "plan_digest": "sha256:" + "a" * 64,
+        "created_at": "2026-08-30T12:00:00Z",
+        "expires_at": "2026-08-30T12:15:00Z",
+        "completed_count": 0,
+        "failed_count": 0,
+        "not_attempted_count": 1,
+        "reason_codes": ["control.plan_ready"],
+    }
 
 
 @contextmanager
@@ -29,6 +74,8 @@ def _admin_socket(tmp_path: Path) -> Iterator[tuple[Path, Path, object]]:
     key_path.chmod(0o400)
     key_fd = os.open(key_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     service, owners = service_at()
+    owners.host_probe = _HostProbeOwner()
+    service._host_probe = owners.host_probe
     principal = AdminPrincipalV1(
         "operator-one",
         (
@@ -37,6 +84,7 @@ def _admin_socket(tmp_path: Path) -> Iterator[tuple[Path, Path, object]]:
             "fleet.google.oauth",
             "fleet.google.provision",
             "fleet.google.billing.bind",
+            "fleet.host.probe",
         ),
         "unix_peer",
         True,
@@ -126,6 +174,103 @@ def _run_child(
             process.wait(timeout=2)
     assert not Path(f"/proc/{pid}").exists()
     return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+
+
+def test_real_host_probe_cli_uses_exact_parser_contract_and_internal_key(
+    tmp_path: Path,
+) -> None:
+    with _admin_socket(tmp_path) as (socket_path, credential_directory, owners):
+        environment = _subprocess_env(tmp_path, socket_path, credential_directory)
+        completed = _run_child(
+            [
+                sys.executable,
+                "-m",
+                "codex_master.server",
+                "fleet",
+                "host",
+                "probe",
+                "worker-one",
+                "--expected-generation",
+                "4",
+                "--json",
+            ],
+            env=environment,
+        )
+        rejected = _run_child(
+            [
+                sys.executable,
+                "-m",
+                "codex_master.server",
+                "fleet",
+                "host",
+                "probe",
+                "worker-one",
+                "--expected-generation",
+                "4",
+                "--json",
+                "--idempotency-key",
+                "operator-key",
+            ],
+            env=environment,
+        )
+        help_result = _run_child(
+            [
+                sys.executable,
+                "-m",
+                "codex_master.server",
+                "fleet",
+                "host",
+                "probe",
+                "--help",
+            ],
+            env=environment,
+        )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == _probe_projection()
+    expected_key = "cli-probe-" + hashlib.sha256(b"worker-one\x004").hexdigest()
+    assert owners.host_probe.calls == [("worker-one", 4, expected_key)]
+    assert len(expected_key) <= 128
+    assert rejected.returncode == 2
+    assert "--idempotency-key" in rejected.stderr
+    assert "unrecognized arguments" in rejected.stderr
+    assert help_result.returncode == 0
+    assert "--idempotency-key" not in help_result.stdout
+
+
+def test_real_registered_host_probe_mcp_call_forwards_caller_key(
+    tmp_path: Path,
+) -> None:
+    list_request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    call_request = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "fleet_host_probe",
+            "arguments": {
+                "host_ref": "worker-one",
+                "expected_generation": 4,
+                "idempotency_key": "caller-probe-key",
+            },
+        },
+    }
+    with _admin_socket(tmp_path) as (socket_path, credential_directory, owners):
+        completed = _run_child(
+            [sys.executable, "-m", "codex_master.server"],
+            input_text="\n".join(
+                (json.dumps(list_request), json.dumps(call_request), "")
+            ),
+            env=_subprocess_env(tmp_path, socket_path, credential_directory),
+        )
+
+    assert completed.returncode == 0, completed.stderr
+    listed, response = [json.loads(line) for line in completed.stdout.splitlines()]
+    visible_names = {tool["name"] for tool in listed["result"]["tools"]}
+    assert "fleet_host_probe" in visible_names
+    assert response["result"]["isError"] is False
+    assert json.loads(response["result"]["content"][0]["text"]) == _probe_projection()
+    assert owners.host_probe.calls == [("worker-one", 4, "caller-probe-key")]
 
 
 def test_real_cli_process_calls_attested_admin_socket(tmp_path: Path) -> None:

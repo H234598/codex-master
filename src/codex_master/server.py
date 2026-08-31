@@ -37401,6 +37401,7 @@ def main_cli(argv: list[str]) -> int:
         in {
             "openai",
             "google",
+            "host",
             "operation",
         }
     ):

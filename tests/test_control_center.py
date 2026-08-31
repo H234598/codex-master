@@ -12,35 +12,128 @@ from codex_master.fleet_control import OllamaPageState
 from codex_master.server import AgentError
 
 
-def test_host_probe_ui_refreshes_only_after_terminal_result() -> None:
-    assert control_center.host_probe_ui_state({"state": "planned"}).state == "QUEUED"
-    assert control_center.host_probe_ui_state({"state": "running"}).state == "RUNNING"
-    assert control_center.host_probe_ui_state({"state": "succeeded"}).refresh_host_card is True
-    assert control_center.host_probe_ui_state({"state": "unknown"}).state == "UNKNOWN"
-
-
-def test_window_host_probe_polls_before_refreshing_host_card() -> None:
+def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal() -> None:
     calls: list[tuple[str, dict]] = []
+    events: list[str] = []
+    responses = [
+        {"id": "op-success", "state": "planned"},
+        {"id": "op-success", "state": "running"},
+        {"id": "op-success", "state": "succeeded"},
+        {"id": "op-failed", "state": "planned"},
+        {"id": "op-failed", "state": "running"},
+        {"id": "op-failed", "state": "failed"},
+    ]
 
     class Controller:
+        busy = False
+
         def submit(self, name, args, callback):
             calls.append((name, args))
-            callback({"id": "op-one", "state": "planned"} if name == "fleet_host_probe" else {"state": "succeeded"})
+            if name == "agent_status":
+                events.append("backend:host-refresh")
+                callback(
+                    ControlCenterViewModelTest()._page(
+                        ControlCenterViewModelTest()._status_result()
+                    )
+                )
+                return True
+            result = responses.pop(0)
+            events.append(f"backend:{result['state']}")
+            callback(result)
             return True
 
-    class Label:
-        def set_text(self, _text):
-            pass
+        def close(self):
+            return True
+
+    Gtk = ControlCenterWindowContractTest._mock_gtk()
+    Gtk.Button.new_with_label.side_effect = lambda _label: Mock()
+    Gtk.Entry.side_effect = lambda: Mock()
+    Gtk.Label.side_effect = lambda **_values: Mock()
+    Gtk.SpinButton.new_with_range.side_effect = lambda *_values: Mock()
+    GLib = Mock()
+    GLib.idle_add.return_value = 1
+    GLib.timeout_add.side_effect = (
+        lambda _interval, callback, *args: (callback(*args), 1)[1]
+    )
+    window = control_center.ControlCenterWindow(
+        Gtk,
+        GLib,
+        object(),
+        controller=Controller(),
+    )
+    window.host_ref_entry.get_text.return_value = "worker-one"
+    window.host_generation_spin.get_value_as_int.return_value = 4
+    window.list_box.get_children.return_value = []
+    clicked = window.host_probe_button.connect.call_args.args[1]
+
+    clicked(window.host_probe_button)
+    clicked(window.host_probe_button)
+
+    assert [name for name, _args in calls] == [
+        "fleet_host_probe",
+        "fleet_operation_status",
+        "fleet_operation_status",
+        "agent_status",
+        "fleet_host_probe",
+        "fleet_operation_status",
+        "fleet_operation_status",
+        "agent_status",
+    ]
+    for index, (name, arguments) in enumerate(calls):
+        if name == "fleet_host_probe":
+            assert arguments["host_ref"] == "worker-one"
+            assert arguments["expected_generation"] == 4
+            assert arguments["idempotency_key"].startswith("gui-probe-")
+            assert len(arguments["idempotency_key"]) <= 128
+        elif name == "fleet_operation_status":
+            assert arguments == {
+                "operation_id": "op-success" if index < 4 else "op-failed"
+            }
+        else:
+            assert arguments == {
+                "agent": "all",
+                "agents_offset": 0,
+                "agents_limit": 20,
+            }
+    rendered = [call.args[0] for call in window.host_probe_status_label.set_text.call_args_list]
+    assert "Host-Probe: QUEUED" in rendered
+    assert "Host-Probe: RUNNING" in rendered
+    assert "Host-Probe: SUCCEEDED" in rendered
+    assert "Host-Probe: UNKNOWN" in rendered
+    assert events == [
+        "backend:planned",
+        "backend:running",
+        "backend:succeeded",
+        "backend:host-refresh",
+        "backend:planned",
+        "backend:running",
+        "backend:failed",
+        "backend:host-refresh",
+    ]
+
+
+def test_host_probe_unknown_terminality_follows_canonical_operation_contract() -> None:
+    noncanonical = control_center.host_probe_ui_state({"state": "unknown"})
+    assert noncanonical == control_center.HostProbeUiState("UNKNOWN", False)
+    for terminal in ("failed", "partial", "blocked"):
+        assert control_center.host_probe_ui_state(
+            {"state": terminal}
+        ) == control_center.HostProbeUiState("UNKNOWN", True)
 
     window = object.__new__(control_center.ControlCenterWindow)
-    window.controller = Controller()
-    window.status_label = Label()
-    refreshed: list[bool] = []
-    window.refresh = lambda: refreshed.append(True)
+    window._host_probe_operation_id = "op-running"
+    window._host_probe_poll_attempts = control_center.MAX_HOST_PROBE_POLLS
+    window.host_probe_status_label = Mock()
+    window.GLib = Mock()
+    window.refresh_host_card = Mock()
 
-    assert window.probe_host("worker-one", 4) is True
-    assert [name for name, _args in calls] == ["fleet_host_probe", "fleet_operation_status"]
-    assert refreshed == [True]
+    window._host_probe_started({"id": "op-running", "state": "running"})
+
+    window.host_probe_status_label.set_text.assert_called_with(
+        "Host-Probe: UNKNOWN"
+    )
+    window.GLib.timeout_add.assert_not_called()
+    window.refresh_host_card.assert_not_called()
 
 
 class ControlCenterViewModelTest(unittest.TestCase):
@@ -767,11 +860,17 @@ class ControlCenterWindowContractTest(unittest.TestCase):
         try:
             self.assertEqual(
                 window.page_names(),
-                {"Übersicht", "Werkzeuge", "Ollama/Modelle", "Ollama/Instanzen"},
+                {
+                    "Übersicht",
+                    "Hosts",
+                    "Werkzeuge",
+                    "Ollama/Modelle",
+                    "Ollama/Instanzen",
+                },
             )
             self.assertIs(window.Gtk, Gtk)
             self.assertGreater(len(window.tool_catalog), 0)
-            self.assertEqual(Gtk.Notebook.return_value.append_page.call_count, 5)
+            self.assertEqual(Gtk.Notebook.return_value.append_page.call_count, 6)
         finally:
             self.assertTrue(window.controller.close())
 

@@ -421,28 +421,32 @@ class AgentOperationStore:
         with self._state.locked():
             document = self._read_locked()
             record = self._find(document["operations"], receipt.operation_id)
-            existing = record["completion"]
-            if record["state"] in _TERMINAL_STATES:
-                if type(record["lease"]) is not dict:
-                    _raise("host.lease_stale")
-                self._validate_receipt_fences(
-                    principal, receipt, record, record["lease"], check_deadline=False
-                )
-                if record["state"] != receipt.state:
-                    _raise("host.completion_conflict")
-                if existing == self._completion_doc(receipt):
-                    return self._view(record)
-                _raise("host.completion_conflict")
-            if record["state"] != "leased" or type(record["lease"]) is not dict:
-                _raise("host.lease_stale")
-            lease = record["lease"]
-            self._validate_receipt_fences(
-                principal, receipt, record, lease, check_deadline=True
-            )
+            terminal = self._validate_completion_locked(principal, receipt, record)
+            if terminal:
+                return self._view(record)
             record["state"] = receipt.state
             record["completion"] = self._completion_doc(receipt)
             self._write_locked(document)
             return self._view(record)
+
+    def validate_completion(
+        self, principal: AgentPrincipalV1, receipt: AgentReceiptV1
+    ) -> Mapping[str, object]:
+        """Validate receipt fences and expose fixed owner context without mutation."""
+        if type(principal) is not AgentPrincipalV1 or type(receipt) is not AgentReceiptV1:
+            _raise("host.request_invalid")
+        with self._state.locked():
+            record = self._find(
+                self._read_locked()["operations"], receipt.operation_id
+            )
+            self._validate_completion_locked(principal, receipt, record)
+            return MappingProxyType(
+                {
+                    "target_host_ref": record["target_host_ref"],
+                    "registry_generation": record["registry_generation"],
+                    "arguments": MappingProxyType(dict(record["arguments"])),
+                }
+            )
 
     def cancel(self, operation_id: str) -> AgentOperationViewV1:
         operation_id = _token(operation_id, "host.operation_not_found")
@@ -713,6 +717,40 @@ class AgentOperationStore:
             _raise("host.result_mismatch")
         if check_deadline and _parse_time(lease["deadline"]) <= self._now():
             _raise("host.lease_stale")
+
+    def _validate_completion_locked(
+        self,
+        principal: AgentPrincipalV1,
+        receipt: AgentReceiptV1,
+        record: Mapping[str, Any],
+    ) -> bool:
+        existing = record["completion"]
+        if record["state"] in _TERMINAL_STATES:
+            if type(record["lease"]) is not dict:
+                _raise("host.lease_stale")
+            self._validate_receipt_fences(
+                principal,
+                receipt,
+                record,
+                record["lease"],
+                check_deadline=False,
+            )
+            if (
+                record["state"] != receipt.state
+                or existing != self._completion_doc(receipt)
+            ):
+                _raise("host.completion_conflict")
+            return True
+        if record["state"] != "leased" or type(record["lease"]) is not dict:
+            _raise("host.lease_stale")
+        self._validate_receipt_fences(
+            principal,
+            receipt,
+            record,
+            record["lease"],
+            check_deadline=True,
+        )
+        return False
 
     @staticmethod
     def _completion_doc(receipt: AgentReceiptV1) -> dict[str, object]:

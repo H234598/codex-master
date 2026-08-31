@@ -58,6 +58,8 @@ MAX_BACKEND_STDOUT_BYTES = 1024 * 1024
 MAX_BACKEND_STDERR_BYTES = 64 * 1024
 DEFAULT_BACKEND_TIMEOUT_SECONDS = 180
 MAX_BACKEND_TIMEOUT_SECONDS = 660
+HOST_PROBE_POLL_INTERVAL_MS = 1_000
+MAX_HOST_PROBE_POLLS = 60
 AGENT_ID_RE = re.compile(r"^[abcu](?:[1-9]|[1-9][0-9]|100)$")
 SERIES_FILTER_RE = re.compile(r"^[abcu]$")
 STATUS_PAGE_FIELDS = {
@@ -177,7 +179,7 @@ def host_probe_ui_state(result: object) -> HostProbeUiState:
     state = result["state"]
     if state in {"planned", "queued"}:
         return HostProbeUiState("QUEUED", False)
-    if state in {"running", "leased"}:
+    if state == "running":
         return HostProbeUiState("RUNNING", False)
     if state == "succeeded":
         return HostProbeUiState("SUCCEEDED", True)
@@ -825,19 +827,29 @@ def row_summary(row: AgentRow) -> str:
 
 
 class ControlCenterWindow:
-    def __init__(self, Gtk: Any, GLib: Any, application: Any) -> None:
+    def __init__(
+        self,
+        Gtk: Any,
+        GLib: Any,
+        application: Any,
+        *,
+        controller: Any | None = None,
+    ) -> None:
         self.Gtk = Gtk
         self.GLib = GLib
         self.page = 0
         self.last_page: StatusPage | None = None
-        self.controller = OperationController(schedule=GLib.idle_add)
+        self.controller = controller or OperationController(schedule=GLib.idle_add)
         self.tool_inputs: dict[str, tuple[FieldDescriptor, Any, Any, str]] = {}
         self.visible_tools: tuple[ToolDescriptor, ...] = ()
         self.selected_tool: ToolDescriptor | None = None
         self._suppress_tool_auto_run = False
         self._close_poll_id = 0
+        self._host_probe_operation_id: str | None = None
+        self._host_probe_poll_attempts = 0
         self._page_names = (
             "Übersicht",
+            "Hosts",
             "Werkzeuge",
             "Ollama/Modelle",
             "Ollama/Instanzen",
@@ -891,6 +903,7 @@ class ControlCenterWindow:
         outer.pack_start(self.status_label, False, False, 0)
         self.notebook = Gtk.Notebook()
         self.notebook.append_page(outer, Gtk.Label(label="Übersicht"))
+        self.notebook.append_page(self._build_hosts_page(), Gtk.Label(label="Hosts"))
         self.notebook.append_page(self._build_tools_page(), Gtk.Label(label="Werkzeuge"))
         self.notebook.append_page(self._build_ollama_page(), Gtk.Label(label="Ollama"))
         self.window.add(self.notebook)
@@ -913,18 +926,109 @@ class ControlCenterWindow:
             "expected_generation": generation,
             "idempotency_key": "gui-probe-" + secrets.token_hex(16),
         }
-        return self.controller.submit("fleet_host_probe", arguments, self._host_probe_started)
+        previous = (
+            self._host_probe_operation_id,
+            self._host_probe_poll_attempts,
+        )
+        self._host_probe_operation_id = None
+        self._host_probe_poll_attempts = 0
+        submitted = self.controller.submit(
+            "fleet_host_probe", arguments, self._host_probe_started
+        )
+        if not submitted:
+            (
+                self._host_probe_operation_id,
+                self._host_probe_poll_attempts,
+            ) = previous
+        return submitted
+
+    def _build_hosts_page(self) -> Any:
+        Gtk = self.Gtk
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_border_width(12)
+        self.host_card_label = Gtk.Label(
+            label="Hostkarte · aktiven Probevertrag gezielt ausführen"
+        )
+        self.host_card_label.set_xalign(0.0)
+        outer.pack_start(self.host_card_label, False, False, 0)
+        form = Gtk.Grid(column_spacing=8, row_spacing=6)
+        form.attach(Gtk.Label(label="Host-Ref"), 0, 0, 1, 1)
+        self.host_ref_entry = Gtk.Entry()
+        self.host_ref_entry.set_max_length(64)
+        form.attach(self.host_ref_entry, 1, 0, 1, 1)
+        form.attach(Gtk.Label(label="Generation"), 0, 1, 1, 1)
+        self.host_generation_spin = Gtk.SpinButton.new_with_range(
+            0, 2**31 - 1, 1
+        )
+        form.attach(self.host_generation_spin, 1, 1, 1, 1)
+        outer.pack_start(form, False, False, 0)
+        self.host_probe_button = Gtk.Button.new_with_label("Host prüfen")
+        self.host_probe_button.connect(
+            "clicked", lambda _button: self._probe_selected_host()
+        )
+        outer.pack_start(self.host_probe_button, False, False, 0)
+        self.host_probe_status_label = Gtk.Label(label="Host-Probe: bereit")
+        self.host_probe_status_label.set_xalign(0.0)
+        outer.pack_start(self.host_probe_status_label, False, False, 0)
+        return outer
+
+    def _probe_selected_host(self) -> None:
+        host_ref = self.host_ref_entry.get_text()
+        generation = self.host_generation_spin.get_value_as_int()
+        if not self.probe_host(host_ref, generation):
+            self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
 
     def _host_probe_started(self, result: dict[str, Any]) -> None:
         state = host_probe_ui_state(result)
-        self.status_label.set_text(f"Host-Probe: {state.state}")
         operation_id = result.get("id")
+        if not isinstance(operation_id, str) or (
+            self._host_probe_operation_id is not None
+            and operation_id != self._host_probe_operation_id
+        ):
+            self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
+            return
+        self._host_probe_operation_id = operation_id
+        self.host_probe_status_label.set_text(f"Host-Probe: {state.state}")
         if state.refresh_host_card:
-            self.refresh()
-        elif isinstance(operation_id, str):
-            self.controller.submit(
-                "fleet_operation_status", {"operation_id": operation_id}, self._host_probe_started
-            )
+            self.refresh_host_card()
+            self._host_probe_operation_id = None
+            self._host_probe_poll_attempts = 0
+        elif state.state in {"QUEUED", "RUNNING"} and isinstance(
+            operation_id, str
+        ):
+            if self._host_probe_poll_attempts >= MAX_HOST_PROBE_POLLS:
+                self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
+                return
+            try:
+                source_id = self.GLib.timeout_add(
+                    HOST_PROBE_POLL_INTERVAL_MS,
+                    self._poll_host_probe,
+                    operation_id,
+                )
+            except Exception:
+                source_id = 0
+            if (
+                isinstance(source_id, bool)
+                or not isinstance(source_id, int)
+                or source_id <= 0
+            ):
+                self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
+
+    def _poll_host_probe(self, operation_id: str) -> bool:
+        if operation_id != self._host_probe_operation_id:
+            return False
+        self._host_probe_poll_attempts += 1
+        if not self.controller.submit(
+            "fleet_operation_status",
+            {"operation_id": operation_id},
+            self._host_probe_started,
+        ):
+            self.host_probe_status_label.set_text("Host-Probe: UNKNOWN")
+        return False
+
+    def refresh_host_card(self) -> None:
+        """Refresh visible host-adjacent status only after a terminal probe."""
+        self.refresh()
 
     def ollama_apply_sensitive(self) -> bool:
         return bool(self._ollama_apply_enabled)
