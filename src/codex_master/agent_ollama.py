@@ -369,7 +369,7 @@ class ProductionAgentOllamaAdapter:
             saved = self._read_locked()["running"].get(instance_ref)
         if saved is None:
             _no_effect("provider.instance_missing")
-        if saved["generation"] != generation:
+        if generation < saved["generation"]:
             _no_effect("provider.generation_stale")
         if saved["queue_plan_digest"] != plan_digest:
             _no_effect("provider.plan_precondition_stale")
@@ -479,9 +479,7 @@ class ProductionAgentOllamaAdapter:
             and self._claim_alive(saved["claim"])
         ):
             _no_effect("provider.instance_stopping")
-        registry, plan = self._fresh_plan_current(instance_ref)
-        if registry.generation != generation:
-            _no_effect("provider.generation_stale")
+        _registry, plan = self._fresh_plan_current(instance_ref)
         if ollama_plan_digest(plan) != saved["plan_digest"]:
             _no_effect("provider.plan_changed")
         running = adopt_running_instance(plan, runtime=self._runtime, **{
