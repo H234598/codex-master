@@ -1,15 +1,15 @@
-# SDD ledger — plan: /home/teladi/Dokumente/Obsidian_Vaults/Teladi_Programming/Projekte/codex-master/Baupläne!/2026-08-30-Masterjet-Outbound-Pull-Hostagent-Implementierungsplan.md
+# SDD ledger — plan: `Projekte/codex-master/Baupläne!/2026-08-30-Masterjet-Outbound-Pull-Hostagent-Implementierungsplan.md`
 
 ## Workspace
 
-- Master worktree: `/run/media/teladi/SSD3/codex-worktrees/worktrees/codex-master/outbound-hostagent-20260830`
+- Master workspace: isolated SSD-backed `codex-master` worktree
 - Master branch/base: `feat/outbound-hostagent-20260830` / `8cae63b3879e8d07b9db75c33ef80e67a4e1ed92`
-- Usage worktree: `/run/media/teladi/SSD3/codex-worktrees/worktrees/codex-usage/outbound-hostagent-20260830`
+- Usage workspace: isolated SSD-backed `codex-usage` worktree
 - Usage branch/base: `feat/outbound-hostagent-usage-20260830` / `800b91862838c0cc3484a5e8ea8b3046f7e962fd`
 - Storage write/readback: PASS, SHA-256 `c4f8b482829fa7bc7c3fa1e8f143fdb732a25d21ae93c5c9093ca32b789fa09f`
 - Master baseline: 440 passed in 91.89s.
 - Usage baseline: 256 passed, 1 skipped in 15.82s.
-- Old `/dev/loop20` remains forbidden; only `/dev/sdg1` mounted at `/run/media/teladi/SSD3` is used.
+- Damaged legacy workspace remains forbidden; only freshly validated isolated storage is used.
 
 ## Preflight task self-consistency
 
@@ -124,6 +124,8 @@ Task 5: fix round 2/5 — 7 Important + M1–M3 addressed; 120 focused + 185 rel
 Task 5: fix round 3/5 running — original implementer resumed at `4887340`; exact lifecycle intent/stop/reconcile and monotonic deadline work only, no Task 6 transition
 Task 5: fix round 3/5 — 5 Important addressed; 126 focused + 186 relevant regression tests passed; 12 CodeRabbit uncommitted rounds, final round 0 findings; Ruff, compileall, diff-check and secret scan green
 Task 5: fix round 4/5 — rereview-3 mutable-memfd cache Important addressed; real unsealed RED `(True, True)`, sealed/unsealed live-kernel GREEN; 127 focused + 195 direct runtime-consumer regressions passed; CodeRabbit uncommitted round 1 returned 0 findings; Ruff, compileall, diff-check and secret scan green; no Task 6 transition
+Task 5: scoped re-review round 4 — executable-adoption Important closed; 0 Critical, 0 Important, 1 documentation Minor; portable ledger correction independently re-reviewed with 0 findings
+Task 5: complete — commits `ab648fe0668dffc2c544f2186acb188fd2331679..479b904f1cb60f76194f37ffd319c5086291716a`; 127 focused + 195 direct consumer regressions passed; final scoped verdict 0 Critical, 0 Important, 0 Minor
 Task 6: pending
 Task 7: pending
 Task 8: pending

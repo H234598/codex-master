@@ -210,3 +210,10 @@ Fresh verification:
 - Added-line secret-pattern scan: PASS, no matches.
 - CodeRabbit CLI 0.7.5 uncommitted round 1: 0 findings across the two changed
   Python files. There were no review suggestions to accept or reject.
+
+Independent committed-range review closed the executable-adoption Important
+with no remaining production or test finding. Its sole documentation Minor—
+machine-specific absolute paths in the newly tracked ledger—was replaced by
+portable vault-relative and role-based descriptions. The follow-up absolute-
+path scan, diff check, secret scan and CodeRabbit uncommitted review all passed
+with zero findings.
