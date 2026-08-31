@@ -24,7 +24,29 @@ def test_public_class_and_hive_examples_load_with_stable_digest() -> None:
     classes = load_agent_class_catalog(ROOT / "codex-agent-classes.json")
     config = load_hive_config(ROOT / "codex-hive.json", classes)
     assert classes["gottbiene"].scope_kind == "global"
-    assert config.mode == "shadow"
+    assert config.mode == "enforced"
+    assert config.repositories == (
+        {
+            "config_digest": "sha256:d88da7c0121fcad0eac9cb11d3a884a8f41ea9cb2d708fa6142ad1bb82d3de85",
+            "default_branch": "main",
+            "remote_identity": "https://github.com/H234598/codex-master.git",
+            "repo_id": "codex-master",
+        },
+    )
+    assert config.principals == (
+        {
+            "class_id": "gottbiene",
+            "parent_principal_id": None,
+            "principal_id": "godbee-main",
+            "repo_id": None,
+        },
+        {
+            "class_id": "koenigin",
+            "parent_principal_id": "godbee-main",
+            "principal_id": "queen-codex-master",
+            "repo_id": "codex-master",
+        },
+    )
     assert config.digest.startswith("sha256:")
 
 
@@ -88,7 +110,7 @@ def test_attested_catalog_and_hive_config_bytes_use_the_same_strict_contract() -
     config = load_hive_config_bytes(config_raw, snapshot.classes)
 
     assert snapshot.digest == "sha256:" + hashlib.sha256(catalog_raw).hexdigest()
-    assert config.mode == "shadow"
+    assert config.mode == "enforced"
     with pytest.raises(HiveConfigError, match="hive_config_unavailable"):
         load_hive_config_bytes(b"{", snapshot.classes)
 
