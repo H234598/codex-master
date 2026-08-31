@@ -56,6 +56,12 @@ class _NativeSpawnHelper:
     spawn: object
 
 
+@dataclass(frozen=True, slots=True)
+class _UnitSnapshot:
+    control_group: Path | None
+    invocation_id: str | None
+
+
 @dataclass(slots=True)
 class _SpawnedProcess:
     unit: str
@@ -64,6 +70,9 @@ class _SpawnedProcess:
     stdout_fd: int
     stderr_fd: int
     cgroup: Path | None = None
+    cgroup_fd: int = -1
+    cgroup_identity: tuple[int, int] | None = None
+    invocation_id: str | None = None
     returncode: int | None = None
     cgroup_released: bool = False
 
@@ -185,6 +194,15 @@ def _remaining(deadline: float) -> float:
     return value
 
 
+def _manager_runtime_limit(deadline: float) -> str:
+    """Encode the absolute runner deadline plus its fixed cleanup bound."""
+
+    microseconds = int((deadline + _CLEANUP_SECONDS - time.monotonic()) * 1_000_000)
+    if microseconds <= 0:
+        raise BoundedProcessError("command_timeout")
+    return f"{microseconds}us"
+
+
 def _systemctl(
     arguments: Sequence[str], *, environment: dict[str, str], deadline: float
 ) -> bytes:
@@ -228,6 +246,7 @@ def _systemd_run_arguments(
     *,
     cwd: Path,
     environment: dict[str, str],
+    manager_runtime: str,
     unit: str,
 ) -> tuple[str, ...]:
     runtime_directory = environment["XDG_RUNTIME_DIR"]
@@ -242,6 +261,11 @@ def _systemd_run_arguments(
         f"--unit={unit}",
         "--property=Delegate=no",
         "--property=KillMode=control-group",
+        f"--property=RuntimeMaxSec={manager_runtime}",
+        "--property=TimeoutStopSec=0",
+        "--property=SendSIGKILL=yes",
+        "--property=CollectMode=inactive-or-failed",
+        "--property=ExitType=main",
         "--property=InaccessiblePaths="
         f"{runtime_directory}/bus {runtime_directory}/systemd/private",
         "--pipe",
@@ -351,56 +375,164 @@ def _cgroup_path(value: bytes) -> Path:
     return _CGROUP_ROOT / path.relative_to(path.anchor)
 
 
+def _unit_snapshot(
+    unit: str, *, environment: dict[str, str], deadline: float
+) -> _UnitSnapshot:
+    output = _systemctl(
+        (
+            "show",
+            "--property=ControlGroup",
+            "--property=InvocationID",
+            "--property=LoadState",
+            unit,
+        ),
+        environment=environment,
+        deadline=deadline,
+    )
+    properties: dict[str, str] = {}
+    try:
+        lines = output.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    for line in lines:
+        name, separator, value = line.partition("=")
+        if not separator or name in properties:
+            raise BoundedProcessError("command_group_unavailable")
+        properties[name] = value
+    if set(properties) != {"ControlGroup", "InvocationID", "LoadState"}:
+        raise BoundedProcessError("command_group_unavailable")
+    if properties["LoadState"] == "not-found":
+        if properties["ControlGroup"] or properties["InvocationID"]:
+            raise BoundedProcessError("command_group_unavailable")
+        return _UnitSnapshot(None, None)
+    if not properties["ControlGroup"] or not properties["InvocationID"]:
+        return _UnitSnapshot(None, None)
+    if len(properties["InvocationID"]) != 32 or any(
+        character not in "0123456789abcdef" for character in properties["InvocationID"]
+    ):
+        raise BoundedProcessError("command_group_unavailable")
+    return _UnitSnapshot(
+        _cgroup_path(properties["ControlGroup"].encode("utf-8")),
+        properties["InvocationID"],
+    )
+
+
+def _open_cgroup_directory(cgroup: Path) -> tuple[int, tuple[int, int]]:
+    descriptor = -1
+    retained = False
+    try:
+        descriptor = os.open(
+            cgroup,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            raise BoundedProcessError("command_group_unavailable")
+        retained = True
+        return descriptor, (info.st_dev, info.st_ino)
+    except BoundedProcessError:
+        raise
+    except OSError as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    finally:
+        if not retained:
+            descriptor = _close_descriptor(descriptor)
+
+
 def _bind_cgroup(
     process: _SpawnedProcess, *, environment: dict[str, str], deadline: float
 ) -> None:
     while True:
-        output = _systemctl(
-            ("show", "--value", "--property=ControlGroup", process.unit),
-            environment=environment,
-            deadline=deadline,
+        snapshot = _unit_snapshot(
+            process.unit, environment=environment, deadline=deadline
         )
-        if output.strip():
-            cgroup = _cgroup_path(output)
-            if (cgroup / "cgroup.events").is_file():
-                process.cgroup = cgroup
-                return
+        if snapshot.control_group is not None and snapshot.invocation_id is not None:
+            descriptor, identity = _open_cgroup_directory(snapshot.control_group)
+            try:
+                confirmed = _unit_snapshot(
+                    process.unit, environment=environment, deadline=deadline
+                )
+                if confirmed == snapshot:
+                    process.cgroup = snapshot.control_group
+                    process.cgroup_fd = descriptor
+                    process.cgroup_identity = identity
+                    process.invocation_id = snapshot.invocation_id
+                    return
+            finally:
+                if process.cgroup_fd != descriptor:
+                    descriptor = _close_descriptor(descriptor)
         time.sleep(min(0.005, _remaining(deadline)))
 
 
-def _cgroup_is_empty(cgroup: Path) -> bool:
+def _bound_cgroup_descriptor(process: _SpawnedProcess) -> int:
+    if process.cgroup_fd < 0 or process.cgroup_identity is None:
+        raise BoundedProcessError("command_group_unavailable")
     try:
-        events = (cgroup / "cgroup.events").read_text(encoding="ascii")
+        info = os.fstat(process.cgroup_fd)
+    except OSError as exc:
+        raise BoundedProcessError("command_group_unavailable") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or (info.st_dev, info.st_ino) != process.cgroup_identity
+    ):
+        raise BoundedProcessError("command_group_unavailable")
+    return process.cgroup_fd
+
+
+def _read_bound_cgroup_file(process: _SpawnedProcess, name: str) -> str:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=_bound_cgroup_descriptor(process),
+        )
+        chunks = bytearray()
+        while True:
+            chunk = os.read(descriptor, 4096)
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        return chunks.decode("ascii")
     except FileNotFoundError:
-        return True
+        raise
     except (OSError, UnicodeError) as exc:
         raise BoundedProcessError("command_group_unavailable") from exc
+    finally:
+        descriptor = _close_descriptor(descriptor)
+
+
+def _cgroup_is_empty(process: _SpawnedProcess) -> bool:
+    try:
+        events = _read_bound_cgroup_file(process, "cgroup.events")
+    except FileNotFoundError:
+        return True
     populated = [line for line in events.splitlines() if line.startswith("populated ")]
     if populated != ["populated 0"]:
         return False
     try:
-        return not (cgroup / "cgroup.procs").read_text(encoding="ascii").split()
+        return not _read_bound_cgroup_file(process, "cgroup.procs").split()
     except FileNotFoundError:
         return True
-    except (OSError, UnicodeError) as exc:
-        raise BoundedProcessError("command_group_unavailable") from exc
 
 
-def _wait_for_cgroup_empty(cgroup: Path, deadline: float) -> bool:
+def _wait_for_cgroup_empty(process: _SpawnedProcess, deadline: float) -> bool:
     while time.monotonic() < deadline:
-        if _cgroup_is_empty(cgroup):
+        if _cgroup_is_empty(process):
             return True
         time.sleep(0.005)
-    return _cgroup_is_empty(cgroup)
+    return _cgroup_is_empty(process)
 
 
-def _kill_bound_cgroup(cgroup: Path) -> None:
-    """Kill only every member of the cgroup bound from this random unit."""
+def _kill_bound_cgroup(process: _SpawnedProcess) -> None:
+    """Kill only the directory-FD-bound cgroup generation of this process."""
 
     descriptor = -1
     try:
         descriptor = os.open(
-            cgroup / "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            "cgroup.kill",
+            os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=_bound_cgroup_descriptor(process),
         )
         if os.write(descriptor, b"1") != 1:
             raise BoundedProcessError("command_group_unavailable")
@@ -416,14 +548,24 @@ def _wait_for_unit_resolved(
     process: _SpawnedProcess, *, environment: dict[str, str], deadline: float
 ) -> None:
     while True:
-        output = _systemctl(
-            ("show", "--value", "--property=LoadState", process.unit),
-            environment=environment,
-            deadline=deadline,
+        snapshot = _unit_snapshot(
+            process.unit, environment=environment, deadline=deadline
         )
-        if output.strip() == b"not-found":
+        if snapshot.invocation_id != process.invocation_id:
             return
         time.sleep(min(0.005, _remaining(deadline)))
+
+
+def _stop_bound_unit(
+    process: _SpawnedProcess, *, environment: dict[str, str], deadline: float
+) -> None:
+    snapshot = _unit_snapshot(process.unit, environment=environment, deadline=deadline)
+    if (
+        snapshot.control_group != process.cgroup
+        or snapshot.invocation_id != process.invocation_id
+    ):
+        return
+    _systemctl(("stop", process.unit), environment=environment, deadline=deadline)
 
 
 def _stop_cgroup(
@@ -431,20 +573,30 @@ def _stop_cgroup(
 ) -> None:
     stop_error: BoundedProcessError | None = None
     try:
-        _systemctl(
-            ("stop", process.unit),
+        _stop_bound_unit(
+            process,
             environment=environment,
             deadline=min(deadline, time.monotonic() + _STOP_SECONDS),
         )
     except BoundedProcessError as exc:
         stop_error = exc
-    if process.cgroup is not None:
-        _kill_bound_cgroup(process.cgroup)
-        if not _wait_for_cgroup_empty(process.cgroup, deadline):
-            raise BoundedProcessError("command_timeout")
-        _wait_for_unit_resolved(process, environment=environment, deadline=deadline)
+    kill_error: BoundedProcessError | None = None
+    try:
+        _kill_bound_cgroup(process)
+    except BoundedProcessError as exc:
+        kill_error = exc
+    if stop_error is not None and kill_error is not None:
+        raise BoundedProcessError("command_cleanup_bounded") from kill_error
+    if not _wait_for_cgroup_empty(process, deadline):
+        raise BoundedProcessError("command_cleanup_bounded")
+    _wait_for_unit_resolved(process, environment=environment, deadline=deadline)
     if stop_error is not None:
         raise stop_error
+
+
+def _close_bound_cgroup(process: _SpawnedProcess) -> None:
+    process.cgroup_fd = _close_descriptor(process.cgroup_fd)
+    process.cgroup_identity = None
 
 
 def _returncode(waited: object) -> int:
@@ -545,7 +697,11 @@ def run_bounded(
     _verify_runner_capability(environment=environment, deadline=deadline)
     unit = _unit_name()
     command = _systemd_run_arguments(
-        arguments, cwd=cwd, environment=environment, unit=unit
+        arguments,
+        cwd=cwd,
+        environment=environment,
+        manager_runtime=_manager_runtime_limit(deadline),
+        unit=unit,
     )
     process: _SpawnedProcess | None = None
     selector: selectors.BaseSelector | None = None
@@ -614,9 +770,7 @@ def run_bounded(
             returncode = _wait_for_process(process, _remaining(deadline))
         except TimeoutError as exc:
             raise BoundedProcessError("command_timeout") from exc
-        if process.cgroup is None or not _wait_for_cgroup_empty(
-            process.cgroup, deadline
-        ):
+        if process.cgroup is None or not _wait_for_cgroup_empty(process, deadline):
             raise BoundedProcessError("command_timeout")
         _wait_for_unit_resolved(process, environment=environment, deadline=deadline)
         process.cgroup_released = True
@@ -638,7 +792,7 @@ def run_bounded(
             _close_process_descriptors(process)
             cleanup_error: BoundedProcessError | None = None
             try:
-                if not process.cgroup_released:
+                if process.cgroup_fd >= 0 and not process.cgroup_released:
                     _stop_cgroup(
                         process, environment=environment, deadline=cleanup_deadline
                     )
@@ -647,6 +801,7 @@ def run_bounded(
             finally:
                 _reap_process(process, cleanup_deadline)
                 process.pidfd = _close_descriptor(process.pidfd)
+                _close_bound_cgroup(process)
             if cleanup_error is not None:
                 raise cleanup_error
 
