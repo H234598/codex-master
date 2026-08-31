@@ -16301,7 +16301,12 @@ google_accounts:
         ), patch.object(
             server_module,
             "_read_bound_mcp_health",
-            return_value=(True, {"ok": True}, {"ok": True}),
+            return_value=server_module._BoundMcpHealth(
+                canonical_cli_available=True,
+                client_binding_available=True,
+                registration={"ok": True},
+                client_config={"ok": True},
+            ),
         ), patch.object(server_module, "codex_home_context", return_value={"ok": True}):
             result = server_module.master_plugin_status()
 
@@ -16662,10 +16667,11 @@ google_accounts:
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
             "codex_master.server._read_bound_mcp_health",
-            return_value=(
-                True,
-                mock_registration.return_value,
-                mock_client_config.return_value,
+            return_value=server_module._BoundMcpHealth(
+                canonical_cli_available=True,
+                client_binding_available=True,
+                registration=mock_registration.return_value,
+                client_config=mock_client_config.return_value,
             ),
         ):
             result = master_namespace_status()
@@ -16747,10 +16753,11 @@ google_accounts:
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
             "codex_master.server._read_bound_mcp_health",
-            return_value=(
-                True,
-                mock_registration.return_value,
-                mock_client_config.return_value,
+            return_value=server_module._BoundMcpHealth(
+                canonical_cli_available=True,
+                client_binding_available=True,
+                registration=mock_registration.return_value,
+                client_config=mock_client_config.return_value,
             ),
         ):
             result = master_namespace_status()
@@ -16817,10 +16824,11 @@ google_accounts:
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
             "codex_master.server._read_bound_mcp_health",
-            return_value=(
-                True,
-                mock_registration.return_value,
-                mock_client_config.return_value,
+            return_value=server_module._BoundMcpHealth(
+                canonical_cli_available=True,
+                client_binding_available=True,
+                registration=mock_registration.return_value,
+                client_config=mock_client_config.return_value,
             ),
         ):
             result = master_namespace_status()
@@ -16885,10 +16893,11 @@ google_accounts:
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
             "codex_master.server._read_bound_mcp_health",
-            return_value=(
-                True,
-                mock_registration.return_value,
-                mock_client_config.return_value,
+            return_value=server_module._BoundMcpHealth(
+                canonical_cli_available=True,
+                client_binding_available=True,
+                registration=mock_registration.return_value,
+                client_config=mock_client_config.return_value,
             ),
         ):
             result = master_namespace_status()
@@ -16981,10 +16990,11 @@ google_accounts:
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
             "codex_master.server._read_bound_mcp_health",
-            return_value=(
-                True,
-                {"ok": True},
-                mock_client_config.return_value,
+            return_value=server_module._BoundMcpHealth(
+                canonical_cli_available=True,
+                client_binding_available=True,
+                registration={"ok": True},
+                client_config=mock_client_config.return_value,
             ),
         ):
             result = master_timeout_policy()

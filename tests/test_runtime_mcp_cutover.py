@@ -293,13 +293,12 @@ def test_bound_mcp_health_reads_registration_and_config_through_one_no_create_bi
             side_effect=AssertionError("bound health must not read ambient CODEX_HOME"),
         ),
     ):
-        available, actual_registration, actual_client_config = (
-            server._read_bound_mcp_health(entrypoint)
-        )
+        health = server._read_bound_mcp_health(entrypoint)
 
-    assert available is True
-    assert actual_registration is registration
-    assert actual_client_config is client_config
+    assert health.canonical_cli_available is True
+    assert health.client_binding_available is True
+    assert health.registration is registration
+    assert health.client_config is client_config
     bind.assert_called_once_with()
     check.assert_called_once_with(entrypoint, binding=binding)
     config_status.assert_called_once_with(binding.config_path, command_path=entrypoint)
@@ -713,7 +712,7 @@ def test_registration_inspection_does_not_create_a_missing_client_config_directo
     assert not (home / ".codex").exists()
 
 
-def test_doctor_missing_config_fails_closed_before_creating_state_or_locks(
+def test_doctor_client_binding_unavailable_keeps_safe_core_checks_without_state(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "main-home"
@@ -725,6 +724,18 @@ def test_doctor_missing_config_fails_closed_before_creating_state_or_locks(
     entrypoint.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     entrypoint.chmod(0o700)
     state_root = tmp_path / "state"
+    agent_home = tmp_path / "agent-home"
+    agent_home.mkdir(mode=0o700)
+    agent_runner = tmp_path / "agent-runner"
+    agent_runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    agent_runner.chmod(0o700)
+    inventory_snapshot = SimpleNamespace(agent_ids=("a1",))
+    agent_status = {
+        "external_process_count": 0,
+        "home": "not_returned",
+        "external_processes": [],
+        "external_processes_truncated": False,
+    }
 
     with (
         patch.object(server.os, "geteuid", return_value=1000),
@@ -739,25 +750,161 @@ def test_doctor_missing_config_fails_closed_before_creating_state_or_locks(
         patch.object(server, "LEASE_DIR", state_root / "leases"),
         patch.object(server, "_runtime_mcp_entrypoint", return_value=entrypoint),
         patch.object(
+            server, "current_agent_inventory", return_value=inventory_snapshot
+        ) as inventory,
+        patch.object(
+            server,
+            "agent_config",
+            return_value={
+                "home": agent_home,
+                "runner": agent_runner,
+                "session": "agent-session",
+            },
+        ) as agent_configuration,
+        patch.object(
+            server, "agent_home_process_summary", return_value=agent_status
+        ) as process_summary,
+        patch.object(server, "tmux_alive", return_value=False) as tmux_alive,
+        patch.object(
+            server, "agent_identity_guard", return_value={"ok": True}
+        ) as identity_guard,
+        patch.object(
+            server, "mcp_command_startup_self_test", return_value={"ok": True}
+        ) as startup_self_test,
+        patch.object(
+            server,
+            "codex_home_context",
+            return_value={"name": "codex_home_context", "ok": True},
+        ) as home_context,
+        patch.object(
+            server, "raw_log_retention_status", return_value={"raw_output": "not_returned"}
+        ) as raw_retention,
+        patch.object(
+            server, "native_hook_coverage_status", return_value={"ok": True}
+        ) as native_hooks,
+    ):
+        result = server.doctor()
+
+    checks = {item["name"]: item for item in result["checks"]}
+    registration = next(item for item in result["checks"] if item["name"] == "mcp_registered")
+    assert result["ok"] is False
+    assert checks["canonical_codex_cli_available"]["ok"] is True
+    assert registration["lookup_status"] == "unavailable"
+    assert registration["reason"] == "client_binding_unavailable"
+    assert checks["codex_client_mcp_config"]["reason"] == "client_binding_unavailable"
+    assert not (home / ".codex").exists()
+    assert not state_root.exists()
+    assert not (state_root / "locks").exists()
+    for name in (
+        "tmux_available",
+        "runtime_mcp_entrypoint",
+        "mcp_startup_self_test",
+        "agent_a1_home_exists",
+        "agent_a1_runner_executable",
+        "agent_a1_tmux_session_state",
+        "agent_a1_home_not_used_externally",
+        "agent_a1_single_identity_guard",
+        "mcp_startup_timeout_configured",
+        "codex_home_context",
+        "raw_log_retention_configured",
+        "native_hook_coverage",
+    ):
+        assert name in checks
+    inventory.assert_called_once_with()
+    agent_configuration.assert_called_once_with("a1", inventory_snapshot)
+    process_summary.assert_called_once_with("a1")
+    tmux_alive.assert_called_once_with("agent-session")
+    identity_guard.assert_called_once_with(False, agent_status, pane_process_id=None)
+    startup_self_test.assert_not_called()
+    assert checks["mcp_startup_self_test"] == {
+        "name": "mcp_startup_self_test",
+        "ok": False,
+        "status": "unavailable",
+        "reason": "client_binding_unavailable",
+        "raw_output": "not_returned",
+    }
+    home_context.assert_called_once_with()
+    raw_retention.assert_called_once_with()
+    native_hooks.assert_called_once_with()
+    assert str(state_root) not in json.dumps(result, sort_keys=True)
+
+
+def test_doctor_canonical_cli_unavailable_keeps_core_checks_and_cause(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "main-home"
+    home.mkdir(mode=0o700)
+    (home / ".codex").mkdir(mode=0o700)
+    entrypoint = tmp_path / "codex-master-mcp"
+    entrypoint.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    entrypoint.chmod(0o700)
+    state_root = tmp_path / "state"
+
+    with (
+        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.object(
+            server,
+            "_canonical_codex_cli_path",
+            side_effect=server.AgentError("canonical_codex_cli_unavailable"),
+        ),
+        patch.object(server, "STATE_ROOT", state_root),
+        patch.object(server, "RAW_DIR", state_root / "raw"),
+        patch.object(server, "META_DIR", state_root / "meta"),
+        patch.object(server, "LOCK_DIR", state_root / "locks"),
+        patch.object(server, "LEASE_DIR", state_root / "leases"),
+        patch.object(server, "_runtime_mcp_entrypoint", return_value=entrypoint),
+        patch.object(
             server, "current_agent_inventory", return_value=SimpleNamespace(agent_ids=())
         ) as inventory,
         patch.object(
             server, "mcp_command_startup_self_test", return_value={"ok": True}
         ) as startup_self_test,
-        patch.object(server, "raw_log_retention_status", return_value={}),
-        patch.object(server, "native_hook_coverage_status", return_value={}),
+        patch.object(
+            server,
+            "codex_home_context",
+            return_value={"name": "codex_home_context", "ok": True},
+        ) as home_context,
+        patch.object(
+            server, "raw_log_retention_status", return_value={"raw_output": "not_returned"}
+        ) as raw_retention,
+        patch.object(
+            server, "native_hook_coverage_status", return_value={"ok": True}
+        ) as native_hooks,
     ):
         result = server.doctor()
 
-    registration = next(item for item in result["checks"] if item["name"] == "mcp_registered")
+    checks = {item["name"]: item for item in result["checks"]}
     assert result["ok"] is False
-    assert registration["lookup_status"] == "unavailable"
-    assert not (home / ".codex").exists()
+    assert checks["canonical_codex_cli_available"]["ok"] is False
+    assert checks["mcp_registered"]["reason"] == "canonical_cli_unavailable"
+    assert checks["codex_client_mcp_config"]["reason"] == "canonical_cli_unavailable"
     assert not state_root.exists()
     assert not (state_root / "locks").exists()
-    inventory.assert_not_called()
+    for name in (
+        "tmux_available",
+        "runtime_mcp_entrypoint",
+        "mcp_startup_self_test",
+        "mcp_startup_timeout_configured",
+        "codex_home_context",
+        "raw_log_retention_configured",
+        "native_hook_coverage",
+    ):
+        assert name in checks
+    inventory.assert_called_once_with()
     startup_self_test.assert_not_called()
-    assert str(state_root) not in json.dumps(result, sort_keys=True)
+    assert checks["mcp_startup_self_test"] == {
+        "name": "mcp_startup_self_test",
+        "ok": False,
+        "status": "unavailable",
+        "reason": "canonical_cli_unavailable",
+        "raw_output": "not_returned",
+    }
+    home_context.assert_called_once_with()
+    raw_retention.assert_called_once_with()
+    native_hooks.assert_called_once_with()
 
 
 def test_binding_rejects_a_symlinked_client_config_directory(tmp_path: Path) -> None:
