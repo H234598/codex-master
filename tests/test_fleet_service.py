@@ -3178,3 +3178,64 @@ def test_completed_remote_apply_receipt_rejects_conflicting_terminal_result(
 
     assert store.get(apply.id) == before_queue
     assert registry.load() == before_registry
+
+
+def test_completed_remote_apply_receipt_replay_is_persistently_read_only(
+    tmp_path: Path,
+) -> None:
+    """An exact terminal redelivery neither rewrites saga nor queue files."""
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    assert service.accept_agent_result(principal, receipt).state == "succeeded"
+    changed = replace(
+        running, lifecycle_state="failed", readiness_state="not_ready"
+    )
+    completed = registry.load()
+    drifted = registry.replace(
+        models=completed.models,
+        instances=(changed,),
+        expected_generation=completed.generation,
+    )
+
+    def snapshot(path: Path) -> tuple[int, int, bytes]:
+        content = path.read_bytes()
+        status = path.stat()
+        return status.st_ino, status.st_size, content
+
+    remote_saga = (
+        tmp_path
+        / "owner"
+        / "fleet"
+        / "ollama-remote"
+        / "remote-ollama-operations.json"
+    )
+    queue_operations = tmp_path / "operations" / "agent-operations" / "operations.json"
+    queue_result = (
+        tmp_path / "operations" / "agent-operations" / "results" / apply.id
+    )
+    before_files = {
+        "remote_saga": snapshot(remote_saga),
+        "queue_operations": snapshot(queue_operations),
+        "queue_result": snapshot(queue_result),
+    }
+    before_queue = store.get(apply.id)
+
+    replay = new_service().accept_agent_result(principal, receipt)
+
+    assert replay == before_queue
+    assert store.get(apply.id) == before_queue
+    assert registry.load() == drifted
+    assert {
+        "remote_saga": snapshot(remote_saga),
+        "queue_operations": snapshot(queue_operations),
+        "queue_result": snapshot(queue_result),
+    } == before_files

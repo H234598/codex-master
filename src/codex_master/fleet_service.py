@@ -714,35 +714,35 @@ class FleetService:
 
     def _prepare_remote_completion(self, receipt: AgentReceiptV1) -> str:
         digest = self._completion_saga_digest(receipt)
-        phase: str | None = None
-
-        def prepare(document: dict[str, object]) -> None:
-            nonlocal phase
-            record = cast(dict[str, object], document["operations"]).get(
-                receipt.operation_id
-            )
-            if not isinstance(record, dict):
-                raise FleetConflictError("resource.host_response_invalid")
-            completion = record.get("completion")
-            expected = {"state": receipt.state, "receipt_digest": digest}
-            if completion is None:
-                record["completion"] = {**expected, "phase": "prepared"}
-                phase = "prepared"
-                return
-            if (
-                not isinstance(completion, Mapping)
-                or completion.get("state") != receipt.state
-                or completion.get("receipt_digest") != digest
-                or completion.get("phase")
-                not in {"prepared", "owner_applied", "queue_completed"}
-            ):
-                raise FleetConflictError("resource.host_response_invalid")
-            phase = cast(str, completion["phase"])
-
-        self._mutate_remote_document(prepare)
-        if phase is None:  # Defensive: _mutate_remote_document always invokes prepare.
-            raise FleetConflictError("resource.host_response_invalid")
-        return phase
+        state = self._ollama_remote_state
+        if state is None:
+            raise FleetConflictError("ollama.transport_invalid")
+        try:
+            with state.locked():
+                document = self._remote_document_locked(state)
+                record = cast(dict[str, object], document["operations"]).get(
+                    receipt.operation_id
+                )
+                if not isinstance(record, dict):
+                    raise FleetConflictError("resource.host_response_invalid")
+                completion = record.get("completion")
+                expected = {"state": receipt.state, "receipt_digest": digest}
+                if completion is None:
+                    record["completion"] = {**expected, "phase": "prepared"}
+                    self._remote_document_locked_validate(document)
+                    state.replace_json_locked(_REMOTE_OLLAMA_DOCUMENT, document)
+                    return "prepared"
+                if (
+                    not isinstance(completion, Mapping)
+                    or completion.get("state") != receipt.state
+                    or completion.get("receipt_digest") != digest
+                    or completion.get("phase")
+                    not in {"prepared", "owner_applied", "queue_completed"}
+                ):
+                    raise FleetConflictError("resource.host_response_invalid")
+                return cast(str, completion["phase"])
+        except HiveStateError:
+            raise FleetConflictError("resource.host_response_invalid") from None
 
     def _mark_remote_owner_applied(
         self,
@@ -1597,9 +1597,7 @@ class FleetService:
                 # phase were already checked above.  A terminal replay must not
                 # revisit an owner effect: a later legitimate registry change
                 # cannot invalidate the idempotent queue acknowledgement.
-                completed = self._agent_operations.complete(principal, receipt)
-                self._mark_remote_completed(receipt)
-                return completed
+                return queued
             instance_ref: str | None = None
             readiness: OllamaReadinessStatus | None = None
             if receipt.state != "succeeded":
