@@ -23150,13 +23150,27 @@ def _read_bound_mcp_health(
 
 
 def doctor() -> dict[str, Any]:
-    ensure_state()
     install_path = _runtime_mcp_entrypoint()
     (
         canonical_codex_cli_available,
         registration,
         client_config,
     ) = _read_bound_mcp_health(install_path)
+    if not canonical_codex_cli_available:
+        return {
+            "ok": False,
+            "checks": [
+                {
+                    "name": "canonical_codex_cli_available",
+                    "ok": False,
+                },
+                {"name": "mcp_registered", **registration},
+                client_config,
+            ],
+            "raw_output": "not_returned",
+        }
+
+    ensure_state()
     checks: list[dict[str, Any]] = [
         {"name": "tmux_available", "ok": shutil.which("tmux") is not None},
         {

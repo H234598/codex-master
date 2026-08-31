@@ -713,7 +713,7 @@ def test_registration_inspection_does_not_create_a_missing_client_config_directo
     assert not (home / ".codex").exists()
 
 
-def test_doctor_does_not_create_a_missing_client_config_directory(
+def test_doctor_missing_config_fails_closed_before_creating_state_or_locks(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "main-home"
@@ -724,6 +724,7 @@ def test_doctor_does_not_create_a_missing_client_config_directory(
     entrypoint = tmp_path / "codex-master-mcp"
     entrypoint.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     entrypoint.chmod(0o700)
+    state_root = tmp_path / "state"
 
     with (
         patch.object(server.os, "geteuid", return_value=1000),
@@ -731,20 +732,32 @@ def test_doctor_does_not_create_a_missing_client_config_directory(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
         patch.object(server, "_canonical_codex_cli_path", return_value=executable),
-        patch.object(server, "ensure_state"),
+        patch.object(server, "STATE_ROOT", state_root),
+        patch.object(server, "RAW_DIR", state_root / "raw"),
+        patch.object(server, "META_DIR", state_root / "meta"),
+        patch.object(server, "LOCK_DIR", state_root / "locks"),
+        patch.object(server, "LEASE_DIR", state_root / "leases"),
         patch.object(server, "_runtime_mcp_entrypoint", return_value=entrypoint),
         patch.object(
             server, "current_agent_inventory", return_value=SimpleNamespace(agent_ids=())
-        ),
-        patch.object(server, "mcp_command_startup_self_test", return_value={"ok": True}),
+        ) as inventory,
+        patch.object(
+            server, "mcp_command_startup_self_test", return_value={"ok": True}
+        ) as startup_self_test,
         patch.object(server, "raw_log_retention_status", return_value={}),
         patch.object(server, "native_hook_coverage_status", return_value={}),
     ):
         result = server.doctor()
 
     registration = next(item for item in result["checks"] if item["name"] == "mcp_registered")
+    assert result["ok"] is False
     assert registration["lookup_status"] == "unavailable"
     assert not (home / ".codex").exists()
+    assert not state_root.exists()
+    assert not (state_root / "locks").exists()
+    inventory.assert_not_called()
+    startup_self_test.assert_not_called()
+    assert str(state_root) not in json.dumps(result, sort_keys=True)
 
 
 def test_binding_rejects_a_symlinked_client_config_directory(tmp_path: Path) -> None:
