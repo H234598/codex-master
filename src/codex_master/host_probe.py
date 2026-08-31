@@ -293,7 +293,7 @@ class RemoteHostProbeAdapter:
         if plan.operation.state != "planned":
             return plan.operation
         document_generation = self._registry.document_generation()
-        self._agent_operations.enqueue(
+        agent_operation = self._agent_operations.enqueue(
             AgentOperationRequestV1(
                 key=_operation_key(host_ref, idempotency_key), kind="host.probe", action="collect",
                 registry_generation=document_generation,
@@ -302,6 +302,12 @@ class RemoteHostProbeAdapter:
                 deadline=(self._clock().astimezone(UTC).replace(microsecond=0) + timedelta(minutes=5)),
                 target_host_ref=host_ref,
             )
+        )
+        self._operations.bind_host_probe_agent(
+            plan.operation_id,
+            agent_operation_id=agent_operation.operation_id,
+            target_host_ref=host_ref,
+            plan_digest=plan.plan_digest,
         )
         return plan.operation
 
@@ -341,12 +347,28 @@ class RemoteHostProbeCompletionOwner:
         operation_id = arguments.get("admin_operation_id")
         if type(operation_id) is not str:
             raise HostProbeError()
-        operation = self._operations.get(operation_id)
+        lifecycle = self._operations.claim_host_probe_agent(
+            operation_id,
+            agent_operation_id=exhaustion.operation_id,
+            target_host_ref=target,
+            plan_digest=exhaustion.plan_digest,
+        )
+        if lifecycle.operation is None:
+            terminal = self._agent_operations.get(exhaustion.operation_id)
+            if (
+                not lifecycle.acknowledged
+                or terminal.state != "unknown"
+                or terminal.reason_codes != ("host.attempts_exhausted",)
+            ):
+                raise AdminOperationError("control.operation_state_conflict")
+            return True
+        operation = lifecycle.operation
         if (
             operation.kind != "hosts.probe"
             or operation.plan_digest != exhaustion.plan_digest
         ):
             raise HostProbeError()
+        self._require_lifecycle_operation(operation)
         operation = self._transition_lifecycle_failure(
             operation_id,
             operation.expected_generation,
@@ -377,12 +399,28 @@ class RemoteHostProbeCompletionOwner:
         operation_id = arguments.get("admin_operation_id")
         if type(operation_id) is not str:
             raise HostProbeError()
-        operation = self._operations.get(operation_id)
+        lifecycle = self._operations.claim_host_probe_agent(
+            operation_id,
+            agent_operation_id=expiry.operation_id,
+            target_host_ref=target,
+            plan_digest=expiry.plan_digest,
+        )
+        if lifecycle.operation is None:
+            terminal = self._agent_operations.get(expiry.operation_id)
+            if (
+                not lifecycle.acknowledged
+                or terminal.state != "unknown"
+                or terminal.reason_codes != ("host.lease_expired",)
+            ):
+                raise AdminOperationError("control.operation_state_conflict")
+            return True
+        operation = lifecycle.operation
         if (
             operation.kind != "hosts.probe"
             or operation.plan_digest != expiry.plan_digest
         ):
             raise HostProbeError()
+        self._require_lifecycle_operation(operation)
         operation = self._transition_lifecycle_failure(
             operation_id,
             operation.expected_generation,
@@ -391,6 +429,48 @@ class RemoteHostProbeCompletionOwner:
         if operation.state not in _TERMINAL_ADMIN_STATES:
             raise AdminOperationError("control.operation_state_conflict")
         return True
+
+    def acknowledge_agent_lifecycle(
+        self,
+        lifecycle: AgentAttemptExhaustionV1 | AgentOperationDeadlineExpiryV1,
+    ) -> None:
+        """Release the Admin owner only after the Agent terminal write is visible."""
+
+        if type(lifecycle) not in {
+            AgentAttemptExhaustionV1,
+            AgentOperationDeadlineExpiryV1,
+        }:
+            raise HostProbeError()
+        if (lifecycle.kind, lifecycle.action) != ("host.probe", "collect"):
+            return
+        target = lifecycle.target_host_ref
+        arguments = lifecycle.arguments
+        if (
+            type(target) is not str
+            or lifecycle.host_ref != target
+            or set(arguments) != {"admin_operation_id", "probe_schema"}
+            or arguments.get("probe_schema") != 1
+        ):
+            raise HostProbeError()
+        operation_id = arguments.get("admin_operation_id")
+        if type(operation_id) is not str:
+            raise HostProbeError()
+        terminal = self._agent_operations.get(lifecycle.operation_id)
+        expected_reason = (
+            "host.attempts_exhausted"
+            if type(lifecycle) is AgentAttemptExhaustionV1
+            else "host.lease_expired"
+        )
+        if terminal.state != "unknown" or terminal.reason_codes != (
+            expected_reason,
+        ):
+            raise AgentOperationError("host.operation_store_unavailable")
+        self._operations.acknowledge_host_probe_agent(
+            operation_id,
+            agent_operation_id=lifecycle.operation_id,
+            target_host_ref=target,
+            plan_digest=lifecycle.plan_digest,
+        )
 
     def complete(self, principal: object, receipt: AgentReceiptV1) -> object:
         if receipt.result.kind != "host.probe" or receipt.result.action != "collect":
@@ -416,7 +496,23 @@ class RemoteHostProbeCompletionOwner:
             or type(document_generation) is not int
         ):
             raise HostProbeError()
-        operation = self._operations.get(operation_id)
+        lifecycle = self._operations.claim_host_probe_agent(
+            operation_id,
+            agent_operation_id=receipt.operation_id,
+            target_host_ref=target,
+            plan_digest=receipt.plan_digest,
+        )
+        if lifecycle.operation is None:
+            terminal = self._agent_operations.get(receipt.operation_id)
+            if not lifecycle.acknowledged or terminal.state not in {
+                "succeeded",
+                "failed",
+                "unknown",
+                "cancelled",
+            }:
+                raise AdminOperationError("control.operation_state_conflict")
+            return self._agent_operations.complete(operation_principal, receipt)
+        operation = lifecycle.operation
         if (
             operation.kind != "hosts.probe"
             or operation.plan_digest != receipt.plan_digest
@@ -474,7 +570,12 @@ class RemoteHostProbeCompletionOwner:
         if operation.state in _TERMINAL_ADMIN_STATES and operation.reason_codes != (
             "control.restart_reconciled",
         ):
-            return self._agent_operations.complete(operation_principal, receipt)
+            return self._complete_agent_and_ack(
+                operation_principal,
+                receipt,
+                operation_id,
+                target,
+            )
         try:
             resulting_generation = _next_generation(host_generation)
         except HostProbeError:
@@ -514,7 +615,12 @@ class RemoteHostProbeCompletionOwner:
             raise
         operation = self._active_operation(operation_id, host_generation)
         if operation.state in _TERMINAL_ADMIN_STATES:
-            return self._agent_operations.complete(operation_principal, receipt)
+            return self._complete_agent_and_ack(
+                operation_principal,
+                receipt,
+                operation_id,
+                target,
+            )
         if operation.not_attempted_count:
             self._operations.record_step(
                 operation_id, "host.probe.collect", succeeded=True
@@ -528,7 +634,12 @@ class RemoteHostProbeCompletionOwner:
                 state="succeeded",
                 resulting_generation=resulting_generation,
             )
-        return self._agent_operations.complete(operation_principal, receipt)
+        return self._complete_agent_and_ack(
+            operation_principal,
+            receipt,
+            operation_id,
+            target,
+        )
 
     def _active_operation(
         self, operation_id: str, generation: int
@@ -567,6 +678,36 @@ class RemoteHostProbeCompletionOwner:
                 plan_digest=plan_digest,
             )
 
+    @staticmethod
+    def _require_lifecycle_operation(operation: OperationV1) -> None:
+        if operation.state in {"planned", "running"}:
+            return
+        if (
+            operation.state == "failed"
+            and operation.resulting_generation is None
+            and operation.failed_count == 1
+            and operation.completed_count == 0
+            and operation.not_attempted_count == 0
+            and operation.reason_codes
+            in {("host.probe_unknown",), ("host.probe_failed",)}
+        ):
+            return
+        if (
+            operation.state == "succeeded"
+            and operation.resulting_generation == operation.expected_generation + 1
+            and operation.completed_count == 1
+            and operation.failed_count == 0
+            and operation.not_attempted_count == 0
+        ):
+            return
+        if (
+            operation.state == "partial"
+            and operation.resulting_generation is None
+            and operation.reason_codes == ("control.restart_reconciled",)
+        ):
+            return
+        raise AdminOperationError("control.operation_state_conflict")
+
     def _complete_failure(
         self,
         principal: OperationPrincipalV1,
@@ -578,7 +719,35 @@ class RemoteHostProbeCompletionOwner:
         operation = self._transition_failure(operation_id, generation, reason)
         if operation.state not in _TERMINAL_ADMIN_STATES:
             raise AdminOperationError("control.operation_state_conflict")
-        return self._agent_operations.complete(principal, receipt)
+        return self._complete_agent_and_ack(
+            principal,
+            receipt,
+            operation_id,
+            principal.host_ref,
+        )
+
+    def _complete_agent_and_ack(
+        self,
+        principal: OperationPrincipalV1,
+        receipt: AgentReceiptV1,
+        operation_id: str,
+        target_host_ref: str,
+    ) -> object:
+        completed = self._agent_operations.complete(principal, receipt)
+        terminal = self._agent_operations.get(receipt.operation_id)
+        if (
+            terminal.state != receipt.state
+            or terminal.reason_codes != receipt.reason_codes
+            or terminal.result_digest != receipt.result_digest
+        ):
+            raise AgentOperationError("host.operation_store_unavailable")
+        self._operations.acknowledge_host_probe_agent(
+            operation_id,
+            agent_operation_id=receipt.operation_id,
+            target_host_ref=target_host_ref,
+            plan_digest=receipt.plan_digest,
+        )
+        return completed
 
     def _transition_failure(
         self, operation_id: str, generation: int, reason: str
@@ -597,6 +766,13 @@ class RemoteHostProbeCompletionOwner:
             )
         operation = self._active_operation(operation_id, generation)
         if operation.state == "running":
+            if operation.failed_count:
+                if operation.reason_codes not in {
+                    ("host.probe_unknown",),
+                    ("host.probe_failed",),
+                }:
+                    raise AdminOperationError("control.operation_state_conflict")
+                reason = operation.reason_codes[0]
             operation = self._operations.finish(
                 operation_id,
                 state="failed",

@@ -21,6 +21,8 @@ from codex_master.hive.state import HiveStateError, HiveStateStore
 MAX_OPERATION_RECORDS = 256
 MAX_OPERATION_STEPS = 1_000
 MAX_OPERATION_V1_STATE_BYTES = 2 * 1024 * 1024
+MAX_HOST_PROBE_LIFECYCLE_OWNERS = 1_024
+MAX_HOST_PROBE_LIFECYCLE_STATE_BYTES = 1024 * 1024
 # Largest canonical `,"owner":...` admitted by owner validation below.
 _MAX_OWNER_METADATA_BYTES = len(
     b',"owner":{"boot_id":"ffffffff-ffff-ffff-ffff-ffffffffffff",'
@@ -33,6 +35,7 @@ MAX_OPERATION_V2_STATE_BYTES = (
 OPERATION_LIFETIME = timedelta(minutes=15)
 
 _DOCUMENT = PurePosixPath("operations.json")
+_HOST_PROBE_LIFECYCLE_DOCUMENT = PurePosixPath("host-probe-lifecycle.json")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 _BOOT_ID = re.compile(
@@ -61,6 +64,16 @@ _LEGACY_RECORD_FIELDS = _RECORD_FIELDS - {"owner"}
 _STEP_FIELDS = frozenset({"name", "state", "reason_code"})
 _OWNER_FIELDS = frozenset({"boot_id", "pid", "start_ticks"})
 _UNKNOWN_OWNER_FIELDS = frozenset({"status"})
+_HOST_PROBE_LIFECYCLE_FIELDS = frozenset(
+    {
+        "operation_id",
+        "agent_operation_id",
+        "target_host_ref",
+        "expected_generation",
+        "plan_digest",
+        "acknowledged",
+    }
+)
 
 OwnerIdentity = tuple[str, int, int]
 
@@ -138,6 +151,14 @@ class AdminOperationPlan:
     operation: OperationV1
 
 
+@dataclass(frozen=True, slots=True)
+class _HostProbeLifecycleOwner:
+    """Exact private Admin owner or acknowledged tombstone for one Agent job."""
+
+    operation: OperationV1 | None
+    acknowledged: bool
+
+
 class AdminOperationStore:
     """One bounded private document guarded by Hive's durable CAS lock."""
 
@@ -150,11 +171,31 @@ class AdminOperationStore:
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise AdminOperationError("control.operation_store_unavailable")
+        self._state_root = state_root
         self._root = state_root / "admin-operations"
         self._clock = clock or (lambda: datetime.now(UTC))
         self._owner_probe = owner_probe or _LinuxOwnerProbe()
         try:
             self._state = HiveStateStore(self._root)
+            with self._state.locked():
+                records = self._read_locked()
+                owners = self._read_host_probe_lifecycle_locked()
+                for owner in owners:
+                    record = self._find_optional(records, owner["operation_id"])
+                    if record is None:
+                        if not owner["acknowledged"]:
+                            raise AdminOperationError(
+                                "control.operation_store_unavailable"
+                            )
+                        continue
+                    self._require_host_probe_lifecycle_record(
+                        record,
+                        owner["plan_digest"],
+                    )
+                    if owner["expected_generation"] != record["expected_generation"]:
+                        raise AdminOperationError(
+                            "control.operation_store_unavailable"
+                        )
             self._reconcile_running()
         except (HiveStateError, OSError, ValueError):
             raise AdminOperationError("control.operation_store_unavailable") from None
@@ -185,7 +226,14 @@ class AdminOperationStore:
         now = self._now()
 
         with self._locked_records() as records:
-            if self._prune_expired(records, now):
+            lifecycle = self._read_host_probe_lifecycle_locked()
+            self._migrate_host_probe_lifecycle_locked(records, lifecycle, now)
+            protected = {
+                owner["operation_id"]
+                for owner in lifecycle
+                if not owner["acknowledged"]
+            }
+            if self._prune_expired(records, now, protected):
                 self._write_locked(records)
             for record in records:
                 if record["idempotency_key"] != key:
@@ -362,6 +410,83 @@ class AdminOperationStore:
         with self._locked_records() as records:
             return self._operation(self._find(records, operation_id))
 
+    def bind_host_probe_agent(
+        self,
+        operation_id: str,
+        *,
+        agent_operation_id: str,
+        target_host_ref: str,
+        plan_digest: str,
+    ) -> _HostProbeLifecycleOwner:
+        """Durably bind one remote probe before its Admin record can be pruned."""
+
+        return self._claim_host_probe_agent(
+            operation_id,
+            agent_operation_id=agent_operation_id,
+            target_host_ref=target_host_ref,
+            plan_digest=plan_digest,
+        )
+
+    def claim_host_probe_agent(
+        self,
+        operation_id: str,
+        *,
+        agent_operation_id: str,
+        target_host_ref: str,
+        plan_digest: str,
+    ) -> _HostProbeLifecycleOwner:
+        """Resolve an exact live owner or an explicit acknowledged tombstone."""
+
+        return self._claim_host_probe_agent(
+            operation_id,
+            agent_operation_id=agent_operation_id,
+            target_host_ref=target_host_ref,
+            plan_digest=plan_digest,
+        )
+
+    def acknowledge_host_probe_agent(
+        self,
+        operation_id: str,
+        *,
+        agent_operation_id: str,
+        target_host_ref: str,
+        plan_digest: str,
+    ) -> _HostProbeLifecycleOwner:
+        """Acknowledge only after the paired Agent lifecycle is durably terminal."""
+
+        operation_id, agent_operation_id, target_host_ref, plan_digest = (
+            self._host_probe_lifecycle_arguments(
+                operation_id,
+                agent_operation_id,
+                target_host_ref,
+                plan_digest,
+            )
+        )
+        with self._locked_records() as records:
+            owners = self._read_host_probe_lifecycle_locked()
+            owner = self._find_host_probe_lifecycle_owner(owners, operation_id)
+            if owner is None:
+                raise AdminOperationError("control.operation_not_found")
+            self._require_host_probe_lifecycle_owner(
+                owner,
+                agent_operation_id=agent_operation_id,
+                target_host_ref=target_host_ref,
+                plan_digest=plan_digest,
+            )
+            if owner["acknowledged"]:
+                record = self._find_optional(records, operation_id)
+                return _HostProbeLifecycleOwner(
+                    None if record is None else self._operation(record),
+                    True,
+                )
+            record = self._find(records, operation_id)
+            self._require_host_probe_lifecycle_record(record, plan_digest)
+            if record["state"] not in _TERMINAL_STATES:
+                raise AdminOperationError("control.operation_state_conflict")
+            owner["acknowledged"] = True
+            self._write_host_probe_lifecycle_locked(owners)
+            return _HostProbeLifecycleOwner(self._operation(record), True)
+
     def resume_host_probe(
         self, operation_id: str, *, expected_generation: int
     ) -> OperationV1:
@@ -385,7 +510,14 @@ class AdminOperationStore:
                 raise AdminOperationError("control.plan_expired")
             record["owner"] = self._owner_document(self._current_owner())
             record["state"] = "running"
-            record["reason_codes"] = ["control.operation_running"]
+            step_reasons = [
+                step["reason_code"]
+                for step in record["steps"]
+                if step["reason_code"] is not None
+            ]
+            record["reason_codes"] = list(dict.fromkeys(step_reasons)) or [
+                "control.operation_running"
+            ]
             self._write_locked(records)
             return self._operation(record)
 
@@ -404,6 +536,7 @@ class AdminOperationStore:
             raise AdminOperationError("control.operation_invalid")
         with self._locked_records() as records:
             record = self._find(records, operation_id)
+            now = self._now()
             exact_pair = (
                 record["kind"] == "hosts.probe"
                 and record["expected_generation"] == expected_generation
@@ -418,21 +551,49 @@ class AdminOperationStore:
                     "reason_code": None,
                 }
             ]
-            failed_step = [
+            failed_steps = {
+                reason: [
+                    {
+                        "name": "host.probe.collect",
+                        "state": "failed",
+                        "reason_code": reason,
+                    }
+                ]
+                for reason in ("host.probe_unknown", "host.probe_failed")
+            }
+            succeeded_step = [
                 {
                     "name": "host.probe.collect",
-                    "state": "failed",
-                    "reason_code": "host.probe_unknown",
+                    "state": "succeeded",
+                    "reason_code": None,
                 }
             ]
-            terminal = (
-                record["state"] == "failed"
+            terminal_failure_reason = next(
+                (
+                    reason
+                    for reason, step in failed_steps.items()
+                    if record["state"] == "failed"
+                    and record["owner"] is None
+                    and record["resulting_generation"] is None
+                    and record["reason_codes"] == [reason]
+                    and record["steps"] == step
+                ),
+                None,
+            )
+            if exact_pair and terminal_failure_reason is not None:
+                return self._operation(record)
+            succeeded_restart = (
+                record["state"] == "partial"
                 and record["owner"] is None
                 and record["resulting_generation"] is None
-                and record["reason_codes"] == ["host.probe_unknown"]
-                and record["steps"] == failed_step
+                and record["reason_codes"] == ["control.restart_reconciled"]
+                and record["steps"] == succeeded_step
             )
-            if exact_pair and terminal:
+            if (
+                exact_pair
+                and succeeded_restart
+                and self._parse_time(record["expires_at"]) <= now
+            ):
                 return self._operation(record)
             planned = (
                 record["state"] == "planned"
@@ -441,26 +602,325 @@ class AdminOperationStore:
                 and record["reason_codes"] == ["control.plan_ready"]
                 and record["steps"] == not_attempted_step
             )
+            restart_step_reason = next(
+                (
+                    reason
+                    for reason, step in failed_steps.items()
+                    if record["steps"] == step
+                ),
+                None,
+            )
             restart_reconciled_failure = (
                 record["state"] == "partial"
                 and record["owner"] is None
                 and record["resulting_generation"] is None
                 and record["reason_codes"] == ["control.restart_reconciled"]
-                and record["steps"] in (not_attempted_step, failed_step)
+                and (
+                    record["steps"] == not_attempted_step
+                    or restart_step_reason is not None
+                )
             )
             if (
                 not exact_pair
                 or not (planned or restart_reconciled_failure)
-                or self._parse_time(record["expires_at"]) > self._now()
+                or self._parse_time(record["expires_at"]) > now
             ):
                 raise AdminOperationError("control.operation_state_conflict")
+            failure_reason = restart_step_reason or "host.probe_unknown"
             record["state"] = "failed"
-            record["steps"][0]["state"] = "failed"
-            record["steps"][0]["reason_code"] = "host.probe_unknown"
-            record["reason_codes"] = ["host.probe_unknown"]
+            if record["steps"] == not_attempted_step:
+                record["steps"][0]["state"] = "failed"
+                record["steps"][0]["reason_code"] = failure_reason
+            record["reason_codes"] = [failure_reason]
             self._validate_state(record, "control.operation_invalid")
             self._write_locked(records)
             return self._operation(record)
+
+    def _claim_host_probe_agent(
+        self,
+        operation_id: str,
+        *,
+        agent_operation_id: str,
+        target_host_ref: str,
+        plan_digest: str,
+    ) -> _HostProbeLifecycleOwner:
+        operation_id, agent_operation_id, target_host_ref, plan_digest = (
+            self._host_probe_lifecycle_arguments(
+                operation_id,
+                agent_operation_id,
+                target_host_ref,
+                plan_digest,
+            )
+        )
+        with self._locked_records() as records:
+            owners = self._read_host_probe_lifecycle_locked()
+            owner = self._find_host_probe_lifecycle_owner(owners, operation_id)
+            record = self._find_optional(records, operation_id)
+            if owner is not None:
+                self._require_host_probe_lifecycle_owner(
+                    owner,
+                    agent_operation_id=agent_operation_id,
+                    target_host_ref=target_host_ref,
+                    plan_digest=plan_digest,
+                )
+                if record is None:
+                    if not owner["acknowledged"]:
+                        raise AdminOperationError("control.operation_not_found")
+                    return _HostProbeLifecycleOwner(None, True)
+                self._require_host_probe_lifecycle_record(record, plan_digest)
+                if owner["expected_generation"] != record["expected_generation"]:
+                    raise AdminOperationError("control.operation_store_unavailable")
+                return _HostProbeLifecycleOwner(
+                    self._operation(record),
+                    owner["acknowledged"],
+                )
+            if record is None:
+                raise AdminOperationError("control.operation_not_found")
+            self._require_host_probe_lifecycle_record(record, plan_digest)
+            if any(
+                candidate["agent_operation_id"] == agent_operation_id
+                for candidate in owners
+            ):
+                raise AdminOperationError("control.operation_state_conflict")
+            if len(owners) >= MAX_HOST_PROBE_LIFECYCLE_OWNERS:
+                raise AdminOperationError("control.operation_limit")
+            owner = {
+                "operation_id": operation_id,
+                "agent_operation_id": agent_operation_id,
+                "target_host_ref": target_host_ref,
+                "expected_generation": record["expected_generation"],
+                "plan_digest": plan_digest,
+                "acknowledged": False,
+            }
+            owners.append(owner)
+            self._write_host_probe_lifecycle_locked(owners)
+            return _HostProbeLifecycleOwner(self._operation(record), False)
+
+    @classmethod
+    def _host_probe_lifecycle_arguments(
+        cls,
+        operation_id: object,
+        agent_operation_id: object,
+        target_host_ref: object,
+        plan_digest: object,
+    ) -> tuple[str, str, str, str]:
+        operation_id = cls._token(operation_id)
+        agent_operation_id = cls._token(agent_operation_id)
+        target_host_ref = cls._token(target_host_ref)
+        if type(plan_digest) is not str or _DIGEST.fullmatch(plan_digest) is None:
+            raise AdminOperationError("control.operation_invalid")
+        return operation_id, agent_operation_id, target_host_ref, plan_digest
+
+    @staticmethod
+    def _require_host_probe_lifecycle_record(
+        record: Mapping[str, Any], plan_digest: str
+    ) -> None:
+        exact_pair = (
+            record["kind"] != "hosts.probe"
+            or record["plan_digest"] != plan_digest
+            or len(record["steps"]) != 1
+            or record["steps"][0]["name"] != "host.probe.collect"
+        )
+        if exact_pair:
+            raise AdminOperationError("control.operation_state_conflict")
+        step = record["steps"][0]
+        not_attempted = step == {
+            "name": "host.probe.collect",
+            "state": "not_attempted",
+            "reason_code": None,
+        }
+        succeeded = step == {
+            "name": "host.probe.collect",
+            "state": "succeeded",
+            "reason_code": None,
+        }
+        failed_reason = (
+            step["reason_code"]
+            if step["state"] == "failed"
+            and step["reason_code"] in {"host.probe_unknown", "host.probe_failed"}
+            else None
+        )
+        state = record["state"]
+        valid = (
+            state == "planned"
+            and not_attempted
+            and record["resulting_generation"] is None
+            and record["reason_codes"] == ["control.plan_ready"]
+        ) or (
+            state == "running"
+            and (not_attempted or succeeded or failed_reason is not None)
+            and record["resulting_generation"] is None
+        ) or (
+            state == "partial"
+            and (not_attempted or succeeded or failed_reason is not None)
+            and record["resulting_generation"] is None
+            and record["reason_codes"] == ["control.restart_reconciled"]
+        ) or (
+            state == "failed"
+            and failed_reason is not None
+            and record["resulting_generation"] is None
+            and record["reason_codes"] == [failed_reason]
+        ) or (
+            state == "succeeded"
+            and succeeded
+            and record["resulting_generation"]
+            == record["expected_generation"] + 1
+        )
+        if not valid:
+            raise AdminOperationError("control.operation_state_conflict")
+
+    @staticmethod
+    def _require_host_probe_lifecycle_owner(
+        owner: Mapping[str, Any],
+        *,
+        agent_operation_id: str,
+        target_host_ref: str,
+        plan_digest: str,
+    ) -> None:
+        if (
+            owner["agent_operation_id"] != agent_operation_id
+            or owner["target_host_ref"] != target_host_ref
+            or owner["plan_digest"] != plan_digest
+        ):
+            raise AdminOperationError("control.operation_state_conflict")
+
+    def _read_host_probe_lifecycle_locked(self) -> list[dict[str, Any]]:
+        try:
+            raw = self._state.read_private_bytes(
+                _HOST_PROBE_LIFECYCLE_DOCUMENT,
+                max_bytes=MAX_HOST_PROBE_LIFECYCLE_STATE_BYTES,
+            )
+        except HiveStateError as exc:
+            if exc.args == ("state_not_found",):
+                return []
+            raise AdminOperationError("control.operation_store_unavailable") from None
+        try:
+            document = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            raise AdminOperationError("control.operation_store_unavailable") from None
+        if (
+            not isinstance(document, Mapping)
+            or set(document) != {"schema_version", "owners"}
+            or document.get("schema_version") != 1
+            or type(document.get("owners")) is not list
+            or len(document["owners"]) > MAX_HOST_PROBE_LIFECYCLE_OWNERS
+        ):
+            raise AdminOperationError("control.operation_store_unavailable")
+        owners: list[dict[str, Any]] = []
+        operation_ids: set[str] = set()
+        agent_operation_ids: set[str] = set()
+        for value in document["owners"]:
+            if not isinstance(value, Mapping) or set(value) != _HOST_PROBE_LIFECYCLE_FIELDS:
+                raise AdminOperationError("control.operation_store_unavailable")
+            owner = {
+                "operation_id": self._stored_token(value["operation_id"]),
+                "agent_operation_id": self._stored_token(
+                    value["agent_operation_id"]
+                ),
+                "target_host_ref": self._stored_token(value["target_host_ref"]),
+                "expected_generation": self._stored_generation(
+                    value["expected_generation"]
+                ),
+                "plan_digest": value["plan_digest"],
+                "acknowledged": value["acknowledged"],
+            }
+            if (
+                type(owner["plan_digest"]) is not str
+                or _DIGEST.fullmatch(owner["plan_digest"]) is None
+                or type(owner["acknowledged"]) is not bool
+                or owner["operation_id"] in operation_ids
+                or owner["agent_operation_id"] in agent_operation_ids
+            ):
+                raise AdminOperationError("control.operation_store_unavailable")
+            operation_ids.add(owner["operation_id"])
+            agent_operation_ids.add(owner["agent_operation_id"])
+            owners.append(owner)
+        return owners
+
+    def _write_host_probe_lifecycle_locked(
+        self, owners: list[dict[str, Any]]
+    ) -> None:
+        if len(owners) > MAX_HOST_PROBE_LIFECYCLE_OWNERS:
+            raise AdminOperationError("control.operation_limit")
+        try:
+            raw = self._encoded_host_probe_lifecycle(owners)
+            if len(raw) > MAX_HOST_PROBE_LIFECYCLE_STATE_BYTES:
+                raise AdminOperationError("control.operation_limit")
+            self._state.replace_private_bytes(_HOST_PROBE_LIFECYCLE_DOCUMENT, raw)
+        except AdminOperationError:
+            raise
+        except (HiveStateError, OSError, TypeError, ValueError, RecursionError):
+            raise AdminOperationError("control.operation_store_unavailable") from None
+
+    def _migrate_host_probe_lifecycle_locked(
+        self,
+        records: list[dict[str, Any]],
+        owners: list[dict[str, Any]],
+        now: datetime,
+    ) -> None:
+        owned_ids = {owner["operation_id"] for owner in owners}
+        candidates = {
+            record["id"]: record
+            for record in records
+            if record["id"] not in owned_ids
+            and self._parse_time(record["expires_at"]) <= now
+            and self._is_unbound_host_probe_reconciliation_candidate(record)
+        }
+        if not candidates:
+            return
+        try:
+            from codex_master.agent_operations import (
+                AgentOperationError,
+                AgentOperationStore,
+            )
+
+            agent_bindings = AgentOperationStore(
+                self._state_root
+            )._host_probe_lifecycle_bindings()
+        except (AgentOperationError, OSError, ValueError):
+            raise AdminOperationError("control.operation_store_unavailable") from None
+        bindings_by_admin_id: dict[str, Mapping[str, object]] = {}
+        for binding in agent_bindings:
+            admin_operation_id = binding["admin_operation_id"]
+            if admin_operation_id not in candidates:
+                continue
+            if admin_operation_id in bindings_by_admin_id:
+                raise AdminOperationError("control.operation_store_unavailable")
+            bindings_by_admin_id[admin_operation_id] = binding
+        changed = False
+        for operation_id, record in candidates.items():
+            binding = bindings_by_admin_id.get(operation_id)
+            if binding is None:
+                continue
+            if binding["plan_digest"] != record["plan_digest"]:
+                raise AdminOperationError("control.operation_store_unavailable")
+            if len(owners) >= MAX_HOST_PROBE_LIFECYCLE_OWNERS:
+                raise AdminOperationError("control.operation_limit")
+            owners.append(
+                {
+                    "operation_id": operation_id,
+                    "agent_operation_id": binding["operation_id"],
+                    "target_host_ref": binding["target_host_ref"],
+                    "expected_generation": record["expected_generation"],
+                    "plan_digest": record["plan_digest"],
+                    "acknowledged": False,
+                }
+            )
+            changed = True
+        if changed:
+            self._write_host_probe_lifecycle_locked(owners)
+
+    @staticmethod
+    def _encoded_host_probe_lifecycle(owners: list[dict[str, Any]]) -> bytes:
+        return (
+            json.dumps(
+                {"schema_version": 1, "owners": owners},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
 
     def _reconcile_running(self) -> None:
         with self._locked_records() as records:
@@ -543,7 +1003,15 @@ class AdminOperationStore:
         ):
             raise AdminOperationError("control.operation_store_unavailable")
         if legacy:
-            self._prune_expired(records, self._now())
+            now = self._now()
+            owners = self._read_host_probe_lifecycle_locked()
+            self._migrate_host_probe_lifecycle_locked(records, owners, now)
+            protected = {
+                owner["operation_id"]
+                for owner in owners
+                if not owner["acknowledged"]
+            }
+            self._prune_expired(records, now, protected)
             self._write_locked(records)
         return records
 
@@ -777,17 +1245,85 @@ class AdminOperationStore:
 
     @staticmethod
     def _find(records: list[dict[str, Any]], operation_id: str) -> dict[str, Any]:
-        for record in records:
-            if record["id"] == operation_id:
-                return record
+        record = AdminOperationStore._find_optional(records, operation_id)
+        if record is not None:
+            return record
         raise AdminOperationError("control.operation_not_found")
 
     @staticmethod
-    def _prune_expired(records: list[dict[str, Any]], now: datetime) -> bool:
+    def _find_optional(
+        records: list[dict[str, Any]], operation_id: str
+    ) -> dict[str, Any] | None:
+        for record in records:
+            if record["id"] == operation_id:
+                return record
+        return None
+
+    @staticmethod
+    def _find_host_probe_lifecycle_owner(
+        owners: list[dict[str, Any]], operation_id: str
+    ) -> dict[str, Any] | None:
+        for owner in owners:
+            if owner["operation_id"] == operation_id:
+                return owner
+        return None
+
+    @staticmethod
+    def _is_unbound_host_probe_reconciliation_candidate(
+        record: Mapping[str, Any],
+    ) -> bool:
+        if (
+            record["kind"] != "hosts.probe"
+            or record["owner"] is not None
+            or record["resulting_generation"] is not None
+            or len(record["steps"]) != 1
+            or record["steps"][0]["name"] != "host.probe.collect"
+        ):
+            return False
+        step = record["steps"][0]
+        valid_step = step in (
+            {
+                "name": "host.probe.collect",
+                "state": "not_attempted",
+                "reason_code": None,
+            },
+            {
+                "name": "host.probe.collect",
+                "state": "failed",
+                "reason_code": "host.probe_unknown",
+            },
+            {
+                "name": "host.probe.collect",
+                "state": "failed",
+                "reason_code": "host.probe_failed",
+            },
+            {
+                "name": "host.probe.collect",
+                "state": "succeeded",
+                "reason_code": None,
+            },
+        )
+        return (
+            record["state"] == "planned"
+            and record["reason_codes"] == ["control.plan_ready"]
+            and step["state"] == "not_attempted"
+        ) or (
+            record["state"] == "partial"
+            and record["reason_codes"] == ["control.restart_reconciled"]
+            and valid_step
+        )
+
+    @staticmethod
+    def _prune_expired(
+        records: list[dict[str, Any]],
+        now: datetime,
+        protected_operation_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> bool:
         retained = [
             record
             for record in records
             if record["state"] == "running"
+            or record["id"] in protected_operation_ids
             or AdminOperationStore._parse_time(record["expires_at"]) > now
         ]
         changed = len(retained) != len(records)

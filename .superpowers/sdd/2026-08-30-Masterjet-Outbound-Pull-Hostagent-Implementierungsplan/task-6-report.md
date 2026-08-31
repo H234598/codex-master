@@ -917,3 +917,223 @@ and reconstruction paths.
   The first poll after each reconstruction may revalidate up to eight already
   reconciled pairs, while subsequent polls in that process advance to later
   candidates without changing schema-v1 Agent bytes.
+
+## Important rereview closure: I3-D1, I3-P1 and I3-A1
+
+This TDD continuation started from exact HEAD
+`9ad837dbb9037bf319dcde78a343343f30ec979b`. Before repository work,
+`CODEX_HOME` was verified as the required BW_Nufker profile home and the
+profile marker was validated without printing secrets. The index was clean and
+the only pre-existing dirty path was `progress.md`. That file was never edited
+or staged by this implementation; its final observed SHA-256 remained
+`71f42d2b67a1a598f0e7d7ad3d5945c9f94a750ccad236773256b8e0678f9a37`.
+Reviewer verdict files were likewise neither edited nor staged.
+
+### RED evidence
+
+The first selected deadline/partial-state matrix failed five invocations and
+passed four. It demonstrated all three underlying defects before production
+changes: a lease persisted past the operation deadline, completion after the
+operation deadline was accepted, a persisted overlong lease was not
+terminalized at the operation deadline, and two valid reconstructed partial
+step shapes were rejected. The new durable-owner tests initially failed at
+collection because no lifecycle-owner schema/capacity implementation existed.
+
+Further isolated RED runs established the production gaps rather than only
+Store-level symptoms:
+
+- ordinary Admin planning pruned the expired Admin half of a persisted
+  Admin/Agent split before lifecycle reconciliation, after which production
+  polling failed with `control.operation_not_found`;
+- a receipt one second after the operation deadline reached the old completion
+  path instead of being rejected before Registry mutation;
+- the mixed exhaustion/deadline batch had no post-Agent durable lifecycle
+  acknowledgement callback;
+- queued production deadline expiry produced no durable Admin lifecycle owner;
+- deleting the owner sidecar and presenting a legacy schema-v1 Admin document
+  still pruned the split before migration;
+- tightening the migration matrix exposed that arbitrary completed Agent
+  operations must not be treated as pending lifecycle acknowledgements.
+
+The RED tests were retained. No production behavior was weakened to make them
+pass.
+
+### Closure design and invariants
+
+For I3-D1, every lock-local Agent transition now captures exactly one `now`.
+`poll()` refuses a queued operation when `now >= operation_deadline` and caps a
+new lease at
+`min(now + AGENT_OPERATION_LEASE, operation_deadline)`. Completion validation
+checks the stored operation deadline before the lease deadline and before the
+completion owner can mutate Admin or Registry state. Lease expiry evaluates
+the operation deadline first, so a persisted lease from the affected revision
+cannot outlive that harder fence. Queued and leased operation-deadline
+candidates share the existing eight-item, authenticated-host reconciliation
+budget with attempt exhaustion. A terminal operation-deadline cache prevents
+one process from repeatedly consuming the budget, while reconstruction safely
+revalidates the durable pair.
+
+For I3-P1, the existing public Admin operation schema and Agent schema were not
+expanded. A separate private, versioned
+`admin-operations/host-probe-lifecycle.json` schema-v1 document stores only the
+minimal exact binding: Admin operation ID, Agent operation ID, target host,
+expected generation, plan digest and acknowledgement bit. It rejects unknown
+fields, duplicate Admin IDs, duplicate Agent IDs, malformed values and unknown
+schema versions. It is bounded to 1,024 records and 1 MiB. The record bound to
+an unacknowledged Agent lifecycle protects only its exact Admin operation from
+ordinary pruning. After Admin is terminal, Agent is durably terminalized and
+the durable Agent state has been re-read, the owner is acknowledged; only then
+may ordinary Admin pruning remove the Admin operation.
+
+An acknowledged compact tombstone remains because a reconstructed
+`AgentOperationStore` deliberately rediscovers lifecycle-terminal Agent
+records. Removing that proof after Admin pruning would turn a valid later poll
+back into `operation_not_found`, which is never treated as success. This is not
+an unbounded archive: its hard 1,024-record cap equals the permanent Agent
+operation-store cap. The ordinary Admin record does prune after acknowledgement
+as required.
+
+For installations predating the sidecar, Admin pruning performs a narrow
+migration from the strictly validated Agent store before removing an expired
+candidate. Migration accepts only fixed `host.probe/collect` records with the
+exact schema-1 arguments and exact Admin ID/digest pairing, and only while
+queued, leased, or terminal `unknown` for `host.attempts_exhausted` or
+`host.lease_expired`. Successful, failed and cancelled Agent completions are
+negative migration cases. Unpaired expired probe plans prune normally, so
+pruning is neither globally disabled nor made indefinite. Legacy Admin
+schema-v1 input migrates the exact binding before its first prune/write to
+schema v2.
+
+The production adapter durably enqueues the Agent job and then binds the exact
+Admin owner. Receipt and lifecycle paths claim that binding and reject wrong
+Agent ID, reused Agent ID, target host, digest, kind, generation or durable
+shape. Lifecycle ordering is Admin-first, then durable Agent terminal write,
+then acknowledgement outside the Agent lock. Availability failure at either
+post-Admin boundary is restart-idempotent and never fabricates a receipt or
+Registry evidence. Generic `operation_not_found` remains an error; only an
+exact acknowledged tombstone plus the matching durable Agent terminal state is
+accepted as an already-completed replay.
+
+For I3-A1, normal `begin()` and expiry-strict `resume_host_probe()` remain
+unchanged. The narrow lifecycle expiry transition accepts all and only the
+valid dead-owner `partial/control.restart_reconciled` shapes after expiry:
+`not_attempted/None`, `failed/host.probe_unknown`,
+`failed/host.probe_failed`, and `succeeded/None`. It preserves a known failure
+reason or the successful step, performs no Registry mutation, and is
+idempotent across repeated calls and Store reconstruction. Wrong owner, kind,
+generation, digest, step, state, reason, and resulting generation remain
+fail-closed. Resuming an unexpired reconstructed failure also preserves the
+step's known reason instead of overwriting it with a generic running reason.
+
+No Task-7 operation, compatibility branch, public wire field, public contract,
+or Agent/Admin operation document schema change was introduced.
+
+### GREEN and regression evidence
+
+All Python test commands below used `PYTHONPATH=src`; the first command shown is
+the final complete affected-file rerun after the last review fix.
+
+```text
+# Complete changed and directly adjacent Task-6 files
+tests/test_agent_operations.py tests/test_admin_operations.py
+tests/test_host_probe.py tests/test_host_probe_production_graph.py
+tests/test_agent_http.py
+178 passed in 77.80s
+
+# Task-1--5 contract, identity, daemon, HostAgent state/client/executor deps
+tests/test_agent_contracts.py tests/test_agent_identity.py
+tests/test_agent_daemon.py tests/test_host_agent_state.py
+tests/test_host_agent.py tests/test_admin_daemon.py
+185 passed in 33.82s
+
+# Host-probe HTTP contract, scope and HTTPS step-up selection
+tests/test_admin_contracts.py tests/test_admin_service.py tests/test_admin_http.py
+3 passed, 246 deselected in 1.30s
+
+# Real CLI/MCP host-probe integration selection
+tests/test_admin_cli_mcp_integration.py
+2 passed, 3 deselected in 3.54s
+
+# Control catalog and Control Center host-probe selection
+tests/test_control_catalog.py tests/test_control_center.py
+4 passed, 55 deselected in 0.74s
+```
+
+The non-overlapping final matrices contain 372 passing invocations and 304
+explicit deselections. Focused review-fix runs also passed, including five
+legacy migration/terminal-state cases and four exact owner/restart cases; they
+overlap the complete affected-file matrix and are not added to that total.
+
+The final mandatory regression matrix covers:
+
+- lease capping one second before the operation deadline, exact-deadline lease
+  refusal, completion one second after the deadline without Registry mutation,
+  and successful completion before both fences;
+- persisted overlong-lease terminalization at the operation deadline;
+- ordinary Admin plan/capacity pruning before migrated split reconciliation,
+  legacy schema-v1 migration, reconstruction, repeated production polls,
+  post-ack Admin pruning and later acknowledged-tombstone replay;
+- exact wrong host, Agent ID, duplicate Agent ID, digest, kind, generation,
+  state, step, reason and resulting-generation failures without durable
+  mutation;
+- every valid restart-reconciled step form after expiry, repetition and restart
+  idempotency, with successful/failure evidence preservation;
+- queued production deadline expiry without a lease and a mixed batch of more
+  than eight attempt-exhaustion/deadline candidates sharing one eight-item
+  budget, authenticated host scope, later-candidate progress after an early
+  failure, and exact durable bytes/schema assertions.
+
+Ruff passed all eight changed Python source/test files. `compileall` passed the
+four changed production modules. `git diff --check` passed. The count-only
+suspected-secret scan over the authorized source/test diff reported zero
+matches and printed no matched value. These checks are repeated over the staged
+report-inclusive change before commit.
+
+### Review evidence and finding disposition
+
+CodeRabbit CLI 0.7.5 was installed, authenticated, assigned a Pro seat and had
+active usage capacity. It was run only after a zero-hit secret scan and with
+separate uncommitted source and test scopes. Its review hints were treated as
+untrusted and verified against the actual Store/owner flow:
+
+- indefinite retention of all unbound expired probe candidates was valid; it
+  was replaced by the exact Agent-store migration and an unpaired-pruning
+  negative test;
+- migrating arbitrary terminal Agent states was valid; migration was limited
+  to queued/leased or the two lifecycle-terminal unknown forms, with completed,
+  failed and cancelled negative tests;
+- pruning a legacy Admin schema-v1 document before constructing its exact owner
+  was valid; ordering was reversed and the production reconstruction test now
+  explicitly exercises schema v1 without owner fields;
+- rejecting duplicate `agent_operation_id` only on the next Store read was
+  valid; the write path now rejects it before persistence and the durable bytes
+  remain unchanged in the regression;
+- deleting acknowledged tombstones when the Admin operation no longer exists
+  was rejected twice: it would erase the only bounded durable proof needed by a
+  reconstructed lifecycle-terminal Agent record and recreate the original
+  `operation_not_found` failure. The cap is fixed and matches the Agent Store's
+  own record cap.
+
+After those dispositions, the final CodeRabbit source review completed with 0
+findings across the four production files, and the separate final test review
+completed with 0 findings across the four changed test files. Native review
+then traced all Store clocks, state predicates, callback/lock ordering,
+cross-store failure boundaries, pruning/migration order, schema validation,
+host scoping and Registry mutation sites and found no remaining blocking or
+important defect.
+
+### Residual risks
+
+- Reconciliation remains authenticated-host-poll driven. A host that never
+  polls cannot be reconciled by a different host, by design.
+- Admin-first terminalization, Agent terminalization and acknowledgement are
+  three durable writes rather than one cross-store transaction. Tested retries
+  converge each intermediate boundary without Registry mutation.
+- Acknowledged lifecycle tombstones remain until a future coordinated Agent
+  operation archival design exists. The current fixed 1,024-entry cap prevents
+  growth beyond the already permanent 1,024-record Agent Store and is therefore
+  not a new earlier exhaustion boundary.
+- Production-graph tests use the real Stores, Registry, adapter, HTTP
+  application and completion owner but replace TLS/socket transport in process.
+  Separate identity, HTTP client and daemon regressions passed; this is not a
+  live two-daemon mTLS test.

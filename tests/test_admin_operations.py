@@ -12,6 +12,8 @@ import pytest
 
 from codex_master.admin_contracts import OperationV1
 from codex_master.admin_operations import (
+    MAX_HOST_PROBE_LIFECYCLE_OWNERS,
+    MAX_HOST_PROBE_LIFECYCLE_STATE_BYTES,
     MAX_OPERATION_RECORDS,
     AdminOperationError,
     AdminOperationStore,
@@ -496,6 +498,252 @@ def test_byte_capacity_failure_still_persists_safe_expiry_cleanup(tmp_path) -> N
     assert store.get(running_ids[0]).state == "running"
 
 
+def test_host_probe_owner_blocks_pruning_until_ack_then_leaves_bounded_tombstone(
+    tmp_path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="durable-host-probe-owner",
+        steps=("host.probe.collect",),
+    )
+    store.bind_host_probe_agent(
+        probe.operation_id,
+        agent_operation_id="operation-agent-one",
+        target_host_ref="worker-one",
+        plan_digest=probe.plan_digest,
+    )
+    clock.now += timedelta(minutes=16)
+    store.plan(
+        kind="google.provision",
+        generation=4,
+        key="prune-before-agent-ack",
+        steps=("one",),
+    )
+
+    assert store.get(probe.operation_id).state == "planned"
+    claimed = store.claim_host_probe_agent(
+        probe.operation_id,
+        agent_operation_id="operation-agent-one",
+        target_host_ref="worker-one",
+        plan_digest=probe.plan_digest,
+    )
+    assert claimed.operation is not None
+    assert claimed.acknowledged is False
+    store.expire_host_probe(
+        probe.operation_id,
+        expected_generation=4,
+        plan_digest=probe.plan_digest,
+    )
+    store.acknowledge_host_probe_agent(
+        probe.operation_id,
+        agent_operation_id="operation-agent-one",
+        target_host_ref="worker-one",
+        plan_digest=probe.plan_digest,
+    )
+    store.plan(
+        kind="google.provision",
+        generation=4,
+        key="prune-after-agent-ack",
+        steps=("one",),
+    )
+
+    with pytest.raises(AdminOperationError, match="control.operation_not_found"):
+        store.get(probe.operation_id)
+    restarted = store_at(tmp_path, clock)
+    tombstone = restarted.claim_host_probe_agent(
+        probe.operation_id,
+        agent_operation_id="operation-agent-one",
+        target_host_ref="worker-one",
+        plan_digest=probe.plan_digest,
+    )
+    assert tombstone.operation is None
+    assert tombstone.acknowledged is True
+    owner_path = tmp_path / "admin-operations" / "host-probe-lifecycle.json"
+    owner_bytes = owner_path.read_bytes()
+    owner_document = json.loads(owner_bytes)
+    assert owner_document["schema_version"] == 1
+    assert len(owner_document["owners"]) == 1
+    assert len(owner_bytes) <= MAX_HOST_PROBE_LIFECYCLE_STATE_BYTES
+
+
+def test_unpaired_expired_host_probe_plan_prunes_normally(tmp_path) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="unpaired-expired-host-probe",
+        steps=("host.probe.collect",),
+    )
+    clock.now += timedelta(minutes=16)
+
+    store.plan(
+        kind="google.provision",
+        generation=4,
+        key="prune-unpaired-host-probe",
+        steps=("one",),
+    )
+
+    with pytest.raises(AdminOperationError, match="control.operation_not_found"):
+        store.get(probe.operation_id)
+    assert not (
+        tmp_path / "admin-operations" / "host-probe-lifecycle.json"
+    ).exists()
+
+
+def test_host_probe_owner_rejects_wrong_binding_and_missing_operation_without_mutation(
+    tmp_path,
+) -> None:
+    store = store_at(tmp_path)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="strict-host-probe-owner",
+        steps=("host.probe.collect",),
+    )
+    store.bind_host_probe_agent(
+        probe.operation_id,
+        agent_operation_id="operation-agent-one",
+        target_host_ref="worker-one",
+        plan_digest=probe.plan_digest,
+    )
+    owner_path = tmp_path / "admin-operations" / "host-probe-lifecycle.json"
+    before = owner_path.read_bytes()
+
+    for changes in (
+        {"agent_operation_id": "operation-agent-two"},
+        {"target_host_ref": "worker-two"},
+        {"plan_digest": "sha256:" + "0" * 64},
+    ):
+        arguments = {
+            "agent_operation_id": "operation-agent-one",
+            "target_host_ref": "worker-one",
+            "plan_digest": probe.plan_digest,
+            **changes,
+        }
+        with pytest.raises(
+            AdminOperationError, match="control.operation_state_conflict"
+        ):
+            store.claim_host_probe_agent(probe.operation_id, **arguments)
+        assert owner_path.read_bytes() == before
+
+    with pytest.raises(AdminOperationError, match="control.operation_not_found"):
+        store.claim_host_probe_agent(
+            "op-missing",
+            agent_operation_id="operation-missing",
+            target_host_ref="worker-one",
+            plan_digest=probe.plan_digest,
+        )
+    assert owner_path.read_bytes() == before
+
+
+def test_host_probe_owner_rejects_reused_agent_operation_id_without_mutation(
+    tmp_path,
+) -> None:
+    store = store_at(tmp_path)
+    first = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="first-agent-owner",
+        steps=("host.probe.collect",),
+    )
+    second = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="second-agent-owner",
+        steps=("host.probe.collect",),
+    )
+    store.bind_host_probe_agent(
+        first.operation_id,
+        agent_operation_id="operation-agent-one",
+        target_host_ref="worker-one",
+        plan_digest=first.plan_digest,
+    )
+    owner_path = tmp_path / "admin-operations" / "host-probe-lifecycle.json"
+    before = owner_path.read_bytes()
+
+    with pytest.raises(
+        AdminOperationError, match="control.operation_state_conflict"
+    ):
+        store.bind_host_probe_agent(
+            second.operation_id,
+            agent_operation_id="operation-agent-one",
+            target_host_ref="worker-one",
+            plan_digest=second.plan_digest,
+        )
+
+    assert owner_path.read_bytes() == before
+    assert store_at(tmp_path).get(first.operation_id).state == "planned"
+    assert store_at(tmp_path).get(second.operation_id).state == "planned"
+
+
+def test_host_probe_owner_capacity_is_bounded(tmp_path, monkeypatch) -> None:
+    import codex_master.admin_operations as operations
+
+    monkeypatch.setattr(operations, "MAX_HOST_PROBE_LIFECYCLE_OWNERS", 2)
+    store = store_at(tmp_path)
+    plans = [
+        store.plan(
+            kind="hosts.probe",
+            generation=4,
+            key=f"bounded-owner-{index}",
+            steps=("host.probe.collect",),
+        )
+        for index in range(3)
+    ]
+    for index, probe in enumerate(plans[:2]):
+        store.bind_host_probe_agent(
+            probe.operation_id,
+            agent_operation_id=f"operation-agent-{index}",
+            target_host_ref="worker-one",
+            plan_digest=probe.plan_digest,
+        )
+
+    with pytest.raises(AdminOperationError, match="control.operation_limit"):
+        store.bind_host_probe_agent(
+            plans[2].operation_id,
+            agent_operation_id="operation-agent-over-limit",
+            target_host_ref="worker-one",
+            plan_digest=plans[2].plan_digest,
+        )
+
+    document = json.loads(
+        (tmp_path / "admin-operations" / "host-probe-lifecycle.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert document["schema_version"] == 1
+    assert len(document["owners"]) == 2
+    assert MAX_HOST_PROBE_LIFECYCLE_OWNERS == 1_024
+
+
+def test_host_probe_owner_schema_rejects_unknown_fields(tmp_path) -> None:
+    store = store_at(tmp_path)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="owner-schema",
+        steps=("host.probe.collect",),
+    )
+    store.bind_host_probe_agent(
+        probe.operation_id,
+        agent_operation_id="operation-agent-one",
+        target_host_ref="worker-one",
+        plan_digest=probe.plan_digest,
+    )
+    owner_path = tmp_path / "admin-operations" / "host-probe-lifecycle.json"
+    document = json.loads(owner_path.read_text(encoding="utf-8"))
+    document["owners"][0]["unexpected"] = True
+    owner_path.write_text(json.dumps(document), encoding="utf-8")
+    owner_path.chmod(0o600)
+
+    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+        store_at(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("kind", "generation", "steps"),
     [
@@ -715,6 +963,132 @@ def test_expired_restart_reconciled_failed_host_probe_terminalizes(
     assert terminal.state == "failed"
     assert terminal.failed_count == 1
     assert terminal.reason_codes == ("host.probe_unknown",)
+
+
+@pytest.mark.parametrize(
+    ("step_state", "step_reason", "expected_state", "expected_reason"),
+    (
+        ("not_attempted", None, "failed", "host.probe_unknown"),
+        ("failed", "host.probe_unknown", "failed", "host.probe_unknown"),
+        ("failed", "host.probe_failed", "failed", "host.probe_failed"),
+        ("succeeded", None, "partial", "control.restart_reconciled"),
+    ),
+)
+def test_expired_restart_reconciled_host_probe_accepts_every_durable_step_shape(
+    tmp_path,
+    step_state: str,
+    step_reason: str | None,
+    expected_state: str,
+    expected_reason: str,
+) -> None:
+    clock = Clock()
+    dead_probe = OwnerProbe(False)
+    store = store_at(tmp_path, clock, owner_probe=dead_probe)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key=f"expired-shape-{step_state}-{step_reason}",
+        steps=("host.probe.collect",),
+    )
+    store.begin(probe.operation_id, current_generation=4)
+    if step_state != "not_attempted":
+        store.record_step(
+            probe.operation_id,
+            "host.probe.collect",
+            succeeded=step_state == "succeeded",
+            reason_code=step_reason,
+        )
+    clock.now += timedelta(minutes=16)
+    recovered = store_at(tmp_path, clock, owner_probe=dead_probe)
+    before = recovered.get(probe.operation_id)
+    assert before.state == "partial"
+    assert before.reason_codes == ("control.restart_reconciled",)
+
+    terminal = recovered.expire_host_probe(
+        probe.operation_id,
+        expected_generation=4,
+        plan_digest=probe.plan_digest,
+    )
+
+    assert terminal.state == expected_state
+    assert terminal.reason_codes == (expected_reason,)
+    assert terminal.completed_count == (step_state == "succeeded")
+    assert terminal.failed_count == (step_state == "failed" or step_state == "not_attempted")
+    assert recovered.expire_host_probe(
+        probe.operation_id,
+        expected_generation=4,
+        plan_digest=probe.plan_digest,
+    ) == terminal
+    assert store_at(tmp_path, clock, owner_probe=dead_probe).get(probe.operation_id) == terminal
+
+
+def test_expired_restart_reconciled_host_probe_rejects_noncanonical_step_shape(
+    tmp_path,
+) -> None:
+    clock = Clock()
+    dead_probe = OwnerProbe(False)
+    store = store_at(tmp_path, clock, owner_probe=dead_probe)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="expired-invalid-succeeded-reason",
+        steps=("host.probe.collect",),
+    )
+    store.begin(probe.operation_id, current_generation=4)
+    store.record_step(
+        probe.operation_id,
+        "host.probe.collect",
+        succeeded=True,
+        reason_code="host.probe_failed",
+    )
+    clock.now += timedelta(minutes=16)
+    recovered = store_at(tmp_path, clock, owner_probe=dead_probe)
+    before = recovered.get(probe.operation_id)
+
+    with pytest.raises(AdminOperationError, match="control.operation_state_conflict"):
+        recovered.expire_host_probe(
+            probe.operation_id,
+            expected_generation=4,
+            plan_digest=probe.plan_digest,
+        )
+
+    assert recovered.get(probe.operation_id) == before
+
+
+def test_expired_restart_reconciled_host_probe_rejects_resulting_generation(
+    tmp_path,
+) -> None:
+    clock = Clock()
+    dead_probe = OwnerProbe(False)
+    store = store_at(tmp_path, clock, owner_probe=dead_probe)
+    probe = store.plan(
+        kind="hosts.probe",
+        generation=4,
+        key="expired-invalid-resulting-generation",
+        steps=("host.probe.collect",),
+    )
+    store.begin(probe.operation_id, current_generation=4)
+    clock.now += timedelta(minutes=16)
+    recovered = store_at(tmp_path, clock, owner_probe=dead_probe)
+    document_path = tmp_path / "admin-operations" / "operations.json"
+    document = json.loads(document_path.read_text(encoding="utf-8"))
+    document["operations"][0]["resulting_generation"] = 5
+    document_path.write_text(
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    document_path.chmod(0o600)
+    recovered = store_at(tmp_path, clock, owner_probe=dead_probe)
+    before = document_path.read_bytes()
+
+    with pytest.raises(AdminOperationError, match="control.operation_state_conflict"):
+        recovered.expire_host_probe(
+            probe.operation_id,
+            expected_generation=4,
+            plan_digest=probe.plan_digest,
+        )
+
+    assert document_path.read_bytes() == before
 
 
 def test_expired_planned_host_probe_has_one_exact_idempotent_failure_transition(

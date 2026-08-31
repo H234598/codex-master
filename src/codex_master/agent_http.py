@@ -46,6 +46,10 @@ class _Store(Protocol):
         | None = None,
         operation_deadline_owner: Callable[[AgentOperationDeadlineExpiryV1], bool]
         | None = None,
+        lifecycle_ack_owner: Callable[
+            [AgentAttemptExhaustionV1 | AgentOperationDeadlineExpiryV1], None
+        ]
+        | None = None,
     ) -> object: ...
     def complete(self, principal: OperationPrincipalV1, receipt: object) -> object: ...
 
@@ -128,6 +132,11 @@ class AgentHttpApplication:
                     "reconcile_operation_deadline",
                     None,
                 )
+                lifecycle_ack_owner = getattr(
+                    owner,
+                    "acknowledge_agent_lifecycle",
+                    None,
+                )
                 if callable(deadline_owner):
                     result = self._store.poll(
                         _operation_principal(principal),
@@ -136,12 +145,22 @@ class AgentHttpApplication:
                             exhaustion_owner if callable(exhaustion_owner) else None
                         ),
                         operation_deadline_owner=deadline_owner,
+                        lifecycle_ack_owner=(
+                            lifecycle_ack_owner
+                            if callable(lifecycle_ack_owner)
+                            else None
+                        ),
                     )
                 elif callable(exhaustion_owner):
                     result = self._store.poll(
                         _operation_principal(principal),
                         _authoritative_poll(principal, parsed_poll),
                         attempt_exhaustion_owner=exhaustion_owner,
+                        lifecycle_ack_owner=(
+                            lifecycle_ack_owner
+                            if callable(lifecycle_ack_owner)
+                            else None
+                        ),
                     )
                 else:
                     result = self._store.poll(

@@ -659,6 +659,55 @@ def test_remote_completion_duplicate_is_idempotent_and_conflict_is_rejected(
     assert document.read_bytes() == after_first
 
 
+@pytest.mark.parametrize("receipt_state", ("succeeded", "failed", "unknown"))
+def test_agent_terminal_ack_failure_retries_after_owner_reconstruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_state: str,
+) -> None:
+    owner, operations, agent_operations, _registry, principal, lease, operation_id = (
+        _remote_scenario(tmp_path)
+    )
+    receipt = _receipt(lease, state=receipt_state)
+    original_ack = operations.acknowledge_host_probe_agent
+    attempts = 0
+
+    def fail_ack_once(*args: object, **kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise AdminOperationError("control.operation_store_unavailable")
+        return original_ack(*args, **kwargs)
+
+    monkeypatch.setattr(
+        operations,
+        "acknowledge_host_probe_agent",
+        fail_ack_once,
+    )
+
+    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+        owner.complete(principal, receipt)
+
+    assert operations.get(operation_id).state in {"succeeded", "failed"}
+    assert agent_operations.get(lease.operation_id).state == receipt_state
+
+    operations = AdminOperationStore.for_test(tmp_path, clock=lambda: NOW)
+    agent_operations = AgentOperationStore.for_test(tmp_path, clock=lambda: NOW)
+    completed = RemoteHostProbeCompletionOwner(
+        operation_store=operations,
+        agent_operations=agent_operations,
+        host_registry=HostRegistry.for_test(tmp_path),
+    ).complete(principal, receipt)
+
+    assert completed.state == receipt_state
+    lifecycle = json.loads(
+        (
+            tmp_path / "admin-operations" / "host-probe-lifecycle.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert lifecycle["owners"][0]["acknowledged"] is True
+
+
 @pytest.mark.parametrize(
     ("phase", "first_admin_state"),
     (

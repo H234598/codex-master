@@ -17,7 +17,10 @@ from codex_master.agent_contracts import (
     serialize_agent_result,
 )
 from codex_master.agent_operations import (
+    MAX_AGENT_OPERATION_STATE_BYTES,
     MAX_AGENT_OPERATION_RECORDS,
+    AgentAttemptExhaustionV1,
+    AgentOperationDeadlineExpiryV1,
     AgentOperationError,
     AgentOperationRequestV1,
     AgentOperationStore,
@@ -40,6 +43,16 @@ class Clock:
 
     def advance(self, *, seconds: int) -> None:
         self.now += timedelta(seconds=seconds)
+
+
+class SequenceClock:
+    def __init__(self, values: tuple[datetime, ...]) -> None:
+        self.values = iter(values)
+        self.calls = 0
+
+    def __call__(self) -> datetime:
+        self.calls += 1
+        return next(self.values)
 
 
 def digest(value: object) -> str:
@@ -141,6 +154,43 @@ def test_operation_views_and_requests_are_frozen_and_constructible(
     assert view.kind == request.kind
     with pytest.raises(FrozenInstanceError):
         view.state = "failed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("terminal_state", ("succeeded", "failed", "cancelled"))
+def test_host_probe_owner_migration_excludes_non_lifecycle_terminal_states(
+    tmp_path: Path,
+    terminal_state: str,
+) -> None:
+    store = store_at(tmp_path)
+    request = replace(
+        operation_request(
+            arguments={
+                "admin_operation_id": "operation-admin-one",
+                "probe_schema": 1,
+            }
+        ),
+        target_host_ref="worker-one",
+    )
+    queued = store.enqueue(request)
+    assert len(store._host_probe_lifecycle_bindings()) == 1
+
+    if terminal_state == "cancelled":
+        store.cancel(queued.operation_id)
+    else:
+        lease = store.poll(principal(), poll())
+        assert isinstance(lease, AgentLeaseV1)
+        if terminal_state == "succeeded":
+            receipt = receipt_for(lease)
+        else:
+            receipt = receipt_for(
+                lease,
+                state="failed",
+                result=result_for(lease, ready=False),
+                reason_codes=("resource_unavailable",),
+            )
+        store.complete(principal(), receipt)
+
+    assert store._host_probe_lifecycle_bindings() == ()
 
 
 def test_default_clock_can_enqueue_without_second_aligned_injection(
@@ -553,6 +603,113 @@ def test_operation_deadline_never_issues_a_new_lease_and_orders_owner_first(
     assert terminal.reason_codes == ("host.lease_expired",)
 
 
+def test_lease_is_capped_at_operation_deadline_and_predeadline_completion_works(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    operation_deadline = NOW + timedelta(minutes=5)
+    store.enqueue(operation_request(deadline=operation_deadline))
+    clock.now = operation_deadline - timedelta(seconds=1)
+
+    lease = store.poll(principal(), poll(epoch=3))
+
+    assert isinstance(lease, AgentLeaseV1)
+    assert lease.deadline == operation_deadline
+    assert store.complete(principal(), receipt_for(lease)).state == "succeeded"
+
+
+def test_poll_uses_one_now_per_locked_transition_at_deadline_boundary(
+    tmp_path: Path,
+) -> None:
+    operation_deadline = NOW + timedelta(minutes=5)
+    clock = SequenceClock(
+        (
+            NOW,
+            operation_deadline - timedelta(seconds=1),
+            operation_deadline - timedelta(seconds=1),
+        )
+    )
+    store = AgentOperationStore.for_test(tmp_path, clock=clock)
+    store.enqueue(operation_request(deadline=operation_deadline))
+
+    lease = store.poll(principal(), poll(epoch=3))
+
+    assert isinstance(lease, AgentLeaseV1)
+    assert lease.deadline == operation_deadline
+    assert clock.calls == 3
+
+
+def test_poll_at_operation_deadline_never_issues_a_lease(tmp_path: Path) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    operation_deadline = NOW + timedelta(minutes=5)
+    queued = store.enqueue(operation_request(deadline=operation_deadline))
+    clock.now = operation_deadline
+
+    result = store.poll(principal(), poll(epoch=3))
+
+    assert isinstance(result, AgentNoWorkV1)
+    terminal = store.get(queued.operation_id)
+    assert terminal.state == "unknown"
+    assert terminal.attempt == 0
+    assert terminal.reason_codes == ("host.lease_expired",)
+
+
+def test_completion_after_operation_deadline_is_stale_even_with_live_lease(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    operation_deadline = NOW + timedelta(minutes=5)
+    store.enqueue(operation_request(deadline=operation_deadline))
+    clock.now = operation_deadline - timedelta(seconds=1)
+    lease = store.poll(principal(), poll(epoch=3))
+    assert isinstance(lease, AgentLeaseV1)
+    before = store.get(lease.operation_id)
+    clock.now = operation_deadline + timedelta(seconds=1)
+
+    with pytest.raises(AgentOperationError, match="host.lease_stale"):
+        store.complete(principal(), receipt_for(lease))
+
+    assert store.get(lease.operation_id) == before
+
+
+def test_persisted_overlong_lease_terminalizes_at_operation_deadline(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    operation_deadline = NOW + timedelta(minutes=5)
+    store.enqueue(operation_request(deadline=operation_deadline))
+    clock.now = operation_deadline - timedelta(seconds=1)
+    lease = store.poll(principal(), poll(epoch=3))
+    assert isinstance(lease, AgentLeaseV1)
+    document_path = tmp_path / "agent-operations" / "operations.json"
+    document = json.loads(document_path.read_text(encoding="utf-8"))
+    document["operations"][0]["lease"]["deadline"] = (
+        operation_deadline + timedelta(seconds=29)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    document_path.write_text(
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    document_path.chmod(0o600)
+    clock.now = operation_deadline
+    restarted = store_at(tmp_path, clock)
+    observed: list[object] = []
+
+    restarted.expire_leases(
+        operation_deadline_owner=lambda context: observed.append(context) is None,
+        owner_host_ref="worker-one",
+    )
+
+    assert len(observed) == 1
+    terminal = restarted.get(lease.operation_id)
+    assert terminal.state == "unknown"
+    assert terminal.reason_codes == ("host.lease_expired",)
+
+
 def test_ownerless_poll_terminalizes_queued_operation_deadline(
     tmp_path: Path,
 ) -> None:
@@ -568,6 +725,108 @@ def test_ownerless_poll_terminalizes_queued_operation_deadline(
     assert terminal.attempt == 0
     assert terminal.state == "unknown"
     assert terminal.reason_codes == ("host.lease_expired",)
+
+
+def test_mixed_lifecycle_candidates_share_budget_scope_and_ack_after_durable_write(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    operation_ids: list[str] = []
+    for index in range(10):
+        deadline = NOW + timedelta(minutes=15 if index % 2 == 0 else 5)
+        operation_ids.append(
+            store.enqueue(
+                replace(
+                    operation_request(
+                        deadline=deadline,
+                        key=f"mixed-lifecycle-{index}",
+                    ),
+                    target_host_ref="worker-one",
+                )
+            ).operation_id
+        )
+    wrong_host = store.enqueue(
+        replace(
+            operation_request(
+                deadline=NOW + timedelta(minutes=5),
+                key="mixed-lifecycle-wrong-host",
+            ),
+            target_host_ref="worker-two",
+        )
+    )
+    document_path = tmp_path / "agent-operations" / "operations.json"
+    document = json.loads(document_path.read_text(encoding="utf-8"))
+    for index, record in enumerate(document["operations"][:10]):
+        if index % 2:
+            continue
+        record["state"] = "leased"
+        record["attempt"] = 8
+        record["lease"] = {
+            "lease_id": f"lease-mixed-{index}",
+            "host_ref": "worker-one",
+            "registry_generation": 7,
+            "lease_epoch": 3,
+            "deadline": (NOW + timedelta(minutes=1)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        }
+    document_path.write_text(
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    document_path.chmod(0o600)
+    record_fields = {
+        record["operation_id"]: frozenset(record) for record in document["operations"]
+    }
+    clock.now = NOW + timedelta(minutes=6)
+    restarted = store_at(tmp_path, clock)
+    offered: list[object] = []
+    acknowledged: list[str] = []
+
+    def owner(context: object) -> bool:
+        offered.append(context)
+        return True
+
+    def acknowledge(context: object) -> None:
+        assert isinstance(
+            context,
+            (AgentAttemptExhaustionV1, AgentOperationDeadlineExpiryV1),
+        )
+        terminal = restarted.get(context.operation_id)
+        assert terminal.state == "unknown"
+        acknowledged.append(context.operation_id)
+
+    restarted.expire_leases(
+        attempt_exhaustion_owner=owner,
+        operation_deadline_owner=owner,
+        lifecycle_ack_owner=acknowledge,
+        owner_host_ref="worker-one",
+    )
+
+    assert len(offered) == len(acknowledged) == 8
+    assert any(isinstance(item, AgentAttemptExhaustionV1) for item in offered)
+    assert any(isinstance(item, AgentOperationDeadlineExpiryV1) for item in offered)
+    assert restarted.get(wrong_host.operation_id).state == "queued"
+
+    restarted.expire_leases(
+        attempt_exhaustion_owner=owner,
+        operation_deadline_owner=owner,
+        lifecycle_ack_owner=acknowledge,
+        owner_host_ref="worker-one",
+    )
+    assert len(offered) == len(acknowledged) == 10
+    assert {restarted.get(operation_id).state for operation_id in operation_ids} == {
+        "unknown"
+    }
+    durable = document_path.read_bytes()
+    persisted = json.loads(durable)
+    assert persisted["schema_version"] == 1
+    assert len(durable) <= MAX_AGENT_OPERATION_STATE_BYTES
+    assert {
+        record["operation_id"]: frozenset(record)
+        for record in persisted["operations"]
+    } == record_fields
 
 
 def test_recursive_private_result_fields_are_rejected(tmp_path: Path) -> None:
