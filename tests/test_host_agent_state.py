@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import multiprocessing
 from pathlib import Path
 import threading
 
@@ -73,6 +74,85 @@ def test_pre_effect_crash_redelivers_and_finished_receipt_replays(
         result=result(item),
     )
     assert restarted.accept(item) == receipt
+
+
+def test_expired_unclaimed_same_operation_rebinds_only_safe_fence(
+    tmp_path: Path,
+) -> None:
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    old = lease(deadline=datetime(2020, 1, 1, tzinfo=UTC))
+    state.accept(old)
+    renewed = lease(lease_id="lease-two", attempt=2)
+    assert state.accept(renewed) is None
+    assert state.begin_effect(renewed) is not None
+    with pytest.raises(HostAgentStateError, match="host.replay_conflict"):
+        state.accept(lease(lease_id="lease-three", attempt=3))
+
+
+def test_live_claim_deadline_terminalizes_unknown_and_late_finish_replays(
+    tmp_path: Path,
+) -> None:
+    item = lease(
+        deadline=datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=1)
+    )
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    state.accept(item)
+    token = state.begin_effect(item)
+    assert token is not None
+    recovered = state.recover(item)
+    assert recovered is not None and recovered.state == "unknown"
+    late = state.finish(
+        item,
+        state="succeeded",
+        reason_codes=("done",),
+        result=result(item),
+        claim_token=token,
+    )
+    assert late == recovered
+
+
+def test_recover_wait_is_interruptible(tmp_path: Path) -> None:
+    item = lease(
+        deadline=datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=10)
+    )
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    state.accept(item)
+    assert state.begin_effect(item) is not None
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(HostAgentStateError, match="host.operation_interrupted"):
+        state.recover(item, stop_event=stop)
+
+
+def test_live_process_claim_is_bounded_by_lease_deadline(tmp_path: Path) -> None:
+    item = lease(
+        deadline=datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=2)
+    )
+    ready = multiprocessing.Event()
+    release = multiprocessing.Event()
+
+    def own() -> None:
+        state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+        state.accept(item)
+        assert state.begin_effect(item) is not None
+        ready.set()
+        release.wait(5)
+
+    process = multiprocessing.get_context("fork").Process(target=own)
+    process.start()
+    try:
+        assert ready.wait(2)
+        receipt = HostAgentState.for_test(
+            tmp_path, host_ref="worker-one"
+        ).recover(item)
+        assert receipt is not None and receipt.state == "unknown"
+        assert process.is_alive()
+    finally:
+        release.set()
+        process.join(3)
+        if process.is_alive():
+            process.terminate()
+            process.join(3)
 
 
 def test_recover_returns_receipt_completed_between_its_locked_reads(
@@ -188,6 +268,7 @@ def test_state_rejects_duplicate_keys_and_incoherent_records(tmp_path: Path) -> 
         '{"schema_version":2,"schema_version":2,"highest_lease_epoch":0,'
         '"highest_registry_generation":0,"accepted":{},"receipts":{}}'
     )
+    state_file.chmod(0o600)
     with pytest.raises(HostAgentStateError, match="host.state_unavailable"):
         HostAgentState.for_test(tmp_path, host_ref="worker-one")
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import threading
 
 import pytest
 
@@ -15,7 +16,6 @@ from codex_master.ollama_registry import (
     OllamaModelV1,
     OllamaRegistryStore,
 )
-from codex_master.ollama_runtime import OllamaRuntimeError
 
 
 class FakeProcess:
@@ -131,7 +131,9 @@ def test_production_adapter_uses_public_runtime_plan_apply_probe_stop(
     store, _executable = registry_at(tmp_path)
     runtime = ControlledRuntime()
     executor = AgentOllamaExecutor(
-        agent_ollama.ProductionAgentOllamaAdapter(store, runtime=runtime)
+        agent_ollama.ProductionAgentOllamaAdapter(
+            store, state_root=tmp_path / "state", runtime=runtime
+        )
     )
 
     planned = executor.plan({"instance_ref": "instance-one", "generation": 1})
@@ -161,7 +163,9 @@ def test_apply_revalidates_original_path_evidence_at_actual_consumer(
     store, executable = registry_at(tmp_path)
     runtime = ControlledRuntime()
     executor = AgentOllamaExecutor(
-        agent_ollama.ProductionAgentOllamaAdapter(store, runtime=runtime)
+        agent_ollama.ProductionAgentOllamaAdapter(
+            store, state_root=tmp_path / "state", runtime=runtime
+        )
     )
     plan_ref = executor.plan(
         {"instance_ref": "instance-one", "generation": 1}
@@ -170,7 +174,9 @@ def test_apply_revalidates_original_path_evidence_at_actual_consumer(
     executable.write_bytes(b"#!/bin/sh\nexit 0\n")
     executable.chmod(0o700)
 
-    with pytest.raises(OllamaRuntimeError, match="resource.target_path_changed"):
+    with pytest.raises(
+        agent_ollama.AgentOllamaNoEffectError, match="provider.plan_changed"
+    ):
         executor.apply({"plan_ref": plan_ref})
 
     assert runtime.started == []
@@ -180,7 +186,7 @@ def test_unknown_or_stale_local_refs_prove_no_effect(tmp_path: Path) -> None:
     store, _executable = registry_at(tmp_path)
     executor = AgentOllamaExecutor(
         agent_ollama.ProductionAgentOllamaAdapter(
-            store, runtime=ControlledRuntime()
+            store, state_root=tmp_path / "state", runtime=ControlledRuntime()
         )
     )
     with pytest.raises(
@@ -203,10 +209,125 @@ def test_each_closed_action_rejects_free_form_arguments(tmp_path: Path) -> None:
     store, _executable = registry_at(tmp_path)
     executor = AgentOllamaExecutor(
         agent_ollama.ProductionAgentOllamaAdapter(
-            store, runtime=ControlledRuntime()
+            store, state_root=tmp_path / "state", runtime=ControlledRuntime()
         )
     )
     with pytest.raises(AgentOllamaError, match="host.arguments_invalid"):
         executor.apply({"plan_ref": "one", "free": "form"})
     with pytest.raises(AgentOllamaError, match="host.arguments_invalid"):
         executor.probe({"instance_ref": "/absolute/path", "generation": 1})
+
+
+def test_adapter_restart_recovers_plan_and_running_ownership(tmp_path: Path) -> None:
+    store, _executable = registry_at(tmp_path)
+    runtime = ControlledRuntime()
+    state_root = tmp_path / "state"
+    first = AgentOllamaExecutor(
+        agent_ollama.ProductionAgentOllamaAdapter(
+            store, state_root=state_root, runtime=runtime
+        )
+    )
+    plan_ref = first.plan(
+        {"instance_ref": "instance-one", "generation": 1}
+    )["plan_ref"]
+    second = AgentOllamaExecutor(
+        agent_ollama.ProductionAgentOllamaAdapter(
+            store, state_root=state_root, runtime=runtime
+        )
+    )
+    second.apply({"plan_ref": plan_ref})
+    third = AgentOllamaExecutor(
+        agent_ollama.ProductionAgentOllamaAdapter(
+            store, state_root=state_root, runtime=runtime
+        )
+    )
+    assert third.probe(
+        {"instance_ref": "instance-one", "generation": 1}
+    )["ready"] is True
+    assert third.stop(
+        {"instance_ref": "instance-one", "generation": 1}
+    ) == {"stopped": True}
+
+
+def test_plan_journal_has_exact_limit_and_deterministic_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _executable = registry_at(tmp_path)
+    now = 1_000
+    monkeypatch.setattr(agent_ollama.time, "time", lambda: now)
+    adapter = agent_ollama.ProductionAgentOllamaAdapter(
+        store,
+        state_root=tmp_path / "state",
+        runtime=ControlledRuntime(),
+        max_plans=2,
+        plan_max_age_seconds=10,
+    )
+    arguments = {"instance_ref": "instance-one", "generation": 1}
+    adapter.plan(arguments)
+    adapter.plan(arguments)
+    with pytest.raises(AgentOllamaError, match="provider.plan_limit"):
+        adapter.plan(arguments)
+    now = 1_010
+    assert "plan_ref" in adapter.plan(arguments)
+
+
+def test_concurrent_apply_consumes_one_durable_plan_once(tmp_path: Path) -> None:
+    store, _executable = registry_at(tmp_path)
+    runtime = ControlledRuntime()
+    state_root = tmp_path / "state"
+    first = agent_ollama.ProductionAgentOllamaAdapter(
+        store, state_root=state_root, runtime=runtime
+    )
+    second = agent_ollama.ProductionAgentOllamaAdapter(
+        store, state_root=state_root, runtime=runtime
+    )
+    arguments = {"instance_ref": "instance-one", "generation": 1}
+    plan_refs = [
+        first.plan(arguments)["plan_ref"],
+        second.plan(arguments)["plan_ref"],
+    ]
+    barrier = threading.Barrier(3)
+    outcomes: list[str] = []
+
+    def apply(
+        adapter: agent_ollama.ProductionAgentOllamaAdapter, plan_ref: str
+    ) -> None:
+        barrier.wait()
+        try:
+            adapter.apply({"plan_ref": plan_ref})
+            outcomes.append("started")
+        except agent_ollama.AgentOllamaNoEffectError:
+            outcomes.append("rejected")
+
+    threads = [
+        threading.Thread(target=apply, args=(adapter, plan_ref))
+        for adapter, plan_ref in zip((first, second), plan_refs, strict=True)
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(3)
+    assert sorted(outcomes) == ["rejected", "started"]
+    assert len(runtime.started) == 1
+
+
+def test_new_registry_generation_expires_old_plans(tmp_path: Path) -> None:
+    store, _executable = registry_at(tmp_path)
+    adapter = agent_ollama.ProductionAgentOllamaAdapter(
+        store, state_root=tmp_path / "state", runtime=ControlledRuntime()
+    )
+    old_ref = adapter.plan(
+        {"instance_ref": "instance-one", "generation": 1}
+    )["plan_ref"]
+    snapshot = store.load()
+    store.replace(
+        models=snapshot.models,
+        instances=snapshot.instances,
+        expected_generation=1,
+    )
+    adapter.plan({"instance_ref": "instance-one", "generation": 2})
+    with pytest.raises(
+        agent_ollama.AgentOllamaNoEffectError, match="provider.plan_missing"
+    ):
+        adapter.apply({"plan_ref": old_ref})

@@ -195,6 +195,15 @@ class HostAgentState:
             self._check_generation(document, lease)
             accepted = document["accepted"].get(lease.operation_id)
             if accepted is not None:
+                old_lease = self._parse_lease(accepted["lease"])
+                if self._safe_rebind(accepted, old_lease, lease):
+                    document["accepted"][lease.operation_id] = {
+                        "fence": list(_lease_fence(lease)),
+                        "lease": serialize_agent_lease(lease),
+                        "effect_claim": None,
+                    }
+                    self._write_locked(document)
+                    return None
                 self._check_record(accepted, lease)
                 return None
             changed = self._reclaim_expired_locked(document)
@@ -243,7 +252,12 @@ class HostAgentState:
             self._write_locked(document)
             return token
 
-    def recover(self, lease: AgentLeaseV1) -> AgentReceiptV1 | None:
+    def recover(
+        self,
+        lease: AgentLeaseV1,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> AgentReceiptV1 | None:
         """Recover completion, safe redelivery, or an abandoned effect."""
         saved = self.accept(lease)
         if saved is not None:
@@ -262,7 +276,8 @@ class HostAgentState:
                 claim = record["effect_claim"]
                 if claim is None:
                     return None
-                if not self._claim_alive(claim):
+                expired = lease.deadline <= datetime.now(UTC)
+                if expired or not self._claim_alive(claim):
                     return self._finish_locked(
                         document,
                         lease,
@@ -276,7 +291,10 @@ class HostAgentState:
                         claim_token=None,
                         allow_abandoned=True,
                     )
-            time.sleep(0.01)
+            if stop_event is not None and stop_event.wait(0.01):
+                _fail("host.operation_interrupted")
+            if stop_event is None:
+                time.sleep(0.01)
 
     def finish(
         self,
@@ -332,10 +350,7 @@ class HostAgentState:
         existing = document["receipts"].get(lease.operation_id)
         if existing is not None:
             self._check_record(existing, lease)
-            saved = parse_agent_receipt(existing["receipt"])
-            if saved != receipt:
-                _fail("host.replay_conflict")
-            return saved
+            return parse_agent_receipt(existing["receipt"])
         accepted = document["accepted"].get(lease.operation_id)
         if accepted is None:
             _fail("host.operation_not_accepted")
@@ -343,7 +358,7 @@ class HostAgentState:
         claim = accepted["effect_claim"]
         if claim is not None:
             if allow_abandoned:
-                if self._claim_alive(claim):
+                if self._claim_alive(claim) and lease.deadline > datetime.now(UTC):
                     _fail("host.effect_claim_active")
             elif (
                 type(claim_token) is not str
@@ -381,6 +396,37 @@ class HostAgentState:
     def _check_record(record: Mapping[str, Any], lease: AgentLeaseV1) -> None:
         if tuple(record.get("fence", ())) != _lease_fence(lease):
             _fail("host.replay_conflict")
+
+    @staticmethod
+    def _safe_rebind(
+        record: Mapping[str, Any], old: AgentLeaseV1, new: AgentLeaseV1
+    ) -> bool:
+        return (
+            record.get("effect_claim") is None
+            and old.deadline <= datetime.now(UTC)
+            and new.deadline > datetime.now(UTC)
+            and new.attempt > old.attempt
+            and (
+                old.operation_id,
+                old.host_ref,
+                old.kind,
+                old.action,
+                old.registry_generation,
+                old.lease_epoch,
+                old.plan_digest,
+                old.arguments_digest,
+            )
+            == (
+                new.operation_id,
+                new.host_ref,
+                new.kind,
+                new.action,
+                new.registry_generation,
+                new.lease_epoch,
+                new.plan_digest,
+                new.arguments_digest,
+            )
+        )
 
     def _reclaim_expired_locked(self, document: dict[str, Any]) -> bool:
         changed = False

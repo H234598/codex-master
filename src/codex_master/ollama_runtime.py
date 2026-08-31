@@ -447,6 +447,26 @@ class OllamaProcess(Protocol):
     def wait(self, timeout: float | None = None) -> int: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _AdoptedProcess:
+    pid: int
+    start_ticks: int
+
+    def poll(self) -> int | None:
+        try:
+            return None if _process_start_ticks(self.pid) == self.start_ticks else 0
+        except OSError:
+            return 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("adopted-ollama", timeout)
+            time.sleep(0.01)
+        return 0
+
+
 class OllamaRuntime(Protocol):
     def available_cpus(self) -> tuple[int, ...]: ...
 
@@ -902,6 +922,72 @@ def start_local_instance(
         _fail("provider.process_start_failed")
     finally:
         _discard_strong(_START_RECORDS, request_provenance, request)
+
+
+def ollama_plan_digest(plan: OllamaLocalPlan) -> str:
+    """Return a stable semantic/evidence digest for a genuine live plan."""
+    if not isinstance(plan, OllamaLocalPlan) or not _matches_weak(
+        _PLAN_RECORDS, plan._provenance, plan, _plan_state(plan)
+    ):
+        _fail("provider.plan_invalid")
+    encoded = json.dumps(
+        _plan_state(plan), sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def adopt_running_instance(
+    plan: OllamaLocalPlan,
+    *,
+    unit_name: str,
+    port: int,
+    ollama_pid: int,
+    control_group: str,
+    process_start_ticks: int,
+    runtime: OllamaRuntime | None = None,
+) -> RunningOllamaInstance:
+    """Adopt a persisted scope only after fresh plan and live identity checks."""
+    if (
+        not isinstance(plan, OllamaLocalPlan)
+        or not _consume_weak(_PLAN_RECORDS, plan._provenance, plan, _plan_state(plan))
+        or not _UNIT_NAME.fullmatch(unit_name)
+        or type(port) is not int
+        or not 1 <= port <= 65535
+        or type(ollama_pid) is not int
+        or ollama_pid < 1
+        or type(control_group) is not str
+        or not control_group.startswith("/")
+        or "\n" in control_group
+        or type(process_start_ticks) is not int
+        or process_start_ticks < 1
+    ):
+        _fail("provider.instance_invalid")
+    _revalidate_path(plan.executable, plan.host, kind="executable")
+    _revalidate_path(plan.models_directory, plan.host, kind="models")
+    adapter = runtime or SystemOllamaRuntime()
+    process = _AdoptedProcess(ollama_pid, process_start_ticks)
+    if not adapter.scope_process_matches(
+        unit_name, ollama_pid, control_group, process_start_ticks
+    ):
+        _fail("resource.scope_membership_invalid")
+    if not adapter.process_running(process, ollama_pid, process_start_ticks):
+        _fail("provider.process_unavailable")
+    if not adapter.listener_owned_by(ollama_pid, port):
+        _fail("provider.endpoint_identity_invalid")
+    provenance = secrets.token_bytes(32)
+    running = RunningOllamaInstance(
+        plan=plan,
+        unit_name=unit_name,
+        port=port,
+        process=process,
+        ollama_pid=ollama_pid,
+        control_group=control_group,
+        process_start_ticks=process_start_ticks,
+        _provenance=provenance,
+        _seal=_RUNNING_SEAL,
+    )
+    _register_weak(_RUNNING_RECORDS, provenance, running, _running_state(running))
+    return running
 
 
 def stop_local_instance(

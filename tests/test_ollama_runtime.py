@@ -20,6 +20,7 @@ from codex_master.ollama_registry import (
     OllamaRegistryV1,
 )
 from codex_master.ollama_runtime import (
+    adopt_running_instance,
     OllamaHostSnapshot,
     OllamaRuntimeError,
     SystemOllamaRuntime,
@@ -926,6 +927,38 @@ def test_running_identity_uses_scope_leader_not_systemd_run_pid(tmp_path: Path) 
     assert active.ollama_pid == 4343
     assert active.control_group == "/user.slice/ollama.scope"
     assert active.process_start_ticks == 901
+
+
+def test_public_adoption_strongly_validates_running_identity(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    plan = planned(tmp_path)
+    unit = "codex-master-ollama-" + "a" * 32 + ".scope"
+    adopted = adopt_running_instance(
+        plan,
+        unit_name=unit,
+        port=11435,
+        ollama_pid=4343,
+        control_group="/user.slice/ollama.scope",
+        process_start_ticks=901,
+        runtime=runtime,
+    )
+    assert probe_instance_readiness(adopted, runtime=runtime).ready is True
+
+    runtime.listener_matches = False
+    second = tmp_path / "second"
+    second.mkdir()
+    with pytest.raises(
+        OllamaRuntimeError, match="provider.endpoint_identity_invalid"
+    ):
+        adopt_running_instance(
+            planned(second),
+            unit_name=unit,
+            port=11435,
+            ollama_pid=4343,
+            control_group="/user.slice/ollama.scope",
+            process_start_ticks=901,
+            runtime=runtime,
+        )
 
 
 def test_scope_resolution_waits_for_pinned_target_exec(

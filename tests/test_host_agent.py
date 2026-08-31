@@ -159,6 +159,9 @@ class _RawTlsServer:
         self._thread = threading.Thread(target=self._run)
         self._thread.start()
 
+    def set_response(self, response: bytes) -> None:
+        self._response = response
+
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
@@ -370,6 +373,22 @@ def test_typed_pre_effect_rejection_is_failed(tmp_path: Path) -> None:
     assert receipt.reason_codes == ("host.operation_failed",)
 
 
+def test_invalid_arguments_never_poison_durable_acceptance(tmp_path: Path) -> None:
+    state = HostAgentState.for_test(tmp_path, host_ref="worker-one")
+    runtime = Ollama()
+    executor = HostAgentExecutor(state=state, ollama=runtime)
+    invalid_arguments = {"plan_ref": "plan-one", "extra": True}
+    with pytest.raises(Exception, match="host.arguments_invalid"):
+        executor.execute(
+            lease(
+                arguments=invalid_arguments,
+                arguments_digest=digest(invalid_arguments),
+            )
+        )
+    assert executor.execute(lease()).state == "succeeded"
+    assert runtime.apply_calls == 1
+
+
 def test_run_once_polls_executes_receipt_and_honors_idle() -> None:
     class Client:
         def __init__(self, response: object) -> None:
@@ -549,6 +568,27 @@ def test_client_enforces_full_backoff_response_bound_and_exact_idle_type() -> No
         client.poll(AgentPollV1(7, 3, "sha256:" + "c" * 64, 5))
     assert delays == list(BACKOFF_SECONDS)
 
+
+def test_client_backoff_is_interruptible_by_shutdown() -> None:
+    class Offline:
+        def open(self, request: object, timeout: int) -> object:
+            raise URLError("offline")
+
+    stop = threading.Event()
+    stop.set()
+    client = HostAgentClient(
+        "https://master.internal", context=ssl.create_default_context()
+    )
+    client._opener = Offline()  # type: ignore[attr-defined]
+    client.set_stop_event(stop)
+    with pytest.raises(HostAgentError, match="host.operation_interrupted"):
+        client.poll(AgentPollV1(7, 3, "sha256:" + "c" * 64, 5))
+
+
+def test_client_enforces_response_bound_and_exact_idle_type() -> None:
+    client = HostAgentClient(
+        "https://master.internal", context=ssl.create_default_context()
+    )
     class Headers:
         def __init__(self, length: int) -> None:
             self.length = length
@@ -625,12 +665,11 @@ def test_live_client_rejects_every_redirect_without_second_mtls_connection(
         origin = _RawTlsServer(host_agent_pki, response)
         if not cross_origin:
             location = f"https://localhost:{origin.port}/redirected"
-            origin.close()
             response = (
                 f"HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\n"
                 "Content-Length: 0\r\nConnection: close\r\n\r\n"
             ).encode()
-            origin = _RawTlsServer(host_agent_pki, response)
+            origin.set_response(response)
         client = _live_client(host_agent_pki, origin.port)
         with pytest.raises(HostAgentError, match="resource.host_response_invalid"):
             client.poll(AgentPollV1(7, 3, "sha256:" + "c" * 64, 5))
@@ -653,6 +692,19 @@ def test_live_client_rejects_every_redirect_without_second_mtls_connection(
         b"Content-Type: application/json\r\n"
         + f"Content-Length: {len(_idle_body())}\r\nConnection: close\r\n\r\n".encode()
         + _idle_body(),
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        b"1\r\n{\r\n0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Transfer-Encoding: identity\r\nTransfer-Encoding: chunked\r\n"
+        + f"Content-Length: {len(_idle_body())}\r\nConnection: close\r\n\r\n".encode()
+        + _idle_body(),
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Content-Length: 1, 1\r\nConnection: close\r\n\r\n{}",
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(_idle_body())}\r\nConnection: close\r\n\r\n".encode()
+        + _idle_body()
+        + b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
         b"Content-Length: 89\r\nConnection: close\r\n\r\n"
         b'{"schema_version":1,"registry_generation":7,"registry_generation":8,'
@@ -735,3 +787,30 @@ def test_poll_loop_is_stoppable_and_cli_accepts_no_secret_arguments(
 
     with pytest.raises(SystemExit):
         main(["--master-url", "https://secret.invalid"])
+
+
+def test_poll_loop_recovers_expected_error_but_propagates_fatal() -> None:
+    stop = threading.Event()
+
+    class Recovering:
+        calls = 0
+
+        def run_once(self, *, max_wait_seconds: int) -> int:
+            self.calls += 1
+            if self.calls == 1:
+                raise HostAgentError("resource.host_unreachable")
+            stop.set()
+            return 0
+
+    recovering = Recovering()
+    run_poll_loop(recovering, max_wait_seconds=20, stop_event=stop)  # type: ignore[arg-type]
+    assert recovering.calls == 2
+
+    class Fatal:
+        def run_once(self, *, max_wait_seconds: int) -> int:
+            raise MemoryError
+
+    with pytest.raises(MemoryError):
+        run_poll_loop(
+            Fatal(), max_wait_seconds=20, stop_event=threading.Event()  # type: ignore[arg-type]
+        )

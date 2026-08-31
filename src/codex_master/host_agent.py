@@ -37,6 +37,7 @@ from codex_master.agent_contracts import (
     serialize_agent_result,
 )
 from codex_master.agent_ollama import (
+    AgentOllamaError,
     AgentOllamaExecutor,
     AgentOllamaNoEffectError,
     ProductionAgentOllamaAdapter,
@@ -306,6 +307,10 @@ class HostAgentClient:
         if not callable(sleep):
             _fail("host.request_invalid")
         self._sleep = sleep
+        self._stop_event: threading.Event | None = None
+
+    def set_stop_event(self, stop_event: threading.Event) -> None:
+        self._stop_event = stop_event
 
     def poll(self, poll: AgentPollV1) -> AgentLeaseV1 | AgentNoWorkV1:
         """POST one bounded poll and parse its exact response."""
@@ -400,7 +405,7 @@ class HostAgentClient:
         request = Request(
             self.master_url + target,
             data=_json(value),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Connection": "close"},
             method="POST",
         )
         raw: bytes | None = None
@@ -409,9 +414,14 @@ class HostAgentClient:
                 with self._opener.open(request, timeout=35) as response:
                     content_types = response.headers.get_all("Content-Type") or []
                     content_lengths = response.headers.get_all("Content-Length") or []
+                    transfer_encodings = response.headers.get_all("Transfer-Encoding") or []
                     if response.status != 200 or response.geturl() != request.full_url:
                         _fail("resource.host_response_invalid")
-                    if content_types != ["application/json"] or len(content_lengths) != 1:
+                    if (
+                        content_types != ["application/json"]
+                        or len(content_lengths) != 1
+                        or transfer_encodings
+                    ):
                         _fail("resource.host_response_invalid")
                     content_length = content_lengths[0]
                     if (
@@ -423,7 +433,12 @@ class HostAgentClient:
                         _fail("resource.host_response_invalid")
                     expected_length = int(content_length)
                     try:
-                        raw = response.read(expected_length + 1)
+                        stream = getattr(response, "fp", None)
+                        raw = (
+                            stream.read(expected_length + 1)
+                            if stream is not None
+                            else response.read(expected_length + 1)
+                        )
                     except (IncompleteRead, HTTPException):
                         _fail("resource.host_response_invalid")
                     if len(raw) != expected_length:
@@ -436,7 +451,12 @@ class HostAgentClient:
             except (URLError, OSError, TimeoutError):
                 if attempt == len(BACKOFF_SECONDS):
                     _fail("resource.host_unreachable")
-                self._sleep(BACKOFF_SECONDS[attempt])  # type: ignore[operator]
+                delay = BACKOFF_SECONDS[attempt]
+                if self._stop_event is not None:
+                    if self._stop_event.wait(delay):
+                        _fail("host.operation_interrupted")
+                else:
+                    self._sleep(delay)  # type: ignore[operator]
         if raw is None:
             _fail("resource.host_unreachable")
         if len(raw) > MAX_RESPONSE_BYTES:
@@ -481,6 +501,18 @@ class HostAgentExecutor:
         self._state = state
         self._ollama = AgentOllamaExecutor(ollama)  # type: ignore[arg-type]
         self._host_probe = host_probe or HostProbeExecutor()
+        self._stop_event: threading.Event | None = None
+
+    def set_stop_event(self, stop_event: threading.Event) -> None:
+        self._stop_event = stop_event
+
+    def validate(self, kind: str, action: str, arguments: object) -> None:
+        if kind == "ollama.instance":
+            self._ollama.validate(action, arguments)
+        elif kind == "host.probe" and action == "collect":
+            self._host_probe.collect(arguments)
+        else:
+            _fail("host.action_unsupported")
 
     def dispatch(
         self, kind: str, action: str, arguments: object
@@ -504,18 +536,20 @@ class HostAgentExecutor:
             _fail("host.request_invalid")
         if lease.deadline <= datetime.now(UTC):
             _fail("host.lease_expired")
-        recovered = self._state.recover(lease)
+        try:
+            self.validate(lease.kind, lease.action, lease.arguments)
+        except AgentOllamaError as error:
+            _fail(str(error))
+        recovered = self._state.recover(lease, stop_event=self._stop_event)
         if recovered is not None:
             return recovered
-        if lease.kind == "ollama.instance":
-            self._ollama.validate(lease.action, lease.arguments)
         mutating = (lease.kind, lease.action) in {
             ("ollama.instance", "apply"),
             ("ollama.instance", "stop"),
         }
         claim_token = self._state.begin_effect(lease) if mutating else None
         if mutating and claim_token is None:
-            concurrent = self._state.recover(lease)
+            concurrent = self._state.recover(lease, stop_event=self._stop_event)
             if concurrent is None:
                 _fail("host.effect_claim_lost")
             return concurrent
@@ -585,6 +619,12 @@ class HostAgent:
         self._lease_epoch = lease_epoch
         self._capabilities_digest = capabilities_digest
 
+    def set_stop_event(self, stop_event: threading.Event) -> None:
+        for target in (self._client, self._executor):
+            setter = getattr(target, "set_stop_event", None)
+            if callable(setter):
+                setter(stop_event)
+
     def _poll(self, max_wait_seconds: int) -> AgentPollV1:
         return AgentPollV1(
             self._registry_generation,
@@ -622,7 +662,7 @@ def assemble_host_agent(
     registry = OllamaRegistryStore(config.ollama_registry_path)
     executor = HostAgentExecutor(
         state=state,
-        ollama=ProductionAgentOllamaAdapter(registry),
+        ollama=ProductionAgentOllamaAdapter(registry, state_root=config.state_root),
     )
     return (
         HostAgent(
@@ -643,8 +683,17 @@ def run_poll_loop(
     stop_event: threading.Event,
 ) -> None:
     """Run until signalled, with interruptible server-requested idle waits."""
+    setter = getattr(agent, "set_stop_event", None)
+    if callable(setter):
+        setter(stop_event)
     while not stop_event.is_set():
-        delay = agent.run_once(max_wait_seconds=max_wait_seconds)
+        try:
+            delay = agent.run_once(max_wait_seconds=max_wait_seconds)
+        except HostAgentError:
+            if stop_event.is_set():
+                return
+            stop_event.wait(BACKOFF_SECONDS[0])
+            continue
         if delay > 0:
             stop_event.wait(delay)
 
