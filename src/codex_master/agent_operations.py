@@ -615,15 +615,22 @@ class AgentOperationStore:
             document = self._read_locked()
             record = self._find(document["operations"], receipt.operation_id)
             terminal = self._validate_completion_locked(principal, receipt, record)
+            if terminal:
+                self._write_result_locked(
+                    receipt.operation_id,
+                    receipt.result,
+                    receipt.result_digest,
+                )
+                return self._view(record)
+            record["state"] = receipt.state
+            record["completion"] = self._completion_doc(receipt)
+            if len(_canonical_bytes(document)) > MAX_AGENT_OPERATION_STATE_BYTES:
+                _raise("host.operation_store_unavailable")
             self._write_result_locked(
                 receipt.operation_id,
                 receipt.result,
                 receipt.result_digest,
             )
-            if terminal:
-                return self._view(record)
-            record["state"] = receipt.state
-            record["completion"] = self._completion_doc(receipt)
             self._write_locked(document)
             return self._view(record)
 

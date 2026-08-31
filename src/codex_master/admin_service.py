@@ -1023,7 +1023,6 @@ class MasterjetControlService:
                 "succeeded",
                 "failed",
                 "unknown",
-                "cancelled",
             }:
                 raise _service_error("resource.host_response_invalid")
             result = self._agent_operations.result(agent_operation_id)

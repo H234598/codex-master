@@ -905,6 +905,29 @@ def test_large_result_completion_survives_document_pressure_replay_and_restart(
     assert restarted.result(lease.operation_id) == result
 
 
+def test_completion_at_exhausted_metadata_bound_leaves_no_result_sidecar(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = store_at(tmp_path)
+    lease = lease_one(store)
+    document_path = tmp_path / "agent-operations" / "operations.json"
+    result_path = tmp_path / "agent-operations" / "results" / lease.operation_id
+    before = document_path.read_bytes()
+    monkeypatch.setattr(
+        agent_operations_module,
+        "MAX_AGENT_OPERATION_STATE_BYTES",
+        len(before),
+    )
+
+    with pytest.raises(
+        AgentOperationError, match="host.operation_store_unavailable"
+    ):
+        store.complete(principal(), receipt_for(lease))
+
+    assert document_path.read_bytes() == before
+    assert not result_path.exists()
+
+
 def test_cancel_queued_is_terminal_and_never_polled_or_redelivered(
     tmp_path: Path,
 ) -> None:

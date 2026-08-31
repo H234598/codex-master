@@ -1376,6 +1376,38 @@ def test_operations_get_rejects_terminal_binding_without_durable_result(
         )
 
 
+def test_operations_get_rejects_cancelled_agent_with_durable_result(tmp_path) -> None:
+    admin_operations, agent_operations, plan = _bound_host_probe_stores(tmp_path)
+    _lease, _probe_payload, receipt = _probe_receipt(agent_operations)
+    agent_operations.complete(AgentPrincipalV1("worker-one", 7), receipt)
+    agent_operation_id = admin_operations.agent_operation_id(plan.operation_id)
+    assert agent_operation_id is not None
+
+    document_path = tmp_path / "agent-operations" / "operations.json"
+    document = json.loads(document_path.read_text(encoding="utf-8"))
+    record = next(
+        item
+        for item in document["operations"]
+        if item["operation_id"] == agent_operation_id
+    )
+    record["state"] = "cancelled"
+    document_path.write_text(
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    assert agent_operations.result(agent_operation_id) is not None
+    _finish_probe_admin_operation(admin_operations, plan)
+
+    with pytest.raises(AdminServiceError) as captured:
+        _service_with_operation_stores(admin_operations, agent_operations).query(
+            principal("fleet.read"),
+            "operations.get",
+            {"operation_id": plan.operation_id},
+        )
+
+    assert captured.value.problem.code == "resource.host_response_invalid"
+
+
 @pytest.mark.parametrize(
     ("operation", "arguments", "scope", "expected_call"),
     (
