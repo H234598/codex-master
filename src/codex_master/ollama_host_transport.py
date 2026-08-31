@@ -1072,21 +1072,6 @@ def _hex_token(value: object, length: int) -> bool:
     )
 
 
-def _safe_model_id(value: object) -> bool:
-    return (
-        type(value) is str
-        and 0 < len(value) <= 512
-        and not value.startswith("/")
-        and "\\" not in value
-        and all(component not in ("", ".", "..") for component in value.split("/"))
-        and all(
-            character.isascii()
-            and (character.isalnum() or character in "._:/-@")
-            for character in value
-        )
-    )
-
-
 def _plan_state(plan: OllamaHostPlan) -> tuple[object, ...]:
     return (
         plan.schema_version,
