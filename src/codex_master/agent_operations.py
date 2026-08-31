@@ -28,6 +28,7 @@ MAX_AGENT_OPERATION_STATE_BYTES = 4 * 1024 * 1024
 AGENT_OPERATION_LIFETIME = timedelta(minutes=15)
 AGENT_OPERATION_LEASE = timedelta(seconds=30)
 MAX_AGENT_OPERATION_ATTEMPTS = 8
+MAX_AGENT_EXHAUSTION_RECONCILIATIONS_PER_POLL = 8
 
 _DOCUMENT = PurePosixPath("operations.json")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
@@ -267,6 +268,58 @@ class AgentOperationViewV1:
             object.__setattr__(self, "result_digest", _digest(self.result_digest))
 
 
+@dataclass(frozen=True, slots=True)
+class AgentAttemptExhaustionV1:
+    """Exact private context for a bounded terminal-exhaustion owner."""
+
+    operation_id: str
+    host_ref: str
+    target_host_ref: str | None
+    kind: str
+    action: str
+    registry_generation: int
+    attempt: int
+    plan_digest: str
+    arguments_digest: str
+    arguments: Mapping[str, object]
+    lease_id: str
+    lease_epoch: int
+    deadline: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operation_id", _token(self.operation_id))
+        object.__setattr__(self, "host_ref", _token(self.host_ref))
+        if self.target_host_ref is not None:
+            object.__setattr__(
+                self,
+                "target_host_ref",
+                _token(self.target_host_ref),
+            )
+        kind, action = _check_kind_action(self.kind, self.action)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "action", action)
+        object.__setattr__(
+            self,
+            "registry_generation",
+            _integer(self.registry_generation),
+        )
+        object.__setattr__(self, "attempt", _integer(self.attempt, low=1))
+        object.__setattr__(self, "plan_digest", _digest(self.plan_digest))
+        object.__setattr__(
+            self,
+            "arguments_digest",
+            _digest(self.arguments_digest),
+        )
+        object.__setattr__(
+            self,
+            "arguments",
+            cast(Mapping[str, object], _freeze_json(dict(self.arguments))),
+        )
+        object.__setattr__(self, "lease_id", _token(self.lease_id))
+        object.__setattr__(self, "lease_epoch", _integer(self.lease_epoch))
+        object.__setattr__(self, "deadline", _utc(self.deadline))
+
+
 class AgentOperationStore:
     """One bounded durable master queue guarded by HiveStateStore."""
 
@@ -347,15 +400,30 @@ class AgentOperationStore:
             return self._view(record)
 
     def poll(
-        self, principal: AgentPrincipalV1, poll: AgentPollV1
+        self,
+        principal: AgentPrincipalV1,
+        poll: AgentPollV1,
+        *,
+        attempt_exhaustion_owner: Callable[[AgentAttemptExhaustionV1], bool]
+        | None = None,
     ) -> AgentLeaseV1 | AgentNoWorkV1:
         if type(principal) is not AgentPrincipalV1 or type(poll) is not AgentPollV1:
             _raise("host.request_invalid")
+        if attempt_exhaustion_owner is not None and not callable(
+            attempt_exhaustion_owner
+        ):
+            _raise("host.request_invalid")
         if principal.registry_generation != poll.registry_generation:
             _raise("host.registry_generation_stale")
-        self.expire_leases()
         self._begin_poll(principal.host_ref)
         try:
+            if attempt_exhaustion_owner is None:
+                self.expire_leases()
+            else:
+                self.expire_leases(
+                    attempt_exhaustion_owner=attempt_exhaustion_owner,
+                    owner_host_ref=principal.host_ref,
+                )
             with self._state.locked():
                 document = self._read_locked()
                 host_epochs = document["host_epochs"]
@@ -468,9 +536,23 @@ class AgentOperationStore:
             self._write_locked(document)
             return self._view(record)
 
-    def expire_leases(self) -> tuple[str, ...]:
+    def expire_leases(
+        self,
+        *,
+        attempt_exhaustion_owner: Callable[[AgentAttemptExhaustionV1], bool]
+        | None = None,
+        owner_host_ref: str | None = None,
+    ) -> tuple[str, ...]:
+        if attempt_exhaustion_owner is not None:
+            if not callable(attempt_exhaustion_owner) or owner_host_ref is None:
+                _raise("host.request_invalid")
+            owner_host_ref = _token(owner_host_ref)
+        elif owner_host_ref is not None:
+            _raise("host.request_invalid")
         now = self._now()
         expired: list[str] = []
+        exhaustions: list[AgentAttemptExhaustionV1] = []
+        changed = False
         with self._state.locked():
             document = self._read_locked()
             for record in document["operations"]:
@@ -480,16 +562,31 @@ class AgentOperationStore:
                     continue
                 expired.append(record["operation_id"])
                 if record["attempt"] >= MAX_AGENT_OPERATION_ATTEMPTS:
-                    record["state"] = "unknown"
-                    record["completion"] = {
-                        "reason_codes": ["host.attempts_exhausted"],
-                        "result_digest": None,
-                    }
+                    lease = record["lease"]
+                    # An authenticated poll may reconcile only its own host.
+                    # Other hosts retain their durable candidate for their poll.
+                    if (
+                        attempt_exhaustion_owner is not None
+                        and lease["host_ref"] == owner_host_ref
+                        and len(exhaustions)
+                        < MAX_AGENT_EXHAUSTION_RECONCILIATIONS_PER_POLL
+                    ):
+                        exhaustions.append(self._attempt_exhaustion(record))
+                    elif attempt_exhaustion_owner is None:
+                        self._set_attempts_exhausted(record)
+                        changed = True
                 else:
                     record["state"] = "queued"
                     record["lease"] = None
-            if expired:
+                    changed = True
+            if changed:
                 self._write_locked(document)
+        if attempt_exhaustion_owner is not None:
+            for exhaustion in exhaustions:
+                claimed = attempt_exhaustion_owner(exhaustion)
+                if type(claimed) is not bool:
+                    _raise("host.operation_store_unavailable")
+                self._finalize_attempt_exhaustion(exhaustion)
         return tuple(expired)
 
     def get(self, operation_id: str) -> AgentOperationViewV1:
@@ -509,6 +606,57 @@ class AgentOperationStore:
                     "arguments": MappingProxyType(dict(record["arguments"])),
                 }
             )
+
+    def _attempt_exhaustion(
+        self, record: Mapping[str, Any]
+    ) -> AgentAttemptExhaustionV1:
+        lease = record["lease"]
+        if type(lease) is not dict:
+            _raise("host.operation_store_unavailable")
+        return AgentAttemptExhaustionV1(
+            operation_id=record["operation_id"],
+            host_ref=lease["host_ref"],
+            target_host_ref=record["target_host_ref"],
+            kind=record["kind"],
+            action=record["action"],
+            registry_generation=record["registry_generation"],
+            attempt=record["attempt"],
+            plan_digest=record["plan_digest"],
+            arguments_digest=record["arguments_digest"],
+            arguments=record["arguments"],
+            lease_id=lease["lease_id"],
+            lease_epoch=lease["lease_epoch"],
+            deadline=_parse_time(lease["deadline"]),
+        )
+
+    def _finalize_attempt_exhaustion(
+        self, exhaustion: AgentAttemptExhaustionV1
+    ) -> None:
+        with self._state.locked():
+            document = self._read_locked()
+            record = self._find(document["operations"], exhaustion.operation_id)
+            if record["state"] == "unknown" and record["completion"] == {
+                "reason_codes": ["host.attempts_exhausted"],
+                "result_digest": None,
+            }:
+                return
+            if (
+                record["state"] != "leased"
+                or record["attempt"] < MAX_AGENT_OPERATION_ATTEMPTS
+                or self._attempt_exhaustion(record) != exhaustion
+                or exhaustion.deadline > self._now()
+            ):
+                _raise("host.lease_stale")
+            self._set_attempts_exhausted(record)
+            self._write_locked(document)
+
+    @staticmethod
+    def _set_attempts_exhausted(record: dict[str, Any]) -> None:
+        record["state"] = "unknown"
+        record["completion"] = {
+            "reason_codes": ["host.attempts_exhausted"],
+            "result_digest": None,
+        }
 
     def _begin_poll(self, host_ref: str) -> None:
         with self._active_lock:
@@ -827,6 +975,8 @@ __all__ = [
     "AGENT_OPERATION_LIFETIME",
     "MAX_AGENT_OPERATION_ATTEMPTS",
     "MAX_AGENT_OPERATION_RECORDS",
+    "MAX_AGENT_EXHAUSTION_RECONCILIATIONS_PER_POLL",
+    "AgentAttemptExhaustionV1",
     "AgentOperationError",
     "AgentOperationRequestV1",
     "AgentOperationStore",

@@ -472,6 +472,7 @@ class HostRegistry:
                 item
                 for item in registrations
                 if item["ref"] in seen_refs
+                or item["ref"] in ssh_bindings
                 or item["source"] != "static-agent-binding"
             ]
             next_bindings: list[dict[str, object]] = []
@@ -547,11 +548,19 @@ class HostRegistry:
                 raise HostRegistryError("host.identity_history_full")
             next_registrations.sort(key=lambda item: str(item["ref"]))
             next_bindings.sort(key=lambda item: str(item["ref"]))
+            observation_owner_refs = set(ssh_bindings) | {
+                str(item["ref"]) for item in next_bindings
+            }
+            next_observations = [
+                item
+                for item in observations
+                if item["ref"] in observation_owner_refs
+            ]
             self._write_locked(
                 next_registrations,
                 ssh_bindings,
                 next_bindings,
-                observations,
+                next_observations,
                 mutation_generation,
                 epoch_history,
             )

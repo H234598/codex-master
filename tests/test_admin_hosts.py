@@ -1083,6 +1083,64 @@ def test_agent_sync_last_removal_persists_generation_and_rejects_stale_cas(
     assert document.read_bytes() == before
 
 
+def test_agent_sync_last_removal_prunes_owned_active_observation_atomically(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    desired = ((static_registration(), agent_binding()),)
+    registry.synchronize_agent_bindings(desired, expected_generation=0)
+    registry.record_active_probe(
+        "worker-one",
+        generation=2,
+        resource_evidence={
+            "cpu_threads": 8,
+            "memory_bytes": 16_000_000_000,
+        },
+        observed_at="2026-08-31T08:00:00Z",
+    )
+
+    registry.synchronize_agent_bindings((), expected_generation=2)
+
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    payload = json.loads(document.read_text(encoding="utf-8"))
+    assert registry.list() == ()
+    assert payload["generation"] == 3
+    assert payload["registrations"] == []
+    assert payload["bindings"] == {"ssh": [], "agent": []}
+    assert payload["observations"] == []
+    assert payload["agent_epoch_history"] == [
+        {"ref": "worker-one", "lease_epoch": 1}
+    ]
+    reopened = registry_at(tmp_path)
+    assert reopened.document_generation() == 3
+    assert reopened.list() == ()
+
+
+def test_agent_sync_removal_preserves_observation_when_ssh_domain_remains(
+    tmp_path: Path,
+) -> None:
+    registry = registry_at(tmp_path)
+    registry.record_probe("worker-one", generation=1, evidence=valid_evidence())
+    desired = ((static_registration(), agent_binding()),)
+    registry.synchronize_agent_bindings(desired, expected_generation=1)
+    document = tmp_path / "admin-hosts" / "hosts.json"
+    before = json.loads(document.read_text(encoding="utf-8"))
+
+    registry.synchronize_agent_bindings((), expected_generation=2)
+
+    after = json.loads(document.read_text(encoding="utf-8"))
+    assert after["generation"] == 3
+    assert after["registrations"] == before["registrations"]
+    assert after["bindings"]["ssh"] == before["bindings"]["ssh"]
+    assert after["bindings"]["agent"] == []
+    assert after["observations"] == before["observations"]
+    assert after["agent_epoch_history"] == [
+        {"ref": "worker-one", "lease_epoch": 1}
+    ]
+    assert registry.get("worker-one").generation == 1
+    assert registry_at(tmp_path).get("worker-one") == registry.get("worker-one")
+
+
 def test_agent_sync_readd_uses_tombstoned_epoch_and_new_generation(
     tmp_path: Path,
 ) -> None:

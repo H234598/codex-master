@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
+from collections.abc import Callable
 from typing import Final, Protocol, cast
 
 from .admin_hosts import AgentPrincipalV1, HostRegistryError
@@ -20,6 +21,7 @@ from .agent_contracts import (
     serialize_agent_lease,
 )
 from .agent_operations import (
+    AgentAttemptExhaustionV1,
     AgentOperationError,
     AgentPrincipalV1 as OperationPrincipalV1,
 )
@@ -34,7 +36,14 @@ _HEADERS = (("Content-Type", "application/json"), ("Cache-Control", "no-store"))
 
 
 class _Store(Protocol):
-    def poll(self, principal: OperationPrincipalV1, poll: object) -> object: ...
+    def poll(
+        self,
+        principal: OperationPrincipalV1,
+        poll: object,
+        *,
+        attempt_exhaustion_owner: Callable[[AgentAttemptExhaustionV1], bool]
+        | None = None,
+    ) -> object: ...
     def complete(self, principal: OperationPrincipalV1, receipt: object) -> object: ...
 
 
@@ -105,10 +114,23 @@ class AgentHttpApplication:
             )
             if target == "/agent/v1/polls":
                 parsed_poll = parse_agent_poll(value)
-                result = self._store.poll(
-                    _operation_principal(principal),
-                    _authoritative_poll(principal, parsed_poll),
+                owner = self._completion_owner
+                exhaustion_owner = getattr(
+                    owner,
+                    "reconcile_attempt_exhaustion",
+                    None,
                 )
+                if callable(exhaustion_owner):
+                    result = self._store.poll(
+                        _operation_principal(principal),
+                        _authoritative_poll(principal, parsed_poll),
+                        attempt_exhaustion_owner=exhaustion_owner,
+                    )
+                else:
+                    result = self._store.poll(
+                        _operation_principal(principal),
+                        _authoritative_poll(principal, parsed_poll),
+                    )
                 return _response(200, self._poll_result(result))
             receipt = parse_agent_receipt(value)
             if receipt.operation_id != cast(re.Match[str], receipt_match).group(1):

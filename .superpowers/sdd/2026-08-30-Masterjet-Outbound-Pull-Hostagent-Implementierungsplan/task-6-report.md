@@ -653,3 +653,141 @@ recovery tests; the canonical success graph uses the production Store clock
 without injection. Production reclamation is poll-driven, so a host that never
 polls cannot trigger immediate expiry maintenance; once polling resumes, the
 durable queue converges. No known Task-6 correctness risk remains.
+
+## Second exceptional lifecycle-fix round: orphan observations and attempt exhaustion
+
+This user-authorized round is limited to the two Important lifecycle findings
+in `task-6-rereview-exceptional.md`. It does not add a Task-7 result wire or
+Task-8 Ollama behavior. The hard gate passed before edits: the worktree and
+Git toplevel were the required SSD3 path, HEAD was exactly
+`e5a3121808aafc4e3f9ed4ea8f02e50410e57bfc`, and `CODEX_HOME` selected the
+canonical `RH_Privat` profile. The plan/spec annotation sidecars were checked
+before the complete documents were read; neither sidecar exists. The
+pre-existing `progress.md` modification was not edited.
+
+### RED evidence
+
+The regressions were added before production edits and run through the real
+stores and polling path:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src pytest -q -p no:cacheprovider \
+  tests/test_admin_hosts.py::test_agent_sync_last_removal_prunes_owned_active_observation_atomically \
+  tests/test_admin_hosts.py::test_agent_sync_removal_preserves_observation_when_ssh_domain_remains \
+  tests/test_host_probe_production_graph.py::test_attempt_exhaustion_reconciles_paired_admin_after_master_restart \
+  tests/test_host_probe_production_graph.py::test_attempt_exhaustion_retries_one_shot_reconciliation_failure_on_poll \
+  tests/test_host_probe_production_graph.py::test_attempt_exhaustion_reconciliation_is_scoped_to_polling_host
+
+6 failed in 0.94s
+```
+
+The Agent-only removal returned successfully but immediate `HostRegistry.list()`
+failed `control.host_store_unavailable`; the persisted observation no longer
+had any registration/binding owner. Removing Agent state from a dual SSH+Agent
+host instead failed the write because it also removed the registration still
+required by the SSH binding. On exhaustion, reconstructed normal polling left
+Admin `planned`; the Admin failure injection was never reached; a failed final
+Agent write left Admin `planned`; and polling one host reclaimed another host
+without involving either paired Admin owner.
+
+### Closure architecture
+
+`HostRegistry.synchronize_agent_bindings()` retains a static Agent
+registration when the same ref still has a valid SSH binding. Inside its
+existing single lock, it derives observation owners from the post-sync union
+of SSH refs and Agent-binding refs, prunes only observations outside that
+union, and performs the existing single document replacement. Agent-only
+removal therefore writes empty registration/binding/observation collections at
+document generation 3 and reopens cleanly. A dual host retains byte-equivalent
+registration, SSH binding, and observation metadata while only its Agent
+binding is removed. Epoch history remains a tombstone; existing CAS,
+generation/epoch exhaustion, and no-write-on-error paths are unchanged.
+
+The generic `AgentOperationStore` remains independent of
+`AdminOperationStore`. It now exposes a private typed
+`AgentAttemptExhaustionV1` callback boundary containing the exact Agent
+operation, actual lease host, target host, kind/action, generations, attempt,
+plan/argument digests, fixed arguments, lease ID/epoch, and deadline. An Agent
+poll may process at most eight exhaustion callbacks and only for its own
+authenticated host; other hosts retain their durable candidate for their own
+poll. With no owner, the existing generic attempt-limit behavior remains
+unchanged.
+
+`AgentHttpApplication` supplies the existing
+`RemoteHostProbeCompletionOwner` only on the production poll path. The owner
+accepts exactly `host.probe/collect`, requires lease host equal to target,
+requires exactly `admin_operation_id` plus `probe_schema=1`, and verifies the
+paired Admin kind and plan digest. It then reuses the existing restart-safe
+Admin failure transition to finish the Admin operation as
+`failed/host.probe_unknown`. Only after that returns does the Agent Store
+durably write `unknown/host.attempts_exhausted`.
+
+No external receipt or evidence is fabricated. The Registry is not read or
+mutated during exhaustion. A failed Admin boundary leaves the Agent lease
+durably retryable. A failed final Agent write leaves the Admin terminal and the
+Agent lease retryable; the next ordinary poll recognizes the terminal Admin
+state and completes the Agent transition. Reconstructing Registry, Admin Store,
+Agent Store, application, and owner before the final poll converges through
+the same path. Agent operation schema version 1 and HostRegistry schema version
+3 are unchanged, and the eight-attempt limit retains its original meaning.
+
+### GREEN and preservation evidence
+
+```text
+# Exact lifecycle regressions
+6 passed in 1.99s
+
+# Complete directly affected HostRegistry file
+131 passed in 2.28s
+
+# Complete host-probe and real production-graph files
+59 passed in 3.18s
+
+# Complete Agent operation and Agent HTTP files
+39 passed in 69.88s
+
+# Existing Admin transaction/restart owner file
+38 passed in 50.59s
+
+# Selected Task-1--5 contracts, identity, daemon, HostAgent state/client,
+# executor, and Admin daemon dependencies
+185 passed in 69.63s
+
+# Route/scope/HTTPS step-up, exact CLI/MCP/catalog, and GTK terminal rendering
+10 passed, 244 deselected in 18.83s
+```
+
+These recorded post-fix commands contain 468 passing pytest invocations, with
+the six focused invocations intentionally repeated in their complete affected
+files, plus 244 deselections. The production-graph tests cross real
+`HostRegistry`, `AdminOperationStore`, `AgentOperationStore`,
+`RemoteHostProbeAdapter`, `AgentHttpApplication`, and
+`RemoteHostProbeCompletionOwner` through serialized ordinary polls. They prove
+restart reconstruction, Admin and final-Agent one-shot failure retry, exact
+terminal reasons, no Registry mutation, and no cross-host reconciliation.
+
+Ruff passed all six changed Python code/test files. `compileall` passed the four
+changed production modules with its cache in tmpfs. `git diff --check` passed.
+The count-only suspected-secret scan over the authorized source/test diff
+reported 0 matches and printed no matched values.
+
+### CodeRabbit and residual risk
+
+CodeRabbit CLI 0.7.5 was authenticated and run uncommitted with separate
+`src/codex_master` and `tests` directory scopes. This excluded the protected
+pre-existing `progress.md` diff, whose count-only preflight contains one
+permissive substring match; every authorized file reported zero suspected
+matches. The tests review completed with 0 findings. The first source review
+suggested reconciling other hosts during the current host's poll. That finding
+was rejected as contrary to the explicit no-cross-host-reconciliation contract
+and the authenticated host boundary. After an invariant comment, the source
+rerun completed with 0 findings.
+
+Reclamation remains deliberately poll-driven and host-scoped: a host that
+never polls cannot ask another authenticated host to reconcile its lifecycle.
+The Admin-then-Agent transition spans two durable stores rather than one atomic
+write, so availability failures can expose the documented intermediate state;
+ordinary later polls are the tested recovery mechanism. The production graph
+still replaces only TLS/socket I/O in process; the separate identity, HTTP,
+daemon, client, and restart suites passed. Independent review, not this report,
+decides Task-6 closure.

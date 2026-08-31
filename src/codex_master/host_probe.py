@@ -15,6 +15,7 @@ from typing import Protocol, cast
 from .admin_contracts import OperationV1
 from .agent_contracts import AgentReceiptV1
 from .agent_operations import (
+    AgentAttemptExhaustionV1,
     AgentOperationError,
     AgentOperationRequestV1,
     AgentOperationStore,
@@ -317,6 +318,42 @@ class RemoteHostProbeCompletionOwner:
         self._operations = operation_store
         self._agent_operations = agent_operations
         self._registry = host_registry
+
+    def reconcile_attempt_exhaustion(
+        self, exhaustion: AgentAttemptExhaustionV1
+    ) -> bool:
+        """Terminalize one exact paired Admin probe before Agent exhaustion."""
+
+        if type(exhaustion) is not AgentAttemptExhaustionV1:
+            raise HostProbeError()
+        if (exhaustion.kind, exhaustion.action) != ("host.probe", "collect"):
+            return False
+        target = exhaustion.target_host_ref
+        arguments = exhaustion.arguments
+        if (
+            type(target) is not str
+            or exhaustion.host_ref != target
+            or set(arguments) != {"admin_operation_id", "probe_schema"}
+            or arguments.get("probe_schema") != 1
+        ):
+            raise HostProbeError()
+        operation_id = arguments.get("admin_operation_id")
+        if type(operation_id) is not str:
+            raise HostProbeError()
+        operation = self._operations.get(operation_id)
+        if (
+            operation.kind != "hosts.probe"
+            or operation.plan_digest != exhaustion.plan_digest
+        ):
+            raise HostProbeError()
+        operation = self._transition_failure(
+            operation_id,
+            operation.expected_generation,
+            "host.probe_unknown",
+        )
+        if operation.state not in _TERMINAL_ADMIN_STATES:
+            raise AdminOperationError("control.operation_state_conflict")
+        return True
 
     def complete(self, principal: object, receipt: AgentReceiptV1) -> object:
         if receipt.result.kind != "host.probe" or receipt.result.action != "collect":
