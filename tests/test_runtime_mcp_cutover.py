@@ -442,7 +442,7 @@ def test_force_rollback_reuses_one_pinned_cli_and_client_home_after_add_failure(
         with pytest.raises(server.AgentError, match="codex mcp add failed"):
             server.install(register=True, force=True, sync_plugin_cache=False)
 
-    bind.assert_called_once_with(create_config_directory=True)
+    bind.assert_called_once_with()
     check.assert_called_once_with(
         layout.mcp_entrypoint, include_command=True, binding=binding
     )
@@ -456,24 +456,15 @@ def test_force_rollback_reuses_one_pinned_cli_and_client_home_after_add_failure(
     assert binding.revalidate.call_count == 6
 
 
-def test_binding_removes_only_its_new_empty_config_directory_after_pre_yield_failure(
+def test_install_rejects_missing_client_config_without_mutation(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "main-home"
     home.mkdir(mode=0o700)
+    layout = runtime_layout(tmp_path)
     executable = tmp_path / "codex"
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     executable.chmod(0o700)
-    open_config_directory = server.open_directory_no_follow_matching
-
-    def fail_config_open(
-        path: Path | str,
-        expected: os.stat_result,
-        **kwargs: object,
-    ) -> int:
-        if path == ".codex":
-            raise server.AgentError("injected_config_open_failure")
-        return open_config_directory(path, expected, **kwargs)
 
     with (
         patch.object(server.os, "geteuid", return_value=1000),
@@ -481,45 +472,47 @@ def test_binding_removes_only_its_new_empty_config_directory_after_pre_yield_fai
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
         patch.object(server, "_canonical_codex_cli_path", return_value=executable),
-        patch.object(
-            server,
-            "open_directory_no_follow_matching",
-            side_effect=fail_config_open,
-        ),
+        patch.object(server, "_runtime_layout", return_value=layout),
+        patch.object(server, "install_lock") as lock,
+        patch.object(server, "ensure_applet_action_key") as ensure_key,
     ):
-        with pytest.raises(server.AgentError, match="injected_config_open_failure"):
-            with server._codex_mcp_binding(create_config_directory=True):
-                pass
+        with pytest.raises(
+            server.AgentError, match="canonical_codex_mcp_binding_unavailable"
+        ):
+            server.install(register=False, sync_plugin_cache=False)
 
     assert not (home / ".codex").exists()
+    lock.assert_not_called()
+    ensure_key.assert_not_called()
 
 
-@pytest.mark.parametrize("case", ("nonempty", "replacement", "mode", "existing"))
-def test_binding_never_removes_foreign_changed_or_existing_config_after_pre_yield_failure(
+def test_swap_before_rmdir_has_no_name_based_binding_delete_path() -> None:
+    source = Path(server.__file__).read_text(encoding="utf-8")
+    assert "def _remove_created_empty_codex_config_directory(" not in source
+    assert 'os.rmdir(".codex", dir_fd=home_fd)' not in source
+
+
+def test_missing_config_race_never_deletes_a_foreign_replacement(
     tmp_path: Path,
-    case: str,
 ) -> None:
     home = tmp_path / "main-home"
     home.mkdir(mode=0o700)
-    if case == "existing":
-        (home / ".codex").mkdir(mode=0o700)
-        (home / ".codex" / "existing").write_text("keep", encoding="utf-8")
     executable = tmp_path / "codex"
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     executable.chmod(0o700)
-    moved = tmp_path / "moved-config"
+    foreign = home / ".codex"
+    original_stat = server.os.stat
+    published = False
 
-    def fail_after_config_open(*args: object) -> None:
-        config = home / ".codex"
-        if case == "nonempty":
-            (config / "foreign").write_text("keep", encoding="utf-8")
-        elif case == "replacement":
-            config.rename(moved)
-            config.mkdir(mode=0o700)
-            (config / "foreign").write_text("keep", encoding="utf-8")
-        elif case == "mode":
-            config.chmod(0o755)
-        raise server.AgentError("injected_post_open_failure")
+    def publish_foreign_then_report_missing(
+        path: Path | str, *args: object, **kwargs: object
+    ) -> os.stat_result:
+        nonlocal published
+        if path == ".codex" and not published:
+            published = True
+            foreign.mkdir(mode=0o700)
+            raise FileNotFoundError
+        return original_stat(path, *args, **kwargs)
 
     with (
         patch.object(server.os, "geteuid", return_value=1000),
@@ -527,21 +520,13 @@ def test_binding_never_removes_foreign_changed_or_existing_config_after_pre_yiel
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
         patch.object(server, "_canonical_codex_cli_path", return_value=executable),
-        patch.object(server, "_CodexMcpBinding", side_effect=fail_after_config_open),
+        patch.object(server.os, "stat", side_effect=publish_foreign_then_report_missing),
     ):
-        with pytest.raises(server.AgentError, match="injected_post_open_failure"):
-            with server._codex_mcp_binding(create_config_directory=True):
+        with pytest.raises(server.AgentError, match="canonical_codex_mcp_binding_unavailable"):
+            with server._codex_mcp_binding():
                 pass
 
-    if case == "replacement":
-        assert moved.is_dir()
-        assert (home / ".codex" / "foreign").is_file()
-    elif case == "nonempty":
-        assert (home / ".codex" / "foreign").is_file()
-    elif case == "mode":
-        assert (home / ".codex").stat().st_mode & 0o777 == 0o755
-    else:
-        assert (home / ".codex" / "existing").is_file()
+    assert foreign.is_dir()
 
 
 def test_binding_pins_cli_and_client_config_across_a_dot_codex_swap(
@@ -679,7 +664,7 @@ def test_force_rollback_keeps_the_pinned_dot_codex_after_a_swap(
     assert (config / "marker").read_text(encoding="utf-8") == "replacement"
 
 
-def test_binding_creates_a_missing_client_config_directory_through_the_pinned_home(
+def test_binding_rejects_missing_client_config_without_creating_it(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "main-home"
@@ -695,14 +680,11 @@ def test_binding_creates_a_missing_client_config_directory_through_the_pinned_ho
         ),
         patch.object(server, "_canonical_codex_cli_path", return_value=executable),
     ):
-        with server._codex_mcp_binding(create_config_directory=True) as binding:
-            assert binding.config_path.parent.resolve() == home / ".codex"
-            assert Path(binding.environment["HOME"]).resolve() == home
+        with pytest.raises(server.AgentError, match="canonical_codex_mcp_binding_unavailable"):
+            with server._codex_mcp_binding():
+                pass
 
-    config_home = home / ".codex"
-    assert config_home.is_dir()
-    assert not config_home.is_symlink()
-    assert config_home.stat().st_mode & 0o777 == 0o700
+    assert not (home / ".codex").exists()
 
 
 def test_registration_inspection_does_not_create_a_missing_client_config_directory(
@@ -728,6 +710,40 @@ def test_registration_inspection_does_not_create_a_missing_client_config_directo
 
     run.assert_not_called()
     assert result["lookup_status"] == "unavailable"
+    assert not (home / ".codex").exists()
+
+
+def test_doctor_does_not_create_a_missing_client_config_directory(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "main-home"
+    home.mkdir(mode=0o700)
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    entrypoint = tmp_path / "codex-master-mcp"
+    entrypoint.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    entrypoint.chmod(0o700)
+
+    with (
+        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.object(server, "_canonical_codex_cli_path", return_value=executable),
+        patch.object(server, "ensure_state"),
+        patch.object(server, "_runtime_mcp_entrypoint", return_value=entrypoint),
+        patch.object(
+            server, "current_agent_inventory", return_value=SimpleNamespace(agent_ids=())
+        ),
+        patch.object(server, "mcp_command_startup_self_test", return_value={"ok": True}),
+        patch.object(server, "raw_log_retention_status", return_value={}),
+        patch.object(server, "native_hook_coverage_status", return_value={}),
+    ):
+        result = server.doctor()
+
+    registration = next(item for item in result["checks"] if item["name"] == "mcp_registered")
+    assert registration["lookup_status"] == "unavailable"
     assert not (home / ".codex").exists()
 
 

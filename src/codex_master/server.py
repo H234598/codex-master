@@ -2288,72 +2288,11 @@ def _canonical_codex_client_home() -> tuple[Path, os.stat_result]:
     return home, metadata
 
 
-def _remove_created_empty_codex_config_directory(
-    home_fd: int,
-    expected_config_stat: os.stat_result,
-) -> None:
-    """Best-effort removal of only this call's unchanged, empty config directory."""
-
-    config_fd = -1
-    try:
-        current = os.stat(".codex", dir_fd=home_fd, follow_symlinks=False)
-        if (
-            stat_module.S_ISLNK(current.st_mode)
-            or not stat_module.S_ISDIR(current.st_mode)
-            or not source_identity_with_snapshot_matches(
-                current, expected_config_stat
-            )
-            or current.st_uid != expected_config_stat.st_uid
-            or stat_module.S_IMODE(current.st_mode)
-            != stat_module.S_IMODE(expected_config_stat.st_mode)
-            or getattr(current, "st_nlink", 1)
-            != getattr(expected_config_stat, "st_nlink", 1)
-            or current.st_ctime_ns != expected_config_stat.st_ctime_ns
-        ):
-            return
-        config_fd = os.open(
-            ".codex",
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=home_fd,
-        )
-        if not source_identity_with_snapshot_matches(
-            os.fstat(config_fd), expected_config_stat
-        ):
-            return
-        if os.listdir(config_fd):
-            return
-        current = os.stat(".codex", dir_fd=home_fd, follow_symlinks=False)
-        if (
-            not source_identity_with_snapshot_matches(current, expected_config_stat)
-            or current.st_uid != expected_config_stat.st_uid
-            or stat_module.S_IMODE(current.st_mode)
-            != stat_module.S_IMODE(expected_config_stat.st_mode)
-            or getattr(current, "st_nlink", 1)
-            != getattr(expected_config_stat, "st_nlink", 1)
-            or current.st_ctime_ns != expected_config_stat.st_ctime_ns
-        ):
-            return
-        os.rmdir(".codex", dir_fd=home_fd)
-    except OSError:
-        return
-    finally:
-        if config_fd >= 0:
-            with contextlib.suppress(OSError):
-                os.close(config_fd)
-
-
 @contextlib.contextmanager
-def _codex_mcp_binding(
-    *, create_config_directory: bool = False
-) -> Iterator[_CodexMcpBinding]:
+def _codex_mcp_binding() -> Iterator[_CodexMcpBinding]:
     executable_fd = -1
     home_fd = -1
     config_fd = -1
-    created_config_stat: os.stat_result | None = None
-    binding_yielded = False
     try:
         executable = _canonical_codex_cli_path()
         executable_stat = executable.lstat()
@@ -2378,19 +2317,7 @@ def _codex_mcp_binding(
         try:
             config_stat = os.stat(".codex", dir_fd=home_fd, follow_symlinks=False)
         except FileNotFoundError:
-            if not create_config_directory:
-                raise AgentError("canonical_codex_mcp_binding_unavailable")
-            try:
-                os.mkdir(".codex", 0o700, dir_fd=home_fd)
-            except FileExistsError:
-                pass
-            else:
-                created_config_stat = os.stat(
-                    ".codex", dir_fd=home_fd, follow_symlinks=False
-                )
-            config_stat = created_config_stat or os.stat(
-                ".codex", dir_fd=home_fd, follow_symlinks=False
-            )
+            raise AgentError("canonical_codex_mcp_binding_unavailable") from None
         if (
             stat_module.S_ISLNK(config_stat.st_mode)
             or not stat_module.S_ISDIR(config_stat.st_mode)
@@ -2414,7 +2341,6 @@ def _codex_mcp_binding(
             config_stat,
         )
         binding.revalidate()
-        binding_yielded = True
         yield binding
         binding.revalidate()
     except AgentError:
@@ -2422,8 +2348,6 @@ def _codex_mcp_binding(
     except OSError as exc:
         raise AgentError("canonical_codex_mcp_binding_unavailable") from exc
     finally:
-        if not binding_yielded and created_config_stat is not None and home_fd >= 0:
-            _remove_created_empty_codex_config_directory(home_fd, created_config_stat)
         for descriptor in (config_fd, home_fd, executable_fd):
             if descriptor >= 0:
                 with contextlib.suppress(OSError):
@@ -23855,7 +23779,7 @@ def _install_enrolled_unlocked(
     binding: _CodexMcpBinding | None = None,
 ) -> dict[str, Any]:
     if binding is None:
-        with _codex_mcp_binding(create_config_directory=True) as pinned_binding:
+        with _codex_mcp_binding() as pinned_binding:
             return _install_enrolled_unlocked(
                 register=register,
                 force=force,
@@ -24061,7 +23985,7 @@ def _install_unlocked(
     binding: _CodexMcpBinding | None = None,
 ) -> dict[str, Any]:
     if binding is None:
-        with _codex_mcp_binding(create_config_directory=True) as pinned_binding:
+        with _codex_mcp_binding() as pinned_binding:
             return _install_unlocked(
                 register=register,
                 force=force,
@@ -24098,7 +24022,7 @@ def install(
     sync_plugin_cache: bool = True,
     install_desktop: bool = False,
 ) -> dict[str, Any]:
-    binding_context: Any = _codex_mcp_binding(create_config_directory=True)
+    binding_context: Any = _codex_mcp_binding()
     with binding_context as binding:
         with install_lock():
             return _install_unlocked(
