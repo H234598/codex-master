@@ -9,14 +9,33 @@ from codex_master.hive.repositories import (
     RepositoryError,
     RepositoryRegistry,
 )
+import codex_master.hive.repositories as repositories
 
 
 def make_repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir()
-    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
         ["git", "-C", str(root), "config", "remote.origin.url", "https://github.com/example/repo.git"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Hive Test",
+            "-c",
+            "user.email=hive-test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-q",
+            "-m",
+            "initial main",
+        ],
         check=True,
     )
     return root
@@ -108,6 +127,7 @@ def test_git_rejects_oversized_output_before_process_finishes(tmp_path: Path, mo
     fake_git.chmod(0o755)
     monkeypatch.setenv("GIT_MARKER", str(marker))
     monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(repositories, "_GIT_ENV", {**repositories._GIT_ENV, "PATH": str(tmp_path)})
 
     assert RepositoryRegistry._git(tmp_path, "rev-parse", "--show-toplevel") is None
     assert not marker.exists()

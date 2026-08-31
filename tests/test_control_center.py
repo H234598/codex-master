@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from codex_master import control_center
@@ -208,6 +209,14 @@ class ControlCenterControllerTest(unittest.TestCase):
             timeout_seconds=2,
         )
         self.assertEqual(dispatcher("agent_status", {}), {"ok": True, "name": "agent_status"})
+
+    def test_subprocess_dispatcher_defaults_to_the_runtime_image_entrypoint(self) -> None:
+        entrypoint = Path("/tmp/codex-master-runtime/bin/codex-master-mcp")
+
+        with patch.object(control_center, "runtime_mcp_entrypoint", return_value=entrypoint):
+            dispatcher = control_center.SubprocessToolDispatcher()
+
+        self.assertEqual(dispatcher._argv, [str(entrypoint)])
 
     def test_subprocess_dispatcher_kills_hung_backend_at_deadline(self) -> None:
         dispatcher = control_center.SubprocessToolDispatcher(

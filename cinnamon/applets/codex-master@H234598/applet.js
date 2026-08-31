@@ -629,7 +629,7 @@ FlottenmanagementApplet.prototype = {
     _trackedStatusArgv() {
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
         return [
-            home + "/.local/bin/codex-master-mcp",
+            home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp",
             APPLET_STATUS_COMMAND,
             "--schema-version",
             String(APPLET_STATUS_SCHEMA_VERSION),
@@ -647,7 +647,7 @@ FlottenmanagementApplet.prototype = {
         const terminal = this._normalizeTerminalCommand(this.terminalCommand);
         if (!terminal) return;
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
-        const statusCommand = home + "/.local/bin/codex-master-mcp";
+        const statusCommand = home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp";
         const shellQuote = (value) => `'${String(value).replace(/'/g, "'\\''")}'`;
         const terminalName = terminal.split("/").pop();
         const terminalExecutionArgs = terminalName === "gnome-terminal" ? ["--"] : ["-e"];
@@ -674,7 +674,7 @@ FlottenmanagementApplet.prototype = {
 
     _controlCenterArgv() {
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
-        return [home + "/.local/bin/codex-master-mcp", "control-center-launch"];
+        return [home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp", "control-center-launch"];
     },
 
     _appletActionArgv(actionRequest) {
@@ -688,7 +688,7 @@ FlottenmanagementApplet.prototype = {
         }
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
         return [
-            home + "/.local/bin/codex-master-mcp",
+            home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp",
             APPLET_ACTION_COMMAND,
             actionRequest.action,
             actionRequest.agent,
@@ -790,7 +790,7 @@ FlottenmanagementApplet.prototype = {
             throw new Error("Overview home unavailable");
         }
         const argv = [
-            home + "/.local/bin/codex-master-mcp",
+            home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp",
             "fleet",
             APPLET_OVERVIEW_COMMAND,
             "--format",

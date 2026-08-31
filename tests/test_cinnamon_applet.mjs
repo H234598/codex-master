@@ -819,7 +819,7 @@ test("overview argv is shell-free and adds only explicit session flag", () => {
   const firstApplet = first.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   firstApplet._refreshOverview();
   assert.deepEqual(Array.from(first.launcherSpawns[0].argv), [
-    "/tmp/overview-home/.local/bin/codex-master-mcp",
+    "/tmp/overview-home/.local/lib/codex-master-runtime/bin/codex-master-mcp",
     "fleet",
     "overview",
     "--format",
@@ -831,7 +831,7 @@ test("overview argv is shell-free and adds only explicit session flag", () => {
   const secondApplet = second.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   secondApplet._refreshOverview();
   assert.deepEqual(Array.from(second.launcherSpawns[0].argv), [
-    "/home/tester/.local/bin/codex-master-mcp",
+    "/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp",
     "fleet",
     "overview",
     "--format",
@@ -1295,7 +1295,7 @@ test("builds fixed mcp argv and validierte ids", async () => {
   await Promise.resolve();
 
   const launch = launcherSpawns.at(-1);
-  assert.equal(launch.argv[0], "/tmp/home/.local/bin/codex-master-mcp");
+  assert.equal(launch.argv[0], "/tmp/home/.local/lib/codex-master-runtime/bin/codex-master-mcp");
   assert.equal(launch.argv[1], "applet-status");
   assert.equal(launch.argv[2], "--schema-version");
   assert.equal(launch.argv[3], "4");
@@ -1351,7 +1351,7 @@ test("control-center uses one fixed bounded detach helper", () => {
   controlCenterItem.activate();
   assert.equal(fixture.subprocesses.length, 1);
   assert.deepEqual(Array.from(fixture.launcherSpawns[0].argv), [
-    "/home/tester/.local/bin/codex-master-mcp",
+    "/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp",
     "control-center-launch",
   ]);
   assert.deepEqual(Array.from(fixture.launcherSpawns[0].envCalls), [
@@ -3109,7 +3109,7 @@ test("fleet status terminal uses Ghostty by default and the configured executabl
     "-e",
     "/bin/bash",
     "-c",
-    "'/home/tester/.local/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
+    "'/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
   ]);
 
   fixture.setSetting("terminal-command", "gnome-terminal");
@@ -3119,7 +3119,7 @@ test("fleet status terminal uses Ghostty by default and the configured executabl
     "--",
     "/bin/bash",
     "-c",
-    "'/home/tester/.local/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
+    "'/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
   ]);
 
   fixture.setSetting("terminal-command", "konsole");
@@ -3129,7 +3129,7 @@ test("fleet status terminal uses Ghostty by default and the configured executabl
     "-e",
     "/bin/bash",
     "-c",
-    "'/home/tester/.local/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
+    "'/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
   ]);
 });
 

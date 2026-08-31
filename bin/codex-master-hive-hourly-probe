@@ -1,7 +1,7 @@
 #!/usr/bin/bash
 set -euo pipefail
 
-runtime_root="${BASH_SOURCE[0]%/bin/codex-master-mcp}"
+runtime_root="${BASH_SOURCE[0]%/bin/codex-master-hive-hourly-probe}"
 [[ "${runtime_root}" != "${BASH_SOURCE[0]}" && "${runtime_root}" == /* ]] || exit 64
 for variable in "${!CODEX_@}"; do unset "${variable}"; done
 unset PYTHONHOME PYTHONPATH
@@ -12,6 +12,6 @@ import sys
 from pathlib import Path
 root = Path(sys.argv[1])
 sys.path.insert(0, str(root / "src"))
-sys.argv = [str(root / "bin" / "codex-master-mcp"), *sys.argv[2:]]
-runpy.run_module("codex_master.server", run_name="__main__", alter_sys=True)
+sys.argv = [str(root / "bin" / "codex-master-hive-hourly-probe"), *sys.argv[2:]]
+runpy.run_module("codex_master.hive.hourly_probe", run_name="__main__", alter_sys=True)
 ' "${runtime_root}" "$@"
