@@ -292,6 +292,142 @@ def test_bounded_runner_never_kills_a_reused_cgroup_generation(
     assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
 
 
+def test_bounded_runner_never_stops_a_reused_unit_after_a_valid_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late same-name replacement must survive the old cgroup cleanup."""
+
+    import codex_master.runtime_process as runtime_process
+
+    from codex_master.runtime_process import BoundedProcessError, run_bounded
+
+    unit = f"codex-master-runtime-late-swap-{secrets.token_hex(16)}.service"
+    foreign_ready = tmp_path / "foreign.ready"
+    foreign_hold = tmp_path / "foreign.hold"
+    foreign_pid = tmp_path / "foreign.pid"
+    foreign_cgroup = tmp_path / "foreign.cgroup"
+    os.mkfifo(foreign_ready, 0o600)
+    os.mkfifo(foreign_hold, 0o600)
+    foreign = (
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path({str(foreign_pid)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+        "cgroup = next(\n"
+        "    line.split('::', 1)[1].strip()\n"
+        "    for line in open('/proc/self/cgroup', encoding='utf-8')\n"
+        "    if line.startswith('0::')\n"
+        ")\n"
+        f"Path({str(foreign_cgroup)!r}).write_text(cgroup, encoding='utf-8')\n"
+        f"ready = os.open({str(foreign_ready)!r}, os.O_WRONLY)\n"
+        "os.write(ready, b'ready')\n"
+        "os.close(ready)\n"
+        f"os.read(os.open({str(foreign_hold)!r}, os.O_RDONLY), 1)\n"
+    )
+    child = _script(tmp_path / "old-generation.py", "import time\ntime.sleep(60)\n")
+    environment = runtime_process.minimal_environment(home=tmp_path)
+    real_bind = runtime_process._bind_cgroup
+    real_snapshot = runtime_process._unit_snapshot
+    real_systemctl = runtime_process._systemctl
+    bound: dict[str, object] = {}
+    armed = False
+    descriptors_before = len(list(Path("/proc/self/fd").iterdir()))
+
+    def bind_then_arm(
+        process: object, *, environment: dict[str, str], deadline: float
+    ) -> None:
+        nonlocal armed
+        real_bind(process, environment=environment, deadline=deadline)
+        assert process.cgroup is not None
+        assert process.invocation_id is not None
+        bound["snapshot"] = runtime_process._UnitSnapshot(
+            process.cgroup, process.invocation_id
+        )
+        bound["old_inode"] = os.fstat(process.cgroup_fd).st_ino
+        armed = True
+        raise BoundedProcessError("command_group_unavailable")
+
+    def snapshot_then_replace(
+        observed_unit: str, *, environment: dict[str, str], deadline: float
+    ) -> object:
+        nonlocal armed
+        snapshot = real_snapshot(
+            observed_unit, environment=environment, deadline=deadline
+        )
+        if observed_unit != unit or not armed:
+            return snapshot
+        assert snapshot in {
+            bound["snapshot"],
+            runtime_process._UnitSnapshot(None, None),
+        }
+        armed = False
+        with contextlib.suppress(BoundedProcessError):
+            real_systemctl(("stop", unit), environment=environment, deadline=deadline)
+        _wait_for_test_unit_resolved(
+            runtime_process,
+            unit,
+            environment=environment,
+            deadline=deadline,
+        )
+        started = subprocess.run(
+            [
+                "/usr/bin/systemd-run",
+                "--user",
+                "--no-block",
+                "--collect",
+                f"--unit={unit}",
+                "/usr/bin/python3",
+                "-c",
+                foreign,
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            timeout=deadline - time.monotonic(),
+        )
+        assert started.returncode == 0
+        assert _read_fifo_event(foreign_ready, deadline=deadline) == b"ready"
+        foreign_path = Path("/sys/fs/cgroup") / foreign_cgroup.read_text(
+            encoding="utf-8"
+        ).strip().lstrip("/")
+        bound["foreign_cgroup"] = foreign_path
+        bound["foreign_inode"] = foreign_path.stat().st_ino
+        return bound["snapshot"]
+
+    monkeypatch.setattr(runtime_process, "_bind_cgroup", bind_then_arm)
+    monkeypatch.setattr(runtime_process, "_unit_snapshot", snapshot_then_replace)
+    monkeypatch.setattr(runtime_process, "_unit_name", lambda: unit)
+
+    try:
+        with pytest.raises(BoundedProcessError):
+            run_bounded([str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=2)
+
+        assert foreign_pid.exists()
+        foreign_process = int(foreign_pid.read_text(encoding="utf-8"))
+        os.kill(foreign_process, 0)
+        assert bound["foreign_cgroup"] == bound["snapshot"].control_group
+        assert bound["old_inode"] != bound["foreign_inode"]
+        assert Path(bound["foreign_cgroup"]).exists()
+        assert (
+            real_systemctl(
+                ("show", "--value", "--property=LoadState", unit),
+                environment=environment,
+                deadline=time.monotonic() + 1,
+            ).strip()
+            != b"not-found"
+        )
+    finally:
+        _cleanup_exact_test_unit(
+            runtime_process,
+            unit,
+            environment=environment,
+            systemctl=real_systemctl,
+        )
+
+    assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
+
+
 def test_bounded_runner_manager_lifetime_ends_a_unit_after_runner_sigkill(
     tmp_path: Path, runtime_image
 ) -> None:
@@ -443,7 +579,6 @@ def test_bounded_runner_reports_a_bounded_manager_lifetime_when_cleanup_loses_au
     real_bind = runtime_process._bind_cgroup
     real_systemctl = runtime_process._systemctl
     bound: dict[str, object] = {}
-    calls: list[tuple[str, ...]] = []
     descriptor = os.open(live, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
 
     def bind_then_fail(
@@ -454,22 +589,10 @@ def test_bounded_runner_reports_a_bounded_manager_lifetime_when_cleanup_loses_au
         assert _read_fifo_event(ready, deadline=deadline) == b"ready"
         raise BoundedProcessError("command_group_unavailable")
 
-    def fail_only_the_bound_unit_stop(
-        arguments: tuple[str, ...],
-        *,
-        environment: dict[str, str],
-        deadline: float,
-    ) -> bytes:
-        calls.append(arguments)
-        if arguments == ("stop", unit):
-            raise BoundedProcessError("command_group_unavailable")
-        return real_systemctl(arguments, environment=environment, deadline=deadline)
-
     def fail_bound_cgroup_kill(*_args: object, **_kwargs: object) -> None:
         raise BoundedProcessError("command_group_unavailable")
 
     monkeypatch.setattr(runtime_process, "_bind_cgroup", bind_then_fail)
-    monkeypatch.setattr(runtime_process, "_systemctl", fail_only_the_bound_unit_stop)
     monkeypatch.setattr(runtime_process, "_kill_bound_cgroup", fail_bound_cgroup_kill)
     monkeypatch.setattr(runtime_process, "_unit_name", lambda: unit)
 
@@ -480,8 +603,7 @@ def test_bounded_runner_reports_a_bounded_manager_lifetime_when_cleanup_loses_au
                 run_bounded(
                     [str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=0.75
                 )
-            assert error.value.code == "command_cleanup_bounded", calls
-            assert ("stop", unit) in calls
+            assert error.value.code == "command_cleanup_bounded"
             assert (
                 _read_fifo_message(descriptor, selector, deadline=time.monotonic() + 1)
                 == b"live"
@@ -596,10 +718,10 @@ def test_bounded_runner_denies_a_user_manager_escape_from_the_runtime_unit(
         )
 
 
-def test_bounded_runner_terminates_its_bound_cgroup_when_systemctl_stop_fails(
+def test_bounded_runner_terminates_its_bound_cgroup_without_a_manager_stop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A stop error cannot let a known live target child survive runner return."""
+    """The FD-bound kill terminates a known child without a named manager stop."""
 
     import codex_master.runtime_process as runtime_process
 
@@ -632,6 +754,7 @@ def test_bounded_runner_terminates_its_bound_cgroup_when_systemctl_stop_fails(
     real_systemctl = runtime_process._systemctl
     unit = f"codex-master-runtime-stop-failure-{secrets.token_hex(16)}.service"
     bound: dict[str, object] = {}
+    calls: list[tuple[str, ...]] = []
 
     def bind_then_wait(
         process: object, *, environment: dict[str, str], deadline: float
@@ -641,26 +764,24 @@ def test_bounded_runner_terminates_its_bound_cgroup_when_systemctl_stop_fails(
         bound["cgroup"] = process.cgroup
         assert _read_fifo_event(ready, deadline=deadline) == b"ready"
 
-    def fail_only_the_bound_unit_stop(
+    def record_manager_call(
         arguments: tuple[str, ...],
         *,
         environment: dict[str, str],
         deadline: float,
     ) -> bytes:
-        if arguments == ("stop", bound.get("unit")):
-            assert child_pid.exists()
-            os.kill(int(child_pid.read_text(encoding="utf-8")), 0)
-            raise BoundedProcessError("command_group_unavailable")
+        calls.append(arguments)
         return real_systemctl(arguments, environment=environment, deadline=deadline)
 
     monkeypatch.setattr(runtime_process, "_bind_cgroup", bind_then_wait)
-    monkeypatch.setattr(runtime_process, "_systemctl", fail_only_the_bound_unit_stop)
+    monkeypatch.setattr(runtime_process, "_systemctl", record_manager_call)
     monkeypatch.setattr(runtime_process, "_unit_name", lambda: unit)
 
     try:
-        with pytest.raises(BoundedProcessError, match="command_group_unavailable"):
+        with pytest.raises(BoundedProcessError, match="command_timeout"):
             run_bounded([str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=0.5)
 
+        assert ("stop", unit) not in calls
         assert bound["cgroup"] is not None
         cgroup = Path(bound["cgroup"])
         assert cgroup == Path("/sys/fs/cgroup") / child_cgroup.read_text(

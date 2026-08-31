@@ -32,7 +32,6 @@ _ENV = "/usr/bin/env"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _RUNTIME_DIRECTORY_ROOT = Path("/run/user")
 _CLEANUP_SECONDS = 0.5
-_STOP_SECONDS = 0.2
 
 
 class BoundedProcessError(RuntimeError):
@@ -556,42 +555,16 @@ def _wait_for_unit_resolved(
         time.sleep(min(0.005, _remaining(deadline)))
 
 
-def _stop_bound_unit(
-    process: _SpawnedProcess, *, environment: dict[str, str], deadline: float
-) -> None:
-    snapshot = _unit_snapshot(process.unit, environment=environment, deadline=deadline)
-    if (
-        snapshot.control_group != process.cgroup
-        or snapshot.invocation_id != process.invocation_id
-    ):
-        return
-    _systemctl(("stop", process.unit), environment=environment, deadline=deadline)
-
-
 def _stop_cgroup(
     process: _SpawnedProcess, *, environment: dict[str, str], deadline: float
 ) -> None:
-    stop_error: BoundedProcessError | None = None
-    try:
-        _stop_bound_unit(
-            process,
-            environment=environment,
-            deadline=min(deadline, time.monotonic() + _STOP_SECONDS),
-        )
-    except BoundedProcessError as exc:
-        stop_error = exc
-    kill_error: BoundedProcessError | None = None
     try:
         _kill_bound_cgroup(process)
     except BoundedProcessError as exc:
-        kill_error = exc
-    if stop_error is not None and kill_error is not None:
-        raise BoundedProcessError("command_cleanup_bounded") from kill_error
+        raise BoundedProcessError("command_cleanup_bounded") from exc
     if not _wait_for_cgroup_empty(process, deadline):
         raise BoundedProcessError("command_cleanup_bounded")
     _wait_for_unit_resolved(process, environment=environment, deadline=deadline)
-    if stop_error is not None:
-        raise stop_error
 
 
 def _close_bound_cgroup(process: _SpawnedProcess) -> None:

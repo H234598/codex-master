@@ -15,7 +15,13 @@ import tempfile
 from typing import Any
 
 from codex_master.runtime_layout import LayoutError, RuntimeLayout
-from codex_master.runtime_process import BoundedProcessError, DEFAULT_STDERR_LIMIT, DEFAULT_STDOUT_LIMIT, run_bounded
+from codex_master.runtime_process import (
+    BoundedProcessError,
+    DEFAULT_STDERR_LIMIT,
+    DEFAULT_STDOUT_LIMIT,
+    run_bounded,
+)
+from codex_master.runtime_status import runtime_status
 
 
 DETERMINISTIC_PROBE_HOURS_UTC = (0, 3, 6, 9, 12, 15, 18, 21)
@@ -77,7 +83,10 @@ def _green_hive_runtime(value: object) -> bool:
         and type(checks) is dict
         and frozenset(checks) == {"authority", "repository", "state"}
         and all(_ready_state(checks.get(key)) for key in checks)
-        and all(_ready_state(value.get(key)) for key in ("authority", "repository", "principal", "state", "pilot"))
+        and all(
+            _ready_state(value.get(key))
+            for key in ("authority", "repository", "principal", "state", "pilot")
+        )
         and type(reasons) is list
         and not reasons
         and value.get("mutation_performed") is False
@@ -117,7 +126,8 @@ def evaluate(
     doctor = doctor if isinstance(doctor, Mapping) else {}
     doctor_checks = doctor.get("checks")
     doctor_ready = isinstance(doctor_checks, Mapping) and all(
-        _ready_state(doctor_checks.get(key)) for key in ("authority", "repository", "state")
+        _ready_state(doctor_checks.get(key))
+        for key in ("authority", "repository", "state")
     )
     checks = {
         "runtime_layout": _green_runtime_status(runtime_status),
@@ -135,7 +145,11 @@ def probe_spawn_gate(
     """Accept only one fresh, complete and green v2 result for Hive spawning."""
 
     if not isinstance(payload, Mapping) or frozenset(payload) != _PROBE_RECORD_KEYS:
-        return {"allowed": False, "reason_code": "probe_ambiguous", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_ambiguous",
+            "raw_output": "not_returned",
+        }
     checks = payload.get("checks")
     commands = payload.get("commands")
     if (
@@ -147,20 +161,41 @@ def probe_spawn_gate(
         or frozenset(commands) != _PROBE_COMMAND_KEYS
         or any(value is not True for value in commands.values())
     ):
-        return {"allowed": False, "reason_code": "probe_red", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_red",
+            "raw_output": "not_returned",
+        }
     checked_at = payload.get("checked_at")
     if not isinstance(checked_at, str) or not 1 <= len(checked_at) <= 40:
-        return {"allowed": False, "reason_code": "probe_invalid", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_invalid",
+            "raw_output": "not_returned",
+        }
     try:
         observed = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
         reference = now() if callable(now) else (now or datetime.now(UTC))
-        if observed.tzinfo is None or observed.utcoffset() is None or reference.tzinfo is None or reference.utcoffset() is None:
+        if (
+            observed.tzinfo is None
+            or observed.utcoffset() is None
+            or reference.tzinfo is None
+            or reference.utcoffset() is None
+        ):
             raise ValueError
         age = (reference.astimezone(UTC) - observed.astimezone(UTC)).total_seconds()
     except (TypeError, ValueError, OverflowError):
-        return {"allowed": False, "reason_code": "probe_invalid", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_invalid",
+            "raw_output": "not_returned",
+        }
     if age < 0 or age > MAX_PROBE_AGE_SECONDS:
-        return {"allowed": False, "reason_code": "probe_stale", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_stale",
+            "raw_output": "not_returned",
+        }
     return {"allowed": True, "reason_code": "probe_ready", "raw_output": "not_returned"}
 
 
@@ -231,9 +266,17 @@ def read_probe_gate(
     try:
         payload = _read_private_probe_state(state_file)
     except FileNotFoundError:
-        return {"allowed": False, "reason_code": "probe_missing", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_missing",
+            "raw_output": "not_returned",
+        }
     except (OSError, ValueError):
-        return {"allowed": False, "reason_code": "probe_invalid", "raw_output": "not_returned"}
+        return {
+            "allowed": False,
+            "reason_code": "probe_invalid",
+            "raw_output": "not_returned",
+        }
     return probe_spawn_gate(payload, now=now)
 
 
@@ -256,7 +299,11 @@ def _open_probe_gate_lock(state_file: Path, *, create: bool) -> int:
             raise ValueError("probe_gate_lock_invalid")
         if create:
             try:
-                descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                descriptor = os.open(
+                    lock_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
             except FileExistsError:
                 descriptor = -1
             else:
@@ -328,7 +375,11 @@ def probe_capacity_guard(
     try:
         capacity_lock.__enter__()
     except (OSError, ValueError):
-        yield {"allowed": False, "reason_code": "probe_invalid", "raw_output": "not_returned"}
+        yield {
+            "allowed": False,
+            "reason_code": "probe_invalid",
+            "raw_output": "not_returned",
+        }
         return
     try:
         yield read_probe_gate(state_file=state_file, now=now)
@@ -350,7 +401,9 @@ def _state_directory(path: Path) -> Path:
                 item = current.lstat()
             if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
                 raise ValueError("unsafe_probe_state_directory")
-            if current == path and (item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o700):
+            if current == path and (
+                item.st_uid != os.geteuid() or stat.S_IMODE(item.st_mode) != 0o700
+            ):
                 raise ValueError("unsafe_probe_state_directory")
     except (OSError, ValueError) as exc:
         raise ValueError("unsafe_probe_state_directory") from exc
@@ -375,12 +428,19 @@ def _atomic_write(path: Path, payload: Mapping[str, object]) -> None:
     ):
         raise ValueError("probe_state_write_failed")
     try:
-        encoded = (json.dumps(dict(payload), ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        encoded = (
+            json.dumps(
+                dict(payload), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        ).encode("utf-8")
     except (TypeError, ValueError, RecursionError) as exc:
         raise ValueError("probe_state_encode_failed") from exc
     if len(encoded) > MAX_PROBE_STATE_BYTES:
         raise ValueError("probe_state_oversize")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
@@ -390,7 +450,9 @@ def _atomic_write(path: Path, payload: Mapping[str, object]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        directory_descriptor = os.open(
+            path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
         try:
             os.fsync(directory_descriptor)
         finally:
@@ -423,6 +485,13 @@ def _run_json(
         return {}, False
 
 
+def _runtime_status_json(layout: RuntimeLayout) -> tuple[dict[str, Any], bool]:
+    """Run the one bounded MCP status check outside a bus-isolated child."""
+
+    value = runtime_status(layout=layout)
+    return (value, value.get("ok") is True)
+
+
 def run_probe(
     *,
     layout: RuntimeLayout | None = None,
@@ -433,16 +502,16 @@ def run_probe(
     """Run direct v2 checks and atomically publish exactly one v2 record."""
 
     try:
-        active_layout = RuntimeLayout.from_module_path(Path(__file__)) if layout is None else layout
+        active_layout = (
+            RuntimeLayout.from_module_path(Path(__file__)) if layout is None else layout
+        )
     except LayoutError as exc:
         raise ValueError("probe_runtime_layout_unavailable") from exc
     if not isinstance(active_layout, RuntimeLayout):
         raise ValueError("probe_runtime_layout_unavailable")
     state_directory = _state_directory(state_directory or _probe_state_root())
+    runtime, runtime_command = _runtime_status_json(active_layout)
     if runner is None:
-        runtime, runtime_command = _run_json(
-            active_layout, active_layout.mcp_entrypoint, "hive", "runtime-status"
-        )
         hive, hive_command = _run_json(
             active_layout, active_layout.mcp_entrypoint, "hive", "status"
         )
@@ -450,14 +519,15 @@ def run_probe(
             active_layout, active_layout.mcp_entrypoint, "hive", "doctor"
         )
     else:
-        runtime, runtime_command = runner(
-            active_layout.mcp_entrypoint, "hive", "runtime-status"
-        )
         hive, hive_command = runner(active_layout.mcp_entrypoint, "hive", "status")
         doctor, doctor_command = runner(active_layout.mcp_entrypoint, "hive", "doctor")
     result = evaluate(runtime, hive, doctor)
     moment = (now or (lambda: datetime.now(UTC)))()
-    if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
+    if (
+        not isinstance(moment, datetime)
+        or moment.tzinfo is None
+        or moment.utcoffset() is None
+    ):
         raise ValueError("probe_clock_invalid")
     result.update(
         {

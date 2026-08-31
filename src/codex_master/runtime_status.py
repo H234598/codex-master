@@ -45,12 +45,12 @@ def _probe_payload() -> bytes:
     )
 
 
-def _run_direct_mcp(layout: RuntimeLayout) -> tuple[int, str]:
+def _run_direct_mcp(*, layout: RuntimeLayout, home: Path) -> tuple[int, str]:
     try:
         result = run_bounded(
             [str(layout.mcp_entrypoint)],
             cwd=layout.root,
-            home=Path.home(),
+            home=home,
             timeout_seconds=_MCP_TIMEOUT_SECONDS,
             stdout_limit=_MAX_MCP_OUTPUT_BYTES,
             stderr_limit=DEFAULT_STDERR_LIMIT,
@@ -184,7 +184,9 @@ def _blocked_surface(reason_code: str) -> dict[str, object]:
     }
 
 
-def runtime_status(*, layout: RuntimeLayout | None = None) -> dict[str, object]:
+def runtime_status(
+    *, layout: RuntimeLayout | None = None, home: Path | None = None
+) -> dict[str, object]:
     """Check only the image metadata and its direct MCP initialize/tools surface."""
 
     try:
@@ -200,7 +202,9 @@ def runtime_status(*, layout: RuntimeLayout | None = None) -> dict[str, object]:
             "raw_output": "not_returned",
         }
     try:
-        returncode, output = _run_direct_mcp(active_layout)
+        returncode, output = _run_direct_mcp(
+            layout=active_layout, home=Path.home() if home is None else home
+        )
     except TimeoutError:
         surface = _blocked_surface("mcp_timeout")
     except RuntimeError:

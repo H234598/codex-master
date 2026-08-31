@@ -255,7 +255,9 @@ def test_atomic_write_never_unlinks_a_foreign_temp_swapped_before_replace_failur
         foreign_temporary = source
         raise OSError(errno.EIO, "controlled replace failure")
 
-    monkeypatch.setattr(hourly_probe_module.os, "replace", fail_after_swapping_temporary)
+    monkeypatch.setattr(
+        hourly_probe_module.os, "replace", fail_after_swapping_temporary
+    )
 
     with pytest.raises(ValueError, match="probe_state_write_failed"):
         hourly_probe_module._atomic_write(state_file, green_probe(NOW.isoformat()))
@@ -265,12 +267,14 @@ def test_atomic_write_never_unlinks_a_foreign_temp_swapped_before_replace_failur
     assert foreign_temporary.read_bytes() == foreign_contents
 
 
-def test_run_probe_persists_only_one_schema_v2_health_record(tmp_path: Path) -> None:
+def test_run_probe_persists_only_one_schema_v2_health_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     state_directory = tmp_path / "state"
     layout = runtime_layout(tmp_path)
     calls: list[tuple[str, ...]] = []
+    direct_status = green_runtime_status()
     green = {
-        "hive runtime-status": (green_runtime_status(), True),
         "hive status": (
             green_hive_runtime(),
             True,
@@ -292,6 +296,10 @@ def test_run_probe_persists_only_one_schema_v2_health_record(tmp_path: Path) -> 
         calls.append(arguments)
         return green[" ".join(arguments)]
 
+    monkeypatch.setattr(
+        hourly_probe_module, "runtime_status", lambda *, layout: direct_status
+    )
+
     result = run_probe(
         layout=layout,
         state_directory=state_directory,
@@ -300,7 +308,7 @@ def test_run_probe_persists_only_one_schema_v2_health_record(tmp_path: Path) -> 
     )
     assert set(result) == {"schema_version", "checked_at", "checks", "commands"}
     assert result["schema_version"] == 2
-    assert calls == [("hive", "runtime-status"), ("hive", "status"), ("hive", "doctor")]
+    assert calls == [("hive", "status"), ("hive", "doctor")]
     assert (
         read_probe_gate(
             state_file=state_directory / "hive-hourly-health.json", now=NOW
@@ -310,10 +318,9 @@ def test_run_probe_persists_only_one_schema_v2_health_record(tmp_path: Path) -> 
     assert not (state_directory / "hive-hourly-alarm.json").exists()
 
     def red_runner(_command: Path, *arguments: str) -> tuple[dict[str, object], bool]:
-        if arguments == ("hive", "runtime-status"):
-            return {"ok": False}, True
         return green[" ".join(arguments)]
 
+    direct_status = {"ok": False}
     result = run_probe(
         layout=layout,
         state_directory=state_directory,
@@ -322,6 +329,50 @@ def test_run_probe_persists_only_one_schema_v2_health_record(tmp_path: Path) -> 
     )
     assert set(result) == {"schema_version", "checked_at", "checks", "commands"}
     assert not (state_directory / "hive-hourly-alarm.json").exists()
+
+
+def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = runtime_layout(tmp_path)
+    status_layouts: list[RuntimeLayout] = []
+    bounded_commands: list[tuple[str, ...]] = []
+
+    def direct_status(*, layout: RuntimeLayout) -> dict[str, object]:
+        status_layouts.append(layout)
+        return green_runtime_status()
+
+    def bounded(
+        _layout: RuntimeLayout, _command: Path, *arguments: str
+    ) -> tuple[dict[str, object], bool]:
+        bounded_commands.append(arguments)
+        if arguments == ("hive", "status"):
+            return green_hive_runtime(), True
+        assert arguments == ("hive", "doctor")
+        return (
+            {
+                "healthy": True,
+                "checks": {
+                    "authority": "ready",
+                    "repository": "ready",
+                    "state": "ready",
+                },
+            },
+            True,
+        )
+
+    monkeypatch.setattr(hourly_probe_module, "runtime_status", direct_status)
+    monkeypatch.setattr(hourly_probe_module, "_run_json", bounded)
+
+    result = run_probe(
+        layout=layout,
+        state_directory=tmp_path / "state",
+        now=lambda: NOW,
+    )
+
+    assert status_layouts == [layout]
+    assert bounded_commands == [("hive", "status"), ("hive", "doctor")]
+    assert result["commands"]["runtime_status"] is True
 
 
 def test_hourly_probe_unit_runs_only_the_runtime_image_entrypoint() -> None:
@@ -506,6 +557,39 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         is True
     )
     assert not list(runtime_root.rglob("__pycache__"))
+
+
+def test_hourly_probe_from_a_complete_image_checks_runtime_status_without_recursion(
+    tmp_path: Path, runtime_image
+) -> None:
+    """The image's real probe must keep runtime-status outside a second runner."""
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    environment = {
+        "HOME": str(home),
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+    }
+
+    completed = subprocess.run(
+        [runtime_image.root / "bin" / "codex-master-hive-hourly-probe", "--json"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env=environment,
+        timeout=10,
+    )
+
+    assert completed.returncode in {0, 1}, completed.stderr
+    assert json.loads(completed.stdout)["checks"]["runtime_layout"] is True
+    state = json.loads(
+        (
+            home / ".local" / "state" / "codex-master-mcp" / "hive-hourly-health.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert state["commands"]["runtime_status"] is True
 
 
 def test_installer_source_reader_is_no_follow_descriptor_bounded(
@@ -754,6 +838,7 @@ def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
     stage.mkdir(mode=0o700)
     installer["_build_runtime_image"](repository=ROOT, stage=stage)
     observed: list[tuple[str, ...]] = []
+    status_calls: list[tuple[RuntimeLayout, Path]] = []
 
     class Completed:
         def __init__(self, returncode: int, stdout: str) -> None:
@@ -762,23 +847,26 @@ def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
 
     def run(command: list[str], **_kwargs: object) -> Completed:
         observed.append(tuple(command))
-        diagnostic = command[-1]
-        payload: dict[str, object] = {"status": "ready"}
-        if diagnostic == "runtime-status":
-            payload = {"ok": True}
-        return Completed(0, json.dumps(payload))
+        return Completed(0, json.dumps({"status": "ready"}))
+
+    def status(*, layout: RuntimeLayout, home: Path) -> dict[str, object]:
+        status_calls.append((layout, home))
+        return {"ok": True}
 
     monkeypatch.setitem(
         installer["_validate_runtime_image_stage"].__globals__, "run_bounded", run
+    )
+    monkeypatch.setitem(
+        installer["_validate_runtime_image_stage"].__globals__, "runtime_status", status
     )
     installer["_validate_runtime_image_stage"](stage=stage, home=tmp_path / "home")
 
     entrypoint = str(stage / "bin" / "codex-master-mcp")
     assert observed == [
-        (entrypoint, "hive", "runtime-status"),
         (entrypoint, "hive", "status"),
         (entrypoint, "hive", "doctor"),
     ]
+    assert status_calls == [(RuntimeLayout.from_runtime_root(stage), tmp_path / "home")]
 
 
 def test_runtime_image_publish_failure_leaves_the_previous_complete_image_untouched(
@@ -853,7 +941,7 @@ def test_runtime_image_build_failure_never_publishes_a_partial_stage(
 
 
 def test_probe_capacity_guard_serializes_the_health_record_publication(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_directory = tmp_path / "state"
     layout = runtime_layout(tmp_path)
@@ -875,6 +963,10 @@ def test_probe_capacity_guard_serializes_the_health_record_publication(
 
     def green_runner(_command: Path, *arguments: str) -> tuple[dict[str, object], bool]:
         return healthy[" ".join(arguments)]
+
+    monkeypatch.setattr(
+        hourly_probe_module, "runtime_status", lambda *, layout: green_runtime_status()
+    )
 
     run_probe(
         layout=layout,
@@ -911,7 +1003,7 @@ def test_probe_capacity_guard_serializes_the_health_record_publication(
 
 @pytest.mark.parametrize("error_type", (OSError, ValueError))
 def test_probe_capacity_guard_preserves_body_exceptions(
-    tmp_path: Path, error_type: type[Exception]
+    tmp_path: Path, error_type: type[Exception], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_directory = tmp_path / "state"
     layout = runtime_layout(tmp_path)
@@ -930,6 +1022,9 @@ def test_probe_capacity_guard_preserves_body_exceptions(
             True,
         ),
     }
+    monkeypatch.setattr(
+        hourly_probe_module, "runtime_status", lambda *, layout: green_runtime_status()
+    )
     run_probe(
         layout=layout,
         state_directory=state_directory,

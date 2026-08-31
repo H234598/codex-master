@@ -27,6 +27,7 @@ from codex_master.runtime_process import (  # noqa: E402
     run_bounded,
 )
 from codex_master.runtime_layout import RuntimeLayout  # noqa: E402
+from codex_master.runtime_status import runtime_status  # noqa: E402
 
 
 _RUNTIME_ROOT_NAME = "codex-master-runtime"
@@ -327,7 +328,10 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
         layout = RuntimeLayout.from_runtime_root(stage)
     except ValueError as exc:
         raise InstallError("install_stage_validation_failed") from exc
-    for hive_command in ("runtime-status", "status", "doctor"):
+    status = runtime_status(layout=layout, home=home)
+    if status.get("ok") is not True:
+        raise InstallError("install_stage_validation_failed")
+    for hive_command in ("status", "doctor"):
         try:
             completed = run_bounded(
                 [os.fspath(command), "hive", hive_command],
@@ -347,8 +351,6 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
         except (json.JSONDecodeError, RecursionError) as exc:
             raise InstallError("install_stage_validation_failed") from exc
         if not isinstance(payload, dict):
-            raise InstallError("install_stage_validation_failed")
-        if hive_command == "runtime-status" and payload.get("ok") is not True:
             raise InstallError("install_stage_validation_failed")
 
 
