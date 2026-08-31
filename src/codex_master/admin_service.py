@@ -66,6 +66,7 @@ from .fleet_service import (
 )
 from .ollama_registry import OllamaInstanceV1, OllamaModelV1
 from .ollama_runtime import OllamaReadinessStatus
+from .admin_contracts import OperationV1
 
 
 QUERY_SCOPES = MappingProxyType(
@@ -199,6 +200,16 @@ class OllamaFleetPort(Protocol):
     def probe_ollama_instance(
         self, instance_ref: str, *, expected_generation: int
     ) -> OllamaReadinessStatus: ...
+
+
+class HostProbePort(Protocol):
+    def probe(
+        self,
+        host_ref: str,
+        *,
+        expected_generation: int,
+        idempotency_key: str,
+    ) -> OperationV1: ...
 
 
 class SecretIngressPort(Protocol):
@@ -356,6 +367,7 @@ class MasterjetControlService:
         secret_ingress: SecretIngressPort | None,
         account_registry: AccountRegistryPort | None = None,
         ollama_fleet: OllamaFleetPort | None = None,
+        host_probe: HostProbePort | None = None,
     ) -> None:
         self._operation_store = operation_store
         self._openai_accounts = openai_accounts
@@ -369,6 +381,7 @@ class MasterjetControlService:
         self._secret_ingress = secret_ingress
         self._account_registry = account_registry
         self._ollama_fleet = ollama_fleet
+        self._host_probe = host_probe
         self._ollama_plan_digests: dict[str, str] = {}
 
     @classmethod
@@ -720,6 +733,15 @@ class MasterjetControlService:
             elif domain == "ollama":
                 owner = _required(self._ollama_fleet)
                 current = owner.ollama_generation()
+            elif domain == "host":
+                host_ref = cast(str, request.arguments["host_ref"])
+                host = next(
+                    (item for item in self._host_registry.list() if item.ref == host_ref),
+                    None,
+                )
+                if host is None:
+                    raise _service_error("control.host_not_found")
+                current = host.generation
             else:
                 current = self._google_manager.inventory_generation()
         except AdminServiceError:
@@ -779,6 +801,19 @@ class MasterjetControlService:
 
     def _hosts_list(self, *_values: object) -> dict[str, object]:
         return {"hosts": [_serialize_host(item) for item in self._host_registry.list()]}
+
+    def _hosts_probe(
+        self,
+        _principal: AdminPrincipalV1,
+        request: AdminRequestV1,
+        *_values: object,
+    ) -> dict[str, object]:
+        operation = _required(self._host_probe).probe(
+            cast(str, request.arguments["host_ref"]),
+            expected_generation=_generation(request),
+            idempotency_key=_idempotency(request),
+        )
+        return public_admin_result(operation)
 
     def _openai_accounts_list(self, *_values: object) -> dict[str, object]:
         owner = _required(self._openai_accounts)
@@ -1354,6 +1389,7 @@ _QUERY_HANDLERS: Mapping[str, Handler] = MappingProxyType(
 )
 _COMMAND_HANDLERS: Mapping[str, Handler] = MappingProxyType(
     {
+        "hosts.probe": MasterjetControlService._hosts_probe,
         "openai.accounts.add": MasterjetControlService._account_add,
         "openai.accounts.disable": MasterjetControlService._account_disable,
         "google.accounts.add": MasterjetControlService._account_add,

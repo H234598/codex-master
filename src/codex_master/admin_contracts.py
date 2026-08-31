@@ -36,6 +36,13 @@ ADMIN_OPERATION_METADATA = MappingProxyType(
     {
         "control.operations.list": AdminOperationMetadataV1(None, False, ()),
         "hosts.list": AdminOperationMetadataV1("fleet.host.read", False, ()),
+        "hosts.probe": AdminOperationMetadataV1(
+            "fleet.host.probe",
+            True,
+            ("host_ref",),
+            requires_idempotency=True,
+            generation_domain="host",
+        ),
         "openai.accounts.list": AdminOperationMetadataV1("fleet.read", False, ()),
         "google.accounts.list": AdminOperationMetadataV1("fleet.read", False, ()),
         "google.projects.list": AdminOperationMetadataV1(

@@ -30,6 +30,7 @@ from .admin_daemon import (
 from .admin_hosts import AgentBindingV1, HostRegistry, HostRegistryError
 from .admin_http import AdminHttpServer
 from .admin_operations import AdminOperationStore
+from .agent_operations import AgentOperationStore
 from .admin_secret_ingress import AdminSecretIngressOwner
 from .admin_service import MasterjetControlService, OpenAIAccountSummaryV1
 from .admin_socket import AdminSocketServer, UnixPeerCredentials
@@ -74,6 +75,7 @@ from .ollama_host_transport import (
     OllamaHostLease,
     OllamaHostTransport,
 )
+from .host_probe import HostProbeRouter, LocalHostProbeAdapter, RemoteHostProbeAdapter
 from .ollama_registry import OllamaRegistryStore
 
 
@@ -2395,6 +2397,16 @@ def assemble_admin_runtime() -> AdminRuntime:
             secret_ingress=ingress,
             account_registry=registry,
             ollama_fleet=ollama_fleet,
+            host_probe=HostProbeRouter(
+                local_host_ref=CONTROL_HOST_REF,
+                local=LocalHostProbeAdapter(
+                    operation_store=operation_store, host_registry=host_registry
+                ),
+                remote=RemoteHostProbeAdapter(
+                    operation_store=operation_store,
+                    agent_operations=AgentOperationStore(state_root),
+                ),
+            ),
         )
 
         bearer = (

@@ -34320,6 +34320,12 @@ _MASTERJET_ADMIN_TOOL_SPECS = (
         None,
     ),
     (
+        "fleet_host_probe",
+        "hosts.probe",
+        "Queue or run one bounded active host probe.",
+        None,
+    ),
+    (
         "fleet_ollama_models",
         "ollama.models.list",
         "List redacted Ollama model catalog entries.",
@@ -34377,6 +34383,7 @@ _MASTERJET_ADMIN_CLI_COMMANDS = MappingProxyType(
         ("google", "billing-plan"): ("google.billing.plan", None),
         ("google", "billing-apply"): ("google.billing.apply", None),
         ("operation", "status"): ("operations.get", None),
+        ("host", "probe"): ("hosts.probe", None),
         ("ollama", "models"): ("ollama.models.list", None),
         ("ollama", "instances"): ("ollama.instances.list", None),
         ("ollama", "instance-plan"): ("ollama.instance.plan", None),
@@ -34416,7 +34423,13 @@ def _add_masterjet_admin_cli_command(
         optional = tuple(
             dict.fromkeys((*optional, *alternate_required, *alternate_optional))
         )
+    positional_host_ref = operation == "hosts.probe"
+    if positional_host_ref:
+        parser.add_argument("host_ref")
+        parser.add_argument("--json", action="store_true")
     for field in (*required, *optional):
+        if positional_host_ref and field == "host_ref":
+            continue
         options: dict[str, object] = {
             "type": int
             if field == "expected_generation"
@@ -37811,6 +37824,17 @@ def _main_cli_impl(argv: list[str]) -> int:
         if namespace == "operation":
             _add_masterjet_admin_cli_command(
                 operation_sub, command, operation, alternate_operation
+            )
+
+    p_fleet_host = fleet_sub.add_parser("host")
+    host_sub = p_fleet_host.add_subparsers(dest="fleet_host_command", required=True)
+    for (namespace, command), (
+        operation,
+        alternate_operation,
+    ) in _MASTERJET_ADMIN_CLI_COMMANDS.items():
+        if namespace == "host":
+            _add_masterjet_admin_cli_command(
+                host_sub, command, operation, alternate_operation
             )
 
     p_fleet_account = fleet_sub.add_parser("account")

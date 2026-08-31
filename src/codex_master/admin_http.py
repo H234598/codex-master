@@ -59,6 +59,10 @@ _OLLAMA_PROBE_ROUTE = re.compile(
     r"/admin/v1/ollama/instances/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})/probe\Z",
     re.ASCII,
 )
+_HOST_PROBE_ROUTE = re.compile(
+    r"/admin/v1/hosts/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})/probe\Z",
+    re.ASCII,
+)
 _REST_SEGMENT = r"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})"
 _REST_DIGEST = r"(sha256:[0-9a-f]{64})"
 _REST_GET_ROUTES = {
@@ -200,6 +204,7 @@ class _AdminHandler(BaseHTTPRequestHandler):
         route_arguments: dict[str, str] = {}
         apply_match = _OLLAMA_APPLY_ROUTE.fullmatch(self.path)
         probe_match = _OLLAMA_PROBE_ROUTE.fullmatch(self.path)
+        host_probe_match = _HOST_PROBE_ROUTE.fullmatch(self.path)
         if self.path == "/admin/v1":
             pass
         elif self.path == _OLLAMA_PLAN_ROUTE:
@@ -210,6 +215,9 @@ class _AdminHandler(BaseHTTPRequestHandler):
         elif probe_match is not None:
             expected_operation = "ollama.instance.probe"
             route_arguments = {"instance_ref": probe_match.group(1)}
+        elif host_probe_match is not None:
+            expected_operation = "hosts.probe"
+            route_arguments = {"host_ref": host_probe_match.group(1)}
         else:
             route = _post_route(self.path)
             if route is None:
@@ -250,7 +258,10 @@ class _AdminHandler(BaseHTTPRequestHandler):
             self._reply_problem(400, "control.request_invalid")
             return
         try:
-            principal, _verified = self._authorize_step_up(principal, request)
+            principal, verified = self._authorize_step_up(principal, request)
+            if request.operation == "hosts.probe" and not verified:
+                self._reply_problem(403, "control.step_up_required")
+                return
             result = self.server.service.handle(principal, request)
         except AdminAuthError as error:
             self._reply_auth_error(error)

@@ -107,6 +107,15 @@ def test_operation_metadata_is_immutable_and_owns_scope_and_fields() -> None:
         ADMIN_OPERATION_METADATA["google.provision.apply"] = metadata  # type: ignore[index]
 
 
+def test_host_probe_uses_separate_scope_and_remote_step_up() -> None:
+    metadata = ADMIN_OPERATION_METADATA["hosts.probe"]
+
+    assert metadata.scope == "fleet.host.probe"
+    assert metadata.command is True
+    assert metadata.argument_fields == ("host_ref",)
+    assert metadata.requires_idempotency is True
+
+
 def test_ollama_instance_plan_preserves_typed_cpu_and_model_arguments() -> None:
     arguments = {
         "ref": "quiet-runner",
