@@ -712,10 +712,12 @@ class FleetService:
             ).encode("utf-8")
         ).hexdigest()
 
-    def _prepare_remote_completion(self, receipt: AgentReceiptV1) -> None:
+    def _prepare_remote_completion(self, receipt: AgentReceiptV1) -> str:
         digest = self._completion_saga_digest(receipt)
+        phase: str | None = None
 
         def prepare(document: dict[str, object]) -> None:
+            nonlocal phase
             record = cast(dict[str, object], document["operations"]).get(
                 receipt.operation_id
             )
@@ -725,6 +727,7 @@ class FleetService:
             expected = {"state": receipt.state, "receipt_digest": digest}
             if completion is None:
                 record["completion"] = {**expected, "phase": "prepared"}
+                phase = "prepared"
                 return
             if (
                 not isinstance(completion, Mapping)
@@ -734,8 +737,12 @@ class FleetService:
                 not in {"prepared", "owner_applied", "queue_completed"}
             ):
                 raise FleetConflictError("resource.host_response_invalid")
+            phase = cast(str, completion["phase"])
 
         self._mutate_remote_document(prepare)
+        if phase is None:  # Defensive: _mutate_remote_document always invokes prepare.
+            raise FleetConflictError("resource.host_response_invalid")
+        return phase
 
     def _mark_remote_owner_applied(
         self,
@@ -1584,7 +1591,7 @@ class FleetService:
             # The receipt is the durable saga's idempotency key.  Persist it
             # before a registry/lane side effect, then let redelivery resume
             # the exact phase after a process interruption.
-            self._prepare_remote_completion(receipt)
+            completion_phase = self._prepare_remote_completion(receipt)
             instance_ref: str | None = None
             readiness: OllamaReadinessStatus | None = None
             if receipt.state != "succeeded":
@@ -1596,7 +1603,12 @@ class FleetService:
                     receipt, instance_ref=None, readiness=None
                 )
             elif action == "apply":
-                instance_ref = self._accept_remote_apply(plan, receipt)
+                instance_ref = self._accept_remote_apply(
+                    plan,
+                    receipt,
+                    owner_already_applied=completion_phase
+                    in {"owner_applied", "queue_completed"},
+                )
                 self._mark_remote_owner_applied(
                     receipt, instance_ref=instance_ref, readiness=None
                 )
@@ -1619,7 +1631,11 @@ class FleetService:
             return completed
 
     def _accept_remote_apply(
-        self, plan: _RemoteOllamaPlanV1, receipt: AgentReceiptV1
+        self,
+        plan: _RemoteOllamaPlanV1,
+        receipt: AgentReceiptV1,
+        *,
+        owner_already_applied: bool,
     ) -> str:
         payload = receipt.result.payload
         if (
@@ -1637,6 +1653,15 @@ class FleetService:
         existing = next(
             (item for item in current.instances if item.ref == running.ref), None
         )
+        if owner_already_applied:
+            # This phase is receipt-digest bound by _prepare_remote_completion.
+            # A later, unrelated registry CAS must not replay an apply that this
+            # owner has already committed; only this instance's exact post-state
+            # is sufficient to resume queue completion.
+            if existing != running:
+                raise FleetConflictError("control.plan_stale")
+            self._ollama_remote_applied[running.ref] = plan
+            return running.ref
         if current.generation == plan.registry_generation:
             pass
         elif current.generation == plan.registry_generation + 1 and existing == running:

@@ -2834,3 +2834,237 @@ def _ollama_receipt(lease, state: str, result):
         result,
         lease.envelope_digest,
     )
+
+
+def _remote_apply_receipt_before_queue_completion(tmp_path: Path):
+    """Build a genuinely leased remote apply whose receipt has not completed."""
+
+    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
+    from codex_master.agent_contracts import AgentPollV1, AgentResultV1
+    from codex_master.agent_operations import AgentOperationStore, AgentPrincipalV1
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.ollama_host_transport import (
+        AgentQueueRemoteOllamaOperationPort,
+        HostRegistryOllamaLeaseSource,
+        OllamaHostTransport,
+    )
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    hosts = HostRegistry.for_test(tmp_path / "hosts")
+    hosts.provision_agent_binding(
+        {
+            "ref": "worker-west",
+            "label": "Worker West",
+            "role": "execution",
+            "capabilities": ["ollama.execute", "resource.probe"],
+        },
+        AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
+        expected_generation=0,
+    )
+    store = AgentOperationStore.for_test(tmp_path / "operations")
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    registry.replace(
+        models=(_ollama_model("model-a", "provider-a"),),
+        instances=(),
+        expected_generation=0,
+    )
+    transport = OllamaHostTransport(
+        registry=registry,
+        leases=HostRegistryOllamaLeaseSource(hosts),
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=store, host_registry=hosts
+        ),
+    )
+    paths = FleetPaths.from_state_root(tmp_path / "owner")
+
+    def new_service() -> FleetService:
+        return FleetService(
+            paths,
+            build_fleet_private_io(paths),
+            pool_root=tmp_path / "pool",
+            ollama_registry=registry,
+            ollama_transport=transport,
+            agent_operations=store,
+        )
+
+    principal = AgentPrincipalV1("worker-west", hosts.document_generation())
+    poll = AgentPollV1(
+        hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
+    )
+    service = new_service()
+    planned = replace(
+        _ollama_instance("remote-west"),
+        host_ref="worker-west",
+        selected_model_refs=("model-a",),
+    )
+    plan = service.plan_ollama_instance(planned, expected_generation=1)
+    plan_lease = store.poll(principal, poll)
+    assert service.accept_agent_result(
+        principal,
+        _ollama_receipt(
+            plan_lease,
+            "succeeded",
+            AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"}),
+        ),
+    ).state == "succeeded"
+    apply = service.apply_ollama_instance(plan.id, expected_generation=1)
+    apply_lease = store.poll(principal, poll)
+    receipt = _ollama_receipt(
+        apply_lease,
+        "succeeded",
+        AgentResultV1(
+            "ollama.instance",
+            "apply",
+            {"instance_ref": "remote-west", "generation": 1},
+        ),
+    )
+    running = replace(
+        planned, lifecycle_state="running", readiness_state="unknown"
+    )
+    return service, new_service, store, registry, principal, apply, receipt, running
+
+
+def test_remote_apply_receipt_recovers_after_unrelated_registry_generation_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An owner-applied receipt resumes without replaying its apply CAS."""
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    original_complete = store.complete
+
+    def crash_after_owner(*_args, **_kwargs):
+        current = registry.load()
+        assert current.generation == 2
+        assert current.instances == (running,)
+        operation = service._remote_document()["operations"][apply.id]
+        assert operation["completion"]["phase"] == "owner_applied"
+        raise RuntimeError("injected_after_owner_before_queue_completion")
+
+    monkeypatch.setattr(store, "complete", crash_after_owner)
+    with pytest.raises(
+        RuntimeError, match="injected_after_owner_before_queue_completion"
+    ):
+        service.accept_agent_result(principal, receipt)
+    monkeypatch.setattr(store, "complete", original_complete)
+    assert store.get(apply.id).state == "leased"
+
+    unrelated = replace(
+        _ollama_instance("remote-east"),
+        host_ref="worker-east",
+        selected_model_refs=("model-a",),
+    )
+    after_apply = registry.load()
+    expected = registry.replace(
+        models=after_apply.models,
+        instances=after_apply.instances + (unrelated,),
+        expected_generation=after_apply.generation,
+    )
+    assert expected.generation == 3
+
+    completed = new_service().accept_agent_result(principal, receipt)
+
+    assert completed.state == "succeeded"
+    assert store.get(apply.id).state == "succeeded"
+    assert registry.load() == expected
+
+
+def test_remote_apply_receipt_recovery_refuses_changed_applied_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner-applied recovery cannot bless a different post-state as success."""
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    original_complete = store.complete
+
+    def crash_after_owner(*_args, **_kwargs):
+        raise RuntimeError("injected_after_owner_before_queue_completion")
+
+    monkeypatch.setattr(store, "complete", crash_after_owner)
+    with pytest.raises(
+        RuntimeError, match="injected_after_owner_before_queue_completion"
+    ):
+        service.accept_agent_result(principal, receipt)
+    monkeypatch.setattr(store, "complete", original_complete)
+    after_apply = registry.load()
+    assert after_apply.instances == (running,)
+    conflicting = replace(
+        running, lifecycle_state="failed", readiness_state="not_ready"
+    )
+    drifted = registry.replace(
+        models=after_apply.models,
+        instances=(conflicting,),
+        expected_generation=after_apply.generation,
+    )
+
+    with pytest.raises(FleetConflictError, match="control.plan_stale"):
+        new_service().accept_agent_result(principal, receipt)
+
+    assert store.get(apply.id).state == "leased"
+    assert registry.load() == drifted
+
+
+def test_remote_apply_prepared_phase_does_not_trust_generation_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prepared receipt still needs the narrow original apply-CAS evidence."""
+
+    from codex_master.fleet_service import FleetService
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    original_mark = FleetService._mark_remote_owner_applied
+
+    def crash_before_owner(*_args, **_kwargs):
+        raise RuntimeError("injected_after_apply_before_owner_phase")
+
+    monkeypatch.setattr(FleetService, "_mark_remote_owner_applied", crash_before_owner)
+    with pytest.raises(RuntimeError, match="injected_after_apply_before_owner_phase"):
+        service.accept_agent_result(principal, receipt)
+    monkeypatch.setattr(FleetService, "_mark_remote_owner_applied", original_mark)
+    operation = service._remote_document()["operations"][apply.id]
+    assert operation["completion"]["phase"] == "prepared"
+    after_apply = registry.load()
+    assert after_apply.instances == (running,)
+    unrelated = replace(
+        _ollama_instance("remote-east"),
+        host_ref="worker-east",
+        selected_model_refs=("model-a",),
+    )
+    drifted = registry.replace(
+        models=after_apply.models,
+        instances=after_apply.instances + (unrelated,),
+        expected_generation=after_apply.generation,
+    )
+
+    with pytest.raises(FleetConflictError, match="control.plan_stale"):
+        new_service().accept_agent_result(principal, receipt)
+
+    assert store.get(apply.id).state == "leased"
+    assert registry.load() == drifted
