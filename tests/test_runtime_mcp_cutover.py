@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import stat as stat_module
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -1054,7 +1055,7 @@ def test_canonical_codex_cli_binds_the_native_payload_from_the_attested_wrapper(
             return_value=(package, target),
         ),
         patch.object(
-            server, "trusted_runner_executable", return_value=native
+            server, "_attested_native_codex_payload_path", return_value=native
         ) as validate,
         patch.object(
             server.shutil,
@@ -1079,11 +1080,10 @@ def test_canonical_codex_cli_uses_only_the_documented_wrapper_and_its_native_pay
             "_codex_native_install_descriptor",
             return_value=(package, target),
         ),
+        patch.object(server, "trusted_runner_executable", return_value=wrapper) as validate,
         patch.object(
-            server,
-            "trusted_runner_executable",
-            side_effect=(wrapper, native),
-        ) as validate,
+            server, "_attested_native_codex_payload_path", return_value=native
+        ) as attest,
         patch.object(
             server.shutil,
             "which",
@@ -1094,11 +1094,11 @@ def test_canonical_codex_cli_uses_only_the_documented_wrapper_and_its_native_pay
 
     assert validate.call_args_list == [
         ((server.CANONICAL_CODEX_CLI_PATH,), {}),
-        ((native,), {}),
     ]
+    attest.assert_called_once_with(native)
 
 
-def test_canonical_codex_cli_rejects_a_missing_or_untrusted_native_payload() -> None:
+def test_canonical_codex_cli_rejects_a_missing_native_payload() -> None:
     wrapper = Path("/opt/codex/node_modules/@openai/codex/bin/codex.js")
 
     with (
@@ -1108,14 +1108,134 @@ def test_canonical_codex_cli_rejects_a_missing_or_untrusted_native_payload() -> 
             "_codex_native_install_descriptor",
             return_value=("codex-linux-x64", "x86_64-unknown-linux-musl"),
         ),
+    ):
+        with pytest.raises(server.AgentError, match="canonical_codex_cli_unavailable"):
+            server._canonical_codex_cli_path()
+
+
+def test_canonical_codex_cli_rejects_a_native_payload_symlink_outside_the_package(
+    tmp_path: Path,
+) -> None:
+    wrapper = tmp_path / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+    package = "codex-linux-x64"
+    target = "x86_64-unknown-linux-musl"
+    native = wrapper.parents[1] / "node_modules" / "@openai" / package / "vendor" / target / "bin" / "codex"
+    native.parent.mkdir(mode=0o700, parents=True)
+    outside = tmp_path / "outside-package-native"
+    outside.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    outside.chmod(0o700)
+    native.symlink_to(outside)
+
+    with (
+        patch.object(server, "_canonical_codex_wrapper_path", return_value=wrapper),
         patch.object(
             server,
-            "trusted_runner_executable",
-            side_effect=server.AgentError("fleet_executable_invalid"),
+            "_codex_native_install_descriptor",
+            return_value=(package, target),
         ),
     ):
         with pytest.raises(server.AgentError, match="canonical_codex_cli_unavailable"):
             server._canonical_codex_cli_path()
+
+    assert native.is_symlink()
+    assert native.resolve() == outside
+
+
+def test_attested_native_codex_payload_rejects_an_effective_user_owned_file(
+    tmp_path: Path,
+) -> None:
+    native = tmp_path / "native-codex"
+    native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    native.chmod(0o700)
+
+    with pytest.raises(server.AgentError, match="canonical_codex_cli_unavailable"):
+        server._attested_native_codex_payload_path(native)
+
+
+def test_attested_native_codex_payload_rejects_a_hardlinked_file(tmp_path: Path) -> None:
+    native = tmp_path / "native-codex"
+    native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    native.chmod(0o700)
+    root_owned_hardlink = os.stat_result(
+        (stat_module.S_IFREG | 0o755, 0, 0, 2, 0, 0, 0, 0, 0, 0)
+    )
+
+    with patch.object(server.os, "lstat", return_value=root_owned_hardlink):
+        with pytest.raises(server.AgentError, match="canonical_codex_cli_unavailable"):
+            server._attested_native_codex_payload_path(native)
+
+
+def test_attested_native_codex_payload_rejects_a_group_writable_file(
+    tmp_path: Path,
+) -> None:
+    native = tmp_path / "native-codex"
+    native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    native.chmod(0o700)
+    root_owned_writable = os.stat_result(
+        (stat_module.S_IFREG | 0o775, 0, 0, 1, 0, 0, 0, 0, 0, 0)
+    )
+
+    with patch.object(server.os, "lstat", return_value=root_owned_writable):
+        with pytest.raises(server.AgentError, match="canonical_codex_cli_unavailable"):
+            server._attested_native_codex_payload_path(native)
+
+
+def test_attested_native_codex_payload_rejects_an_untrusted_parent_chain(
+    tmp_path: Path,
+) -> None:
+    native = tmp_path / "native-codex"
+    native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    native.chmod(0o700)
+    root_owned_regular = os.stat_result(
+        (stat_module.S_IFREG | 0o755, 0, 0, 1, 0, 0, 0, 0, 0, 0)
+    )
+
+    with (
+        patch.object(server.os, "lstat", return_value=root_owned_regular),
+        patch.object(server, "directory_chain_is_real_no_symlink", return_value=True),
+        patch.object(server, "executable_directory_chain_is_trusted", return_value=False),
+    ):
+        with pytest.raises(server.AgentError, match="canonical_codex_cli_unavailable"):
+            server._attested_native_codex_payload_path(native)
+
+
+def test_binding_rejects_a_native_payload_swapped_to_a_symlink_before_open(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "main-home"
+    config = home / ".codex"
+    config.mkdir(mode=0o700, parents=True)
+    native = tmp_path / "native-codex"
+    native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    native.chmod(0o700)
+    outside = tmp_path / "outside-native"
+    outside.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    outside.chmod(0o700)
+    real_open = server.os.open
+    swapped = False
+
+    def swap_before_native_open(path: Path | str, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if path == native and not swapped:
+            native.unlink()
+            native.symlink_to(outside)
+            swapped = True
+        return real_open(path, flags, *args, **kwargs)
+
+    with (
+        patch.object(server.os, "geteuid", return_value=1000),
+        patch.object(
+            server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
+        ),
+        patch.object(server, "_canonical_codex_cli_path", return_value=native),
+        patch.object(server.os, "open", side_effect=swap_before_native_open),
+    ):
+        with pytest.raises(server.AgentError, match="canonical_codex_cli_unavailable"):
+            with server._codex_mcp_binding():
+                pass
+
+    assert swapped
+    assert native.is_symlink()
 
 
 def test_native_codex_payload_derivation_rejects_a_non_package_wrapper() -> None:

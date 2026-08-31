@@ -2285,15 +2285,35 @@ def _native_codex_cli_path_from_wrapper(wrapper: Path) -> Path:
     )
 
 
+def _attested_native_codex_payload_path(native: Path) -> Path:
+    """Accept only the logical native file inside the attested package tree."""
+
+    if not isinstance(native, Path) or not native.is_absolute():
+        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable")
+    try:
+        metadata = native.lstat()
+    except OSError as exc:
+        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable") from exc
+    if (
+        stat_module.S_ISLNK(metadata.st_mode)
+        or not stat_module.S_ISREG(metadata.st_mode)
+        or getattr(metadata, "st_nlink", 1) != 1
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+        or not os.access(native, os.X_OK)
+        or not directory_chain_is_real_no_symlink(native.parent)
+        or not executable_directory_chain_is_trusted(native.parent)
+    ):
+        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable")
+    return native
+
+
 def _canonical_codex_cli_path() -> Path:
     """Return the attested native Codex payload without executing its JS wrapper."""
 
     wrapper = _canonical_codex_wrapper_path()
     native = _native_codex_cli_path_from_wrapper(wrapper)
-    try:
-        return trusted_runner_executable(native)
-    except AgentError as exc:
-        raise _CanonicalCodexCliUnavailable("canonical_codex_cli_unavailable") from exc
+    return _attested_native_codex_payload_path(native)
 
 
 @dataclass
