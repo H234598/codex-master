@@ -26,12 +26,19 @@ from codex_master.hive.config import (
     HiveConfigError,
     _is_catalog_digest,
     load_agent_class_catalog_snapshot,
+    load_agent_class_catalog_snapshot_bytes,
     load_hive_config,
+    load_hive_config_bytes,
 )
 from codex_master.hive.events import HiveEventError, HiveEventStore
 from codex_master.hive.principals import Principal, PrincipalRegistry
 from codex_master.hive.repositories import RepositoryBinding, RepositoryRegistry
 from codex_master.hive.state import HiveStateError, HiveStateStore
+from codex_master.runtime_layout import (
+    LayoutError,
+    RuntimeImageRepositoryRoot,
+    RuntimeLayout,
+)
 from codex_master.usage_snapshot import (
     AccountUsageEvidenceV2,
     UsageEvidenceV2,
@@ -311,12 +318,15 @@ def read_hive_runtime_evidence(
     catalog_path: Path | None = None,
     config_path: Path | None = None,
     state_root: Path | None = None,
-    repository_roots: Mapping[str, Path] | None = None,
+    repository_roots: Mapping[str, Path | RuntimeImageRepositoryRoot] | None = None,
     dynamic_account_evidence: object | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> HiveRuntimeEvidence:
     """Read one canonical Hive projection without creating or repairing state."""
 
+    use_runtime_image = (
+        catalog_path is None and config_path is None and repository_roots is None
+    )
     repository_root = _default_repository_root()
     catalog_path = catalog_path or repository_root / "codex-agent-classes.json"
     config_path = config_path or repository_root / "codex-hive.json"
@@ -347,12 +357,34 @@ def read_hive_runtime_evidence(
             **{**empty, "reason_codes": ("hive_runtime_unavailable",)}
         )
     try:
-        snapshot = load_agent_class_catalog_snapshot(catalog_path)
-        config = load_hive_config(config_path, snapshot.classes)
-    except (HiveConfigError, OSError, TypeError, ValueError):
-        return HiveRuntimeEvidence(
-            **{**empty, "reason_codes": ("hive_config_unavailable",)}
-        )
+        if use_runtime_image:
+            layout = RuntimeLayout.from_module_path(Path(__file__))
+            snapshot = load_agent_class_catalog_snapshot_bytes(
+                layout.read_attested_file("codex-agent-classes.json")
+            )
+            config = load_hive_config_bytes(
+                layout.read_attested_file("codex-hive.json"), snapshot.classes
+            )
+            repository_roots = {
+                str(item["repo_id"]): layout.repository_root()
+                for item in config.repositories
+            }
+        else:
+            snapshot = load_agent_class_catalog_snapshot(catalog_path)
+            config = load_hive_config(config_path, snapshot.classes)
+    except (HiveConfigError, LayoutError, OSError, TypeError, ValueError):
+        if use_runtime_image and not (repository_root / ".codex-master-runtime-manifest.json").exists():
+            try:
+                snapshot = load_agent_class_catalog_snapshot(catalog_path)
+                config = load_hive_config(config_path, snapshot.classes)
+            except (HiveConfigError, OSError, TypeError, ValueError):
+                return HiveRuntimeEvidence(
+                    **{**empty, "reason_codes": ("hive_config_unavailable",)}
+                )
+        else:
+            return HiveRuntimeEvidence(
+                **{**empty, "reason_codes": ("hive_config_unavailable",)}
+            )
 
     state_kind = _existing_state_kind(state_root)
     repository_kind = "not_configured" if not config.repositories else "unavailable"
@@ -480,7 +512,7 @@ def build_hive_runtime(
     config: HiveConfig,
     classes: Mapping[str, AgentClassProfile],
     *,
-    repository_roots: Mapping[str, Path],
+    repository_roots: Mapping[str, Path | RuntimeImageRepositoryRoot],
     state_root: Path,
     materialize_principals: bool = False,
     read_only: bool = False,
@@ -509,6 +541,14 @@ def build_hive_runtime(
         raise HiveRuntimeError("invalid_hive_runtime_mode")
     if read_only and materialize_principals:
         raise HiveRuntimeError("read_only_runtime_materialization_forbidden")
+    if (
+        not read_only
+        and any(
+            isinstance(root, RuntimeImageRepositoryRoot)
+            for root in repository_roots.values()
+        )
+    ):
+        raise HiveRuntimeError("runtime_image_repository_read_only")
 
     repositories = _build_repositories(config, repository_roots)
     try:
@@ -540,7 +580,7 @@ def _compose_hive_runtime_from_catalog_snapshot(
     config: HiveConfig,
     snapshot: AgentClassCatalogSnapshot,
     *,
-    repository_roots: Mapping[str, Path],
+    repository_roots: Mapping[str, Path | RuntimeImageRepositoryRoot],
     state_root: Path,
     expected_catalog_digest: str | None = None,
     materialize_principals: bool = False,
@@ -563,7 +603,9 @@ def _compose_hive_runtime_from_catalog_snapshot(
     return replace(runtime, classes=snapshot.classes, catalog_digest=snapshot.digest)
 
 
-def _build_repositories(config: HiveConfig, roots: Mapping[str, Path]) -> RepositoryRegistry:
+def _build_repositories(
+    config: HiveConfig, roots: Mapping[str, Path | RuntimeImageRepositoryRoot]
+) -> RepositoryRegistry:
     expected_ids = {str(raw.get("repo_id")) for raw in config.repositories}
     if set(roots) != expected_ids:
         raise HiveRuntimeError("repository_root_set_mismatch")

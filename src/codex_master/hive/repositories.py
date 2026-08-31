@@ -15,6 +15,10 @@ import subprocess
 import time
 
 from codex_master.hive.types import HiveValidationError, validate_identifier
+from codex_master.runtime_layout import (
+    LayoutError,
+    RuntimeImageRepositoryRoot,
+)
 
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -42,7 +46,7 @@ class RepositoryError(ValueError):
 class RepositoryBinding:
     repo_id: str
     remote_identity: str
-    local_root: Path
+    local_root: Path | RuntimeImageRepositoryRoot
     default_branch: str
     config_digest: str
 
@@ -57,7 +61,9 @@ class RepositoryBinding:
             or any(ord(char) < 32 for char in self.remote_identity)
         ):
             raise RepositoryError("invalid_remote_identity")
-        if not isinstance(self.local_root, Path) or not self.local_root.is_absolute():
+        if not isinstance(self.local_root, RuntimeImageRepositoryRoot) and (
+            not isinstance(self.local_root, Path) or not self.local_root.is_absolute()
+        ):
             raise RepositoryError("invalid_repository_root")
         if not isinstance(self.default_branch, str) or not _BRANCH_RE.fullmatch(self.default_branch):
             raise RepositoryError("invalid_default_branch")
@@ -150,6 +156,12 @@ class RepositoryRegistry:
     def validate(self, repo_id: str) -> RepositoryValidation:
         binding = self.get(repo_id)
         root = binding.local_root
+        if isinstance(root, RuntimeImageRepositoryRoot):
+            try:
+                root._validated_path()
+            except (LayoutError, OSError, TypeError, ValueError):
+                return RepositoryValidation(repo_id, False, "repository_root_untrusted")
+            return RepositoryValidation(repo_id, True, "repository_verified")
         try:
             root_stat = root.lstat()
             resolved_root = root.resolve(strict=True)
@@ -190,6 +202,8 @@ class RepositoryRegistry:
 
     def resolve_path(self, repo_id: str, value: str) -> Path:
         binding = self.get(repo_id)
+        if isinstance(binding.local_root, RuntimeImageRepositoryRoot):
+            raise RepositoryError("repository_image_read_only")
         if (
             not isinstance(value, str)
             or not value

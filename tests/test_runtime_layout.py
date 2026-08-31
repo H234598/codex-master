@@ -107,6 +107,8 @@ def test_runtime_layout_is_immutable_and_derived_only_from_a_valid_image(tmp_pat
     assert layout.metadata_root == root
     assert layout.spawn_helper == root / "src" / "codex_master" / "_runtime_spawn_helper.so"
     assert len(layout.spawn_helper_digest) == 64
+    assert layout.manifest_digest.startswith("sha256:")
+    assert not isinstance(layout.repository_root(), Path)
     with pytest.raises(FrozenInstanceError):
         layout.root = root.parent  # type: ignore[misc]
 
@@ -176,6 +178,7 @@ def test_runtime_layout_rejects_linked_and_outside_entrypoints(tmp_path: Path) -
         module.RuntimeLayout.from_runtime_root(root)
 
     restored = materialize_runtime_image(tmp_path / "another")
+    valid_layout = module.RuntimeLayout.from_runtime_root(restored)
     with pytest.raises(module.LayoutError):
         module.RuntimeLayout(
             root=restored,
@@ -184,6 +187,9 @@ def test_runtime_layout_rejects_linked_and_outside_entrypoints(tmp_path: Path) -
             metadata_root=restored,
             spawn_helper=restored / "src" / "codex_master" / "_runtime_spawn_helper.so",
             spawn_helper_digest="0" * 64,
+            root_device=valid_layout.root_device,
+            root_inode=valid_layout.root_inode,
+            manifest_digest=valid_layout.manifest_digest,
         )
 
 
@@ -197,12 +203,70 @@ def test_runtime_layout_rejects_a_helper_or_manifest_digest_deviation(tmp_path: 
     with pytest.raises(module.LayoutError):
         module.RuntimeLayout.from_runtime_root(root)
 
+
+def test_runtime_layout_rejects_a_replaced_generation_or_manifest_digest(tmp_path: Path) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    layout = module.RuntimeLayout.from_runtime_root(root)
+
+    with pytest.raises(module.LayoutError):
+        module.RuntimeLayout(
+            root=layout.root,
+            mcp_entrypoint=layout.mcp_entrypoint,
+            probe_entrypoint=layout.probe_entrypoint,
+            metadata_root=layout.metadata_root,
+            spawn_helper=layout.spawn_helper,
+            spawn_helper_digest=layout.spawn_helper_digest,
+            root_device=layout.root_device,
+            root_inode=layout.root_inode,
+            manifest_digest="sha256:" + "0" * 64,
+        )
+
+    root.rename(tmp_path / "retired-generation")
+    materialize_runtime_image(tmp_path)
+    with pytest.raises(module.LayoutError):
+        module.validate_runtime_metadata(layout)
+
     root = materialize_runtime_image(tmp_path / "manifest")
     manifest = root / ".codex-master-runtime-manifest.json"
     manifest.write_text("{}", encoding="utf-8")
 
     with pytest.raises(module.LayoutError):
         module.RuntimeLayout.from_runtime_root(root)
+
+
+def test_runtime_image_repository_root_is_not_a_gitless_path_exception(tmp_path: Path) -> None:
+    from codex_master.hive.repositories import (
+        RepositoryBinding,
+        RepositoryError,
+        RepositoryRegistry,
+    )
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    layout = module.RuntimeLayout.from_runtime_root(root)
+    registry = RepositoryRegistry(
+        (
+            RepositoryBinding(
+                "runtime-image",
+                "https://github.com/example/runtime-image.git",
+                layout.repository_root(),
+                "main",
+                RepositoryRegistry.config_digest(b"runtime-image-binding"),
+            ),
+        )
+    )
+
+    assert registry.validate("runtime-image").allowed is True
+    with pytest.raises(RepositoryError, match="repository_image_read_only"):
+        registry.resolve_path("runtime-image", "src")
+    root.rename(tmp_path / "retired-image")
+    materialize_runtime_image(tmp_path)
+    result = registry.validate("runtime-image")
+    assert result.allowed is False
+    assert result.reason_code == "repository_root_untrusted"
 
 
 def test_runtime_layout_rejects_a_nonprivate_image_subdirectory(tmp_path: Path) -> None:
