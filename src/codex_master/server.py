@@ -283,7 +283,10 @@ from codex_master.hive.runtime import (
     build_hive_runtime,
 )
 from codex_master.hive.tools import call_hive_tool, hive_tool_definitions
-from codex_master.runtime_status import runtime_status
+from codex_master.runtime_status import (
+    AUTONOMOUS_RUNTIME_STATUS_MCP_ARGUMENT,
+    runtime_status,
+)
 from codex_master.selection.model_policy import load_model_policy
 from codex_master.limit_tracker import (
     derive_limit_decisions,
@@ -35589,10 +35592,15 @@ def rpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
 
 
 def handle_rpc(
-    msg: dict[str, Any], *, enforce_master_role: bool = False
+    msg: dict[str, Any],
+    *,
+    enforce_master_role: bool = False,
+    autonomous_runtime_surface: bool = False,
 ) -> dict[str, Any] | None:
     if not isinstance(msg, dict):
         raise AgentError("RPC message must be an object")
+    if autonomous_runtime_surface:
+        enforce_master_role = True
     message_id = msg.get("id")
     valid_id = message_id is None or (
         isinstance(message_id, str)
@@ -35644,7 +35652,9 @@ def handle_rpc(
         )
     if method == "tools/list":
         tools = TOOLS
-        if enforce_master_role:
+        if autonomous_runtime_surface:
+            tools = [tool for tool in TOOLS if tool["name"] == "runtime_status"]
+        elif enforce_master_role:
             tools = (
                 teamleader_tool_catalog()
                 if master_tool_access_status()["authorized"]
@@ -35668,10 +35678,10 @@ def handle_rpc(
                 if not isinstance(requested_name, str):
                     raise AgentError("tools/call requires a known tool name")
                 if requested_name != "runtime_status":
+                    if autonomous_runtime_surface:
+                        raise AgentError("teamleader authorization required")
                     status = require_teamleader_tool_access()
-                    principal_class = require_principal_tool_access(
-                        requested_name, status
-                    )
+                    principal_class = require_principal_tool_access(requested_name, status)
             name, args = validate_tool_call(
                 params.get("name"), params.get("arguments", {})
             )
@@ -36110,7 +36120,9 @@ def _unauthenticated_mcp_request(message: object) -> bool:
         return True
 
 
-def _sterile_runtime_surface_response(message: dict[str, Any]) -> dict[str, Any] | None:
+def _sterile_runtime_surface_response(
+    message: dict[str, Any], *, autonomous_runtime_surface: bool = False
+) -> dict[str, Any] | None:
     """Serve only autonomous runtime RPCs without initializing private state."""
 
     method = message.get("method")
@@ -36120,7 +36132,11 @@ def _sterile_runtime_surface_response(message: dict[str, Any]) -> dict[str, Any]
         "tools/list",
         "tools/call",
     ):
-        return handle_rpc(message, enforce_master_role=True)
+        return handle_rpc(
+            message,
+            enforce_master_role=True,
+            autonomous_runtime_surface=autonomous_runtime_surface,
+        )
     message_id = message.get("id")
     if "id" not in message:
         return None
@@ -36132,21 +36148,25 @@ def _sterile_runtime_surface_response(message: dict[str, Any]) -> dict[str, Any]
             and (not isinstance(message_id, float) or math.isfinite(message_id))
         )
     ):
-        return handle_rpc(message, enforce_master_role=True)
+        return handle_rpc(
+            message,
+            enforce_master_role=True,
+            autonomous_runtime_surface=autonomous_runtime_surface,
+        )
     return rpc_error(message_id, -32000, "teamleader authorization required")
 
 
-def serve_mcp() -> int:
+def serve_mcp(*, autonomous_runtime_surface: bool = False) -> int:
     """Serve MCP with a startup inventory scoped to this server lifetime."""
 
     previous_inventory = swap_agent_inventory(None)
     try:
-        return _serve_mcp_impl()
+        return _serve_mcp_impl(autonomous_runtime_surface=autonomous_runtime_surface)
     finally:
         swap_agent_inventory(previous_inventory)
 
 
-def _serve_mcp_impl() -> int:
+def _serve_mcp_impl(*, autonomous_runtime_surface: bool = False) -> int:
     global _FLEET_STARTUP_ERROR
     initialized_regular_surface = False
     while True:
@@ -36154,7 +36174,11 @@ def _serve_mcp_impl() -> int:
             msg = read_message()
             if msg is None:
                 return 0
-            if _unauthenticated_mcp_request(msg):
+            if autonomous_runtime_surface:
+                response = _sterile_runtime_surface_response(
+                    msg, autonomous_runtime_surface=True
+                )
+            elif _unauthenticated_mcp_request(msg):
                 response = _sterile_runtime_surface_response(msg)
             else:
                 if not initialized_regular_surface:
@@ -43608,8 +43632,11 @@ def _master_fleet_home_v2_cutover(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
-    if len(sys.argv) > 1:
-        return main_cli(sys.argv[1:])
+    arguments = sys.argv[1:]
+    if arguments == [AUTONOMOUS_RUNTIME_STATUS_MCP_ARGUMENT]:
+        return serve_mcp(autonomous_runtime_surface=True)
+    if arguments:
+        return main_cli(arguments)
     return serve_mcp()
 
 

@@ -21,6 +21,7 @@ _MCP_SERVER_NAME = "codex-master-mcp"
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 _MAX_MCP_OUTPUT_BYTES = 256 * 1024
 RUNTIME_STATUS_MCP_TIMEOUT_SECONDS = 10.0
+AUTONOMOUS_RUNTIME_STATUS_MCP_ARGUMENT = "--runtime-status-mcp"
 _REQUIRED_AUTONOMOUS_TOOL = "runtime_status"
 
 
@@ -48,7 +49,7 @@ def _probe_payload() -> bytes:
 def _run_direct_mcp(*, layout: RuntimeLayout, home: Path) -> tuple[int, str]:
     try:
         result = run_bounded(
-            [str(layout.mcp_entrypoint)],
+            [str(layout.mcp_entrypoint), AUTONOMOUS_RUNTIME_STATUS_MCP_ARGUMENT],
             cwd=layout.root,
             home=home,
             timeout_seconds=RUNTIME_STATUS_MCP_TIMEOUT_SECONDS,
@@ -221,4 +222,8 @@ def runtime_status(
     }
 
 
-__all__ = ["RUNTIME_STATUS_MCP_TIMEOUT_SECONDS", "runtime_status"]
+__all__ = [
+    "AUTONOMOUS_RUNTIME_STATUS_MCP_ARGUMENT",
+    "RUNTIME_STATUS_MCP_TIMEOUT_SECONDS",
+    "runtime_status",
+]
