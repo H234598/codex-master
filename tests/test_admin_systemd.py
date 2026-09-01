@@ -176,6 +176,15 @@ def test_agent_api_unit_uses_private_tls_entrypoint_and_credentials() -> None:
     assert "agent-bindings" not in service["LoadCredential"]
 
 
+def test_agent_api_waits_for_admin_binding_provisioning() -> None:
+    unit = _directives("Unit", AGENT_API_UNIT)
+
+    assert unit["Requires"] == ["codex-master-admin.service"]
+    assert unit["After"] == [
+        "network-online.target codex-master-admin.service"
+    ]
+
+
 def test_host_agent_unit_has_exact_hardening_credentials_and_write_scope() -> None:
     """Production break: a host agent can otherwise leak keys or write broadly."""
 

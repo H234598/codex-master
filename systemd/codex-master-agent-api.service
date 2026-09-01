@@ -1,7 +1,8 @@
 [Unit]
 Description=Codex Master isolated host-agent TLS API
 Wants=network-online.target
-After=network-online.target
+Requires=codex-master-admin.service
+After=network-online.target codex-master-admin.service
 StartLimitIntervalSec=60s
 StartLimitBurst=3
 
