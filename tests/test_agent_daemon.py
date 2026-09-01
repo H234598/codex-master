@@ -48,8 +48,14 @@ class FakeContext:
 def _credential_directory(tmp_path: Path) -> Path:
     directory = tmp_path / "credentials"
     directory.mkdir(mode=0o700)
-    for name in ("agent-server-cert", "agent-server-key", "agent-client-ca"):
-        (directory / name).write_bytes(name.encode())
+    for name in (
+        "agent-server-cert",
+        "agent-server-key",
+        "agent-client-ca",
+        "agent-listen-address",
+    ):
+        payload = b"10.23.4.5\n" if name == "agent-listen-address" else name.encode()
+        (directory / name).write_bytes(payload)
     return directory
 
 
@@ -61,6 +67,7 @@ def test_systemd_credentials_are_opened_as_fds_and_names_are_fixed(tmp_path) -> 
             b"agent-server-cert",
             b"agent-server-key",
             b"agent-client-ca",
+            b"10.23.4.5\n",
         ]
     assert all(_fd_is_closed(fd) for fd in credentials)
 
@@ -614,6 +621,34 @@ def test_main_accepts_only_listen_address_and_port(monkeypatch, capsys) -> None:
     assert "agent.arguments_invalid" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "payload",
+    (b"127.0.0.1\n", b"0.0.0.0\n", b"8.8.8.8\n", b"not-an-address\n", b"10.0.0.1\nextra"),
+)
+def test_agent_ingress_credential_requires_one_private_reachable_ipv4(
+    tmp_path: Path, payload: bytes
+) -> None:
+    path = tmp_path / "listen-address"
+    path.write_bytes(payload)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        with pytest.raises(RuntimeError, match="agent.listen_address_invalid"):
+            agent_daemon.load_agent_listen_address(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_agent_ingress_credential_accepts_rfc1918_and_cgnat(tmp_path: Path) -> None:
+    for payload in (b"10.23.4.5\n", b"172.20.4.5\n", b"192.168.4.5\n", b"100.64.4.5\n"):
+        path = tmp_path / "listen-address"
+        path.write_bytes(payload)
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            assert agent_daemon.load_agent_listen_address(descriptor) == payload.decode().strip()
+        finally:
+            os.close(descriptor)
+
+
 def test_main_assembles_from_credential_directory_without_secret_arguments(monkeypatch, tmp_path) -> None:
     directory = _credential_directory(tmp_path)
     observed: dict[str, object] = {}
@@ -631,8 +666,26 @@ def test_main_assembles_from_credential_directory_without_secret_arguments(monke
     assert agent_daemon.main(["--listen-address", "127.0.0.1", "--port", "9443"]) == 0
     assert observed["address"] == "127.0.0.1"
     assert observed["port"] == 9443
-    assert len(observed["fds"]) == 3
+    assert len(observed["fds"]) == 4
     assert observed["shared_gid"] == 4321
+
+
+def test_main_uses_private_address_from_systemd_credential(monkeypatch, tmp_path) -> None:
+    directory = _credential_directory(tmp_path)
+    observed: dict[str, object] = {}
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(directory))
+    monkeypatch.setattr(agent_daemon, "agent_state_group_id", lambda: 4321)
+    monkeypatch.setattr(
+        agent_daemon,
+        "assemble_server",
+        lambda address, port, credentials, **kwargs: observed.update(
+            address=address, port=port, fds=tuple(credentials), **kwargs
+        )
+        or _StoppedServer(),
+    )
+
+    assert agent_daemon.main(["--listen-address-credential", "--port", "9443"]) == 0
+    assert observed["address"] == "10.23.4.5"
 
 
 @pytest.mark.parametrize(
@@ -790,6 +843,7 @@ def live_pki(tmp_path_factory):
         ).public_bytes(serialization.Encoding.PEM),
         "agent-server-key": _pem_private_key(server_key),
         "agent-client-ca": ca.public_bytes(serialization.Encoding.PEM),
+        "agent-listen-address": b"10.23.4.5\n",
         "agent-client.crt": _issue_certificate(
             "agent", ca, ca_key, client_key.public_key(), client=True
         ).public_bytes(serialization.Encoding.PEM),

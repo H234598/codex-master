@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the complete hardened host-agent service set from trusted inputs."""
+"""Install one role-separated hardened agent service from trusted inputs."""
 
 from __future__ import annotations
 
@@ -16,14 +16,34 @@ from typing import NamedTuple, Sequence
 
 ROOT_UID = 0
 ROOT_GID = 0
+MASTER_ROLE = "master"
+WORKER_ROLE = "worker"
+AGENT_API_UNIT = "codex-master-agent-api.service"
 HOST_AGENT_UNIT = "codex-master-host-agent.service"
-UNIT_NAMES = (
-    "codex-master-admin.service",
-    "codex-master-agent-api.service",
-    HOST_AGENT_UNIT,
-)
-SYSUSERS_NAME = "codex-master-host-agent.conf"
-TMPFILES_NAME = "codex-master-host-agent.conf"
+UNIT_NAMES = (AGENT_API_UNIT, HOST_AGENT_UNIT)
+ROLE_UNITS = {
+    MASTER_ROLE: (AGENT_API_UNIT,),
+    WORKER_ROLE: (HOST_AGENT_UNIT,),
+}
+ROLE_LAYOUT_NAMES = {
+    MASTER_ROLE: "codex-master-agent-api.conf",
+    WORKER_ROLE: "codex-master-host-agent.conf",
+}
+_ROLE_CREDENTIALS = {
+    MASTER_ROLE: (
+        ("agent_server_key", "agent-server.key", 0o400, "credentials"),
+        ("agent_server_cert", "agent-server.crt", 0o444, "credentials"),
+        ("agent_client_ca", "agent-client-ca.crt", 0o444, "credentials"),
+        ("agent_bindings", "agent-bindings.json", 0o400, "admin_credentials"),
+        ("agent_listen_address", "agent-listen-address", 0o444, "credentials"),
+    ),
+    WORKER_ROLE: (
+        ("agent_client_key", "agent-client.key", 0o400, "credentials"),
+        ("agent_client_cert", "agent-client.crt", 0o444, "credentials"),
+        ("agent_master_ca", "agent-master-ca.crt", 0o444, "credentials"),
+        ("agent_config", "agent-config.json", 0o400, "credentials"),
+    ),
+}
 _OPEN_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _OPEN_FILE = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
 
@@ -64,8 +84,14 @@ def _packaged_source_directory() -> Path:
 
 _SOURCE_DIRECTORY = _packaged_source_directory()
 UNIT_SOURCES = {name: _SOURCE_DIRECTORY / "systemd" / name for name in UNIT_NAMES}
-SYSUSERS_SOURCE = _SOURCE_DIRECTORY / "systemd" / "sysusers.d" / SYSUSERS_NAME
-TMPFILES_SOURCE = _SOURCE_DIRECTORY / "systemd" / "tmpfiles.d" / TMPFILES_NAME
+SYSUSERS_SOURCES = {
+    role: _SOURCE_DIRECTORY / "systemd" / "sysusers.d" / name
+    for role, name in ROLE_LAYOUT_NAMES.items()
+}
+TMPFILES_SOURCES = {
+    role: _SOURCE_DIRECTORY / "systemd" / "tmpfiles.d" / name
+    for role, name in ROLE_LAYOUT_NAMES.items()
+}
 
 
 def _absolute_path(value: str) -> Path:
@@ -228,16 +254,22 @@ def _close_directories(directories: dict[str, int]) -> None:
         os.close(descriptor)
 
 
-def _destination_directories(root: Path) -> dict[str, int]:
+def _destination_directories(
+    root: Path, required: frozenset[str]
+) -> dict[str, int]:
     destination_root = _open_directory(root)
     opened: dict[str, int] = {}
     try:
         _assert_trusted_directory(os.fstat(destination_root), 0o755)
         opened["etc"] = _open_or_create_directory(destination_root, "etc", 0o755)
-        opened["credentials"] = _open_or_create_directory(opened["etc"], "codex-master", 0o700)
-        opened["admin_credentials"] = _open_or_create_directory(
-            opened["etc"], "codex-master-admin", 0o700
-        )
+        if "credentials" in required:
+            opened["credentials"] = _open_or_create_directory(
+                opened["etc"], "codex-master", 0o700
+            )
+        if "admin_credentials" in required:
+            opened["admin_credentials"] = _open_or_create_directory(
+                opened["etc"], "codex-master-admin", 0o700
+            )
         opened["systemd"] = _open_or_create_directory(opened["etc"], "systemd", 0o755)
         opened["units"] = _open_or_create_directory(opened["systemd"], "system", 0o755)
         opened["usr"] = _open_or_create_directory(destination_root, "usr", 0o755)
@@ -318,6 +350,7 @@ def _commit_staged(staged: Sequence[_Staged], modes: Sequence[int]) -> None:
 
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = _Parser(add_help=False)
+    parser.add_argument("--role", choices=(MASTER_ROLE, WORKER_ROLE), required=True)
     for name in (
         "agent-server-key",
         "agent-server-cert",
@@ -327,23 +360,23 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         "agent-client-cert",
         "agent-master-ca",
         "agent-config",
+        "agent-listen-address",
     ):
-        parser.add_argument(f"--{name}", required=True)
+        parser.add_argument(f"--{name}")
     parser.add_argument("--destdir", default="/")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--enable", action="store_true")
     arguments = parser.parse_args(argv)
-    for name in (
-        "agent_server_key",
-        "agent_server_cert",
-        "agent_client_ca",
-        "agent_bindings",
-        "agent_client_key",
-        "agent_client_cert",
-        "agent_master_ca",
-        "agent_config",
-        "destdir",
-    ):
+    required = {item[0] for item in _ROLE_CREDENTIALS[arguments.role]}
+    supplied = {
+        name
+        for role in _ROLE_CREDENTIALS.values()
+        for name, _destination, _mode, _directory in role
+        if getattr(arguments, name) is not None
+    }
+    if supplied != required:
+        raise InstallerError
+    for name in (*sorted(required), "destdir"):
         setattr(arguments, name, _absolute_path(getattr(arguments, name)))
     if arguments.enable and (arguments.destdir != Path("/") or arguments.dry_run):
         raise InstallerError
@@ -351,36 +384,56 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
 
 
 def _sources(arguments: argparse.Namespace) -> list[_Source]:
-    credentials = (
-        (arguments.agent_server_key, "agent-server.key", 0o400, "credentials"),
-        (arguments.agent_server_cert, "agent-server.crt", 0o444, "credentials"),
-        (arguments.agent_client_ca, "agent-client-ca.crt", 0o444, "credentials"),
-        (arguments.agent_bindings, "agent-bindings.json", 0o400, "admin_credentials"),
-        (arguments.agent_client_key, "agent-client.key", 0o400, "credentials"),
-        (arguments.agent_client_cert, "agent-client.crt", 0o444, "credentials"),
-        (arguments.agent_master_ca, "agent-master-ca.crt", 0o444, "credentials"),
-        (arguments.agent_config, "agent-config.json", 0o400, "credentials"),
-    )
-    result = [
-        _Source(_open_trusted_source(path, mode), destination, mode, directory)
-        for path, destination, mode, directory in credentials
-    ]
-    for name in UNIT_NAMES:
+    result: list[_Source] = []
+    try:
+        for argument, destination, mode, directory in _ROLE_CREDENTIALS[
+            arguments.role
+        ]:
+            result.append(
+                _Source(
+                    _open_trusted_source(getattr(arguments, argument), mode),
+                    destination,
+                    mode,
+                    directory,
+                )
+            )
+        for name in ROLE_UNITS[arguments.role]:
+            result.append(
+                _Source(
+                    _open_trusted_source(UNIT_SOURCES[name], 0o644),
+                    name,
+                    0o644,
+                    "units",
+                )
+            )
+        layout_name = ROLE_LAYOUT_NAMES[arguments.role]
         result.append(
-            _Source(_open_trusted_source(UNIT_SOURCES[name], 0o644), name, 0o644, "units")
+            _Source(
+                _open_trusted_source(SYSUSERS_SOURCES[arguments.role], 0o644),
+                layout_name,
+                0o644,
+                "sysusers",
+            )
         )
-    result.append(
-        _Source(_open_trusted_source(SYSUSERS_SOURCE, 0o644), SYSUSERS_NAME, 0o644, "sysusers")
-    )
-    result.append(
-        _Source(_open_trusted_source(TMPFILES_SOURCE, 0o644), TMPFILES_NAME, 0o644, "tmpfiles")
-    )
-    return result
+        result.append(
+            _Source(
+                _open_trusted_source(TMPFILES_SOURCES[arguments.role], 0o644),
+                layout_name,
+                0o644,
+                "tmpfiles",
+            )
+        )
+        return result
+    except BaseException:
+        for source in result:
+            os.close(source.descriptor)
+        raise
 
 
-def _provision_static_layout(destination: Path) -> None:
-    sysusers = destination / "usr/lib/sysusers.d" / SYSUSERS_NAME
-    tmpfiles = destination / "usr/lib/tmpfiles.d" / TMPFILES_NAME
+def _provision_static_layout(destination: Path, role: str) -> None:
+    layout_name = ROLE_LAYOUT_NAMES[role]
+    sysusers = destination / "usr/lib/sysusers.d" / layout_name
+    tmpfiles = destination / "usr/lib/tmpfiles.d" / layout_name
     subprocess.run(
         ["/usr/bin/systemd-sysusers", f"--root={destination}", os.fspath(sysusers)],
         check=True,
@@ -395,7 +448,7 @@ def _provision_static_layout(destination: Path) -> None:
     )
 
 
-def _enable_service() -> None:
+def _enable_service(role: str) -> None:
     subprocess.run(
         ["/usr/bin/systemctl", "daemon-reload"],
         check=True,
@@ -403,7 +456,7 @@ def _enable_service() -> None:
         stderr=subprocess.DEVNULL,
     )
     subprocess.run(
-        ["/usr/bin/systemctl", "enable", "--now", HOST_AGENT_UNIT],
+        ["/usr/bin/systemctl", "enable", "--now", *ROLE_UNITS[role]],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -420,7 +473,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         sources = _sources(arguments)
         if arguments.dry_run:
             return 0
-        directories = _destination_directories(arguments.destdir)
+        directories = _destination_directories(
+            arguments.destdir,
+            frozenset(source.directory for source in sources),
+        )
         staged: list[_Staged] = []
         try:
             for source in sources:
@@ -430,9 +486,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise
         _commit_staged(staged, [source.mode for source in sources])
         if arguments.destdir == Path("/"):
-            _provision_static_layout(arguments.destdir)
+            _provision_static_layout(arguments.destdir, arguments.role)
         if arguments.enable:
-            _enable_service()
+            _enable_service(arguments.role)
         return 0
     except (InstallerError, OSError, subprocess.SubprocessError, SystemExit):
         print("install-host-agent: installation failed", file=sys.stderr)

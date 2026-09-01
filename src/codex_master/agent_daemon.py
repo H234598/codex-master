@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+import ipaddress
 import json
 import math
 import os
@@ -45,7 +46,16 @@ from .server import build_fleet_private_io
 
 
 _STATE_ROOT = AGENT_STATE_ROOT
-_CREDENTIAL_NAMES = ("agent-server-cert", "agent-server-key", "agent-client-ca")
+_CREDENTIAL_NAMES = (
+    "agent-server-cert",
+    "agent-server-key",
+    "agent-client-ca",
+    "agent-listen-address",
+)
+_PRIVATE_AGENT_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")
+)
 TLS_HANDSHAKE_TIMEOUT_SECONDS = 2.0
 HTTP_HEADER_TIMEOUT_SECONDS = 2.0
 HTTP_BODY_TIMEOUT_SECONDS = 2.0
@@ -144,9 +154,12 @@ class AgentCredentialFds:
     certificate: int
     private_key: int
     agent_ca: int
+    listen_address: int = -1
 
     def __iter__(self) -> Iterator[int]:
-        return iter((self.certificate, self.private_key, self.agent_ca))
+        return iter(
+            (self.certificate, self.private_key, self.agent_ca, self.listen_address)
+        )
 
 
 class _CredentialOwner(AbstractContextManager[AgentCredentialFds]):
@@ -199,6 +212,27 @@ def create_agent_ssl_context(credentials: AgentCredentialFds) -> ssl.SSLContext:
     )
     context.load_verify_locations(cafile=f"/proc/self/fd/{credentials.agent_ca}")
     return context
+
+
+def load_agent_listen_address(descriptor: int) -> str:
+    """Load one explicit private IPv4 ingress address from a credential FD."""
+
+    try:
+        if type(descriptor) is not int or descriptor < 0:
+            raise OSError
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        raw = os.read(descriptor, 65)
+        if not raw.endswith(b"\n") or raw.count(b"\n") != 1 or len(raw) > 64:
+            raise ValueError
+        value = raw[:-1].decode("ascii")
+        address = ipaddress.ip_address(value)
+        if not isinstance(address, ipaddress.IPv4Address) or not any(
+            address in network for network in _PRIVATE_AGENT_NETWORKS
+        ):
+            raise ValueError
+    except (OSError, UnicodeError, ValueError):
+        raise RuntimeError("agent.listen_address_invalid") from None
+    return str(address)
 
 
 class _AgentRequestHandler(socketserver.StreamRequestHandler):
@@ -462,7 +496,9 @@ def run_server(server: object) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
-    parser.add_argument("--listen-address", default="0.0.0.0")
+    listen = parser.add_mutually_exclusive_group()
+    listen.add_argument("--listen-address", default="127.0.0.1")
+    listen.add_argument("--listen-address-credential", action="store_true")
     parser.add_argument("--port", type=int, default=9443)
     try:
         arguments = parser.parse_args(argv)
@@ -473,9 +509,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return os.EX_USAGE
     try:
         with open_systemd_credentials(os.environ) as credentials:
+            address = (
+                load_agent_listen_address(credentials.listen_address)
+                if arguments.listen_address_credential
+                else arguments.listen_address
+            )
             run_server(
                 assemble_server(
-                    arguments.listen_address,
+                    address,
                     arguments.port,
                     credentials,
                     shared_gid=agent_state_group_id(),
@@ -497,4 +538,12 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["AgentApiServer", "AgentCredentialFds", "create_agent_ssl_context", "main", "open_systemd_credentials", "run_server"]
+__all__ = [
+    "AgentApiServer",
+    "AgentCredentialFds",
+    "create_agent_ssl_context",
+    "load_agent_listen_address",
+    "main",
+    "open_systemd_credentials",
+    "run_server",
+]

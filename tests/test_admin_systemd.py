@@ -10,6 +10,8 @@ AGENT_API_UNIT = ROOT / "systemd" / "codex-master-agent-api.service"
 HOST_AGENT_UNIT = ROOT / "systemd" / "codex-master-host-agent.service"
 SYSUSERS = ROOT / "systemd" / "sysusers.d" / "codex-master-host-agent.conf"
 TMPFILES = ROOT / "systemd" / "tmpfiles.d" / "codex-master-host-agent.conf"
+MASTER_SYSUSERS = ROOT / "systemd" / "sysusers.d" / "codex-master-agent-api.conf"
+MASTER_TMPFILES = ROOT / "systemd" / "tmpfiles.d" / "codex-master-agent-api.conf"
 
 
 def _directives(
@@ -155,13 +157,14 @@ def test_agent_api_unit_uses_private_tls_entrypoint_and_credentials() -> None:
     assert service["SupplementaryGroups"] == ["codex-master-agent-state"]
     assert service["ReadWritePaths"] == ["/var/lib/codex-master-agent"]
     assert service["ExecStart"] == [
-        "/usr/bin/codex-master-agent-api --listen-address=127.0.0.1 --port=9443"
+        "/usr/bin/codex-master-agent-api --listen-address-credential --port=9443"
     ]
     assert service["TimeoutStopSec"] == ["10s"]
     assert service["LoadCredential"] == [
         "agent-server-key:/etc/codex-master/agent-server.key",
         "agent-server-cert:/etc/codex-master/agent-server.crt",
         "agent-client-ca:/etc/codex-master/agent-client-ca.crt",
+        "agent-listen-address:/etc/codex-master/agent-listen-address",
     ]
     assert "BindPaths" not in service
     assert "BindReadOnlyPaths" not in service
@@ -213,19 +216,23 @@ def test_host_agent_unit_has_exact_hardening_credentials_and_write_scope() -> No
 def test_static_accounts_and_shared_agent_state_are_deployable() -> None:
     """Production break: distinct service UIDs need one deliberate non-secret bridge."""
 
-    assert SYSUSERS.read_text(encoding="utf-8").splitlines() == [
+    assert MASTER_SYSUSERS.read_text(encoding="utf-8").splitlines() == [
         "g codex-master-admin -",
         "g codex-master-agent-api -",
-        "g codex-master-host-agent -",
         "g codex-master-agent-state -",
         'u codex-master-admin - "Codex Master administration daemon" /var/empty',
         'u codex-master-agent-api - "Codex Master agent API" /var/empty',
-        'u codex-master-host-agent - "Codex Master outbound host agent" /var/empty',
         "m codex-master-admin codex-master-agent-state",
         "m codex-master-agent-api codex-master-agent-state",
     ]
-    assert TMPFILES.read_text(encoding="utf-8").splitlines() == [
+    assert MASTER_TMPFILES.read_text(encoding="utf-8").splitlines() == [
         "d /var/lib/codex-master-agent 2770 codex-master-agent-api codex-master-agent-state -",
+    ]
+    assert SYSUSERS.read_text(encoding="utf-8").splitlines() == [
+        "g codex-master-host-agent -",
+        'u codex-master-host-agent - "Codex Master outbound host agent" /var/empty',
+    ]
+    assert TMPFILES.read_text(encoding="utf-8").splitlines() == [
         "d /var/lib/codex-master-host-agent 0700 codex-master-host-agent codex-master-host-agent -",
         "d /var/lib/codex-master-host-agent/ollama 0700 codex-master-host-agent codex-master-host-agent -",
     ]
@@ -241,9 +248,11 @@ def test_wheel_contract_contains_installer_units_and_static_account_layout() -> 
             "systemd/codex-master-host-agent.service",
         ],
         "lib/codex-master/systemd/sysusers.d": [
+            "systemd/sysusers.d/codex-master-agent-api.conf",
             "systemd/sysusers.d/codex-master-host-agent.conf"
         ],
         "lib/codex-master/systemd/tmpfiles.d": [
+            "systemd/tmpfiles.d/codex-master-agent-api.conf",
             "systemd/tmpfiles.d/codex-master-host-agent.conf"
         ],
         "libexec/codex-master": ["scripts/install-host-agent"],

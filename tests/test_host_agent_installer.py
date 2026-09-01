@@ -68,27 +68,31 @@ def _credential_sources(root: Path) -> dict[str, Path]:
 
 
 def _arguments(sources: dict[str, Path], destdir: Path, *extra: str) -> list[str]:
-    return [
-        "--agent-server-key",
-        os.fspath(sources["agent-server-key"]),
-        "--agent-server-cert",
-        os.fspath(sources["agent-server-cert"]),
-        "--agent-client-ca",
-        os.fspath(sources["agent-client-ca"]),
-        "--agent-bindings",
-        os.fspath(sources["agent-bindings"]),
-        "--agent-client-key",
-        os.fspath(sources["agent-client-key"]),
-        "--agent-client-cert",
-        os.fspath(sources["agent-client-cert"]),
-        "--agent-master-ca",
-        os.fspath(sources["agent-master-ca"]),
-        "--agent-config",
-        os.fspath(sources["agent-config"]),
-        "--destdir",
-        os.fspath(destdir),
-        *extra,
-    ]
+    return _role_arguments("worker", sources, destdir, *extra)
+
+
+def _role_arguments(
+    role: str, sources: dict[str, Path], destdir: Path, *extra: str
+) -> list[str]:
+    credentials = {
+        "master": (
+            "agent-server-key",
+            "agent-server-cert",
+            "agent-client-ca",
+            "agent-bindings",
+            "agent-listen-address",
+        ),
+        "worker": (
+            "agent-client-key",
+            "agent-client-cert",
+            "agent-master-ca",
+            "agent-config",
+        ),
+    }[role]
+    result = ["--role", role]
+    for name in credentials:
+        result.extend((f"--{name}", os.fspath(sources[name])))
+    return [*result, "--destdir", os.fspath(destdir), *extra]
 
 
 def _root_owned_sources(
@@ -114,6 +118,10 @@ def prepared_installer(
 ) -> tuple[ModuleType, dict[str, Path], Path, list[tuple[int, int]]]:
     module = _load_installer()
     sources = _credential_sources(tmp_path / "source")
+    listen_address = tmp_path / "source" / "agent-listen-address"
+    listen_address.write_text("10.23.4.5\n", encoding="ascii")
+    listen_address.chmod(0o444)
+    sources["agent-listen-address"] = listen_address
     units = {name: tmp_path / name for name in UNIT_NAMES}
     for name, unit in units.items():
         unit.write_text("[Service]\nExecStart=/usr/bin/" + name + "\n", encoding="utf-8")
@@ -125,8 +133,20 @@ def prepared_installer(
     tmpfiles.write_text("d /var/lib/codex-master-agent 2770 root root -\n", encoding="utf-8")
     tmpfiles.chmod(0o644)
     monkeypatch.setattr(module, "UNIT_SOURCES", units)
-    monkeypatch.setattr(module, "SYSUSERS_SOURCE", sysusers)
-    monkeypatch.setattr(module, "TMPFILES_SOURCE", tmpfiles)
+    monkeypatch.setattr(module, "SYSUSERS_SOURCE", sysusers, raising=False)
+    monkeypatch.setattr(module, "TMPFILES_SOURCE", tmpfiles, raising=False)
+    monkeypatch.setattr(
+        module,
+        "SYSUSERS_SOURCES",
+        {"master": sysusers, "worker": sysusers},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "TMPFILES_SOURCES",
+        {"master": tmpfiles, "worker": tmpfiles},
+        raising=False,
+    )
     destination = tmp_path / "destination"
     destination.mkdir()
     fchown_calls = _root_owned_sources(
@@ -138,6 +158,65 @@ def prepared_installer(
         tmpfiles,
     )
     return module, sources, destination, fchown_calls
+
+
+def test_worker_role_never_accepts_or_installs_master_credentials(
+    prepared_installer: tuple[ModuleType, dict[str, Path], Path, list[tuple[int, int]]],
+) -> None:
+    module, sources, destination, _fchown_calls = prepared_installer
+
+    assert module.main(_role_arguments("worker", sources, destination)) == 0
+
+    credentials = destination / "etc" / "codex-master"
+    assert {path.name for path in credentials.iterdir()} == {
+        "agent-client.key",
+        "agent-client.crt",
+        "agent-master-ca.crt",
+        "agent-config.json",
+    }
+    assert not (destination / "etc" / "codex-master-admin").exists()
+    assert {
+        path.name for path in (destination / "etc" / "systemd" / "system").iterdir()
+    } == {"codex-master-host-agent.service"}
+
+
+def test_master_role_never_accepts_or_installs_worker_credentials(
+    prepared_installer: tuple[ModuleType, dict[str, Path], Path, list[tuple[int, int]]],
+) -> None:
+    module, sources, destination, _fchown_calls = prepared_installer
+
+    assert module.main(_role_arguments("master", sources, destination)) == 0
+
+    credentials = destination / "etc" / "codex-master"
+    assert {path.name for path in credentials.iterdir()} == {
+        "agent-server.key",
+        "agent-server.crt",
+        "agent-client-ca.crt",
+        "agent-listen-address",
+    }
+    assert (
+        destination / "etc" / "codex-master-admin" / "agent-bindings.json"
+    ).is_file()
+    assert {
+        path.name for path in (destination / "etc" / "systemd" / "system").iterdir()
+    } == {"codex-master-agent-api.service"}
+
+
+@pytest.mark.parametrize(
+    ("role", "foreign"),
+    (("worker", "agent-server-key"), ("master", "agent-client-key")),
+)
+def test_roles_reject_foreign_credentials_before_mutation(
+    prepared_installer: tuple[ModuleType, dict[str, Path], Path, list[tuple[int, int]]],
+    role: str,
+    foreign: str,
+) -> None:
+    module, sources, destination, _fchown_calls = prepared_installer
+    arguments = _role_arguments(role, sources, destination)
+    arguments.extend((f"--{foreign}", os.fspath(sources[foreign])))
+
+    assert module.main(arguments) == 1
+    assert list(destination.iterdir()) == []
 
 
 def test_installer_rejects_relative_credential_paths_without_disclosing_content(
@@ -232,21 +311,16 @@ def test_install_is_atomic_idempotent_and_uses_exact_modes(
         for path in credentials.iterdir()
     }
     assert installed == {
-        "agent-server.key": (SECRET + b"agent-server-key", 0o400),
-        "agent-server.crt": (SECRET + b"agent-server-cert", 0o444),
-        "agent-client-ca.crt": (SECRET + b"agent-client-ca", 0o444),
         "agent-client.key": (SECRET + b"agent-client-key", 0o400),
         "agent-client.crt": (SECRET + b"agent-client-cert", 0o444),
         "agent-master-ca.crt": (SECRET + b"agent-master-ca", 0o444),
         "agent-config.json": (sources["agent-config"].read_bytes(), 0o400),
     }
-    assert (destination / "etc" / "codex-master-admin" / "agent-bindings.json").read_bytes() == (
-        b'{"schema_version":1,"hosts":[]}'
-    )
+    assert not (destination / "etc" / "codex-master-admin").exists()
     assert {
         path.name
         for path in (destination / "etc" / "systemd" / "system").iterdir()
-    } == set(UNIT_NAMES)
+    } == {UNIT_NAME}
     assert (destination / "usr" / "lib" / "sysusers.d" / "codex-master-host-agent.conf").is_file()
     assert (destination / "usr" / "lib" / "tmpfiles.d" / "codex-master-host-agent.conf").is_file()
     assert all(uid_gid == (os.geteuid(), os.getegid()) for uid_gid in fchown_calls)
@@ -291,7 +365,7 @@ def test_enable_reloads_then_enables_and_starts_only_the_host_agent_unit(
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
 
-    module._enable_service()
+    module._enable_service("worker")
 
     assert calls == [
         ["/usr/bin/systemctl", "daemon-reload"],
@@ -299,6 +373,31 @@ def test_enable_reloads_then_enables_and_starts_only_the_host_agent_unit(
     ]
     assert all(SECRET.decode("ascii") not in " ".join(argv) for argv in calls)
     assert all("agent-api" not in " ".join(argv) for argv in calls)
+
+
+def test_master_enable_starts_only_agent_api_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_installer()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda argv, **_kwargs: calls.append(argv)
+        or subprocess.CompletedProcess(argv, 0),
+    )
+
+    module._enable_service("master")
+
+    assert calls == [
+        ["/usr/bin/systemctl", "daemon-reload"],
+        [
+            "/usr/bin/systemctl",
+            "enable",
+            "--now",
+            "codex-master-agent-api.service",
+        ],
+    ]
 
 
 def test_static_layout_provisioner_is_scoped_to_its_destination_root(
@@ -313,7 +412,7 @@ def test_static_layout_provisioner_is_scoped_to_its_destination_root(
         or subprocess.CompletedProcess(argv, 0),
     )
 
-    module._provision_static_layout(tmp_path)
+    module._provision_static_layout(tmp_path, "worker")
 
     assert calls == [
         [
@@ -403,8 +502,8 @@ def test_commit_failure_restores_the_previous_complete_generation(
     credentials = destination / "etc" / "codex-master"
     original = {path.name: path.read_bytes() for path in credentials.iterdir()}
     for name, payload, mode in (
-        ("agent-server-key", b"replacement-key", 0o400),
-        ("agent-server-cert", b"replacement-cert", 0o444),
+        ("agent-client-key", b"replacement-key", 0o400),
+        ("agent-client-cert", b"replacement-cert", 0o444),
     ):
         sources[name].chmod(0o600)
         sources[name].write_bytes(payload)
@@ -412,7 +511,7 @@ def test_commit_failure_restores_the_previous_complete_generation(
     real_replace = module.os.replace
 
     def fail_second_commit(source, target, *args, **kwargs):
-        if str(source).startswith(".agent-server.crt.stage-") and target == "agent-server.crt":
+        if str(source).startswith(".agent-client.crt.stage-") and target == "agent-client.crt":
             raise OSError
         return real_replace(source, target, *args, **kwargs)
 
