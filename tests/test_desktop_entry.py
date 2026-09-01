@@ -276,7 +276,6 @@ class FleetDesktopEntryTest(unittest.TestCase):
             wrapper = root / "wrapper"
             wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
             wrapper.chmod(0o700)
-            install_path = root / "bin" / "codex-master-mcp"
             desktop_path = (
                 root / "share" / "applications" / server.FLEET_DESKTOP_ENTRY_NAME
             )
@@ -291,7 +290,11 @@ class FleetDesktopEntryTest(unittest.TestCase):
                     "codex_master.server.install_lock",
                     return_value=contextlib.nullcontext(),
                 ),
-                patch("codex_master.server.repo_wrapper_path", return_value=wrapper),
+                patch(
+                    "codex_master.server._codex_mcp_binding",
+                    return_value=contextlib.nullcontext(SimpleNamespace()),
+                ),
+                patch("codex_master.server._runtime_mcp_entrypoint", return_value=wrapper),
                 patch(
                     "codex_master.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
@@ -305,13 +308,11 @@ class FleetDesktopEntryTest(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     server.install(
                         register=False,
-                        install_path=install_path,
                         sync_plugin_cache=False,
                         install_desktop=True,
                     )
 
             self.assertFalse(desktop_path.exists())
-            self.assertFalse(install_path.exists())
 
     def test_restore_refuses_changed_installed_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -332,7 +333,6 @@ class FleetDesktopEntryTest(unittest.TestCase):
             wrapper = root / "wrapper"
             wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
             wrapper.chmod(0o700)
-            install_path = root / "bin" / "codex-master-mcp"
             desktop_path = (
                 root / "share" / "applications" / server.FLEET_DESKTOP_ENTRY_NAME
             )
@@ -343,7 +343,11 @@ class FleetDesktopEntryTest(unittest.TestCase):
                     "codex_master.server.install_lock",
                     return_value=contextlib.nullcontext(),
                 ),
-                patch("codex_master.server.repo_wrapper_path", return_value=wrapper),
+                patch(
+                    "codex_master.server._codex_mcp_binding",
+                    return_value=contextlib.nullcontext(SimpleNamespace()),
+                ),
+                patch("codex_master.server._runtime_mcp_entrypoint", return_value=wrapper),
                 patch(
                     "codex_master.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
@@ -357,23 +361,21 @@ class FleetDesktopEntryTest(unittest.TestCase):
                 with self.assertRaisesRegex(server.AgentError, "injected failure"):
                     server.install(
                         register=False,
-                        install_path=install_path,
                         sync_plugin_cache=True,
                         install_desktop=True,
                     )
 
             self.assertEqual(desktop_path.read_text(encoding="utf-8"), "old desktop\n")
-            self.assertFalse(install_path.exists())
 
     def test_install_with_nonportable_path_skips_desktop_without_breaking_install(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            wrapper = root / "wrapper"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(0o700)
             install_path = root / "nicht-portabel-ä" / "codex-master-mcp"
+            install_path.parent.mkdir()
+            install_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            install_path.chmod(0o700)
             desktop_path = (
                 root / "share" / "applications" / server.FLEET_DESKTOP_ENTRY_NAME
             )
@@ -384,7 +386,11 @@ class FleetDesktopEntryTest(unittest.TestCase):
                     "codex_master.server.install_lock",
                     return_value=contextlib.nullcontext(),
                 ),
-                patch("codex_master.server.repo_wrapper_path", return_value=wrapper),
+                patch(
+                    "codex_master.server._codex_mcp_binding",
+                    return_value=contextlib.nullcontext(SimpleNamespace()),
+                ),
+                patch("codex_master.server._runtime_mcp_entrypoint", return_value=install_path),
                 patch(
                     "codex_master.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
@@ -393,7 +399,6 @@ class FleetDesktopEntryTest(unittest.TestCase):
             ):
                 result = server.install(
                     register=False,
-                    install_path=install_path,
                     sync_plugin_cache=False,
                     install_desktop=True,
                 )
@@ -403,7 +408,6 @@ class FleetDesktopEntryTest(unittest.TestCase):
                 "skipped_unsupported_command_path",
             )
             self.assertEqual(result["desktop_entry"]["stale_entry"], "removed")
-            self.assertEqual(install_path.resolve(strict=False), wrapper)
             self.assertFalse(desktop_path.exists())
 
     def test_remove_and_restore_desktop_entry(self) -> None:
@@ -445,25 +449,26 @@ class FleetDesktopEntryTest(unittest.TestCase):
             self.assertEqual(result["status"], "left_in_place_different_content")
             self.assertTrue(path.exists())
 
-    def test_uninstall_failure_restores_symlink_and_desktop_entry(self) -> None:
+    def test_uninstall_failure_restores_desktop_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            wrapper = root / "wrapper"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(0o700)
-            install_path = root / "bin" / "codex-master-mcp"
-            install_path.parent.mkdir()
-            install_path.symlink_to(wrapper)
+            entrypoint = root / "codex-master-mcp"
+            entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
+            entrypoint.chmod(0o700)
             desktop_path = (
                 root / "share" / "applications" / server.FLEET_DESKTOP_ENTRY_NAME
             )
-            server.install_fleet_desktop_entry(install_path, desktop_path)
+            server.install_fleet_desktop_entry(entrypoint, desktop_path)
             with (
                 patch(
                     "codex_master.server.install_lock",
                     return_value=contextlib.nullcontext(),
                 ),
-                patch("codex_master.server.repo_wrapper_path", return_value=wrapper),
+                patch(
+                    "codex_master.server._codex_mcp_binding",
+                    return_value=contextlib.nullcontext(SimpleNamespace()),
+                ),
+                patch("codex_master.server._runtime_mcp_entrypoint", return_value=entrypoint),
                 patch(
                     "codex_master.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
@@ -473,7 +478,7 @@ class FleetDesktopEntryTest(unittest.TestCase):
                     return_value={"registered": True, "command_matches": True},
                 ),
                 patch(
-                    "codex_master.server.run_command",
+                    "codex_master.server._run_bound_codex_mcp_command",
                     return_value=server.subprocess.CompletedProcess(
                         ["codex", "mcp", "remove"], 1, "", ""
                     ),
@@ -484,29 +489,23 @@ class FleetDesktopEntryTest(unittest.TestCase):
                 ):
                     server.uninstall(
                         unregister=True,
-                        remove_symlink=True,
-                        install_path=install_path,
                         remove_desktop=True,
                     )
 
-            self.assertEqual(install_path.resolve(strict=False), wrapper)
             self.assertTrue(
-                server.verify_fleet_desktop_entry(install_path, desktop_path)["ok"]
+                server.verify_fleet_desktop_entry(entrypoint, desktop_path)["ok"]
             )
 
     def test_uninstall_call_assignment_interrupt_restores_desktop_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            wrapper = root / "wrapper"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(0o700)
-            install_path = root / "bin" / "codex-master-mcp"
-            install_path.parent.mkdir()
-            install_path.symlink_to(wrapper)
+            entrypoint = root / "codex-master-mcp"
+            entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
+            entrypoint.chmod(0o700)
             desktop_path = (
                 root / "share" / "applications" / server.FLEET_DESKTOP_ENTRY_NAME
             )
-            server.install_fleet_desktop_entry(install_path, desktop_path)
+            server.install_fleet_desktop_entry(entrypoint, desktop_path)
             real_remove = server.remove_fleet_desktop_entry
 
             def remove_then_interrupt(*args, **kwargs):
@@ -518,7 +517,11 @@ class FleetDesktopEntryTest(unittest.TestCase):
                     "codex_master.server.install_lock",
                     return_value=contextlib.nullcontext(),
                 ),
-                patch("codex_master.server.repo_wrapper_path", return_value=wrapper),
+                patch(
+                    "codex_master.server._codex_mcp_binding",
+                    return_value=contextlib.nullcontext(SimpleNamespace()),
+                ),
+                patch("codex_master.server._runtime_mcp_entrypoint", return_value=entrypoint),
                 patch(
                     "codex_master.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
@@ -531,25 +534,22 @@ class FleetDesktopEntryTest(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     server.uninstall(
                         unregister=False,
-                        remove_symlink=True,
-                        install_path=install_path,
                         remove_desktop=True,
                     )
 
-            self.assertEqual(install_path.resolve(strict=False), wrapper)
             self.assertTrue(
-                server.verify_fleet_desktop_entry(install_path, desktop_path)["ok"]
+                server.verify_fleet_desktop_entry(entrypoint, desktop_path)["ok"]
             )
 
     @patch("codex_master.server.print_json", return_value=0)
     @patch("codex_master.server.uninstall", return_value={"ok": True})
-    def test_cli_remove_symlink_requests_desktop_removal(
+    def test_cli_uninstall_preserves_desktop_entry(
         self, mock_uninstall, _mock_print_json
     ) -> None:
-        result = server.main_cli(["uninstall", "--remove-symlink"])
+        result = server.main_cli(["uninstall"])
 
         self.assertEqual(result, 0)
-        self.assertEqual(mock_uninstall.call_args.kwargs["remove_desktop"], True)
+        self.assertEqual(mock_uninstall.call_args.kwargs["remove_desktop"], False)
 
     @patch("codex_master.server.print_json", return_value=0)
     @patch("codex_master.server.install", return_value={"ok": True})

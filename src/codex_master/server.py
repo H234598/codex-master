@@ -30754,6 +30754,11 @@ def _fleet_apply_managed_update(
         except Exception as exc:
             if not rollback():
                 raise AgentError("fleet_update_rollback_diverged") from None
+            if transaction is not None:
+                _fleet_complete_rolled_back_transaction(
+                    transaction,
+                    current.generation,
+                )
             if isinstance(exc, AgentError):
                 raise
             raise AgentError("fleet_managed_update_failed") from None
@@ -30813,12 +30818,12 @@ def _fleet_apply_managed_update(
                 backups = []
                 staged = []
                 raise AgentError("fleet_update_rollback_diverged") from None
+            if transaction is not None:
+                _fleet_complete_rolled_back_transaction(
+                    transaction,
+                    current.generation,
+                )
             if isinstance(exc, FleetConflictError):
-                if transaction is not None:
-                    _fleet_complete_rolled_back_transaction(
-                        transaction,
-                        current.generation,
-                    )
                 created = []
                 backups = []
                 staged = []
@@ -31235,6 +31240,12 @@ def fleet_series_apply(
                 materialization["create_ids"],
                 materialization["remove_ids"],
             )
+            with _fleet_artifact_builder(
+                candidate.runner,
+                codex_executable=codex_executable,
+                gemini_executable=gemini_executable,
+            ) as preflight_artifacts:
+                preflight_artifacts.validate()  # type: ignore[attr-defined]
             with _fleet_active_recovery_transaction(
                 _FleetRecoveryTransaction.begin(
                     RecoveryOperation.SERIES_APPLY,
@@ -31310,6 +31321,13 @@ def fleet_series_apply(
         preplanned_create_names: dict[str, str] = {}
         planned_tombstone_indexes: dict[str, int] = {}
         planned_tombstone_names: dict[str, str] = {}
+        if create_ids or verify_keep_ids:
+            with _fleet_artifact_builder(
+                candidate.runner,
+                codex_executable=codex_executable,
+                gemini_executable=gemini_executable,
+            ) as preflight_artifacts:
+                preflight_artifacts.validate()  # type: ignore[attr-defined]
         if create_ids or update_ids or remove_ids:
             prepared_entries: list[RecoveryEntry] = []
             current_inventory = build_inventory(current, AGENT_POOL_ROOT)
@@ -31586,12 +31604,12 @@ def fleet_series_apply(
                             created = []
                             staged = []
                             raise AgentError("fleet_create_rollback_diverged") from None
+                        if active_tx is not None:
+                            _fleet_complete_rolled_back_transaction(
+                                active_tx,
+                                current.generation,
+                            )
                         if isinstance(exc, FleetConflictError):
-                            if active_tx is not None:
-                                _fleet_complete_rolled_back_transaction(
-                                    active_tx,
-                                    current.generation,
-                                )
                             created = []
                             staged = []
                             raise AgentError("generation_conflict") from None
@@ -31650,6 +31668,15 @@ def fleet_series_apply(
                         clean = False
                     if not clean:
                         raise AgentError("fleet_create_rollback_diverged") from None
+                    if (
+                        active_tx is not None
+                        and active_tx.journal.phase
+                        in {RecoveryPhase.PREPARED, RecoveryPhase.MATERIALIZING}
+                    ):
+                        _fleet_complete_rolled_back_transaction(
+                            active_tx,
+                            current.generation,
+                        )
                     if isinstance(exc, AgentError):
                         raise
                     raise AgentError("fleet_materialization_failed") from None

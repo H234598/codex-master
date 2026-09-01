@@ -189,7 +189,10 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
                 enforce_master_role=True,
             )
 
-        self.assertEqual(listed["result"]["tools"], [])
+        self.assertEqual(
+            [tool["name"] for tool in listed["result"]["tools"]],
+            ["runtime_status"],
+        )
         self.assertTrue(called["result"]["isError"])
         self.assertIn("teamleader", called["result"]["content"][0]["text"])
         dispatch.assert_not_called()
@@ -329,7 +332,7 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
             wrapper.chmod(0o700)
             with patch("codex_master.server.assert_install_context_allows_master_registration"), patch(
-                "codex_master.server.repo_wrapper_path", return_value=wrapper
+                "codex_master.server._runtime_mcp_entrypoint", return_value=wrapper
             ), patch(
                 "codex_master.server.enroll_current_teamleader",
                 return_value={"changed": True},
@@ -340,7 +343,11 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
                 return_value={"ok": False},
             ):
                 with self.assertRaisesRegex(server.AgentError, "startup self-test"):
-                    server._install_unlocked(register=True, sync_plugin_cache=False)
+                    server._install_unlocked(
+                        register=True,
+                        sync_plugin_cache=False,
+                        binding=SimpleNamespace(),
+                    )
             revoke.assert_called_once_with()
 
     def test_failure_after_preflight_also_rolls_back_new_enrollment(self) -> None:
@@ -356,7 +363,7 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             "codex_master.server.revoke_current_teamleader"
         ) as revoke:
             with self.assertRaisesRegex(server.AgentError, "later failure"):
-                server._install_unlocked(register=True)
+                server._install_unlocked(register=True, binding=SimpleNamespace())
         revoke.assert_called_once_with()
 
     def test_keyboard_interrupt_after_enrollment_still_revokes(self) -> None:
@@ -372,68 +379,69 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             "codex_master.server.revoke_current_teamleader"
         ) as revoke:
             with self.assertRaises(KeyboardInterrupt):
-                server._install_unlocked(register=True)
+                server._install_unlocked(register=True, binding=SimpleNamespace())
         revoke.assert_called_once_with()
 
     def test_successful_mcp_uninstall_revokes_current_teamleader(self) -> None:
         with patch(
+            "codex_master.server._runtime_mcp_entrypoint",
+            return_value=Path("/runtime/bin/codex-master-mcp"),
+        ), patch(
             "codex_master.server.check_mcp_registration",
             return_value={"registered": True, "command_matches": True},
         ), patch(
-            "codex_master.server.run_command",
+            "codex_master.server._run_bound_codex_mcp_command",
             return_value=subprocess.CompletedProcess([], 0, "", ""),
         ), patch(
             "codex_master.server.revoke_current_teamleader",
             return_value={"changed": True},
         ) as revoke:
-            result = server._uninstall_unlocked(unregister=True, remove_symlink=False)
+            result = server._uninstall_unlocked(
+                unregister=True, binding=SimpleNamespace()
+            )
         self.assertEqual(result["teamleader"], "removed")
         revoke.assert_called_once_with()
 
     def test_idempotent_uninstall_revokes_without_existing_mcp_registration(self) -> None:
         with patch(
+            "codex_master.server._runtime_mcp_entrypoint",
+            return_value=Path("/runtime/bin/codex-master-mcp"),
+        ), patch(
             "codex_master.server.check_mcp_registration",
             return_value={"registered": False, "lookup_status": "not_registered"},
         ), patch(
             "codex_master.server.revoke_current_teamleader",
             return_value={"changed": True},
         ) as revoke:
-            result = server._uninstall_unlocked(unregister=True, remove_symlink=False)
+            result = server._uninstall_unlocked(
+                unregister=True, binding=SimpleNamespace()
+            )
         self.assertEqual(result["teamleader"], "removed")
         revoke.assert_called_once_with()
 
-    def test_uninstall_revocation_failure_restores_symlink_and_mcp_registration(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            wrapper = root / "wrapper"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(0o700)
-            install_path = root / "bin" / "codex-master-mcp"
-            install_path.parent.mkdir()
-            install_path.symlink_to(wrapper)
-            with patch(
-                "codex_master.server.repo_wrapper_path", return_value=wrapper
-            ), patch(
-                "codex_master.server.check_mcp_registration",
-                return_value={"registered": True, "command_matches": True},
-            ), patch(
-                "codex_master.server.run_command",
-                side_effect=[
-                    subprocess.CompletedProcess([], 0, "", ""),
-                    subprocess.CompletedProcess([], 0, "", ""),
-                ],
-            ) as command, patch(
-                "codex_master.server.revoke_current_teamleader",
-                side_effect=server.AgentError("registry failure"),
-            ):
-                with self.assertRaisesRegex(server.AgentError, "registry failure"):
-                    server._uninstall_unlocked(
-                        unregister=True,
-                        remove_symlink=True,
-                        install_path=install_path,
-                    )
-            self.assertEqual(install_path.resolve(), wrapper)
-            self.assertEqual(command.call_count, 2)
+    def test_uninstall_revocation_failure_restores_mcp_registration(self) -> None:
+        with patch(
+            "codex_master.server._runtime_mcp_entrypoint",
+            return_value=Path("/runtime/bin/codex-master-mcp"),
+        ), patch(
+            "codex_master.server.check_mcp_registration",
+            return_value={"registered": True, "command_matches": True},
+        ), patch(
+            "codex_master.server._run_bound_codex_mcp_command",
+            side_effect=[
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ],
+        ) as command, patch(
+            "codex_master.server.revoke_current_teamleader",
+            side_effect=server.AgentError("registry failure"),
+        ):
+            with self.assertRaisesRegex(server.AgentError, "registry failure"):
+                server._uninstall_unlocked(
+                    unregister=True,
+                    binding=SimpleNamespace(),
+                )
+        self.assertEqual(command.call_count, 2)
 
 
 if __name__ == "__main__":

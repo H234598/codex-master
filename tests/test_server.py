@@ -25,6 +25,7 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
+import pytest
 import yaml
 
 import codex_master.server as server_module
@@ -56,7 +57,6 @@ from codex_master.usage_snapshot import (
     UsageSnapshot,
     UsageTrendV2,
 )
-
 
 from codex_master.server import (
     AgentError,
@@ -128,11 +128,9 @@ from codex_master.server import (
     dismiss_codex_update_prompt,
     DEFAULT_AGENT_MODEL,
     DEFAULT_AGENT_MODEL_EFFORT,
-    doctor,
     ensure_state,
     ensure_assignment_session_model,
     handle_rpc,
-    install,
     agent_lease_status,
     public_agent_lease,
     public_error_payload,
@@ -187,7 +185,6 @@ from codex_master.server import (
     trim_chars,
     trim_lines,
     tui_accepts_input,
-    uninstall,
     wait_agent,
     wait_agent_input_ready,
     wait_terminal_status,
@@ -223,6 +220,30 @@ from codex_master.server import (
     watchdog_output_changed_since_marker,
     system_resource_snapshot,
 )
+
+
+@pytest.fixture(autouse=True)
+def _green_hive_probe_for_server_unit_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Keep unrelated server unit tests behind a valid capacity precondition."""
+
+    monkeypatch.setattr(
+        server_module,
+        "read_probe_gate",
+        lambda: {
+            "allowed": True,
+            "reason_code": "probe_ready",
+            "raw_output": "not_returned",
+        },
+    )
+    runtime_entrypoint = tmp_path / "codex-master-mcp"
+    runtime_entrypoint.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    runtime_entrypoint.chmod(0o700)
+    monkeypatch.setattr(
+        server_module, "_runtime_mcp_entrypoint", lambda: runtime_entrypoint
+    )
 
 
 RESOURCE_TEST_BOOT_ID = "123e4567-e89b-12d3-a456-426614174000"
@@ -3095,7 +3116,9 @@ class ServerHelpersTest(unittest.TestCase):
                 with self.assertRaises(AgentCapacityError) as raised:
                     start_agent("a", cwd=directory, replacement_reservation_id="r")
 
-        self.assertEqual(raised.exception.payload["reason_codes"], ["resource_snapshot_invalid"])
+        self.assertEqual(
+            raised.exception.payload["reason_codes"], ["cgroup_preflight_failed"]
+        )
         run_tmux.assert_not_called()
 
     def test_private_g5_tmux_router_uses_validated_meta_socket_and_public_meta_redacts_it(self) -> None:
@@ -4390,6 +4413,11 @@ class ServerHelpersTest(unittest.TestCase):
                 "running_agents": 10,
                 "reason_codes": [],
             },
+        ), patch(
+            "codex_master.server._typed_g5_cgroup_runtime",
+            return_value=(object(), object()),
+        ), patch(
+            "codex_master.server._g5_warmup_active", return_value=False
         ):
             result = spawn_admission_decision(1)
 
@@ -4448,6 +4476,11 @@ class ServerHelpersTest(unittest.TestCase):
             "codex_master.server.native_agent_status", return_value=native
         ), patch(
             "codex_master.server.system_resource_snapshot", new=system_resource_snapshot
+        ), patch(
+            "codex_master.server._typed_g5_cgroup_runtime",
+            return_value=(object(), object()),
+        ), patch(
+            "codex_master.server._g5_warmup_active", return_value=False
         ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
             "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
         ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
@@ -5931,6 +5964,34 @@ class ServerHelpersTest(unittest.TestCase):
                 "features": {"memories": True},
             },
         )
+
+    def test_codex_config_path_honors_relative_codex_home_without_creation(self) -> None:
+        relative_home = Path(f".test-codex-home-{uuid.uuid4().hex}")
+        expected = Path.cwd() / relative_home / "config.toml"
+
+        with patch.dict("os.environ", {"CODEX_HOME": str(relative_home)}):
+            result = server_module.codex_config_path()
+
+        self.assertEqual(result, expected)
+        self.assertFalse(expected.exists())
+
+    def test_restore_mcp_startup_timeout_snapshot_restores_existing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / ".codex" / "config.toml"
+            config.parent.mkdir()
+            original = "[mcp_servers.codex-master-mcp]\nstartup_timeout_sec = 60\n"
+            config.write_text(original, encoding="utf-8")
+            config.chmod(0o600)
+
+            result = server_module.ensure_mcp_startup_timeout_configured(
+                config, capture_snapshot=True
+            )
+            server_module.restore_mcp_startup_timeout_snapshot(
+                result["_config_snapshot"]
+            )
+
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
 
     def test_ensure_mcp_startup_timeout_configured_is_path_sparse_and_no_follow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -19555,7 +19616,7 @@ google_accounts:
 
     @patch("codex_master.server.record_assignment", side_effect=AgentError("record failed"))
     @patch("codex_master.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
-    def test_agent_assign_keeps_fresh_lease_when_recording_fails_after_send(
+    def test_agent_assign_does_not_invent_lease_when_recording_fails_without_restart(
         self, _mock_send, _mock_record
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -19581,8 +19642,8 @@ google_accounts:
 
                 lease = agent_lease_status("a")
 
-        self.assertEqual(lease["state"], "held")
-        self.assertTrue(lease["held_by_this_server"])
+        self.assertEqual(lease["state"], "unclaimed")
+        self.assertFalse(lease["held_by_this_server"])
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
@@ -28231,6 +28292,7 @@ google_accounts:
             require_lease=True,
             manage_unclaimed=False,
             dry_run=False,
+            safe_shutdown_only=False,
         )
 
     def test_direct_usage_watchdog_acquires_lifecycle_lock_when_mutating(self) -> None:
@@ -28260,7 +28322,9 @@ google_accounts:
         self.assertEqual(result["status"], "ok")
         self.assertEqual(events, ["lock", "unlock"])
         mock_lock.assert_called_once_with("a1")
-        mock_unlocked.assert_called_once_with("a1", dry_run=False)
+        mock_unlocked.assert_called_once_with(
+            "a1", dry_run=False, safe_shutdown_only=False
+        )
 
     @patch("codex_master.server.claim_agent_with_wait")
     def test_mutating_tools_require_auth_by_default_and_allow_bootstrap_override(self, mock_claim_with_wait) -> None:
@@ -30020,52 +30084,6 @@ google_accounts:
         self.assertFalse(outside.exists())
         self.assertNotIn(str(outside), str(raised.exception))
 
-    def test_repo_wrapper_works_via_symlink(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        wrapper = repo_root / "bin" / "codex-master-mcp"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            symlink = root / "codex-master-mcp"
-            symlink.symlink_to(wrapper)
-            home = root / "home"
-            codex_home = home / ".codex"
-            codex_home.mkdir(parents=True)
-            state = root / "state"
-            state.mkdir()
-            registry = state / "teamleaders.json"
-            registry.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 2,
-                        "principals": [
-                            {
-                                "digest": server_module.teamleader_principal_digest(codex_home),
-                                "class": "koenigin",
-                                "agent_id": None,
-                            }
-                        ],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            registry.chmod(0o600)
-            child_env = dict(
-                os.environ,
-                HOME=str(home),
-                CODEX_HOME=str(codex_home),
-                CODEX_MASTER_MCP_STATE=str(state),
-            )
-            result = subprocess.run(
-                [str(symlink), "tools"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=child_env,
-                check=True,
-            )
-        payload = json.loads(result.stdout)
-        self.assertIn("agent_start", {tool["name"] for tool in payload["tools"]})
 
     def test_agent_skills_inventory_is_metadata_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -31280,7 +31298,7 @@ google_accounts:
         self.assertEqual(start.call_args.kwargs["model"], DEFAULT_AGENT_MODEL)
         self.assertEqual(start.call_args.kwargs["model_reasoning_effort"], DEFAULT_AGENT_MODEL_EFFORT)
 
-    def test_agent_assign_keeps_fresh_lease_when_model_switch_leaves_home_process(
+    def test_agent_assign_does_not_release_unacquired_lease_when_model_switch_fails(
         self,
     ) -> None:
         with (
@@ -31304,7 +31322,7 @@ google_accounts:
             patch(
                 "codex_master.server.claim_for_agent_mutation",
                 return_value=({"state": "held", "held_by_this_server": True}, True),
-            ),
+            ) as mock_claim,
             patch(
                 "codex_master.server.ensure_assignment_session_model",
                 side_effect=AgentError("orphaned process"),
@@ -31328,7 +31346,8 @@ google_accounts:
                     allow_unauthenticated=True,
                 )
 
-        self.assertTrue(mock_model.call_args.kwargs["release_lease_on_failure"])
+        self.assertFalse(mock_model.call_args.kwargs["release_lease_on_failure"])
+        mock_claim.assert_not_called()
         mock_release.assert_not_called()
 
     def test_bound_teamleader_assign_uses_ensure_unchanged_without_restart_or_spawn(
@@ -32930,7 +32949,8 @@ class AppletStatusContractTest(unittest.TestCase):
         state = server_module.applet_action_state(row, usage, admission, run_marker=None)
         token = server_module.issue_applet_action_token("start", "a1", state, b"k" * 32)
 
-        result = server_module.applet_action("start", "a1", token)
+        with patch("codex_master.server.require_fleet_recovery_ready"):
+            result = server_module.applet_action("start", "a1", token)
 
         self.assertEqual(
             result,
@@ -32986,7 +33006,9 @@ class AppletStatusContractTest(unittest.TestCase):
         result = server_module.applet_action("stop", "a1", token)
 
         self.assertEqual(result["state"], "sleeping")
-        mock_claim.assert_called_once_with("a1", ttl_seconds=60)
+        mock_claim.assert_called_once_with(
+            "a1", ttl_seconds=60, enforce_recovery_gate=False
+        )
         mock_stop.assert_called_once_with("a1")
         self.assertNotIn("lease", result)
         self.assertNotIn("account", json.dumps(result, sort_keys=True))
@@ -34624,608 +34646,24 @@ class CliLifecycleTest(unittest.TestCase):
         payload = json.loads(mock_print.call_args.args[0])
         self.assertEqual(payload["error"], f"raw log max_bytes must be <= {MAX_RAW_LOG_BYTES}")
 
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.print_json")
-    def test_cli_install_plans_expected_local_install_flow(self, mock_print_json, mock_run) -> None:
-        captured_payloads = []
-        link_created = False
 
-        def _capture(payload):
-            captured_payloads.append(payload)
-            return 0
 
-        mock_print_json.side_effect = _capture
-        with tempfile.TemporaryDirectory() as tmp_home:
-            local_bin = Path(tmp_home) / ".local" / "bin"
-            local_bin.mkdir(parents=True, exist_ok=True)
-            with patch("codex_master.server.enroll_current_teamleader", return_value={"changed": False}), patch.dict(
-                "os.environ", {"HOME": tmp_home}
-            ):
-                with patch("codex_master.server.shutil.which", return_value="/usr/bin/codex"):
-                    mock_run.side_effect = [
-                        subprocess.CompletedProcess(
-                            ["codex", "mcp", "get", "codex-master-mcp"],
-                            1,
-                            "",
-                            "Error: No MCP server named 'codex-master-mcp' found.\n",
-                        ),
-                        subprocess.CompletedProcess(
-                            [
-                                "codex",
-                                "mcp",
-                                "add",
-                                "codex-master-mcp",
-                                "--",
-                                str(Path(tmp_home) / ".local" / "bin" / "codex-master-mcp"),
-                            ],
-                            0,
-                            "",
-                            "",
-                        ),
-                    ]
-                    result = main_cli(["install", "--path", str(Path(tmp_home) / ".local" / "bin" / "codex-master-mcp")])
-                    link_created = (Path(tmp_home) / ".local" / "bin" / "codex-master-mcp").exists()
-                    config_content = (Path(tmp_home) / ".codex" / "config.toml").read_text(encoding="utf-8")
 
-        install_link = Path(tmp_home) / ".local" / "bin" / "codex-master-mcp"
-        self.assertEqual(result, 0)
-        self.assertEqual(len(captured_payloads), 1)
-        payload = captured_payloads[0]
-        self.assertEqual(payload.get("ok"), True)
-        self.assertEqual(payload.get("install_path"), "not_returned")
-        self.assertEqual(payload.get("install_path_state"), "set")
-        self.assertEqual(payload.get("install_path_kind"), "configured_install_path")
-        self.assertEqual(payload.get("target"), "not_returned")
-        self.assertEqual(payload.get("target_state"), "repo_wrapper")
-        self.assertEqual(payload.get("symlink"), "created")
-        self.assertEqual(payload["mcp"]["requested"], True)
-        self.assertEqual(payload["mcp"]["status"], "registered")
-        self.assertEqual(payload["mcp"]["startup_timeout"]["status"], "updated")
-        self.assertEqual(payload["mcp"]["startup_timeout"]["startup_timeout_sec"], 120)
-        self.assertEqual(payload["mcp"]["startup_timeout"]["config_path"], "not_returned")
-        self.assertTrue(payload["startup_self_test"]["ok"])
-        self.assertEqual(payload["startup_self_test"]["raw_output"], "not_returned")
-        self.assertTrue(payload["plugin_cache_install"]["ok"])
-        self.assertEqual(payload["plugin_cache_install"]["status"], "synced")
-        self.assertEqual(payload["plugin_cache_install"]["cache_entry"], "not_returned")
-        self.assertEqual(payload["plugin_cache_install"]["plugin_cache"]["path"], "not_returned")
-        self.assertIn("startup_timeout_sec = 120", config_content)
-        self.assertIn('default_tools_approval_mode = "approve"', config_content)
-        self.assertTrue(link_created)
-        payload_text = json.dumps(payload, sort_keys=True)
-        self.assertNotIn(str(install_link), payload_text)
-        self.assertNotIn(str(Path(__file__).resolve().parents[1] / "bin" / "codex-master-mcp"), payload_text)
-        self.assertNotIn(str(Path(tmp_home)), payload_text)
-        mock_run.assert_any_call(["codex", "mcp", "add", "codex-master-mcp", "--", str(install_link)])
 
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_missing_repo_wrapper_error_is_path_sparse(self, mock_wrapper_path) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            mock_wrapper_path.return_value = wrapper
 
-            with self.assertRaisesRegex(AgentError, "repo wrapper missing") as raised:
-                install(register=False, install_path=install_link, sync_plugin_cache=False)
 
-        self.assertNotIn(str(tmp_path), str(raised.exception))
-        self.assertNotIn("secret-repo", str(raised.exception))
 
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_non_executable_repo_wrapper_error_is_path_sparse(self, mock_wrapper_path) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
-            wrapper.parent.mkdir(parents=True)
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(0o600)
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            mock_wrapper_path.return_value = wrapper
 
-            with self.assertRaisesRegex(AgentError, "repo wrapper is not executable") as raised:
-                install(register=False, install_path=install_link, sync_plugin_cache=False)
 
-        self.assertNotIn(str(tmp_path), str(raised.exception))
-        self.assertNotIn("secret-repo", str(raised.exception))
 
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_rejects_executable_directory_as_repo_wrapper(self, mock_wrapper_path) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
-            wrapper.mkdir(parents=True)
-            wrapper.chmod(0o700)
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            mock_wrapper_path.return_value = wrapper
 
-            with self.assertRaisesRegex(AgentError, "repo wrapper is not executable") as raised:
-                install(register=False, install_path=install_link, sync_plugin_cache=False)
 
-        self.assertNotIn(str(tmp_path), str(raised.exception))
-        self.assertNotIn("secret-repo", str(raised.exception))
 
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_mcp_add_failure_is_data_sparse(
-        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
-            wrapper.parent.mkdir(parents=True)
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {"registered": False, "ok": False, "startup_timeout_ok": True}
-            mock_run.return_value = subprocess.CompletedProcess(
-                ["codex", "mcp", "add"],
-                1,
-                "",
-                f"SECRET_OUTPUT_SHOULD_NOT_RETURN {tmp_path}\n",
-            )
 
-            with self.assertRaisesRegex(AgentError, "codex mcp add failed") as raised:
-                install(register=True, install_path=install_link, sync_plugin_cache=False)
 
-        error_text = str(raised.exception)
-        self.assertNotIn(str(tmp_path), error_text)
-        self.assertNotIn("SECRET_OUTPUT_SHOULD_NOT_RETURN", error_text)
 
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_force_restores_previous_mcp_registration_after_add_failure(
-        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
-            previous_command = tmp_path / "previous-codex"
-            wrapper.parent.mkdir(parents=True)
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            previous_command.write_text("#!/bin/sh\n", encoding="utf-8")
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            install_link.parent.mkdir()
-            install_link.symlink_to(previous_command)
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {
-                "registered": True,
-                "command_matches": False,
-                "startup_timeout_ok": True,
-                "_registered_command": str(previous_command),
-            }
-            mock_run.side_effect = [
-                subprocess.CompletedProcess(["codex", "mcp", "remove"], 0, "", ""),
-                subprocess.CompletedProcess(["codex", "mcp", "add"], 1, "", ""),
-                subprocess.CompletedProcess(["codex", "mcp", "add"], 0, "", ""),
-            ]
 
-            with self.assertRaisesRegex(AgentError, "codex mcp add failed"):
-                install(register=True, force=True, install_path=install_link, sync_plugin_cache=False)
 
-            commands = [call.args[0] for call in mock_run.call_args_list]
-            restored_link = install_link.resolve(strict=False)
-
-        self.assertEqual(
-            commands,
-            [
-                ["codex", "mcp", "remove", MCP_SERVER_NAME],
-                ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_link)],
-                ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(previous_command)],
-            ],
-        )
-        self.assertEqual(restored_link, previous_command)
-
-    def test_install_cache_failure_preserves_existing_install_link(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            previous_target = tmp_path / "previous-target"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            previous_target.write_text("previous\n", encoding="utf-8")
-            install_link.parent.mkdir()
-            install_link.symlink_to(previous_target)
-
-            with patch("codex_master.server.repo_wrapper_path", return_value=wrapper), patch(
-                "codex_master.server.sync_plugin_cache_from_repo",
-                side_effect=AgentError("injected cache failure"),
-            ):
-                with self.assertRaisesRegex(AgentError, "injected cache failure"):
-                    install(register=False, force=True, install_path=install_link)
-
-            resolved = install_link.resolve(strict=False)
-
-        self.assertEqual(resolved, previous_target)
-
-    @patch("codex_master.server.sync_plugin_cache_from_repo")
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_does_not_sync_plugin_cache_after_mcp_failure(
-        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run, mock_sync
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {
-                "registered": False,
-                "lookup_status": "not_registered",
-                "ok": False,
-                "startup_timeout_ok": True,
-            }
-            mock_run.return_value = subprocess.CompletedProcess(["codex", "mcp", "add"], 1, "", "")
-
-            with self.assertRaisesRegex(AgentError, "codex mcp add failed"):
-                install(register=True, install_path=install_link)
-
-        mock_sync.assert_not_called()
-
-    @patch("codex_master.server.sync_plugin_cache_from_repo", side_effect=AgentError("cache failed"))
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_cache_failure_restores_startup_timeout_config(
-        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run, _mock_sync
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            config = tmp_path / ".codex" / "config.toml"
-            config.parent.mkdir()
-            config.write_text(
-                "[mcp_servers.codex-master-mcp]\nstartup_timeout_sec = 60\n",
-                encoding="utf-8",
-            )
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {
-                "registered": False,
-                "lookup_status": "not_registered",
-                "ok": False,
-                "startup_timeout_ok": False,
-            }
-            mock_run.side_effect = [
-                subprocess.CompletedProcess(["codex", "mcp", "add"], 0, "", ""),
-                subprocess.CompletedProcess(["codex", "mcp", "remove"], 0, "", ""),
-            ]
-
-            with patch("codex_master.server.enroll_current_teamleader", return_value={"changed": False}), patch.dict(
-                "os.environ", {"HOME": str(tmp_path)}, clear=False
-            ):
-                with self.assertRaisesRegex(AgentError, "cache failed"):
-                    install(register=True, install_path=install_link)
-
-            config_content = config.read_text(encoding="utf-8")
-            link_exists = install_link.exists() or install_link.is_symlink()
-
-        self.assertEqual(config_content, "[mcp_servers.codex-master-mcp]\nstartup_timeout_sec = 60\n")
-        self.assertFalse(link_exists)
-
-    @patch("codex_master.server.sync_plugin_cache_from_repo")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_refuses_incomplete_plugin_cache_before_link_mutation(
-        self, mock_wrapper_path, mock_sync
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-            mock_sync.return_value = {
-                "ok": False,
-                "status": "sync_incomplete",
-                "raw_output": "not_returned",
-            }
-
-            with self.assertRaisesRegex(AgentError, "plugin cache sync incomplete"):
-                install(register=False, install_path=install_link)
-
-            link_exists = install_link.exists() or install_link.is_symlink()
-
-        self.assertFalse(link_exists)
-        mock_sync.assert_called_once_with()
-
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_force_refuses_uninspectable_mcp_registration(
-        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            previous_target = tmp_path / "previous-target"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            previous_target.write_text("previous\n", encoding="utf-8")
-            install_link.parent.mkdir()
-            install_link.symlink_to(previous_target)
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {
-                "registered": True,
-                "command_matches": False,
-                "startup_timeout_ok": True,
-            }
-
-            with self.assertRaisesRegex(
-                AgentError,
-                "registration command could not be inspected; refusing force replacement",
-            ):
-                install(register=True, force=True, install_path=install_link, sync_plugin_cache=False)
-
-            resolved = install_link.resolve(strict=False)
-
-        self.assertEqual(resolved, previous_target)
-        mock_run.assert_not_called()
-
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_refuses_unknown_mcp_lookup_after_link_rollback(
-        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {
-                "registered": False,
-                "lookup_status": "unavailable",
-                "ok": False,
-            }
-
-            with self.assertRaisesRegex(AgentError, "registration could not be inspected"):
-                install(register=True, install_path=install_link, sync_plugin_cache=False)
-
-            link_exists = install_link.exists() or install_link.is_symlink()
-
-        self.assertFalse(link_exists)
-        mock_run.assert_not_called()
-
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_force_refuses_existing_regular_file_without_overwrite(self, mock_wrapper_path) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_path = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            install_path.parent.mkdir()
-            install_path.write_text("keep me\n", encoding="utf-8")
-            mock_wrapper_path.return_value = wrapper
-
-            with self.assertRaisesRegex(AgentError, "install path exists and is not this wrapper symlink"):
-                install(register=False, force=True, install_path=install_path, sync_plugin_cache=False)
-
-            content = install_path.read_text(encoding="utf-8")
-
-        self.assertEqual(content, "keep me\n")
-
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.ensure_mcp_startup_timeout_configured", side_effect=AgentError("timeout failed"))
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_timeout_failure_removes_new_mcp_registration(
-        self, mock_wrapper_path, mock_self_test, mock_registration, _mock_timeout, mock_run
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {
-                "registered": False,
-                "ok": False,
-                "startup_timeout_ok": False,
-            }
-            mock_run.side_effect = [
-                subprocess.CompletedProcess(["codex", "mcp", "add"], 0, "", ""),
-                subprocess.CompletedProcess(["codex", "mcp", "remove"], 0, "", ""),
-            ]
-
-            with self.assertRaisesRegex(AgentError, "timeout failed"):
-                install(register=True, install_path=install_link, sync_plugin_cache=False)
-
-            commands = [call.args[0] for call in mock_run.call_args_list]
-            link_exists = install_link.exists() or install_link.is_symlink()
-
-        self.assertEqual(
-            commands,
-            [
-                ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_link)],
-                ["codex", "mcp", "remove", MCP_SERVER_NAME],
-            ],
-        )
-        self.assertFalse(link_exists)
-
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_mcp_remove_failure_is_data_sparse(
-        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
-            wrapper.parent.mkdir(parents=True)
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {
-                "registered": True,
-                "ok": False,
-                "startup_timeout_ok": True,
-                "_registered_command": str(tmp_path / "previous-codex"),
-            }
-            mock_run.return_value = subprocess.CompletedProcess(
-                ["codex", "mcp", "remove"],
-                1,
-                "",
-                f"SECRET_OUTPUT_SHOULD_NOT_RETURN {tmp_path}\n",
-            )
-
-            with self.assertRaisesRegex(AgentError, "codex mcp remove failed") as raised:
-                install(register=True, force=True, install_path=install_link, sync_plugin_cache=False)
-
-        error_text = str(raised.exception)
-        self.assertNotIn(str(tmp_path), error_text)
-        self.assertNotIn("SECRET_OUTPUT_SHOULD_NOT_RETURN", error_text)
-
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_refuses_failed_startup_self_test_before_writing_link(
-        self, mock_wrapper_path, mock_self_test
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": False, "status": "failed", "raw_output": "not_returned"}
-
-            with self.assertRaisesRegex(AgentError, "startup self-test"):
-                install(register=True, install_path=install_link)
-            link_exists = install_link.exists() or install_link.is_symlink()
-
-        self.assertFalse(link_exists)
-
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_self_tests_installed_path_before_registration(
-        self, mock_wrapper_path, mock_self_test, mock_registration
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {"registered": True, "ok": True, "startup_timeout_ok": True}
-
-            install(register=True, install_path=install_link, sync_plugin_cache=False)
-
-        self.assertEqual(mock_self_test.call_args_list[0].args[0], wrapper)
-        self.assertEqual(mock_self_test.call_args_list[1].args[0], install_link)
-
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.ensure_mcp_startup_timeout_configured")
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_keeps_matching_registration_when_timeout_is_stale(
-        self, mock_wrapper_path, mock_self_test, mock_registration, mock_timeout, mock_run
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {
-                "registered": True,
-                "command_matches": True,
-                "ok": False,
-                "startup_timeout_ok": False,
-            }
-            mock_timeout.return_value = {"status": "updated", "raw_output": "not_returned"}
-
-            result = install(register=True, install_path=install_link, sync_plugin_cache=False)
-
-        self.assertEqual(result["mcp"]["status"], "already_registered")
-        self.assertEqual(result["mcp"]["startup_timeout"]["status"], "updated")
-        mock_run.assert_not_called()
-
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.ensure_mcp_startup_timeout_configured")
-    @patch("codex_master.server.codex_client_mcp_config_status")
-    @patch("codex_master.server.check_mcp_registration")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_migrates_matching_registration_when_approval_mode_is_prompt(
-        self,
-        mock_wrapper_path,
-        mock_self_test,
-        mock_registration,
-        mock_client_config,
-        mock_timeout,
-        mock_run,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {
-                "registered": True,
-                "command_matches": True,
-                "ok": True,
-                "startup_timeout_ok": True,
-            }
-            mock_client_config.return_value = {
-                "startup_timeout_ok": True,
-                "default_tools_approval_mode": "prompt",
-                "default_tools_approval_mode_ok": False,
-            }
-            mock_timeout.return_value = {"status": "updated", "raw_output": "not_returned"}
-
-            with patch.object(server_module, "ensure_applet_action_key"):
-                result = server_module._install_enrolled_unlocked(
-                    register=True,
-                    install_path=install_link,
-                    sync_plugin_cache=False,
-                )
-
-        self.assertEqual(result["mcp"]["status"], "already_registered")
-        self.assertEqual(result["mcp"]["startup_timeout"]["status"], "updated")
-        mock_timeout.assert_called_once_with(capture_snapshot=True)
-        mock_run.assert_not_called()
 
     @patch("codex_master.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_is_data_sparse(self, mock_run) -> None:
@@ -35358,517 +34796,17 @@ class CliLifecycleTest(unittest.TestCase):
             )
         )
 
-    def test_install_refuses_master_registration_inside_managed_agent_home(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            agent_home = tmp_path / "agent-a-home"
-            agents = {
-                "a": {"label": "A", "runner": tmp_path / "a-runner", "home": agent_home, "session": "session-a"},
-                "b": {
-                    "label": "B",
-                    "runner": tmp_path / "b-runner",
-                    "home": tmp_path / "agent-b-home",
-                    "session": "session-b",
-                },
-            }
-            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": str(agent_home)}), patch.dict(
-                "codex_master.server.AGENTS", agents, clear=True
-            ):
-                with self.assertRaisesRegex(AgentError, "managed Agentin home"):
-                    install(register=True, install_path=install_link)
-            link_exists = install_link.exists() or install_link.is_symlink()
 
-        self.assertFalse(link_exists)
 
-    @patch("codex_master.server.print_json")
-    def test_cli_uninstall_plans_expected_local_unregister_flow(self, mock_print_json) -> None:
-        captured_payloads = []
 
-        def _capture(payload):
-            captured_payloads.append(payload)
-            return 0
 
-        mock_print_json.side_effect = _capture
-        with tempfile.TemporaryDirectory() as tmp_home:
-            wrapper = Path(__file__).resolve().parents[1] / "bin" / "codex-master-mcp"
-            install_link = Path(tmp_home) / ".local" / "bin" / "codex-master-mcp"
-            install_link.parent.mkdir(parents=True, exist_ok=True)
-            install_link.symlink_to(wrapper)
-            with patch.dict("os.environ", {"HOME": tmp_home}):
-                result = main_cli(
-                    ["uninstall", "--remove-symlink", "--keep-registration", "--path", str(install_link)]
-                )
 
-        self.assertEqual(result, 0)
-        self.assertFalse(install_link.exists())
-        self.assertEqual(len(captured_payloads), 1)
-        payload = captured_payloads[0]
-        self.assertEqual(payload.get("ok"), True)
-        self.assertEqual(payload.get("symlink"), "removed")
-        self.assertEqual(payload.get("mcp"), "skipped")
 
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.check_mcp_registration")
-    def test_uninstall_mcp_remove_failure_is_data_sparse(self, mock_registration, mock_run) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            mock_registration.return_value = {"registered": True, "command_matches": True, "ok": False}
-            mock_run.return_value = subprocess.CompletedProcess(
-                ["codex", "mcp", "remove"],
-                1,
-                "",
-                f"SECRET_OUTPUT_SHOULD_NOT_RETURN {tmp_path}\n",
-            )
 
-            with self.assertRaisesRegex(AgentError, "codex mcp remove failed") as raised:
-                uninstall(unregister=True, remove_symlink=False, install_path=install_link)
 
-        error_text = str(raised.exception)
-        self.assertNotIn(str(tmp_path), error_text)
-        self.assertNotIn("SECRET_OUTPUT_SHOULD_NOT_RETURN", error_text)
 
-    def test_uninstall_symlink_failure_does_not_unregister_mcp(self) -> None:
-        from codex_master import server as server_module
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            install_link = Path(tmpdir) / "bin" / "codex-master-mcp"
-            install_link.parent.mkdir()
 
-            with patch.object(
-                server_module,
-                "remove_install_symlink_if_repo_wrapper",
-                side_effect=AgentError("injected symlink removal failure"),
-            ), patch.object(server_module, "check_mcp_registration") as mock_registration, patch.object(
-                server_module, "run_command"
-            ) as mock_run:
-                with self.assertRaisesRegex(AgentError, "injected symlink removal failure"):
-                    uninstall(unregister=True, remove_symlink=True, install_path=install_link)
-
-        mock_registration.assert_not_called()
-        mock_run.assert_not_called()
-
-    def test_uninstall_mcp_failure_restores_removed_install_link(self) -> None:
-        from codex_master import server as server_module
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            install_link.parent.mkdir()
-            install_link.symlink_to(wrapper)
-
-            with patch.object(server_module, "repo_wrapper_path", return_value=wrapper), patch.object(
-                server_module,
-                "check_mcp_registration",
-                return_value={"registered": True, "command_matches": True},
-            ), patch.object(
-                server_module,
-                "run_command",
-                return_value=subprocess.CompletedProcess(["codex", "mcp", "remove"], 1, "", ""),
-            ):
-                with self.assertRaisesRegex(AgentError, "codex mcp remove failed"):
-                    uninstall(unregister=True, remove_symlink=True, install_path=install_link)
-
-            restored = install_link.resolve(strict=False)
-
-        self.assertEqual(restored, wrapper)
-
-    def test_uninstall_unknown_mcp_status_restores_removed_install_link(self) -> None:
-        from codex_master import server as server_module
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "bin" / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            install_link.parent.mkdir()
-            install_link.symlink_to(wrapper)
-
-            with patch.object(server_module, "repo_wrapper_path", return_value=wrapper), patch.object(
-                server_module,
-                "check_mcp_registration",
-                return_value={"registered": False, "lookup_status": "unavailable", "ok": False},
-            ), patch.object(server_module, "run_command") as mock_run:
-                with self.assertRaisesRegex(AgentError, "registration could not be inspected"):
-                    uninstall(unregister=True, remove_symlink=True, install_path=install_link)
-
-            restored = install_link.resolve(strict=False)
-
-        self.assertEqual(restored, wrapper)
-        mock_run.assert_not_called()
-
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server.check_mcp_registration")
-    def test_uninstall_leaves_different_mcp_registration_in_place(self, mock_registration, mock_run) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            install_link = Path(tmpdir) / "bin" / "codex-master-mcp"
-            mock_registration.return_value = {"registered": True, "command_matches": False, "ok": False}
-
-            result = uninstall(unregister=True, remove_symlink=False, install_path=install_link)
-
-        self.assertEqual(result["mcp"], "left_in_place_different_command")
-        mock_run.assert_not_called()
-
-    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_refuses_symlink_parent_without_writing_redirected_path(self, mock_wrapper_path, _mock_registration) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            real_bin = tmp_path / "real-bin"
-            link_bin = tmp_path / "link-bin"
-            redirected = real_bin / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            real_bin.mkdir()
-            link_bin.symlink_to(real_bin, target_is_directory=True)
-            mock_wrapper_path.return_value = wrapper
-
-            with self.assertRaisesRegex(AgentError, "install parent directories must be real directories") as raised:
-                install_path = link_bin / "codex-master-mcp"
-                from codex_master.server import install
-
-                install(register=False, install_path=install_path)
-
-            redirected_exists = redirected.exists() or redirected.is_symlink()
-
-        self.assertFalse(redirected_exists)
-        self.assertNotIn(str(link_bin), str(raised.exception))
-        self.assertNotIn(str(real_bin), str(raised.exception))
-
-    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_handles_install_path_symlink_loop_without_crashing(
-        self, mock_wrapper_path, _mock_registration
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            install_link.symlink_to(install_link)
-            mock_wrapper_path.return_value = wrapper
-
-            with self.assertRaisesRegex(AgentError, "install path exists and is not this wrapper symlink"):
-                install(register=False, install_path=install_link)
-
-            still_symlink = install_link.is_symlink()
-
-        self.assertTrue(still_symlink)
-
-    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
-    @patch("codex_master.server.repo_wrapper_path")
-    @patch("codex_master.server.ensure_directory_chain_no_symlink")
-    def test_install_refuses_parent_swap_after_validation_without_redirecting(
-        self, mock_ensure_chain, mock_wrapper_path, _mock_registration
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            real_bin = tmp_path / "real-bin"
-            link_bin = tmp_path / "link-bin"
-            redirected = real_bin / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            real_bin.mkdir()
-            link_bin.mkdir()
-            mock_wrapper_path.return_value = wrapper
-
-            def swap_parent(path, _error_text):
-                if Path(path) == link_bin:
-                    link_bin.rmdir()
-                    link_bin.symlink_to(real_bin, target_is_directory=True)
-
-            mock_ensure_chain.side_effect = swap_parent
-
-            with self.assertRaisesRegex(AgentError, "could_not_write_install_symlink") as raised:
-                install(register=False, force=True, install_path=link_bin / "codex-master-mcp", sync_plugin_cache=False)
-
-            redirected_exists = redirected.exists() or redirected.is_symlink()
-
-        self.assertFalse(redirected_exists)
-        self.assertNotIn(str(link_bin), str(raised.exception))
-        self.assertNotIn(str(real_bin), str(raised.exception))
-
-    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
-    @patch("codex_master.server.repo_wrapper_path")
-    @patch("codex_master.server.ensure_directory_chain_no_symlink")
-    def test_install_refuses_real_parent_swap_after_validation(
-        self, mock_ensure_chain, mock_wrapper_path, _mock_registration
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            old_bin = tmp_path / "old-bin"
-            link_bin = tmp_path / "link-bin"
-            replacement_bin = tmp_path / "replacement-bin"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            link_bin.mkdir()
-            replacement_bin.mkdir()
-            mock_wrapper_path.return_value = wrapper
-
-            def swap_parent(path, _error_text):
-                if Path(path) == link_bin:
-                    link_bin.rename(old_bin)
-                    replacement_bin.rename(link_bin)
-
-            mock_ensure_chain.side_effect = swap_parent
-
-            with self.assertRaisesRegex(AgentError, "could_not_write_install_symlink"):
-                install(register=False, install_path=link_bin / "codex-master-mcp", sync_plugin_cache=False)
-
-            replacement_link = link_bin / "codex-master-mcp"
-            replacement_exists = replacement_link.exists() or replacement_link.is_symlink()
-
-        self.assertFalse(replacement_exists)
-
-    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_force_replaces_mismatched_symlink_atomically(
-        self, mock_wrapper_path, _mock_registration
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            other = tmp_path / "other-wrapper"
-            install_link = tmp_path / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            other.write_text("#!/bin/sh\n", encoding="utf-8")
-            install_link.symlink_to(other)
-            mock_wrapper_path.return_value = wrapper
-
-            result = install(register=False, force=True, install_path=install_link, sync_plugin_cache=False)
-            resolved = install_link.resolve(strict=False)
-            tmp_links = list(tmp_path.glob(".codex-master-mcp.tmp.*"))
-
-        self.assertEqual(result["symlink"], "replaced")
-        self.assertEqual(result["install_path"], "not_returned")
-        self.assertEqual(resolved, wrapper)
-        self.assertEqual(tmp_links, [])
-
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_install_refuses_install_path_swap_before_replace(self, mock_wrapper_path) -> None:
-        from codex_master import server as server_module
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_path = tmp_path / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            mock_wrapper_path.return_value = wrapper
-            real_replace = server_module.replace_install_symlink
-
-            def swap_target_then_replace(path: Path, target: Path, **kwargs: Any) -> None:
-                path.write_text("keep me\n", encoding="utf-8")
-                real_replace(path, target, **kwargs)
-
-            with patch.object(server_module, "replace_install_symlink", side_effect=swap_target_then_replace):
-                with self.assertRaisesRegex(AgentError, "install path changed after validation"):
-                    install(register=False, install_path=install_path, sync_plugin_cache=False)
-
-            content = install_path.read_text(encoding="utf-8")
-
-        self.assertEqual(content, "keep me\n")
-
-    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_uninstall_refuses_symlink_parent_without_removing_redirected_link(
-        self, mock_wrapper_path, _mock_registration
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            real_bin = tmp_path / "real-bin"
-            link_bin = tmp_path / "link-bin"
-            redirected = real_bin / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            real_bin.mkdir()
-            redirected.symlink_to(wrapper)
-            link_bin.symlink_to(real_bin, target_is_directory=True)
-            mock_wrapper_path.return_value = wrapper
-
-            with self.assertRaisesRegex(AgentError, "install parent directories must be real directories") as raised:
-                from codex_master.server import uninstall
-
-                uninstall(unregister=False, remove_symlink=True, install_path=link_bin / "codex-master-mcp")
-
-            redirected_is_symlink = redirected.is_symlink()
-
-        self.assertTrue(redirected_is_symlink)
-        self.assertNotIn(str(link_bin), str(raised.exception))
-        self.assertNotIn(str(real_bin), str(raised.exception))
-
-    @patch("codex_master.server.repo_wrapper_path")
-    @patch("codex_master.server.ensure_directory_chain_no_symlink")
-    def test_uninstall_refuses_parent_swap_after_validation_without_removing_redirected_link(
-        self, mock_ensure_chain, mock_wrapper_path
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            real_bin = tmp_path / "real-bin"
-            link_bin = tmp_path / "link-bin"
-            redirected = real_bin / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            real_bin.mkdir()
-            redirected.symlink_to(wrapper)
-            link_bin.mkdir()
-            mock_wrapper_path.return_value = wrapper
-
-            def swap_parent(path, _error_text):
-                if Path(path) == link_bin:
-                    link_bin.rmdir()
-                    link_bin.symlink_to(real_bin, target_is_directory=True)
-
-            mock_ensure_chain.side_effect = swap_parent
-
-            with self.assertRaisesRegex(AgentError, "could_not_remove_install_symlink") as raised:
-                uninstall(unregister=False, remove_symlink=True, install_path=link_bin / "codex-master-mcp")
-
-            redirected_is_symlink = redirected.is_symlink()
-
-        self.assertTrue(redirected_is_symlink)
-        self.assertNotIn(str(link_bin), str(raised.exception))
-        self.assertNotIn(str(real_bin), str(raised.exception))
-
-    @patch("codex_master.server.repo_wrapper_path")
-    @patch("codex_master.server.ensure_directory_chain_no_symlink")
-    def test_uninstall_refuses_real_parent_swap_after_validation(
-        self, mock_ensure_chain, mock_wrapper_path
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            old_bin = tmp_path / "old-bin"
-            link_bin = tmp_path / "link-bin"
-            replacement_bin = tmp_path / "replacement-bin"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            link_bin.mkdir()
-            replacement_bin.mkdir()
-            replacement_link = replacement_bin / "codex-master-mcp"
-            replacement_link.symlink_to(wrapper)
-            mock_wrapper_path.return_value = wrapper
-
-            def swap_parent(path, _error_text):
-                if Path(path) == link_bin:
-                    link_bin.rename(old_bin)
-                    replacement_bin.rename(link_bin)
-
-            mock_ensure_chain.side_effect = swap_parent
-
-            with self.assertRaisesRegex(AgentError, "could_not_remove_install_symlink"):
-                uninstall(unregister=False, remove_symlink=True, install_path=link_bin / "codex-master-mcp")
-
-            replacement_link = link_bin / "codex-master-mcp"
-            replacement_is_symlink = replacement_link.is_symlink()
-
-        self.assertTrue(replacement_is_symlink)
-
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_uninstall_leaves_install_path_symlink_loop_without_crashing(self, mock_wrapper_path) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            install_link.symlink_to(install_link)
-            mock_wrapper_path.return_value = wrapper
-
-            result = uninstall(unregister=False, remove_symlink=True, install_path=install_link)
-            still_symlink = install_link.is_symlink()
-
-        self.assertEqual(result["symlink"], "left_in_place_not_repo_wrapper")
-        self.assertTrue(still_symlink)
-
-    def test_uninstall_missing_parent_is_noop_without_creating_directories(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            install_path = Path(tmpdir) / "missing" / "bin" / "codex-master-mcp"
-
-            result = uninstall(unregister=False, remove_symlink=True, install_path=install_path)
-
-            parent_exists = install_path.parent.exists()
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["symlink"], "missing")
-        self.assertFalse(parent_exists)
-
-    @patch("codex_master.server.agent_home_process_summary")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
-    @patch("codex_master.server.shutil.which")
-    @patch("codex_master.server.repo_wrapper_path")
-    def test_doctor_reports_unreadable_install_symlink_loop_without_crashing(
-        self,
-        mock_wrapper_path,
-        mock_shutil_which,
-        _mock_check_mcp_registration,
-        _mock_tmux_alive,
-        mock_agent_home_process_summary,
-    ) -> None:
-        mock_shutil_which.side_effect = lambda cmd: "/usr/bin/" + cmd if cmd in {"codex", "tmux"} else None
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            wrapper = tmp_path / "wrapper"
-            install_link = tmp_path / "codex-master-mcp"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-            install_link.symlink_to(install_link)
-            mock_wrapper_path.return_value = wrapper
-            mock_agent_home_process_summary.side_effect = lambda agent: {
-                "home": agent,
-                "process_count": 0,
-                "managed_process_count": 0,
-                "external_process_count": 0,
-                "external_processes": [],
-                "external_processes_truncated": False,
-            }
-
-            agents = {
-                "a": {"label": "A", "runner": tmp_path / "a-runner", "home": tmp_path / "a", "session": "session-a"},
-                "b": {"label": "B", "runner": tmp_path / "b-runner", "home": tmp_path / "b", "session": "session-b"},
-            }
-            for cfg in agents.values():
-                cfg["runner"].write_text("#!/bin/sh\n", encoding="utf-8")
-                cfg["runner"].chmod(cfg["runner"].stat().st_mode | stat.S_IXUSR)
-                cfg["home"].mkdir()
-            outside_home = tmp_path / "outside-home"
-            outside_home.mkdir()
-            agents["a"]["home"].rmdir()
-            agents["a"]["home"].symlink_to(outside_home, target_is_directory=True)
-
-            with patch("codex_master.server.DEFAULT_INSTALL_PATH", install_link), patch.dict(
-                "codex_master.server.AGENTS", agents, clear=True
-            ), patch("codex_master.server.STATE_ROOT", tmp_path / "state"), patch(
-                "codex_master.server.RAW_DIR", tmp_path / "state" / "raw"
-            ), patch(
-                "codex_master.server.META_DIR", tmp_path / "state" / "meta"
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", tmp_path / "legacy-state"), patch(
-                "codex_master.server.LEGACY_META_DIR", tmp_path / "legacy-state" / "meta"
-            ):
-                result = doctor()
-
-        installed = next(item for item in result["checks"] if item["name"] == "installed_symlink")
-        self.assertFalse(installed["ok"])
-        self.assertEqual(installed["path"], "not_returned")
-        self.assertEqual(installed["target"], "<unreadable>")
-        self.assertEqual(installed["target_state"], "unreadable")
-        home_check = next(item for item in result["checks"] if item["name"] == "agent_a_home_exists")
-        self.assertFalse(home_check["ok"])
-        self.assertNotIn(str(install_link), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch(
@@ -38993,7 +37931,12 @@ class NativeAgentRegistryTest(unittest.TestCase):
                     "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
                 ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
                     "codex_master.server._resource_meminfo", return_value=(50.0, 8192.0)
-                ), patch("codex_master.server._effective_cpu_count", return_value=4):
+                ), patch("codex_master.server._effective_cpu_count", return_value=4), patch(
+                    "codex_master.server._typed_g5_cgroup_runtime",
+                    return_value=(object(), object()),
+                ), patch(
+                    "codex_master.server._g5_warmup_active", return_value=False
+                ):
                     result = spawn_admission_decision(1)
 
         self.assertFalse(result["allowed"])
@@ -41652,7 +40595,7 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
         self.assertIsNotNone(reply)
         assert reply is not None
         tools = {tool["name"]: tool for tool in reply["result"]["tools"]}
-        self.assertEqual(len(tools), 86)
+        self.assertEqual(len(tools), 88)
         for allowed_name in {
             "fleet_google_inventory",
             "fleet_openai_accounts",
@@ -41730,7 +40673,7 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
             status = server_module.master_tool_access_status()
 
         self.assertTrue(status["authorized"])
-        self.assertEqual(status["visible_tool_count"], 86)
+        self.assertEqual(status["visible_tool_count"], 88)
 
     def test_admin_capability_catalog_rejects_wire_shape_downgrade(self) -> None:
         from codex_master.admin_contracts import (
