@@ -50,7 +50,7 @@ EXPECTED_PAYLOAD = (
     (
         "python/codex_master/fleet_home_broker_client.py",
         "src/codex_master/fleet_home_broker_client.py",
-        "a6277900a8fddbf835968e27562348483d4af5bcd77fd8e3cafc36dcb189e24c",
+        "c75697379ff1c5a32fb5c7c9ea07a837418415a6fdf0568b0ada2ad93d905fb4",
         420,
     ),
     (
@@ -62,7 +62,7 @@ EXPECTED_PAYLOAD = (
     (
         "python/codex_master/fleet_home_broker_linux.py",
         "src/codex_master/fleet_home_broker_linux.py",
-        "c5a07911fb052375ea82b1ab489d20ec13af1f96a38f31e9cd94be010465e249",
+        "1746cb2f493381356a6543ee1b7d8f9ddf966a16137ea373fa5d131c6443fefc",
         420,
     ),
     (
@@ -74,7 +74,7 @@ EXPECTED_PAYLOAD = (
     (
         "python/codex_master/fleet_home_broker_protocol.py",
         "src/codex_master/fleet_home_broker_protocol.py",
-        "a13c533d4a2425bbab72e64494321955155d1fa8fb6c6c2de2a8fea97ae0f55f",
+        "1407cf0cba84e2df35a66aa7b467fd618414b9269bd100cde8d65d11590fe165",
         420,
     ),
     (
@@ -101,19 +101,19 @@ EXPECTED_MANIFEST_BYTES = (
     b'83b5288383e58d4fb95f21fbe15de3596030d80025813d1d48134a613b5def0b",'
     b'"mode":420},'
     b'{"path":"python/codex_master/fleet_home_broker_client.py","sha256":"'
-    b'a6277900a8fddbf835968e27562348483d4af5bcd77fd8e3cafc36dcb189e24c",'
+    b'c75697379ff1c5a32fb5c7c9ea07a837418415a6fdf0568b0ada2ad93d905fb4",'
     b'"mode":420},'
     b'{"path":"python/codex_master/fleet_home_broker_identity.py","sha256":"'
     b'e1020cac4275441a9720d2ea9029288cbf2f2289054278e2508e4169d0990c49",'
     b'"mode":420},'
     b'{"path":"python/codex_master/fleet_home_broker_linux.py","sha256":"'
-    b'c5a07911fb052375ea82b1ab489d20ec13af1f96a38f31e9cd94be010465e249",'
+    b'1746cb2f493381356a6543ee1b7d8f9ddf966a16137ea373fa5d131c6443fefc",'
     b'"mode":420},'
     b'{"path":"python/codex_master/fleet_home_broker_package.py","sha256":"'
     b'7989c0c92dab6cf1ea7ce3d4b8de6433756525bd5bd9f293e1041a9ccf0c5de6",'
     b'"mode":420},'
     b'{"path":"python/codex_master/fleet_home_broker_protocol.py","sha256":"'
-    b'a13c533d4a2425bbab72e64494321955155d1fa8fb6c6c2de2a8fea97ae0f55f",'
+    b'1407cf0cba84e2df35a66aa7b467fd618414b9269bd100cde8d65d11590fe165",'
     b'"mode":420},'
     b'{"path":"python/codex_master/fleet_home_broker_wal.py","sha256":"'
     b'f720caf69b6b036315dcfd86691c89be5f5ec8e6c8acd125b68f786f25213920",'

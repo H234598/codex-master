@@ -3,18 +3,26 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from codex_master.hive.messages import HiveMessageError, validate_message
+from codex_master.hive.principals import Principal, PrincipalRegistry
 from codex_master.hive.status import (
+    admission_status,
     aggregate_godbee_status,
     aggregate_queen_status,
     aggregate_teamlead_status,
+    godbee_status,
     proactive_anchor_status,
     hive_doctor,
     hive_status,
+    queen_list,
+    queen_status,
+    queue_status,
+    selection_status,
 )
 from codex_master.hive.runtime import HiveRuntimeEvidence
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+DIGEST = "sha256:" + "a" * 64
 
 
 def report(
@@ -44,6 +52,63 @@ def report(
         "payload": {"status": status, "raw_output": "not_returned", "private": "not_returned"},
         "raw_output": "not_returned",
     })
+
+
+def principal_registry() -> PrincipalRegistry:
+    registry = PrincipalRegistry()
+    registry.create(Principal("godbee-main", "gottbiene", None, "profile", "global", None, "active", DIGEST, 1))
+    registry.create(Principal("queen-repo", "koenigin", "godbee-main", "profile", "repository", "repo-one", "active", DIGEST, 1))
+    registry.create(Principal("lead-one", "teamleiterin", "queen-repo", "profile", "repository", "repo-one", "active", DIGEST, 1))
+    return registry
+
+
+def test_admission_status_redacts_private_routing_fields() -> None:
+    assert admission_status("admission-one", state="queued") == {
+        "admission_id": "admission-one",
+        "state": "queued",
+        "account_key": "not_returned",
+        "scope": "not_returned",
+        "raw_output": "not_returned",
+    }
+    with pytest.raises(ValueError, match="invalid_admission_id"):
+        admission_status("")
+
+
+def test_godbee_status_is_data_sparse_and_read_only() -> None:
+    assert godbee_status() == {
+        "principal_class": "gottbiene",
+        "direct_repository_writes": False,
+        "open_requests": 0,
+        "raw_output": "not_returned",
+    }
+
+
+def test_queen_list_returns_only_queen_principals() -> None:
+    result = queen_list(offset=0, limit=10, registry=principal_registry())
+    assert [item["principal_id"] for item in result["items"]] == ["queen-repo"]
+    assert result["raw_output"] == "not_returned"
+
+
+def test_queen_status_rejects_non_queen_principals() -> None:
+    registry = principal_registry()
+    assert queen_status("queen-repo", registry=registry)["state"] == "active"
+    with pytest.raises(ValueError, match="not_a_queen"):
+        queen_status("lead-one", registry=registry)
+
+
+def test_queue_status_filters_non_mappings_before_pagination() -> None:
+    result = queue_status(offset=1, limit=1, items=({"id": "first"}, object(), {"id": "second"}))
+    assert result["items"] == [{"id": "second"}]
+    with pytest.raises(ValueError, match="invalid_status_pagination"):
+        queue_status(offset=0, limit=True)
+
+
+def test_selection_status_is_preview_only() -> None:
+    assert selection_status() == {
+        "mode": "preview_only",
+        "eligible_candidates": 0,
+        "raw_output": "not_returned",
+    }
 
 
 def test_hierarchical_aggregates_keep_teamlead_queen_and_godbee_scopes_separate() -> None:

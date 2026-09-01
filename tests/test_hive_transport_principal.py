@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from codex_master.hive import transport_principal
 from codex_master.hive.authority import AuthorityContext, AuthorityEngine
 from codex_master.hive.principals import ExecutionBinding, Principal, PrincipalRegistry
 from codex_master.hive.repositories import RepositoryBinding, RepositoryRegistry
@@ -23,6 +24,12 @@ CAPABILITIES = (
     "hive.resource.trend.read",
     "hive.resource.absolute.read",
 )
+
+
+def test_transport_identifier_redacts_validation_details() -> None:
+    assert transport_principal._identifier("principal-one", "principal") == "principal-one"
+    with pytest.raises(TransportPrincipalError, match="resource_access_denied"):
+        transport_principal._identifier("bad principal", "principal")
 
 
 class FakeVerifier:

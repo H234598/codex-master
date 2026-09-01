@@ -46,6 +46,32 @@ def private_dir(path: Path) -> Path:
     return path
 
 
+def test_attestation_race_hooks_default_to_noop() -> None:
+    assert limit_tracker._before_release_recheck() is None
+    assert limit_tracker._before_payload_recheck(1, "active.json", 2) is None
+
+
+def test_non_finite_json_and_emergency_block_state_are_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="non-finite JSON constant: NaN"):
+        limit_tracker._reject_non_finite("NaN")
+
+    state = {
+        "state": "running",
+        "generation": 3,
+        "children": [],
+        "plans": [],
+        "emergency_active": True,
+    }
+    monkeypatch.setattr(limit_tracker, "_queen_state", state)
+
+    assert limit_tracker.set_emergency_queen_blocked(2, "stale")["updated"] is False
+    blocked = limit_tracker.set_emergency_queen_blocked(3, "waiting")
+    assert blocked["updated"] is True
+    assert blocked["state"]["blocked_reason"] == "waiting"
+
+
 def private_file(path: Path, payload: bytes, mode: int = 0o600) -> Path:
     path.write_bytes(payload)
     path.chmod(mode)

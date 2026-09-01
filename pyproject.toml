@@ -8,6 +8,7 @@ version = "0.10.5"
 description = "Local MCP wrapper for controlling a sleeping Codex Agentinnen pool via tmux"
 requires-python = ">=3.11"
 dependencies = [
+  "PyJWT[crypto]>=2.9,<3",
   "PyYAML>=6.0",
   "dbus-python==1.4.0",
   "PyGObject==3.56.3",
@@ -18,9 +19,17 @@ google-identity = [
     "google-auth>=2.35",
     "google-auth-oauthlib>=1.2",
 ]
+test-index = [
+    "tree-sitter==0.26.0",
+    "tree-sitter-javascript==0.25.0",
+    "tree-sitter-typescript==0.23.2",
+]
 
 [project.scripts]
 codex-master-mcp = "codex_master.server:main"
+codex-master-admin = "codex_master.admin_daemon:main"
+codex-master-agent-api = "codex_master.agent_daemon:main"
+codex-master-host-agent = "codex_master.host_agent:main"
 google-account-manager = "codex_master.google_account_manager_cli:main"
 
 [tool.setuptools.packages.find]
@@ -28,3 +37,19 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 codex_master = ["markdown/*.md", "markdown/classes/*.md"]
+
+[tool.setuptools.data-files]
+"lib/codex-master/systemd" = [
+  "systemd/codex-master-admin.service",
+  "systemd/codex-master-agent-api.service",
+  "systemd/codex-master-host-agent.service",
+]
+"lib/codex-master/systemd/sysusers.d" = [
+  "systemd/sysusers.d/codex-master-agent-api.conf",
+  "systemd/sysusers.d/codex-master-host-agent.conf",
+]
+"lib/codex-master/systemd/tmpfiles.d" = [
+  "systemd/tmpfiles.d/codex-master-agent-api.conf",
+  "systemd/tmpfiles.d/codex-master-host-agent.conf",
+]
+"libexec/codex-master" = ["scripts/install-host-agent"]

@@ -45,10 +45,9 @@ def _valid_identifier(value: object) -> bool:
 
 def _private_directory(path: Path) -> None:
     try:
-        status = path.lstat()
+        path.lstat()
     except FileNotFoundError:
         path.mkdir(mode=0o700, parents=True)
-        status = path.lstat()
     if not path.is_dir() or path.is_symlink():
         raise QueenRuntimeError("queen_runtime_root_invalid")
     os.chmod(path, 0o700)

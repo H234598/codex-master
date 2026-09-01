@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+import codex_master.fleet_home_broker_protocol as protocol
 from codex_master.fleet_home_broker_protocol import (
     AgentStartClaim,
     AgentStartEnvironmentProjection,
@@ -267,6 +268,139 @@ def agent_start_envelope(**changes):
         home_attestation,
     )
     return dataclasses.replace(value, **changes)
+
+
+def test_binding_doc_projects_operation_and_nested_bindings():
+    value = binding(ChpbTransactionOperation.REPLACE)
+
+    assert protocol._binding_doc(value) == {
+        "operation": "replace",
+        "policy": protocol._policy_doc(value.policy),
+        "principal": protocol._principal_doc(value.principal),
+        "store_uuid": U,
+        "transaction_id": T,
+    }
+
+
+def test_digest_requires_lowercase_hex_of_requested_size():
+    assert protocol._digest("f" * 32, 32) == "f" * 32
+    assert protocol._digest("e" * 64, 64) == "e" * 64
+
+    with pytest.raises(ChpbValidationError) as error:
+        protocol._digest("F" * 32, 32)
+    assert error.value.code is ChpbValidationCode.INVALID_FIELD
+
+
+def test_enum_requires_the_exact_enum_class():
+    assert protocol._enum(ChpbMessageKind.REPLY, ChpbMessageKind) is ChpbMessageKind.REPLY
+
+    with pytest.raises(ChpbValidationError) as error:
+        protocol._enum(BrokerResultCode.OK, ChpbMessageKind)
+    assert error.value.code is ChpbValidationCode.INVALID_TYPE
+
+
+def test_expectation_doc_projects_all_binding_expectations():
+    assert protocol._expectation_doc(expected()) == {
+        "agent_id": AGENT,
+        "fencing_epoch": 4,
+        "manifest_generation": 3,
+        "policy_generation": 7,
+        "projection_digest": A,
+        "unit_generation": 9,
+    }
+
+
+def test_observation_doc_serializes_enum_values_and_population_index():
+    assert protocol._observation_doc(
+        observation(BrokerObjectState.STAGING_PREFIX, BrokerRegistryState.OLD, 2)
+    ) == {
+        "object_state": "staging_prefix",
+        "population_index": 2,
+        "registry_state": "old",
+    }
+
+
+def test_policy_doc_projects_generation_and_digest():
+    assert protocol._policy_doc(policy()) == {
+        "policy_generation": 7,
+        "projection_digest": A,
+    }
+
+
+def test_principal_doc_projects_all_principal_identity_fields():
+    assert protocol._principal_doc(principal()) == {
+        "agent_id": AGENT,
+        "cgroup_dev": 0,
+        "cgroup_ino": 1,
+        "fencing_epoch": 4,
+        "invocation_id": INVOCATION,
+        "manifest_generation": 3,
+        "mcs_pair": "c0,c1",
+        "unit_generation": 9,
+    }
+
+
+def test_status_doc_projects_nested_status_and_optional_terminal_result():
+    value = TransactionStatus(
+        binding(),
+        B2aRecoveryPhase.COMMITTED,
+        BrokerCheckpoint.COMMITTED,
+        observation(BrokerObjectState.FINAL_COMPLETE, BrokerRegistryState.CURRENT, 1),
+        1,
+        BrokerResultCode.COMMITTED,
+    )
+
+    assert protocol._status_doc(value) == {
+        "binding": protocol._binding_doc(value.binding),
+        "b2a_phase": "committed",
+        "checkpoint": "committed",
+        "observation": protocol._observation_doc(value.observation),
+        "population_total": 1,
+        "terminal_result": "committed",
+    }
+
+
+def test_validate_expectation_rejects_noncanonical_projection_digest():
+    with pytest.raises(ChpbValidationError) as error:
+        protocol._validate_expectation(expected(projection_digest="A" * 64))
+    assert error.value.code is ChpbValidationCode.INVALID_FIELD
+
+
+def test_validate_observation_rejects_population_above_protocol_limit():
+    with pytest.raises(ChpbValidationError) as error:
+        protocol._validate_observation(observation(index=257))
+    assert error.value.code is ChpbValidationCode.INVALID_FIELD
+
+
+def test_validate_policy_rejects_wrong_contract_type():
+    with pytest.raises(ChpbValidationError) as error:
+        protocol._validate_policy(expected())
+    assert error.value.code is ChpbValidationCode.INVALID_TYPE
+
+
+def test_b2a_phase_for_checkpoint_rejects_non_checkpoint_input():
+    with pytest.raises(ChpbValidationError) as error:
+        b2a_phase_for_checkpoint(B2aRecoveryPhase.COMMITTED)
+    assert error.value.code is ChpbValidationCode.INVALID_TYPE
+
+
+def test_encode_chpb_message_emits_canonical_utf8_json_with_newline():
+    value = request(ChpbMessageKind.PROVISION_HOME)
+
+    assert encode_chpb_message(value) == (
+        b'{"binding":{"operation":"provision","policy":{"policy_generation":7,'
+        b'"projection_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},'
+        b'"principal":{"agent_id":"bee_1","cgroup_dev":0,"cgroup_ino":1,'
+        b'"fencing_epoch":4,"invocation_id":"11111111111111111111111111111111",'
+        b'"manifest_generation":3,"mcs_pair":"c0,c1","unit_generation":9},'
+        b'"store_uuid":"33333333333333333333333333333333",'
+        b'"transaction_id":"22222222222222222222222222222222"},'
+        b'"expected":{"agent_id":"bee_1","fencing_epoch":4,"manifest_generation":3,'
+        b'"policy_generation":7,"projection_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+        b'"unit_generation":9},"kind":"provision_home","protocol":"CHPB/2",'
+        b'"request_id":"11111111111111111111111111111111",'
+        b'"transaction_id":"22222222222222222222222222222222"}\n'
+    )
 
 
 def test_public_contract_types_are_frozen_and_slotted():

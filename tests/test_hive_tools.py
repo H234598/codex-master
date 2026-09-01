@@ -10,7 +10,7 @@ from codex_master.hive.runtime import HiveRuntimeEvidence
 
 def test_read_only_hive_tools_have_closed_schemas_and_bounded_output() -> None:
     definitions = hive_tool_definitions()
-    assert len(definitions) == 12
+    assert len(definitions) == 17
     assert all(item["inputSchema"]["additionalProperties"] is False for item in definitions)
     assert not {"execute_global_request", "retry_repo_dispatch", "cancel_global_request"} & {
         item["name"] for item in definitions

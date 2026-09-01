@@ -23,6 +23,29 @@ from codex_master.google_account_inventory import (
 _SYNTHETIC_SECRET = "synthetic-secret-not-for-output"
 
 
+def test_public_loader_uses_only_canonical_inventory_path() -> None:
+    loader = GoogleAccountInventoryLoader()
+    assert loader._path == inventory.DEFAULT_GOOGLE_ACCOUNT_INVENTORY_PATH
+
+
+def test_frozen_index_iteration_returns_stable_keys() -> None:
+    index = inventory._FrozenIndex({"account-one": 1, "account-two": 2})
+    assert tuple(iter(index)) == ("account-one", "account-two")
+
+
+def test_frozen_index_length_matches_copied_mapping() -> None:
+    source = {"account-one": 1}
+    index = inventory._FrozenIndex(source)
+    source["account-two"] = 2
+    assert len(index) == 1
+
+
+def test_private_secret_source_rejects_serializing() -> None:
+    source = inventory._GoogleAccountInventorySecretSource({"project-one": "synthetic-secret"})
+    with pytest.raises(TypeError, match="private inventory secret source is not serializable"):
+        pickle.dumps(source)
+
+
 def _write_private_inventory(root: Path, content: str) -> Path:
     root.mkdir(mode=0o700)
     root.chmod(0o700)

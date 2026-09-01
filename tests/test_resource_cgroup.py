@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import inspect
 import os
 import runpy
@@ -21,7 +20,9 @@ from codex_master.resource_cgroup import (
     CgroupProfileV1,
     CgroupIoPressureEvidenceV1,
     CpuTopologyV1,
+    OllamaCpuProfile,
     PreparedAgentScope,
+    ResourceCgroupError,
     read_hive_io_pressure,
     derive_cgroup_profile,
     parse_cpu_topology,
@@ -293,6 +294,30 @@ def test_systemd_user_cgroup_adapter_binds_runner_and_root_once(
         adapter._cgroup_root = bound_root
     assert adapter._runner is runner
     assert adapter._cgroup_root is bound_root
+
+
+def test_user_bus_available_converts_preflight_failure_to_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter = resource_cgroup.SystemdUserCgroupAdapter(
+        runner=_approved_provider_runner(monkeypatch, tmp_path)
+    )
+    monkeypatch.setattr(
+        resource_cgroup.SystemdUserCgroupAdapter,
+        "_user_bus_socket_present",
+        lambda _self: True,
+    )
+    assert adapter.user_bus_available() is True
+
+    def unavailable(_self: object) -> bool:
+        raise resource_cgroup.CgroupPreflightError("cgroup_preflight_failed")
+
+    monkeypatch.setattr(
+        resource_cgroup.SystemdUserCgroupAdapter,
+        "_user_bus_socket_present",
+        unavailable,
+    )
+    assert adapter.user_bus_available() is False
 
 
 def test_approved_runtime_provider_constructs_exact_adapter_internally(
@@ -697,6 +722,28 @@ def test_profile_rejects_two_physical_core_hybrid_before_efficiency_branch() -> 
 
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         derive_cgroup_profile(two_core_hybrid, approved_cpuset=(1,), mem_total_bytes=16 * GIB)
+
+
+@pytest.mark.parametrize("allowed", ["", "0-", "3-1", "0,0", "all", "4-99"])
+def test_ollama_cpu_profile_rejects_invalid_cpuset(allowed: str) -> None:
+    with pytest.raises(ResourceCgroupError, match="resource.cgroup_profile_invalid"):
+        OllamaCpuProfile.parse(allowed, 200, 50, available_cpus=set(range(12)))
+
+
+def test_ollama_cpu_profile_maps_exact_systemd_properties() -> None:
+    profile = OllamaCpuProfile.parse("4-7", 350, 40, available_cpus=set(range(12)))
+
+    assert profile.systemd_properties() == {
+        "AllowedCPUs": "4-7",
+        "CPUQuota": "350%",
+        "CPUWeight": "40",
+    }
+
+
+@pytest.mark.parametrize("quota,weight", [(0, 50), (10001, 50), (200, 0), (200, 10001)])
+def test_ollama_cpu_profile_rejects_out_of_range_cpu_limits(quota: int, weight: int) -> None:
+    with pytest.raises(ResourceCgroupError, match="resource.cgroup_profile_invalid"):
+        OllamaCpuProfile.parse("4-7", quota, weight, available_cpus=set(range(12)))
 
 
 def test_scope_runner_uses_held_scope_before_tmux_and_readbacks_every_required_property() -> None:

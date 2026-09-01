@@ -9,7 +9,10 @@ ANCHOR_KEY = "sha256:" + "a" * 64
 
 def parser():
     root = argparse.ArgumentParser()
-    add_hive_cli_parsers(root.add_subparsers(dest="command"))
+    sub = root.add_subparsers(dest="command")
+    fleet = sub.add_parser("fleet")
+    fleet_sub = fleet.add_subparsers(dest="fleet_namespace", required=True)
+    add_hive_cli_parsers(sub, fleet_subparsers=fleet_sub)
     return root
 
 
@@ -78,3 +81,26 @@ def test_runtime_status_returns_only_the_autonomous_contract() -> None:
         result = {}
 
     assert set(result) == {"ok", "metadata", "mcp_surface", "raw_output"}
+
+
+def test_fleet_test_cli_uses_injected_shared_service(tmp_path) -> None:
+    from test_hive_test_service import service
+
+    evidence_service, test_id = service(tmp_path)
+    index_status = run_hive_cli(
+        parser().parse_args(["fleet", "test", "index", "validate"]),
+        test_service=evidence_service,
+    )
+    plan = run_hive_cli(
+        parser().parse_args(["fleet", "test", "plan", "--changed-path", "src/example.py"]),
+        test_service=evidence_service,
+    )
+    run = run_hive_cli(
+        parser().parse_args(
+            ["fleet", "test", "run", test_id, "--index-digest", index_status["index_digest"]]
+        ),
+        test_service=evidence_service,
+    )
+
+    assert plan["tests"][0]["action"] == "run"
+    assert run["receipt"]["result"] == "passed"

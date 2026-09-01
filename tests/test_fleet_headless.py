@@ -7,7 +7,10 @@ import time
 
 import pytest
 
+import codex_master.fleet_headless as fleet_headless
 from codex_master.fleet_headless import (
+    HEADLESS_CANCEL_GRACE_SECONDS,
+    HEADLESS_TERM_GRACE_SECONDS,
     HeadlessJobError,
     MAX_HEADLESS_TIMEOUT_SECONDS,
     MAX_HEADLESS_STDERR_BYTES,
@@ -16,6 +19,7 @@ from codex_master.fleet_headless import (
     HeadlessJobRegistry,
     HeadlessProcessResult,
     run_bounded_process,
+    signal_process_group,
 )
 
 
@@ -144,6 +148,41 @@ def test_finish_keeps_public_job_record_data_sparse() -> None:
     assert public["status"] == "completed"
     assert public["raw_output"] == "not_returned"
     assert "private" not in repr(public)
+
+
+def test_registry_get_timeout_and_cancel_escalation_share_one_job() -> None:
+    process = FakeProcess(returncode=None)
+    job, registry, signals = make_job(process)
+
+    assert registry.get("d1") is job
+    assert registry.get("missing") is None
+    registry.request_timeout("d1", 100.0)
+    registry.advance_cancel("d1", 100.0 + HEADLESS_CANCEL_GRACE_SECONDS)
+    registry.advance_cancel(
+        "d1", 100.0 + HEADLESS_CANCEL_GRACE_SECONDS + HEADLESS_TERM_GRACE_SECONDS
+    )
+
+    assert [signum for _pid, signum in signals] == [
+        signal.SIGINT,
+        signal.SIGTERM,
+        signal.SIGKILL,
+    ]
+
+
+def test_signal_process_group_targets_only_verified_group_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeProcess()
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(fleet_headless.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(fleet_headless.os, "getpgrp", lambda: process.pid + 1)
+    monkeypatch.setattr(
+        fleet_headless.os, "killpg", lambda pgid, signum: calls.append((pgid, signum))
+    )
+
+    signal_process_group(process, signal.SIGTERM)
+
+    assert calls == [(process.pid, signal.SIGTERM)]
 
 
 def test_new_process_setup_failure_reaps_owned_process() -> None:

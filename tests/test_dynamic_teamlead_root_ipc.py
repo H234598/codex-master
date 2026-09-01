@@ -181,6 +181,9 @@ def test_control_cannot_be_copied_serialized_or_replaced(clone) -> None:
     with pytest.raises(Exception):
         clone(control)
 
+    with pytest.raises(TypeError, match="control cannot be serialized"):
+        control.__reduce__()
+
 
 def test_control_rejects_regular_mutation_and_subclassing() -> None:
     control = SystemBusDynamicTeamleadStartControl(RecordingExchange([]))

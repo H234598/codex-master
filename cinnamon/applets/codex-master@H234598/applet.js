@@ -35,6 +35,8 @@ const MIN_OVERVIEW_INTERVAL_SECONDS = 15;
 const MAX_OVERVIEW_INTERVAL_SECONDS = 3600;
 const MAX_TRACKED_AGENTS = 6;
 const MAX_NATIVE_BEES = 6;
+const MAX_OLLAMA_INSTANCES = 64;
+const MAX_OLLAMA_LANES = 4096;
 const MAX_TRACKED_AGENTS_SETTING_CHARS = 128;
 const MAX_TERMINAL_COMMAND_CHARS = 256;
 const APPLET_ERROR_LOG_LIMIT = 8;
@@ -223,6 +225,9 @@ FlottenmanagementApplet.prototype = {
         this._statusSummaryItem = null;
         this._overviewSummaryItem = null;
         this._overviewDetailItem = null;
+        this._ollamaSummary = null;
+        this._ollamaSummaryItem = null;
+        this._ollamaManageItem = null;
         this._settingsMenuItem = null;
         this._statusRowItems = [];
         this._nativeSubmenuItem = null;
@@ -322,6 +327,18 @@ FlottenmanagementApplet.prototype = {
         this._overviewDetailItem = new PopupMenu.PopupMenuItem("Übersicht Details: —", { reactive: false });
         this.menu.addMenuItem(this._overviewSummaryItem);
         this.menu.addMenuItem(this._overviewDetailItem);
+
+        this._ollamaSummaryItem = new PopupMenu.PopupMenuItem(
+            this.ollamaText(), { reactive: false }
+        );
+        this.menu.addMenuItem(this._ollamaSummaryItem);
+        this._ollamaManageItem = new PopupMenu.PopupMenuItem("Ollama verwalten");
+        this._connectTracked(
+            this._ollamaManageItem,
+            "activate",
+            () => this.activateOllamaManage()
+        );
+        this.menu.addMenuItem(this._ollamaManageItem);
 
         this._initializeSettings(instance_id);
         this._applySettings();
@@ -637,9 +654,48 @@ FlottenmanagementApplet.prototype = {
         ];
     },
 
-    _launchControlCenter() {
+    _launchControlCenter(page = null) {
         if (this._removed || this._statusInFlight) return;
-        this._startStatusRefresh({ kind: "launcher" });
+        this._startStatusRefresh({ kind: "launcher", page });
+    },
+
+    renderOllamaSummary(summary) {
+        const fields = summary && typeof summary === "object"
+            ? Object.keys(summary).sort()
+            : [];
+        const expected = ["blocked_instances", "ready_instances", "ready_lanes"];
+        const validCount = (value, maximum) => Number.isSafeInteger(value)
+            && value >= 0
+            && value <= maximum;
+        if (
+            fields.length !== expected.length
+            || !fields.every((field, index) => field === expected[index])
+            || !validCount(summary.ready_instances, MAX_OLLAMA_INSTANCES)
+            || !validCount(summary.blocked_instances, MAX_OLLAMA_INSTANCES)
+            || summary.ready_instances + summary.blocked_instances > MAX_OLLAMA_INSTANCES
+            || !validCount(summary.ready_lanes, MAX_OLLAMA_LANES)
+        ) {
+            this._ollamaSummary = null;
+            this._setMenuItemText(this._ollamaSummaryItem, this.ollamaText());
+            return false;
+        }
+        this._ollamaSummary = {
+            ready_instances: summary.ready_instances,
+            ready_lanes: summary.ready_lanes,
+            blocked_instances: summary.blocked_instances,
+        };
+        this._setMenuItemText(this._ollamaSummaryItem, this.ollamaText());
+        return true;
+    },
+
+    ollamaText() {
+        const summary = this._ollamaSummary;
+        if (!summary) return "Ollama: nicht verfügbar";
+        return `Ollama: ${summary.ready_instances} Instanzen · ${summary.ready_lanes} Lanes · ${summary.blocked_instances} blockiert`;
+    },
+
+    activateOllamaManage() {
+        this._launchControlCenter("ollama");
     },
 
     _launchTerminalStatus() {
@@ -672,9 +728,11 @@ FlottenmanagementApplet.prototype = {
         }
     },
 
-    _controlCenterArgv() {
+    _controlCenterArgv(page = null) {
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
-        return [home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp", "control-center-launch"];
+        const argv = [home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp", "control-center-launch"];
+        if (page === "ollama") argv.push("--page", "ollama");
+        return argv;
     },
 
     _appletActionArgv(actionRequest) {
@@ -873,7 +931,7 @@ FlottenmanagementApplet.prototype = {
         let process;
         try {
             const argv = commandKind === "launcher"
-                ? this._controlCenterArgv()
+                ? this._controlCenterArgv(request.page)
                 : overviewRequest ? this._overviewArgv()
                 : actionRequest ? this._appletActionArgv(actionRequest) : this._trackedStatusArgv();
             const launcher = Gio.SubprocessLauncher.new(
@@ -2410,6 +2468,9 @@ FlottenmanagementApplet.prototype = {
                 this._statusRowItems = [];
                 this._overviewSummaryItem = null;
                 this._overviewDetailItem = null;
+                this._ollamaSummary = null;
+                this._ollamaSummaryItem = null;
+                this._ollamaManageItem = null;
                 this._nativeSubmenuItem = null;
                 this._nativeBeeRowItems = [];
                 this._quickControlSubmenuItem = null;

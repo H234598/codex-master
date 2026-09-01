@@ -87,3 +87,77 @@ def test_emergency_queen_request_is_idempotent_and_serial(monkeypatch, tmp_path)
     assert draining["state"]["state"] == "draining"
     finished = limit_tracker.finish_emergency_queen(first["state"]["generation"])
     assert finished["state"]["state"] == "idle"
+
+
+def test_queen_candidates_only_returns_approved_plan_files(monkeypatch, tmp_path) -> None:
+    plans = tmp_path / "Dokumente/Obsidian_Vaults/Teladi_Programming/Projekte/codex-master/Baupläne!"
+    plans.mkdir(parents=True)
+    (plans / "approved.md").write_text("Status: approved", encoding="utf-8")
+    (plans / "draft.md").write_text("Status: draft", encoding="utf-8")
+    monkeypatch.setattr(limit_tracker.Path, "home", classmethod(lambda cls: tmp_path))
+
+    assert limit_tracker._queen_candidates() == [str(plans / "approved.md")]
+
+
+def test_emergency_recommendation_distinguishes_hot_and_recovered_windows() -> None:
+    hot = {
+        "five_hour_tracker": {"five_hour_windows_until_weekly_reset": 2},
+        "weekly_monthly": [{"window": "weekly", "used_percent": 90, "deviation_from_limit_pp": 90}],
+        "five_hour_projection": {"deviation_from_limit_pp": 20},
+    }
+    recovered = {
+        "weekly_monthly": [{"window": "weekly", "deviation_from_limit_pp": -20}],
+        "five_hour_projection": {"deviation_from_limit_pp": -20},
+    }
+
+    assert limit_tracker.emergency_recommendation(hot) == "activate"
+    assert limit_tracker.emergency_recommendation(recovered, active_fast=True) == "flex"
+
+
+def test_emergency_refresh_needed_only_spends_a_pull_for_fast_or_hot_weekly_state() -> None:
+    hot = {
+        "five_hour_tracker": {"five_hour_windows_until_weekly_reset": 5},
+        "weekly_monthly": [{"window": "weekly", "used_percent": 80}],
+    }
+
+    assert limit_tracker.emergency_refresh_needed({}) is False
+    assert limit_tracker.emergency_refresh_needed(hot) is True
+    assert limit_tracker.emergency_refresh_needed({}, active_fast=True) is True
+
+
+def test_refresh_usage_snapshots_runs_bounded_local_usage_command(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Completed:
+        returncode = 0
+
+    def run(argv, **kwargs):
+        calls.append({"argv": argv, **kwargs})
+        return Completed()
+
+    monkeypatch.setenv("CODEX_USAGE_COMMAND", "/mock/codex-usage")
+    monkeypatch.setenv("CODEX_USAGE_CONFIG", "")
+    monkeypatch.setattr(limit_tracker.subprocess, "run", run)
+
+    assert limit_tracker.refresh_usage_snapshots() == {"attempted": True, "ok": True, "returncode": 0, "error": None}
+    assert calls[0]["argv"] == ["/mock/codex-usage", "once", "--format", "json"]
+    assert calls[0]["timeout"] == 120
+
+
+def test_set_emergency_queen_blocked_persists_matching_generation_only(monkeypatch, tmp_path) -> None:
+    state_root = tmp_path / "state"
+    monkeypatch.setattr(limit_tracker, "STATE_ROOT", state_root)
+    monkeypatch.setattr(limit_tracker, "EMERGENCY_QUEEN_STATE", state_root / "state.json")
+    limit_tracker._write_state(
+        limit_tracker.EMERGENCY_QUEEN_STATE,
+        limit_tracker._queen_state_payload(
+            state="running", generation=3, reason="test", plans=[], current_plan=None,
+            emergency_active=True, queen_agent="queen",
+        ),
+    )
+
+    assert limit_tracker.set_emergency_queen_blocked(2, "stale")["updated"] is False
+    blocked = limit_tracker.set_emergency_queen_blocked(3, "waiting")
+    assert blocked["updated"] is True
+    assert blocked["state"]["state"] == "blocked"
+    assert blocked["state"]["blocked_reason"] == "waiting"

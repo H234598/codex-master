@@ -19,6 +19,7 @@ from codex_master.google_oauth_authorization import (
     GoogleOAuthAuthorizationProfileV1,
     GoogleOAuthOperationV1,
     GoogleOAuthProfileIdV1,
+    google_oauth_scope_values_v1,
     resolve_google_oauth_profile_v1,
 )
 
@@ -238,6 +239,27 @@ def test_billing_read_is_allowed() -> None:
     assert (
         GoogleOAuthOperationV1.PROJECTS_GET_BILLING_INFO in profile.allowed_operations
     )
+
+
+def test_browser_scope_values_are_exact_google_uris_without_scope_expansion() -> None:
+    assert google_oauth_scope_values_v1(GoogleOAuthProfileIdV1.INVENTORY_READONLY) == (
+        "https://www.googleapis.com/auth/cloud-billing.readonly",
+        "https://www.googleapis.com/auth/cloud-platform.read-only",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "openid",
+    )
+    assert google_oauth_scope_values_v1(GoogleOAuthProfileIdV1.PROVISIONER) == (
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "openid",
+    )
+
+
+def test_browser_scope_values_reject_unknown_profile_fail_closed() -> None:
+    with pytest.raises(
+        GoogleOAuthAuthorizationError, match="credential.oauth_profile_unknown"
+    ):
+        google_oauth_scope_values_v1("future-profile")
 
 
 @pytest.mark.parametrize(
@@ -469,3 +491,24 @@ def test_resolution_has_no_filesystem_environment_clock_network_or_browser_side_
 
     assert profile.scope_fingerprint == EXPECTED_SCOPE_FINGERPRINT
     assert dict(os.environ) == before_environment
+
+
+def test_build_inventory_readonly_profile_reconstructs_the_closed_read_policy() -> None:
+    profile = policy._build_inventory_readonly_profile()
+
+    assert profile.profile_id is GoogleOAuthProfileIdV1.INVENTORY_READONLY
+    assert profile.minimal_scopes == EXPECTED_SCOPES
+    assert tuple(operation.value for operation in profile.allowed_operations) == EXPECTED_OPERATIONS
+
+
+def test_build_provisioner_profile_has_the_mutation_policy_and_fingerprint() -> None:
+    profile = policy._build_provisioner_profile()
+
+    assert profile.profile_id is GoogleOAuthProfileIdV1.PROVISIONER
+    assert profile.minimal_scopes == ("cloud-platform", "email", "openid")
+    assert GoogleOAuthOperationV1.PROJECTS_CREATE in profile.allowed_operations
+    assert profile.scope_fingerprint.startswith("sha256:")
+
+
+def test_restore_provisioner_profile_returns_the_canonical_singleton() -> None:
+    assert policy._restore_provisioner_profile() is policy._PROVISIONER_PROFILE

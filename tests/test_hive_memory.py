@@ -37,3 +37,15 @@ def test_specialist_cannot_promote_directly_to_global() -> None:
             {"source_principal_id": "specialist-one", "summary": "result", "provenance_refs": ("report:one",)},
             actor=principal("specialist-one", "spezialistin", "repo-one"), memory_id="memory-one", repo_id="repo-one", now=NOW,
         )
+
+
+def test_memory_entry_public_projection_is_data_sparse() -> None:
+    entry = promote_teamlead_report(
+        {"source_principal_id": "specialist-one", "summary": "verified result", "provenance_refs": ("report:one",)},
+        actor=principal("lead-one", "teamleiterin", "repo-one"),
+        memory_id="memory-one",
+        repo_id="repo-one",
+        now=NOW,
+    )
+    assert entry.public()["raw_output"] == "not_returned"
+    assert entry.public()["created_at_utc"] == NOW.isoformat()

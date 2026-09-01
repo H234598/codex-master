@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from datetime import UTC, datetime, timedelta
 import importlib
 import uuid
@@ -576,6 +577,8 @@ def test_dynamic_worker_principal_round_trips_complete_resolution_carrier() -> N
     principal = reserved.runtime_principals[0]
 
     assert isinstance(principal, fleet_registry.FleetDynamicWorkerPrincipalV2)
+    assert repr(principal) == "FleetDynamicWorkerPrincipalV2(<redacted>)"
+    assert str(principal) == repr(principal)
     assert principal.principal_id == "dw-" + "7" * 32
     assert principal.ticket_id == "ticket:worker-7"
     assert principal.lease_binding_reference == reservation._binding_reference()
@@ -1851,6 +1854,9 @@ def test_registry_operation_is_single_use_and_has_no_pre_enter_guard() -> None:
         empty_worker_snapshot(), reservation, expected_generation=5
     )
 
+    assert repr(operation) == "<_DynamicWorkerRegistryOperationV2 redacted>"
+    with pytest.raises(TypeError, match="operations are not serializable"):
+        pickle.dumps(operation)
     assert allocator._active_lease_binding_verifications == {}
     with pytest.raises(FleetValidationError, match="worker_lease_binding_denied"):
         operation.candidate
@@ -1879,6 +1885,13 @@ def test_registry_operation_is_single_use_and_has_no_pre_enter_guard() -> None:
     second_allocator.revoke(second_reservation._binding_input().lease, "discarded")
     assert second_allocator._active_lease_binding_verifications == {}
     del never_entered
+
+
+def test_optional_sha256_digest_accepts_none_or_exact_digest() -> None:
+    digest = _digest("a")
+
+    assert fleet_registry._optional_sha256_digest(None, "invalid") is None
+    assert fleet_registry._optional_sha256_digest(digest, "invalid") == digest
 
 
 def test_registry_rejects_opaque_forge_foreign_allocator_and_reference_before_cas() -> (

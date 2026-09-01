@@ -94,6 +94,24 @@ WORKER_CLASSES = (
 )
 
 
+def test_model_policy_post_init_validates_reasoning_levels() -> None:
+    policy = ModelPolicy("model-one", "family-one", 1, ("low",), ("read",))
+    assert policy.reasoning_levels == ("low",)
+    with pytest.raises(ValueError, match="invalid_model_reasoning_levels"):
+        ModelPolicy("model-one", "family-one", 1, ())
+
+
+def test_agent_class_policy_post_init_validates_default_lifecycle() -> None:
+    policy = AgentClassPolicy(
+        "arbeitsbiene", "ephemeral", ("ephemeral",), ("luna",), "low", "high", ("read",)
+    )
+    assert policy.default_lifecycle == "ephemeral"
+    with pytest.raises(ValueError, match="invalid_agent_class_policy"):
+        AgentClassPolicy(
+            "arbeitsbiene", "persistent", ("ephemeral",), ("luna",), "low", "high", ("read",)
+        )
+
+
 def resolve(**overrides):
     values = {
         "scope_kind": "read",

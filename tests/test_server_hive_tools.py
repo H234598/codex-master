@@ -1356,7 +1356,17 @@ def test_red_probe_routes_watchdogs_to_safe_shutdown_only(
 
 def test_server_exposes_additive_read_only_hive_tools() -> None:
     names = {tool["name"] for tool in server.TOOLS}
-    assert {"hive_status", "godbee_status", "queen_list", "agent_selection_status"} <= names
+    assert {
+        "hive_status",
+        "godbee_status",
+        "queen_list",
+        "agent_selection_status",
+        "hive_test_index_status",
+        "hive_test_plan",
+        "hive_test_run",
+        "hive_test_status",
+        "hive_test_invalidate",
+    } <= names
     assert server.call_validated_tool("hive_status", {})["raw_output"] == "not_returned"
 
 
@@ -1378,6 +1388,15 @@ def test_server_runtime_factory_can_forward_read_only_assembly() -> None:
         read_only=True,
         now=None,
     )
+
+
+def test_server_denies_test_mutations_without_queen_or_teamlead_principal() -> None:
+    with pytest.raises(server.AgentError, match="authority.scope_denied"):
+        server.call_tool(
+            "hive_test_run",
+            {"test_id": "pytest:tests/test_x.py:test_x", "index_digest": "sha256:" + "a" * 64},
+            principal_class="arbeitsbiene",
+        )
 
 
 def queen_workpackage(mode: str = "enforced") -> dict[str, object]:

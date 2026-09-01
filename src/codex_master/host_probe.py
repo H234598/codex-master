@@ -1,0 +1,870 @@
+"""Bounded, privacy-preserving active host probe evidence."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+from typing import Protocol, cast
+
+from .admin_contracts import OperationV1
+from .agent_contracts import AgentReceiptV1
+from .agent_operations import (
+    AgentAttemptExhaustionV1,
+    AgentOperationDeadlineExpiryV1,
+    AgentOperationError,
+    AgentOperationRequestV1,
+    AgentOperationStore,
+    AgentPrincipalV1 as OperationPrincipalV1,
+    _host_probe_admin_operation_id,
+)
+from .admin_operations import AdminOperationError, AdminOperationStore
+from .admin_hosts import (
+    AgentPrincipalV1 as RegistryPrincipalV1,
+    HostRegistry,
+    HostRegistryError,
+)
+
+
+_TERMINAL_ADMIN_STATES = frozenset({"succeeded", "failed", "partial", "blocked"})
+_MAX_GENERATION = 2**63 - 1
+
+
+class HostProbeError(ValueError):
+    """Stable error with no host-local diagnostic details."""
+
+    def __init__(self, code: str = "host.probe_failed") -> None:
+        super().__init__(code)
+
+
+def _probe_operation_id(arguments: object) -> str:
+    try:
+        return _host_probe_admin_operation_id(
+            arguments,
+            "host.arguments_invalid",
+        )
+    except AgentOperationError:
+        raise HostProbeError() from None
+
+
+class HostProbeKernel(Protocol):
+    cpu_count: object
+    memory_bytes: object
+
+    def uname(self) -> tuple[str, str]: ...
+    def cgroup_v2(self) -> bool: ...
+    def systemd(self) -> bool: ...
+    def load(self) -> float: ...
+    def pressure(self) -> float: ...
+    def ollama_available(self) -> bool: ...
+
+
+class HostProbePort(Protocol):
+    def probe(
+        self, host_ref: str, *, expected_generation: int, idempotency_key: str
+    ) -> OperationV1: ...
+
+
+def _utc_timestamp(value: datetime) -> str:
+    if type(value) is not datetime or value.tzinfo is None or value.microsecond:
+        raise HostProbeError()
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _integer(value: object, *, maximum: int = 2**31 - 1) -> int:
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise HostProbeError()
+    return cast(int, value)
+
+
+def _classify_memory(value: object) -> str:
+    memory = _integer(value, maximum=2**63 - 1)
+    gib = memory // 1024**3
+    if gib < 8:
+        return "under-8-gib"
+    if gib < 32:
+        return "8-31-gib"
+    if gib < 128:
+        return "32-127-gib"
+    return "128-plus-gib"
+
+
+def _classify_load(value: object, cpu_count: int) -> str:
+    if type(value) not in {int, float} or type(value) is bool or value < 0:
+        raise HostProbeError()
+    ratio = float(value) / cpu_count
+    return "idle" if ratio < 0.5 else "busy" if ratio < 1.0 else "saturated"
+
+
+def _classify_pressure(value: object) -> str:
+    if type(value) not in {int, float} or type(value) is bool or not 0 <= value <= 100:
+        raise HostProbeError()
+    return "none" if value == 0 else "low" if value < 10 else "elevated"
+
+
+@dataclass(frozen=True, slots=True)
+class HostProbeEvidenceV1:
+    kernel_class: str
+    architecture_class: str
+    cpu_count: int
+    memory_class: str
+    cgroup_v2: bool
+    systemd: bool
+    load_class: str
+    pressure_class: str
+    ollama_capability: bool
+    observed_at: str
+    agent_generation: int = 1
+
+    def __post_init__(self) -> None:
+        if self.kernel_class not in {"linux", "other"} or self.architecture_class not in {"x86_64", "arm64", "other"}:
+            raise HostProbeError()
+        _integer(self.cpu_count)
+        if self.memory_class not in {"under-8-gib", "8-31-gib", "32-127-gib", "128-plus-gib"}:
+            raise HostProbeError()
+        if type(self.cgroup_v2) is not bool or type(self.systemd) is not bool or type(self.ollama_capability) is not bool:
+            raise HostProbeError()
+        if self.load_class not in {"idle", "busy", "saturated"} or self.pressure_class not in {"none", "low", "elevated"}:
+            raise HostProbeError()
+        if type(self.observed_at) is not str:
+            raise HostProbeError()
+        try:
+            observed = datetime.strptime(self.observed_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        except ValueError:
+            raise HostProbeError() from None
+        if observed.strftime("%Y-%m-%dT%H:%M:%SZ") != self.observed_at:
+            raise HostProbeError()
+        _integer(self.agent_generation)
+
+    def public(self) -> dict[str, object]:
+        value = {
+            "kernel_class": self.kernel_class, "architecture_class": self.architecture_class,
+            "cpu_count": self.cpu_count, "memory_class": self.memory_class,
+            "cgroup_v2": self.cgroup_v2, "systemd": self.systemd,
+            "load_class": self.load_class, "pressure_class": self.pressure_class,
+            "ollama_capability": self.ollama_capability, "observed_at": self.observed_at,
+            "agent_generation": self.agent_generation,
+        }
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+        return {**value, "evidence_digest": "sha256:" + hashlib.sha256(canonical).hexdigest()}
+
+    @classmethod
+    def from_public(cls, value: object) -> "HostProbeEvidenceV1":
+        if type(value) is not dict or set(value) != {
+            "kernel_class", "architecture_class", "cpu_count", "memory_class",
+            "cgroup_v2", "systemd", "load_class", "pressure_class",
+            "ollama_capability", "observed_at", "agent_generation", "evidence_digest",
+        }:
+            raise HostProbeError()
+        evidence = cls(
+            value["kernel_class"], value["architecture_class"], value["cpu_count"], value["memory_class"],
+            value["cgroup_v2"], value["systemd"], value["load_class"], value["pressure_class"],
+            value["ollama_capability"], value["observed_at"], value["agent_generation"],
+        )
+        if evidence.public()["evidence_digest"] != value["evidence_digest"]:
+            raise HostProbeError()
+        return evidence
+
+
+class LocalHostProbeCollector:
+    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(UTC).replace(microsecond=0))
+
+    def collect(self, kernel: HostProbeKernel | None = None) -> HostProbeEvidenceV1:
+        try:
+            source = kernel or _SystemKernel()
+            system, machine = source.uname()
+            cpu_count = _integer(source.cpu_count)
+            return HostProbeEvidenceV1(
+                "linux" if system.lower() == "linux" else "other",
+                "x86_64" if machine.lower() in {"x86_64", "amd64"} else "arm64" if machine.lower() in {"aarch64", "arm64"} else "other",
+                cpu_count, _classify_memory(source.memory_bytes), source.cgroup_v2(),
+                source.systemd(), _classify_load(source.load(), cpu_count),
+                _classify_pressure(source.pressure()), source.ollama_available(),
+                _utc_timestamp(self._clock()),
+            )
+        except HostProbeError:
+            raise
+        except (OSError, RuntimeError, ValueError, TypeError):
+            raise HostProbeError() from None
+
+
+class _SystemKernel:
+    @property
+    def cpu_count(self) -> object:
+        return os.cpu_count()
+
+    @property
+    def memory_bytes(self) -> object:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+        raise OSError
+
+    def uname(self) -> tuple[str, str]:
+        return platform.system(), platform.machine()
+
+    def cgroup_v2(self) -> bool:
+        return Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+
+    def systemd(self) -> bool:
+        return Path("/run/systemd/system").is_dir()
+
+    def load(self) -> float:
+        return os.getloadavg()[0]
+
+    def pressure(self) -> float:
+        line = Path("/proc/pressure/cpu").read_text(encoding="ascii").splitlines()[0]
+        return float(next(item[4:] for item in line.split() if item.startswith("avg10=")))
+
+    def ollama_available(self) -> bool:
+        return Path("/run/ollama/ollama.sock").is_socket()
+
+
+class LocalHostProbeAdapter:
+    """Collect one bounded local observation and finish its admin operation."""
+
+    def __init__(
+        self,
+        *,
+        operation_store: AdminOperationStore,
+        host_registry: HostRegistry,
+        collector: LocalHostProbeCollector | None = None,
+    ) -> None:
+        self._operations = operation_store
+        self._registry = host_registry
+        self._collector = collector or LocalHostProbeCollector()
+
+    def probe(
+        self, host_ref: str, *, expected_generation: int, idempotency_key: str
+    ) -> OperationV1:
+        plan = self._operations.plan(
+            kind="hosts.probe", generation=expected_generation,
+            key=_operation_key(host_ref, idempotency_key), steps=("host.probe.collect",),
+        )
+        if plan.operation.state != "planned":
+            return plan.operation
+        self._operations.begin(plan.operation.id, current_generation=expected_generation)
+        try:
+            evidence = self._collector.collect()
+            resulting_generation = _next_generation(expected_generation)
+            self._registry.record_active_probe(
+                host_ref,
+                generation=resulting_generation,
+                resource_evidence={
+                    "cpu_threads": evidence.cpu_count,
+                    "memory_bytes": _memory_floor(evidence.memory_class),
+                },
+                observed_at=evidence.observed_at,
+            )
+        except Exception:
+            self._operations.record_step(
+                plan.operation.id, "host.probe.collect", succeeded=False,
+                reason_code="host.probe_failed",
+            )
+            return self._operations.finish(
+                plan.operation.id, state="failed", reason_codes=("host.probe_failed",),
+            )
+        self._operations.record_step(plan.operation.id, "host.probe.collect", succeeded=True)
+        return self._operations.finish(
+            plan.operation.id,
+            state="succeeded",
+            resulting_generation=resulting_generation,
+        )
+
+
+class RemoteHostProbeAdapter:
+    """Queue only the fixed host-agent collection action; never run a shell."""
+
+    def __init__(
+        self,
+        *,
+        operation_store: AdminOperationStore,
+        agent_operations: AgentOperationStore,
+        host_registry: HostRegistry,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._operations = operation_store
+        self._agent_operations = agent_operations
+        self._registry = host_registry
+        self._clock = clock or (lambda: datetime.now(UTC).replace(microsecond=0))
+
+    def probe(
+        self, host_ref: str, *, expected_generation: int, idempotency_key: str
+    ) -> OperationV1:
+        plan = self._operations.plan(
+            kind="hosts.probe", generation=expected_generation,
+            key=_operation_key(host_ref, idempotency_key), steps=("host.probe.collect",),
+        )
+        if plan.operation.state != "planned":
+            return plan.operation
+        document_generation = self._registry.document_generation()
+        agent_operation = self._agent_operations.enqueue(
+            AgentOperationRequestV1(
+                key=_operation_key(host_ref, idempotency_key), kind="host.probe", action="collect",
+                registry_generation=document_generation,
+                plan_digest=plan.plan_digest,
+                arguments={"admin_operation_id": plan.operation_id, "probe_schema": 1},
+                deadline=(self._clock().astimezone(UTC).replace(microsecond=0) + timedelta(minutes=5)),
+                target_host_ref=host_ref,
+            )
+        )
+        self._operations.bind_host_probe_agent(
+            plan.operation_id,
+            agent_operation_id=agent_operation.operation_id,
+            target_host_ref=host_ref,
+            plan_digest=plan.plan_digest,
+        )
+        return plan.operation
+
+
+class RemoteHostProbeCompletionOwner:
+    """Task-6-only receipt completion boundary for fixed probe results."""
+
+    def __init__(
+        self,
+        *,
+        operation_store: AdminOperationStore,
+        agent_operations: AgentOperationStore,
+        host_registry: HostRegistry,
+    ) -> None:
+        self._operations = operation_store
+        self._agent_operations = agent_operations
+        self._registry = host_registry
+
+    def reconcile_attempt_exhaustion(
+        self, exhaustion: AgentAttemptExhaustionV1
+    ) -> bool:
+        """Terminalize one exact paired Admin probe before Agent exhaustion."""
+
+        if type(exhaustion) is not AgentAttemptExhaustionV1:
+            raise HostProbeError()
+        if (exhaustion.kind, exhaustion.action) != ("host.probe", "collect"):
+            return False
+        target = exhaustion.target_host_ref
+        arguments = exhaustion.arguments
+        if (
+            type(target) is not str
+            or exhaustion.host_ref != target
+        ):
+            raise HostProbeError()
+        operation_id = _probe_operation_id(arguments)
+        lifecycle = self._operations.claim_host_probe_agent(
+            operation_id,
+            agent_operation_id=exhaustion.operation_id,
+            target_host_ref=target,
+            plan_digest=exhaustion.plan_digest,
+        )
+        if lifecycle.operation is None:
+            terminal = self._agent_operations.get(exhaustion.operation_id)
+            if (
+                not lifecycle.acknowledged
+                or terminal.state != "unknown"
+                or terminal.reason_codes != ("host.attempts_exhausted",)
+            ):
+                raise AdminOperationError("control.operation_state_conflict")
+            return True
+        operation = lifecycle.operation
+        if (
+            operation.kind != "hosts.probe"
+            or operation.plan_digest != exhaustion.plan_digest
+        ):
+            raise HostProbeError()
+        self._require_lifecycle_operation(operation)
+        operation = self._transition_lifecycle_failure(
+            operation_id,
+            operation.expected_generation,
+            exhaustion.plan_digest,
+        )
+        if operation.state not in _TERMINAL_ADMIN_STATES:
+            raise AdminOperationError("control.operation_state_conflict")
+        return True
+
+    def reconcile_operation_deadline(
+        self, expiry: AgentOperationDeadlineExpiryV1
+    ) -> bool:
+        """Terminalize the exact expired Admin pair before Agent expiry."""
+
+        if type(expiry) is not AgentOperationDeadlineExpiryV1:
+            raise HostProbeError()
+        if (expiry.kind, expiry.action) != ("host.probe", "collect"):
+            return False
+        target = expiry.target_host_ref
+        arguments = expiry.arguments
+        if (
+            type(target) is not str
+            or expiry.host_ref != target
+        ):
+            raise HostProbeError()
+        operation_id = _probe_operation_id(arguments)
+        lifecycle = self._operations.claim_host_probe_agent(
+            operation_id,
+            agent_operation_id=expiry.operation_id,
+            target_host_ref=target,
+            plan_digest=expiry.plan_digest,
+        )
+        if lifecycle.operation is None:
+            terminal = self._agent_operations.get(expiry.operation_id)
+            if (
+                not lifecycle.acknowledged
+                or terminal.state != "unknown"
+                or terminal.reason_codes != ("host.lease_expired",)
+            ):
+                raise AdminOperationError("control.operation_state_conflict")
+            return True
+        operation = lifecycle.operation
+        if (
+            operation.kind != "hosts.probe"
+            or operation.plan_digest != expiry.plan_digest
+        ):
+            raise HostProbeError()
+        self._require_lifecycle_operation(operation)
+        operation = self._transition_lifecycle_failure(
+            operation_id,
+            operation.expected_generation,
+            expiry.plan_digest,
+        )
+        if operation.state not in _TERMINAL_ADMIN_STATES:
+            raise AdminOperationError("control.operation_state_conflict")
+        return True
+
+    def acknowledge_agent_lifecycle(
+        self,
+        lifecycle: AgentAttemptExhaustionV1 | AgentOperationDeadlineExpiryV1,
+    ) -> None:
+        """Release the Admin owner only after the Agent terminal write is visible."""
+
+        if type(lifecycle) not in {
+            AgentAttemptExhaustionV1,
+            AgentOperationDeadlineExpiryV1,
+        }:
+            raise HostProbeError()
+        if (lifecycle.kind, lifecycle.action) != ("host.probe", "collect"):
+            return
+        target = lifecycle.target_host_ref
+        arguments = lifecycle.arguments
+        if (
+            type(target) is not str
+            or lifecycle.host_ref != target
+        ):
+            raise HostProbeError()
+        operation_id = _probe_operation_id(arguments)
+        terminal = self._agent_operations.get(lifecycle.operation_id)
+        expected_reason = (
+            "host.attempts_exhausted"
+            if type(lifecycle) is AgentAttemptExhaustionV1
+            else "host.lease_expired"
+        )
+        if terminal.state != "unknown" or terminal.reason_codes != (
+            expected_reason,
+        ):
+            raise AgentOperationError("host.operation_store_unavailable")
+        self._operations.acknowledge_host_probe_agent(
+            operation_id,
+            agent_operation_id=lifecycle.operation_id,
+            target_host_ref=target,
+            plan_digest=lifecycle.plan_digest,
+        )
+
+    def complete(self, principal: object, receipt: AgentReceiptV1) -> object:
+        if receipt.result.kind != "host.probe" or receipt.result.action != "collect":
+            return self._agent_operations.complete(
+                _operation_principal(principal), receipt
+            )
+        operation_principal = _operation_principal(principal)
+        context = self._agent_operations.validate_completion(
+            operation_principal, receipt
+        )
+        target = context["target_host_ref"]
+        arguments = context["arguments"]
+        if type(target) is not str or not isinstance(arguments, Mapping):
+            raise HostProbeError()
+        if operation_principal.host_ref != target:
+            raise AgentOperationError("host.identity_mismatch")
+        operation_id = _probe_operation_id(arguments)
+        document_generation = context["registry_generation"]
+        if (
+            type(document_generation) is not int
+        ):
+            raise HostProbeError()
+        lifecycle = self._operations.claim_host_probe_agent(
+            operation_id,
+            agent_operation_id=receipt.operation_id,
+            target_host_ref=target,
+            plan_digest=receipt.plan_digest,
+        )
+        if lifecycle.operation is None:
+            terminal = self._agent_operations.get(receipt.operation_id)
+            if not lifecycle.acknowledged or terminal.state not in {
+                "succeeded",
+                "failed",
+                "unknown",
+                "cancelled",
+            }:
+                raise AdminOperationError("control.operation_state_conflict")
+            return self._agent_operations.complete(operation_principal, receipt)
+        operation = lifecycle.operation
+        if (
+            operation.kind != "hosts.probe"
+            or operation.plan_digest != receipt.plan_digest
+        ):
+            raise HostProbeError()
+        host_generation = operation.expected_generation
+        authoritative_failure = self._authoritative_restart_failure(
+            operation_id,
+            host_generation,
+            operation,
+        )
+        if authoritative_failure is not None:
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                host_generation,
+                authoritative_failure,
+            )
+        try:
+            host = self._registry.get(target)
+        except HostRegistryError as error:
+            if error.code not in {"control.host_not_found", "host.identity_not_found"}:
+                raise
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                host_generation,
+                "host.probe_failed",
+            )
+        allowed_host_generations = {host_generation}
+        if (
+            host_generation < _MAX_GENERATION
+            and (
+                operation.state in {"running", *_TERMINAL_ADMIN_STATES}
+                or operation.reason_codes == ("control.restart_reconciled",)
+            )
+        ):
+            allowed_host_generations.add(host_generation + 1)
+        if host.generation not in allowed_host_generations:
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                host_generation,
+                "host.probe_failed",
+            )
+        if receipt.state != "succeeded":
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                host_generation,
+                "host.probe_unknown",
+            )
+        try:
+            evidence = HostProbeEvidenceV1.from_public(dict(receipt.result.payload))
+        except HostProbeError:
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                host_generation,
+                "host.probe_failed",
+            )
+        operation = self._operations.get(operation_id)
+        if operation.state in _TERMINAL_ADMIN_STATES and operation.reason_codes != (
+            "control.restart_reconciled",
+        ):
+            return self._complete_agent_and_ack(
+                operation_principal,
+                receipt,
+                operation_id,
+                target,
+            )
+        try:
+            resulting_generation = _next_generation(host_generation)
+        except HostProbeError:
+            return self._complete_failure(
+                operation_principal,
+                receipt,
+                operation_id,
+                host_generation,
+                "host.probe_failed",
+            )
+        operation = self._active_operation(operation_id, host_generation)
+        if operation.state != "running":
+            raise HostProbeError()
+        try:
+            self._registry.record_active_probe(
+                target,
+                generation=resulting_generation,
+                resource_evidence={
+                    "cpu_threads": evidence.cpu_count,
+                    "memory_bytes": _memory_floor(evidence.memory_class),
+                },
+                observed_at=evidence.observed_at,
+            )
+        except HostRegistryError as error:
+            if error.code in {
+                "credential.generation_conflict",
+                "credential.generation_exhausted",
+                "host.identity_not_found",
+            }:
+                return self._complete_failure(
+                    operation_principal,
+                    receipt,
+                    operation_id,
+                    host_generation,
+                    "host.probe_failed",
+                )
+            raise
+        operation = self._active_operation(operation_id, host_generation)
+        if operation.state in _TERMINAL_ADMIN_STATES:
+            return self._complete_agent_and_ack(
+                operation_principal,
+                receipt,
+                operation_id,
+                target,
+            )
+        if operation.not_attempted_count:
+            self._operations.record_step(
+                operation_id, "host.probe.collect", succeeded=True
+            )
+        operation = self._active_operation(operation_id, host_generation)
+        if operation.failed_count or operation.not_attempted_count:
+            raise HostProbeError()
+        if operation.state == "running":
+            self._operations.finish(
+                operation_id,
+                state="succeeded",
+                resulting_generation=resulting_generation,
+            )
+        return self._complete_agent_and_ack(
+            operation_principal,
+            receipt,
+            operation_id,
+            target,
+        )
+
+    def _authoritative_restart_failure(
+        self,
+        operation_id: str,
+        generation: int,
+        operation: OperationV1,
+    ) -> str | None:
+        if (
+            operation.state == "partial"
+            and operation.reason_codes == ("control.restart_reconciled",)
+            and operation.completed_count == 0
+            and operation.failed_count == 1
+            and operation.not_attempted_count == 0
+        ):
+            operation = self._operations.resume_host_probe(
+                operation_id,
+                expected_generation=generation,
+            )
+        if (
+            operation.state == "running"
+            and operation.completed_count == 0
+            and operation.failed_count == 1
+            and operation.not_attempted_count == 0
+            and operation.reason_codes
+            in {("host.probe_unknown",), ("host.probe_failed",)}
+        ):
+            return operation.reason_codes[0]
+        return None
+
+    def _active_operation(
+        self, operation_id: str, generation: int
+    ) -> OperationV1:
+        operation = self._operations.get(operation_id)
+        if operation.state == "partial" and operation.reason_codes == (
+            "control.restart_reconciled",
+        ):
+            operation = self._operations.resume_host_probe(
+                operation_id, expected_generation=generation
+            )
+        if operation.state == "planned":
+            operation = self._operations.begin(
+                operation_id, current_generation=generation
+            )
+        return operation
+
+    def _transition_lifecycle_failure(
+        self,
+        operation_id: str,
+        generation: int,
+        plan_digest: str,
+    ) -> OperationV1:
+        try:
+            return self._transition_failure(
+                operation_id,
+                generation,
+                "host.probe_unknown",
+            )
+        except AdminOperationError as error:
+            if error.code != "control.plan_expired":
+                raise
+            return self._operations.expire_host_probe(
+                operation_id,
+                expected_generation=generation,
+                plan_digest=plan_digest,
+            )
+
+    @staticmethod
+    def _require_lifecycle_operation(operation: OperationV1) -> None:
+        if operation.state in {"planned", "running"}:
+            return
+        if (
+            operation.state == "failed"
+            and operation.resulting_generation is None
+            and operation.failed_count == 1
+            and operation.completed_count == 0
+            and operation.not_attempted_count == 0
+            and operation.reason_codes
+            in {("host.probe_unknown",), ("host.probe_failed",)}
+        ):
+            return
+        if (
+            operation.state == "succeeded"
+            and operation.resulting_generation == operation.expected_generation + 1
+            and operation.completed_count == 1
+            and operation.failed_count == 0
+            and operation.not_attempted_count == 0
+        ):
+            return
+        if (
+            operation.state == "partial"
+            and operation.resulting_generation is None
+            and operation.reason_codes == ("control.restart_reconciled",)
+        ):
+            return
+        raise AdminOperationError("control.operation_state_conflict")
+
+    def _complete_failure(
+        self,
+        principal: OperationPrincipalV1,
+        receipt: AgentReceiptV1,
+        operation_id: str,
+        generation: int,
+        reason: str,
+    ) -> object:
+        operation = self._transition_failure(operation_id, generation, reason)
+        if operation.state not in _TERMINAL_ADMIN_STATES:
+            raise AdminOperationError("control.operation_state_conflict")
+        return self._complete_agent_and_ack(
+            principal,
+            receipt,
+            operation_id,
+            principal.host_ref,
+        )
+
+    def _complete_agent_and_ack(
+        self,
+        principal: OperationPrincipalV1,
+        receipt: AgentReceiptV1,
+        operation_id: str,
+        target_host_ref: str,
+    ) -> object:
+        completed = self._agent_operations.complete(principal, receipt)
+        terminal = self._agent_operations.get(receipt.operation_id)
+        if (
+            terminal.state != receipt.state
+            or terminal.reason_codes != receipt.reason_codes
+            or terminal.result_digest != receipt.result_digest
+        ):
+            raise AgentOperationError("host.operation_store_unavailable")
+        self._operations.acknowledge_host_probe_agent(
+            operation_id,
+            agent_operation_id=receipt.operation_id,
+            target_host_ref=target_host_ref,
+            plan_digest=receipt.plan_digest,
+        )
+        return completed
+
+    def _transition_failure(
+        self, operation_id: str, generation: int, reason: str
+    ) -> OperationV1:
+        operation = self._active_operation(operation_id, generation)
+        if operation.state in _TERMINAL_ADMIN_STATES:
+            return operation
+        if operation.state != "running":
+            raise AdminOperationError("control.operation_state_conflict")
+        if operation.not_attempted_count:
+            self._operations.record_step(
+                operation_id,
+                "host.probe.collect",
+                succeeded=False,
+                reason_code=reason,
+            )
+        operation = self._active_operation(operation_id, generation)
+        if operation.state == "running":
+            if operation.failed_count:
+                if operation.reason_codes not in {
+                    ("host.probe_unknown",),
+                    ("host.probe_failed",),
+                }:
+                    raise AdminOperationError("control.operation_state_conflict")
+                reason = operation.reason_codes[0]
+            operation = self._operations.finish(
+                operation_id,
+                state="failed",
+                reason_codes=(reason,),
+            )
+        return operation
+
+
+class HostProbeRouter:
+    """Choose the directly-attached control host without exposing transport data."""
+
+    def __init__(
+        self, *, local_host_ref: str, local: HostProbePort, remote: HostProbePort
+    ) -> None:
+        self._local_host_ref = local_host_ref
+        self._local = local
+        self._remote = remote
+
+    def probe(
+        self, host_ref: str, *, expected_generation: int, idempotency_key: str
+    ) -> OperationV1:
+        owner = self._local if host_ref == self._local_host_ref else self._remote
+        return owner.probe(
+            host_ref,
+            expected_generation=expected_generation,
+            idempotency_key=idempotency_key,
+        )
+
+
+def _memory_floor(memory_class: str) -> int:
+    return {
+        "under-8-gib": 1 * 1024**3, "8-31-gib": 8 * 1024**3,
+        "32-127-gib": 32 * 1024**3, "128-plus-gib": 128 * 1024**3,
+    }[memory_class]
+
+
+def _next_generation(generation: int) -> int:
+    if type(generation) is not int or not 0 <= generation < _MAX_GENERATION:
+        raise HostProbeError()
+    return generation + 1
+
+
+def _operation_principal(principal: object) -> OperationPrincipalV1:
+    if type(principal) is OperationPrincipalV1:
+        return cast(OperationPrincipalV1, principal)
+    if type(principal) is RegistryPrincipalV1:
+        registry_principal = cast(RegistryPrincipalV1, principal)
+        return OperationPrincipalV1(
+            registry_principal.host_ref,
+            registry_principal.registry_generation,
+        )
+    raise AgentOperationError("host.request_invalid")
+
+
+def _operation_key(host_ref: str, idempotency_key: str) -> str:
+    if type(host_ref) is not str or type(idempotency_key) is not str:
+        raise HostProbeError()
+    return "probe-" + hashlib.sha256(f"{host_ref}\0{idempotency_key}".encode("ascii")).hexdigest()

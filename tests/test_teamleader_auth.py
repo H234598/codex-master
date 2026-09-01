@@ -195,11 +195,12 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
         dispatch.assert_not_called()
 
     def test_authorized_queen_rpc_sees_exact_runtime_catalog(self) -> None:
+        visible_tools = server._masterjet_visible_tools(server.TOOLS)
         allowed = {
             "authorized": True,
             "role": "koenigin",
             "principal_class": "koenigin",
-            "visible_tool_count": len(server.TOOLS),
+            "visible_tool_count": len(visible_tools),
         }
         with patch("codex_master.server.master_tool_access_status", return_value=allowed):
             listed = server.handle_rpc(
@@ -207,7 +208,7 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
                 enforce_master_role=True,
             )
 
-        self.assertEqual(listed["result"]["tools"], server.TOOLS)
+        self.assertEqual(listed["result"]["tools"], visible_tools)
 
     def test_teamleader_rpc_catalog_hides_admin_and_credential_tools(self) -> None:
         allowed = {

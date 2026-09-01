@@ -186,3 +186,72 @@ def test_all_discovered_home_configs_receive_same_stable_catalog_and_resolved_ti
         assert values["service_tier"] == "flex"
     assert catalog_paths == {str(root / "effective-codex-model-catalog.json")}
     assert Path(next(iter(catalog_paths))).is_file()
+
+
+def test_fetch_builds_fixed_request_and_decodes_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, int]] = []
+
+    class Headers:
+        @staticmethod
+        def get_content_charset() -> str:
+            return "utf-8"
+
+    class Response:
+        headers = Headers()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_values: object) -> None:
+            return None
+
+        @staticmethod
+        def read() -> bytes:
+            return "gültig".encode()
+
+    def open_request(request: object, *, timeout: int) -> Response:
+        calls.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr(pricing_inventory, "urlopen", open_request)
+
+    assert pricing_inventory._fetch(pricing_inventory.PRICING_URL) == (
+        "utf-8",
+        "gültig",
+    )
+    request, timeout = calls[0]
+    assert request.full_url == pricing_inventory.PRICING_URL
+    assert request.get_header("User-agent") == "codex-master-openai-inventory/1"
+    assert timeout == 60
+
+
+def test_openai_key_reader_uses_only_openai_section(tmp_path: Path) -> None:
+    token_file = tmp_path / "api-token.env"
+    token_file.write_text(
+        "[OTHER]\nwrong\n[OPENAI]\nOPENAI_API_KEY=private-openai-key\n",
+        encoding="utf-8",
+    )
+
+    assert pricing_inventory._openai_key_from_file(token_file) == "private-openai-key"
+    assert pricing_inventory._openai_key_from_file(tmp_path / "missing") is None
+
+
+def test_main_reports_generation_or_bounded_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    generation = tmp_path / "generation"
+    monkeypatch.setattr(pricing_inventory, "update", lambda _root: generation)
+
+    assert pricing_inventory.main(["--root", str(tmp_path)]) == 0
+    assert capsys.readouterr().out == f"{generation}\n"
+
+    def fail(_root: Path) -> Path:
+        raise RuntimeError("fetch-failed")
+
+    monkeypatch.setattr(pricing_inventory, "update", fail)
+    assert pricing_inventory.main(["--root", str(tmp_path)]) == 1
+    assert capsys.readouterr().err == "openai-pricing-inventory: fetch-failed\n"

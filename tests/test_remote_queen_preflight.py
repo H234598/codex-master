@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from codex_master import remote_queen_preflight
 from codex_master.remote_queen_bootstrap import (
     HostFactsV1,
     ManifestGenerationV1,
@@ -46,6 +47,12 @@ DESIRED_GENERATION = ManifestGenerationV1(
     generation="rq-bootstrap-2026-08-29",
     sha256="a" * 64,
 )
+
+
+def test_json_constant_rejection_is_fail_closed() -> None:
+    with pytest.raises(RemoteQueenBootstrapError) as caught:
+        remote_queen_preflight._reject_json_constant("NaN")
+    assert caught.value.code == "RQ_E_PLAN_INCONSISTENT"
 
 HOST_FACTS_PAYLOAD = {
     "schema_version": "RemoteQueenHostFactsV1",

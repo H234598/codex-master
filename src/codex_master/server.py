@@ -37,7 +37,16 @@ import uuid
 from collections.abc import Collection
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Literal,
+    Mapping,
+    cast,
+)
 
 import yaml
 
@@ -49,6 +58,11 @@ from codex_master.fleet_home_v2_cutover import (
     FleetHomeV2Result,
     FleetHomeV2QuiescencePort,
     LocalFleetHomeV2Filesystem,
+)
+from codex_master.admin_contracts import (
+    ADMIN_OPERATION_CATALOG,
+    ADMIN_OPERATION_CATALOG_DIGEST,
+    ADMIN_OPERATION_METADATA,
 )
 from codex_master.fleet_registry import (
     AgentDescriptor,
@@ -303,6 +317,11 @@ from codex_master.selection.task_classification import (
 from codex_master.selection_service import SelectionRequest, SelectionService
 from codex_master.hive.types import TaskComplexity
 
+if TYPE_CHECKING:
+    from codex_master.admin_contracts import AdminPrincipalV1
+    from codex_master.admin_service import MasterjetControlService
+    from codex_master.admin_socket import AdminSocketClient
+
 
 STATE_ROOT = Path(
     os.environ.get("CODEX_MASTER_MCP_STATE")
@@ -345,6 +364,11 @@ BASE_ARGS = [
 ]
 
 HEADLESS_JOBS = HeadlessJobRegistry()
+_MASTERJET_ADMIN_BINDING: tuple[MasterjetControlService, AdminPrincipalV1] | None = None
+_MASTERJET_ADMIN_BINDING_LOCK = threading.Lock()
+_MASTERJET_ADMIN_SOCKET_CLIENT: AdminSocketClient | None = None
+_MASTERJET_ADMIN_SOCKET_KEY_FD: int | None = None
+_MASTERJET_ADMIN_ALLOWED_OPERATIONS: frozenset[str] = frozenset()
 HEADLESS_META_KEY = "headless_job"
 G5_TMUX_SOCKET_META_KEY = "tmux_socket"
 G5_TMUX_SOCKET_RE = re.compile(r"g5-[0-9a-f]{20}")
@@ -636,8 +660,14 @@ TEAMLEADER_TOOL_NAMES = frozenset(
         "hive_authority_check",
         "hive_admission_status",
         "agent_selection_status",
+        "hive_test_index_status",
+        "hive_test_plan",
+        "hive_test_run",
+        "hive_test_status",
+        "hive_test_invalidate",
     }
 )
+HIVE_TEST_MUTATING_TOOL_NAMES = frozenset({"hive_test_run", "hive_test_invalidate"})
 MAX_PAGED_OFFSET = 10_000_000
 PLUGIN_CACHE_ALLOWED_FILES = (
     ".app.json",
@@ -1895,6 +1925,10 @@ class AgentError(RuntimeError):
             self.payload = payload
 
 
+class MasterjetAdminError(AgentError):
+    """Expose only the stable public admin problem contract."""
+
+
 class HeadlessWriteScopeError(AgentError):
     """Raised when headless writes lack an enforceable filesystem boundary."""
 
@@ -1967,6 +2001,8 @@ def _public_resource_snapshot(value: Any) -> dict[str, Any] | None:
 
 
 def public_error_payload(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, MasterjetAdminError):
+        return dict(exc.payload)
     payload: dict[str, Any] = {"error": safe_error_text(exc)}
     if isinstance(
         exc,
@@ -3451,7 +3487,14 @@ def master_tool_access_status() -> dict[str, Any]:
             principal_class = "koenigin"
     authorized = principal_class is not None
     visible_tool_count = (
-        len(allowed_tool_names_for_principal_class(principal_class))
+        len(
+            {
+                tool["name"]
+                for tool in _masterjet_visible_tools(TOOLS)
+                if tool["name"]
+                in allowed_tool_names_for_principal_class(principal_class)
+            }
+        )
         if authorized
         else 0
     )
@@ -23478,10 +23521,13 @@ def launch_control_center_detached(
     *,
     command_path: Path | None = None,
     environ: Mapping[str, str] | None = None,
+    page: str | None = None,
 ) -> dict[str, Any]:
     require_teamleader_tool_access()
     command_path = command_path or _runtime_mcp_entrypoint()
     fleet_desktop_entry_bytes(command_path)
+    if page not in {None, "ollama"}:
+        raise AgentError("control-center page is invalid")
     source = os.environ if environ is None else environ
     child_env = {
         key: value
@@ -23499,6 +23545,9 @@ def launch_control_center_detached(
         (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0),
     )
     command = str(command_path)
+    argv = [command, "control-center"]
+    if page == "ollama":
+        argv.extend(("--page", "ollama"))
     try:
         closefrom = getattr(os, "POSIX_SPAWN_CLOSEFROM", None)
         if closefrom is None:
@@ -23507,7 +23556,7 @@ def launch_control_center_detached(
                 open(os.devnull, "wb") as null_stdout,
             ):
                 subprocess.Popen(
-                    [command, "control-center"],
+                    argv,
                     env=child_env,
                     stdin=null_stdin,
                     stdout=null_stdout,
@@ -23518,7 +23567,7 @@ def launch_control_center_detached(
         else:
             os.posix_spawn(
                 command,
-                [command, "control-center"],
+                argv,
                 child_env,
                 file_actions=(*file_actions, (closefrom, 3)),
                 setsid=True,
@@ -24997,7 +25046,11 @@ def call_tool(
     runtime: MasterjetRuntime | None = None,
 ) -> dict[str, Any]:
     authority_class = principal_class or "arbeitsbiene"
+    if name in _MASTERJET_ADMIN_TOOL_ROUTES:
+        return _masterjet_admin_tool_call(name, args)
     if name in {tool["name"] for tool in hive_tool_definitions()}:
+        if name in HIVE_TEST_MUTATING_TOOL_NAMES and authority_class not in HIVE_PRINCIPAL_CLASSES:
+            raise AgentError("authority.scope_denied")
         return dict(call_hive_tool(name, args))
     if name == "fleet_overview":
         overview_format = str(args.get("format", "json"))
@@ -34676,7 +34729,487 @@ def spawn_admission_lock() -> Any:
                 pass
 
 
+_MASTERJET_ADMIN_TOOL_SPECS = (
+    (
+        "fleet_openai_accounts",
+        "openai.accounts.list",
+        "List redacted OpenAI fleet accounts.",
+        None,
+    ),
+    (
+        "fleet_openai_auth_plan",
+        "openai.auth.plan",
+        "Plan OpenAI auth sync without accepting auth bytes.",
+        None,
+    ),
+    (
+        "fleet_google_inventory",
+        "google.accounts.list",
+        "List redacted Google accounts or projects.",
+        "google.projects.list",
+    ),
+    (
+        "fleet_google_oauth_begin",
+        "google.oauth.begin",
+        "Begin browser OAuth without accepting OAuth codes.",
+        None,
+    ),
+    (
+        "fleet_google_provision_plan",
+        "google.provision.plan",
+        "Plan Google provisioning against fresh quota evidence.",
+        None,
+    ),
+    (
+        "fleet_google_quota_evidence_sync",
+        "google.quota-evidence.sync",
+        "Persist fresh account-bound Google quota evidence.",
+        None,
+    ),
+    (
+        "fleet_google_provision_apply",
+        "google.provision.apply",
+        "Apply one immutable Google provisioning plan.",
+        None,
+    ),
+    (
+        "fleet_google_billing_plan",
+        "google.billing.plan",
+        "Plan one account-bound Google billing link.",
+        None,
+    ),
+    (
+        "fleet_google_billing_apply",
+        "google.billing.apply",
+        "Apply one immutable Google billing plan.",
+        None,
+    ),
+    (
+        "fleet_operation_status",
+        "operations.get",
+        "Return one durable operation by opaque identifier.",
+        None,
+    ),
+    (
+        "fleet_hosts",
+        "hosts.list",
+        "List public host registry records for the Hosts page.",
+        None,
+    ),
+    (
+        "fleet_host_probe",
+        "hosts.probe",
+        "Queue or run one bounded active host probe.",
+        None,
+    ),
+    (
+        "fleet_ollama_models",
+        "ollama.models.list",
+        "List redacted Ollama model catalog entries.",
+        None,
+    ),
+    (
+        "fleet_ollama_instances",
+        "ollama.instances.list",
+        "List redacted Ollama fleet instances.",
+        None,
+    ),
+    (
+        "fleet_ollama_instance_plan",
+        "ollama.instance.plan",
+        "Plan one typed Ollama instance placement.",
+        None,
+    ),
+    (
+        "fleet_ollama_instance_apply",
+        "ollama.instance.apply",
+        "Apply one immutable Ollama instance plan.",
+        None,
+    ),
+    (
+        "fleet_ollama_instance_probe",
+        "ollama.instance.probe",
+        "Probe one owned Ollama instance and update readiness.",
+        None,
+    ),
+)
+_MASTERJET_ADMIN_TOOL_ROUTES = MappingProxyType(
+    {
+        name: (operation, alternate_operation)
+        for name, operation, _description, alternate_operation in _MASTERJET_ADMIN_TOOL_SPECS
+    }
+)
+_MASTERJET_ADMIN_REQUEST_FIELDS = frozenset(
+    {"expected_generation", "idempotency_key", "plan_digest"}
+)
+_MASTERJET_ADMIN_CLI_COMMANDS = MappingProxyType(
+    {
+        ("openai", "list"): ("openai.accounts.list", None),
+        ("openai", "add"): ("openai.accounts.add", None),
+        ("openai", "auth-sync"): ("openai.auth.plan", None),
+        ("openai", "disable"): ("openai.accounts.disable", None),
+        ("google", "add"): ("google.accounts.add", None),
+        ("google", "inventory"): (
+            "google.accounts.list",
+            "google.projects.list",
+        ),
+        ("google", "oauth-begin"): ("google.oauth.begin", None),
+        ("google", "quota-sync"): ("google.quota-evidence.sync", None),
+        ("google", "provision-plan"): ("google.provision.plan", None),
+        ("google", "provision-apply"): ("google.provision.apply", None),
+        ("google", "billing-plan"): ("google.billing.plan", None),
+        ("google", "billing-apply"): ("google.billing.apply", None),
+        ("operation", "status"): ("operations.get", None),
+        ("host", "probe"): ("hosts.probe", None),
+        ("ollama", "models"): ("ollama.models.list", None),
+        ("ollama", "instances"): ("ollama.instances.list", None),
+        ("ollama", "instance-plan"): ("ollama.instance.plan", None),
+        ("ollama", "instance-apply"): ("ollama.instance.apply", None),
+        ("ollama", "probe"): ("ollama.instance.probe", None),
+    }
+)
+
+
+def _masterjet_admin_operation_fields(
+    operation: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    metadata = ADMIN_OPERATION_METADATA[operation]
+    required = list(metadata.argument_fields)
+    optional = list(metadata.optional_argument_fields)
+    if metadata.command:
+        required.append("expected_generation")
+    if metadata.requires_idempotency:
+        required.append("idempotency_key")
+    if metadata.requires_digest:
+        required.append("plan_digest")
+    return tuple(required), tuple(optional)
+
+
+def _add_masterjet_admin_cli_command(
+    subparsers: Any,
+    command: str,
+    operation: str,
+    alternate_operation: str | None,
+) -> None:
+    parser = subparsers.add_parser(command)
+    required, optional = _masterjet_admin_operation_fields(operation)
+    if operation == "hosts.probe":
+        required = tuple(field for field in required if field != "idempotency_key")
+    if alternate_operation is not None:
+        alternate_required, alternate_optional = _masterjet_admin_operation_fields(
+            alternate_operation
+        )
+        optional = tuple(
+            dict.fromkeys((*optional, *alternate_required, *alternate_optional))
+        )
+    positional_host_ref = operation == "hosts.probe"
+    if positional_host_ref:
+        parser.add_argument("host_ref")
+        parser.add_argument("--json", action="store_true", required=True)
+    for field in (*required, *optional):
+        if positional_host_ref and field == "host_ref":
+            continue
+        options: dict[str, object] = {
+            "type": int
+            if field == "expected_generation"
+            or field in ADMIN_OPERATION_METADATA[operation].integer_argument_fields
+            else str,
+            "required": field in required,
+        }
+        if field in ADMIN_OPERATION_METADATA[operation].token_list_argument_fields:
+            options["action"] = "append"
+        parser.add_argument(f"--{field.replace('_', '-')}", **options)
+    parser.set_defaults(
+        masterjet_admin_operation=operation,
+        masterjet_admin_alternate_operation=alternate_operation,
+    )
+
+
+def _masterjet_admin_cli_call(args: argparse.Namespace) -> dict[str, Any]:
+    operation = cast(str, args.masterjet_admin_operation)
+    alternate_operation = cast(str | None, args.masterjet_admin_alternate_operation)
+    if (
+        alternate_operation is not None
+        and getattr(args, "account_ref", None) is not None
+    ):
+        operation = alternate_operation
+    required, optional = _masterjet_admin_operation_fields(operation)
+    arguments = {
+        field: value
+        for field in (*required, *optional)
+        if (value := getattr(args, field, None)) is not None
+    }
+    if operation == "hosts.probe":
+        host_ref = arguments.get("host_ref")
+        generation = arguments.get("expected_generation")
+        if type(host_ref) is not str or type(generation) is not int:
+            raise AgentError("control.service_unavailable")
+        arguments["idempotency_key"] = "cli-probe-" + hashlib.sha256(
+            f"{host_ref}\0{generation}".encode("ascii")
+        ).hexdigest()
+    return _masterjet_admin_operation_call(operation, arguments)
+
+
+def bind_masterjet_control_service(
+    service: MasterjetControlService,
+    principal: AdminPrincipalV1,
+) -> None:
+    """Bind one authenticated in-process admin service before serving requests."""
+
+    from codex_master.admin_contracts import AdminPrincipalV1
+    from codex_master.admin_service import MasterjetControlService
+
+    if (
+        type(service) is not MasterjetControlService
+        or type(principal) is not AdminPrincipalV1
+    ):
+        raise AgentError("control.service_unavailable")
+    global _MASTERJET_ADMIN_BINDING
+    with _MASTERJET_ADMIN_BINDING_LOCK:
+        if _MASTERJET_ADMIN_BINDING is not None:
+            raise AgentError("control.service_already_bound")
+        _MASTERJET_ADMIN_BINDING = (service, principal)
+
+
+def _masterjet_admin_operation_call(
+    operation: str, args: Mapping[str, object]
+) -> dict[str, Any]:
+    from codex_master.admin_contracts import (
+        AdminContractError,
+        AdminRequestV1,
+        canonical_admin_problem,
+        public_admin_result,
+    )
+
+    binding = _MASTERJET_ADMIN_BINDING
+    client = _MASTERJET_ADMIN_SOCKET_CLIENT
+    if (
+        binding is None and client is None
+    ) or operation not in ADMIN_OPERATION_METADATA:
+        raise AgentError("control.service_unavailable")
+    arguments = {
+        key: value
+        for key, value in args.items()
+        if key not in _MASTERJET_ADMIN_REQUEST_FIELDS
+    }
+    try:
+        request = AdminRequestV1(
+            operation,
+            arguments,
+            cast(int | None, args.get("expected_generation")),
+            cast(str | None, args.get("idempotency_key")),
+            cast(str | None, args.get("plan_digest")),
+        )
+    except AdminContractError as exc:
+        problem = canonical_admin_problem(exc.code)
+        raise MasterjetAdminError(problem.code, public_admin_result(problem)) from None
+    if binding is not None:
+        from codex_master.admin_service import AdminServiceError
+
+        try:
+            service, principal = binding
+            return dict(service.handle(principal, request))
+        except AdminServiceError as exc:
+            raise MasterjetAdminError(
+                exc.problem.code, public_admin_result(exc.problem)
+            ) from None
+    from codex_master.admin_socket import AdminSocketError
+
+    assert client is not None
+    try:
+        return dict(client.call(request))
+    except AdminSocketError as exc:
+        raise MasterjetAdminError(
+            exc.problem.code, public_admin_result(exc.problem)
+        ) from None
+
+
+def _masterjet_admin_tool_call(name: str, args: Mapping[str, object]) -> dict[str, Any]:
+    route = _MASTERJET_ADMIN_TOOL_ROUTES.get(name)
+    if route is None:
+        raise AgentError("control.service_unavailable")
+    operation, alternate_operation = route
+    if alternate_operation is not None and "account_ref" in args:
+        operation = alternate_operation
+    return _masterjet_admin_operation_call(operation, args)
+
+
+def _masterjet_admin_capabilities(
+    result: Mapping[str, object],
+) -> frozenset[str]:
+    allowed = result.get("allowed")
+    if (
+        set(result)
+        != {"schema_version", "catalog_digest", "operation_count", "allowed"}
+        or type(result.get("schema_version")) is not int
+        or result.get("schema_version") != 1
+        or result.get("catalog_digest") != ADMIN_OPERATION_CATALOG_DIGEST
+        or type(result.get("operation_count")) is not int
+        or result.get("operation_count") != len(ADMIN_OPERATION_CATALOG)
+        or type(allowed) is not list
+        or len(allowed) != len(ADMIN_OPERATION_CATALOG)
+        or any(type(value) is not bool for value in cast(list[object], allowed))
+        or any(
+            permitted and ADMIN_OPERATION_METADATA[operation].scope is None
+            for operation, permitted in zip(
+                ADMIN_OPERATION_CATALOG, cast(list[bool], allowed), strict=True
+            )
+        )
+    ):
+        raise ValueError("invalid admin capabilities")
+    return frozenset(
+        operation
+        for operation, permitted in zip(
+            ADMIN_OPERATION_CATALOG, cast(list[bool], allowed), strict=True
+        )
+        if permitted and ADMIN_OPERATION_METADATA[operation].scope is not None
+    )
+
+
+def _connect_masterjet_admin_socket() -> bool:
+    """Bind one request process to the attested local admin socket."""
+
+    from codex_master.admin_socket import AdminSocketClient, AdminSocketError
+
+    from codex_master.admin_contracts import AdminRequestV1
+
+    global _MASTERJET_ADMIN_ALLOWED_OPERATIONS
+    global _MASTERJET_ADMIN_SOCKET_CLIENT, _MASTERJET_ADMIN_SOCKET_KEY_FD
+    if (
+        _MASTERJET_ADMIN_BINDING is not None
+        or _MASTERJET_ADMIN_SOCKET_CLIENT is not None
+    ):
+        return False
+    socket_path = Path(
+        os.environ.get("CODEX_MASTER_ADMIN_SOCKET", STATE_ROOT / "admin.sock")
+    ).expanduser()
+    credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
+    key_path = (
+        Path(credential_directory) / "masterjet-local-attestation-key"
+        if credential_directory
+        else STATE_ROOT / "credentials" / "masterjet-local-attestation-key"
+    )
+    key_fd = -1
+    try:
+        key_fd = os.open(
+            key_path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        client = AdminSocketClient(socket_path, attestation_key_fd=key_fd)
+        capability_result = client.call(
+            AdminRequestV1("control.operations.list", {}, None, None, None)
+        )
+        operations = _masterjet_admin_capabilities(capability_result)
+    except (AdminSocketError, OSError, ValueError):
+        if key_fd >= 0:
+            os.close(key_fd)
+        raise AgentError("control.service_unavailable") from None
+    _MASTERJET_ADMIN_SOCKET_KEY_FD = key_fd
+    _MASTERJET_ADMIN_SOCKET_CLIENT = client
+    _MASTERJET_ADMIN_ALLOWED_OPERATIONS = operations
+    return True
+
+
+def _disconnect_masterjet_admin_socket(created: bool) -> None:
+    if not created:
+        return
+    global _MASTERJET_ADMIN_ALLOWED_OPERATIONS
+    global _MASTERJET_ADMIN_SOCKET_CLIENT, _MASTERJET_ADMIN_SOCKET_KEY_FD
+    key_fd = _MASTERJET_ADMIN_SOCKET_KEY_FD
+    _MASTERJET_ADMIN_SOCKET_CLIENT = None
+    _MASTERJET_ADMIN_SOCKET_KEY_FD = None
+    _MASTERJET_ADMIN_ALLOWED_OPERATIONS = frozenset()
+    if key_fd is not None:
+        os.close(key_fd)
+
+
+def _masterjet_visible_tools(
+    tools: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    binding = _MASTERJET_ADMIN_BINDING
+    if binding is None:
+        allowed_operations = _MASTERJET_ADMIN_ALLOWED_OPERATIONS
+    else:
+        scopes = frozenset(binding[1].scopes)
+        allowed_operations = frozenset(
+            operation
+            for operation, metadata in ADMIN_OPERATION_METADATA.items()
+            if metadata.scope in scopes
+        )
+    return [
+        tool
+        for tool in tools
+        if tool["name"] not in _MASTERJET_ADMIN_TOOL_ROUTES
+        or _MASTERJET_ADMIN_TOOL_ROUTES[tool["name"]][0] in allowed_operations
+    ]
+
+
+def _masterjet_admin_tool_definition(
+    name: str,
+    operation: str,
+    description: str,
+    alternate_operation: str | None,
+) -> dict[str, Any]:
+    required, optional = _masterjet_admin_operation_fields(operation)
+    metadata = ADMIN_OPERATION_METADATA[operation]
+    text_max_lengths = {
+        field: metadata.text_argument_max_utf8_bytes
+        for field in metadata.text_argument_fields
+    }
+    if alternate_operation is not None:
+        alternate_required, alternate_optional = _masterjet_admin_operation_fields(
+            alternate_operation
+        )
+        alternate_metadata = ADMIN_OPERATION_METADATA[alternate_operation]
+        text_max_lengths.update(
+            {
+                field: alternate_metadata.text_argument_max_utf8_bytes
+                for field in alternate_metadata.text_argument_fields
+            }
+        )
+        optional = tuple(
+            dict.fromkeys((*optional, *alternate_required, *alternate_optional))
+        )
+    properties = {
+        field: (
+            {"type": "integer", "minimum": 0}
+            if field == "expected_generation"
+            else {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000,
+            }
+            if field in metadata.integer_argument_fields
+            else {
+                "type": "array",
+                "items": text_schema(128),
+                "minItems": 1,
+                "maxItems": 64,
+                "uniqueItems": True,
+            }
+            if field in metadata.token_list_argument_fields
+            else text_schema(text_max_lengths.get(field, 128))
+        )
+        for field in (*required, *optional)
+    }
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        schema["required"] = list(required)
+    return {"name": name, "description": description, "inputSchema": schema}
+
+
+_MASTERJET_ADMIN_TOOLS = [
+    _masterjet_admin_tool_definition(name, operation, description, alternate_operation)
+    for name, operation, description, alternate_operation in _MASTERJET_ADMIN_TOOL_SPECS
+]
+
+
 TOOLS: list[dict[str, Any]] = [
+    *_MASTERJET_ADMIN_TOOLS,
     {
         "name": "runtime_status",
         "description": "Return the autonomous runtime-image health contract without principal or client integration state.",
@@ -36117,7 +36650,7 @@ def handle_rpc(
                 if master_tool_access_status()["authorized"]
                 else [tool for tool in TOOLS if tool["name"] == "runtime_status"]
             )
-        return reply(rpc_result(message_id, {"tools": tools}))
+        return reply(rpc_result(message_id, {"tools": _masterjet_visible_tools(tools)}))
     if method == "resources/list":
         return reply(rpc_result(message_id, {"resources": []}))
     if method == "prompts/list":
@@ -36130,8 +36663,8 @@ def handle_rpc(
                 params = {}
             if not isinstance(params, dict):
                 raise AgentError("tools/call params must be an object")
+            requested_name = params.get("name")
             if enforce_master_role:
-                requested_name = params.get("name")
                 if not isinstance(requested_name, str):
                     raise AgentError("tools/call requires a known tool name")
                 if requested_name != "runtime_status":
@@ -36139,9 +36672,25 @@ def handle_rpc(
                         raise AgentError("teamleader authorization required")
                     status = require_teamleader_tool_access()
                     principal_class = require_principal_tool_access(requested_name, status)
-            name, args = validate_tool_call(
-                params.get("name"), params.get("arguments", {})
-            )
+            try:
+                name, args = validate_tool_call(
+                    requested_name, params.get("arguments", {})
+                )
+            except AgentError:
+                if (
+                    type(requested_name) is not str
+                    or requested_name not in _MASTERJET_ADMIN_TOOL_ROUTES
+                ):
+                    raise
+                from codex_master.admin_contracts import (
+                    canonical_admin_problem,
+                    public_admin_result,
+                )
+
+                problem = canonical_admin_problem("control.request_invalid")
+                raise MasterjetAdminError(
+                    problem.code, public_admin_result(problem)
+                ) from None
             payload = (
                 runtime_status()
                 if name == "runtime_status"
@@ -36617,9 +37166,16 @@ def serve_mcp(*, autonomous_runtime_surface: bool = False) -> int:
     """Serve MCP with a startup inventory scoped to this server lifetime."""
 
     previous_inventory = swap_agent_inventory(None)
+    admin_socket_created = False
     try:
+        if not autonomous_runtime_surface:
+            try:
+                admin_socket_created = _connect_masterjet_admin_socket()
+            except AgentError:
+                pass
         return _serve_mcp_impl(autonomous_runtime_surface=autonomous_runtime_surface)
     finally:
+        _disconnect_masterjet_admin_socket(admin_socket_created)
         swap_agent_inventory(previous_inventory)
 
 
@@ -37412,6 +37968,24 @@ def main_cli(argv: list[str]) -> int:
         finally:
             swap_agent_inventory(previous_inventory)
 
+    admin_socket_created = False
+    if (
+        len(argv) >= 2
+        and argv[0] == "fleet"
+        and argv[1]
+        in {
+            "openai",
+            "google",
+            "host",
+            "operation",
+        }
+    ):
+        try:
+            admin_socket_created = _connect_masterjet_admin_socket()
+        except AgentError as exc:
+            print_json(public_error_payload(exc))
+            return 1
+
     global _FLEET_STARTUP_ERROR
     previous_inventory = swap_agent_inventory(None)
     try:
@@ -37420,6 +37994,7 @@ def main_cli(argv: list[str]) -> int:
         _publish_startup_fleet_inventory()
         return _main_cli_impl(argv)
     finally:
+        _disconnect_masterjet_admin_socket(admin_socket_created)
         swap_agent_inventory(previous_inventory)
 
 
@@ -37785,6 +38360,69 @@ def _main_cli_impl(argv: list[str]) -> int:
 
     p_fleet = sub.add_parser("fleet")
     fleet_sub = p_fleet.add_subparsers(dest="fleet_namespace", required=True)
+    p_fleet_openai = fleet_sub.add_parser("openai")
+    openai_sub = p_fleet_openai.add_subparsers(
+        dest="fleet_openai_command", required=True
+    )
+    for (namespace, command), (
+        operation,
+        alternate_operation,
+    ) in _MASTERJET_ADMIN_CLI_COMMANDS.items():
+        if namespace == "openai":
+            _add_masterjet_admin_cli_command(
+                openai_sub, command, operation, alternate_operation
+            )
+
+    p_fleet_google = fleet_sub.add_parser("google")
+    google_sub = p_fleet_google.add_subparsers(
+        dest="fleet_google_command", required=True
+    )
+    for (namespace, command), (
+        operation,
+        alternate_operation,
+    ) in _MASTERJET_ADMIN_CLI_COMMANDS.items():
+        if namespace == "google":
+            _add_masterjet_admin_cli_command(
+                google_sub, command, operation, alternate_operation
+            )
+
+    p_fleet_ollama = fleet_sub.add_parser("ollama")
+    ollama_sub = p_fleet_ollama.add_subparsers(
+        dest="fleet_ollama_command", required=True
+    )
+    for (namespace, command), (
+        operation,
+        alternate_operation,
+    ) in _MASTERJET_ADMIN_CLI_COMMANDS.items():
+        if namespace == "ollama":
+            _add_masterjet_admin_cli_command(
+                ollama_sub, command, operation, alternate_operation
+            )
+
+    p_fleet_operation = fleet_sub.add_parser("operation")
+    operation_sub = p_fleet_operation.add_subparsers(
+        dest="fleet_operation_command", required=True
+    )
+    for (namespace, command), (
+        operation,
+        alternate_operation,
+    ) in _MASTERJET_ADMIN_CLI_COMMANDS.items():
+        if namespace == "operation":
+            _add_masterjet_admin_cli_command(
+                operation_sub, command, operation, alternate_operation
+            )
+
+    p_fleet_host = fleet_sub.add_parser("host")
+    host_sub = p_fleet_host.add_subparsers(dest="fleet_host_command", required=True)
+    for (namespace, command), (
+        operation,
+        alternate_operation,
+    ) in _MASTERJET_ADMIN_CLI_COMMANDS.items():
+        if namespace == "host":
+            _add_masterjet_admin_cli_command(
+                host_sub, command, operation, alternate_operation
+            )
+
     p_fleet_account = fleet_sub.add_parser("account")
     account_sub = p_fleet_account.add_subparsers(
         dest="fleet_account_command", required=True
@@ -37865,8 +38503,10 @@ def _main_cli_impl(argv: list[str]) -> int:
     sub.add_parser("release-status")
     sub.add_parser("watchdog-status")
     sub.add_parser("timeout-policy")
-    sub.add_parser("control-center")
-    sub.add_parser("control-center-launch", help=argparse.SUPPRESS)
+    p_control_center = sub.add_parser("control-center")
+    p_control_center.add_argument("--page", choices=("ollama",))
+    p_control_center_launch = sub.add_parser("control-center-launch", help=argparse.SUPPRESS)
+    p_control_center_launch.add_argument("--page", choices=("ollama",))
     p_applet_status = sub.add_parser("applet-status")
     p_applet_status.add_argument("agents", nargs="*")
     p_applet_status.add_argument("--schema-version", type=int, default=1)
@@ -37937,7 +38577,7 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_raw_log_writer.add_argument("path")
     p_raw_log_writer.add_argument("--max-bytes", type=int, default=MAX_RAW_LOG_BYTES)
 
-    add_hive_cli_parsers(sub)
+    add_hive_cli_parsers(sub, fleet_subparsers=fleet_sub)
 
     args = parser.parse_args(argv)
     try:
@@ -37945,7 +38585,11 @@ def _main_cli_impl(argv: list[str]) -> int:
             return write_bounded_raw_log(Path(args.path), args.max_bytes)
         if args.command in {"hive", "selection-status", "reset-anchor-run"}:
             return print_json(run_hive_cli(args))
+        if args.command == "fleet" and args.fleet_namespace == "test":
+            return print_json(run_hive_cli(args))
         if args.command == "fleet":
+            if hasattr(args, "masterjet_admin_operation"):
+                return print_json(_masterjet_admin_cli_call(args))
             if args.fleet_namespace == "account":
                 if args.fleet_account_command == "list":
                     return print_json(call_validated_tool("fleet_account_list", {}))
@@ -38550,9 +39194,11 @@ def _main_cli_impl(argv: list[str]) -> int:
         if args.command == "control-center":
             from codex_master.control_center import run_control_center
 
-            return run_control_center([])
+            control_args = ["--page", args.page] if args.page else []
+            return run_control_center(control_args)
         if args.command == "control-center-launch":
-            return print_json(launch_control_center_detached())
+            launch_values = {"page": args.page} if args.page else {}
+            return print_json(launch_control_center_detached(**launch_values))
         if args.command == "applet-status":
             return print_json(
                 call_validated_tool(
@@ -39924,8 +40570,6 @@ def _read_hive_api_token_yaml(
             raise AgentError("api_token_yaml_invalid_structure")
         if len(billing_accounts) > 4:
             raise AgentError("api_token_yaml_google_account_billing_limit_exceeded")
-        if len(projects) > 10:
-            raise AgentError("api_token_yaml_google_account_project_limit_exceeded")
 
         local_billing_refs: set[str] = set()
         for billing_account in billing_accounts:
@@ -42970,7 +43614,7 @@ _G_MIGRATION_CRASHED: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 
 def _g_migration_crash_point(_point: str) -> None:
-    """Private test seam; production has no crash injection."""
+    return None  # Private test seam; production has no crash injection.
 
 
 def _g_migration_checkpoint(point: str) -> None:

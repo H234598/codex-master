@@ -13,7 +13,6 @@ from codex_master.remote_queen_bootstrap import (
     DNF_PACKAGES,
     HostFactsV1,
     ManifestGenerationV1,
-    PackagePlanV1,
     RemoteQueenBootstrapError,
     package_plan_for,
 )
@@ -1323,3 +1322,25 @@ def test_foreign_and_operation_payloads_never_enter_errors():
 
     assert exc_info.value.code == "RQ_E_FOREIGN_STATE"
     assert "secret-rb2-do-not-retain" not in str(exc_info.value)
+
+
+def test_exact_accepts_only_the_requested_concrete_type() -> None:
+    class TextSubclass(str):
+        pass
+
+    assert deps._exact("value", str) is True
+    assert deps._exact(TextSubclass("value"), str) is False
+    assert deps._exact(True, int) is False
+
+
+def test_unique_requires_hashable_distinct_tuple_values() -> None:
+    assert deps._unique(("one", "two")) is True
+    assert deps._unique(("one", "one")) is False
+
+
+def test_valid_pin_version_accepts_only_canonical_two_or_three_part_versions() -> None:
+    assert deps._valid_pin_version("1.2") is True
+    assert deps._valid_pin_version("1.2.3") is True
+    assert deps._valid_pin_version("01.2") is False
+    assert deps._valid_pin_version("1") is False
+    assert deps._valid_pin_version(1.2) is False

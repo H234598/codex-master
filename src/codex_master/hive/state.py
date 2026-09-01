@@ -57,7 +57,9 @@ def _ensure_private_directory(path: Path) -> None:
             raise HiveStateError("state_directory_unavailable") from exc
 
 
-def _validate_existing_private_directory(path: Path) -> None:
+def _validate_existing_private_directory(
+    path: Path, *, shared_gid: int | None = None
+) -> None:
     """Validate an existing private directory without repairing or creating it."""
 
     try:
@@ -66,26 +68,46 @@ def _validate_existing_private_directory(path: Path) -> None:
         raise HiveStateError("state_not_found") from None
     except OSError as exc:
         raise HiveStateError("state_directory_unavailable") from exc
-    if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode) or current.st_mode & 0o077:
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
         raise HiveStateError("state_directory_untrusted")
-    if current.st_uid != os.geteuid() or stat.S_IMODE(current.st_mode) != 0o700:
+    trusted = (
+        current.st_uid == os.geteuid()
+        and stat.S_IMODE(current.st_mode) == 0o700
+        if shared_gid is None
+        else current.st_gid == shared_gid
+        and stat.S_IMODE(current.st_mode) == 0o2770
+    )
+    if not trusted:
         raise HiveStateError("state_directory_untrusted")
 
 
 class HiveStateStore:
     """Private state root with no-follow reads and atomic replacement."""
 
-    def __init__(self, root: Path, *, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        shared_gid: int | None = None,
+        read_only: bool = False,
+    ) -> None:
         if not isinstance(root, Path) or not root.is_absolute():
             raise HiveStateError("invalid_state_root")
         if type(read_only) is not bool:
             raise HiveStateError("invalid_state_mode")
+        if shared_gid is not None and (
+            isinstance(shared_gid, bool) or not isinstance(shared_gid, int) or shared_gid < 0
+        ):
+            raise HiveStateError("invalid_state_group")
         self._root = root
         self._read_only = read_only
+        self._shared_gid = shared_gid
+        self._directory_mode = 0o2770 if shared_gid is not None else 0o700
+        self._file_mode = 0o660 if shared_gid is not None else 0o600
         if read_only:
-            _validate_existing_private_directory(root)
+            _validate_existing_private_directory(root, shared_gid=shared_gid)
         else:
-            _ensure_private_directory(root)
+            self._ensure_directory(root)
         self._lock_path = root / ".hive-state.lock"
         descriptor = self._open_private_root()
         try:
@@ -244,9 +266,9 @@ class HiveStateStore:
         path = self._root.joinpath(*relative.parts)
         parent = path.parent
         if self._read_only:
-            _validate_existing_private_directory(parent)
+            _validate_existing_private_directory(parent, shared_gid=self._shared_gid)
         else:
-            _ensure_private_directory(parent)
+            self._ensure_directory(parent)
         try:
             root_resolved = self._root.resolve(strict=True)
             parent_resolved = parent.resolve(strict=True)
@@ -273,9 +295,16 @@ class HiveStateStore:
                 except FileNotFoundError:
                     if self._read_only:
                         raise HiveStateError("state_not_found") from None
+                    created = False
                     try:
-                        os.mkdir(part, 0o700, dir_fd=descriptor)
+                        os.mkdir(part, self._directory_mode, dir_fd=descriptor)
+                        created = True
+                    except FileExistsError:
+                        pass
+                    try:
                         child = os.open(part, flags, dir_fd=descriptor)
+                        if created:
+                            os.fchmod(child, self._directory_mode)
                     except OSError as exc:
                         raise HiveStateError("state_directory_unavailable") from exc
                 except OSError as exc:
@@ -336,45 +365,105 @@ class HiveStateStore:
             raise HiveStateError("state_lock_unavailable") from exc
         if existing is not None:
             self._validate_private_file(existing, MAX_HIVE_STATE_BYTES)
-        flags = (os.O_RDONLY if self._read_only else os.O_RDWR) | getattr(os, "O_NOFOLLOW", 0)
-        if not self._read_only:
-            flags |= os.O_CREAT
+        flags = (
+            (os.O_RDONLY if self._read_only else os.O_RDWR)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        created = False
         try:
-            descriptor = os.open(lock_name, flags, 0o600, dir_fd=root_descriptor)
+            if self._read_only:
+                descriptor = os.open(lock_name, flags, dir_fd=root_descriptor)
+            elif existing is None:
+                try:
+                    descriptor = os.open(
+                        lock_name,
+                        flags | os.O_CREAT | os.O_EXCL,
+                        self._file_mode,
+                        dir_fd=root_descriptor,
+                    )
+                    created = True
+                except FileExistsError:
+                    existing = os.stat(
+                        lock_name,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    self._validate_private_file(existing, MAX_HIVE_STATE_BYTES)
+                    descriptor = os.open(lock_name, flags, dir_fd=root_descriptor)
+            else:
+                descriptor = os.open(lock_name, flags, dir_fd=root_descriptor)
         except OSError as exc:
             raise HiveStateError("state_lock_unavailable") from exc
         try:
             opened = os.fstat(descriptor)
+            if created:
+                os.fchmod(descriptor, self._file_mode)
+                opened = os.fstat(descriptor)
             self._validate_private_file(opened, MAX_HIVE_STATE_BYTES)
             if existing is not None and not self._same_file(existing, opened):
                 raise HiveStateError("state_lock_unavailable")
-            if not self._read_only:
-                os.fchmod(descriptor, 0o600)
-            self._validate_private_file(os.fstat(descriptor), MAX_HIVE_STATE_BYTES)
             return descriptor
         except Exception:
             os.close(descriptor)
             raise
 
-    @staticmethod
-    def _validate_private_directory(info: os.stat_result) -> None:
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) != 0o700
-        ):
+    def _ensure_directory(self, path: Path) -> None:
+        try:
+            created = False
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                try:
+                    path.mkdir(
+                        parents=True,
+                        exist_ok=False,
+                        mode=self._directory_mode,
+                    )
+                    created = True
+                except FileExistsError:
+                    pass
+                if created:
+                    os.chmod(path, self._directory_mode)
+            current = path.lstat()
+        except OSError as exc:
+            raise HiveStateError("state_directory_unavailable") from exc
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+            raise HiveStateError("state_directory_untrusted")
+        self._validate_private_directory(current)
+
+    def _validate_private_directory(self, info: os.stat_result) -> None:
+        if not stat.S_ISDIR(info.st_mode):
+            raise HiveStateError("state_directory_untrusted")
+        if self._shared_gid is None:
+            trusted = (
+                info.st_uid == os.geteuid()
+                and stat.S_IMODE(info.st_mode) == self._directory_mode
+            )
+        else:
+            trusted = (
+                info.st_gid == self._shared_gid
+                and stat.S_IMODE(info.st_mode) == self._directory_mode
+            )
+        if not trusted:
             raise HiveStateError("state_directory_untrusted")
 
-    @staticmethod
-    def _validate_private_file(info: os.stat_result, max_bytes: int) -> None:
+    def _validate_private_file(self, info: os.stat_result, max_bytes: int) -> None:
         if info.st_size > max_bytes:
             raise HiveStateError("state_oversize")
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_nlink != 1
-            or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise HiveStateError("state_file_untrusted")
+        if self._shared_gid is None:
+            trusted = (
+                info.st_uid == os.geteuid()
+                and stat.S_IMODE(info.st_mode) == self._file_mode
+            )
+        else:
+            trusted = (
+                info.st_gid == self._shared_gid
+                and stat.S_IMODE(info.st_mode) == self._file_mode
+            )
+        if not trusted:
             raise HiveStateError("state_file_untrusted")
 
     @staticmethod
@@ -441,10 +530,10 @@ class HiveStateStore:
                 descriptor = os.open(
                     temporary,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
+                    self._file_mode,
                     dir_fd=parent_descriptor,
                 )
-                os.fchmod(descriptor, 0o600)
+                os.fchmod(descriptor, self._file_mode)
                 self._validate_private_file(os.fstat(descriptor), MAX_HIVE_STATE_BYTES)
                 offset = 0
                 while offset < len(payload):
@@ -567,7 +656,7 @@ class HiveStateStore:
                 self._exists(path)
             descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=parent)
             temporary = Path(name)
-            os.fchmod(descriptor, 0o600)
+            os.fchmod(descriptor, self._file_mode)
             with os.fdopen(descriptor, "wb") as handle:
                 descriptor = None
                 handle.write(encoded)

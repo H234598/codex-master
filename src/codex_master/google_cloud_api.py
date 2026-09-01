@@ -73,8 +73,12 @@ class _UrlLibTransport:
         except urllib.error.HTTPError as error:
             if error.code in {401, 403}:
                 raise GoogleCloudApiError("google.api_auth_failed") from None
-            if error.code in {409, 429}:
-                raise GoogleCloudApiError("google.api_quota_or_conflict") from None
+            if error.code == 408 or 500 <= error.code <= 599:
+                raise GoogleCloudApiError("google.api_unavailable") from None
+            if error.code == 409:
+                raise GoogleCloudApiError("google.api_conflict") from None
+            if error.code == 429:
+                raise GoogleCloudApiError("google.api_quota_exhausted") from None
             raise GoogleCloudApiError("google.api_request_failed") from None
         except (OSError, urllib.error.URLError):
             raise GoogleCloudApiError("google.api_unavailable") from None
@@ -184,7 +188,9 @@ class GoogleCloudApi:
         )
         return self._operation_response(operation, _RESOURCE_MANAGER)
 
-    def update_project_name(self, resource_name: str, project_name: str) -> dict[str, object]:
+    def update_project_name(
+        self, resource_name: str, project_name: str
+    ) -> dict[str, object]:
         operation = self._request(
             "PATCH",
             f"{_RESOURCE_MANAGER}/{resource_name}?updateMask=displayName",
@@ -217,9 +223,7 @@ class GoogleCloudApi:
             {
                 "displayName": display_name,
                 "restrictions": {
-                    "apiTargets": [
-                        {"service": "generativelanguage.googleapis.com"}
-                    ]
+                    "apiTargets": [{"service": "generativelanguage.googleapis.com"}]
                 },
             },
         )
@@ -256,9 +260,7 @@ class GoogleCloudApi:
                 "name": key_name,
                 "displayName": display_name,
                 "restrictions": {
-                    "apiTargets": [
-                        {"service": "generativelanguage.googleapis.com"}
-                    ]
+                    "apiTargets": [{"service": "generativelanguage.googleapis.com"}]
                 },
             },
         )
@@ -279,6 +281,8 @@ class GoogleCloudApi:
             f"{_SERVICE_USAGE}/projects/{project_number}/services?filter=state%3AENABLED",
         )
         services = page.get("services", [])
-        if type(services) is not list or any(type(item) is not dict for item in services):
+        if type(services) is not list or any(
+            type(item) is not dict for item in services
+        ):
             raise GoogleCloudApiError("google.api_response_invalid")
         return services

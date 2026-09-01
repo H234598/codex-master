@@ -4,16 +4,18 @@ import contextlib
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import stat
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import ContextManager, Mapping, TypeVar
+from typing import ContextManager, Mapping, TypeVar, cast
 
 from .fleet_registry import (
     FleetAccount,
@@ -59,6 +61,19 @@ from .selection import (
     TaskKind,
     preview_selection,
 )
+from .ollama_host_transport import CONTROL_HOST_REF
+from .admin_contracts import OperationV1
+from .agent_contracts import AgentReceiptV1, remote_envelope_digest, serialize_agent_result
+from .agent_operations import AgentOperationError, AgentOperationStore
+from .agent_operations import AgentPrincipalV1 as OperationAgentPrincipalV1
+from .hive.state import HiveStateError, HiveStateStore
+from .ollama_registry import (
+    OllamaInstanceV1,
+    OllamaModelV1,
+    OllamaRegistryStore,
+    OllamaRegistryV1,
+)
+from .ollama_runtime import OllamaReadinessStatus
 
 
 MAX_REGISTRY_BYTES = 1024 * 1024
@@ -67,6 +82,8 @@ MAX_RATE_LIMIT_BYTES = 256 * 1024
 MAX_USAGE_BYTES = 1024 * 1024
 MAX_EVENT_BYTES = 512 * 1024
 MAX_SECRET_BYTES = 16 * 1024
+_REMOTE_OLLAMA_DOCUMENT = PurePosixPath("remote-ollama-operations.json")
+_REMOTE_OLLAMA_STATE_BYTES = 512 * 1024
 _CREDENTIAL_BINDING_SALT_BYTES = 32
 _CREDENTIAL_BINDING_DOMAIN = b"codex-master:gemini-credential-binding:v1\0"
 GEMINI_MIN_REQUEST_INTERVAL_SECONDS = 60
@@ -242,7 +259,9 @@ def _redacted_gemini_event_reason(reason: str | None) -> str | None:
 
 
 class FleetConflictError(ValueError):
-    pass
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 class FleetSecretError(ValueError):
@@ -344,6 +363,205 @@ class FleetPrivateIO:
     remove_file: Callable[[Path], bool] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class OllamaResourceSnapshotV1:
+    host_ref: str
+    generation: int
+    observed_at_utc: str
+    valid_until_utc: str
+    green: bool
+    headroom_seconds: int
+
+    def __post_init__(self) -> None:
+        try:
+            observed = datetime.fromisoformat(
+                self.observed_at_utc.replace("Z", "+00:00")
+            )
+            valid_until = datetime.fromisoformat(
+                self.valid_until_utc.replace("Z", "+00:00")
+            )
+        except (AttributeError, ValueError):
+            raise ValueError("ollama.resource_snapshot_invalid") from None
+        if (
+            not _ACCOUNT_ID_RE.fullmatch(self.host_ref)
+            or type(self.generation) is not int
+            or self.generation < 1
+            or observed.tzinfo is None
+            or valid_until.tzinfo is None
+            or valid_until <= observed
+            or type(self.green) is not bool
+            or type(self.headroom_seconds) is not int
+            or self.headroom_seconds < 0
+        ):
+            raise ValueError("ollama.resource_snapshot_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaFleetPlanV1:
+    plan_id: str
+    plan_digest: str
+    registry_generation: int
+    resource_generation: int | None
+    instance: OllamaInstanceV1 = field(repr=False)
+    host_plan: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaHiveLaneV1:
+    lane_ref: str
+    instance_ref: str
+    host_ref: str
+    model_ref: str
+    provider_model_id: str
+    task_profile: str = "simple_only"
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaApplyResultV1:
+    registry: OllamaRegistryV1
+    instance: OllamaInstanceV1
+    readiness: OllamaReadinessStatus
+    hive_lanes: tuple[OllamaHiveLaneV1, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RemoteOllamaPlanV1:
+    operation_id: str
+    plan_digest: str
+    agent_plan_digest: str
+    registry_generation: int
+    resource_generation: int | None
+    instance: OllamaInstanceV1
+
+
+def _remote_instance_document(instance: OllamaInstanceV1) -> dict[str, object]:
+    return {
+        "ref": instance.ref,
+        "label": instance.label,
+        "host_ref": instance.host_ref,
+        "ollama_executable": instance.ollama_executable,
+        "models_directory": instance.models_directory,
+        "selected_model_refs": list(instance.selected_model_refs),
+        "allowed_cpus": instance.allowed_cpus,
+        "cpu_quota_percent": instance.cpu_quota_percent,
+        "cpu_weight": instance.cpu_weight,
+        "lifecycle_state": instance.lifecycle_state,
+        "readiness_state": instance.readiness_state,
+    }
+
+
+def _remote_instance_from_document(value: object) -> OllamaInstanceV1:
+    required = {
+        "ref",
+        "label",
+        "host_ref",
+        "ollama_executable",
+        "models_directory",
+        "selected_model_refs",
+        "allowed_cpus",
+        "cpu_quota_percent",
+        "cpu_weight",
+        "lifecycle_state",
+        "readiness_state",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise FleetConflictError("resource.host_response_invalid")
+    selected = value["selected_model_refs"]
+    if not isinstance(selected, (list, tuple)) or any(
+        not isinstance(ref, str) for ref in selected
+    ):
+        raise FleetConflictError("resource.host_response_invalid")
+    try:
+        return OllamaInstanceV1(
+            cast(str, value["ref"]),
+            cast(str, value["label"]),
+            cast(str, value["host_ref"]),
+            cast(str, value["ollama_executable"]),
+            cast(str, value["models_directory"]),
+            tuple(selected),
+            cast(str, value["allowed_cpus"]),
+            cast(int, value["cpu_quota_percent"]),
+            cast(int, value["cpu_weight"]),
+            cast(str, value["lifecycle_state"]),
+            cast(str, value["readiness_state"]),
+        )
+    except (TypeError, ValueError):
+        raise FleetConflictError("resource.host_response_invalid") from None
+
+
+def _readiness_document(value: OllamaReadinessStatus) -> dict[str, object]:
+    return {
+        "ready": value.ready,
+        "reason_codes": list(value.reason_codes),
+        "process_running": value.process_running,
+        "cgroup_member": value.cgroup_member,
+        "loopback_endpoint_reachable": value.loopback_endpoint_reachable,
+        "available_model_ids": list(value.available_model_ids),
+    }
+
+
+def _readiness_from_document(value: object) -> OllamaReadinessStatus:
+    if not isinstance(value, Mapping) or set(value) != {
+        "ready",
+        "reason_codes",
+        "process_running",
+        "cgroup_member",
+        "loopback_endpoint_reachable",
+        "available_model_ids",
+    }:
+        raise FleetConflictError("resource.host_response_invalid")
+    try:
+        return OllamaReadinessStatus(
+            value["ready"],
+            tuple(value["reason_codes"]),
+            value["process_running"],
+            value["cgroup_member"],
+            value["loopback_endpoint_reachable"],
+            tuple(value["available_model_ids"]),
+        )
+    except (TypeError, ValueError):
+        raise FleetConflictError("resource.host_response_invalid") from None
+
+
+def _ensure_remote_state_directory(
+    directory: Path, *, mode: int, shared_gid: int | None
+) -> None:
+    try:
+        metadata = directory.lstat()
+    except FileNotFoundError:
+        created = False
+        try:
+            directory.mkdir(mode=mode)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise HiveStateError("state_directory_unavailable") from exc
+        if created:
+            try:
+                os.chmod(directory, mode)
+            except OSError as exc:
+                raise HiveStateError("state_directory_unavailable") from exc
+        try:
+            metadata = directory.lstat()
+        except OSError as exc:
+            raise HiveStateError("state_directory_unavailable") from exc
+    except OSError as exc:
+        raise HiveStateError("state_directory_unavailable") from exc
+    trusted_identity = (
+        metadata.st_uid == os.geteuid()
+        if shared_gid is None
+        else metadata.st_gid == shared_gid
+    )
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != mode
+        or not trusted_identity
+    ):
+        raise HiveStateError("state_directory_untrusted")
+
+
 class FleetService:
     def __init__(
         self,
@@ -353,6 +571,13 @@ class FleetService:
         pool_root: Path,
         probe_max_age_seconds: int = 900,
         read_only: bool = False,
+        ollama_registry: OllamaRegistryStore | None = None,
+        ollama_transport: object | None = None,
+        agent_operations: AgentOperationStore | None = None,
+        shared_state_gid: int | None = None,
+        ollama_resource_snapshot: Callable[
+            [str], OllamaResourceSnapshotV1 | None
+        ] | None = None,
     ) -> None:
         self._paths = paths
         self._io = private_io
@@ -367,6 +592,1232 @@ class FleetService:
         ):
             raise ValueError("invalid_probe_max_age")
         self._probe_max_age_seconds = probe_max_age_seconds
+        self._ollama_registry = ollama_registry
+        self._ollama_transport = ollama_transport
+        self._agent_operations = agent_operations
+        self._ollama_remote_state = None
+        if ollama_registry is not None and agent_operations is not None:
+            try:
+                if shared_state_gid is not None and (
+                    isinstance(shared_state_gid, bool)
+                    or not isinstance(shared_state_gid, int)
+                    or shared_state_gid < 0
+                ):
+                    raise ValueError
+                directory_mode = 0o2770 if shared_state_gid is not None else 0o700
+                for directory in (paths.root.parent, paths.root):
+                    _ensure_remote_state_directory(
+                        directory,
+                        mode=directory_mode,
+                        shared_gid=shared_state_gid,
+                    )
+                self._ollama_remote_state = HiveStateStore(
+                    paths.root / "ollama-remote", shared_gid=shared_state_gid
+                )
+            except (HiveStateError, OSError):
+                raise ValueError("ollama.remote_state_unavailable") from None
+        self._ollama_resource_snapshot = ollama_resource_snapshot
+        self._ollama_lock = threading.RLock()
+        self._ollama_plans: dict[str, OllamaFleetPlanV1] = {}
+        self._ollama_applied: dict[str, OllamaApplyResultV1] = {}
+        self._ollama_ready: dict[str, OllamaReadinessStatus] = {}
+        self._ollama_executions: dict[str, tuple[object, int]] = {}
+        self._ollama_remote_plans: dict[str, _RemoteOllamaPlanV1] = {}
+        self._ollama_remote_operations: dict[str, tuple[str, _RemoteOllamaPlanV1]] = {}
+        self._ollama_remote_applied: dict[str, _RemoteOllamaPlanV1] = {}
+
+    def _require_ollama(self) -> tuple[OllamaRegistryStore, object]:
+        if self._ollama_registry is None or self._ollama_transport is None:
+            raise FleetConflictError("ollama.not_configured")
+        return self._ollama_registry, self._ollama_transport
+
+    def _remote_document(self) -> dict[str, object]:
+        """Load the private, restart-safe remote operation index."""
+
+        state = self._ollama_remote_state
+        if state is None:
+            raise FleetConflictError("ollama.transport_invalid")
+        try:
+            with state.locked():
+                return self._remote_document_locked(state)
+        except HiveStateError:
+            raise FleetConflictError("resource.host_response_invalid") from None
+
+    @staticmethod
+    def _remote_document_locked(state: HiveStateStore) -> dict[str, object]:
+        try:
+            document = dict(
+                state.read_json_locked(
+                    _REMOTE_OLLAMA_DOCUMENT, max_bytes=_REMOTE_OLLAMA_STATE_BYTES
+                )
+            )
+        except HiveStateError as error:
+            if str(error) == "state_not_found":
+                return {"schema_version": 1, "operations": {}, "ready": {}}
+            raise
+        if (
+            set(document) != {"schema_version", "operations", "ready"}
+            or document["schema_version"] != 1
+            or not isinstance(document["operations"], dict)
+            or not isinstance(document["ready"], dict)
+        ):
+            raise FleetConflictError("resource.host_response_invalid")
+        return document
+
+    def _mutate_remote_document(
+        self, mutate: Callable[[dict[str, object]], None]
+    ) -> None:
+        state = self._ollama_remote_state
+        if state is None:
+            raise FleetConflictError("ollama.transport_invalid")
+        try:
+            with state.locked():
+                document = self._remote_document_locked(state)
+                mutate(document)
+                self._remote_document_locked_validate(document)
+                state.replace_json_locked(_REMOTE_OLLAMA_DOCUMENT, document)
+        except HiveStateError:
+            raise FleetConflictError("resource.host_response_invalid") from None
+
+    @staticmethod
+    def _remote_document_locked_validate(document: object) -> None:
+        if (
+            not isinstance(document, Mapping)
+            or set(document) != {"schema_version", "operations", "ready"}
+            or document["schema_version"] != 1
+            or not isinstance(document["operations"], dict)
+            or not isinstance(document["ready"], dict)
+        ):
+            raise FleetConflictError("resource.host_response_invalid")
+
+    def _remote_plan_from_record(
+        self, operation_id: str, record: object
+    ) -> _RemoteOllamaPlanV1:
+        required = {
+            "action",
+            "plan_id",
+            "plan_digest",
+            "agent_plan_digest",
+            "registry_generation",
+            "resource_generation",
+            "instance",
+            "arguments_digest",
+        }
+        if (
+            not isinstance(record, Mapping)
+            or not required.issubset(record)
+            or set(record) - required - {"completed", "instance_ref", "completion"}
+        ):
+            raise FleetConflictError("resource.host_response_invalid")
+        completion = record.get("completion")
+        if completion is not None and (
+            not isinstance(completion, Mapping)
+            or set(completion) != {"state", "receipt_digest", "phase"}
+            or completion.get("state") not in {"succeeded", "failed", "unknown"}
+            or not isinstance(completion.get("receipt_digest"), str)
+            or completion.get("phase")
+            not in {"prepared", "owner_applied", "queue_completed"}
+        ):
+            raise FleetConflictError("resource.host_response_invalid")
+        if (
+            not isinstance(operation_id, str)
+            or not isinstance(record["plan_id"], str)
+            or not isinstance(record["plan_digest"], str)
+            or not isinstance(record["agent_plan_digest"], str)
+            or not isinstance(record["registry_generation"], int)
+            or (
+                record["resource_generation"] is not None
+                and not isinstance(record["resource_generation"], int)
+            )
+            or not isinstance(record["arguments_digest"], str)
+        ):
+            raise FleetConflictError("resource.host_response_invalid")
+        instance = _remote_instance_from_document(record["instance"])
+        return _RemoteOllamaPlanV1(
+            operation_id,
+            record["plan_digest"],
+            record["agent_plan_digest"],
+            record["registry_generation"],
+            record["resource_generation"],
+            instance,
+        )
+
+    @staticmethod
+    def _completion_saga_digest(receipt: AgentReceiptV1) -> str:
+        return "sha256:" + hashlib.sha256(
+            json.dumps(
+                {
+                    "operation_id": receipt.operation_id,
+                    "lease_id": receipt.lease_id,
+                    "lease_epoch": receipt.lease_epoch,
+                    "attempt": receipt.attempt,
+                    "plan_digest": receipt.plan_digest,
+                    "arguments_digest": receipt.arguments_digest,
+                    "envelope_digest": receipt.envelope_digest,
+                    "state": receipt.state,
+                    "reason_codes": receipt.reason_codes,
+                    "result_digest": receipt.result_digest,
+                    "result": serialize_agent_result(receipt.result),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _prepare_remote_completion(self, receipt: AgentReceiptV1) -> str:
+        digest = self._completion_saga_digest(receipt)
+        state = self._ollama_remote_state
+        if state is None:
+            raise FleetConflictError("ollama.transport_invalid")
+        try:
+            with state.locked():
+                document = self._remote_document_locked(state)
+                record = cast(dict[str, object], document["operations"]).get(
+                    receipt.operation_id
+                )
+                if not isinstance(record, dict):
+                    raise FleetConflictError("resource.host_response_invalid")
+                completion = record.get("completion")
+                expected = {"state": receipt.state, "receipt_digest": digest}
+                if completion is None:
+                    record["completion"] = {**expected, "phase": "prepared"}
+                    self._remote_document_locked_validate(document)
+                    state.replace_json_locked(_REMOTE_OLLAMA_DOCUMENT, document)
+                    return "prepared"
+                if (
+                    not isinstance(completion, Mapping)
+                    or completion.get("state") != receipt.state
+                    or completion.get("receipt_digest") != digest
+                    or completion.get("phase")
+                    not in {"prepared", "owner_applied", "queue_completed"}
+                ):
+                    raise FleetConflictError("resource.host_response_invalid")
+                return cast(str, completion["phase"])
+        except HiveStateError:
+            raise FleetConflictError("resource.host_response_invalid") from None
+
+    def _mark_remote_owner_applied(
+        self,
+        receipt: AgentReceiptV1,
+        *,
+        instance_ref: str | None,
+        readiness: OllamaReadinessStatus | None,
+    ) -> None:
+        digest = self._completion_saga_digest(receipt)
+
+        def owner_applied(document: dict[str, object]) -> None:
+            record = cast(dict[str, object], document["operations"]).get(
+                receipt.operation_id
+            )
+            if not isinstance(record, dict):
+                raise FleetConflictError("resource.host_response_invalid")
+            completion = record.get("completion")
+            if (
+                not isinstance(completion, dict)
+                or completion.get("state") != receipt.state
+                or completion.get("receipt_digest") != digest
+                or completion.get("phase") not in {"prepared", "owner_applied", "queue_completed"}
+            ):
+                raise FleetConflictError("resource.host_response_invalid")
+            if completion["phase"] == "queue_completed":
+                return
+            completion["phase"] = "owner_applied"
+            if instance_ref is not None:
+                record["instance_ref"] = instance_ref
+                ready = cast(dict[str, object], document["ready"])
+                if readiness is None:
+                    ready.pop(instance_ref, None)
+                else:
+                    ready[instance_ref] = _readiness_document(readiness)
+
+        self._mutate_remote_document(owner_applied)
+
+    def _remote_plan(self, plan_id: str) -> _RemoteOllamaPlanV1 | None:
+        if self._ollama_remote_state is None:
+            return None
+        document = self._remote_document()
+        record = cast(dict[str, object], document["operations"]).get(plan_id)
+        if record is None:
+            return None
+        plan = self._remote_plan_from_record(plan_id, record)
+        if record.get("action") != "plan" or record.get("plan_id") != plan_id:
+            return None
+        return plan
+
+    def _remote_operation(
+        self, operation_id: str
+    ) -> tuple[str, _RemoteOllamaPlanV1, Mapping[str, object]] | None:
+        if self._ollama_remote_state is None:
+            return None
+        document = self._remote_document()
+        record = cast(dict[str, object], document["operations"]).get(operation_id)
+        if record is None:
+            self._recover_remote_owner_from_queue(operation_id)
+            document = self._remote_document()
+            record = cast(dict[str, object], document["operations"]).get(operation_id)
+            if record is None:
+                return None
+        if not isinstance(record, Mapping):
+            raise FleetConflictError("resource.host_response_invalid")
+        action = record.get("action")
+        plan_id = record.get("plan_id")
+        if action not in {"plan", "apply", "probe", "stop"} or not isinstance(
+            plan_id, str
+        ):
+            raise FleetConflictError("resource.host_response_invalid")
+        plan = self._remote_plan(plan_id)
+        if plan is None:
+            raise FleetConflictError("resource.host_response_invalid")
+        return action, plan, record
+
+    def _recover_remote_owner_from_queue(self, operation_id: str) -> None:
+        """Rebuild any remote owner from its queue-committed bounded envelope.
+
+        The recovery lookup is one exact operation-id lookup, never an index
+        scan.  Action owners can only be reconstructed through the durable
+        plan owner named by their exact ``plan_id`` fence.
+        """
+        if self._agent_operations is None or self._ollama_registry is None:
+            return
+        try:
+            context = self._agent_operations.owner_context(operation_id)
+            queued = self._agent_operations.get(operation_id)
+        except AgentOperationError:
+            return
+        if (
+            context is None
+            or context.get("owner") != "ollama.remote"
+            or context.get("schema_version") != 1
+            or context.get("action") != queued.action
+            or context.get("queue_plan_digest") != queued.plan_digest
+            or context.get("registry_generation") != queued.registry_generation
+        ):
+            return
+        instance_ref = context.get("instance_ref")
+        host_ref = context.get("host_ref")
+        resource_generation = context.get("resource_generation")
+        if (
+            not isinstance(instance_ref, str)
+            or not isinstance(host_ref, str)
+            or (resource_generation is not None and not isinstance(resource_generation, int))
+        ):
+            return
+        try:
+            queued_instance = _remote_instance_from_document(context.get("instance"))
+        except FleetConflictError:
+            return
+        if queued_instance.ref != instance_ref or queued_instance.host_ref != host_ref:
+            return
+        action = cast(str, context["action"])
+        if action != "plan":
+            plan_id = context.get("plan_id")
+            if not isinstance(plan_id, str):
+                return
+            plan = self._remote_plan(plan_id)
+            if (
+                plan is None
+                or plan.instance.ref != instance_ref
+                or plan.instance.host_ref != host_ref
+                or _remote_instance_document(plan.instance)
+                != _remote_instance_document(queued_instance)
+                or plan.resource_generation != resource_generation
+                or context.get("plan_precondition_digest")
+                != "sha256:" + plan.agent_plan_digest
+            ):
+                return
+            payload = {
+                "action": action,
+                "plan_id": plan.operation_id,
+                "plan_digest": plan.plan_digest,
+                "agent_plan_digest": queued.plan_digest.removeprefix("sha256:"),
+                "registry_generation": context.get("ollama_registry_generation"),
+                "resource_generation": plan.resource_generation,
+                "instance": _remote_instance_document(plan.instance),
+                "arguments_digest": queued.arguments_digest,
+            }
+            self._record_recovered_remote_owner(operation_id, payload)
+            return
+        registry = self._ollama_registry.load()
+        if registry.generation != context.get("ollama_registry_generation"):
+            return
+        instance = queued_instance
+        agent_digest = queued.plan_digest.removeprefix("sha256:")
+        plan_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "instance": {
+                        "ref": instance.ref,
+                        "host_ref": instance.host_ref,
+                        "models": instance.selected_model_refs,
+                        "allowed_cpus": instance.allowed_cpus,
+                        "cpu_quota_percent": instance.cpu_quota_percent,
+                        "cpu_weight": instance.cpu_weight,
+                    },
+                    "registry_generation": registry.generation,
+                    "resource_generation": resource_generation,
+                    "host_plan_digest": "sha256:" + agent_digest,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        payload = {
+            "action": "plan", "plan_id": operation_id, "plan_digest": plan_digest,
+            "agent_plan_digest": agent_digest, "registry_generation": registry.generation,
+            "resource_generation": resource_generation,
+            "instance": _remote_instance_document(instance),
+            "arguments_digest": queued.arguments_digest,
+        }
+        self._record_recovered_remote_owner(operation_id, payload)
+
+    def _record_recovered_remote_owner(
+        self, operation_id: str, payload: dict[str, object]
+    ) -> None:
+        def record_owner(document: dict[str, object]) -> None:
+            operations = cast(dict[str, object], document["operations"])
+            prior = operations.get(operation_id)
+            if prior is None:
+                operations[operation_id] = payload
+            elif not isinstance(prior, Mapping) or any(prior.get(k) != v for k, v in payload.items()):
+                raise FleetConflictError("resource.host_response_invalid")
+        self._mutate_remote_document(record_owner)
+
+    def _remote_applied(self, instance_ref: str) -> _RemoteOllamaPlanV1 | None:
+        if self._ollama_remote_state is None:
+            return None
+        document = self._remote_document()
+        for operation_id, record in cast(dict[str, object], document["operations"]).items():
+            if not isinstance(operation_id, str) or not isinstance(record, Mapping):
+                raise FleetConflictError("resource.host_response_invalid")
+            if (
+                record.get("action") == "apply"
+                and record.get("instance_ref") == instance_ref
+                and record.get("completed") is True
+            ):
+                plan_id = record.get("plan_id")
+                if not isinstance(plan_id, str):
+                    raise FleetConflictError("resource.host_response_invalid")
+                return self._remote_plan(plan_id)
+        return None
+
+    def _remote_stopped(self, instance_ref: str) -> bool:
+        if self._ollama_remote_state is None:
+            return False
+        document = self._remote_document()
+        return any(
+            isinstance(record, Mapping)
+            and record.get("action") == "stop"
+            and record.get("instance_ref") == instance_ref
+            and record.get("completed") is True
+            for record in cast(dict[str, object], document["operations"]).values()
+        )
+
+    def _record_remote_operation(
+        self,
+        operation: OperationV1,
+        *,
+        action: str,
+        plan: _RemoteOllamaPlanV1,
+        agent_plan_digest: str,
+    ) -> None:
+        if self._agent_operations is None:
+            raise FleetConflictError("ollama.transport_invalid")
+        try:
+            queued = self._agent_operations.get(operation.id)
+            owner_context = self._agent_operations.owner_context(operation.id)
+        except AgentOperationError:
+            raise FleetConflictError("ollama.transport_invalid") from None
+        if (
+            queued.kind != "ollama.instance"
+            or queued.action != action
+            or queued.plan_digest != "sha256:" + agent_plan_digest
+            or owner_context is None
+            or owner_context.get("action") != action
+            or owner_context.get("host_ref") != plan.instance.host_ref
+            or owner_context.get("instance_ref") != plan.instance.ref
+            or owner_context.get("registry_generation") != queued.registry_generation
+            or owner_context.get("resource_generation") != plan.resource_generation
+            or owner_context.get("queue_plan_digest") != queued.plan_digest
+            or owner_context.get("plan_precondition_digest")
+            != "sha256:"
+            + (plan.agent_plan_digest if action != "plan" else agent_plan_digest)
+            or (
+                action != "plan"
+                and owner_context.get("plan_id") != plan.operation_id
+            )
+        ):
+            raise FleetConflictError("ollama.transport_invalid")
+        payload = {
+            "action": action,
+            "plan_id": plan.operation_id,
+            "plan_digest": plan.plan_digest,
+            "agent_plan_digest": agent_plan_digest,
+            "registry_generation": (
+                plan.registry_generation
+                if action == "plan"
+                else owner_context.get("ollama_registry_generation")
+            ),
+            "resource_generation": plan.resource_generation,
+            "instance": _remote_instance_document(plan.instance),
+            "arguments_digest": queued.arguments_digest,
+        }
+        def record(document: dict[str, object]) -> None:
+            operations = cast(dict[str, object], document["operations"])
+            prior = operations.get(operation.id)
+            if prior is not None:
+                if (
+                    not isinstance(prior, Mapping)
+                    or any(prior.get(key) != value for key, value in payload.items())
+                    or set(prior) - set(payload) - {
+                        "completed",
+                        "instance_ref",
+                        "completion",
+                    }
+                ):
+                    raise FleetConflictError("resource.host_response_invalid")
+                return
+            operations[operation.id] = payload
+
+        self._mutate_remote_document(record)
+
+    def _mark_remote_completed(
+        self,
+        receipt: AgentReceiptV1,
+        *,
+        instance_ref: str | None = None,
+        readiness: OllamaReadinessStatus | None = None,
+    ) -> None:
+        digest = self._completion_saga_digest(receipt)
+
+        def complete(document: dict[str, object]) -> None:
+            operations = cast(dict[str, object], document["operations"])
+            record = operations.get(receipt.operation_id)
+            if not isinstance(record, dict):
+                raise FleetConflictError("resource.host_response_invalid")
+            completion = record.get("completion")
+            if (
+                not isinstance(completion, dict)
+                or completion.get("state") != receipt.state
+                or completion.get("receipt_digest") != digest
+                or completion.get("phase")
+                not in {"prepared", "owner_applied", "queue_completed"}
+            ):
+                raise FleetConflictError("resource.host_response_invalid")
+            updated = dict(record)
+            updated["completed"] = True
+            updated_completion = dict(completion)
+            updated_completion["phase"] = "queue_completed"
+            updated["completion"] = updated_completion
+            if instance_ref is not None:
+                updated["instance_ref"] = instance_ref
+            operations[receipt.operation_id] = updated
+            ready = cast(dict[str, object], document["ready"])
+            if instance_ref is not None:
+                if readiness is None:
+                    ready.pop(instance_ref, None)
+                else:
+                    ready[instance_ref] = _readiness_document(readiness)
+
+        self._mutate_remote_document(complete)
+
+    def ollama_models(self) -> tuple[OllamaModelV1, ...]:
+        registry, _transport = self._require_ollama()
+        return registry.load().models
+
+    def ollama_instances(self) -> tuple[OllamaInstanceV1, ...]:
+        registry, _transport = self._require_ollama()
+        return registry.load().instances
+
+    def ollama_generation(self) -> int:
+        registry, _transport = self._require_ollama()
+        return registry.load().generation
+
+    def ollama_plan_digest(self, plan_id: str) -> str | None:
+        """Return a persisted remote digest after a service restart."""
+
+        if not isinstance(plan_id, str):
+            return None
+        remote = self._remote_plan(plan_id)
+        if remote is not None:
+            return "sha256:" + remote.plan_digest
+        local = self._ollama_plans.get(plan_id)
+        return None if local is None else "sha256:" + local.plan_digest
+
+    def _assert_remote_resource_fence(self, plan: _RemoteOllamaPlanV1) -> None:
+        """Require the exact attestation that admitted this remote plan.
+
+        The value is carried in the agent envelope as well; this check stops a
+        later master-side enqueue before an outdated headroom observation can
+        reach the host.
+        """
+
+        if plan.resource_generation is None:
+            return
+        snapshot = (
+            self._ollama_resource_snapshot(plan.instance.host_ref)
+            if self._ollama_resource_snapshot is not None
+            else None
+        )
+        if not isinstance(snapshot, OllamaResourceSnapshotV1):
+            raise FleetConflictError("ollama.resource_headroom_required")
+        now = self._io.utc_now()
+        observed = datetime.fromisoformat(snapshot.observed_at_utc.replace("Z", "+00:00"))
+        valid_until = datetime.fromisoformat(
+            snapshot.valid_until_utc.replace("Z", "+00:00")
+        )
+        if (
+            snapshot.host_ref != plan.instance.host_ref
+            or snapshot.generation != plan.resource_generation
+            or not snapshot.green
+            or snapshot.headroom_seconds < 3600
+            or not observed <= now < valid_until
+            or (valid_until - now).total_seconds() < 3600
+        ):
+            raise FleetConflictError("ollama.resource_headroom_required")
+
+    def probe_ollama_instance(
+        self,
+        instance_ref: str,
+        *,
+        expected_generation: int,
+    ) -> OllamaReadinessStatus | OperationV1:
+        registry, transport = self._require_ollama()
+        with self._ollama_lock:
+            current = registry.load()
+            if (
+                not isinstance(instance_ref, str)
+                or type(expected_generation) is not int
+                or current.generation != expected_generation
+            ):
+                raise FleetConflictError("generation_conflict")
+            instance = next(
+                (
+                    candidate
+                    for candidate in current.instances
+                    if candidate.ref == instance_ref
+                ),
+                None,
+            )
+            remote_plan = self._remote_applied(instance_ref)
+            if remote_plan is not None:
+                if instance is None:
+                    raise FleetConflictError("ollama.runtime_not_owned")
+                self._assert_remote_resource_fence(remote_plan)
+                try:
+                    queued = transport.probe_remote(
+                        remote_plan.instance,
+                        generation=expected_generation,
+                        resource_generation=remote_plan.resource_generation,
+                        plan_digest=remote_plan.plan_digest,
+                        plan_precondition_digest=remote_plan.agent_plan_digest,
+                        owner_plan_id=remote_plan.operation_id,
+                    )
+                except AttributeError:
+                    raise FleetConflictError("ollama.transport_invalid") from None
+                if type(queued) is not OperationV1:
+                    raise FleetConflictError("ollama.transport_invalid")
+                self._ollama_remote_operations[queued.id] = ("probe", remote_plan)
+                self._record_remote_operation(
+                    queued,
+                    action="probe",
+                    plan=remote_plan,
+                    agent_plan_digest=remote_plan.plan_digest,
+                )
+                return queued
+            execution_record = self._ollama_executions.get(instance_ref)
+            if instance is None or execution_record is None:
+                raise FleetConflictError("ollama.runtime_not_owned")
+            execution, fence = execution_record
+            readiness = transport.probe(execution, current_fence=fence)
+            if not isinstance(readiness, OllamaReadinessStatus):
+                raise FleetConflictError("ollama.transport_invalid")
+            readiness_state = "ready" if readiness.ready else "not_ready"
+            lifecycle_state = "running" if readiness.process_running else "failed"
+            if readiness.ready:
+                self._ollama_ready[instance_ref] = readiness
+            else:
+                self._ollama_ready.pop(instance_ref, None)
+            if (
+                instance.readiness_state != readiness_state
+                or instance.lifecycle_state != lifecycle_state
+            ):
+                updated = dataclass_replace(
+                    instance,
+                    readiness_state=readiness_state,
+                    lifecycle_state=lifecycle_state,
+                )
+                registry.replace(
+                    models=current.models,
+                    instances=tuple(
+                        updated if candidate.ref == instance_ref else candidate
+                        for candidate in current.instances
+                    ),
+                    expected_generation=current.generation,
+                )
+            return readiness
+
+    def plan_ollama_instance(
+        self,
+        instance: OllamaInstanceV1,
+        *,
+        expected_generation: int,
+    ) -> OllamaFleetPlanV1 | OperationV1:
+        registry, transport = self._require_ollama()
+        current = registry.load()
+        if (
+            type(instance) is not OllamaInstanceV1
+            or type(expected_generation) is not int
+            or current.generation != expected_generation
+        ):
+            raise FleetConflictError("generation_conflict")
+        existing = next(
+            (candidate for candidate in current.instances if candidate.ref == instance.ref),
+            None,
+        )
+        running_on_host = sum(
+            candidate.host_ref == instance.host_ref
+            and candidate.lifecycle_state == "running"
+            and candidate.ref != instance.ref
+            for candidate in current.instances
+        )
+        if running_on_host >= 4 and (
+            existing is None or existing.lifecycle_state != "running"
+        ):
+            code = (
+                "ollama.local_limit_reached"
+                if instance.host_ref == CONTROL_HOST_REF
+                else "ollama.host_limit_reached"
+            )
+            raise FleetConflictError(code)
+        resource_generation = None
+        if running_on_host >= 2 and (
+            existing is None or existing.lifecycle_state != "running"
+        ):
+            snapshot = (
+                self._ollama_resource_snapshot(instance.host_ref)
+                if self._ollama_resource_snapshot is not None
+                else None
+            )
+            now = self._io.utc_now()
+            if not isinstance(snapshot, OllamaResourceSnapshotV1):
+                raise FleetConflictError("ollama.resource_headroom_required")
+            observed = datetime.fromisoformat(
+                snapshot.observed_at_utc.replace("Z", "+00:00")
+            )
+            valid_until = datetime.fromisoformat(
+                snapshot.valid_until_utc.replace("Z", "+00:00")
+            )
+            if (
+                snapshot.host_ref != instance.host_ref
+                or not snapshot.green
+                or snapshot.headroom_seconds < 3600
+                or not observed <= now < valid_until
+                or (valid_until - now).total_seconds() < 3600
+            ):
+                raise FleetConflictError("ollama.resource_headroom_required")
+            resource_generation = snapshot.generation
+        try:
+            host_plan = transport.plan(
+                instance,
+                generation=current.generation,
+                resource_generation=resource_generation,
+            )
+        except AttributeError:
+            raise FleetConflictError("ollama.transport_invalid") from None
+        plan_id = secrets.token_hex(16)
+        host_digest = getattr(host_plan, "plan_digest", None)
+        if not isinstance(host_digest, str):
+            raise FleetConflictError("ollama.transport_invalid")
+        plan_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "instance": {
+                        "ref": instance.ref,
+                        "host_ref": instance.host_ref,
+                        "models": instance.selected_model_refs,
+                        "allowed_cpus": instance.allowed_cpus,
+                        "cpu_quota_percent": instance.cpu_quota_percent,
+                        "cpu_weight": instance.cpu_weight,
+                    },
+                    "registry_generation": current.generation,
+                    "resource_generation": resource_generation,
+                    "host_plan_digest": host_digest,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        with self._ollama_lock:
+            if type(host_plan) is OperationV1:
+                remote_plan = _RemoteOllamaPlanV1(
+                    host_plan.id,
+                    plan_digest,
+                    host_digest.removeprefix("sha256:"),
+                    current.generation,
+                    resource_generation,
+                    instance,
+                )
+                self._ollama_remote_plans[host_plan.id] = remote_plan
+                operation = dataclass_replace(
+                    host_plan, plan_digest="sha256:" + plan_digest
+                )
+                self._record_remote_operation(
+                    operation,
+                    action="plan",
+                    plan=remote_plan,
+                    agent_plan_digest=remote_plan.agent_plan_digest,
+                )
+                return operation
+            planned = OllamaFleetPlanV1(
+                plan_id,
+                plan_digest,
+                current.generation,
+                resource_generation,
+                instance,
+                host_plan,
+            )
+            self._ollama_plans[plan_id] = planned
+        return planned
+
+    def apply_ollama_instance(
+        self,
+        plan_id: str,
+        *,
+        expected_generation: int,
+    ) -> OllamaApplyResultV1 | OperationV1:
+        registry, transport = self._require_ollama()
+        with self._ollama_lock:
+            remote_plan = self._remote_plan(plan_id)
+            if remote_plan is not None:
+                if (
+                    type(expected_generation) is not int
+                    or remote_plan.registry_generation != expected_generation
+                    or registry.load().generation != expected_generation
+                ):
+                    raise FleetConflictError("control.plan_stale")
+                self._assert_remote_resource_fence(remote_plan)
+                if self._agent_operations is None:
+                    raise FleetConflictError("ollama.transport_invalid")
+                try:
+                    view = self._agent_operations.get(remote_plan.operation_id)
+                    result = self._agent_operations.result(remote_plan.operation_id)
+                except AgentOperationError as error:
+                    raise FleetConflictError(error.code) from None
+                if view.state == "unknown":
+                    raise FleetConflictError("host.operation_unknown")
+                if view.state != "succeeded" or result is None:
+                    raise FleetConflictError("control.plan_stale")
+                if (
+                    result.kind != "ollama.instance"
+                    or result.action != "plan"
+                    or set(result.payload) != {"plan_ref"}
+                    or type(result.payload["plan_ref"]) is not str
+                ):
+                    raise FleetConflictError("ollama.transport_invalid")
+                try:
+                    queued = transport.apply_remote(
+                        remote_plan.instance,
+                        generation=remote_plan.registry_generation,
+                        resource_generation=remote_plan.resource_generation,
+                        plan_digest=remote_plan.plan_digest,
+                        plan_ref=result.payload["plan_ref"],
+                        plan_precondition_digest=remote_plan.agent_plan_digest,
+                        owner_plan_id=remote_plan.operation_id,
+                    )
+                except AttributeError:
+                    raise FleetConflictError("ollama.transport_invalid") from None
+                if type(queued) is not OperationV1:
+                    raise FleetConflictError("ollama.transport_invalid")
+                self._ollama_remote_operations[queued.id] = ("apply", remote_plan)
+                self._record_remote_operation(
+                    queued,
+                    action="apply",
+                    plan=remote_plan,
+                    agent_plan_digest=remote_plan.plan_digest,
+                )
+                return queued
+            applied = self._ollama_applied.get(plan_id)
+            if applied is not None:
+                return applied
+            plan = self._ollama_plans.get(plan_id)
+            if (
+                plan is None
+                or type(expected_generation) is not int
+                or plan.registry_generation != expected_generation
+            ):
+                raise FleetConflictError("control.plan_stale")
+            current = registry.load()
+            if current.generation != expected_generation:
+                raise FleetConflictError("control.plan_stale")
+            execution = None
+            try:
+                fence = getattr(plan.host_plan, "fence")
+                execution = transport.apply(plan.host_plan, current_fence=fence)
+                readiness = transport.probe(execution, current_fence=fence)
+                models_by_ref = {model.ref: model for model in current.models}
+                selected_models = tuple(
+                    models_by_ref[ref] for ref in plan.instance.selected_model_refs
+                )
+                if (
+                    not isinstance(readiness, OllamaReadinessStatus)
+                    or not readiness.ready
+                    or not {
+                        model.provider_model_id for model in selected_models
+                    }.issubset(readiness.available_model_ids)
+                ):
+                    raise FleetConflictError("ollama.instance_not_ready")
+                ready_instance = dataclass_replace(
+                    plan.instance,
+                    lifecycle_state="running",
+                    readiness_state="ready",
+                )
+                instances = tuple(
+                    ready_instance if candidate.ref == ready_instance.ref else candidate
+                    for candidate in current.instances
+                )
+                if all(candidate.ref != ready_instance.ref for candidate in current.instances):
+                    instances += (ready_instance,)
+                stored = registry.replace(
+                    models=current.models,
+                    instances=instances,
+                    expected_generation=current.generation,
+                )
+            except Exception:
+                cleanup_failed = False
+                if execution is not None:
+                    try:
+                        transport.stop(execution, current_fence=fence)
+                    except Exception:
+                        cleanup_failed = True
+                self._ollama_plans.pop(plan_id, None)
+                if cleanup_failed:
+                    raise FleetConflictError("ollama.cleanup_failed") from None
+                raise
+            self._ollama_ready[ready_instance.ref] = readiness
+            self._ollama_executions[ready_instance.ref] = (execution, fence)
+            result = OllamaApplyResultV1(
+                stored,
+                ready_instance,
+                readiness,
+                self.ollama_hive_lanes(),
+            )
+            self._ollama_applied[plan_id] = result
+            return result
+
+    def ollama_hive_lanes(self) -> tuple[OllamaHiveLaneV1, ...]:
+        registry, _transport = self._require_ollama()
+        current = registry.load()
+        models = {model.ref: model for model in current.models}
+        persisted_ready: Mapping[str, object] = {}
+        if self._ollama_remote_state is not None:
+            persisted_ready = cast(Mapping[str, object], self._remote_document()["ready"])
+        lanes = []
+        for instance in current.instances:
+            readiness = self._ollama_ready.get(instance.ref)
+            if readiness is None and instance.ref in persisted_ready:
+                readiness = _readiness_from_document(persisted_ready[instance.ref])
+            if (
+                instance.lifecycle_state != "running"
+                or instance.readiness_state != "ready"
+                or readiness is None
+                or not readiness.ready
+            ):
+                continue
+            for model_ref in instance.selected_model_refs:
+                model = models.get(model_ref)
+                if (
+                    model is None
+                    or not model.installed
+                    or not model.hive_enabled
+                    or not model.simple_only
+                    or model.provider_model_id not in readiness.available_model_ids
+                ):
+                    continue
+                lanes.append(
+                    OllamaHiveLaneV1(
+                        f"ollama:{instance.ref}:{model.ref}",
+                        instance.ref,
+                        instance.host_ref,
+                        model.ref,
+                        model.provider_model_id,
+                    )
+                )
+        return tuple(lanes)
+
+    def stop_ollama_instance(
+        self, instance_ref: str, *, expected_generation: int
+    ) -> OperationV1 | None:
+        registry, transport = self._require_ollama()
+        with self._ollama_lock:
+            remote_plan = self._remote_applied(instance_ref)
+            if remote_plan is None:
+                execution_record = self._ollama_executions.get(instance_ref)
+                if execution_record is None:
+                    raise FleetConflictError("ollama.runtime_not_owned")
+                execution, fence = execution_record
+                return transport.stop(execution, current_fence=fence)
+            if registry.load().generation != expected_generation:
+                raise FleetConflictError("control.plan_stale")
+            self._assert_remote_resource_fence(remote_plan)
+            if self._remote_stopped(instance_ref):
+                return None
+            try:
+                queued = transport.stop_remote(
+                    remote_plan.instance,
+                    generation=expected_generation,
+                    resource_generation=remote_plan.resource_generation,
+                    plan_digest=remote_plan.plan_digest,
+                    plan_precondition_digest=remote_plan.agent_plan_digest,
+                    owner_plan_id=remote_plan.operation_id,
+                )
+            except AttributeError:
+                raise FleetConflictError("ollama.transport_invalid") from None
+            if type(queued) is not OperationV1:
+                raise FleetConflictError("ollama.transport_invalid")
+            self._ollama_remote_operations[queued.id] = ("stop", remote_plan)
+            self._record_remote_operation(
+                queued,
+                action="stop",
+                plan=remote_plan,
+                agent_plan_digest=remote_plan.plan_digest,
+            )
+            return queued
+
+    def accept_agent_result(
+        self, principal: OperationAgentPrincipalV1, receipt: AgentReceiptV1
+    ) -> object:
+        """Complete one Ollama receipt after its typed owner fences are checked.
+
+        Unknown effects deliberately complete only the durable agent operation:
+        no registry row, readiness cache, or Hive lane is fabricated or retried.
+        """
+
+        if (
+            type(principal) is not OperationAgentPrincipalV1
+            or type(receipt) is not AgentReceiptV1
+            or self._agent_operations is None
+        ):
+            raise FleetConflictError("ollama.transport_invalid")
+        with self._ollama_lock:
+            managed = self._remote_operation(receipt.operation_id)
+            if managed is None:
+                raise FleetConflictError("resource.host_response_invalid")
+            action, plan, record = managed
+            try:
+                context = self._agent_operations.validate_completion(principal, receipt)
+                queued = self._agent_operations.get(receipt.operation_id)
+            except AgentOperationError as error:
+                raise FleetConflictError(error.code) from None
+            expected_precondition = "sha256:" + (
+                cast(str, record.get("agent_plan_digest"))
+                if action == "plan" else plan.agent_plan_digest
+            )
+            if (
+                context.get("target_host_ref") != plan.instance.host_ref
+                or context.get("registry_generation") != queued.registry_generation
+                or queued.kind != "ollama.instance"
+                or queued.action != action
+                or queued.arguments_digest != record.get("arguments_digest")
+                or queued.plan_digest
+                != "sha256:" + cast(str, record.get("agent_plan_digest"))
+                or context.get("required_registry_generation")
+                != queued.registry_generation
+                or context.get("resource_generation") != plan.resource_generation
+                or context.get("plan_precondition_digest")
+                != expected_precondition
+                or context.get("envelope_digest")
+                != remote_envelope_digest(
+                    registry_generation=queued.registry_generation,
+                    lease_epoch=cast(int, context.get("required_lease_epoch")),
+                    resource_generation=plan.resource_generation,
+                    plan_precondition_digest=expected_precondition,
+                )
+                or receipt.envelope_digest != context.get("envelope_digest")
+            ):
+                raise FleetConflictError("resource.host_response_invalid")
+            if (
+                receipt.result.kind != "ollama.instance"
+                or receipt.result.action != action
+            ):
+                raise FleetConflictError("resource.host_response_invalid")
+            # The receipt is the durable saga's idempotency key.  Persist it
+            # before a registry/lane side effect, then let redelivery resume
+            # the exact phase after a process interruption.
+            completion_phase = self._prepare_remote_completion(receipt)
+            if completion_phase == "queue_completed":
+                # Receipt/principal/envelope and the receipt-digest-bound saga
+                # phase were already checked above.  A terminal replay must not
+                # revisit an owner effect: a later legitimate registry change
+                # cannot invalidate the idempotent queue acknowledgement.
+                return queued
+            instance_ref: str | None = None
+            readiness: OllamaReadinessStatus | None = None
+            if receipt.state != "succeeded":
+                self._mark_remote_owner_applied(
+                    receipt, instance_ref=None, readiness=None
+                )
+            elif action == "plan":
+                self._mark_remote_owner_applied(
+                    receipt, instance_ref=None, readiness=None
+                )
+            elif action == "apply":
+                instance_ref = self._accept_remote_apply(
+                    plan,
+                    receipt,
+                    owner_already_applied=completion_phase == "owner_applied",
+                )
+                self._mark_remote_owner_applied(
+                    receipt, instance_ref=instance_ref, readiness=None
+                )
+            elif action == "probe":
+                instance_ref, readiness = self._accept_remote_probe(plan, receipt)
+                self._mark_remote_owner_applied(
+                    receipt, instance_ref=instance_ref, readiness=readiness
+                )
+            elif action == "stop":
+                instance_ref = self._accept_remote_stop(plan, receipt)
+                self._mark_remote_owner_applied(
+                    receipt, instance_ref=instance_ref, readiness=None
+                )
+            else:
+                raise FleetConflictError("resource.host_response_invalid")
+            completed = self._agent_operations.complete(principal, receipt)
+            self._mark_remote_completed(
+                receipt, instance_ref=instance_ref, readiness=readiness
+            )
+            return completed
+
+    def _accept_remote_apply(
+        self,
+        plan: _RemoteOllamaPlanV1,
+        receipt: AgentReceiptV1,
+        *,
+        owner_already_applied: bool,
+    ) -> str:
+        payload = receipt.result.payload
+        if (
+            set(payload) != {"instance_ref", "generation"}
+            or payload.get("instance_ref") != plan.instance.ref
+            or type(payload.get("generation")) is not int
+            or payload.get("generation") != plan.registry_generation
+        ):
+            raise FleetConflictError("resource.host_response_invalid")
+        registry, _transport = self._require_ollama()
+        current = registry.load()
+        running = dataclass_replace(
+            plan.instance, lifecycle_state="running", readiness_state="unknown"
+        )
+        existing = next(
+            (item for item in current.instances if item.ref == running.ref), None
+        )
+        if owner_already_applied:
+            # This phase is receipt-digest bound by _prepare_remote_completion.
+            # A later, unrelated registry CAS must not replay an apply that this
+            # owner has already committed; only this instance's exact post-state
+            # is sufficient to resume queue completion.
+            if existing != running:
+                raise FleetConflictError("control.plan_stale")
+            self._ollama_remote_applied[running.ref] = plan
+            return running.ref
+        if current.generation == plan.registry_generation:
+            pass
+        elif current.generation == plan.registry_generation + 1 and existing == running:
+            self._ollama_remote_applied[running.ref] = plan
+            return running.ref
+        else:
+            raise FleetConflictError("control.plan_stale")
+        instances = tuple(
+            running if item.ref == running.ref else item for item in current.instances
+        )
+        if all(item.ref != running.ref for item in current.instances):
+            instances += (running,)
+        registry.replace(
+            models=current.models,
+            instances=instances,
+            expected_generation=current.generation,
+        )
+        self._ollama_remote_applied[running.ref] = plan
+        return running.ref
+
+    def _accept_remote_probe(
+        self, plan: _RemoteOllamaPlanV1, receipt: AgentReceiptV1
+    ) -> tuple[str, OllamaReadinessStatus | None]:
+        payload = receipt.result.payload
+        try:
+            readiness = OllamaReadinessStatus(
+                payload["ready"],
+                tuple(payload["reason_codes"]),
+                payload["process_running"],
+                payload["cgroup_member"],
+                payload["loopback_endpoint_reachable"],
+                tuple(payload["available_model_ids"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            raise FleetConflictError("resource.host_response_invalid") from None
+        registry, _transport = self._require_ollama()
+        current = registry.load()
+        instance = next((item for item in current.instances if item.ref == plan.instance.ref), None)
+        if instance is None:
+            raise FleetConflictError("ollama.runtime_not_owned")
+        models = {model.ref: model for model in current.models}
+        selected = tuple(models.get(ref) for ref in instance.selected_model_refs)
+        ready = (
+            readiness.ready
+            and readiness.process_running
+            and readiness.cgroup_member
+            and readiness.loopback_endpoint_reachable
+            and all(model is not None for model in selected)
+            and all(
+                model.provider_model_id in readiness.available_model_ids
+                for model in selected
+                if model is not None
+            )
+        )
+        updated = dataclass_replace(
+            instance,
+            lifecycle_state="running" if readiness.process_running else "failed",
+            readiness_state="ready" if ready else "not_ready",
+        )
+        if updated != instance:
+            registry.replace(
+                models=current.models,
+                instances=tuple(
+                    updated if item.ref == updated.ref else item
+                    for item in current.instances
+                ),
+                expected_generation=current.generation,
+            )
+        if ready:
+            self._ollama_ready[updated.ref] = readiness
+        else:
+            self._ollama_ready.pop(updated.ref, None)
+        return updated.ref, readiness if ready else None
+
+    def _accept_remote_stop(
+        self, plan: _RemoteOllamaPlanV1, receipt: AgentReceiptV1
+    ) -> str:
+        if receipt.result.payload != {"stopped": True}:
+            raise FleetConflictError("resource.host_response_invalid")
+        registry, _transport = self._require_ollama()
+        current = registry.load()
+        instance = next((item for item in current.instances if item.ref == plan.instance.ref), None)
+        if instance is None:
+            raise FleetConflictError("ollama.runtime_not_owned")
+        stopped = dataclass_replace(
+            instance, lifecycle_state="stopped", readiness_state="unknown"
+        )
+        if stopped != instance:
+            registry.replace(
+                models=current.models,
+                instances=tuple(
+                    stopped if item.ref == stopped.ref else item
+                    for item in current.instances
+                ),
+                expected_generation=current.generation,
+            )
+        self._ollama_ready.pop(stopped.ref, None)
+        self._ollama_remote_applied.pop(stopped.ref, None)
+        return stopped.ref
 
     def _ensure_layout(self) -> None:
         self._io.ensure_dir(self._paths.root)

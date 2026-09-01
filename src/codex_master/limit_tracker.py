@@ -600,6 +600,8 @@ def _release_tree_digest(
 def _before_release_recheck() -> None:
     """Test hook for a real post-attestation release-tree race."""
 
+    return None
+
 
 def _verify_active(
     paths: _EvidencePaths,
@@ -1043,6 +1045,8 @@ def _shared_locks(
 
 def _before_payload_recheck(_fd: int, _name: str, _held: int) -> None:
     """Test hook for proving that the post-read identity check is live."""
+
+    return None
 
 
 def _read_current_evidence(

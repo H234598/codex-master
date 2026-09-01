@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""Install one role-separated hardened agent service from trusted inputs."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import secrets
+import stat
+import subprocess
+import sys
+import sysconfig
+from typing import NamedTuple, Sequence
+
+
+ROOT_UID = 0
+ROOT_GID = 0
+MASTER_ROLE = "master"
+WORKER_ROLE = "worker"
+ADMIN_UNIT = "codex-master-admin.service"
+AGENT_API_UNIT = "codex-master-agent-api.service"
+HOST_AGENT_UNIT = "codex-master-host-agent.service"
+UNIT_NAMES = (ADMIN_UNIT, AGENT_API_UNIT, HOST_AGENT_UNIT)
+ROLE_UNITS = {
+    MASTER_ROLE: (ADMIN_UNIT, AGENT_API_UNIT),
+    WORKER_ROLE: (HOST_AGENT_UNIT,),
+}
+ROLE_LAYOUT_NAMES = {
+    MASTER_ROLE: "codex-master-agent-api.conf",
+    WORKER_ROLE: "codex-master-host-agent.conf",
+}
+_ROLE_CREDENTIALS = {
+    MASTER_ROLE: (
+        ("admin_config", "admin-config.json", 0o400, "admin_credentials"),
+        ("admin_bearer", "admin-bearer", 0o400, "admin_credentials"),
+        ("admin_totp", "admin-totp", 0o400, "admin_credentials"),
+        ("admin_attestation", "admin-attestation", 0o400, "admin_credentials"),
+        ("admin_vault_key", "admin-vault-key", 0o400, "admin_credentials"),
+        (
+            "admin_quota_evidence",
+            "admin-quota-evidence.json",
+            0o400,
+            "admin_credentials",
+        ),
+        ("agent_server_key", "agent-server.key", 0o400, "credentials"),
+        ("agent_server_cert", "agent-server.crt", 0o444, "credentials"),
+        ("agent_client_ca", "agent-client-ca.crt", 0o444, "credentials"),
+        ("agent_bindings", "agent-bindings.json", 0o400, "admin_credentials"),
+        ("agent_listen_address", "agent-listen-address", 0o444, "credentials"),
+    ),
+    WORKER_ROLE: (
+        ("agent_client_key", "agent-client.key", 0o400, "credentials"),
+        ("agent_client_cert", "agent-client.crt", 0o444, "credentials"),
+        ("agent_master_ca", "agent-master-ca.crt", 0o444, "credentials"),
+        ("agent_config", "agent-config.json", 0o400, "credentials"),
+    ),
+}
+_OPEN_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+_OPEN_FILE = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+class InstallerError(Exception):
+    """A deliberately detail-free installation failure."""
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, _message: str) -> None:
+        raise InstallerError
+
+
+class _Source(NamedTuple):
+    descriptor: int
+    destination: str
+    mode: int
+    directory: str
+
+
+class _Staged(NamedTuple):
+    parent: int
+    name: str
+    stage: str
+
+
+class _Removal(NamedTuple):
+    parent: int
+    name: str
+    mode: int
+
+
+def _packaged_source_directory() -> Path:
+    executable = Path(__file__).resolve()
+    candidates = [Path(sysconfig.get_path("data")) / "lib" / "codex-master"]
+    if len(executable.parents) >= 3:
+        candidates.append(executable.parents[2] / "lib" / "codex-master")
+    candidates.append(executable.parents[1])
+    for candidate in candidates:
+        if (candidate / "systemd").is_dir():
+            return candidate
+    return candidates[0]
+
+
+_SOURCE_DIRECTORY = _packaged_source_directory()
+UNIT_SOURCES = {name: _SOURCE_DIRECTORY / "systemd" / name for name in UNIT_NAMES}
+SYSUSERS_SOURCES = {
+    role: _SOURCE_DIRECTORY / "systemd" / "sysusers.d" / name
+    for role, name in ROLE_LAYOUT_NAMES.items()
+}
+TMPFILES_SOURCES = {
+    role: _SOURCE_DIRECTORY / "systemd" / "tmpfiles.d" / name
+    for role, name in ROLE_LAYOUT_NAMES.items()
+}
+
+
+def _absolute_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+        raise InstallerError
+    return path
+
+
+def _same_metadata(first: os.stat_result, second: os.stat_result) -> bool:
+    return (
+        first.st_dev,
+        first.st_ino,
+        first.st_mode,
+        first.st_uid,
+        first.st_gid,
+        first.st_nlink,
+        first.st_size,
+        first.st_mtime_ns,
+        first.st_ctime_ns,
+    ) == (
+        second.st_dev,
+        second.st_ino,
+        second.st_mode,
+        second.st_uid,
+        second.st_gid,
+        second.st_nlink,
+        second.st_size,
+        second.st_mtime_ns,
+        second.st_ctime_ns,
+    )
+
+
+def _assert_trusted_regular(metadata: os.stat_result, mode: int) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != ROOT_UID
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        raise InstallerError
+
+
+def _assert_trusted_directory(metadata: os.stat_result, mode: int) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != ROOT_UID
+        or metadata.st_gid != ROOT_GID
+        or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        raise InstallerError
+
+
+def _open_directory(path: Path) -> int:
+    descriptor = os.open("/", _OPEN_DIRECTORY)
+    try:
+        for component in path.parts[1:]:
+            before = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode):
+                raise InstallerError
+            child = os.open(component, _OPEN_DIRECTORY, dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                after = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+                if not _same_metadata(before, opened) or not _same_metadata(before, after):
+                    raise InstallerError
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_trusted_source(path: Path, mode: int) -> int:
+    parent = _open_directory(path.parent)
+    descriptor = -1
+    try:
+        before = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        _assert_trusted_regular(before, mode)
+        descriptor = os.open(path.name, _OPEN_FILE, dir_fd=parent)
+        opened = os.fstat(descriptor)
+        after = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if not _same_metadata(before, opened) or not _same_metadata(before, after):
+            raise InstallerError
+        _assert_trusted_regular(opened, mode)
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    finally:
+        os.close(parent)
+
+
+def _open_or_create_directory(parent: int, name: str, mode: int) -> int:
+    try:
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        os.mkdir(name, mode, dir_fd=parent)
+        descriptor = os.open(name, _OPEN_DIRECTORY, dir_fd=parent)
+        try:
+            os.fchown(descriptor, ROOT_UID, ROOT_GID)
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+            os.fsync(parent)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+    _assert_trusted_directory(before, mode)
+    descriptor = os.open(name, _OPEN_DIRECTORY, dir_fd=parent)
+    try:
+        opened = os.fstat(descriptor)
+        after = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if not _same_metadata(before, opened) or not _same_metadata(before, after):
+            raise InstallerError
+        _assert_trusted_directory(opened, mode)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _copy_atomically(source: int, parent: int, name: str, mode: int) -> None:
+    temporary = f".{name}.tmp-{os.getpid()}-{secrets.token_hex(16)}"
+    destination = -1
+    try:
+        destination = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            mode,
+            dir_fd=parent,
+        )
+        os.fchown(destination, ROOT_UID, ROOT_GID)
+        os.fchmod(destination, mode)
+        while chunk := os.read(source, 64 * 1024):
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(destination, view) :]
+        os.fsync(destination)
+        os.close(destination)
+        destination = -1
+        os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        if destination >= 0:
+            os.close(destination)
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+
+
+def _close_directories(directories: dict[str, int]) -> None:
+    for descriptor in directories.values():
+        os.close(descriptor)
+
+
+def _destination_directories(
+    root: Path, required: frozenset[str], role: str
+) -> dict[str, int]:
+    destination_root = _open_directory(root)
+    opened: dict[str, int] = {}
+    try:
+        _assert_trusted_directory(os.fstat(destination_root), 0o755)
+        opened["etc"] = _open_or_create_directory(destination_root, "etc", 0o755)
+        if "credentials" in required:
+            opened["credentials"] = _open_or_create_directory(
+                opened["etc"], "codex-master", 0o700
+            )
+        if "admin_credentials" in required:
+            opened["admin_credentials"] = _open_or_create_directory(
+                opened["etc"], "codex-master-admin", 0o700
+            )
+        elif role == WORKER_ROLE:
+            try:
+                os.stat(
+                    "codex-master-admin",
+                    dir_fd=opened["etc"],
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                opened["admin_credentials"] = _open_or_create_directory(
+                    opened["etc"], "codex-master-admin", 0o700
+                )
+        opened["systemd"] = _open_or_create_directory(opened["etc"], "systemd", 0o755)
+        opened["units"] = _open_or_create_directory(opened["systemd"], "system", 0o755)
+        opened["usr"] = _open_or_create_directory(destination_root, "usr", 0o755)
+        opened["lib"] = _open_or_create_directory(opened["usr"], "lib", 0o755)
+        opened["sysusers"] = _open_or_create_directory(opened["lib"], "sysusers.d", 0o755)
+        opened["tmpfiles"] = _open_or_create_directory(opened["lib"], "tmpfiles.d", 0o755)
+        return opened
+    except BaseException:
+        _close_directories(opened)
+        raise
+    finally:
+        os.close(destination_root)
+
+
+def _stage(source: _Source, parent: int) -> _Staged:
+    stage = f".{source.destination}.stage-{secrets.token_hex(16)}"
+    _copy_atomically(source.descriptor, parent, stage, source.mode)
+    return _Staged(parent, source.destination, stage)
+
+
+def _discard_staged(staged: Sequence[_Staged]) -> None:
+    for item in staged:
+        try:
+            os.unlink(item.stage, dir_fd=item.parent)
+            os.fsync(item.parent)
+        except FileNotFoundError:
+            pass
+
+
+def _assert_existing_destination(parent: int, name: str, mode: int) -> bool:
+    try:
+        existing = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    _assert_trusted_regular(existing, mode)
+    return True
+
+
+def _commit_staged(
+    staged: Sequence[_Staged], modes: Sequence[int], removals: Sequence[_Removal] = ()
+) -> None:
+    token = secrets.token_hex(16)
+    committed: list[tuple[_Staged, str | None]] = []
+    removed: list[tuple[_Removal, str]] = []
+    successful = False
+    try:
+        for item in removals:
+            if not _assert_existing_destination(item.parent, item.name, item.mode):
+                continue
+            backup = f".{item.name}.backup-{token}"
+            os.replace(item.name, backup, src_dir_fd=item.parent, dst_dir_fd=item.parent)
+            os.fsync(item.parent)
+            removed.append((item, backup))
+        for item, mode in zip(staged, modes, strict=True):
+            backup = (
+                f".{item.name}.backup-{token}"
+                if _assert_existing_destination(item.parent, item.name, mode)
+                else None
+            )
+            if backup is not None:
+                os.replace(item.name, backup, src_dir_fd=item.parent, dst_dir_fd=item.parent)
+            committed.append((item, backup))
+            os.replace(item.stage, item.name, src_dir_fd=item.parent, dst_dir_fd=item.parent)
+            os.fsync(item.parent)
+        successful = True
+    except BaseException:
+        for item, backup in reversed(committed):
+            try:
+                os.unlink(item.name, dir_fd=item.parent)
+            except FileNotFoundError:
+                pass
+            if backup is not None:
+                os.replace(backup, item.name, src_dir_fd=item.parent, dst_dir_fd=item.parent)
+            os.fsync(item.parent)
+        for item, backup in reversed(removed):
+            os.replace(backup, item.name, src_dir_fd=item.parent, dst_dir_fd=item.parent)
+            os.fsync(item.parent)
+        raise
+    finally:
+        for item in staged:
+            try:
+                os.unlink(item.stage, dir_fd=item.parent)
+            except FileNotFoundError:
+                pass
+        if successful:
+            for item, backup in committed:
+                if backup is not None:
+                    os.unlink(backup, dir_fd=item.parent)
+                    os.fsync(item.parent)
+            for item, backup in removed:
+                os.unlink(backup, dir_fd=item.parent)
+                os.fsync(item.parent)
+
+
+def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = _Parser(add_help=False)
+    parser.add_argument("--role", choices=(MASTER_ROLE, WORKER_ROLE), required=True)
+    for name in (
+        "admin-config",
+        "admin-bearer",
+        "admin-totp",
+        "admin-attestation",
+        "admin-vault-key",
+        "admin-quota-evidence",
+        "agent-server-key",
+        "agent-server-cert",
+        "agent-client-ca",
+        "agent-bindings",
+        "agent-client-key",
+        "agent-client-cert",
+        "agent-master-ca",
+        "agent-config",
+        "agent-listen-address",
+    ):
+        parser.add_argument(f"--{name}")
+    parser.add_argument("--destdir", default="/")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--enable", action="store_true")
+    arguments = parser.parse_args(argv)
+    required = {item[0] for item in _ROLE_CREDENTIALS[arguments.role]}
+    supplied = {
+        name
+        for role in _ROLE_CREDENTIALS.values()
+        for name, _destination, _mode, _directory in role
+        if getattr(arguments, name) is not None
+    }
+    if supplied != required:
+        raise InstallerError
+    for name in (*sorted(required), "destdir"):
+        setattr(arguments, name, _absolute_path(getattr(arguments, name)))
+    if arguments.enable and (arguments.destdir != Path("/") or arguments.dry_run):
+        raise InstallerError
+    return arguments
+
+
+def _sources(arguments: argparse.Namespace) -> list[_Source]:
+    result: list[_Source] = []
+    try:
+        for argument, destination, mode, directory in _ROLE_CREDENTIALS[
+            arguments.role
+        ]:
+            result.append(
+                _Source(
+                    _open_trusted_source(getattr(arguments, argument), mode),
+                    destination,
+                    mode,
+                    directory,
+                )
+            )
+        for name in ROLE_UNITS[arguments.role]:
+            result.append(
+                _Source(
+                    _open_trusted_source(UNIT_SOURCES[name], 0o644),
+                    name,
+                    0o644,
+                    "units",
+                )
+            )
+        layout_name = ROLE_LAYOUT_NAMES[arguments.role]
+        result.append(
+            _Source(
+                _open_trusted_source(SYSUSERS_SOURCES[arguments.role], 0o644),
+                layout_name,
+                0o644,
+                "sysusers",
+            )
+        )
+        result.append(
+            _Source(
+                _open_trusted_source(TMPFILES_SOURCES[arguments.role], 0o644),
+                layout_name,
+                0o644,
+                "tmpfiles",
+            )
+        )
+        return result
+    except BaseException:
+        for source in result:
+            os.close(source.descriptor)
+        raise
+
+
+def _foreign_removals(role: str, directories: dict[str, int]) -> list[_Removal]:
+    foreign_role = WORKER_ROLE if role == MASTER_ROLE else MASTER_ROLE
+    result = [
+        _Removal(directories[directory], destination, mode)
+        for _argument, destination, mode, directory in _ROLE_CREDENTIALS[foreign_role]
+        if directory in directories
+    ]
+    result.extend(
+        _Removal(directories["units"], name, 0o644)
+        for name in ROLE_UNITS[foreign_role]
+    )
+    layout_name = ROLE_LAYOUT_NAMES[foreign_role]
+    result.extend(
+        (
+            _Removal(directories["sysusers"], layout_name, 0o644),
+            _Removal(directories["tmpfiles"], layout_name, 0o644),
+        )
+    )
+    return result
+
+
+def _provision_static_layout(destination: Path, role: str) -> None:
+    layout_name = ROLE_LAYOUT_NAMES[role]
+    sysusers = destination / "usr/lib/sysusers.d" / layout_name
+    tmpfiles = destination / "usr/lib/tmpfiles.d" / layout_name
+    subprocess.run(
+        ["/usr/bin/systemd-sysusers", f"--root={destination}", os.fspath(sysusers)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["/usr/bin/systemd-tmpfiles", f"--root={destination}", "--create", os.fspath(tmpfiles)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _enable_service(role: str) -> None:
+    subprocess.run(
+        ["/usr/bin/systemctl", "daemon-reload"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["/usr/bin/systemctl", "enable", "--now", *ROLE_UNITS[role]],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _disable_foreign_services(role: str) -> None:
+    foreign_role = WORKER_ROLE if role == MASTER_ROLE else MASTER_ROLE
+    subprocess.run(
+        ["/usr/bin/systemctl", "disable", "--now", *ROLE_UNITS[foreign_role]],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["/usr/bin/systemctl", "daemon-reload"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    sources: list[_Source] = []
+    directories: dict[str, int] = {}
+    try:
+        arguments = _parse_arguments(argv)
+        if os.geteuid() != ROOT_UID:
+            raise InstallerError
+        sources = _sources(arguments)
+        if arguments.dry_run:
+            return 0
+        directories = _destination_directories(
+            arguments.destdir,
+            frozenset(source.directory for source in sources),
+            arguments.role,
+        )
+        removals = _foreign_removals(arguments.role, directories)
+        existing_removals = [
+            removal
+            for removal in removals
+            if _assert_existing_destination(
+                removal.parent, removal.name, removal.mode
+            )
+        ]
+        staged: list[_Staged] = []
+        try:
+            for source in sources:
+                staged.append(_stage(source, directories[source.directory]))
+            if arguments.destdir == Path("/") and any(
+                removal.name in UNIT_NAMES for removal in existing_removals
+            ):
+                _disable_foreign_services(arguments.role)
+            _commit_staged(
+                staged,
+                [source.mode for source in sources],
+                existing_removals,
+            )
+        except BaseException:
+            _discard_staged(staged)
+            raise
+        if arguments.destdir == Path("/"):
+            _provision_static_layout(arguments.destdir, arguments.role)
+        if arguments.enable:
+            _enable_service(arguments.role)
+        return 0
+    except (InstallerError, OSError, subprocess.SubprocessError, SystemExit):
+        print("install-host-agent: installation failed", file=sys.stderr)
+        return 1
+    finally:
+        _close_directories(directories)
+        for source in sources:
+            os.close(source.descriptor)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

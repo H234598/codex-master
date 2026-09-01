@@ -58,6 +58,7 @@ class FieldDescriptor:
     min_items: int | None = None
     max_items: int | None = None
     item_max_length: int | None = None
+    unique_items: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +99,12 @@ _READ_ONLY_TOOLS = {
     "agent_pool_status",
     "agent_doctor",
     "fleet_account_list",
+    "fleet_openai_accounts",
+    "fleet_google_inventory",
+    "fleet_ollama_models",
+    "fleet_ollama_instances",
+    "fleet_operation_status",
+    "fleet_hosts",
     "fleet_gemini_bootstrap_plan",
     "fleet_series_list",
     "fleet_provider_models",
@@ -118,6 +125,9 @@ _READ_ONLY_TOOLS = {
     "fleet_status_compact",
     "goddess_report_status",
     "goddess_report_list",
+    "hive_test_index_status",
+    "hive_test_plan",
+    "hive_test_status",
 }
 _MUTATING_TOOLS = {
     "agent_claim",
@@ -138,10 +148,23 @@ _MUTATING_TOOLS = {
     "fleet_account_disable",
     "fleet_account_probe",
     "fleet_account_delete",
+    "fleet_openai_auth_plan",
+    "fleet_google_oauth_begin",
+    "fleet_google_provision_plan",
+    "fleet_google_provision_apply",
+    "fleet_google_billing_plan",
+    "fleet_google_billing_apply",
+    "fleet_google_quota_evidence_sync",
+    "fleet_ollama_instance_plan",
+    "fleet_ollama_instance_apply",
+    "fleet_ollama_instance_probe",
+    "fleet_host_probe",
     "fleet_series_apply",
     "fleet_series_disable",
     "fleet_series_delete",
     "goddess_report_run",
+    "hive_test_run",
+    "hive_test_invalidate",
 }
 _BROAD_TOOLS = {
     "agent_start",
@@ -166,7 +189,9 @@ _ROOT_KEYWORDS = frozenset({"type", "required", "properties", "additionalPropert
 _STRING_KEYWORDS = frozenset({"type", "description", "default", "enum", "maxLength"})
 _INTEGER_KEYWORDS = frozenset({"type", "description", "default", "enum", "minimum", "maximum"})
 _BOOLEAN_KEYWORDS = frozenset({"type", "description", "default"})
-_ARRAY_KEYWORDS = frozenset({"type", "description", "default", "items", "minItems", "maxItems"})
+_ARRAY_KEYWORDS = frozenset(
+    {"type", "description", "default", "items", "minItems", "maxItems", "uniqueItems"}
+)
 _ARRAY_ITEM_KEYWORDS = frozenset({"type", "maxLength"})
 
 _DANGEROUS_TRUE_ARGUMENTS = frozenset(
@@ -306,6 +331,8 @@ def _normalize_value(
                 f"{label}[{index}] must not exceed {field.item_max_length} characters"
             )
         normalized_items.append(item)
+    if field.unique_items and len(set(normalized_items)) != len(normalized_items):
+        raise error_type(f"{label} must not contain duplicates")
     return tuple(normalized_items)
 
 
@@ -416,6 +443,9 @@ def _compile_field(name: str, raw_schema: Any, required: bool) -> FieldDescripto
             raise SchemaError(f"{label} maxItems is missing or unsupported")
         if min_items is not None and min_items > max_items:
             raise SchemaError(f"{label} minItems must not exceed maxItems")
+        unique_items = schema.get("uniqueItems", False)
+        if not isinstance(unique_items, bool):
+            raise SchemaError(f"{label} uniqueItems must be a boolean")
         field = FieldDescriptor(
             name=name,
             kind=FieldKind.STRING_ARRAY,
@@ -424,6 +454,7 @@ def _compile_field(name: str, raw_schema: Any, required: bool) -> FieldDescripto
             min_items=min_items,
             max_items=max_items,
             item_max_length=item_max_length,
+            unique_items=unique_items,
         )
     else:
         raise SchemaError(f"{label} uses unsupported type")

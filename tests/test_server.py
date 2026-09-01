@@ -25,13 +25,15 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
+import yaml
+
 import codex_master.server as server_module
 import codex_master.resource_cgroup as resource_cgroup
 from codex_master import __version__
 from codex_master.hive.types import TaskComplexity
 from codex_master.hive.state import HiveStateStore
-from codex_master.fleet_home_recovery import make_fleet_identity_journal_plan
 from codex_master.masterjet_runtime import MasterjetRuntime
+from codex_master.fleet_home_recovery import make_fleet_identity_journal_plan
 from codex_master.resource_cgroup import (
     CgroupPreflightError,
     CgroupProfileV1,
@@ -8307,6 +8309,44 @@ google_accounts:
             path.chmod(0o600)
             with self.assertRaisesRegex(server_module.AgentError, "api_token_yaml_duplicate_project"):
                 server_module._read_hive_api_token_yaml(path=path)
+
+    def test_read_hive_api_token_yaml_accepts_more_than_ten_google_projects(self) -> None:
+        projects = [
+            {
+                "ref": f"the-hive-{number}",
+                "billing_account_ref": None,
+                "status": "active",
+                "project_id": f"project-{number}",
+                "project_number": str(1000 + number),
+                "key_id": f"key-{number}",
+                "key_uid": f"uid-{number}",
+                "secret": f"secret-{number}",
+            }
+            for number in range(1, 18)
+        ]
+        document = {
+            "schema_version": 1,
+            "google_accounts": [
+                {
+                    "ref": "google-a",
+                    "login_email": "one@example.com",
+                    "recovery_email": None,
+                    "subject_id": None,
+                    "billing_accounts": [],
+                    "projects": projects,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "api-token.yaml"
+            path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            path.chmod(0o600)
+
+            tokens = server_module._read_hive_api_token_yaml(path=path)
+
+        self.assertEqual(len(tokens), 17)
+        self.assertEqual(tokens[17], "secret-17")
 
     def test_read_hive_api_token_yaml_rejects_slim_schema_violations(self) -> None:
         base_project = """\
@@ -29660,81 +29700,42 @@ google_accounts:
             tmp_path = Path(tmpdir)
             repo = tmp_path / "repo"
             checked_parent = repo / "checked-parent"
-            moved_parent = repo / "moved-parent"
             outside = tmp_path / "outside"
             repo.mkdir()
             checked_parent.mkdir()
             outside.mkdir()
-            for args in (
-                ("git", "init", "--quiet"),
-                ("git", "config", "user.email", "test@example.invalid"),
-                ("git", "config", "user.name", "Headless Test"),
-            ):
-                subprocess.run(args, cwd=repo, check=True, capture_output=True, text=True)
-            (repo / "README.md").write_text("baseline\n", encoding="utf-8")
-            subprocess.run(
-                ("git", "add", "README.md"),
-                cwd=repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                ("git", "commit", "--quiet", "-m", "baseline"),
-                cwd=repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
             target = checked_parent / "agent-a"
             observed: list[Path] = []
             raced = [False]
 
             def race_before_git(args, **kwargs):
                 if args[:3] == ["git", "show-ref", "--verify"] and not raced[0]:
-                    checked_parent.rename(moved_parent)
+                    checked_parent.rmdir()
                     checked_parent.symlink_to(outside, target_is_directory=True)
                     raced[0] = True
+                    return subprocess.CompletedProcess(args, 1, "", "")
                 if args[:3] == ["git", "worktree", "add"]:
                     observed.append(Path(kwargs["cwd"]).resolve())
-                    result = subprocess.run(
-                        args,
-                        cwd=kwargs["cwd"],
-                        env=kwargs.get("env"),
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=kwargs.get("timeout"),
-                        pass_fds=kwargs.get("pass_fds", ()),
+                    (Path(kwargs["cwd"]) / ".git").write_text(
+                        "gitdir: /mock\n", encoding="utf-8"
                     )
-                    checked_parent.unlink()
-                    moved_parent.rename(checked_parent)
-                    return result
-                return subprocess.run(
-                    args,
-                    cwd=kwargs["cwd"],
-                    env=kwargs.get("env"),
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=kwargs.get("timeout"),
-                    pass_fds=kwargs.get("pass_fds", ()),
-                )
+                return subprocess.CompletedProcess(args, 0, "", "")
 
             mock_subprocess_run.side_effect = race_before_git
+            scope_store = SimpleNamespace(
+                create=Mock(return_value=SimpleNamespace(attestation_id="test-scope"))
+            )
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("codex_master.server.repo_root", return_value=repo), patch(
+                "codex_master.server._headless_write_scope_store",
+                return_value=scope_store,
+            ):
                 result = worktree_create_for_agent("a", path=str(target))
 
         self.assertEqual(result["status"], "created")
         self.assertEqual(len(observed), 1)
         self.assertNotEqual(observed[0].parent, outside)
-        add_calls = [
-            call.args[0]
-            for call in mock_subprocess_run.call_args_list
-            if call.args and call.args[0][:3] == ["git", "worktree", "add"]
-        ]
-        self.assertEqual(add_calls, [["git", "worktree", "add", "-b", "agent-a", "."]])
+        self.assertEqual(mock_subprocess_run.call_args.args[0], ["git", "worktree", "add", "-b", "agent-a", "."])
 
     @patch("codex_master.server.run_command")
     def test_worktree_create_refuses_target_swap_before_git_call(self, mock_run_command) -> None:
@@ -29758,7 +29759,9 @@ google_accounts:
 
             with patch("codex_master.server.open_directory_no_follow_matching", side_effect=race_target_open):
                 with patch("codex_master.server.repo_root", return_value=repo):
-                    with self.assertRaisesRegex(AgentError, "headless_attestation_rollback_incomplete"):
+                    with self.assertRaisesRegex(
+                        AgentError, "headless_attestation_rollback_incomplete"
+                    ):
                         worktree_create_for_agent("a", path=str(target))
 
             target_is_symlink = target.is_symlink()
@@ -29790,57 +29793,32 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            for args in (
-                ("git", "init", "--quiet"),
-                ("git", "config", "user.email", "test@example.invalid"),
-                ("git", "config", "user.name", "Headless Test"),
-            ):
-                subprocess.run(args, cwd=repo, check=True, capture_output=True, text=True)
-            (repo / "README.md").write_text("baseline\n", encoding="utf-8")
-            subprocess.run(
-                ("git", "add", "README.md"),
-                cwd=repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                ("git", "commit", "--quiet", "-m", "baseline"),
-                cwd=repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
 
-            def run_real_command(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-                return subprocess.run(
-                    args,
-                    cwd=kwargs.get("cwd"),
-                    env=kwargs.get("env"),
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=kwargs.get("timeout"),
-                    pass_fds=kwargs.get("pass_fds", ()),
+            def run_git(args, **kwargs):
+                if args[:3] == ["git", "show-ref", "--verify"]:
+                    return subprocess.CompletedProcess(args, 1, "", "")
+                (Path(kwargs["cwd"]) / ".git").write_text(
+                    "gitdir: /mock\n", encoding="utf-8"
                 )
+                return subprocess.CompletedProcess(args, 0, "", "")
 
-            mock_run_command.side_effect = run_real_command
+            mock_run_command.side_effect = run_git
+            scope_store = SimpleNamespace(
+                create=Mock(return_value=SimpleNamespace(attestation_id="test-scope"))
+            )
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("codex_master.server.repo_root", return_value=repo), patch(
+                "codex_master.server._headless_write_scope_store",
+                return_value=scope_store,
+            ):
                 result = worktree_create_for_agent("a", path=relative)
 
         self.assertEqual(result["path"], relative)
         self.assertEqual(result["path_state"], "set")
         self.assertEqual(result["path_kind"], "repo_relative")
         self.assertEqual(result["status"], "created")
-        add_calls = [
-            call
-            for call in mock_run_command.call_args_list
-            if call.args and call.args[0][:3] == ["git", "worktree", "add"]
-        ]
-        self.assertEqual(len(add_calls), 1)
-        self.assertEqual(add_calls[0].args[0], ["git", "worktree", "add", "-b", "agent-a", "."])
-        self.assertRegex(str(add_calls[0].kwargs["cwd"]), r"^/proc/self/fd/\d+$")
+        self.assertEqual(mock_run_command.call_args_list[-1].args[0], ["git", "worktree", "add", "-b", "agent-a", "."])
+        self.assertRegex(str(mock_run_command.call_args_list[-1].kwargs["cwd"]), r"^/proc/self/fd/\d+$")
         self.assertNotIn(str(repo), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.run_command")
@@ -29848,62 +29826,28 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            for args in (
-                ("git", "init", "--quiet"),
-                ("git", "config", "user.email", "test@example.invalid"),
-                ("git", "config", "user.name", "Headless Test"),
-            ):
-                subprocess.run(args, cwd=repo, check=True, capture_output=True, text=True)
-            (repo / "README.md").write_text("baseline\n", encoding="utf-8")
-            subprocess.run(
-                ("git", "add", "README.md"),
-                cwd=repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                ("git", "commit", "--quiet", "-m", "baseline"),
-                cwd=repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                ("git", "branch", "origin/main"),
-                cwd=repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
 
-            def run_real_command(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-                return subprocess.run(
-                    args,
-                    cwd=kwargs.get("cwd"),
-                    env=kwargs.get("env"),
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=kwargs.get("timeout"),
-                    pass_fds=kwargs.get("pass_fds", ()),
+            def run_git(args, **kwargs):
+                (Path(kwargs["cwd"]) / ".git").write_text(
+                    "gitdir: /mock\n", encoding="utf-8"
                 )
+                return subprocess.CompletedProcess(args, 0, "", "")
 
-            mock_run_command.side_effect = run_real_command
+            mock_run_command.side_effect = run_git
+            scope_store = SimpleNamespace(
+                create=Mock(return_value=SimpleNamespace(attestation_id="test-scope"))
+            )
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("codex_master.server.repo_root", return_value=repo), patch(
+                "codex_master.server._headless_write_scope_store",
+                return_value=scope_store,
+            ):
                 result = worktree_create_for_agent("a", path=relative, base_ref="origin/main")
 
         self.assertEqual(result["base_ref"], "not_returned")
         self.assertEqual(result["base_ref_state"], "set")
-        add_calls = [
-            call
-            for call in mock_run_command.call_args_list
-            if call.args and call.args[0][:3] == ["git", "worktree", "add"]
-        ]
-        self.assertEqual(len(add_calls), 1)
-        self.assertEqual(add_calls[0].args[0], ["git", "worktree", "add", ".", "origin/main"])
-        self.assertRegex(str(add_calls[0].kwargs["cwd"]), r"^/proc/self/fd/\d+$")
+        self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", ".", "origin/main"])
+        self.assertRegex(str(mock_run_command.call_args.kwargs["cwd"]), r"^/proc/self/fd/\d+$")
         self.assertNotIn("origin/main", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.run_command")
@@ -29939,50 +29883,18 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            for args in (
-                ("git", "init", "--quiet"),
-                ("git", "config", "user.email", "test@example.invalid"),
-                ("git", "config", "user.name", "Headless Test"),
-            ):
-                subprocess.run(args, cwd=repo, check=True, capture_output=True, text=True)
-            (repo / "README.md").write_text("baseline\n", encoding="utf-8")
-            subprocess.run(
-                ("git", "add", "README.md"),
-                cwd=repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                ("git", "commit", "--quiet", "-m", "baseline"),
-                cwd=repo,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
 
-            def fail_worktree_add(
-                args: list[str], **kwargs: Any
-            ) -> subprocess.CompletedProcess[str]:
-                if args[:3] == ["git", "worktree", "add"]:
-                    return subprocess.CompletedProcess(
-                        args,
-                        128,
-                        "",
-                        f"SECRET_WORKTREE_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
-                    )
-                return subprocess.run(
+            def run_git(args, **_kwargs):
+                if args[:4] == ["git", "worktree", "list", "--porcelain"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                return subprocess.CompletedProcess(
                     args,
-                    cwd=kwargs.get("cwd"),
-                    env=kwargs.get("env"),
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=kwargs.get("timeout"),
-                    pass_fds=kwargs.get("pass_fds", ()),
+                    128,
+                    "",
+                    f"SECRET_WORKTREE_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
                 )
 
-            mock_run_command.side_effect = fail_worktree_add
+            mock_run_command.side_effect = run_git
 
             with patch("codex_master.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(AgentError, "git worktree add failed") as raised:
@@ -34023,6 +33935,11 @@ class CliLifecycleTest(unittest.TestCase):
         mock_control_center.assert_called_once_with([])
         self.assertNotIn("control_center", {tool["name"] for tool in server_module.TOOLS})
 
+    @patch("codex_master.control_center.run_control_center", return_value=0)
+    def test_cli_control_center_forwards_ollama_page(self, mock_control_center) -> None:
+        self.assertEqual(main_cli(["control-center", "--page", "ollama"]), 0)
+        mock_control_center.assert_called_once_with(["--page", "ollama"])
+
     @patch("codex_master.server.require_teamleader_tool_access")
     @patch("codex_master.server.subprocess.Popen")
     @patch("codex_master.server.os.posix_spawn", return_value=12345)
@@ -34085,6 +34002,26 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["status"], "launched")
         self.assertEqual(result["raw_output"], "not_returned")
 
+    def test_detached_control_center_forwards_only_ollama_page(self) -> None:
+        command = Path("/home/tester/.local/bin/codex-master-mcp")
+        with (
+            patch.object(server_module.os, "POSIX_SPAWN_CLOSEFROM", 3, create=True),
+            patch.object(server_module.os, "posix_spawn", return_value=12345) as spawn,
+            patch.object(server_module, "require_teamleader_tool_access"),
+        ):
+            server_module.launch_control_center_detached(
+                command_path=command, environ={}, page="ollama"
+            )
+
+            self.assertEqual(
+                spawn.call_args.args[1],
+                [str(command), "control-center", "--page", "ollama"],
+            )
+            with self.assertRaisesRegex(AgentError, "page is invalid"):
+                server_module.launch_control_center_detached(
+                    command_path=command, environ={}, page="secrets"
+                )
+
     @patch("codex_master.server.print_json", return_value=0)
     @patch("codex_master.server.launch_control_center_detached")
     def test_cli_control_center_launch_routes_to_hidden_detach_helper(
@@ -34100,6 +34037,21 @@ class CliLifecycleTest(unittest.TestCase):
         mock_launch.assert_called_once_with()
         mock_print.assert_called_once_with(payload)
         self.assertNotIn("control_center_launch", {tool["name"] for tool in server_module.TOOLS})
+
+    @patch("codex_master.server.print_json", return_value=0)
+    @patch("codex_master.server.launch_control_center_detached")
+    def test_cli_control_center_launch_forwards_ollama_page(
+        self,
+        mock_launch,
+        _mock_print,
+    ) -> None:
+        mock_launch.return_value = {"status": "launched", "raw_output": "not_returned"}
+
+        self.assertEqual(
+            main_cli(["control-center-launch", "--page", "ollama"]), 0
+        )
+
+        mock_launch.assert_called_once_with(page="ollama")
 
     @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})
@@ -34450,6 +34402,8 @@ class CliLifecycleTest(unittest.TestCase):
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
+            ), patch(
+                "codex_master.server.require_fleet_recovery_ready"
             ), server_module.temporary_agent_inventory(inventory):
                 result = send_agent("a", "hello", True)
 
@@ -40163,7 +40117,10 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             target = Path(tmpdir) / "systemd-user"
             target.mkdir()
             for name in (self.service_name, self.slice_name):
-                (target / name).write_bytes((source_root / "systemd" / "user" / name).read_bytes())
+                source = source_root / "systemd" / "user" / name
+                destination = target / name
+                destination.write_bytes(source.read_bytes())
+                destination.chmod(stat.S_IMODE(source.stat().st_mode))
             calls: list[list[str]] = []
             states = self._states(service_state="active", service_enabled="enabled")
             fake = self._systemctl_fake(calls, states)
@@ -40494,7 +40451,10 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             target = Path(tmpdir) / "systemd-user"
             target.mkdir()
             for name in (self.service_name, self.slice_name):
-                (target / name).write_bytes((source_root / "systemd" / "user" / name).read_bytes())
+                source = source_root / "systemd" / "user" / name
+                destination = target / name
+                destination.write_bytes(source.read_bytes())
+                destination.chmod(stat.S_IMODE(source.stat().st_mode))
             states = self._states(service_state="active", service_enabled="enabled")
             states[self.service_name].update(
                 {
@@ -41204,6 +41164,730 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
         self.assertEqual(errors[0]["code"], "resource_monitor_rollback_state_failed")
 
 
+class MasterjetAdminAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from test_admin_service import principal, service_at
+
+        self.service, self.owners = service_at()
+        self.principal = principal(
+            "fleet.read",
+            "fleet.openai.write",
+            "fleet.google.oauth",
+            "fleet.google.provision",
+            "fleet.google.billing.bind",
+            "fleet.ollama.write",
+        )
+
+    def _binding(self, principal: Any | None = None) -> Any:
+        return patch.object(
+            server_module,
+            "_MASTERJET_ADMIN_BINDING",
+            (self.service, principal or self.principal),
+        )
+
+    def _cli(self, *arguments: str) -> tuple[int, dict[str, Any]]:
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            status = server_module._main_cli_impl(list(arguments))
+        return status, json.loads(output.getvalue())
+
+    def _mcp(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        reply = server_module.handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+        self.assertIsNotNone(reply)
+        assert reply is not None
+        result = reply["result"]
+        return {
+            "isError": result["isError"],
+            "payload": json.loads(result["content"][0]["text"]),
+        }
+
+    def test_fleet_google_inventory_cli_and_mcp_outputs_are_identical(self) -> None:
+        with self._binding():
+            status, cli = self._cli("fleet", "google", "inventory")
+            mcp = self._mcp("fleet_google_inventory", {})
+
+        self.assertEqual(status, 0)
+        self.assertFalse(mcp["isError"])
+        self.assertEqual(cli, mcp["payload"])
+        self.assertEqual(cli["accounts"][0]["ref"], "google-one")
+
+    def test_fleet_ollama_list_cli_and_mcp_outputs_are_identical(self) -> None:
+        with self._binding():
+            models_status, models_cli = self._cli("fleet", "ollama", "models")
+            models_mcp = self._mcp("fleet_ollama_models", {})
+            instances_status, instances_cli = self._cli(
+                "fleet", "ollama", "instances"
+            )
+            instances_mcp = self._mcp("fleet_ollama_instances", {})
+
+        self.assertEqual(models_status, 0)
+        self.assertEqual(instances_status, 0)
+        self.assertFalse(models_mcp["isError"])
+        self.assertFalse(instances_mcp["isError"])
+        self.assertEqual(models_cli, models_mcp["payload"])
+        self.assertEqual(instances_cli, instances_mcp["payload"])
+
+    def test_fleet_ollama_plan_cli_and_mcp_preserve_typed_cpu_profile(self) -> None:
+        arguments = {
+            "ref": "quiet-runner",
+            "label": "Quiet Runner",
+            "host_ref": "control-host",
+            "ollama_executable": "/usr/bin/ollama",
+            "models_directory": "/srv/ollama/models",
+            "selected_model_refs": ["model-a"],
+            "allowed_cpus": "4-7",
+            "cpu_quota_percent": 350,
+            "cpu_weight": 40,
+            "expected_generation": 3,
+            "idempotency_key": "request-one",
+        }
+        with self._binding():
+            status, cli = self._cli(
+                "fleet",
+                "ollama",
+                "instance-plan",
+                "--ref",
+                "quiet-runner",
+                "--label",
+                "Quiet Runner",
+                "--host-ref",
+                "control-host",
+                "--ollama-executable",
+                "/usr/bin/ollama",
+                "--models-directory",
+                "/srv/ollama/models",
+                "--selected-model-refs",
+                "model-a",
+                "--allowed-cpus",
+                "4-7",
+                "--cpu-quota-percent",
+                "350",
+                "--cpu-weight",
+                "40",
+                "--expected-generation",
+                "3",
+                "--idempotency-key",
+                "request-one",
+            )
+            mcp = self._mcp("fleet_ollama_instance_plan", arguments)
+
+        tool = next(
+            item
+            for item in server_module.TOOLS
+            if item["name"] == "fleet_ollama_instance_plan"
+        )
+        properties = tool["inputSchema"]["properties"]
+        self.assertEqual(properties["selected_model_refs"]["type"], "array")
+        self.assertEqual(properties["cpu_quota_percent"]["type"], "integer")
+        self.assertEqual(properties["cpu_weight"]["type"], "integer")
+        self.assertEqual(status, 0)
+        self.assertFalse(mcp["isError"])
+        self.assertEqual(cli, mcp["payload"])
+
+    def test_fleet_ollama_apply_and_probe_match_cli_and_mcp(self) -> None:
+        from test_admin_service import principal, service_at
+
+        plan_arguments = {
+            "ref": "quiet-runner",
+            "label": "Quiet Runner",
+            "host_ref": "control-host",
+            "ollama_executable": "/usr/bin/ollama",
+            "models_directory": "/srv/ollama/models",
+            "selected_model_refs": ["model-a"],
+            "allowed_cpus": "4-7",
+            "cpu_quota_percent": 350,
+            "cpu_weight": 40,
+            "expected_generation": 3,
+            "idempotency_key": "request-one",
+        }
+        cli_service, _cli_owners = service_at()
+        mcp_service, _mcp_owners = service_at()
+        operator = principal("fleet.read", "fleet.ollama.write")
+
+        with patch.object(
+            server_module, "_MASTERJET_ADMIN_BINDING", (cli_service, operator)
+        ):
+            _plan_status, cli_plan = self._cli(
+                "fleet", "ollama", "instance-plan",
+                "--ref", "quiet-runner",
+                "--label", "Quiet Runner",
+                "--host-ref", "control-host",
+                "--ollama-executable", "/usr/bin/ollama",
+                "--models-directory", "/srv/ollama/models",
+                "--selected-model-refs", "model-a",
+                "--allowed-cpus", "4-7",
+                "--cpu-quota-percent", "350",
+                "--cpu-weight", "40",
+                "--expected-generation", "3",
+                "--idempotency-key", "request-one",
+            )
+            apply_status, cli_apply = self._cli(
+                "fleet", "ollama", "instance-apply",
+                "--plan-id", str(cli_plan["plan_id"]),
+                "--expected-generation", "3",
+                "--idempotency-key", "apply-one",
+                "--plan-digest", str(cli_plan["plan_digest"]),
+            )
+            probe_status, cli_probe = self._cli(
+                "fleet", "ollama", "probe",
+                "--instance-ref", "quiet-runner",
+                "--expected-generation", "4",
+                "--idempotency-key", "probe-one",
+            )
+
+        with patch.object(
+            server_module, "_MASTERJET_ADMIN_BINDING", (mcp_service, operator)
+        ):
+            mcp_plan = self._mcp("fleet_ollama_instance_plan", plan_arguments)
+            mcp_apply = self._mcp(
+                "fleet_ollama_instance_apply",
+                {
+                    "plan_id": mcp_plan["payload"]["plan_id"],
+                    "expected_generation": 3,
+                    "idempotency_key": "apply-one",
+                    "plan_digest": mcp_plan["payload"]["plan_digest"],
+                },
+            )
+            mcp_probe = self._mcp(
+                "fleet_ollama_instance_probe",
+                {
+                    "instance_ref": "quiet-runner",
+                    "expected_generation": 4,
+                    "idempotency_key": "probe-one",
+                },
+            )
+
+        self.assertEqual((apply_status, probe_status), (0, 0))
+        self.assertFalse(mcp_apply["isError"])
+        self.assertFalse(mcp_probe["isError"])
+        self.assertEqual(cli_apply, mcp_apply["payload"])
+        self.assertEqual(cli_probe, mcp_probe["payload"])
+
+    def test_google_oauth_redirect_cli_and_mcp_accept_same_long_ascii_value(
+        self,
+    ) -> None:
+        from test_admin_service import principal
+
+        prefix = "http://127.0.0.1/callback?state="
+        redirect_uri = prefix + "a" * (2517 - len(prefix))
+        arguments = {
+            "account_ref": "google-one",
+            "oauth_client_ref": "client-one",
+            "redirect_uri": redirect_uri,
+            "scope_profile": "inventory_readonly",
+            "expected_generation": 4,
+            "idempotency_key": "oauth-mcp",
+        }
+
+        with self._binding(principal(*self.principal.scopes, step_up=True)):
+            status, cli = self._cli(
+                "fleet",
+                "google",
+                "oauth-begin",
+                "--account-ref",
+                "google-one",
+                "--oauth-client-ref",
+                "client-one",
+                "--redirect-uri",
+                redirect_uri,
+                "--scope-profile",
+                "inventory_readonly",
+                "--expected-generation",
+                "4",
+                "--idempotency-key",
+                "oauth-cli",
+            )
+            mcp = self._mcp("fleet_google_oauth_begin", arguments)
+
+        tool = next(
+            item
+            for item in server_module.TOOLS
+            if item["name"] == "fleet_google_oauth_begin"
+        )
+        self.assertEqual(
+            tool["inputSchema"]["properties"]["redirect_uri"]["maxLength"],
+            4096,
+        )
+        self.assertEqual(len(redirect_uri), 2517)
+        self.assertEqual(status, 0)
+        self.assertFalse(mcp["isError"])
+        self.assertEqual(cli, mcp["payload"])
+        self.assertEqual(self.owners.google_oauth.calls, ["begin", "begin"])
+
+    def test_google_oauth_redirect_cli_and_mcp_reject_same_utf8_oversize(
+        self,
+    ) -> None:
+        prefix = "http://127.0.0.1/callback?state="
+        invalid_redirects = (
+            prefix + "a" * (4097 - len(prefix)),
+            prefix + "ä" * 2048,
+        )
+
+        with self._binding():
+            results = []
+            for index, redirect_uri in enumerate(invalid_redirects):
+                status, cli = self._cli(
+                    "fleet",
+                    "google",
+                    "oauth-begin",
+                    "--account-ref",
+                    "google-one",
+                    "--oauth-client-ref",
+                    "client-one",
+                    "--redirect-uri",
+                    redirect_uri,
+                    "--scope-profile",
+                    "inventory_readonly",
+                    "--expected-generation",
+                    "4",
+                    "--idempotency-key",
+                    f"oauth-cli-{index}",
+                )
+                mcp = self._mcp(
+                    "fleet_google_oauth_begin",
+                    {
+                        "account_ref": "google-one",
+                        "oauth_client_ref": "client-one",
+                        "redirect_uri": redirect_uri,
+                        "scope_profile": "inventory_readonly",
+                        "expected_generation": 4,
+                        "idempotency_key": f"oauth-mcp-{index}",
+                    },
+                )
+                results.append((status, cli, mcp))
+
+        for status, cli, mcp in results:
+            self.assertEqual(status, 1)
+            self.assertTrue(mcp["isError"])
+            for payload in (cli, mcp["payload"]):
+                self.assertEqual(payload["code"], "control.request_invalid")
+                self.assertNotIn("error", payload)
+        self.assertEqual(self.owners.google_oauth.calls, [])
+
+    def test_fleet_openai_list_cli_and_mcp_outputs_are_identical(self) -> None:
+        with self._binding():
+            status, cli = self._cli("fleet", "openai", "list")
+            mcp = self._mcp("fleet_openai_accounts", {})
+
+        self.assertEqual(status, 0)
+        self.assertFalse(mcp["isError"])
+        self.assertEqual(cli, mcp["payload"])
+        self.assertEqual(cli, {"accounts": [{"generation": 4, "ref": "openai-one"}]})
+
+    def test_fleet_account_commands_use_canonical_cli_names(self) -> None:
+        commands = (
+            (
+                (
+                    "fleet",
+                    "openai",
+                    "add",
+                    "--account-ref",
+                    "openai-two",
+                    "--label",
+                    "OpenAI Two",
+                    "--expected-generation",
+                    "4",
+                    "--idempotency-key",
+                    "add-openai",
+                ),
+                "openai-two",
+            ),
+            (
+                (
+                    "fleet",
+                    "openai",
+                    "disable",
+                    "--account-ref",
+                    "openai-one",
+                    "--expected-generation",
+                    "5",
+                    "--idempotency-key",
+                    "disable-openai",
+                ),
+                "openai-one",
+            ),
+            (
+                (
+                    "fleet",
+                    "google",
+                    "add",
+                    "--account-ref",
+                    "google-two",
+                    "--label",
+                    "Google Two",
+                    "--expected-generation",
+                    "6",
+                    "--idempotency-key",
+                    "add-google",
+                ),
+                "google-two",
+            ),
+        )
+
+        with self._binding():
+            results = [
+                (self._cli(*arguments), account_ref)
+                for arguments, account_ref in commands
+            ]
+
+        for ((status, payload), account_ref) in results:
+            self.assertEqual(status, 0)
+            self.assertEqual(payload["account"]["ref"], account_ref)
+        self.assertEqual(
+            self.owners.account_registry.calls,
+            [
+                ("generation", "openai"),
+                (
+                    "add",
+                    "openai",
+                    "openai-two",
+                    "OpenAI Two",
+                    4,
+                    "add-openai",
+                ),
+                ("generation", "openai"),
+                (
+                    "disable",
+                    "openai",
+                    "openai-one",
+                    5,
+                    "disable-openai",
+                ),
+                ("generation", "google"),
+                (
+                    "add",
+                    "google",
+                    "google-two",
+                    "Google Two",
+                    6,
+                    "add-google",
+                ),
+            ],
+        )
+
+    def test_fleet_operation_status_cli_and_mcp_outputs_are_identical(self) -> None:
+        arguments = {"operation_id": "operation-one"}
+        with self._binding():
+            status, cli = self._cli(
+                "fleet",
+                "operation",
+                "status",
+                "--operation-id",
+                "operation-one",
+            )
+            mcp = self._mcp("fleet_operation_status", arguments)
+
+        self.assertEqual(status, 0)
+        self.assertFalse(mcp["isError"])
+        self.assertEqual(cli, mcp["payload"])
+        self.assertEqual(cli["id"], "operation-one")
+
+    def test_fleet_admin_denied_scope_is_same_problem_for_cli_and_mcp(self) -> None:
+        from test_admin_service import principal
+
+        with self._binding(principal()):
+            status, cli = self._cli("fleet", "google", "inventory")
+            mcp = self._mcp("fleet_google_inventory", {})
+
+        self.assertEqual(status, 1)
+        self.assertTrue(mcp["isError"])
+        for payload in (cli, mcp["payload"]):
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["code"], "authority.scope_denied")
+            self.assertEqual(
+                set(payload),
+                {
+                    "schema_version",
+                    "code",
+                    "severity",
+                    "title",
+                    "detail",
+                    "effect",
+                    "action",
+                    "retryable",
+                    "retry_after_seconds",
+                    "correlation_id",
+                    "occurred_at",
+                },
+            )
+        self.assertEqual(self.owners.google_manager.list_calls, 0)
+
+    def test_fleet_admin_unknown_operation_fails_before_service(self) -> None:
+        with self._binding():
+            mcp = self._mcp("fleet_unknown_operation", {})
+
+        self.assertTrue(mcp["isError"])
+        self.assertEqual(mcp["payload"], {"error": "unknown tool"})
+        self.assertEqual(self.owners.google_manager.list_calls, 0)
+        self.assertEqual(self.owners.openai_accounts.calls, 0)
+
+    def test_masterjet_control_binding_is_exact_and_one_shot(self) -> None:
+        with patch.object(server_module, "_MASTERJET_ADMIN_BINDING", None):
+            server_module.bind_masterjet_control_service(self.service, self.principal)
+            self.assertEqual(
+                server_module._MASTERJET_ADMIN_BINDING,
+                (self.service, self.principal),
+            )
+            with self.assertRaisesRegex(AgentError, "control.service_already_bound"):
+                server_module.bind_masterjet_control_service(
+                    self.service, self.principal
+                )
+
+    def test_fleet_admin_tools_are_scope_filtered_and_have_no_secret_input(
+        self,
+    ) -> None:
+        from test_admin_service import principal
+
+        with self._binding(principal("fleet.read")):
+            reply = server_module.handle_rpc(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            )
+        self.assertIsNotNone(reply)
+        assert reply is not None
+        tools = {tool["name"]: tool for tool in reply["result"]["tools"]}
+        self.assertEqual(len(tools), 86)
+        for allowed_name in {
+            "fleet_google_inventory",
+            "fleet_openai_accounts",
+            "fleet_operation_status",
+            "fleet_ollama_models",
+            "fleet_ollama_instances",
+        }:
+            self.assertIn(allowed_name, tools)
+        for forbidden_name in {
+            "fleet_openai_auth_plan",
+            "fleet_google_oauth_begin",
+            "fleet_google_provision_plan",
+            "fleet_google_provision_apply",
+            "fleet_google_billing_plan",
+            "fleet_google_billing_apply",
+            "fleet_ollama_instance_plan",
+            "fleet_ollama_instance_apply",
+            "fleet_ollama_instance_probe",
+        }:
+            self.assertNotIn(forbidden_name, tools)
+        forbidden = {
+            "access_token",
+            "auth_json",
+            "client_secret",
+            "cookie",
+            "password",
+            "refresh_token",
+            "secret",
+            "token",
+            "totp",
+        }
+        admin_names = {
+            "fleet_openai_accounts",
+            "fleet_openai_auth_plan",
+            "fleet_google_inventory",
+            "fleet_google_oauth_begin",
+            "fleet_google_provision_plan",
+            "fleet_google_provision_apply",
+            "fleet_google_billing_plan",
+            "fleet_google_billing_apply",
+            "fleet_operation_status",
+            "fleet_ollama_models",
+            "fleet_ollama_instances",
+            "fleet_ollama_instance_plan",
+            "fleet_ollama_instance_apply",
+            "fleet_ollama_instance_probe",
+        }
+        all_tools = {tool["name"]: tool for tool in server_module.TOOLS}
+        for name in admin_names:
+            tool = all_tools[name]
+            if tool["name"] not in admin_names:
+                continue
+            properties = tool["inputSchema"].get("properties", {})
+            self.assertTrue(forbidden.isdisjoint(properties))
+
+    def test_master_tool_status_reports_exact_scope_filtered_visible_count(self) -> None:
+        from test_admin_service import principal
+
+        with self._binding(principal("fleet.read")), patch.object(
+            server_module, "codex_home_context", return_value={"home_kind": "root"}
+        ), patch.object(
+            server_module, "managed_home_in_process_ancestry", return_value=False
+        ), patch.object(
+            server_module, "teamleader_principal_digest", return_value="digest-one"
+        ), patch.object(
+            server_module,
+            "read_hive_principals",
+            return_value={
+                "digest-one": {
+                    "class": "koenigin",
+                    "agent_id": None,
+                }
+            },
+        ):
+            status = server_module.master_tool_access_status()
+
+        self.assertTrue(status["authorized"])
+        self.assertEqual(status["visible_tool_count"], 86)
+
+    def test_admin_capability_catalog_rejects_wire_shape_downgrade(self) -> None:
+        from codex_master.admin_contracts import (
+            ADMIN_OPERATION_CATALOG,
+            ADMIN_OPERATION_CATALOG_DIGEST,
+            ADMIN_OPERATION_METADATA,
+        )
+
+        valid = {
+            "schema_version": 1,
+            "catalog_digest": ADMIN_OPERATION_CATALOG_DIGEST,
+            "operation_count": len(ADMIN_OPERATION_CATALOG),
+            "allowed": [
+                ADMIN_OPERATION_METADATA[operation].scope is not None
+                for operation in ADMIN_OPERATION_CATALOG
+            ],
+        }
+        invalid = (
+            {**valid, "schema_version": 2},
+            {**valid, "catalog_digest": "0" * 64},
+            {**valid, "operation_count": len(ADMIN_OPERATION_CATALOG) - 1},
+            {**valid, "allowed": valid["allowed"][:-1]},
+            {**valid, "allowed": [*valid["allowed"], False]},
+            {**valid, "allowed": [1, *valid["allowed"][1:]]},
+            {**valid, "allowed": [True, *valid["allowed"][1:]]},
+            {**valid, "unknown": False},
+        )
+
+        self.assertEqual(
+            server_module._masterjet_admin_capabilities(valid),
+            frozenset(
+                operation
+                for operation in ADMIN_OPERATION_CATALOG
+                if ADMIN_OPERATION_METADATA[operation].scope is not None
+            ),
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                ValueError, "invalid admin capabilities"
+            ):
+                server_module._masterjet_admin_capabilities(payload)
+
+    def test_admin_capability_catalog_requires_exact_integer_field_types(self) -> None:
+        from codex_master.admin_contracts import (
+            ADMIN_OPERATION_CATALOG,
+            ADMIN_OPERATION_CATALOG_DIGEST,
+            ADMIN_OPERATION_METADATA,
+        )
+
+        class IntSubclass(int):
+            pass
+
+        valid = {
+            "schema_version": 1,
+            "catalog_digest": ADMIN_OPERATION_CATALOG_DIGEST,
+            "operation_count": len(ADMIN_OPERATION_CATALOG),
+            "allowed": [
+                ADMIN_OPERATION_METADATA[operation].scope is not None
+                for operation in ADMIN_OPERATION_CATALOG
+            ],
+        }
+        invalid_versions = (True, 1.0, IntSubclass(1), "1")
+        invalid_counts = (
+            True,
+            float(len(ADMIN_OPERATION_CATALOG)),
+            IntSubclass(len(ADMIN_OPERATION_CATALOG)),
+            str(len(ADMIN_OPERATION_CATALOG)),
+        )
+
+        for field, values in (
+            ("schema_version", invalid_versions),
+            ("operation_count", invalid_counts),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    ValueError, "invalid admin capabilities"
+                ):
+                    server_module._masterjet_admin_capabilities(
+                        {**valid, field: value}
+                    )
+
+    def test_fleet_google_provision_plan_preserves_generation_and_idempotency(
+        self,
+    ) -> None:
+        arguments = {
+            "account_ref": "google-one",
+            "expected_generation": 4,
+            "idempotency_key": "provision-one",
+        }
+        with self._binding():
+            result = server_module.call_validated_tool(
+                "fleet_google_provision_plan", arguments
+            )
+
+        self.assertEqual(result["account_ref"], "google-one")
+        self.assertEqual(result["inventory_generation"], 4)
+        self.assertEqual(self.owners.quota_collector.calls, 1)
+        self.assertEqual(self.owners.google_provisioner.plan_calls, 1)
+
+    def test_invalid_admin_contract_is_same_canonical_problem_for_cli_and_mcp(
+        self,
+    ) -> None:
+        with self._binding():
+            status, cli = self._cli(
+                "fleet", "google", "inventory", "--account-ref", "bad/ref"
+            )
+            mcp = self._mcp(
+                "fleet_google_inventory", {"account_ref": "bad/ref"}
+            )
+
+        self.assertEqual(status, 1)
+        self.assertTrue(mcp["isError"])
+        for payload in (cli, mcp["payload"]):
+            self.assertEqual(payload["code"], "control.request_invalid")
+            self.assertEqual(
+                set(payload),
+                {
+                    "schema_version",
+                    "code",
+                    "severity",
+                    "title",
+                    "detail",
+                    "effect",
+                    "action",
+                    "retryable",
+                    "retry_after_seconds",
+                    "correlation_id",
+                    "occurred_at",
+                },
+            )
+
+    def test_invalid_plan_digest_returns_canonical_problem_before_owner(self) -> None:
+        arguments = {
+            "account_ref": "google-one",
+            "expected_generation": 4,
+            "idempotency_key": "apply-one",
+            "plan_digest": "bad-digest",
+        }
+        with self._binding():
+            mcp = self._mcp("fleet_google_provision_apply", arguments)
+
+        self.assertTrue(mcp["isError"])
+        self.assertEqual(mcp["payload"]["code"], "control.request_invalid")
+        self.assertNotIn("error", mcp["payload"])
+        self.assertEqual(self.owners.google_provisioner.apply_calls, 0)
+
+    def test_admin_contract_process_signals_propagate(self) -> None:
+        from codex_master import admin_contracts
+
+        for signal in (KeyboardInterrupt(), SystemExit(9)):
+            with self.subTest(signal=type(signal).__name__), self._binding(), patch.object(
+                admin_contracts, "AdminRequestV1", side_effect=signal
+            ):
+                with self.assertRaises(type(signal)):
+                    server_module.call_validated_tool("fleet_google_inventory", {})
+
+
 def test_dynamic_teamlead_dispatch_does_not_enter_legacy_agent_start() -> None:
     class Control:
         calls = 0
@@ -41249,7 +41933,9 @@ def test_targetless_teamlead_agent_start_keeps_a1_b1_legacy_forbidden() -> None:
             raise AssertionError("agent_start must ignore runtime")
 
     control = Control()
-    with patch.object(server_module, "agent_ids", return_value=["a1", "b1"]), patch.object(
+    with patch.object(
+        server_module, "agent_ids", return_value=["a1", "b1"]
+    ), patch.object(
         server_module,
         "require_broad_mutation_confirmation",
         return_value={"required": False},
@@ -41257,7 +41943,9 @@ def test_targetless_teamlead_agent_start_keeps_a1_b1_legacy_forbidden() -> None:
         server_module,
         "call_agent_lifecycle",
         side_effect=lambda _agent, callback: callback(),
-    ), patch.object(server_module, "require_fleet_recovery_ready"), patch.object(
+    ), patch.object(
+        server_module, "require_fleet_recovery_ready"
+    ), patch.object(
         server_module, "require_authenticated_agent_for_mutation"
     ) as auth, patch.object(
         server_module, "ensure_agent_not_blocked_by_codex_usage"
@@ -41791,6 +42479,7 @@ def test_regular_enforced_mcp_surfaces_remain_principal_scoped() -> None:
     assert surfaces["teamleiterin"] < surfaces["koenigin"]
     assert "master_fleet_home_v2_cutover" in surfaces["koenigin"]
     assert "master_fleet_home_v2_cutover" not in surfaces["teamleiterin"]
+
 
 if __name__ == "__main__":
     unittest.main()

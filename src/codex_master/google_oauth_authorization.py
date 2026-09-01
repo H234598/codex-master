@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
-from typing import Final, NoReturn
+from typing import Final, NoReturn, cast
 
 
 class GoogleOAuthProfileIdV1(str, Enum):
@@ -205,6 +205,19 @@ def _build_provisioner_profile() -> GoogleOAuthAuthorizationProfileV1:
 _PROVISIONER_PROFILE: Final[GoogleOAuthAuthorizationProfileV1] = (
     _build_provisioner_profile()
 )
+_GOOGLE_SCOPE_VALUES: Final[dict[GoogleOAuthProfileIdV1, tuple[str, ...]]] = {
+    GoogleOAuthProfileIdV1.INVENTORY_READONLY: (
+        "https://www.googleapis.com/auth/cloud-billing.readonly",
+        "https://www.googleapis.com/auth/cloud-platform.read-only",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "openid",
+    ),
+    GoogleOAuthProfileIdV1.PROVISIONER: (
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "openid",
+    ),
+}
 
 
 def _restore_inventory_readonly_profile() -> GoogleOAuthAuthorizationProfileV1:
@@ -235,6 +248,16 @@ def _decode_operation(value: object) -> GoogleOAuthOperationV1 | str:
             return GoogleOAuthOperationV1(value)
         return "credential.oauth_operation_forbidden"
     return "credential.oauth_request_invalid"
+
+
+def google_oauth_scope_values_v1(profile_id: object) -> tuple[str, ...]:
+    """Return exact provider scope values for one closed-world profile."""
+
+    profile = _decode_profile(profile_id)
+    del profile_id
+    if type(profile) is str:
+        _raise(profile)
+    return _GOOGLE_SCOPE_VALUES[cast(GoogleOAuthProfileIdV1, profile)]
 
 
 def resolve_google_oauth_profile_v1(

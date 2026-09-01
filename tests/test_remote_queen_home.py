@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from codex_master import remote_queen_home
 from codex_master.remote_queen_bootstrap import ManifestGenerationV1, RemoteQueenBootstrapError
 from codex_master.remote_queen_home import (
     GENERIC_RULES_PATH,
@@ -30,7 +31,6 @@ from codex_master.remote_queen_home import (
     QueenTopicBindingV1,
     RemoteQueenHomeApplyJournalV1,
     RemoteQueenHomeManifestV1,
-    RemoteQueenHomeOperations,
     ResumeCapsuleV1,
     RollbackRemoteQueenHomeRequestV1,
     VerifyRemoteQueenHomeRequestV1,
@@ -94,6 +94,31 @@ def _expect_code(code, fn, *args, **kwargs):
     with pytest.raises(RemoteQueenBootstrapError) as caught:
         fn(*args, **kwargs)
     assert _code(caught) == code
+
+
+def test_material_post_init_validates_new_instances_inside_test_context():
+    material = QueenHomeMaterialV1(
+        "instructions/generic.md",
+        QueenMaterialKindV1.GENERIC_RULES,
+        "generic",
+        "sha256:" + "4" * 64,
+    )
+    assert material.relative_path == "instructions/generic.md"
+
+
+def test_valid_digest_accepts_only_canonical_sha256_values():
+    assert remote_queen_home._valid_digest("sha256:" + "a" * 64)
+    assert not remote_queen_home._valid_digest("sha256:" + "A" * 64)
+
+
+def test_valid_class_id_accepts_only_remote_queen_material_classes():
+    assert remote_queen_home._valid_class_id("queen")
+    assert not remote_queen_home._valid_class_id("teamleiterin")
+
+
+def test_digest_without_own_field_matches_public_canonical_digest():
+    topic = build_queen_topic_binding(WRITE_PATHS)
+    assert remote_queen_home._digest_payload_without_field(topic) == canonical_digest(topic)
 
 
 def _manifest():

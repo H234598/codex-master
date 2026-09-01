@@ -63,6 +63,13 @@ def test_validate_binds_git_root_and_remote_without_public_paths(tmp_path: Path)
     assert current.public()["remote"] == "not_returned"
 
 
+def test_public_status_uses_validated_redacted_projection(tmp_path: Path) -> None:
+    status = registry(make_repo(tmp_path)).public_status("repo-one")
+    assert status["allowed"] is True
+    assert status["root"] == "not_returned"
+    assert status["remote"] == "not_returned"
+
+
 def test_remote_swap_fails_closed(tmp_path: Path) -> None:
     root = make_repo(tmp_path)
     subprocess.run(

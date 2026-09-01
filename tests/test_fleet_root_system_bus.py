@@ -149,6 +149,32 @@ def reconciled_host(generation: int = GENERATION) -> FleetRootRuntimeHost:
     return host
 
 
+def test_runner_executor_requires_factory_and_linux_labels_use_bounded_fds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(TypeError, match="executor_factory_required"):
+        system_bus._ConsumerDynamicTeamleadRunnerExecutor()
+
+    operations = object.__new__(_LinuxPeerOperations)
+    opened: list[tuple[object, ...]] = []
+    closed: list[int] = []
+    monkeypatch.setattr(system_bus.os, "open", lambda *args: opened.append(args) or 40)
+    monkeypatch.setattr(system_bus, "_openat2", lambda *args: opened.append(args) or 41)
+    monkeypatch.setattr(
+        system_bus,
+        "_read_at",
+        lambda fd, name: b"1" if name == "enforce" else PEER_LABEL + b"\0\n",
+    )
+    monkeypatch.setattr(system_bus.os, "close", closed.append)
+    monkeypatch.setattr(system_bus.os, "getpid", lambda: 1234)
+
+    assert operations.read_enforcing() is True
+    assert operations.read_self_label(30) == PEER_LABEL
+    assert closed == [40, 41]
+    assert opened[0][0] == "/sys/fs/selinux"
+    assert opened[1][1] == "1234"
+
+
 def expected_principal(**changes: object) -> PrincipalBinding:
     values = {
         "agent_id": TL_AGENT_ID,

@@ -54,6 +54,111 @@ def test_state_store_uses_private_modes(tmp_path: Path) -> None:
     assert stat.S_IMODE((tmp_path / "state" / ".hive-state.lock").stat().st_mode) == 0o600
 
 
+def test_state_store_can_use_one_exact_group_shared_non_secret_root(tmp_path: Path) -> None:
+    """The Agent bridge is group-scoped, while the default remains private."""
+
+    root = tmp_path / "agent-state"
+    root.mkdir(mode=0o770)
+    os.chmod(root, 0o2770)
+    store = HiveStateStore(root, shared_gid=os.getegid())
+    store.replace_json(PurePosixPath("bindings.json"), {"schema_version": 1})
+
+    assert stat.S_IMODE(root.stat().st_mode) == 0o2770
+    assert stat.S_IMODE((root / "bindings.json").stat().st_mode) == 0o660
+    assert stat.S_IMODE((root / ".hive-state.lock").stat().st_mode) == 0o660
+
+    (root / "bindings.json").chmod(0o600)
+    with pytest.raises(HiveStateError, match="state_file_untrusted"):
+        store.read_private_bytes(PurePosixPath("bindings.json"), max_bytes=4096)
+
+
+def test_shared_state_reuses_group_owned_lock_without_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "agent-state"
+    root.mkdir(mode=0o770)
+    os.chmod(root, 0o2770)
+    lock = root / ".hive-state.lock"
+    lock.touch(mode=0o660)
+    lock.chmod(0o660)
+
+    original_fchmod = os.fchmod
+
+    def deny_existing_lock_chmod(descriptor: int, mode: int) -> None:
+        if os.fstat(descriptor).st_ino == lock.stat().st_ino:
+            raise PermissionError
+        original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr("codex_master.hive.state.os.fchmod", deny_existing_lock_chmod)
+
+    with HiveStateStore(root, shared_gid=os.getegid()).locked():
+        pass
+
+
+def test_shared_state_directory_creation_race_never_chmods_other_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "agent-state"
+    original_mkdir = Path.mkdir
+    original_chmod = os.chmod
+    injected = False
+
+    def race_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal injected
+        if path == root and not injected:
+            injected = True
+            original_mkdir(path, mode=0o770)
+            original_chmod(path, 0o2770)
+        original_mkdir(path, *args, **kwargs)
+
+    def deny_foreign_chmod(path: os.PathLike[str] | str, mode: int) -> None:
+        if Path(path) == root:
+            raise PermissionError
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(Path, "mkdir", race_mkdir)
+    monkeypatch.setattr("codex_master.hive.state.os.chmod", deny_foreign_chmod)
+
+    HiveStateStore(root, shared_gid=os.getegid())
+
+
+def test_shared_state_lock_creation_race_never_fchmods_other_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "agent-state"
+    root.mkdir(mode=0o770)
+    os.chmod(root, 0o2770)
+    lock = root / ".hive-state.lock"
+    original_open = os.open
+    original_fchmod = os.fchmod
+    injected = False
+
+    def race_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal injected
+        if path == lock.name and flags & os.O_CREAT and not injected:
+            injected = True
+            foreign = original_open(
+                path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o660,
+                dir_fd=dir_fd,
+            )
+            original_fchmod(foreign, 0o660)
+            os.close(foreign)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def deny_foreign_fchmod(descriptor: int, mode: int) -> None:
+        if lock.exists() and os.fstat(descriptor).st_ino == lock.stat().st_ino:
+            raise PermissionError
+        original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr("codex_master.hive.state.os.open", race_open)
+    monkeypatch.setattr("codex_master.hive.state.os.fchmod", deny_foreign_fchmod)
+
+    with HiveStateStore(root, shared_gid=os.getegid()).locked():
+        pass
+
+
 def test_state_store_reuses_exact_0700_root_without_chmod_and_existing_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import json
 import importlib
 import threading
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 
 import pytest
+import codex_master.fleet_service as fleet_service_module
 
 from codex_master.agent_resolver import (
     AgentClassPolicy,
@@ -43,7 +45,7 @@ from codex_master.fleet_runners import (
     ProviderErrorQuotaObservation,
     ProbeResult,
 )
-from codex_master.fleet_service import FleetRateLimitError
+from codex_master.fleet_service import FleetConflictError, FleetRateLimitError
 from codex_master.worker_resolution_carrier import (
     WorkerRegistryReservationIssuerV2,
     WorkerResolutionEvidenceV2,
@@ -72,6 +74,54 @@ def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
     assert paths.lock == tmp_path / "fleet" / "registry.lock"
     assert paths.recovery == tmp_path / "fleet" / "recovery.json"
     assert paths.mutation_lock == tmp_path / "fleet" / "mutation.lock"
+
+
+def test_persisted_remote_readiness_requires_exact_document() -> None:
+    document = {
+        "ready": True,
+        "reason_codes": [],
+        "process_running": True,
+        "cgroup_member": True,
+        "loopback_endpoint_reachable": True,
+        "available_model_ids": ["provider-a"],
+    }
+
+    status = fleet_service_module._readiness_from_document(document)
+
+    assert status.ready is True
+    assert status.available_model_ids == ("provider-a",)
+    with pytest.raises(FleetConflictError, match="resource.host_response_invalid"):
+        fleet_service_module._readiness_from_document({**document, "private": True})
+
+
+def test_shared_remote_state_reuses_group_owned_directories_without_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.server import build_fleet_private_io
+
+    paths = FleetPaths.from_state_root(tmp_path / "shared")
+    paths.root.mkdir(parents=True)
+    os.chmod(paths.root.parent, 0o2770)
+    os.chmod(paths.root, 0o2770)
+    protected = {paths.root.parent, paths.root}
+    original_chmod = os.chmod
+
+    def deny_existing_chmod(path, mode):
+        if Path(path) in protected:
+            raise PermissionError
+        original_chmod(path, mode)
+
+    monkeypatch.setattr("codex_master.fleet_service.os.chmod", deny_existing_chmod)
+
+    FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=object(),  # type: ignore[arg-type]
+        agent_operations=object(),  # type: ignore[arg-type]
+        shared_state_gid=os.getegid(),
+    )
 
 
 def _account(
@@ -1927,3 +1977,1314 @@ def test_private_lock_serializes_cross_thread_registry_access(tmp_path: Path) ->
     assert not first_thread.is_alive()
     assert not second_thread.is_alive()
     assert second_entered.is_set()
+
+
+@dataclass(frozen=True)
+class _FleetOllamaHostPlan:
+    instance_ref: str
+    fence: int = 7
+    plan_digest: str = "a" * 64
+
+
+@dataclass(frozen=True)
+class _FleetOllamaExecution:
+    plan: _FleetOllamaHostPlan
+
+
+class _FleetOllamaTransport:
+    def __init__(self, *, ready: bool = True, stop_fails: bool = False) -> None:
+        self.ready = ready
+        self.stop_fails = stop_fails
+        self.calls: list[tuple[str, object]] = []
+
+    def plan(self, instance, *, generation, resource_generation=None):
+        del resource_generation
+        self.calls.append(("plan", (instance, generation)))
+        return _FleetOllamaHostPlan(instance.ref)
+
+    def apply(self, plan, *, current_fence):
+        self.calls.append(("apply", (plan, current_fence)))
+        return _FleetOllamaExecution(plan)
+
+    def probe(self, execution, *, current_fence):
+        from codex_master.ollama_runtime import OllamaReadinessStatus
+
+        self.calls.append(("probe", (execution, current_fence)))
+        return OllamaReadinessStatus(
+            self.ready,
+            () if self.ready else ("provider.model_unavailable",),
+            True,
+            True,
+            True,
+            ("provider-a", "provider-b") if self.ready else ("provider-a",),
+        )
+
+    def stop(self, execution, *, current_fence):
+        self.calls.append(("stop", (execution, current_fence)))
+        if self.stop_fails:
+            raise RuntimeError("private cleanup detail")
+
+
+def _ollama_model(ref: str, provider_id: str):
+    from codex_master.ollama_registry import OllamaModelV1
+
+    return OllamaModelV1(ref, provider_id, True, True, True, "2026-08-30T12:00:00Z")
+
+
+def _ollama_instance(ref: str = "local-main", *, state: str = "planned"):
+    from codex_master.ollama_host_transport import CONTROL_HOST_REF
+    from codex_master.ollama_registry import OllamaInstanceV1
+
+    return OllamaInstanceV1(
+        ref,
+        ref.replace("-", " ").title(),
+        CONTROL_HOST_REF,
+        "/usr/bin/ollama",
+        "/srv/ollama/models",
+        ("model-a", "model-b"),
+        "4-7",
+        350,
+        40,
+        state,
+        "ready" if state == "running" else "unknown",
+    )
+
+
+def _ollama_fleet_service(
+    tmp_path: Path,
+    *,
+    instances=(),
+    ready: bool = True,
+    stop_fails: bool = False,
+    resource_attestation=None,
+):
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    private_io = replace(
+        build_fleet_private_io(paths),
+        utc_now=lambda: datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc),
+    )
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    registry.replace(
+        models=(
+            _ollama_model("model-a", "provider-a"),
+            _ollama_model("model-b", "provider-b"),
+        ),
+        instances=tuple(instances),
+        expected_generation=0,
+    )
+    transport = _FleetOllamaTransport(ready=ready, stop_fails=stop_fails)
+    service = FleetService(
+        paths,
+        private_io,
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        ollama_resource_snapshot=(lambda _host_ref: resource_attestation),
+    )
+    return service, registry, transport
+
+
+def test_ollama_models_and_instances_remain_separate_registry_views(tmp_path: Path) -> None:
+    placed = _ollama_instance()
+    service, _registry, _transport = _ollama_fleet_service(
+        tmp_path, instances=(placed,)
+    )
+
+    assert [model.ref for model in service.ollama_models()] == ["model-a", "model-b"]
+    assert service.ollama_instances() == (placed,)
+    assert service.ollama_generation() == 1
+
+
+def test_apply_publishes_one_lane_per_selected_model_only_after_readiness(
+    tmp_path: Path,
+) -> None:
+    service, registry, transport = _ollama_fleet_service(tmp_path)
+    candidate = _ollama_instance()
+
+    planned = service.plan_ollama_instance(candidate, expected_generation=1)
+    assert service.ollama_hive_lanes() == ()
+    result = service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+
+    assert [lane.model_ref for lane in result.hive_lanes] == ["model-a", "model-b"]
+    assert [lane.provider_model_id for lane in result.hive_lanes] == [
+        "provider-a",
+        "provider-b",
+    ]
+    assert registry.load().instances[0].readiness_state == "ready"
+    assert [call[0] for call in transport.calls] == ["plan", "apply", "probe"]
+
+
+def test_failed_readiness_stops_only_new_execution_and_publishes_nothing(
+    tmp_path: Path,
+) -> None:
+    service, registry, transport = _ollama_fleet_service(tmp_path, ready=False)
+    planned = service.plan_ollama_instance(
+        _ollama_instance(), expected_generation=1
+    )
+
+    with pytest.raises(FleetConflictError, match="ollama.instance_not_ready"):
+        service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+
+    assert registry.load().instances == ()
+    assert service.ollama_hive_lanes() == ()
+    assert [call[0] for call in transport.calls] == ["plan", "apply", "probe", "stop"]
+
+
+def test_failed_readiness_surfaces_cleanup_failure_without_private_detail(
+    tmp_path: Path,
+) -> None:
+    service, _registry, _transport = _ollama_fleet_service(
+        tmp_path, ready=False, stop_fails=True
+    )
+    planned = service.plan_ollama_instance(
+        _ollama_instance(), expected_generation=1
+    )
+
+    with pytest.raises(FleetConflictError, match="^ollama.cleanup_failed$") as error:
+        service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+
+    assert "private cleanup detail" not in str(error.value)
+
+
+def test_four_running_local_instances_block_fifth_before_host_plan(tmp_path: Path) -> None:
+    instances = tuple(
+        replace(_ollama_instance(f"local-{letter}", state="running"), selected_model_refs=("model-a",))
+        for letter in "abcd"
+    )
+    service, _registry, transport = _ollama_fleet_service(
+        tmp_path, instances=instances
+    )
+
+    with pytest.raises(FleetConflictError, match="ollama.local_limit_reached"):
+        service.plan_ollama_instance(
+            replace(_ollama_instance("local-fifth"), selected_model_refs=("model-a",)),
+            expected_generation=1,
+        )
+
+    assert transport.calls == []
+
+
+def test_third_local_instance_requires_green_sixty_minute_attestation(
+    tmp_path: Path,
+) -> None:
+    from codex_master.fleet_service import OllamaResourceSnapshotV1
+
+    instances = tuple(
+        replace(_ollama_instance(f"local-{letter}", state="running"), selected_model_refs=("model-a",))
+        for letter in "ab"
+    )
+    denied, _registry, denied_transport = _ollama_fleet_service(
+        tmp_path / "denied", instances=instances
+    )
+    with pytest.raises(FleetConflictError, match="ollama.resource_headroom_required"):
+        denied.plan_ollama_instance(
+            replace(_ollama_instance("local-third"), selected_model_refs=("model-a",)),
+            expected_generation=1,
+        )
+    assert denied_transport.calls == []
+
+    attestation = OllamaResourceSnapshotV1(
+        host_ref="control-host",
+        generation=9,
+        observed_at_utc="2026-08-30T11:59:00Z",
+        valid_until_utc="2026-08-30T13:01:00Z",
+        green=True,
+        headroom_seconds=3600,
+    )
+    allowed, _registry, allowed_transport = _ollama_fleet_service(
+        tmp_path / "allowed",
+        instances=instances,
+        resource_attestation=attestation,
+    )
+
+    planned = allowed.plan_ollama_instance(
+        replace(_ollama_instance("local-third"), selected_model_refs=("model-a",)),
+        expected_generation=1,
+    )
+
+    assert planned.resource_generation == 9
+    assert [call[0] for call in allowed_transport.calls] == ["plan"]
+
+
+def test_successful_ollama_apply_retry_is_idempotent(tmp_path: Path) -> None:
+    service, registry, transport = _ollama_fleet_service(tmp_path)
+    planned = service.plan_ollama_instance(
+        _ollama_instance(), expected_generation=1
+    )
+
+    first = service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+    second = service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+
+    assert second is first
+    assert registry.load().generation == 2
+    assert [call[0] for call in transport.calls] == ["plan", "apply", "probe"]
+
+
+def test_ollama_probe_withdraws_lanes_when_runtime_loses_readiness(
+    tmp_path: Path,
+) -> None:
+    service, registry, transport = _ollama_fleet_service(tmp_path)
+    planned = service.plan_ollama_instance(
+        _ollama_instance(), expected_generation=1
+    )
+    service.apply_ollama_instance(planned.plan_id, expected_generation=1)
+    transport.ready = False
+
+    status = service.probe_ollama_instance(
+        "local-main", expected_generation=2
+    )
+
+    assert status.ready is False
+    assert service.ollama_hive_lanes() == ()
+    stored = registry.load()
+    assert stored.generation == 3
+    assert stored.instances[0].readiness_state == "not_ready"
+
+
+def test_remote_apply_unknown_never_publishes_lane_and_plan_survives_restart(
+    tmp_path: Path,
+) -> None:
+    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
+    from codex_master.agent_contracts import (
+        AgentPollV1,
+        AgentResultV1,
+    )
+    from codex_master.agent_operations import (
+        AgentOperationStore,
+        AgentPrincipalV1,
+    )
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.ollama_host_transport import (
+        AgentQueueRemoteOllamaOperationPort,
+        HostRegistryOllamaLeaseSource,
+        OllamaHostTransport,
+    )
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    hosts = HostRegistry.for_test(tmp_path / "hosts")
+    hosts.provision_agent_binding(
+        {
+            "ref": "worker-west",
+            "label": "Worker West",
+            "role": "execution",
+            "capabilities": ["ollama.execute", "resource.probe"],
+        },
+        AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
+        expected_generation=0,
+    )
+    agent_operations = AgentOperationStore.for_test(tmp_path / "agent-operations")
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    registry.replace(
+        models=(_ollama_model("model-a", "provider-a"),),
+        instances=(),
+        expected_generation=0,
+    )
+    transport = OllamaHostTransport(
+        registry=registry,
+        leases=HostRegistryOllamaLeaseSource(hosts),
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=agent_operations, host_registry=hosts
+        ),
+    )
+    paths = FleetPaths.from_state_root(tmp_path / "ollama-owner")
+    service = FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        agent_operations=agent_operations,
+    )
+    instance = replace(
+        _ollama_instance("remote-west"),
+        host_ref="worker-west",
+        selected_model_refs=("model-a",),
+    )
+    operation = service.plan_ollama_instance(instance, expected_generation=1)
+    assert operation.state == "queued"
+
+    principal = AgentPrincipalV1("worker-west", hosts.document_generation())
+    poll = AgentPollV1(
+        hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
+    )
+    plan_lease = agent_operations.poll(principal, poll)
+    plan_result = AgentResultV1(
+        "ollama.instance", "plan", {"plan_ref": "remote-plan-one"}
+    )
+    service.accept_agent_result(
+        principal,
+        _ollama_receipt(plan_lease, "succeeded", plan_result),
+    )
+    apply = service.apply_ollama_instance(operation.id, expected_generation=1)
+    assert apply.state == "queued"
+    apply_lease = agent_operations.poll(principal, poll)
+    unknown_result = AgentResultV1(
+        "ollama.instance", "apply", {"status": "effect_unknown"}
+    )
+    service.accept_agent_result(
+        principal,
+        _ollama_receipt(apply_lease, "unknown", unknown_result),
+    )
+
+    assert agent_operations.get(apply.id).state == "unknown"
+    assert registry.load().instances == ()
+    assert service.ollama_hive_lanes() == ()
+    restarted = FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        agent_operations=agent_operations,
+    )
+    assert restarted.ollama_plan_digest(operation.id) == operation.plan_digest
+
+
+def test_remote_resource_generation_drift_blocks_apply_before_queue_side_effect(
+    tmp_path: Path,
+) -> None:
+    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
+    from codex_master.agent_contracts import AgentPollV1, AgentResultV1
+    from codex_master.agent_operations import AgentOperationStore, AgentPrincipalV1
+    from codex_master.fleet_service import (
+        FleetPaths,
+        FleetService,
+        OllamaResourceSnapshotV1,
+    )
+    from codex_master.ollama_host_transport import (
+        AgentQueueRemoteOllamaOperationPort,
+        HostRegistryOllamaLeaseSource,
+        OllamaHostTransport,
+    )
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    hosts = HostRegistry.for_test(tmp_path / "hosts")
+    hosts.provision_agent_binding(
+        {
+            "ref": "worker-west",
+            "label": "Worker West",
+            "role": "execution",
+            "capabilities": ["ollama.execute", "resource.probe"],
+        },
+        AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
+        expected_generation=0,
+    )
+    store = AgentOperationStore.for_test(tmp_path / "operations")
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    running = tuple(
+        replace(
+            _ollama_instance(f"existing-{suffix}", state="running"),
+            host_ref="worker-west",
+            selected_model_refs=("model-a",),
+        )
+        for suffix in ("one", "two")
+    )
+    registry.replace(
+        models=(_ollama_model("model-a", "provider-a"),),
+        instances=running,
+        expected_generation=0,
+    )
+    transport = OllamaHostTransport(
+        registry=registry,
+        leases=HostRegistryOllamaLeaseSource(hosts),
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=store, host_registry=hosts
+        ),
+    )
+    snapshot = [
+        OllamaResourceSnapshotV1(
+            "worker-west",
+            9,
+            "2026-08-30T11:59:00Z",
+            "2026-08-30T13:01:00Z",
+            True,
+            3600,
+        )
+    ]
+    paths = FleetPaths.from_state_root(tmp_path / "owner")
+    io = replace(
+        build_fleet_private_io(paths),
+        utc_now=lambda: datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc),
+    )
+    service = FleetService(
+        paths,
+        io,
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        agent_operations=store,
+        ollama_resource_snapshot=lambda _host: snapshot[0],
+    )
+    instance = replace(
+        _ollama_instance("remote-west"),
+        host_ref="worker-west",
+        selected_model_refs=("model-a",),
+    )
+    plan = service.plan_ollama_instance(instance, expected_generation=1)
+    principal = AgentPrincipalV1("worker-west", hosts.document_generation())
+    lease = store.poll(
+        principal,
+        AgentPollV1(hosts.document_generation(), 3, "sha256:" + "c" * 64, 0),
+    )
+    assert lease.resource_generation == 9
+    service.accept_agent_result(
+        principal,
+        _ollama_receipt(
+            lease,
+            "succeeded",
+            AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"}),
+        ),
+    )
+    snapshot[0] = OllamaResourceSnapshotV1(
+        "worker-west",
+        10,
+        "2026-08-30T11:59:00Z",
+        "2026-08-30T13:01:00Z",
+        True,
+        3600,
+    )
+
+    with pytest.raises(FleetConflictError, match="ollama.resource_headroom_required"):
+        service.apply_ollama_instance(plan.id, expected_generation=1)
+
+    assert registry.load().instances == running
+
+
+def test_remote_completion_redelivery_recovers_every_owner_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A receipt redelivery resumes after owner I/O without duplicating it."""
+
+    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
+    from codex_master.agent_contracts import AgentPollV1, AgentResultV1
+    from codex_master.agent_operations import AgentOperationStore, AgentPrincipalV1
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.ollama_host_transport import (
+        AgentQueueRemoteOllamaOperationPort,
+        HostRegistryOllamaLeaseSource,
+        OllamaHostTransport,
+    )
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    hosts = HostRegistry.for_test(tmp_path / "hosts")
+    hosts.provision_agent_binding(
+        {
+            "ref": "worker-west",
+            "label": "Worker West",
+            "role": "execution",
+            "capabilities": ["ollama.execute", "resource.probe"],
+        },
+        AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
+        expected_generation=0,
+    )
+    store = AgentOperationStore.for_test(tmp_path / "operations")
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    registry.replace(
+        models=(_ollama_model("model-a", "provider-a"),),
+        instances=(),
+        expected_generation=0,
+    )
+    transport = OllamaHostTransport(
+        registry=registry,
+        leases=HostRegistryOllamaLeaseSource(hosts),
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=store, host_registry=hosts
+        ),
+    )
+    paths = FleetPaths.from_state_root(tmp_path / "owner")
+
+    def new_service() -> FleetService:
+        return FleetService(
+            paths,
+            build_fleet_private_io(paths),
+            pool_root=tmp_path / "pool",
+            ollama_registry=registry,
+            ollama_transport=transport,
+            agent_operations=store,
+        )
+
+    principal = AgentPrincipalV1("worker-west", hosts.document_generation())
+    poll = AgentPollV1(
+        hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
+    )
+
+    def complete_after_interruption(
+        service: FleetService, receipt: object
+    ) -> FleetService:
+        original_complete = store.complete
+        interrupted = False
+
+        def crash_after_owner(*args, **kwargs):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise RuntimeError("injected_queue_write_interruption")
+            return original_complete(*args, **kwargs)
+
+        monkeypatch.setattr(store, "complete", crash_after_owner)
+        with pytest.raises(RuntimeError, match="injected_queue_write_interruption"):
+            service.accept_agent_result(principal, receipt)
+        monkeypatch.setattr(store, "complete", original_complete)
+        recovered = new_service()
+        recovered.accept_agent_result(principal, receipt)
+        return recovered
+
+    service = new_service()
+    instance = replace(
+        _ollama_instance("remote-west"),
+        host_ref="worker-west",
+        selected_model_refs=("model-a",),
+    )
+    plan = service.plan_ollama_instance(instance, expected_generation=1)
+    plan_lease = store.poll(principal, poll)
+    plan_receipt = _ollama_receipt(
+        plan_lease,
+        "succeeded",
+        AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"}),
+    )
+    service = complete_after_interruption(
+        service,
+        plan_receipt,
+    )
+    assert store.get(plan.id).state == "succeeded"
+
+    apply = service.apply_ollama_instance(plan.id, expected_generation=1)
+    apply_lease = store.poll(principal, poll)
+    apply_receipt = _ollama_receipt(
+        apply_lease,
+        "succeeded",
+        AgentResultV1(
+            "ollama.instance", "apply", {"instance_ref": "remote-west", "generation": 1}
+        ),
+    )
+    service = complete_after_interruption(
+        service,
+        apply_receipt,
+    )
+    assert store.get(apply.id).state == "succeeded"
+    assert registry.load().generation == 2
+
+    probe = service.probe_ollama_instance("remote-west", expected_generation=2)
+    probe_lease = store.poll(principal, poll)
+    probe_receipt = _ollama_receipt(
+        probe_lease,
+        "succeeded",
+        AgentResultV1(
+            "ollama.instance",
+            "probe",
+            {
+                "ready": True,
+                "reason_codes": ("resource.ready",),
+                "process_running": True,
+                "cgroup_member": True,
+                "loopback_endpoint_reachable": True,
+                "available_model_ids": ("provider-a",),
+            },
+        ),
+    )
+    service = complete_after_interruption(
+        service,
+        probe_receipt,
+    )
+    assert store.get(probe.id).state == "succeeded"
+    assert registry.load().generation == 3
+    assert service.ollama_hive_lanes()[0].instance_ref == "remote-west"
+
+    stop = service.stop_ollama_instance("remote-west", expected_generation=3)
+    assert stop is not None
+    stop_lease = store.poll(principal, poll)
+    stop_receipt = _ollama_receipt(
+        stop_lease,
+        "succeeded",
+        AgentResultV1("ollama.instance", "stop", {"stopped": True}),
+    )
+    original_mark_completed = FleetService._mark_remote_completed
+
+    def crash_after_queue_terminal(*_args, **_kwargs) -> None:
+        raise RuntimeError("injected_completion_journal_interruption")
+
+    monkeypatch.setattr(FleetService, "_mark_remote_completed", crash_after_queue_terminal)
+    with pytest.raises(RuntimeError, match="injected_completion_journal_interruption"):
+        service.accept_agent_result(principal, stop_receipt)
+    assert store.get(stop.id).state == "succeeded"
+    monkeypatch.setattr(FleetService, "_mark_remote_completed", original_mark_completed)
+    service = new_service()
+    service.accept_agent_result(principal, stop_receipt)
+
+    assert store.get(stop.id).state == "succeeded"
+    assert registry.load().generation == 4
+    assert service.ollama_hive_lanes() == ()
+
+    service.plan_ollama_instance(
+        replace(instance, ref="remote-failed"), expected_generation=4
+    )
+    failed_lease = store.poll(principal, poll)
+    failed_receipt = _ollama_receipt(
+        failed_lease,
+        "failed",
+        AgentResultV1("ollama.instance", "plan", {"status": "failed"}),
+    )
+    assert service.accept_agent_result(principal, failed_receipt).state == "failed"
+    before_terminal_replays = registry.load()
+
+    def owner_effect_must_not_run(*_args, **_kwargs):
+        raise AssertionError("terminal receipt repeated an owner effect")
+
+    monkeypatch.setattr(
+        FleetService, "_mark_remote_owner_applied", owner_effect_must_not_run
+    )
+    monkeypatch.setattr(
+        FleetService, "_accept_remote_apply", owner_effect_must_not_run
+    )
+    monkeypatch.setattr(
+        FleetService, "_accept_remote_probe", owner_effect_must_not_run
+    )
+    monkeypatch.setattr(
+        FleetService, "_accept_remote_stop", owner_effect_must_not_run
+    )
+    for receipt in (
+        plan_receipt,
+        apply_receipt,
+        probe_receipt,
+        stop_receipt,
+        failed_receipt,
+    ):
+        assert new_service().accept_agent_result(principal, receipt).state == receipt.state
+    assert registry.load() == before_terminal_replays
+
+
+def test_remote_owner_index_crash_after_enqueue_recovers_every_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh owner can complete every queue row left before index projection."""
+    from codex_master.admin_contracts import OperationV1
+    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
+    from codex_master.agent_contracts import AgentPollV1, AgentResultV1
+    from codex_master.agent_operations import AgentOperationStore, AgentPrincipalV1
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.ollama_host_transport import (
+        AgentQueueRemoteOllamaOperationPort,
+        HostRegistryOllamaLeaseSource,
+        OllamaHostTransport,
+    )
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    hosts = HostRegistry.for_test(tmp_path / "hosts")
+    hosts.provision_agent_binding(
+        {
+            "ref": "worker-west", "label": "Worker West", "role": "execution",
+            "capabilities": ["ollama.execute", "resource.probe"],
+        },
+        AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
+        expected_generation=0,
+    )
+    store = AgentOperationStore.for_test(tmp_path / "operations")
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    registry.replace(
+        models=(_ollama_model("model-a", "provider-a"),), instances=(), expected_generation=0
+    )
+    transport = OllamaHostTransport(
+        registry=registry,
+        leases=HostRegistryOllamaLeaseSource(hosts),
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=store, host_registry=hosts
+        ),
+    )
+    paths = FleetPaths.from_state_root(tmp_path / "owner")
+
+    def new_service() -> FleetService:
+        return FleetService(
+            paths, build_fleet_private_io(paths), pool_root=tmp_path / "pool",
+            ollama_registry=registry, ollama_transport=transport, agent_operations=store,
+        )
+
+    principal = AgentPrincipalV1("worker-west", hosts.document_generation())
+    agent_poll = AgentPollV1(hosts.document_generation(), 3, "sha256:" + "c" * 64, 0)
+
+    def crash_after_enqueue(service: FleetService, invoke):
+        captured: dict[str, object] = {}
+
+        def lose_index(operation, **_kwargs):
+            captured["operation"] = operation
+            raise RuntimeError("injected_owner_index_write_failure")
+
+        monkeypatch.setattr(service, "_record_remote_operation", lose_index)
+        with pytest.raises(RuntimeError, match="injected_owner_index_write_failure"):
+            invoke()
+        operation = captured.get("operation")
+        assert isinstance(operation, OperationV1)
+        assert store.owner_context(operation.id) is not None
+        return operation
+
+    service = new_service()
+    instance = replace(
+        _ollama_instance("remote-west"), host_ref="worker-west", selected_model_refs=("model-a",)
+    )
+    plan = crash_after_enqueue(
+        service, lambda: service.plan_ollama_instance(instance, expected_generation=1)
+    )
+    plan_lease = store.poll(principal, agent_poll)
+    assert plan_lease.operation_id == plan.id
+    service = new_service()
+    plan_receipt = _ollama_receipt(
+        plan_lease, "succeeded", AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"})
+    )
+    assert service.accept_agent_result(principal, plan_receipt).state == "succeeded"
+    assert service.accept_agent_result(principal, plan_receipt).state == "succeeded"
+    before_conflict = registry.load()
+    with pytest.raises(FleetConflictError, match="host.completion_conflict"):
+        service.accept_agent_result(
+            principal,
+            _ollama_receipt(
+                plan_lease,
+                "failed",
+                AgentResultV1("ollama.instance", "plan", {"status": "failed"}),
+            ),
+        )
+    assert registry.load() == before_conflict
+    assert store.get(plan.id).state == "succeeded"
+
+    apply = crash_after_enqueue(
+        service, lambda: service.apply_ollama_instance(plan.id, expected_generation=1)
+    )
+    apply_lease = store.poll(principal, agent_poll)
+    service = new_service()
+    apply_receipt = _ollama_receipt(
+        apply_lease, "succeeded", AgentResultV1(
+            "ollama.instance", "apply", {"instance_ref": "remote-west", "generation": 1}
+        )
+    )
+    assert service.accept_agent_result(principal, apply_receipt).state == "succeeded"
+    assert store.get(apply.id).state == "succeeded"
+
+    probe = crash_after_enqueue(
+        service, lambda: service.probe_ollama_instance("remote-west", expected_generation=2)
+    )
+    probe_lease = store.poll(principal, agent_poll)
+    service = new_service()
+    probe_receipt = _ollama_receipt(
+        probe_lease, "succeeded", AgentResultV1(
+            "ollama.instance", "probe", {
+                "ready": True, "reason_codes": ("resource.ready",), "process_running": True,
+                "cgroup_member": True, "loopback_endpoint_reachable": True,
+                "available_model_ids": ("provider-a",),
+            }
+        )
+    )
+    assert service.accept_agent_result(principal, probe_receipt).state == "succeeded"
+    assert store.get(probe.id).state == "succeeded"
+
+    stop = crash_after_enqueue(
+        service, lambda: service.stop_ollama_instance("remote-west", expected_generation=3)
+    )
+    stop_lease = store.poll(principal, agent_poll)
+    service = new_service()
+    stop_receipt = _ollama_receipt(
+        stop_lease, "succeeded", AgentResultV1("ollama.instance", "stop", {"stopped": True})
+    )
+    assert service.accept_agent_result(principal, stop_receipt).state == "succeeded"
+    assert store.get(stop.id).state == "succeeded"
+
+
+def test_remote_operation_index_keeps_parallel_enqueues_from_separate_owners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durable index has one cross-process read/modify/write critical section."""
+
+    from codex_master.admin_contracts import OperationV1
+    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
+    from codex_master.agent_operations import AgentOperationStore
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.hive.state import HiveStateStore
+    from codex_master.ollama_host_transport import (
+        AgentQueueRemoteOllamaOperationPort,
+        HostRegistryOllamaLeaseSource,
+        OllamaHostTransport,
+    )
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    hosts = HostRegistry.for_test(tmp_path / "hosts")
+    hosts.provision_agent_binding(
+        {
+            "ref": "worker-west",
+            "label": "Worker West",
+            "role": "execution",
+            "capabilities": ["ollama.execute", "resource.probe"],
+        },
+        AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
+        expected_generation=0,
+    )
+    store = AgentOperationStore.for_test(tmp_path / "operations")
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    registry.replace(
+        models=(_ollama_model("model-a", "provider-a"),),
+        instances=(),
+        expected_generation=0,
+    )
+    transport = OllamaHostTransport(
+        registry=registry,
+        leases=HostRegistryOllamaLeaseSource(hosts),
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=store, host_registry=hosts
+        ),
+    )
+    paths = FleetPaths.from_state_root(tmp_path / "owner")
+    first = FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        agent_operations=store,
+    )
+    second = FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        agent_operations=store,
+    )
+    barrier = threading.Barrier(2)
+    original = HiveStateStore.read_json
+
+    def overlap_read(self, relative, *, max_bytes):
+        document = original(self, relative, max_bytes=max_bytes)
+        barrier.wait(timeout=5)
+        return document
+
+    monkeypatch.setattr(HiveStateStore, "read_json", overlap_read)
+    results: list[object] = []
+    failures: list[BaseException] = []
+
+    def plan(service: FleetService, ref: str) -> None:
+        try:
+            results.append(
+                service.plan_ollama_instance(
+                    replace(
+                        _ollama_instance(ref),
+                        host_ref="worker-west",
+                        selected_model_refs=("model-a",),
+                    ),
+                    expected_generation=1,
+                )
+            )
+        except BaseException as error:  # pragma: no cover - asserted below
+            failures.append(error)
+
+    first_thread = threading.Thread(target=plan, args=(first, "remote-one"))
+    second_thread = threading.Thread(target=plan, args=(second, "remote-two"))
+    first_thread.start()
+    second_thread.start()
+    first_thread.join(timeout=10)
+    second_thread.join(timeout=10)
+
+    assert not failures
+    assert len(results) == 2
+    assert all(type(value) is OperationV1 for value in results)
+    restarted = FleetService(
+        paths,
+        build_fleet_private_io(paths),
+        pool_root=tmp_path / "pool",
+        ollama_registry=registry,
+        ollama_transport=transport,
+        agent_operations=store,
+    )
+    assert all(restarted.ollama_plan_digest(value.id) is not None for value in results)
+
+
+def _ollama_receipt(lease, state: str, result):
+    from codex_master.agent_contracts import AgentReceiptV1, serialize_agent_result
+
+    encoded = json.dumps(
+        serialize_agent_result(result), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return AgentReceiptV1(
+        lease.operation_id,
+        lease.lease_id,
+        lease.lease_epoch,
+        lease.attempt,
+        lease.plan_digest,
+        lease.arguments_digest,
+        state,
+        ("host.operation_succeeded",)
+        if state == "succeeded"
+        else ("host.operation_unknown",),
+        "sha256:" + hashlib.sha256(encoded).hexdigest(),
+        result,
+        lease.envelope_digest,
+    )
+
+
+def _remote_apply_receipt_before_queue_completion(tmp_path: Path):
+    """Build a genuinely leased remote apply whose receipt has not completed."""
+
+    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
+    from codex_master.agent_contracts import AgentPollV1, AgentResultV1
+    from codex_master.agent_operations import AgentOperationStore, AgentPrincipalV1
+    from codex_master.fleet_service import FleetPaths, FleetService
+    from codex_master.ollama_host_transport import (
+        AgentQueueRemoteOllamaOperationPort,
+        HostRegistryOllamaLeaseSource,
+        OllamaHostTransport,
+    )
+    from codex_master.ollama_registry import OllamaRegistryStore
+    from codex_master.server import build_fleet_private_io
+
+    hosts = HostRegistry.for_test(tmp_path / "hosts")
+    hosts.provision_agent_binding(
+        {
+            "ref": "worker-west",
+            "label": "Worker West",
+            "role": "execution",
+            "capabilities": ["ollama.execute", "resource.probe"],
+        },
+        AgentBindingV1("worker-west", "sha256:" + "a" * 64, 3, True),
+        expected_generation=0,
+    )
+    store = AgentOperationStore.for_test(tmp_path / "operations")
+    registry = OllamaRegistryStore.for_test(tmp_path / "ollama")
+    registry.replace(
+        models=(_ollama_model("model-a", "provider-a"),),
+        instances=(),
+        expected_generation=0,
+    )
+    transport = OllamaHostTransport(
+        registry=registry,
+        leases=HostRegistryOllamaLeaseSource(hosts),
+        remote=AgentQueueRemoteOllamaOperationPort(
+            agent_operations=store, host_registry=hosts
+        ),
+    )
+    paths = FleetPaths.from_state_root(tmp_path / "owner")
+
+    def new_service() -> FleetService:
+        return FleetService(
+            paths,
+            build_fleet_private_io(paths),
+            pool_root=tmp_path / "pool",
+            ollama_registry=registry,
+            ollama_transport=transport,
+            agent_operations=store,
+        )
+
+    principal = AgentPrincipalV1("worker-west", hosts.document_generation())
+    poll = AgentPollV1(
+        hosts.document_generation(), 3, "sha256:" + "c" * 64, 0
+    )
+    service = new_service()
+    planned = replace(
+        _ollama_instance("remote-west"),
+        host_ref="worker-west",
+        selected_model_refs=("model-a",),
+    )
+    plan = service.plan_ollama_instance(planned, expected_generation=1)
+    plan_lease = store.poll(principal, poll)
+    assert service.accept_agent_result(
+        principal,
+        _ollama_receipt(
+            plan_lease,
+            "succeeded",
+            AgentResultV1("ollama.instance", "plan", {"plan_ref": "remote-plan"}),
+        ),
+    ).state == "succeeded"
+    apply = service.apply_ollama_instance(plan.id, expected_generation=1)
+    apply_lease = store.poll(principal, poll)
+    receipt = _ollama_receipt(
+        apply_lease,
+        "succeeded",
+        AgentResultV1(
+            "ollama.instance",
+            "apply",
+            {"instance_ref": "remote-west", "generation": 1},
+        ),
+    )
+    running = replace(
+        planned, lifecycle_state="running", readiness_state="unknown"
+    )
+    return service, new_service, store, registry, principal, apply, receipt, running
+
+
+def test_remote_apply_receipt_recovers_after_unrelated_registry_generation_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An owner-applied receipt resumes without replaying its apply CAS."""
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    original_complete = store.complete
+
+    def crash_after_owner(*_args, **_kwargs):
+        current = registry.load()
+        assert current.generation == 2
+        assert current.instances == (running,)
+        operation = service._remote_document()["operations"][apply.id]
+        assert operation["completion"]["phase"] == "owner_applied"
+        raise RuntimeError("injected_after_owner_before_queue_completion")
+
+    monkeypatch.setattr(store, "complete", crash_after_owner)
+    with pytest.raises(
+        RuntimeError, match="injected_after_owner_before_queue_completion"
+    ):
+        service.accept_agent_result(principal, receipt)
+    monkeypatch.setattr(store, "complete", original_complete)
+    assert store.get(apply.id).state == "leased"
+
+    unrelated = replace(
+        _ollama_instance("remote-east"),
+        host_ref="worker-east",
+        selected_model_refs=("model-a",),
+    )
+    after_apply = registry.load()
+    expected = registry.replace(
+        models=after_apply.models,
+        instances=after_apply.instances + (unrelated,),
+        expected_generation=after_apply.generation,
+    )
+    assert expected.generation == 3
+
+    completed = new_service().accept_agent_result(principal, receipt)
+
+    assert completed.state == "succeeded"
+    assert store.get(apply.id).state == "succeeded"
+    assert registry.load() == expected
+
+
+def test_remote_apply_receipt_recovery_refuses_changed_applied_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner-applied recovery cannot bless a different post-state as success."""
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    original_complete = store.complete
+
+    def crash_after_owner(*_args, **_kwargs):
+        raise RuntimeError("injected_after_owner_before_queue_completion")
+
+    monkeypatch.setattr(store, "complete", crash_after_owner)
+    with pytest.raises(
+        RuntimeError, match="injected_after_owner_before_queue_completion"
+    ):
+        service.accept_agent_result(principal, receipt)
+    monkeypatch.setattr(store, "complete", original_complete)
+    after_apply = registry.load()
+    assert after_apply.instances == (running,)
+    conflicting = replace(
+        running, lifecycle_state="failed", readiness_state="not_ready"
+    )
+    drifted = registry.replace(
+        models=after_apply.models,
+        instances=(conflicting,),
+        expected_generation=after_apply.generation,
+    )
+
+    with pytest.raises(FleetConflictError, match="control.plan_stale"):
+        new_service().accept_agent_result(principal, receipt)
+
+    assert store.get(apply.id).state == "leased"
+    assert registry.load() == drifted
+
+
+def test_remote_apply_prepared_phase_does_not_trust_generation_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prepared receipt still needs the narrow original apply-CAS evidence."""
+
+    from codex_master.fleet_service import FleetService
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    original_mark = FleetService._mark_remote_owner_applied
+
+    def crash_before_owner(*_args, **_kwargs):
+        raise RuntimeError("injected_after_apply_before_owner_phase")
+
+    monkeypatch.setattr(FleetService, "_mark_remote_owner_applied", crash_before_owner)
+    with pytest.raises(RuntimeError, match="injected_after_apply_before_owner_phase"):
+        service.accept_agent_result(principal, receipt)
+    monkeypatch.setattr(FleetService, "_mark_remote_owner_applied", original_mark)
+    operation = service._remote_document()["operations"][apply.id]
+    assert operation["completion"]["phase"] == "prepared"
+    after_apply = registry.load()
+    assert after_apply.instances == (running,)
+    unrelated = replace(
+        _ollama_instance("remote-east"),
+        host_ref="worker-east",
+        selected_model_refs=("model-a",),
+    )
+    drifted = registry.replace(
+        models=after_apply.models,
+        instances=after_apply.instances + (unrelated,),
+        expected_generation=after_apply.generation,
+    )
+
+    with pytest.raises(FleetConflictError, match="control.plan_stale"):
+        new_service().accept_agent_result(principal, receipt)
+
+    assert store.get(apply.id).state == "leased"
+    assert registry.load() == drifted
+
+
+def test_completed_remote_apply_receipt_ignores_later_target_instance_drift(
+    tmp_path: Path,
+) -> None:
+    """A terminal receipt is a pure no-op even after its target later changes."""
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    assert service.accept_agent_result(principal, receipt).state == "succeeded"
+    operation = service._remote_document()["operations"][apply.id]
+    assert operation["completion"]["phase"] == "queue_completed"
+    assert store.get(apply.id).state == "succeeded"
+
+    changed = replace(
+        running, lifecycle_state="failed", readiness_state="not_ready"
+    )
+    completed = registry.load()
+    drifted = registry.replace(
+        models=completed.models,
+        instances=(changed,),
+        expected_generation=completed.generation,
+    )
+
+    replay = new_service().accept_agent_result(principal, receipt)
+
+    assert replay.state == "succeeded"
+    assert store.get(apply.id).state == "succeeded"
+    assert registry.load() == drifted
+
+
+def test_completed_remote_apply_receipt_rejects_conflicting_terminal_result(
+    tmp_path: Path,
+) -> None:
+    """Terminal replay remains bound to its state, result and result digest."""
+
+    from codex_master.agent_contracts import AgentResultV1
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        _running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    assert service.accept_agent_result(principal, receipt).state == "succeeded"
+    before_queue = store.get(apply.id)
+    before_registry = registry.load()
+    conflicting = _ollama_receipt(
+        receipt,
+        "failed",
+        AgentResultV1("ollama.instance", "apply", {"status": "failed"}),
+    )
+
+    with pytest.raises(FleetConflictError, match="host.completion_conflict"):
+        new_service().accept_agent_result(principal, conflicting)
+
+    assert store.get(apply.id) == before_queue
+    assert registry.load() == before_registry
+
+
+def test_completed_remote_apply_receipt_replay_is_persistently_read_only(
+    tmp_path: Path,
+) -> None:
+    """An exact terminal redelivery neither rewrites saga nor queue files."""
+
+    (
+        service,
+        new_service,
+        store,
+        registry,
+        principal,
+        apply,
+        receipt,
+        running,
+    ) = _remote_apply_receipt_before_queue_completion(tmp_path)
+    assert service.accept_agent_result(principal, receipt).state == "succeeded"
+    changed = replace(
+        running, lifecycle_state="failed", readiness_state="not_ready"
+    )
+    completed = registry.load()
+    drifted = registry.replace(
+        models=completed.models,
+        instances=(changed,),
+        expected_generation=completed.generation,
+    )
+
+    def snapshot(path: Path) -> tuple[int, int, bytes]:
+        content = path.read_bytes()
+        status = path.stat()
+        return status.st_ino, status.st_size, content
+
+    remote_saga = (
+        tmp_path
+        / "owner"
+        / "fleet"
+        / "ollama-remote"
+        / "remote-ollama-operations.json"
+    )
+    queue_operations = tmp_path / "operations" / "agent-operations" / "operations.json"
+    queue_result = (
+        tmp_path / "operations" / "agent-operations" / "results" / apply.id
+    )
+    before_files = {
+        "remote_saga": snapshot(remote_saga),
+        "queue_operations": snapshot(queue_operations),
+        "queue_result": snapshot(queue_result),
+    }
+    before_queue = store.get(apply.id)
+
+    replay = new_service().accept_agent_result(principal, receipt)
+
+    assert replay == before_queue
+    assert store.get(apply.id) == before_queue
+    assert registry.load() == drifted
+    assert {
+        "remote_saga": snapshot(remote_saga),
+        "queue_operations": snapshot(queue_operations),
+        "queue_result": snapshot(queue_result),
+    } == before_files
