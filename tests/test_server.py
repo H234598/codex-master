@@ -39903,7 +39903,10 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             target = Path(tmpdir) / "systemd-user"
             target.mkdir()
             for name in (self.service_name, self.slice_name):
-                (target / name).write_bytes((source_root / "systemd" / "user" / name).read_bytes())
+                source = source_root / "systemd" / "user" / name
+                destination = target / name
+                destination.write_bytes(source.read_bytes())
+                destination.chmod(stat.S_IMODE(source.stat().st_mode))
             calls: list[list[str]] = []
             states = self._states(service_state="active", service_enabled="enabled")
             fake = self._systemctl_fake(calls, states)
@@ -40234,7 +40237,10 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             target = Path(tmpdir) / "systemd-user"
             target.mkdir()
             for name in (self.service_name, self.slice_name):
-                (target / name).write_bytes((source_root / "systemd" / "user" / name).read_bytes())
+                source = source_root / "systemd" / "user" / name
+                destination = target / name
+                destination.write_bytes(source.read_bytes())
+                destination.chmod(stat.S_IMODE(source.stat().st_mode))
             states = self._states(service_state="active", service_enabled="enabled")
             states[self.service_name].update(
                 {
