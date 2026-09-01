@@ -1366,7 +1366,9 @@ def test_unauthorized_runtime_surface_stays_sterile_until_a_principal_is_verifie
     publish.assert_not_called()
     assert not state_root.exists()
     tools = next(response for response in responses if response.get("id") == 2)
-    assert tools["result"] == {"tools": [server.TOOLS[0]]}
+    assert tools["result"] == {
+        "tools": [next(tool for tool in server.TOOLS if tool["name"] == "runtime_status")]
+    }
     runtime = next(response for response in responses if response.get("id") == 3)
     assert runtime["result"]["isError"] is False
     blocked_resources = next(

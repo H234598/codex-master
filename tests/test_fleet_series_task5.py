@@ -7,14 +7,16 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from codex_master import server
 from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from codex_master.fleet_service import FleetConflictError
+from codex_master.hive import hourly_probe as hourly_probe_module
 from codex_master.hive.hourly_probe import run_probe
+from codex_master.runtime_layout import RuntimeLayout
 
 
 @pytest.fixture(autouse=True)
@@ -52,13 +54,34 @@ def runtime_probe_record(
             True,
         ),
     }
+    layout = Mock(spec=RuntimeLayout)
+    layout.mcp_entrypoint = command
+    monkeypatch.setattr(
+        hourly_probe_module,
+        "_runtime_status_json",
+        lambda _layout: (
+            {
+                "ok": True,
+                "metadata": {"ok": True, "reason_code": "ok"},
+                "mcp_surface": {
+                    "ok": True,
+                    "initialize": True,
+                    "tools_list": True,
+                    "tool_count": 1,
+                    "reason_code": "ok",
+                },
+                "raw_output": "not_returned",
+            },
+            True,
+        ),
+    )
     run_probe(
-        repository=repository,
-        command=command,
+        layout=layout,
         state_directory=state_directory,
         now=lambda: datetime.now(UTC),
         runner=lambda _command, *arguments: healthy[" ".join(arguments)],
     )
+    monkeypatch.setattr(hourly_probe_module, "_probe_state_root", lambda: state_directory)
     monkeypatch.setenv("CODEX_MASTER_MCP_STATE", str(state_directory))
     monkeypatch.delenv("CODEX_AGENT_MCP_STATE", raising=False)
 
@@ -424,10 +447,12 @@ import json
 import os
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from codex_master import server
+from codex_master.hive import hourly_probe as hourly_probe_module
 from codex_master.hive.hourly_probe import run_probe
+from codex_master.runtime_layout import RuntimeLayout
 
 mode, root_text, executable_text, crash_point = sys.argv[1:]
 root = Path(root_text)
@@ -448,10 +473,23 @@ healthy = {
     "hive status": (runtime, True),
     "hive doctor": ({"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}}, True),
 }
-run_probe(
-    repository=root / "probe-repository", command=executable, state_directory=probe_state,
-    now=lambda: datetime.now(UTC), runner=lambda _command, *arguments: healthy[" ".join(arguments)],
-)
+layout = Mock(spec=RuntimeLayout)
+layout.mcp_entrypoint = executable
+direct_runtime = {
+    "ok": True,
+    "metadata": {"ok": True, "reason_code": "ok"},
+    "mcp_surface": {
+        "ok": True, "initialize": True, "tools_list": True,
+        "tool_count": 1, "reason_code": "ok",
+    },
+    "raw_output": "not_returned",
+}
+with patch.object(hourly_probe_module, "_runtime_status_json", return_value=(direct_runtime, True)):
+    run_probe(
+        layout=layout, state_directory=probe_state,
+        now=lambda: datetime.now(UTC), runner=lambda _command, *arguments: healthy[" ".join(arguments)],
+    )
+hourly_probe_module._probe_state_root = lambda: probe_state
 os.environ["CODEX_MASTER_MCP_STATE"] = str(probe_state)
 
 with patch.object(server, "STATE_ROOT", state_root), patch.object(

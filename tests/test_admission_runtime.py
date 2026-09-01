@@ -4,6 +4,7 @@ import contextlib
 import fcntl
 from pathlib import Path
 import threading
+from unittest.mock import Mock
 
 import pytest
 
@@ -24,8 +25,10 @@ from codex_master.admission_runtime import (
     ServerAdmissionRuntime,
 )
 from codex_master import server
+from codex_master.hive import hourly_probe as hourly_probe_module
 from codex_master.hive.dispatch import plan_queen_assignment
 from codex_master.hive.hourly_probe import PROBE_GATE_LOCK_NAME, run_probe
+from codex_master.runtime_layout import RuntimeLayout
 from codex_master.server import AgentError, build_server_admission_runtime, build_server_lease_executor, build_server_selection_service
 from codex_master.selection_service import SelectionDeniedError, SelectionService
 
@@ -67,9 +70,29 @@ def materialize_probe_record(
         ),
     }
     reference = datetime.now(timezone.utc)
+    layout = Mock(spec=RuntimeLayout)
+    layout.mcp_entrypoint = command
+    monkeypatch.setattr(
+        hourly_probe_module,
+        "_runtime_status_json",
+        lambda _layout: (
+            {
+                "ok": True,
+                "metadata": {"ok": True, "reason_code": "ok"},
+                "mcp_surface": {
+                    "ok": True,
+                    "initialize": True,
+                    "tools_list": True,
+                    "tool_count": 1,
+                    "reason_code": "ok",
+                },
+                "raw_output": "not_returned",
+            },
+            True,
+        ),
+    )
     run_probe(
-        repository=tmp_path / "probe-repository",
-        command=command,
+        layout=layout,
         state_directory=state_directory,
         now=lambda: (
             reference - timedelta(seconds=4 * 60 * 60 + 1)
@@ -82,6 +105,7 @@ def materialize_probe_record(
             else lambda _command, *arguments: checks[" ".join(arguments)]
         ),
     )
+    monkeypatch.setattr(hourly_probe_module, "_probe_state_root", lambda: state_directory)
     state_file = state_directory / "hive-hourly-health.json"
     if probe_state == "missing":
         state_file.unlink()

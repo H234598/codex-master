@@ -6060,7 +6060,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["server_declared"])
-        self.assertTrue(result["command_matches_install_path"])
+        self.assertTrue(result["command_matches_runtime_entrypoint"])
         self.assertTrue(result["startup_timeout_ok"])
         self.assertTrue(result["default_tools_approval_mode_ok"])
         self.assertEqual(result["path"], "not_returned")
@@ -6138,7 +6138,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["server_declared"])
-        self.assertFalse(result["command_matches_install_path"])
+        self.assertFalse(result["command_matches_runtime_entrypoint"])
         self.assertFalse(result["startup_timeout_ok"])
         self.assertEqual(result["reason"], "mcp_command_mismatch")
         serialized = json.dumps(result, sort_keys=True)
