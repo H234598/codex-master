@@ -374,55 +374,58 @@ def test_g_crash_matrix_reuses_journaled_ids_and_redacts(
     crash_point: str,
     tmp_path: Path,
 ) -> None:
-    service, pool_root = _synthetic_migration_state(tmp_path)
+    with server_module.temporary_agent_inventory(None):
+        service, pool_root = _synthetic_migration_state(tmp_path)
 
-    def crash(point: str) -> None:
-        if point == crash_point:
-            raise SyntheticCrash(point)
+        def crash(point: str) -> None:
+            if point == crash_point:
+                raise SyntheticCrash(point)
 
-    with _safe_synthetic_runtime(), patch.object(
-        server_module, "_g_migration_crash_point", side_effect=crash, create=True
-    ):
-        with pytest.raises(SyntheticCrash):
-            server_module._apply_g_series_migration_for_authorized_caller(
-                service=service,
-                manifest=QUEEN_G_MANIFEST_V1,
-                pool_root=pool_root,
-            )
+        with _safe_synthetic_runtime(), patch.object(
+            server_module, "_g_migration_crash_point", side_effect=crash, create=True
+        ):
+            with pytest.raises(SyntheticCrash):
+                server_module._apply_g_series_migration_for_authorized_caller(
+                    service=service,
+                    manifest=QUEEN_G_MANIFEST_V1,
+                    pool_root=pool_root,
+                )
 
-    journal_path = service._paths.root / "g-series-migration.json"
-    journal = normalize_g_migration_journal(json.loads(journal_path.read_text()))
-    assert journal.allocations
-    journaled_member_ids = {item.member_id for item in journal.allocations}
-    rendered = repr(journal) + str(journal)
-    assert "marker-binding" not in rendered
-    assert "member_id" not in rendered
+        journal_path = service._paths.root / "g-series-migration.json"
+        journal = normalize_g_migration_journal(json.loads(journal_path.read_text()))
+        assert journal.allocations
+        journaled_member_ids = {item.member_id for item in journal.allocations}
+        rendered = repr(journal) + str(journal)
+        assert "marker-binding" not in rendered
+        assert "member_id" not in rendered
 
-    if crash_point in {"after_registry_cas", "after_inventory_publish"}:
-        with _safe_synthetic_runtime():
-            recovered = server_module._apply_g_series_migration_for_authorized_caller(
-                service=service,
-                manifest=QUEEN_G_MANIFEST_V1,
-                pool_root=pool_root,
-            )
-        assert recovered.generation == 219
-        assert public_fleet_snapshot(recovered)["generation"] == 219
-        assert {
-            member.member_id
-            for series in recovered.series
-            for member in series.members
-        } == journaled_member_ids
-    else:
-        with _safe_synthetic_runtime():
-            recovered = server_module._recover_g_series_migration_for_authorized_caller(
-                service=service,
-                pool_root=pool_root,
-            )
-        assert recovered is None
-        assert service.snapshot.generation == 218
+        if crash_point in {"after_registry_cas", "after_inventory_publish"}:
+            with _safe_synthetic_runtime():
+                recovered = server_module._apply_g_series_migration_for_authorized_caller(
+                    service=service,
+                    manifest=QUEEN_G_MANIFEST_V1,
+                    pool_root=pool_root,
+                )
+            assert recovered.generation == 219
+            assert public_fleet_snapshot(recovered)["generation"] == 219
+            assert {
+                member.member_id
+                for series in recovered.series
+                for member in series.members
+            } == journaled_member_ids
+        else:
+            with _safe_synthetic_runtime():
+                recovered = server_module._recover_g_series_migration_for_authorized_caller(
+                    service=service,
+                    pool_root=pool_root,
+                )
+            assert recovered is None
+            assert service.snapshot.generation == 218
 
-    assert not journal_path.exists()
-    assert not any("marker-secret" in str(value) for value in (service.snapshot, recovered))
+        assert not journal_path.exists()
+        assert not any(
+            "marker-secret" in str(value) for value in (service.snapshot, recovered)
+        )
 
 
 def test_g_recovery_reuses_published_alias_view_without_reassignment(tmp_path: Path) -> None:
