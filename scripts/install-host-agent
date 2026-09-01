@@ -88,6 +88,12 @@ class _Removal(NamedTuple):
     mode: int
 
 
+class _ServiceState(NamedTuple):
+    unit: str
+    enabled: bool
+    active: bool
+
+
 def _packaged_source_directory() -> Path:
     executable = Path(__file__).resolve()
     candidates = [Path(sysconfig.get_path("data")) / "lib" / "codex-master"]
@@ -553,6 +559,82 @@ def _disable_foreign_services(role: str) -> None:
     )
 
 
+def _capture_foreign_service_states(role: str) -> tuple[_ServiceState, ...]:
+    foreign_role = WORKER_ROLE if role == MASTER_ROLE else MASTER_ROLE
+    states: list[_ServiceState] = []
+    for unit in ROLE_UNITS[foreign_role]:
+        enabled = subprocess.run(
+            ["/usr/bin/systemctl", "is-enabled", "--quiet", unit],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        active = subprocess.run(
+            ["/usr/bin/systemctl", "is-active", "--quiet", unit],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        if enabled not in {0, 1} or active not in {0, 3}:
+            raise InstallerError
+        states.append(_ServiceState(unit, enabled == 0, active == 0))
+    return tuple(states)
+
+
+def _restore_foreign_service_states(states: Sequence[_ServiceState]) -> None:
+    subprocess.run(
+        ["/usr/bin/systemctl", "daemon-reload"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for state in states:
+        subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "enable" if state.enabled else "disable",
+                state.unit,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "start" if state.active else "stop",
+                state.unit,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def _commit_role_files(
+    staged: Sequence[_Staged],
+    modes: Sequence[int],
+    removals: Sequence[_Removal],
+    *,
+    role: str,
+    live: bool,
+    foreign_units_present: bool,
+) -> None:
+    states = (
+        _capture_foreign_service_states(role)
+        if live and foreign_units_present
+        else ()
+    )
+    try:
+        if states:
+            _disable_foreign_services(role)
+        _commit_staged(staged, modes, removals)
+    except BaseException:
+        if states:
+            _restore_foreign_service_states(states)
+        raise
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     sources: list[_Source] = []
     directories: dict[str, int] = {}
@@ -580,14 +662,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             for source in sources:
                 staged.append(_stage(source, directories[source.directory]))
-            if arguments.destdir == Path("/") and any(
-                removal.name in UNIT_NAMES for removal in existing_removals
-            ):
-                _disable_foreign_services(arguments.role)
-            _commit_staged(
+            _commit_role_files(
                 staged,
                 [source.mode for source in sources],
                 existing_removals,
+                role=arguments.role,
+                live=arguments.destdir == Path("/"),
+                foreign_units_present=any(
+                    removal.name in UNIT_NAMES for removal in existing_removals
+                ),
             )
         except BaseException:
             _discard_staged(staged)

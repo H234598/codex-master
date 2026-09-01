@@ -519,6 +519,86 @@ def test_role_switch_stops_and_disables_only_foreign_units(
     ]
 
 
+def test_live_role_switch_failure_restores_exact_foreign_service_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_installer()
+    states = (
+        module._ServiceState("foreign-enabled.service", True, False),
+        module._ServiceState("foreign-active.service", False, True),
+    )
+    events: list[object] = []
+    monkeypatch.setattr(
+        module,
+        "_capture_foreign_service_states",
+        lambda _role: events.append("capture") or states,
+    )
+    monkeypatch.setattr(
+        module,
+        "_disable_foreign_services",
+        lambda _role: events.append("disable"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_commit_staged",
+        lambda *_args: events.append("commit") or (_ for _ in ()).throw(OSError()),
+    )
+    monkeypatch.setattr(
+        module,
+        "_restore_foreign_service_states",
+        lambda value: events.append(("restore", value)),
+    )
+
+    with pytest.raises(OSError):
+        module._commit_role_files(
+            (),
+            (),
+            (),
+            role="master",
+            live=True,
+            foreign_units_present=True,
+        )
+
+    assert events == [
+        "capture",
+        "disable",
+        "commit",
+        ("restore", states),
+    ]
+
+
+def test_foreign_service_state_capture_and_restore_preserve_enabled_and_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_installer()
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        returncode = 0 if argv[1:] in (
+            ["is-enabled", "--quiet", "codex-master-admin.service"],
+            ["is-active", "--quiet", "codex-master-agent-api.service"],
+        ) else 1 if argv[1] == "is-enabled" else 3
+        return subprocess.CompletedProcess(argv, returncode)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    states = module._capture_foreign_service_states("worker")
+    module._restore_foreign_service_states(states)
+
+    assert states == (
+        module._ServiceState("codex-master-admin.service", True, False),
+        module._ServiceState("codex-master-agent-api.service", False, True),
+    )
+    assert calls[-5:] == [
+        ["/usr/bin/systemctl", "daemon-reload"],
+        ["/usr/bin/systemctl", "enable", "codex-master-admin.service"],
+        ["/usr/bin/systemctl", "stop", "codex-master-admin.service"],
+        ["/usr/bin/systemctl", "disable", "codex-master-agent-api.service"],
+        ["/usr/bin/systemctl", "start", "codex-master-agent-api.service"],
+    ]
+
+
 def test_static_layout_provisioner_is_scoped_to_its_destination_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
