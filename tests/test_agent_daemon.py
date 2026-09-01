@@ -18,11 +18,11 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from codex_master import agent_daemon
 from codex_master.agent_daemon import AgentApiServer, AgentCredentialFds, open_systemd_credentials
-from codex_master.admin_hosts import HostRegistryError
+from codex_master.admin_hosts import HostRegistry, HostRegistryError
 from codex_master.admin_hosts import AgentPrincipalV1
 from codex_master.admin_operations import AdminOperationError
 from codex_master.agent_http import AgentHttpResponse
-from codex_master.agent_operations import AgentOperationError
+from codex_master.agent_operations import AgentOperationError, AgentOperationStore
 
 
 class FakeContext:
@@ -233,6 +233,47 @@ class _NoopHostProbeOwner:
 
     def acknowledge_agent_lifecycle(self, value: object) -> None:
         del value
+
+
+def test_completion_router_forwards_lifecycle_and_builds_ollama_owner(
+    tmp_path: Path,
+) -> None:
+    class LifecycleOwner:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def reconcile_attempt_exhaustion(self, value: object) -> bool:
+            self.calls.append(("attempt", value))
+            return True
+
+        def reconcile_operation_deadline(self, value: object) -> bool:
+            self.calls.append(("deadline", value))
+            return False
+
+        def acknowledge_agent_lifecycle(self, value: object) -> None:
+            self.calls.append(("acknowledge", value))
+
+    lifecycle = LifecycleOwner()
+    router = agent_daemon._AgentCompletionRouter(object(), lifecycle, object())  # type: ignore[arg-type]
+    context = object()
+
+    assert router.reconcile_attempt_exhaustion(context) is True
+    assert router.reconcile_operation_deadline(context) is False
+    router.acknowledge_agent_lifecycle(context)
+    assert lifecycle.calls == [
+        ("attempt", context),
+        ("deadline", context),
+        ("acknowledge", context),
+    ]
+
+    state_root = tmp_path / "agent-state"
+    state_root.mkdir(mode=0o700)
+    fleet = agent_daemon._ollama_completion_fleet(
+        state_root,
+        AgentOperationStore.for_test(tmp_path / "operations"),
+        HostRegistry.for_test(tmp_path / "hosts"),
+    )
+    assert fleet.ollama_generation() == 0
 
 
 def _post_ollama_receipt(

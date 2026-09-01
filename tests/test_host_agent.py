@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import pytest
+import codex_master.host_agent as host_agent_module
 
 from codex_master.agent_ollama import AgentOllamaNoEffectError
 from codex_master.agent_contracts import (
@@ -31,9 +32,11 @@ from codex_master.host_agent import (
     MAX_RESPONSE_BYTES,
     HostAgent,
     HostAgentClient,
+    HostAgentCredentialFds,
     HostAgentError,
     HostAgentExecutor,
     HostProbeExecutor,
+    assemble_host_agent,
     build_tls_context,
     load_host_agent_config,
     main,
@@ -870,6 +873,57 @@ def test_host_agent_config_rejects_paths_outside_its_private_state_boundary(
             load_host_agent_config(descriptor)
     finally:
         os.close(descriptor)
+
+
+def test_host_agent_config_rejects_non_json_constants(tmp_path: Path) -> None:
+    path = tmp_path / "agent-config"
+    path.write_text('{"schema_version":NaN}', encoding="utf-8")
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        with pytest.raises(HostAgentError, match="host.config_invalid"):
+            load_host_agent_config(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_assemble_host_agent_wires_owned_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Config:
+        master_url = "https://master.internal"
+        host_ref = "worker-one"
+        registry_generation = 7
+        lease_epoch = 3
+        capabilities_digest = "sha256:" + "c" * 64
+        state_root = tmp_path / "state"
+        ollama_registry_path = tmp_path / "ollama" / "registry.json"
+
+    config = Config()
+    state = object()
+    registry = object()
+    ollama = object()
+    client = object()
+    monkeypatch.setattr(host_agent_module, "load_host_agent_config", lambda _fd: config)
+    monkeypatch.setattr(host_agent_module, "build_tls_context", lambda **_values: object())
+    monkeypatch.setattr(host_agent_module, "HostAgentState", lambda *_values, **_named: state)
+    monkeypatch.setattr(host_agent_module, "OllamaRegistryStore", lambda _path: registry)
+    monkeypatch.setattr(
+        host_agent_module,
+        "ProductionAgentOllamaAdapter",
+        lambda selected, **_named: ollama if selected is registry else None,
+    )
+    monkeypatch.setattr(
+        host_agent_module,
+        "HostAgentClient",
+        lambda url, **_named: client if url == config.master_url else None,
+    )
+
+    agent, loaded = assemble_host_agent(HostAgentCredentialFds(1, 2, 3, 4))
+
+    assert loaded is config
+    assert agent._client is client
+    assert agent._executor._state is state
+    assert agent._executor._ollama._operations is ollama
 
 
 def test_poll_loop_is_stoppable_and_cli_accepts_no_secret_arguments(

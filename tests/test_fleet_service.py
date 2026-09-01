@@ -12,6 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 import pytest
+import codex_master.fleet_service as fleet_service_module
 
 from codex_master.agent_resolver import (
     AgentClassPolicy,
@@ -73,6 +74,24 @@ def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
     assert paths.lock == tmp_path / "fleet" / "registry.lock"
     assert paths.recovery == tmp_path / "fleet" / "recovery.json"
     assert paths.mutation_lock == tmp_path / "fleet" / "mutation.lock"
+
+
+def test_persisted_remote_readiness_requires_exact_document() -> None:
+    document = {
+        "ready": True,
+        "reason_codes": [],
+        "process_running": True,
+        "cgroup_member": True,
+        "loopback_endpoint_reachable": True,
+        "available_model_ids": ["provider-a"],
+    }
+
+    status = fleet_service_module._readiness_from_document(document)
+
+    assert status.ready is True
+    assert status.available_model_ids == ("provider-a",)
+    with pytest.raises(FleetConflictError, match="resource.host_response_invalid"):
+        fleet_service_module._readiness_from_document({**document, "private": True})
 
 
 def test_shared_remote_state_reuses_group_owned_directories_without_chmod(

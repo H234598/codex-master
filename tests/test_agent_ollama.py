@@ -172,6 +172,25 @@ def test_production_adapter_uses_public_runtime_plan_apply_probe_stop(
     assert len(runtime.stopped) == 1
 
 
+def test_default_port_allocator_uses_system_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class DefaultRuntime:
+        def allocate_loopback_port(self) -> int:
+            return 11436
+
+    monkeypatch.setattr(
+        "codex_master.ollama_runtime.SystemOllamaRuntime",
+        lambda: DefaultRuntime(),
+    )
+    store, _executable = registry_at(tmp_path)
+    adapter = agent_ollama.ProductionAgentOllamaAdapter(
+        store, state_root=tmp_path / "state"
+    )
+
+    assert adapter._allocate_port() == 11436
+
+
 def test_apply_revalidates_original_path_evidence_at_actual_consumer(
     tmp_path: Path,
 ) -> None:

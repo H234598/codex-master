@@ -655,6 +655,10 @@ class OllamaFleet:
             True, (), True, True, True, ("provider-a",)
         )
 
+    def stop_ollama_instance(self, instance_ref, *, expected_generation):
+        self.calls.append(("stop", (instance_ref, expected_generation)))
+        return None
+
 
 class SecretIngress:
     def __init__(self) -> None:
@@ -1022,7 +1026,7 @@ def test_ollama_models_and_instances_queries_keep_layers_separate() -> None:
     assert owners.ollama_fleet.calls == [("models", None), ("instances", None)]
 
 
-def test_ollama_plan_apply_and_probe_use_one_admin_owner() -> None:
+def test_ollama_plan_apply_probe_and_stop_use_one_admin_owner() -> None:
     service, owners = service_at()
     arguments = {
         "ref": "quiet-runner",
@@ -1058,14 +1062,23 @@ def test_ollama_plan_apply_and_probe_use_one_admin_owner() -> None:
         "fleet.ollama.write",
         generation=4,
     )
+    stopped = command(
+        service,
+        "ollama.instance.stop",
+        {"instance_ref": "quiet-runner"},
+        "fleet.ollama.write",
+        generation=4,
+    )
 
     assert planned["plan_digest"] == DIGEST
     assert applied["hive_lanes"][0]["task_profile"] == "simple_only"  # type: ignore[index]
     assert probed["ready"] is True
+    assert stopped == {"schema_version": 1, "stopped": True}
     assert [call[0] for call in owners.ollama_fleet.calls] == [
         "plan",
         "apply",
         "probe",
+        "stop",
     ]
 
 
@@ -1387,6 +1400,57 @@ def test_public_agent_result_keeps_benign_tokens_containing_sk_letters() -> None
     assert public_agent_result(
         "ollama.instance.plan", {"plan_ref": "task-one"}
     ) == {"plan_ref": "task-one"}
+
+
+def test_public_agent_result_validates_generation_boole_and_reason_codes() -> None:
+    assert public_agent_result(
+        "ollama.instance.apply",
+        {"instance_ref": "quiet-runner", "generation": 4},
+    ) == {"instance_ref": "quiet-runner", "generation": 4}
+    assert public_agent_result(
+        "ollama.instance.probe",
+        {
+            "ready": True,
+            "reason_codes": ["host.operation_succeeded"],
+            "process_running": True,
+            "cgroup_member": True,
+            "loopback_endpoint_reachable": True,
+            "available_model_ids": ["provider-a"],
+        },
+    )["reason_codes"] == ["host.operation_succeeded"]
+    assert public_agent_result("ollama.instance.stop", {"stopped": True}) == {
+        "stopped": True
+    }
+
+    for result_kind, payload in (
+        ("ollama.instance.apply", {"instance_ref": "quiet-runner", "generation": True}),
+        (
+            "ollama.instance.probe",
+            {
+                "ready": 1,
+                "reason_codes": [],
+                "process_running": True,
+                "cgroup_member": True,
+                "loopback_endpoint_reachable": True,
+                "available_model_ids": [],
+            },
+        ),
+        (
+            "ollama.instance.probe",
+            {
+                "ready": False,
+                "reason_codes": ["private.agent.marker"],
+                "process_running": False,
+                "cgroup_member": False,
+                "loopback_endpoint_reachable": False,
+                "available_model_ids": [],
+            },
+        ),
+    ):
+        with pytest.raises(
+            AdminContractError, match=r"resource\.host_response_invalid"
+        ):
+            public_agent_result(result_kind, payload)
 
 
 def test_operations_get_rejects_non_public_admin_reason_codes(tmp_path) -> None:

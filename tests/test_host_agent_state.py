@@ -447,6 +447,10 @@ def test_state_rejects_duplicate_keys_and_incoherent_records(tmp_path: Path) -> 
     with pytest.raises(HostAgentStateError, match="host.state_unavailable"):
         HostAgentState.for_test(tmp_path, host_ref="worker-one")
 
+    state_file.write_text('{"schema_version":NaN}')
+    with pytest.raises(HostAgentStateError, match="host.state_unavailable"):
+        HostAgentState.for_test(tmp_path, host_ref="worker-one")
+
     state_file.write_text(
         json.dumps(
             {
