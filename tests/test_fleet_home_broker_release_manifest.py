@@ -44,7 +44,7 @@ EXPECTED_PAYLOAD = (
     (
         "python/codex_master/fleet_home_broker.py",
         "src/codex_master/fleet_home_broker.py",
-        "83b5288383e58d4fb95f21fbe15de3596030d80025813d1d48134a613b5def0b",
+        "58db3221acf9c16420c7cf7da7c4c21586536f4f5a6b112d27721e6ea056e316",
         420,
     ),
     (
@@ -74,7 +74,7 @@ EXPECTED_PAYLOAD = (
     (
         "python/codex_master/fleet_home_broker_protocol.py",
         "src/codex_master/fleet_home_broker_protocol.py",
-        "1407cf0cba84e2df35a66aa7b467fd618414b9269bd100cde8d65d11590fe165",
+        "33f06d9257bd2e6aec311fc99fbd662d46bf26310d6130be7ad673d42d709249",
         420,
     ),
     (
@@ -98,7 +98,7 @@ EXPECTED_MANIFEST_BYTES = (
     b'e9509de8c0a3813f7cb0f918648ea2393f60608ce66d29320022761f17c467a3",'
     b'"mode":420},'
     b'{"path":"python/codex_master/fleet_home_broker.py","sha256":"'
-    b'83b5288383e58d4fb95f21fbe15de3596030d80025813d1d48134a613b5def0b",'
+    b'58db3221acf9c16420c7cf7da7c4c21586536f4f5a6b112d27721e6ea056e316",'
     b'"mode":420},'
     b'{"path":"python/codex_master/fleet_home_broker_client.py","sha256":"'
     b'c75697379ff1c5a32fb5c7c9ea07a837418415a6fdf0568b0ada2ad93d905fb4",'
@@ -113,7 +113,7 @@ EXPECTED_MANIFEST_BYTES = (
     b'7989c0c92dab6cf1ea7ce3d4b8de6433756525bd5bd9f293e1041a9ccf0c5de6",'
     b'"mode":420},'
     b'{"path":"python/codex_master/fleet_home_broker_protocol.py","sha256":"'
-    b'1407cf0cba84e2df35a66aa7b467fd618414b9269bd100cde8d65d11590fe165",'
+    b'33f06d9257bd2e6aec311fc99fbd662d46bf26310d6130be7ad673d42d709249",'
     b'"mode":420},'
     b'{"path":"python/codex_master/fleet_home_broker_wal.py","sha256":"'
     b'f720caf69b6b036315dcfd86691c89be5f5ec8e6c8acd125b68f786f25213920",'

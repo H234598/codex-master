@@ -37,7 +37,9 @@ def test_unit_exposes_the_admin_cli_entrypoint() -> None:
     assert document["project"]["scripts"]["codex-master-admin"] == (
         "codex_master.admin_daemon:main"
     )
-    assert _directives("Service")["ExecStart"] == ["/usr/bin/codex-master-admin"]
+    assert _directives("Service")["ExecStart"] == [
+        "@CODEX_MASTER_BINDIR@/codex-master-admin"
+    ]
 
 
 def test_unit_passes_every_secret_only_as_a_systemd_credential() -> None:
@@ -157,7 +159,8 @@ def test_agent_api_unit_uses_private_tls_entrypoint_and_credentials() -> None:
     assert service["SupplementaryGroups"] == ["codex-master-agent-state"]
     assert service["ReadWritePaths"] == ["/var/lib/codex-master-agent"]
     assert service["ExecStart"] == [
-        "/usr/bin/codex-master-agent-api --listen-address-credential --port=9443"
+        "@CODEX_MASTER_BINDIR@/codex-master-agent-api "
+        "--listen-address-credential --port=9443"
     ]
     assert service["TimeoutStopSec"] == ["10s"]
     assert service["LoadCredential"] == [
@@ -206,7 +209,10 @@ def test_host_agent_unit_has_exact_hardening_credentials_and_write_scope() -> No
     assert service["ReadWritePaths"] == [
         "/var/lib/codex-master-host-agent",
     ]
-    assert service["ExecStart"] == ["/usr/bin/codex-master-host-agent"]
+    assert service["ExecStart"] == [
+        "@CODEX_MASTER_BINDIR@/codex-master-host-agent"
+    ]
+    assert service["PAMName"] == ["login"]
     assert service["TimeoutStopSec"] == ["10s"]
     assert set(service["LoadCredential"]) == {
         "agent-client-key:/etc/codex-master/agent-client.key",

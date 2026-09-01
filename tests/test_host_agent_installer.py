@@ -7,7 +7,7 @@ import stat
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -148,7 +148,11 @@ def prepared_installer(
     sources["agent-listen-address"] = listen_address
     units = {name: tmp_path / name for name in UNIT_NAMES}
     for name, unit in units.items():
-        unit.write_text("[Service]\nExecStart=/usr/bin/" + name + "\n", encoding="utf-8")
+        command = name.removesuffix(".service")
+        unit.write_text(
+            "[Service]\nExecStart=@CODEX_MASTER_BINDIR@/" + command + "\n",
+            encoding="utf-8",
+        )
         unit.chmod(0o644)
     sysusers = tmp_path / "codex-master-host-agent.sysusers"
     sysusers.write_text("g codex-master-agent-state -\n", encoding="utf-8")
@@ -337,6 +341,53 @@ def test_packaged_installer_finds_data_beside_its_install_prefix(
     assert module._packaged_source_directory() == data
 
 
+def test_installed_scripts_directory_follows_packaged_installer_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_installer()
+    monkeypatch.setattr(
+        module,
+        "__file__",
+        "/opt/codex-master-venv/libexec/codex-master/install-host-agent",
+    )
+
+    assert module._installed_scripts_directory() == Path("/opt/codex-master-venv/bin")
+
+
+def test_installed_scripts_directory_rejects_systemd_dollar_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_installer()
+    monkeypatch.setattr(
+        module,
+        "__file__",
+        "/opt/codex$master/libexec/codex-master/install-host-agent",
+    )
+
+    with pytest.raises(module.InstallerError):
+        module._installed_scripts_directory()
+
+
+def test_installer_renders_unit_entrypoint_from_its_install_prefix(
+    prepared_installer: tuple[ModuleType, dict[str, Path], Path, list[tuple[int, int]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, sources, destination, _fchown_calls = prepared_installer
+    monkeypatch.setattr(
+        module,
+        "__file__",
+        "/opt/codex-master-venv/libexec/codex-master/install-host-agent",
+    )
+
+    assert module.main(_arguments(sources, destination)) == 0
+
+    installed = destination / "etc/systemd/system/codex-master-host-agent.service"
+    assert installed.read_text(encoding="utf-8") == (
+        "[Service]\n"
+        "ExecStart=/opt/codex-master-venv/bin/codex-master-host-agent\n"
+    )
+
+
 @pytest.mark.parametrize("unsafe", ["symlink", "wrong-owner", "wrong-mode", "hardlink"])
 def test_installer_rejects_unsafe_credential_sources(
     prepared_installer: tuple[ModuleType, dict[str, Path], Path, list[tuple[int, int]]],
@@ -462,7 +513,8 @@ def test_enable_reloads_then_enables_and_starts_only_the_host_agent_unit(
 
     assert calls == [
         ["/usr/bin/systemctl", "daemon-reload"],
-        ["/usr/bin/systemctl", "enable", "--now", UNIT_NAME],
+        ["/usr/bin/systemctl", "enable", UNIT_NAME],
+        ["/usr/bin/systemctl", "restart", UNIT_NAME],
     ]
     assert all(SECRET.decode("ascii") not in " ".join(argv) for argv in calls)
     assert all("agent-api" not in " ".join(argv) for argv in calls)
@@ -487,7 +539,12 @@ def test_master_enable_starts_admin_and_agent_api_units(
         [
             "/usr/bin/systemctl",
             "enable",
-            "--now",
+            "codex-master-admin.service",
+            "codex-master-agent-api.service",
+        ],
+        [
+            "/usr/bin/systemctl",
+            "restart",
             "codex-master-admin.service",
             "codex-master-agent-api.service",
         ],
@@ -530,8 +587,8 @@ def test_live_role_switch_failure_restores_exact_foreign_service_state(
     events: list[object] = []
     monkeypatch.setattr(
         module,
-        "_capture_foreign_service_states",
-        lambda _role: events.append("capture") or states,
+        "_capture_service_states",
+        lambda units: events.append(("capture", units)) or states,
     )
     monkeypatch.setattr(
         module,
@@ -541,12 +598,23 @@ def test_live_role_switch_failure_restores_exact_foreign_service_state(
     monkeypatch.setattr(
         module,
         "_commit_staged",
-        lambda *_args: events.append("commit") or (_ for _ in ()).throw(OSError()),
+        lambda *_args, after_commit: events.append("commit") or after_commit(),
     )
     monkeypatch.setattr(
         module,
-        "_restore_foreign_service_states",
-        lambda value: events.append(("restore", value)),
+        "_restore_service_states",
+        lambda role, value: events.append(("restore", role, value)),
+    )
+    provisioning = object()
+    monkeypatch.setattr(
+        module,
+        "_capture_provisioning_state",
+        lambda role: events.append(("capture-provisioning", role)) or provisioning,
+    )
+    monkeypatch.setattr(
+        module,
+        "_restore_provisioning_state",
+        lambda role, value: events.append(("restore-provisioning", role, value)),
     )
 
     with pytest.raises(OSError):
@@ -556,18 +624,290 @@ def test_live_role_switch_failure_restores_exact_foreign_service_state(
             (),
             role="master",
             live=True,
-            foreign_units_present=True,
+            existing_units=("codex-master-host-agent.service",),
+            after_commit=lambda: events.append("finalize")
+            or (_ for _ in ()).throw(OSError()),
         )
 
     assert events == [
-        "capture",
+        ("capture", ("codex-master-host-agent.service",)),
+        ("capture-provisioning", "master"),
         "disable",
         "commit",
-        ("restore", states),
+        "finalize",
+        ("restore", "master", states),
+        ("restore-provisioning", "master", provisioning),
     ]
 
 
-def test_foreign_service_state_capture_and_restore_preserve_enabled_and_active(
+def test_live_role_rollback_attempts_provisioning_after_service_restore_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_installer()
+    events: list[str] = []
+    provisioning = object()
+    monkeypatch.setattr(module, "_capture_service_states", lambda _units: ())
+    monkeypatch.setattr(
+        module,
+        "_capture_provisioning_state",
+        lambda _role: provisioning,
+    )
+    monkeypatch.setattr(
+        module,
+        "_commit_staged",
+        lambda *_args, after_commit: after_commit(),
+    )
+    monkeypatch.setattr(
+        module,
+        "_restore_service_states",
+        lambda _role, _states: events.append("services")
+        or (_ for _ in ()).throw(OSError()),
+    )
+    monkeypatch.setattr(
+        module,
+        "_restore_provisioning_state",
+        lambda _role, value: events.append("provisioning")
+        if value is provisioning
+        else None,
+    )
+
+    with pytest.raises(module.InstallerError):
+        module._commit_role_files(
+            (),
+            (),
+            (),
+            role="worker",
+            live=True,
+            existing_units=(),
+            after_commit=lambda: (_ for _ in ()).throw(OSError()),
+        )
+
+    assert events == ["services", "provisioning"]
+
+
+def test_provisioning_rollback_removes_only_new_role_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_installer()
+    removed_directories: list[Path] = []
+    commands: list[list[str]] = []
+    existing_users = {"codex-master-admin", "codex-master-agent-api"}
+    existing_groups = {
+        "codex-master-admin",
+        "codex-master-agent-api",
+        "codex-master-agent-state",
+    }
+
+    def user(name: str) -> object:
+        if name not in existing_users:
+            raise KeyError(name)
+        return object()
+
+    def group(name: str) -> object:
+        if name not in existing_groups:
+            raise KeyError(name)
+        return SimpleNamespace(gr_mem=[])
+
+    monkeypatch.setattr(module.pwd, "getpwnam", user)
+    monkeypatch.setattr(module.grp, "getgrnam", group)
+    def remove_tree(path: Path) -> None:
+        removed_directories.append(Path(path))
+
+    remove_tree.avoids_symlink_attacks = True  # type: ignore[attr-defined]
+    monkeypatch.setattr(module.shutil, "rmtree", remove_tree)
+
+    def run(argv: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        commands.append(argv)
+        if argv[0] == "/usr/sbin/userdel":
+            existing_users.remove(argv[1])
+        else:
+            existing_groups.remove(argv[1])
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    state = module._ProvisioningState(
+        users=frozenset({"codex-master-admin"}),
+        groups=frozenset({"codex-master-admin", "codex-master-agent-state"}),
+        group_memberships=(
+            ("codex-master-admin", frozenset()),
+            ("codex-master-agent-state", frozenset()),
+        ),
+        directories=(),
+    )
+
+    module._restore_provisioning_state("master", state)
+
+    assert removed_directories == [
+        Path("/var/lib/codex-master-agent"),
+        Path("/var/lib/codex-master-admin"),
+    ]
+    assert commands == [
+        ["/usr/sbin/userdel", "codex-master-agent-api"],
+        ["/usr/sbin/groupdel", "codex-master-agent-api"],
+    ]
+
+
+def test_provisioning_snapshot_records_existing_principals_and_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_installer()
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    missing = tmp_path / "missing"
+    monkeypatch.setitem(
+        module.ROLE_USERS,
+        "worker",
+        ("existing-user", "missing-user"),
+    )
+    monkeypatch.setitem(
+        module.ROLE_GROUPS,
+        "worker",
+        ("existing-group", "missing-group"),
+    )
+    monkeypatch.setitem(module.ROLE_STATE_DIRECTORIES, "worker", (existing, missing))
+    monkeypatch.setattr(
+        module.pwd,
+        "getpwnam",
+        lambda name: object()
+        if name == "existing-user"
+        else (_ for _ in ()).throw(KeyError(name)),
+    )
+    monkeypatch.setattr(
+        module.grp,
+        "getgrnam",
+        lambda name: SimpleNamespace(gr_mem=["member"])
+        if name == "existing-group"
+        else (_ for _ in ()).throw(KeyError(name)),
+    )
+
+    existing_stat = existing.lstat()
+
+    assert module._capture_provisioning_state("worker") == module._ProvisioningState(
+        users=frozenset({"existing-user"}),
+        groups=frozenset({"existing-group"}),
+        group_memberships=(("existing-group", frozenset({"member"})),),
+        directories=(
+            module._DirectoryState(
+                existing,
+                existing_stat.st_dev,
+                existing_stat.st_ino,
+                existing_stat.st_uid,
+                existing_stat.st_gid,
+                stat.S_IMODE(existing_stat.st_mode),
+            ),
+        ),
+    )
+
+
+def test_provisioning_rollback_restores_directory_metadata_and_group_membership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_installer()
+    path = Path("/var/lib/codex-master-agent")
+    directory = module._DirectoryState(path, 11, 22, 33, 44, 0o2750)
+    calls: list[object] = []
+    monkeypatch.setitem(module.ROLE_USERS, "master", ())
+    monkeypatch.setitem(module.ROLE_GROUPS, "master", ("state-group",))
+    monkeypatch.setitem(module.ROLE_STATE_DIRECTORIES, "master", (path,))
+    monkeypatch.setattr(module.os, "open", lambda *args, **kwargs: 91)
+    monkeypatch.setattr(
+        module.os,
+        "fstat",
+        lambda _descriptor: SimpleNamespace(st_dev=11, st_ino=22),
+    )
+    monkeypatch.setattr(
+        module.os,
+        "fchown",
+        lambda descriptor, uid, gid: calls.append(("chown", descriptor, uid, gid)),
+    )
+    monkeypatch.setattr(
+        module.os,
+        "fchmod",
+        lambda descriptor, mode: calls.append(("chmod", descriptor, mode)),
+    )
+    monkeypatch.setattr(module.os, "fsync", lambda descriptor: calls.append(("fsync", descriptor)))
+    monkeypatch.setattr(module.os, "close", lambda descriptor: calls.append(("close", descriptor)))
+    memberships = {"state-group": ["kept", "added"]}
+    monkeypatch.setattr(
+        module.grp,
+        "getgrnam",
+        lambda name: SimpleNamespace(gr_mem=memberships[name]),
+    )
+
+    def run(argv: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    state = module._ProvisioningState(
+        users=frozenset(),
+        groups=frozenset({"state-group"}),
+        group_memberships=(("state-group", frozenset({"kept", "removed"})),),
+        directories=(directory,),
+    )
+
+    module._restore_provisioning_state("master", state)
+
+    assert calls == [
+        ("chown", 91, 33, 44),
+        ("chmod", 91, 0o2750),
+        ("fsync", 91),
+        ("close", 91),
+        ["/usr/sbin/gpasswd", "--delete", "added", "state-group"],
+        ["/usr/sbin/gpasswd", "--add", "removed", "state-group"],
+    ]
+
+
+def test_post_commit_failure_restores_previous_complete_file_generation(
+    prepared_installer: tuple[ModuleType, dict[str, Path], Path, list[tuple[int, int]]],
+) -> None:
+    module, sources, destination, _fchown_calls = prepared_installer
+    assert module.main(_role_arguments("master", sources, destination)) == 0
+    original = {
+        path.relative_to(destination): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        for path in destination.rglob("*")
+        if path.is_file()
+    }
+    arguments = module._parse_arguments(_role_arguments("worker", sources, destination))
+    source_records = module._sources(arguments)
+    directories: dict[str, int] = {}
+    try:
+        directories = module._destination_directories(
+            arguments.destdir,
+            frozenset(source.directory for source in source_records),
+            arguments.role,
+        )
+        removals = [
+            removal
+            for removal in module._foreign_removals(arguments.role, directories)
+            if module._assert_existing_destination(
+                removal.parent, removal.name, removal.mode
+            )
+        ]
+        staged = [
+            module._stage(source, directories[source.directory])
+            for source in source_records
+        ]
+        with pytest.raises(OSError):
+            module._commit_staged(
+                staged,
+                [source.mode for source in source_records],
+                removals,
+                after_commit=lambda: (_ for _ in ()).throw(OSError()),
+            )
+    finally:
+        module._close_directories(directories)
+        for source in source_records:
+            os.close(source.descriptor)
+
+    assert {
+        path.relative_to(destination): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        for path in destination.rglob("*")
+        if path.is_file()
+    } == original
+
+
+def test_service_state_restore_removes_new_role_and_preserves_previous_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_installer()
@@ -583,15 +923,35 @@ def test_foreign_service_state_capture_and_restore_preserve_enabled_and_active(
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
 
-    states = module._capture_foreign_service_states("worker")
-    module._restore_foreign_service_states(states)
+    states = module._capture_service_states(
+        ("codex-master-admin.service", "codex-master-agent-api.service")
+    )
+    module._restore_service_states("worker", states)
 
     assert states == (
         module._ServiceState("codex-master-admin.service", True, False),
         module._ServiceState("codex-master-agent-api.service", False, True),
     )
-    assert calls[-5:] == [
+    assert calls[-8:] == [
         ["/usr/bin/systemctl", "daemon-reload"],
+        [
+            "/usr/bin/systemctl",
+            "disable",
+            "--now",
+            "codex-master-host-agent.service",
+        ],
+        [
+            "/usr/bin/systemctl",
+            "is-enabled",
+            "--quiet",
+            "codex-master-host-agent.service",
+        ],
+        [
+            "/usr/bin/systemctl",
+            "is-active",
+            "--quiet",
+            "codex-master-host-agent.service",
+        ],
         ["/usr/bin/systemctl", "enable", "codex-master-admin.service"],
         ["/usr/bin/systemctl", "stop", "codex-master-admin.service"],
         ["/usr/bin/systemctl", "disable", "codex-master-agent-api.service"],
@@ -625,6 +985,30 @@ def test_static_layout_provisioner_is_scoped_to_its_destination_root(
             "--create",
             f"{tmp_path}/usr/lib/tmpfiles.d/codex-master-host-agent.conf",
         ],
+    ]
+
+
+def test_live_role_finalize_provisions_layout_before_optional_enable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_installer()
+    events: list[object] = []
+    monkeypatch.setattr(
+        module,
+        "_provision_static_layout",
+        lambda destination, role: events.append(("provision", destination, role)),
+    )
+    monkeypatch.setattr(
+        module,
+        "_enable_service",
+        lambda role: events.append(("enable", role)),
+    )
+
+    module._finalize_live_role("worker", True)
+
+    assert events == [
+        ("provision", Path("/"), "worker"),
+        ("enable", "worker"),
     ]
 
 

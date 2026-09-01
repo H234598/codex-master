@@ -18,7 +18,7 @@ LoadCredential=agent-server-key:/etc/codex-master/agent-server.key
 LoadCredential=agent-server-cert:/etc/codex-master/agent-server.crt
 LoadCredential=agent-client-ca:/etc/codex-master/agent-client-ca.crt
 LoadCredential=agent-listen-address:/etc/codex-master/agent-listen-address
-ExecStart=/usr/bin/codex-master-agent-api --listen-address-credential --port=9443
+ExecStart=@CODEX_MASTER_BINDIR@/codex-master-agent-api --listen-address-credential --port=9443
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=10s

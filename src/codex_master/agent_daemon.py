@@ -60,6 +60,7 @@ TLS_HANDSHAKE_TIMEOUT_SECONDS = 2.0
 HTTP_HEADER_TIMEOUT_SECONDS = 2.0
 HTTP_BODY_TIMEOUT_SECONDS = 2.0
 AGENT_DRAIN_TIMEOUT_SECONDS = 5.0
+MAX_CONCURRENT_AGENT_CONNECTIONS = 64
 _active_server: object | None = None
 
 
@@ -348,6 +349,10 @@ class AgentApiServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.ssl_context = ssl_context
         self._request_condition = threading.Condition()
         self._request_sockets: set[socket.socket] = set()
+        self._slotted_sockets: set[socket.socket] = set()
+        self._request_slots = threading.BoundedSemaphore(
+            MAX_CONCURRENT_AGENT_CONNECTIONS
+        )
         self._shutdown_worker: threading.Thread | None = None
         super().__init__(server_address, _AgentRequestHandler)
 
@@ -367,10 +372,39 @@ class AgentApiServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             self._request_sockets.add(wrapped)
         return wrapped, address
 
+    def process_request(self, request: socket.socket, client_address: object) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                self.shutdown_request(request)
+            finally:
+                self.release_request_socket(request)
+            return
+        with self._request_condition:
+            self._slotted_sockets.add(request)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.release_request_socket(request)
+            raise
+
+    def process_request_thread(
+        self, request: socket.socket, client_address: object
+    ) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.release_request_socket(request)
+
     def release_request_socket(self, request: socket.socket) -> None:
+        release_slot = False
         with self._request_condition:
             self._request_sockets.discard(request)
+            if request in self._slotted_sockets:
+                self._slotted_sockets.remove(request)
+                release_slot = True
             self._request_condition.notify_all()
+        if release_slot:
+            self._request_slots.release()
 
     def stop_accepting(self) -> None:
         with self._request_condition:

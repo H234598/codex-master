@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import grp
 import os
 from pathlib import Path
+import pwd
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
 import sysconfig
-from typing import NamedTuple, Sequence
+from typing import Callable, NamedTuple, Sequence
 
 
 ROOT_UID = 0
@@ -29,6 +32,28 @@ ROLE_UNITS = {
 ROLE_LAYOUT_NAMES = {
     MASTER_ROLE: "codex-master-agent-api.conf",
     WORKER_ROLE: "codex-master-host-agent.conf",
+}
+ROLE_USERS = {
+    MASTER_ROLE: ("codex-master-admin", "codex-master-agent-api"),
+    WORKER_ROLE: ("codex-master-host-agent",),
+}
+ROLE_GROUPS = {
+    MASTER_ROLE: (
+        "codex-master-admin",
+        "codex-master-agent-api",
+        "codex-master-agent-state",
+    ),
+    WORKER_ROLE: ("codex-master-host-agent",),
+}
+ROLE_STATE_DIRECTORIES = {
+    MASTER_ROLE: (
+        Path("/var/lib/codex-master-admin"),
+        Path("/var/lib/codex-master-agent"),
+    ),
+    WORKER_ROLE: (
+        Path("/var/lib/codex-master-host-agent"),
+        Path("/var/lib/codex-master-host-agent/ollama"),
+    ),
 }
 _ROLE_CREDENTIALS = {
     MASTER_ROLE: (
@@ -58,6 +83,8 @@ _ROLE_CREDENTIALS = {
 }
 _OPEN_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _OPEN_FILE = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+_UNIT_BINDIR_TOKEN = b"@CODEX_MASTER_BINDIR@"
+_MAX_UNIT_BYTES = 64 * 1024
 
 
 class InstallerError(Exception):
@@ -94,6 +121,22 @@ class _ServiceState(NamedTuple):
     active: bool
 
 
+class _DirectoryState(NamedTuple):
+    path: Path
+    device: int
+    inode: int
+    uid: int
+    gid: int
+    mode: int
+
+
+class _ProvisioningState(NamedTuple):
+    users: frozenset[str]
+    groups: frozenset[str]
+    group_memberships: tuple[tuple[str, frozenset[str]], ...]
+    directories: tuple[_DirectoryState, ...]
+
+
 def _packaged_source_directory() -> Path:
     executable = Path(__file__).resolve()
     candidates = [Path(sysconfig.get_path("data")) / "lib" / "codex-master"]
@@ -104,6 +147,26 @@ def _packaged_source_directory() -> Path:
         if (candidate / "systemd").is_dir():
             return candidate
     return candidates[0]
+
+
+def _installed_scripts_directory() -> Path:
+    executable = Path(__file__).resolve()
+    if (
+        len(executable.parents) >= 3
+        and executable.parent.name == "codex-master"
+        and executable.parent.parent.name == "libexec"
+    ):
+        directory = executable.parents[2] / "bin"
+    else:
+        directory = Path(sysconfig.get_path("scripts"))
+    value = os.fspath(directory)
+    if (
+        not directory.is_absolute()
+        or not value.isascii()
+        or any(character.isspace() or character in "\\\"'%$" for character in value)
+    ):
+        raise InstallerError
+    return directory
 
 
 _SOURCE_DIRECTORY = _packaged_source_directory()
@@ -212,6 +275,34 @@ def _open_trusted_source(path: Path, mode: int) -> int:
         raise
     finally:
         os.close(parent)
+
+
+def _open_rendered_unit_source(path: Path) -> int:
+    source = _open_trusted_source(path, 0o644)
+    rendered_descriptor = -1
+    try:
+        raw = os.read(source, _MAX_UNIT_BYTES + 1)
+        if len(raw) > _MAX_UNIT_BYTES or raw.count(_UNIT_BINDIR_TOKEN) != 1:
+            raise InstallerError
+        bindir = os.fspath(_installed_scripts_directory()).encode("ascii")
+        rendered = raw.replace(_UNIT_BINDIR_TOKEN, bindir)
+        rendered_descriptor = os.memfd_create(
+            "codex-master-systemd-unit", getattr(os, "MFD_CLOEXEC", 0)
+        )
+        remaining = memoryview(rendered)
+        while remaining:
+            written = os.write(rendered_descriptor, remaining)
+            if written <= 0:
+                raise OSError
+            remaining = remaining[written:]
+        os.lseek(rendered_descriptor, 0, os.SEEK_SET)
+        return rendered_descriptor
+    except BaseException:
+        if rendered_descriptor >= 0:
+            os.close(rendered_descriptor)
+        raise
+    finally:
+        os.close(source)
 
 
 def _open_or_create_directory(parent: int, name: str, mode: int) -> int:
@@ -346,7 +437,11 @@ def _assert_existing_destination(parent: int, name: str, mode: int) -> bool:
 
 
 def _commit_staged(
-    staged: Sequence[_Staged], modes: Sequence[int], removals: Sequence[_Removal] = ()
+    staged: Sequence[_Staged],
+    modes: Sequence[int],
+    removals: Sequence[_Removal] = (),
+    *,
+    after_commit: Callable[[], None] | None = None,
 ) -> None:
     token = secrets.token_hex(16)
     committed: list[tuple[_Staged, str | None]] = []
@@ -371,6 +466,8 @@ def _commit_staged(
             committed.append((item, backup))
             os.replace(item.stage, item.name, src_dir_fd=item.parent, dst_dir_fd=item.parent)
             os.fsync(item.parent)
+        if after_commit is not None:
+            after_commit()
         successful = True
     except BaseException:
         for item, backup in reversed(committed):
@@ -459,7 +556,7 @@ def _sources(arguments: argparse.Namespace) -> list[_Source]:
         for name in ROLE_UNITS[arguments.role]:
             result.append(
                 _Source(
-                    _open_trusted_source(UNIT_SOURCES[name], 0o644),
+                    _open_rendered_unit_source(UNIT_SOURCES[name]),
                     name,
                     0o644,
                     "units",
@@ -536,7 +633,13 @@ def _enable_service(role: str) -> None:
         stderr=subprocess.DEVNULL,
     )
     subprocess.run(
-        ["/usr/bin/systemctl", "enable", "--now", *ROLE_UNITS[role]],
+        ["/usr/bin/systemctl", "enable", *ROLE_UNITS[role]],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["/usr/bin/systemctl", "restart", *ROLE_UNITS[role]],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -559,10 +662,11 @@ def _disable_foreign_services(role: str) -> None:
     )
 
 
-def _capture_foreign_service_states(role: str) -> tuple[_ServiceState, ...]:
-    foreign_role = WORKER_ROLE if role == MASTER_ROLE else MASTER_ROLE
+def _capture_service_states(units: Sequence[str]) -> tuple[_ServiceState, ...]:
+    if len(set(units)) != len(units) or not set(units).issubset(UNIT_NAMES):
+        raise InstallerError
     states: list[_ServiceState] = []
-    for unit in ROLE_UNITS[foreign_role]:
+    for unit in units:
         enabled = subprocess.run(
             ["/usr/bin/systemctl", "is-enabled", "--quiet", unit],
             check=False,
@@ -581,13 +685,34 @@ def _capture_foreign_service_states(role: str) -> tuple[_ServiceState, ...]:
     return tuple(states)
 
 
-def _restore_foreign_service_states(states: Sequence[_ServiceState]) -> None:
+def _restore_service_states(role: str, states: Sequence[_ServiceState]) -> None:
     subprocess.run(
         ["/usr/bin/systemctl", "daemon-reload"],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    subprocess.run(
+        ["/usr/bin/systemctl", "disable", "--now", *ROLE_UNITS[role]],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for unit in ROLE_UNITS[role]:
+        enabled = subprocess.run(
+            ["/usr/bin/systemctl", "is-enabled", "--quiet", unit],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        active = subprocess.run(
+            ["/usr/bin/systemctl", "is-active", "--quiet", unit],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        if enabled == 0 or active == 0:
+            raise InstallerError
     for state in states:
         subprocess.run(
             [
@@ -611,6 +736,139 @@ def _restore_foreign_service_states(states: Sequence[_ServiceState]) -> None:
         )
 
 
+def _finalize_live_role(role: str, enable: bool) -> None:
+    _provision_static_layout(Path("/"), role)
+    if enable:
+        _enable_service(role)
+
+
+def _capture_provisioning_state(role: str) -> _ProvisioningState:
+    users = frozenset(name for name in ROLE_USERS[role] if _user_exists(name))
+    groups: list[str] = []
+    memberships: list[tuple[str, frozenset[str]]] = []
+    for name in ROLE_GROUPS[role]:
+        try:
+            record = grp.getgrnam(name)
+        except KeyError:
+            continue
+        groups.append(name)
+        memberships.append((name, frozenset(record.gr_mem)))
+    directories: list[_DirectoryState] = []
+    for path in ROLE_STATE_DIRECTORIES[role]:
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(current.st_mode):
+            raise InstallerError
+        directories.append(
+            _DirectoryState(
+                path,
+                current.st_dev,
+                current.st_ino,
+                current.st_uid,
+                current.st_gid,
+                stat.S_IMODE(current.st_mode),
+            )
+        )
+    return _ProvisioningState(
+        users,
+        frozenset(groups),
+        tuple(memberships),
+        tuple(directories),
+    )
+
+
+def _user_exists(name: str) -> bool:
+    try:
+        pwd.getpwnam(name)
+    except KeyError:
+        return False
+    return True
+
+
+def _group_exists(name: str) -> bool:
+    try:
+        grp.getgrnam(name)
+    except KeyError:
+        return False
+    return True
+
+
+def _restore_directory_state(state: _DirectoryState) -> None:
+    descriptor = os.open(state.path, _OPEN_DIRECTORY)
+    try:
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) != (state.device, state.inode):
+            raise InstallerError
+        os.fchown(descriptor, state.uid, state.gid)
+        os.fchmod(descriptor, state.mode)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _restore_provisioning_state(role: str, state: _ProvisioningState) -> None:
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise InstallerError
+    directory_states = {item.path: item for item in state.directories}
+    for path in sorted(
+        set(ROLE_STATE_DIRECTORIES[role]).difference(directory_states),
+        key=lambda item: (len(item.parts), os.fspath(item)),
+        reverse=True,
+    ):
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
+    for path in ROLE_STATE_DIRECTORIES[role]:
+        if path in directory_states:
+            _restore_directory_state(directory_states[path])
+    for name in ROLE_USERS[role]:
+        if name in state.users:
+            continue
+        if _user_exists(name):
+            subprocess.run(
+                ["/usr/sbin/userdel", name],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    for name in ROLE_GROUPS[role]:
+        if name in state.groups:
+            continue
+        if _group_exists(name):
+            subprocess.run(
+                ["/usr/sbin/groupdel", name],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    memberships = dict(state.group_memberships)
+    for name in ROLE_GROUPS[role]:
+        if name not in memberships:
+            continue
+        try:
+            current = frozenset(grp.getgrnam(name).gr_mem)
+        except KeyError as exc:
+            raise InstallerError from exc
+        expected = memberships[name]
+        for member in sorted(current.difference(expected)):
+            subprocess.run(
+                ["/usr/sbin/gpasswd", "--delete", member, name],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        for member in sorted(expected.difference(current)):
+            subprocess.run(
+                ["/usr/sbin/gpasswd", "--add", member, name],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+
 def _commit_role_files(
     staged: Sequence[_Staged],
     modes: Sequence[int],
@@ -618,20 +876,36 @@ def _commit_role_files(
     *,
     role: str,
     live: bool,
-    foreign_units_present: bool,
+    existing_units: Sequence[str],
+    after_commit: Callable[[], None] | None,
 ) -> None:
-    states = (
-        _capture_foreign_service_states(role)
-        if live and foreign_units_present
-        else ()
-    )
+    states = _capture_service_states(existing_units) if live else ()
+    provisioning = _capture_provisioning_state(role) if live else None
+    foreign_role = WORKER_ROLE if role == MASTER_ROLE else MASTER_ROLE
     try:
-        if states:
+        if live and set(existing_units).intersection(ROLE_UNITS[foreign_role]):
             _disable_foreign_services(role)
-        _commit_staged(staged, modes, removals)
+        _commit_staged(
+            staged,
+            modes,
+            removals,
+            after_commit=after_commit,
+        )
     except BaseException:
-        if states:
-            _restore_foreign_service_states(states)
+        if live:
+            assert provisioning is not None
+            rollback_failure: BaseException | None = None
+            try:
+                _restore_service_states(role, states)
+            except BaseException as exc:
+                rollback_failure = exc
+            try:
+                _restore_provisioning_state(role, provisioning)
+            except BaseException as exc:
+                if rollback_failure is None:
+                    rollback_failure = exc
+            if rollback_failure is not None:
+                raise InstallerError from rollback_failure
         raise
 
 
@@ -658,6 +932,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 removal.parent, removal.name, removal.mode
             )
         ]
+        existing_units = tuple(
+            name
+            for name in UNIT_NAMES
+            if _assert_existing_destination(directories["units"], name, 0o644)
+        )
         staged: list[_Staged] = []
         try:
             for source in sources:
@@ -668,17 +947,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 existing_removals,
                 role=arguments.role,
                 live=arguments.destdir == Path("/"),
-                foreign_units_present=any(
-                    removal.name in UNIT_NAMES for removal in existing_removals
-                ),
+                existing_units=existing_units,
+                after_commit=(
+                    lambda: _finalize_live_role(arguments.role, arguments.enable)
+                )
+                if arguments.destdir == Path("/")
+                else None,
             )
         except BaseException:
             _discard_staged(staged)
             raise
-        if arguments.destdir == Path("/"):
-            _provision_static_layout(arguments.destdir, arguments.role)
-        if arguments.enable:
-            _enable_service(arguments.role)
         return 0
     except (InstallerError, OSError, subprocess.SubprocessError, SystemExit):
         print("install-host-agent: installation failed", file=sys.stderr)

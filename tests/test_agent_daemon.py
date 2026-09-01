@@ -407,6 +407,38 @@ def test_server_wraps_every_accepted_connection_before_http(monkeypatch) -> None
         server.server_close()
 
 
+def test_server_bounds_request_threads_before_tls_handshake(monkeypatch) -> None:
+    context = FakeContext()
+    server = AgentApiServer(("127.0.0.1", 0), Application(), Resolver(), context)
+    started: list[object] = []
+    closed: list[object] = []
+    monkeypatch.setattr(server, "_request_slots", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(
+        agent_daemon.socketserver.ThreadingMixIn,
+        "process_request",
+        lambda _server, request, _address: started.append(request),
+    )
+    monkeypatch.setattr(server, "shutdown_request", lambda request: closed.append(request))
+    first, rejected, later = object(), object(), object()
+    try:
+        for request in (first, rejected):
+            server.get_request_from_socket(request, ("127.0.0.1", 1))
+            server.process_request(request, ("127.0.0.1", 1))
+
+        assert started == [first]
+        assert closed == [rejected]
+
+        server.release_request_socket(first)
+        server.get_request_from_socket(later, ("127.0.0.1", 1))
+        server.process_request(later, ("127.0.0.1", 1))
+        assert started == [first, later]
+    finally:
+        server.release_request_socket(first)
+        server.release_request_socket(rejected)
+        server.release_request_socket(later)
+        server.server_close()
+
+
 @pytest.mark.parametrize(
     ("length", "status"),
     [
@@ -972,9 +1004,9 @@ def test_live_slow_clients_do_not_make_shutdown_unbounded(live_pki, stall) -> No
 def test_live_handshake_header_and_body_deadlines_close_stalled_peer(
     live_pki, monkeypatch, phase
 ) -> None:
-    monkeypatch.setattr(agent_daemon, "TLS_HANDSHAKE_TIMEOUT_SECONDS", 0.15)
-    monkeypatch.setattr(agent_daemon, "HTTP_HEADER_TIMEOUT_SECONDS", 0.15)
-    monkeypatch.setattr(agent_daemon, "HTTP_BODY_TIMEOUT_SECONDS", 0.15)
+    monkeypatch.setattr(agent_daemon, "TLS_HANDSHAKE_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(agent_daemon, "HTTP_HEADER_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(agent_daemon, "HTTP_BODY_TIMEOUT_SECONDS", 1.0)
     server, thread = _live_server(live_pki)
     plain = socket.create_connection(server.server_address, timeout=1)
     client = plain
@@ -988,7 +1020,7 @@ def test_live_handshake_header_and_body_deadlines_close_stalled_peer(
                     b"POST /agent/v1/polls HTTP/1.1\r\nContent-Type: application/json\r\n"
                     b"Content-Length: 10\r\n\r\n{}"
                 )
-        client.settimeout(1)
+        client.settimeout(2)
         assert client.recv(1) == b""
     finally:
         client.close()

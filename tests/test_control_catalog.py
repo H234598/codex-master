@@ -21,6 +21,7 @@ from codex_master.server import TOOLS
 
 
 EXPECTED_RISKS = {
+    "runtime_status": Risk.READ_ONLY,
     "agent_spawn_offers": Risk.READ_ONLY,
     "agent_start": Risk.BROAD,
     "agent_status": Risk.READ_ONLY,
@@ -65,6 +66,7 @@ EXPECTED_RISKS = {
     "agent_pool_install": Risk.BROAD,
     "agent_pool_status": Risk.READ_ONLY,
     "agent_pool_copy_auth": Risk.BROAD,
+    "master_fleet_home_v2_cutover": Risk.BROAD,
     "agent_pool_destroy_pool": Risk.DESTRUCTIVE,
     "agent_doctor": Risk.READ_ONLY,
     "fleet_account_list": Risk.READ_ONLY,

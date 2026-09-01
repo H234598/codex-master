@@ -72,6 +72,7 @@ class ToolDescriptor:
 
 
 _READ_ONLY_TOOLS = {
+    "runtime_status",
     "agent_spawn_offers",
     "agent_status",
     "agent_lease_status",
@@ -173,6 +174,7 @@ _BROAD_TOOLS = {
     "usage_watchdog",
     "agent_pool_install",
     "agent_pool_copy_auth",
+    "master_fleet_home_v2_cutover",
 }
 _DESTRUCTIVE_TOOLS = {"agent_pool_destroy_pool"}
 

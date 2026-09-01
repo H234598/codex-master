@@ -24,7 +24,7 @@ jobs:
 
       - name: Install test dependencies
         run: >-
-          python -m pip install --disable-pip-version-check pytest ruff==0.16.3 jsonschema
+          python -m pip install --disable-pip-version-check pytest ruff==0.16.3 jsonschema "PyJWT[crypto]>=2.9,<3"
           tree-sitter==0.26.0 tree-sitter-javascript==0.25.0 tree-sitter-typescript==0.23.2
 
       - name: Install manpage renderer

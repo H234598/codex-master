@@ -32,6 +32,14 @@ def test_ruff_gate_is_pinned_and_non_mutating() -> None:
     assert not re.search(r"^\s*run:\s*ruff\s+check\b.*\s--fix(?:\s|$)", workflow, re.MULTILINE)
 
 
+def test_ci_installs_agent_api_crypto_dependencies_before_collection() -> None:
+    workflow = workflow_text()
+
+    dependency_step = workflow.split("      - name: Install test dependencies\n", 1)[1]
+    dependency_step = dependency_step.split("\n      - name:", 1)[0]
+    assert "PyJWT[crypto]>=2.9,<3" in dependency_step
+
+
 def test_manpage_gate_builds_and_renders_repository_source() -> None:
     workflow = workflow_text()
 
