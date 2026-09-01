@@ -164,3 +164,61 @@ def test_builder_excludes_protocol_declarations_and_indexes_async_class_tests(tm
 
     assert [item.function_id for item in index.functions] == [function_id]
     assert [item.test_id for item in index.tests] == sorted((test_id, module_test_id))
+
+
+def test_builder_indexes_explicit_executable_python_entrypoint(tmp_path: Path) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "tests").mkdir()
+    entrypoint = tmp_path / "scripts/install-tool"
+    entrypoint.write_text(
+        "#!/usr/bin/env python3\n\ndef main() -> int:\n    return 0\n",
+        encoding="utf-8",
+    )
+    entrypoint.chmod(0o755)
+    (tmp_path / "tests/test_install_tool.py").write_text(
+        "def test_main():\n    assert 0 == 0\n",
+        encoding="utf-8",
+    )
+    function_id = "python:scripts/install-tool:main"
+    test_id = "pytest:tests/test_install_tool.py:test_main"
+
+    index = PythonTestIndexBuilder(tmp_path).build(
+        repository_id="example",
+        generation=1,
+        source_paths=("scripts/install-tool",),
+        test_paths=("tests/test_install_tool.py",),
+        bindings={function_id: (test_id,)},
+    )
+
+    assert [item.function_id for item in index.functions] == [function_id]
+
+
+@pytest.mark.parametrize(
+    ("header", "mode"),
+    (("return 0\n", 0o755), ("#!/usr/bin/env python3\n", 0o644)),
+)
+def test_builder_rejects_untrusted_extensionless_python_source(
+    tmp_path: Path, header: str, mode: int
+) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "tests").mkdir()
+    entrypoint = tmp_path / "scripts/install-tool"
+    entrypoint.write_text(f"{header}def main():\n    return 0\n", encoding="utf-8")
+    entrypoint.chmod(mode)
+    (tmp_path / "tests/test_install_tool.py").write_text(
+        "def test_main():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(IndexError, match="test.index_invalid"):
+        PythonTestIndexBuilder(tmp_path).build(
+            repository_id="example",
+            generation=1,
+            source_paths=("scripts/install-tool",),
+            test_paths=("tests/test_install_tool.py",),
+            bindings={
+                "python:scripts/install-tool:main": (
+                    "pytest:tests/test_install_tool.py:test_main",
+                )
+            },
+        )

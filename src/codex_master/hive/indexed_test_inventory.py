@@ -11,7 +11,10 @@ from pathlib import Path, PurePosixPath
 from codex_master.hive.indexed_tests import TestIndexError, TestIndexV1
 
 
-_DEPENDENCY_POLICY = b"python-ast-v1:names,attributes,imports,module-bindings,static-calls"
+_DEPENDENCY_POLICY = b"python-ast-v2:names,attributes,imports,module-bindings,static-calls,python-entrypoints"
+_PYTHON_ENTRYPOINT_HEADERS = frozenset(
+    {"#!/usr/bin/env python3", "#!/usr/bin/python3"}
+)
 _COOLDOWN_RANK = {
     "deterministic": 0,
     "integration": 1,
@@ -245,7 +248,7 @@ class PythonTestIndexBuilder:
                 "schema_version": 1,
                 "generation": generation,
                 "repository_id": repository_id,
-                "indexer_version": "python-ast-v1",
+                "indexer_version": "python-ast-v2",
                 "source_root_digest": _digest(source_rows),
                 "test_root_digest": _digest(test_rows),
                 "dependency_policy_digest": _digest(_DEPENDENCY_POLICY),
@@ -301,9 +304,15 @@ class PythonTestIndexBuilder:
         try:
             resolved = target.resolve(strict=True)
             resolved.relative_to(self._root)
-            if not resolved.is_file() or resolved.suffix != ".py":
+            if not resolved.is_file():
                 raise TestIndexError("test.index_invalid")
-            return ast.parse(resolved.read_text(encoding="utf-8"), filename=relative_path)
+            source = resolved.read_text(encoding="utf-8")
+            if resolved.suffix != ".py" and (
+                not resolved.stat().st_mode & 0o111
+                or source.partition("\n")[0] not in _PYTHON_ENTRYPOINT_HEADERS
+            ):
+                raise TestIndexError("test.index_invalid")
+            return ast.parse(source, filename=relative_path)
         except (OSError, UnicodeError, SyntaxError, ValueError):
             raise TestIndexError("test.index_invalid") from None
 
