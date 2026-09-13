@@ -278,6 +278,21 @@ def test_history_prunes_retention_and_aggregate_never_fabricates_incomplete_rati
     assert aggregate.coverage == "partial"
 
 
+def test_history_does_not_persist_directly_appended_expired_record(tmp_path) -> None:
+    history_path = tmp_path / "cache-history.json"
+    history = CacheTelemetryHistoryV1(history_path, retention=timedelta(minutes=10))
+    expired = normalize_openai_responses(
+        {"usage": {"input_tokens": 20}},
+        context(request_id="expired", observed_at=NOW - timedelta(minutes=11)),
+    )
+
+    receipt = history.append(expired, now=NOW)
+
+    assert receipt.appended is False
+    assert receipt.retained_record_count == 0
+    assert not history_path.exists()
+
+
 def test_history_reports_nonretained_capacity_candidate_as_not_appended(tmp_path) -> None:
     history = CacheTelemetryHistoryV1(tmp_path / "cache-history.json", max_records=1)
     newest = normalize_openai_responses({"usage": {"input_tokens": 1}}, context(request_id="newest"))

@@ -384,7 +384,7 @@ class CacheTelemetryHistoryV1:
             duplicate = duplicate_record is not None
             if duplicate_record is not None and duplicate_record.to_dict() != record.to_dict():
                 raise CacheTelemetryHistoryError("idempotency_conflict")
-            if not duplicate:
+            if not duplicate and _record_time(record) >= cutoff:
                 records.append(record)
             records = _sorted(records)[-self._max_records:]
             retained = not duplicate and any(item.event_key == record.event_key for item in records)
