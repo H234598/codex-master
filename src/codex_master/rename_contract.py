@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tomllib
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
 
 _CONTRACT_SHA256 = "8bd4894672b3db2a494c4b23ec84cbc48eebcd11fe27ac3dd771f602964c396f"
