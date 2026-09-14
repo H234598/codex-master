@@ -538,7 +538,9 @@ def test_06537_rebound_unsorted_account_list_is_invalid(
         paths, canonical_payload, [authority["authorities"][0], beta_authority]
     )
 
-    assert _producer_canonical_payload(canonical_payload) != canonical(canonical_payload)
+    assert canonical(_producer_canonical_payload(canonical_payload)) != canonical(
+        canonical_payload
+    )
     assert read_golden(state_home).status == "invalid"
 
 
@@ -553,7 +555,7 @@ def test_06537_rebound_unsorted_limits_and_tracker_evidence_are_invalid(
     authority = json.loads(paths["authority"].read_text(encoding="utf-8"))
     _rebind_payload_and_authority(paths, payload, authority["authorities"])
 
-    assert _producer_canonical_payload(payload) != canonical(payload)
+    assert canonical(_producer_canonical_payload(payload)) != canonical(payload)
     assert read_golden(state_home).status == "invalid"
 
 
@@ -566,7 +568,7 @@ def test_06537_rebound_integer_percent_instead_of_serializer_float_is_invalid(
     authority = json.loads(paths["authority"].read_text(encoding="utf-8"))
     _rebind_payload_and_authority(paths, payload, authority["authorities"])
 
-    assert _producer_canonical_payload(payload) != canonical(payload)
+    assert canonical(_producer_canonical_payload(payload)) != canonical(payload)
     assert read_golden(state_home).status == "invalid"
 
 
