@@ -12,6 +12,8 @@ from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
 
+from codex_master.dynamic_pool import AccountPoolBindingV1
+
 
 MICRO = 1_000_000
 HALF_LIFE_SECONDS = 7 * 24 * 60 * 60
@@ -472,6 +474,13 @@ class SelectionResult:
     model_id: str
     band: SelectionBand
     fairness_micro: int
+    account_pool_binding: AccountPoolBindingV1 | None = None
+
+    def __post_init__(self) -> None:
+        if self.account_pool_binding is not None and not isinstance(
+            self.account_pool_binding, AccountPoolBindingV1
+        ):
+            raise SelectionError("invalid_dynamic_pool_binding")
 
 
 @dataclass(frozen=True, slots=True)

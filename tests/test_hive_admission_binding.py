@@ -6,13 +6,22 @@ import subprocess
 import pytest
 
 from codex_master.admission import AdmissionPriority, AdmissionState, LeaseBinding
+from codex_master.dynamic_pool import (
+    DynamicPoolInventoryEntryV1,
+    DynamicPoolInventoryV1,
+)
 from codex_master.hive.admission import HiveAdmissionError, create_assignment_admission
 from codex_master.hive.authority import AuthorityContext, AuthorityEngine
-from codex_master.hive.dispatch import AssignmentIntent, WorkPackage, plan_queen_assignment
+from codex_master.hive.dispatch import (
+    AssignmentIntent,
+    WorkPackage,
+    plan_queen_assignment_from_selection,
+)
 from codex_master.hive.principals import Principal, PrincipalRegistry
 from codex_master.hive.repositories import RepositoryBinding, RepositoryRegistry
 from codex_master.hive.state import HiveStateStore
 from codex_master.hive.types import DispatchPriority, TaskComplexity
+from codex_master.selection import SelectionBand, SelectionResult
 from codex_master import server
 from codex_master.server import _server_hive_authority_gate
 
@@ -114,7 +123,7 @@ def _intent() -> AssignmentIntent:
 
 
 def _plan(*, mode: str = "enforced"):
-    return plan_queen_assignment(
+    return plan_queen_assignment_from_selection(
         queen_id="queen-codex-master",
         dispatch_id="dispatch-one",
         workpackage={
@@ -139,6 +148,17 @@ def _plan(*, mode: str = "enforced"):
             "lease_available": True,
             "selection_band": "none",
         },
+        selection=SelectionResult("agent-one", "gpt-primary", SelectionBand.SP3, 0),
+        dynamic_inventory=DynamicPoolInventoryV1(
+            {
+                "agent-one": DynamicPoolInventoryEntryV1(
+                    account_id="account-one",
+                    pool_id="dynamic-pool",
+                    authority_provider="openai",
+                    runtime_provider="openai_chatgpt",
+                ),
+            }
+        ),
     )
 
 
@@ -164,8 +184,9 @@ def test_assignment_binding_materializes_only_a_planned_record(tmp_path: Path) -
     authority, repositories = _authority(tmp_path)
     grant = _grant(authority)
     workpackage = _workpackage()
+    plan = _plan()
     record = create_assignment_admission(
-        plan=_plan(),
+        plan=plan,
         workpackage=workpackage,
         intent=_intent(),
         grant=grant,
@@ -183,7 +204,10 @@ def test_assignment_binding_materializes_only_a_planned_record(tmp_path: Path) -
     assert record.work_item_version == workpackage.version
     assert record.grant_digest == grant.binding_digest()
     assert record.scope.paths == ("src/task.py",)
-    assert record.scope.canonical_digest == repositories.scope_digest("codex-master", "write", ("src/task.py",))
+    assert record.scope.canonical_digest == repositories.scope_digest(
+        "codex-master", "write", ("src/task.py",)
+    )
+    assert record.resource.account_pool_binding is plan.account_pool_binding
     assert authority.get_grant("grant-one").status == "active"
     assert "hmac:account" not in str(record.public())
 
@@ -240,6 +264,25 @@ def test_server_hive_assignment_bridge_binds_plan_before_selection_execution(
     assert record.state is AdmissionState.PLANNED
     assert record.grant_digest == grant.binding_digest()
     assert callable(captured["execute"])
+
+
+def test_server_hive_assignment_bridge_blocks_a_missing_dynamic_pool_binding() -> None:
+    with pytest.raises(server.AgentError, match="dynamic_pool_binding_missing"):
+        server.execute_server_hive_assignment(
+            plan=replace(_plan(), account_pool_binding=None),
+            workpackage=_workpackage(),
+            intent=_intent(),
+            grant=object(),  # type: ignore[arg-type]
+            authority_engine=object(),  # type: ignore[arg-type]
+            repository_registry=object(),  # type: ignore[arg-type]
+            admission_id="bridge-missing-binding",
+            lease_context=LeaseBinding("claimed", "lease-one"),
+            budget_key="standard",
+            expected_usage_micro=1,
+            priority=AdmissionPriority("DP1", "selection"),
+            operations={},
+            now=lambda: NOW,
+        )
 
 
 def test_assignment_binding_rejects_shadow_and_mismatched_workpackage(tmp_path: Path) -> None:

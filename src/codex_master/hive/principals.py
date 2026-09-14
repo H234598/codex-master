@@ -10,6 +10,13 @@ import re
 from threading import RLock
 from pathlib import PurePosixPath
 
+from codex_master.dynamic_pool import (
+    AccountPoolBindingV1,
+    DynamicPoolBindingError,
+    account_pool_binding_from_payload,
+    account_pool_binding_payload,
+)
+from codex_master.admission import AdmissionRecord
 from codex_master.hive.capabilities import ROOT_EXECUTIVE_CLASSES
 from codex_master.hive.state import HiveStateError, HiveStateStore
 from codex_master.hive.types import HiveValidationError, validate_identifier, validate_utc_datetime
@@ -110,6 +117,7 @@ class ExecutionBinding:
     admission_id: str
     state: str
     expires_at_utc: str
+    account_pool_binding: AccountPoolBindingV1 | None = None
 
     def __post_init__(self) -> None:
         for value, field in (
@@ -138,6 +146,10 @@ class ExecutionBinding:
                 raise PrincipalError(str(exc)) from exc
         if self.state not in _BINDING_STATES:
             raise PrincipalError("invalid_binding_state")
+        if self.account_pool_binding is not None and not isinstance(
+            self.account_pool_binding, AccountPoolBindingV1
+        ):
+            raise PrincipalError("invalid_dynamic_pool_binding")
         try:
             validate_utc_datetime(datetime.fromisoformat(self.expires_at_utc.replace("Z", "+00:00")))
         except (HiveValidationError, TypeError, ValueError):
@@ -155,6 +167,40 @@ class ExecutionBinding:
             "state": self.state,
             "expires_at_utc": self.expires_at_utc,
         }
+
+
+def execution_binding_from_admission(
+    *, binding_id: str, admission: AdmissionRecord
+) -> ExecutionBinding:
+    """Forward one admitted resource binding into the typed execution seam.
+
+    Registration remains the responsibility of ``PrincipalRegistry``.  This
+    pure adapter has no registry, grant, or mutation callback and therefore
+    cannot create a live execution binding by itself.
+    """
+
+    if not isinstance(admission, AdmissionRecord):
+        raise PrincipalError("invalid_admission")
+    pool_binding = admission.resource.account_pool_binding
+    if not isinstance(pool_binding, AccountPoolBindingV1):
+        raise PrincipalError("dynamic_pool_binding_missing")
+    lease_id = admission.lease_context.lease_id
+    if not isinstance(lease_id, str):
+        raise PrincipalError("execution_binding_lease_missing")
+    return ExecutionBinding(
+        binding_id,
+        admission.principal_id,
+        admission.repo_id,
+        admission.dispatch_id,
+        admission.resource.agent_id,
+        admission.resource.account_key,
+        admission.resource.model_id,
+        lease_id,
+        admission.admission_id,
+        "active",
+        admission.expires_at_utc.isoformat(),
+        pool_binding,
+    )
 
 
 class PrincipalRegistry:
@@ -424,6 +470,11 @@ class PrincipalRegistry:
             "admission_id": item.admission_id,
             "state": item.state,
             "expires_at_utc": item.expires_at_utc,
+            "account_pool_binding": (
+                account_pool_binding_payload(item.account_pool_binding)
+                if item.account_pool_binding is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -448,9 +499,20 @@ class PrincipalRegistry:
                 raw["binding_id"], raw["principal_id"], raw.get("repo_id"), raw.get("dispatch_id"),
                 raw["agent_id"], raw["account_key"], raw["model_id"], raw["lease_id"],
                 raw["admission_id"], raw["state"], raw["expires_at_utc"],
+                (
+                    account_pool_binding_from_payload(raw["account_pool_binding"])
+                    if raw.get("account_pool_binding") is not None
+                    else None
+                ),
             )
-        except (KeyError, PrincipalError, TypeError) as exc:
+        except (DynamicPoolBindingError, KeyError, PrincipalError, TypeError) as exc:
             raise PrincipalError("principal_state_invalid") from exc
 
 
-__all__ = ["ExecutionBinding", "Principal", "PrincipalError", "PrincipalRegistry"]
+__all__ = [
+    "ExecutionBinding",
+    "Principal",
+    "PrincipalError",
+    "PrincipalRegistry",
+    "execution_binding_from_admission",
+]

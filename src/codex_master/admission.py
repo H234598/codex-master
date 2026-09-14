@@ -23,6 +23,13 @@ from threading import RLock
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from codex_master.dynamic_pool import (
+    AccountPoolBindingV1,
+    DynamicPoolBindingError,
+    account_pool_binding_from_payload,
+    account_pool_binding_payload,
+)
+
 
 DEFAULT_RESERVATION_TTL_SECONDS = 30
 MAX_RESERVATION_TTL_SECONDS = 120
@@ -92,6 +99,7 @@ class ResourceBinding:
     budget_key: str
     model_id: str
     expected_usage_micro: int
+    account_pool_binding: AccountPoolBindingV1 | None = None
 
     def __post_init__(self) -> None:
         for value, code in (
@@ -102,6 +110,10 @@ class ResourceBinding:
         ):
             _bounded_text(value, code, 128)
         _bounded_int(self.expected_usage_micro, "invalid_resource_usage", 0, MAX_RESOURCE_USAGE_MICRO)
+        if self.account_pool_binding is not None and not isinstance(
+            self.account_pool_binding, AccountPoolBindingV1
+        ):
+            raise AdmissionError("invalid_dynamic_pool_binding")
 
 
 @dataclass(frozen=True, slots=True)
@@ -776,6 +788,11 @@ def _record_to_payload(record: AdmissionRecord) -> dict[str, Any]:
             "budget_key": record.resource.budget_key,
             "model_id": record.resource.model_id,
             "expected_usage_micro": record.resource.expected_usage_micro,
+            "account_pool_binding": (
+                account_pool_binding_payload(record.resource.account_pool_binding)
+                if record.resource.account_pool_binding is not None
+                else None
+            ),
         },
         "lease_context": {
             "expected_state": record.lease_context.expected_state,
@@ -825,6 +842,11 @@ def _record_from_payload(payload: object) -> AdmissionRecord:
                 resource["budget_key"],
                 resource["model_id"],
                 resource["expected_usage_micro"],
+                (
+                    account_pool_binding_from_payload(resource["account_pool_binding"])
+                    if resource.get("account_pool_binding") is not None
+                    else None
+                ),
             ),
             LeaseBinding(lease_context["expected_state"], lease_context.get("lease_id")),
             AdmissionPriority(priority["dispatch"], priority["selection_reason"]),
@@ -833,7 +855,13 @@ def _record_from_payload(payload: object) -> AdmissionRecord:
             _parse_timestamp(payload["expires_at_utc"], "invalid_expiry_timestamp"),
             payload["revision"],
         )
-    except (AdmissionError, KeyError, TypeError, ValueError) as exc:
+    except (
+        AdmissionError,
+        DynamicPoolBindingError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
         if isinstance(exc, AdmissionError) and str(exc) == "invalid_admission_state":
             raise
         raise AdmissionError("invalid_admission_state") from exc

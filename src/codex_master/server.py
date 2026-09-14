@@ -39784,6 +39784,7 @@ def build_server_admission_runtime(
     execute: Any = None,
     execution_completed: Any = None,
     completion_journal: CompletionJournal | None = None,
+    pool_authority_reader: Callable[[], UsageEvidenceV2] | None = None,
     hive_runtime: HiveRuntime | None = None,
     now: Callable[[], _dt.datetime] | None = None,
 ) -> ServerAdmissionRuntime:
@@ -39854,6 +39855,7 @@ def build_server_admission_runtime(
         execute=execute,
         execution_completed=execution_completed,
         completion_journal=completion_journal,
+        pool_authority_reader=pool_authority_reader,
         now=now,
     )
 
@@ -39871,6 +39873,7 @@ def build_server_selection_service(
     execute: Any = None,
     execution_completed: Any = None,
     completion_journal: CompletionJournal | None = None,
+    pool_authority_reader: Callable[[], UsageEvidenceV2] | None = None,
     hive_runtime: HiveRuntime | None = None,
     now: Callable[[], _dt.datetime] | None = None,
     sleeper: Callable[[float], None] | None = None,
@@ -39896,6 +39899,7 @@ def build_server_selection_service(
         execute=execute,
         execution_completed=execution_completed,
         completion_journal=completion_journal,
+        pool_authority_reader=pool_authority_reader,
         hive_runtime=hive_runtime,
         now=now,
     )
@@ -39939,6 +39943,8 @@ def execute_server_hive_assignment(
 
     if now is not None and not callable(now):
         raise AgentError("invalid_admission_clock")
+    if plan.account_pool_binding is None:
+        raise AgentError("dynamic_pool_binding_missing")
     if not isinstance(admission_id, str) or not admission_id:
         raise AgentError("invalid_admission_id")
     clock = now or (lambda: _dt.datetime.now(_dt.timezone.utc))

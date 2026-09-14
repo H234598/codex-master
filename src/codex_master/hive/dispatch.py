@@ -9,8 +9,14 @@ import hashlib
 from types import MappingProxyType
 from typing import TypeVar
 
+from codex_master.dynamic_pool import (
+    AccountPoolBindingV1,
+    DynamicPoolInventoryV1,
+    resolve_dynamic_pool_selection,
+)
 from codex_master.hive.messages import HiveMessage, HiveMessageError, _mapping, _text, _texts, _id, record_child_report
 from codex_master.hive.types import DispatchPriority, TaskComplexity, validate_utc_datetime
+from codex_master.selection import SelectionResult
 
 
 class HiveDispatchError(ValueError):
@@ -564,6 +570,7 @@ class QueenAssignmentPlan:
     scope_verified: bool
     lease_available: bool
     selection_band: str
+    account_pool_binding: AccountPoolBindingV1 | None = None
 
     def __post_init__(self) -> None:
         for value, field in (
@@ -601,6 +608,10 @@ class QueenAssignmentPlan:
             raise HiveDispatchError("selection_feature_disabled")
         if self.selection_band != "none":
             raise HiveDispatchError("selection_feature_disabled")
+        if self.account_pool_binding is not None and not isinstance(
+            self.account_pool_binding, AccountPoolBindingV1
+        ):
+            raise HiveDispatchError("invalid_dynamic_pool_binding")
 
     @property
     def gates_ready(self) -> bool:
@@ -705,11 +716,47 @@ def plan_queen_assignment(
             workpackage.get("scope_verified", False),
             workpackage.get("lease_available", False),
             workpackage.get("selection_band", "none"),
+            workpackage.get("account_pool_binding"),
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, HiveDispatchError):
             raise
         raise HiveDispatchError("invalid_workpackage_plan") from exc
+
+
+def plan_queen_assignment_from_selection(
+    *,
+    queen_id: str,
+    dispatch_id: str,
+    workpackage: Mapping[str, object],
+    selection: SelectionResult,
+    dynamic_inventory: DynamicPoolInventoryV1,
+) -> QueenAssignmentPlan:
+    """Resolve the selected agent's binding before planning the Hive bridge.
+
+    This offline bridge deliberately takes an unbound workpackage.  It neither
+    selects an agent nor discovers pool authority: the dynamic resolver uses
+    only the injected inventory for the already selected agent.
+    """
+
+    if not isinstance(workpackage, Mapping):
+        raise HiveDispatchError("invalid_workpackage_plan")
+    if "account_pool_binding" in workpackage:
+        raise HiveDispatchError("manual_dynamic_pool_binding")
+    if not isinstance(selection, SelectionResult):
+        raise HiveDispatchError("invalid_selection_plan")
+    if selection.agent_id != workpackage.get(
+        "agent_id"
+    ) or selection.model_id != workpackage.get("model_id"):
+        raise HiveDispatchError("selection_binding_mismatch")
+    resolved = resolve_dynamic_pool_selection(selection, dynamic_inventory)
+    bound_workpackage = dict(workpackage)
+    bound_workpackage["account_pool_binding"] = resolved.account_pool_binding
+    return plan_queen_assignment(
+        queen_id=queen_id,
+        dispatch_id=dispatch_id,
+        workpackage=bound_workpackage,
+    )
 
 
 _T = TypeVar("_T")
@@ -863,6 +910,7 @@ __all__ = [
     "execute_global_request",
     "plan_global_request",
     "plan_queen_assignment",
+    "plan_queen_assignment_from_selection",
     "retry_repo_dispatch",
     "request_cooperative_pause",
     "acknowledge_checkpoint",

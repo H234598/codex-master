@@ -167,6 +167,22 @@ class SelectionService:
                 current = self._store.complete_revalidation(
                     current.admission_id, expected_revision=current.revision, valid=True, now=self._now()
                 )
+                if current.resource.account_pool_binding is not None:
+                    fresh_check = getattr(
+                        self._runtime, "revalidate_before_begin_execution", None
+                    )
+                    if not callable(fresh_check) or fresh_check(current) is not True:
+                        current = self._store.cancel(
+                            current.admission_id,
+                            expected_revision=current.revision,
+                            now=self._now(),
+                        )
+                        self._store.compensate(
+                            current.admission_id,
+                            expected_revision=current.revision,
+                            now=self._now(),
+                        )
+                        raise SelectionDeniedError("pool authority revalidation denied")
                 current = self._store.begin_execution(
                     current.admission_id, expected_revision=current.revision, now=self._now()
                 )

@@ -15,7 +15,13 @@ from codex_master.hive.authority import (
     AuthorityRequest,
     DelegationGrant,
 )
-from codex_master.hive.principals import ExecutionBinding, Principal, PrincipalError, PrincipalRegistry
+from codex_master.hive.principals import (
+    ExecutionBinding,
+    Principal,
+    PrincipalError,
+    PrincipalRegistry,
+    execution_binding_from_admission,
+)
 from codex_master.hive.repositories import RepositoryBinding, RepositoryError, RepositoryRegistry, RepositoryValidation
 from codex_master.hive.state import HiveStateError, HiveStateStore
 from codex_master.hive.events import HiveEventError, HiveEventStore
@@ -41,6 +47,7 @@ from codex_master.hive.dispatch import (
     execute_global_request,
     plan_global_request,
     plan_queen_assignment,
+    plan_queen_assignment_from_selection,
     acknowledge_checkpoint,
     request_cooperative_pause,
     resume_paused_workpackage,
@@ -79,6 +86,7 @@ __all__ = [
     "AuthorityRequest",
     "DelegationGrant",
     "ExecutionBinding",
+    "execution_binding_from_admission",
     "Principal",
     "PrincipalError",
     "PrincipalRegistry",
@@ -109,6 +117,7 @@ __all__ = [
     "execute_global_request",
     "plan_global_request",
     "plan_queen_assignment",
+    "plan_queen_assignment_from_selection",
     "acknowledge_checkpoint",
     "request_cooperative_pause",
     "resume_paused_workpackage",

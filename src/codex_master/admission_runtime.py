@@ -17,6 +17,8 @@ from typing import Protocol
 
 from codex_master.admission import AdmissionRecord, AdmissionState
 from codex_master.admission_journal import CompletionJournal, CompletionJournalError
+from codex_master.dynamic_pool import exact_pool_authority_revalidation
+from codex_master.usage_snapshot import UsageEvidenceV2
 
 
 ADMISSION_RUNTIME_GATES = (
@@ -92,6 +94,7 @@ class ServerAdmissionRuntime:
         execute: AdmissionExecutor | None = None,
         execution_completed: CompletionEvidence | None = None,
         completion_journal: CompletionJournal | None = None,
+        pool_authority_reader: Callable[[], UsageEvidenceV2] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(gates, Mapping):
@@ -111,10 +114,13 @@ class ServerAdmissionRuntime:
             raise AdmissionRuntimeError("invalid_completion_journal")
         if completion_journal is not None and execution_completed is not None:
             raise AdmissionRuntimeError("ambiguous_completion_evidence")
+        if pool_authority_reader is not None and not callable(pool_authority_reader):
+            raise AdmissionRuntimeError("invalid_pool_authority_reader")
         self._gates = dict(gates)
         self._execute = execute
         self._execution_completed = execution_completed
         self._completion_journal = completion_journal
+        self._pool_authority_reader = pool_authority_reader
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._lock = RLock()
         self._revalidated: dict[str, int] = {}
@@ -152,6 +158,16 @@ class ServerAdmissionRuntime:
             self._last_failure = None
         return True
 
+    def revalidate_before_begin_execution(self, admission: AdmissionRecord) -> bool:
+        """Freshly check the reserved dynamic identity immediately before execution."""
+
+        if (
+            not isinstance(admission, AdmissionRecord)
+            or admission.state is not AdmissionState.ADMITTED
+        ):
+            return self._deny("invalid_admission_state")
+        return self._revalidate_pool_authority(admission)
+
     def execute(self, admission: AdmissionRecord, operation: str) -> Mapping[str, object]:
         """Consume a successful revalidation and call the injected executor once."""
 
@@ -167,7 +183,10 @@ class ServerAdmissionRuntime:
             raise AdmissionRuntimeError("invalid_runtime_operation")
         with self._lock:
             revalidated_revision = self._revalidated.get(admission.admission_id)
-            if revalidated_revision is None or admission.revision <= revalidated_revision:
+            if (
+                revalidated_revision is None
+                or admission.revision <= revalidated_revision
+            ):
                 raise AdmissionRuntimeError("runtime_not_revalidated")
         if self._completion_journal is not None:
             try:
@@ -178,6 +197,8 @@ class ServerAdmissionRuntime:
             if self._revalidated.get(admission.admission_id) != revalidated_revision:
                 raise AdmissionRuntimeError("runtime_not_revalidated")
             del self._revalidated[admission.admission_id]
+        if not self._revalidate_pool_authority(admission):
+            raise AdmissionRuntimeError("pool_authority_revalidation_denied")
         if not callable(self._execute):
             raise AdmissionRuntimeError("runtime_execution_unavailable")
         result = self._execute(admission, operation)
@@ -220,3 +241,13 @@ class ServerAdmissionRuntime:
         with self._lock:
             self._last_failure = decision
         return False
+
+    def _revalidate_pool_authority(self, admission: AdmissionRecord) -> bool:
+        binding = admission.resource.account_pool_binding
+        if binding is None:
+            return True
+        allowed = exact_pool_authority_revalidation(
+            binding,
+            reader=self._pool_authority_reader,
+        )
+        return allowed or self._deny("pool_authority_revalidation_denied")
