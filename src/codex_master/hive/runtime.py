@@ -39,11 +39,6 @@ from codex_master.runtime_layout import (
     RuntimeLayout,
     validate_runtime_metadata,
 )
-from codex_master.usage_snapshot import (
-    AccountUsageEvidenceV2,
-    UsageEvidenceV2,
-    read_usage_evidence_v2,
-)
 
 
 class HiveRuntimeError(ValueError):
@@ -56,7 +51,6 @@ _PILOT_REPOSITORY = "codex-master"
 _PILOT_QUEEN = "queen-codex-master"
 _PILOT_REMOTE = "https://github.com/H234598/codex-master.git"
 _PILOT_FEATURE_FLAGS = frozenset({"sp0_passive", "sp1_deadline", "sp2_secondary_model", "sp3_fairness"})
-_POOL_EVIDENCE_TTL = timedelta(seconds=900)
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,59 +156,6 @@ def _pool_evidence_now(clock: Callable[[], datetime] | None) -> datetime | None:
     return value.astimezone(UTC)
 
 
-def _attested_pool_is_ready(evidence: object, *, now: datetime) -> bool:
-    """Trust only the existing V2 reader's verified source/producer/generation chain."""
-
-    if (
-        type(evidence) is not UsageEvidenceV2
-        or evidence.status != "complete"
-        or not isinstance(evidence.captured_at, datetime)
-        or not isinstance(evidence.generated_at, datetime)
-        or evidence.captured_at.tzinfo is None
-        or evidence.generated_at.tzinfo is None
-    ):
-        return False
-    captured_at = evidence.captured_at.astimezone(UTC)
-    generated_at = evidence.generated_at.astimezone(UTC)
-    if (
-        captured_at > generated_at
-        or generated_at > now
-        or now - captured_at > _POOL_EVIDENCE_TTL
-    ):
-        return False
-    for account in evidence.accounts:
-        if type(account) is not AccountUsageEvidenceV2:
-            return False
-        trends = {
-            (item.pool, item.window_seconds, item.reset_generation): item
-            for item in account.trends
-        }
-        trackers = {
-            (item.pool, item.window_seconds, item.reset_generation): item
-            for item in account.tracker_evidence
-        }
-        for limit in account.limits:
-            key = (limit.pool, limit.window_seconds, limit.reset_generation)
-            trend = trends.get(key)
-            tracker = trackers.get(key)
-            if (
-                limit.pool == "main"
-                and limit.remaining_percent > 0
-                and limit.reset_at > now
-                and trend is not None
-                and trend.coverage == "complete"
-                and trend.last_sample_at <= now
-                and now - trend.last_sample_at <= _POOL_EVIDENCE_TTL
-                and trend.projected_exhaustion_at > now
-                and tracker is not None
-                and tracker.coverage == "complete"
-                and tracker.last_sample_at <= now
-                and now - tracker.last_sample_at <= _POOL_EVIDENCE_TTL
-            ):
-                return True
-    return False
-
-
 def enforced_pilot_gate(
     config: HiveConfig,
     classes: Mapping[str, AgentClassProfile],
@@ -222,7 +163,7 @@ def enforced_pilot_gate(
     *,
     now: Callable[[], datetime] | None = None,
 ) -> dict[str, object]:
-    """Evaluate the closed pilot allowlist using only the canonical V2 pool reader."""
+    """Block static Pilot/Hive authority until an immutable request binding exists."""
 
     if not isinstance(config, HiveConfig) or not isinstance(classes, Mapping):
         return {"allowed": False, "reason_code": "pilot_config_invalid", "raw_output": "not_returned"}
@@ -272,15 +213,9 @@ def enforced_pilot_gate(
     observed_now = _pool_evidence_now(now)
     if observed_now is None:
         return {"allowed": False, "reason_code": "pilot_account_attestation_missing", "raw_output": "not_returned"}
-    try:
-        account_ok = _attested_pool_is_ready(
-            read_usage_evidence_v2(clock=lambda: observed_now), now=observed_now
-        )
-    except Exception:
-        account_ok = False
     return {
-        "allowed": account_ok,
-        "reason_code": "pilot_ready" if account_ok else "pilot_account_attestation_invalid",
+        "allowed": False,
+        "reason_code": "pilot_account_attestation_invalid",
         "raw_output": "not_returned",
     }
 

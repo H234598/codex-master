@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import csv
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -20,17 +23,85 @@ from typing import Literal
 _MAX_POINTER_BYTES = 4096
 _MAX_BINDING_BYTES = 32768
 _MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
+_MAX_POOL_AUTHORITY_BYTES = 256 * 1024
+_MAX_MANIFEST_BYTES = 128 * 1024
 _MAX_LOCK_BYTES = 4096
 _MAX_ACCOUNTS = 100
 _MAX_LIMITS = 32
 _MAX_TRENDS = 32
 _MAX_TOTAL_TRENDS = 3200
+_MAX_POOL_AUTHORITIES = 256
+_MAX_ATTESTATION_FILE_BYTES = 4 * 1024 * 1024
+_MAX_RELEASE_TREE_ENTRIES = 4096
+_MAX_RELEASE_TREE_BYTES = 128 * 1024 * 1024
+_MAX_HISTORY_SAMPLES = 500_000
 _WINDOWS = frozenset({18000, 604800, 2592000})
 _GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _POOL_RE = re.compile(r"^(?:main|spark)$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_RELEASE_RE = re.compile(r"^0\.6\.537-[0-9a-f]{16}$")
+_AUTHORITY_POOL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_PROVIDER_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_MODEL_FAMILY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+_LIFECYCLES = frozenset(("ephemeral", "session", "persistent"))
+_PAYLOAD_STATUSES = frozenset(("ok", "partial", "error", "login_required", "unknown"))
+_TRACKER_COVERAGES = frozenset(("complete", "partial", "insufficient", "stale"))
+_ASCII_TOKEN_RE = re.compile(r"^[!-~]{1,128}$")
+_LOCAL_PATH_RE = re.compile(r"(?:^|[^A-Za-z0-9/])(?:/+|~/|[A-Za-z]:[\\/]|\\\\)")
+_PAYLOAD_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_JWT_RE = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{16,}$")
+_PEM_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+_PAYLOAD_SECRET_NAMES = frozenset(
+    {
+        "token",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "apikey",
+        "secret",
+        "clientsecret",
+        "password",
+        "passphrase",
+        "authorization",
+        "cookie",
+        "cookies",
+        "session",
+        "sessionid",
+        "csrf",
+        "devicecode",
+        "auth",
+        "authjson",
+        "privatekey",
+        "credential",
+        "credentials",
+        "credentialfingerprint",
+        "email",
+        "emailaddress",
+        "responsebody",
+        "raw",
+        "rawoutput",
+        "headers",
+        "profile",
+        "profilepath",
+        "authjsonpath",
+        "sourceurls",
+        "backenduserid",
+        "backendaccountid",
+    }
+)
+_PAYLOAD_SECRET_SUFFIXES = (
+    "token",
+    "secret",
+    "key",
+    "cookie",
+    "password",
+    "path",
+    "url",
+    "header",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +154,7 @@ ReaderStatus = Literal["complete", "stale", "partial", "busy", "unavailable", "i
 
 @dataclass(frozen=True, slots=True)
 class UsageLimitV2:
-    pool: Literal["main", "spark"]
+    pool: str
     window_seconds: int
     reset_generation: str
     used_percent: float
@@ -93,20 +164,20 @@ class UsageLimitV2:
 
 @dataclass(frozen=True, slots=True)
 class UsageTrendV2:
-    pool: Literal["main", "spark"]
+    pool: str
     window_seconds: int
     reset_generation: str
-    coverage: Literal["complete", "partial", "insufficient"]
+    coverage: str
     last_sample_at: datetime
     projected_exhaustion_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
 class TrackerEvidenceV2:
-    pool: Literal["main", "spark"]
+    pool: str
     window_seconds: int
     reset_generation: str
-    coverage: Literal["complete", "partial", "insufficient"]
+    coverage: str
     last_sample_at: datetime
 
 
@@ -124,6 +195,55 @@ class UsageEvidenceV2:
     status: ReaderStatus
     captured_at: datetime | None
     generated_at: datetime | None
+    pool_authorities: tuple["PoolAuthorityV2", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PoolAuthorityV2:
+    account_id: str
+    pool_id: str
+    provider: str
+    allowed_lifecycles: tuple[str, ...]
+    allowed_model_families: tuple[str, ...]
+    hive_available: bool
+    persistent_leadership_eligible: bool
+    long_running_leadership_eligible: bool
+    reasoning_minimum: str
+    reasoning_maximum: str
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceBindingV2:
+    active_manifest_sha256: str
+    generation_id: str
+    payload_sha256: str
+    payload_size_bytes: int
+    published_at: datetime
+    release_id: str
+    source_manifest_sha256: str
+    pool_authority_sha256: str
+    pool_authority_size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PoolAuthorityProjectionV2:
+    authorities: tuple[PoolAuthorityV2, ...]
+    expires_at: datetime
+    generation_id: str
+    issued_at: datetime
+    release_id: str
+    usage_binding_sha256: str
+    usage_payload_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedGenerationV2:
+    accounts: tuple[AccountUsageEvidenceV2, ...]
+    status: ReaderStatus
+    captured_at: datetime | None
+    generated_at: datetime
+    authorities: tuple[PoolAuthorityV2, ...]
+    binding: _EvidenceBindingV2
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +252,22 @@ class _ActiveManifest:
     producer_version: str
     release_id: str
     source_manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveAttestationV2:
+    manifest: _ActiveManifest
+    data_home: Path
+    release_dir: Path
+    entrypoint_path: Path
+    entrypoint_sha256: str
+    launcher_path: Path
+    launcher_sha256: str
+    record_path: Path
+    record_sha256: str
+    release_tree_sha256: str
+    wheel_path: Path
+    wheel_sha256: str
 
 
 class _Invalid(Exception):
@@ -252,6 +388,34 @@ class _FdGuard:
             )
         return descriptor
 
+    def private_lock_directory(self, path: Path) -> int:
+        if (
+            not isinstance(path, Path)
+            or not path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts[1:])
+        ):
+            raise _Invalid()
+        try:
+            passwd_home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            raise _Unavailable() from exc
+        enforce_from = len(path.parts) - 1
+        if path.parts[: len(passwd_home.parts)] == passwd_home.parts:
+            enforce_from = len(passwd_home.parts) - 1
+        try:
+            descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError as exc:
+            raise _Unavailable() from exc
+        self._directories.append(
+            (descriptor, None, None, _metadata(os.fstat(descriptor)))
+        )
+        self._close.append(descriptor)
+        for index, component in enumerate(path.parts[1:], start=1):
+            descriptor = self._open_directory(descriptor, component, controlled=False)
+            if index >= enforce_from:
+                _check_directory(os.fstat(descriptor))
+        return descriptor
+
     def directory(self, parent_fd: int, name: str) -> int:
         if name in {"", ".", ".."} or "/" in name:
             raise _Invalid()
@@ -332,8 +496,8 @@ class _FdGuard:
                 raise _Invalid()
             expected = next(
                 metadata
-                for _parent, file_name, metadata in self._files
-                if file_name == name
+                for stored_parent, file_name, metadata in self._files
+                if stored_parent == parent_fd and file_name == name
             )
             if not _same(os.fstat(descriptor), expected) or not _same(
                 os.stat(name, dir_fd=parent_fd, follow_symlinks=False), expected
@@ -413,6 +577,283 @@ def _hex(value: object) -> str:
     return value
 
 
+def _release_id(value: object) -> str:
+    if type(value) is not str or _RELEASE_RE.fullmatch(value) is None:
+        raise _Invalid()
+    return value
+
+
+def _generation_id(value: object) -> str:
+    if type(value) is not str or _GENERATION_RE.fullmatch(value) is None:
+        raise _Invalid()
+    return value
+
+
+def _canonical_timestamp(value: object) -> datetime:
+    if type(value) is not str:
+        raise _Invalid()
+    parsed = _timestamp(value)
+    if parsed.isoformat().replace("+00:00", "Z") != value:
+        raise _Invalid()
+    return parsed
+
+
+def _canonical_bytes(value: Mapping[str, object]) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise _Invalid() from None
+
+
+def _closed_strings(
+    value: object,
+    *,
+    maximum: int,
+    pattern: re.Pattern[str] | None = None,
+    allowed: frozenset[str] | None = None,
+) -> tuple[str, ...]:
+    if type(value) is not list or not 1 <= len(value) <= maximum:
+        raise _Invalid()
+    values = tuple(value)
+    if any(type(item) is not str for item in values):
+        raise _Invalid()
+    strings = tuple(values)
+    if len(set(strings)) != len(strings) or strings != tuple(sorted(strings)):
+        raise _Invalid()
+    if pattern is not None and any(pattern.fullmatch(item) is None for item in strings):
+        raise _Invalid()
+    if allowed is not None and any(item not in allowed for item in strings):
+        raise _Invalid()
+    return strings
+
+
+def _usage_binding_bytes(binding: _EvidenceBindingV2) -> bytes:
+    return _canonical_bytes(
+        {
+            "active_manifest_sha256": binding.active_manifest_sha256,
+            "generation_id": binding.generation_id,
+            "payload_filename": "account-usage-v2.json",
+            "payload_sha256": binding.payload_sha256,
+            "payload_size_bytes": binding.payload_size_bytes,
+            "published_at": binding.published_at.isoformat().replace("+00:00", "Z"),
+            "producer_version": "0.6.537",
+            "release_id": binding.release_id,
+            "source_manifest_sha256": binding.source_manifest_sha256,
+            "usage_binding_schema_version": 2,
+        }
+    )
+
+
+def _binding_v2(payload: bytes) -> _EvidenceBindingV2:
+    value = _canonical_json(payload, _MAX_BINDING_BYTES)
+    _exact(
+        value,
+        {
+            "binding_schema_version",
+            "pool_authority_filename",
+            "pool_authority_sha256",
+            "pool_authority_size_bytes",
+            "usage_binding",
+        },
+    )
+    usage = value["usage_binding"]
+    if type(usage) is not dict:
+        raise _Invalid()
+    _exact(
+        usage,
+        {
+            "active_manifest_sha256",
+            "generation_id",
+            "payload_filename",
+            "payload_sha256",
+            "payload_size_bytes",
+            "published_at",
+            "producer_version",
+            "release_id",
+            "source_manifest_sha256",
+            "usage_binding_schema_version",
+        },
+    )
+    if (
+        type(value["binding_schema_version"]) is not int
+        or value["binding_schema_version"] != 2
+        or value["pool_authority_filename"] != "pool-authority-v2.json"
+        or type(value["pool_authority_size_bytes"]) is not int
+        or not 1 <= value["pool_authority_size_bytes"] <= _MAX_POOL_AUTHORITY_BYTES
+        or type(usage["usage_binding_schema_version"]) is not int
+        or usage["usage_binding_schema_version"] != 2
+        or usage["payload_filename"] != "account-usage-v2.json"
+        or usage["producer_version"] != "0.6.537"
+        or type(usage["payload_size_bytes"]) is not int
+        or not 1 <= usage["payload_size_bytes"] <= _MAX_PAYLOAD_BYTES
+    ):
+        raise _Invalid()
+    return _EvidenceBindingV2(
+        active_manifest_sha256=_hex(usage["active_manifest_sha256"]),
+        generation_id=_generation_id(usage["generation_id"]),
+        payload_sha256=_hex(usage["payload_sha256"]),
+        payload_size_bytes=usage["payload_size_bytes"],
+        published_at=_canonical_timestamp(usage["published_at"]),
+        release_id=_release_id(usage["release_id"]),
+        source_manifest_sha256=_hex(usage["source_manifest_sha256"]),
+        pool_authority_sha256=_hex(value["pool_authority_sha256"]),
+        pool_authority_size_bytes=value["pool_authority_size_bytes"],
+    )
+
+
+def _pool_authority_v2(payload: bytes) -> _PoolAuthorityProjectionV2:
+    value = _canonical_json(payload, _MAX_POOL_AUTHORITY_BYTES)
+    _exact(
+        value,
+        {
+            "authorities",
+            "expires_at",
+            "generation_id",
+            "issued_at",
+            "pool_authority_schema_version",
+            "producer_version",
+            "release_id",
+            "usage_binding_sha256",
+            "usage_payload_sha256",
+        },
+    )
+    if (
+        type(value["pool_authority_schema_version"]) is not int
+        or value["pool_authority_schema_version"] != 2
+        or value["producer_version"] != "0.6.537"
+        or type(value["authorities"]) is not list
+        or len(value["authorities"]) > _MAX_POOL_AUTHORITIES
+    ):
+        raise _Invalid()
+    authorities: list[PoolAuthorityV2] = []
+    canonical_authorities: list[dict[str, object]] = []
+    keys: list[tuple[str, str, str]] = []
+    for raw in value["authorities"]:
+        if type(raw) is not dict:
+            raise _Invalid()
+        _exact(
+            raw,
+            {
+                "account_id",
+                "allowed_lifecycles",
+                "allowed_model_families",
+                "hive_available",
+                "long_running_leadership_eligible",
+                "persistent_leadership_eligible",
+                "pool_id",
+                "provider",
+                "reasoning_maximum",
+                "reasoning_minimum",
+            },
+        )
+        account_id = raw["account_id"]
+        pool_id = raw["pool_id"]
+        provider = raw["provider"]
+        minimum = raw["reasoning_minimum"]
+        maximum = raw["reasoning_maximum"]
+        if (
+            type(account_id) is not str
+            or account_id in {".", ".."}
+            or _ACCOUNT_RE.fullmatch(account_id) is None
+            or type(pool_id) is not str
+            or _AUTHORITY_POOL_RE.fullmatch(pool_id) is None
+            or type(provider) is not str
+            or _PROVIDER_RE.fullmatch(provider) is None
+            or type(minimum) is not str
+            or type(maximum) is not str
+            or minimum not in _REASONING_LEVELS
+            or maximum not in _REASONING_LEVELS
+            or _REASONING_LEVELS.index(minimum) > _REASONING_LEVELS.index(maximum)
+            or any(
+                type(raw[field]) is not bool
+                for field in (
+                    "hive_available",
+                    "persistent_leadership_eligible",
+                    "long_running_leadership_eligible",
+                )
+            )
+        ):
+            raise _Invalid()
+        key = (account_id, provider, pool_id)
+        keys.append(key)
+        allowed_lifecycles = _closed_strings(
+            raw["allowed_lifecycles"], maximum=32, allowed=_LIFECYCLES
+        )
+        allowed_model_families = _closed_strings(
+            raw["allowed_model_families"], maximum=32, pattern=_MODEL_FAMILY_RE
+        )
+        canonical_authorities.append(
+            {
+                "account_id": account_id,
+                "allowed_lifecycles": list(allowed_lifecycles),
+                "allowed_model_families": list(allowed_model_families),
+                "hive_available": raw["hive_available"],
+                "long_running_leadership_eligible": raw[
+                    "long_running_leadership_eligible"
+                ],
+                "persistent_leadership_eligible": raw[
+                    "persistent_leadership_eligible"
+                ],
+                "pool_id": pool_id,
+                "provider": provider,
+                "reasoning_maximum": maximum,
+                "reasoning_minimum": minimum,
+            }
+        )
+        authorities.append(
+            PoolAuthorityV2(
+                account_id=account_id,
+                pool_id=pool_id,
+                provider=provider,
+                allowed_lifecycles=allowed_lifecycles,
+                allowed_model_families=allowed_model_families,
+                hive_available=raw["hive_available"],
+                persistent_leadership_eligible=raw[
+                    "persistent_leadership_eligible"
+                ],
+                long_running_leadership_eligible=raw[
+                    "long_running_leadership_eligible"
+                ],
+                reasoning_minimum=minimum,
+                reasoning_maximum=maximum,
+            )
+        )
+    if len(set(keys)) != len(keys) or keys != sorted(keys):
+        raise _Invalid()
+    issued_at = _canonical_timestamp(value["issued_at"])
+    expires_at = _canonical_timestamp(value["expires_at"])
+    if not issued_at < expires_at <= issued_at + timedelta(minutes=15):
+        raise _Invalid()
+    _scan_payload_secrets(
+        {
+            "authorities": canonical_authorities,
+            "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+            "generation_id": value["generation_id"],
+            "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
+            "pool_authority_schema_version": 2,
+            "producer_version": "0.6.537",
+            "release_id": value["release_id"],
+            "usage_binding_sha256": value["usage_binding_sha256"],
+            "usage_payload_sha256": value["usage_payload_sha256"],
+        }
+    )
+    return _PoolAuthorityProjectionV2(
+        authorities=tuple(authorities),
+        expires_at=expires_at,
+        generation_id=_generation_id(value["generation_id"]),
+        issued_at=issued_at,
+        release_id=_release_id(value["release_id"]),
+        usage_binding_sha256=_hex(value["usage_binding_sha256"]),
+        usage_payload_sha256=_hex(value["usage_payload_sha256"]),
+    )
+
+
 def _token(value: object, maximum: int) -> str:
     if (
         not isinstance(value, str)
@@ -480,7 +921,7 @@ def _active_manifest(payload: bytes) -> _ActiveManifest:
     )
     if (
         value["active_manifest_schema_version"] != 2
-        or _token(value["producer_version"], 64) != "0.6.536"
+        or _token(value["producer_version"], 64) != "0.6.537"
     ):
         raise _Invalid()
     if value["entry_point"] != "codex_usage.cli:main":
@@ -495,10 +936,454 @@ def _active_manifest(payload: bytes) -> _ActiveManifest:
         _hex(value[name])
     return _ActiveManifest(
         digest=hashlib.sha256(payload).hexdigest(),
-        producer_version="0.6.536",
+        producer_version="0.6.537",
         release_id=_token(value["release_id"], 64),
         source_manifest_sha256=_hex(value["source_manifest_sha256"]),
     )
+
+
+def _canonical_manifest(payload: bytes) -> dict[str, object]:
+    if not isinstance(payload, bytes) or not payload.endswith(b"\n"):
+        raise _Invalid()
+    value = _canonical_json(payload[:-1], _MAX_MANIFEST_BYTES)
+    if _canonical_bytes(value) + b"\n" != payload:
+        raise _Invalid()
+    return value
+
+
+def _manifest_path(value: object) -> Path:
+    if type(value) is not str or not value or "\x00" in value:
+        raise _Invalid()
+    path = Path(value)
+    if (
+        not path.is_absolute()
+        or str(path) != value
+        or any(part in {"", ".", ".."} or "\\" in part for part in path.parts[1:])
+    ):
+        raise _Invalid()
+    return path
+
+
+def _active_manifest_v2(payload: bytes, state_home: Path) -> _ActiveAttestationV2:
+    value = _canonical_manifest(payload)
+    _exact(
+        value,
+        {
+            "data_home",
+            "entrypoint_path",
+            "entrypoint_sha256",
+            "launcher_path",
+            "launcher_sha256",
+            "record_path",
+            "record_sha256",
+            "release_dir",
+            "release_id",
+            "release_tree_sha256",
+            "schema_version",
+            "source_manifest_sha256",
+            "state_home",
+            "version",
+            "wheel_path",
+            "wheel_sha256",
+        },
+    )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 2
+        or value["version"] != "0.6.537"
+        or _manifest_path(value["state_home"]) != state_home
+    ):
+        raise _Invalid()
+    release_id = _release_id(value["release_id"])
+    source_manifest_sha256 = _hex(value["source_manifest_sha256"])
+    if release_id != f"0.6.537-{source_manifest_sha256[:16]}":
+        raise _Invalid()
+    integration = state_home / "codex-usage" / "integration"
+    release_dir = _manifest_path(value["release_dir"])
+    if release_dir != integration / "releases" / release_id:
+        raise _Invalid()
+    data_home = _manifest_path(value["data_home"])
+    entrypoint = _manifest_path(value["entrypoint_path"])
+    launcher = _manifest_path(value["launcher_path"])
+    record = _manifest_path(value["record_path"])
+    wheel = _manifest_path(value["wheel_path"])
+    try:
+        site_packages = record.parent.parent
+        python_directory = site_packages.relative_to(release_dir).parts
+    except ValueError as exc:
+        raise _Invalid() from exc
+    if (
+        not data_home.is_absolute()
+        or len(python_directory) != 4
+        or python_directory[:2] != ("venv", "lib")
+        or python_directory[3] != "site-packages"
+        or not python_directory[2].startswith("python3.")
+        or not python_directory[2].removeprefix("python3.").isdecimal()
+        or entrypoint != site_packages / "codex_usage" / "integration_entrypoint.py"
+        or launcher != release_dir / "venv" / "bin" / "codex-usage"
+        or wheel != release_dir / "producer.whl"
+        or record
+        != site_packages
+        / "codex_usage_integration_producer-0.6.537.dist-info"
+        / "RECORD"
+    ):
+        raise _Invalid()
+    for name in (
+        "entrypoint_sha256",
+        "launcher_sha256",
+        "record_sha256",
+        "release_tree_sha256",
+        "wheel_sha256",
+    ):
+        _hex(value[name])
+    return _ActiveAttestationV2(
+        manifest=_ActiveManifest(
+            digest=hashlib.sha256(payload).hexdigest(),
+            producer_version="0.6.537",
+            release_id=release_id,
+            source_manifest_sha256=source_manifest_sha256,
+        ),
+        data_home=data_home,
+        release_dir=release_dir,
+        entrypoint_path=entrypoint,
+        entrypoint_sha256=_hex(value["entrypoint_sha256"]),
+        launcher_path=launcher,
+        launcher_sha256=_hex(value["launcher_sha256"]),
+        record_path=record,
+        record_sha256=_hex(value["record_sha256"]),
+        release_tree_sha256=_hex(value["release_tree_sha256"]),
+        wheel_path=wheel,
+        wheel_sha256=_hex(value["wheel_sha256"]),
+    )
+
+
+def _pointer_v1(value: dict[str, object]) -> tuple[str, str, str | None, str | None]:
+    _exact(
+        value,
+        {
+            "pointer_schema_version",
+            "current_generation_id",
+            "current_binding_sha256",
+            "previous_generation_id",
+            "previous_binding_sha256",
+        },
+    )
+    if type(value["pointer_schema_version"]) is not int or value[
+        "pointer_schema_version"
+    ] != 1:
+        raise _Invalid()
+    generation = _generation_id(value["current_generation_id"])
+    digest = _hex(value["current_binding_sha256"])
+    previous_generation = value["previous_generation_id"]
+    previous_digest = value["previous_binding_sha256"]
+    if (previous_generation is None) != (previous_digest is None):
+        raise _Invalid()
+    if previous_generation is not None:
+        previous_generation = _generation_id(previous_generation)
+        previous_digest = _hex(previous_digest)
+        if previous_generation == generation:
+            raise _Invalid()
+    return generation, digest, previous_generation, previous_digest
+
+
+def _evidence_lock_name(path: Path) -> str:
+    return hashlib.sha256(os.fsencode(os.path.abspath(path))).hexdigest() + ".lock"
+
+
+def _read_attestation_fd(descriptor: int, expected: _Metadata) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while total <= _MAX_ATTESTATION_FILE_BYTES:
+        block = os.read(
+            descriptor, min(65536, _MAX_ATTESTATION_FILE_BYTES + 1 - total)
+        )
+        if not block:
+            break
+        chunks.append(block)
+        total += len(block)
+    if total > _MAX_ATTESTATION_FILE_BYTES or not _same(
+        os.fstat(descriptor), expected
+    ):
+        raise _Invalid()
+    return b"".join(chunks)
+
+
+def _release_tree(
+    release_fd: int,
+) -> tuple[tuple[tuple[str, bool, _Metadata], ...], tuple[bytes, ...]]:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    root_fd = os.dup(release_fd)
+    stack: list[tuple[int, str, os.stat_result]] = [(root_fd, ".", os.fstat(root_fd))]
+    entries: list[tuple[str, bool, _Metadata]] = []
+    rows: list[bytes] = []
+    entry_count = 1
+    file_bytes = 0
+    try:
+        while stack:
+            descriptor, relative, initial = stack.pop()
+            try:
+                initial_metadata = _metadata(initial)
+                mode = stat.S_IMODE(initial.st_mode)
+                if stat.S_ISDIR(initial.st_mode):
+                    if initial.st_uid != os.geteuid():
+                        raise _Invalid()
+                    entries.append((relative, True, initial_metadata))
+                    rows.append(f"D {relative}\0{mode:04o}\n".encode())
+                    children: list[tuple[str, int, os.stat_result]] = []
+                    try:
+                        with os.scandir(descriptor) as scanned:
+                            for entry in scanned:
+                                if entry_count >= _MAX_RELEASE_TREE_ENTRIES:
+                                    raise _Invalid()
+                                entry_count += 1
+                                name = entry.name
+                                child = entry.stat(follow_symlinks=False)
+                                if (
+                                    not name
+                                    or name in {".", ".."}
+                                    or "/" in name
+                                    or "\\" in name
+                                    or "\x00" in name
+                                    or (stat.S_ISDIR(child.st_mode) and name == "__pycache__")
+                                    or (stat.S_ISREG(child.st_mode) and name.endswith(".pyc"))
+                                    or not (
+                                        stat.S_ISDIR(child.st_mode)
+                                        or stat.S_ISREG(child.st_mode)
+                                    )
+                                    or child.st_uid != os.geteuid()
+                                ):
+                                    raise _Invalid()
+                                child_fd = -1
+                                try:
+                                    child_fd = os.open(
+                                        name,
+                                        directory_flags
+                                        if stat.S_ISDIR(child.st_mode)
+                                        else file_flags,
+                                        dir_fd=descriptor,
+                                    )
+                                    opened = os.fstat(child_fd)
+                                    if (
+                                        stat.S_IFMT(opened.st_mode)
+                                        != stat.S_IFMT(child.st_mode)
+                                        or not _same(opened, _metadata(child))
+                                        or opened.st_uid != os.geteuid()
+                                        or (
+                                            stat.S_ISREG(opened.st_mode)
+                                            and (
+                                                opened.st_nlink != 1
+                                                or opened.st_size
+                                                > _MAX_ATTESTATION_FILE_BYTES
+                                            )
+                                        )
+                                    ):
+                                        raise _Invalid()
+                                    children.append((name, child_fd, opened))
+                                    child_fd = -1
+                                finally:
+                                    if child_fd >= 0:
+                                        os.close(child_fd)
+                        children.sort(key=lambda item: item[0], reverse=True)
+                        stack.extend(
+                            (child_fd, f"{relative}/{name}", child)
+                            for name, child_fd, child in children
+                        )
+                        children.clear()
+                    finally:
+                        for _name, child_fd, _child in children:
+                            os.close(child_fd)
+                    if not _same(os.fstat(descriptor), initial_metadata):
+                        raise _Invalid()
+                    continue
+                if (
+                    not stat.S_ISREG(initial.st_mode)
+                    or initial.st_uid != os.geteuid()
+                    or initial.st_nlink != 1
+                    or initial.st_size > _MAX_ATTESTATION_FILE_BYTES
+                    or file_bytes + initial.st_size > _MAX_RELEASE_TREE_BYTES
+                ):
+                    raise _Invalid()
+                entries.append((relative, False, initial_metadata))
+                payload = _read_attestation_fd(descriptor, initial_metadata)
+                file_bytes += len(payload)
+                if file_bytes > _MAX_RELEASE_TREE_BYTES:
+                    raise _Invalid()
+                rows.append(
+                    f"F {relative}\0{mode:04o}\0{len(payload)}\0".encode()
+                    + hashlib.sha256(payload).hexdigest().encode("ascii")
+                    + b"\n"
+                )
+            finally:
+                os.close(descriptor)
+        return tuple(entries), tuple(rows)
+    finally:
+        for descriptor, _relative, _item in stack:
+            os.close(descriptor)
+
+
+def _open_release_file(
+    release_fd: int, relative: Path, *, mode: int
+) -> bytes:
+    if not relative.parts or relative.is_absolute() or any(
+        part in {"", ".", ".."} or "\\" in part for part in relative.parts
+    ):
+        raise _Invalid()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.dup(release_fd)
+    try:
+        for index, component in enumerate(relative.parts):
+            next_descriptor = os.open(
+                component,
+                file_flags if index == len(relative.parts) - 1 else directory_flags,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        item = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(item.st_mode)
+            or item.st_uid != os.geteuid()
+            or item.st_nlink != 1
+            or stat.S_IMODE(item.st_mode) != mode
+            or not 1 <= item.st_size <= _MAX_ATTESTATION_FILE_BYTES
+        ):
+            raise _Invalid()
+        return _read_attestation_fd(descriptor, _metadata(item))
+    finally:
+        os.close(descriptor)
+
+
+def _record_digest(value: object, payload: bytes) -> bool:
+    if type(value) is not str or not value.startswith("sha256="):
+        return False
+    encoded = value[7:]
+    if len(encoded) != 43 or any(
+        char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        for char in encoded
+    ):
+        return False
+    try:
+        decoded = base64.urlsafe_b64decode(encoded + "=")
+    except (ValueError, TypeError):
+        return False
+    expected = hashlib.sha256(payload).digest()
+    return (
+        decoded == expected
+        and encoded
+        == base64.urlsafe_b64encode(expected).decode("ascii").rstrip("=")
+    )
+
+
+def _verify_record(
+    release_fd: int, attestation: _ActiveAttestationV2, record_payload: bytes
+) -> None:
+    try:
+        site_packages = attestation.record_path.parent.parent.relative_to(
+            attestation.release_dir
+        )
+        record_relative = attestation.record_path.relative_to(
+            attestation.record_path.parent.parent
+        ).as_posix()
+        entrypoint_relative = attestation.entrypoint_path.relative_to(
+            attestation.record_path.parent.parent
+        ).as_posix()
+        rows = csv.reader(io.StringIO(record_payload.decode("utf-8")))
+    except (UnicodeDecodeError, ValueError, csv.Error) as exc:
+        raise _Invalid() from exc
+    seen: set[str] = set()
+    entrypoint_valid = False
+    count = 0
+    try:
+        for row in rows:
+            count += 1
+            if count > _MAX_RELEASE_TREE_ENTRIES or len(row) != 3:
+                raise _Invalid()
+            relative, digest, size_text = row
+            if (
+                not relative
+                or relative in seen
+                or relative.startswith("/")
+                or "\\" in relative
+                or "\x00" in relative
+            ):
+                raise _Invalid()
+            pieces = relative.split("/")
+            if any(piece in {"", ".", ".."} for piece in pieces):
+                raise _Invalid()
+            seen.add(relative)
+            payload = _open_release_file(
+                release_fd, site_packages.joinpath(*pieces), mode=0o600
+            )
+            if digest or size_text:
+                if (
+                    not digest
+                    or not size_text
+                    or not size_text.isdecimal()
+                    or not _record_digest(digest, payload)
+                    or int(size_text) != len(payload)
+                ):
+                    raise _Invalid()
+                if relative == entrypoint_relative:
+                    entrypoint_valid = True
+            elif relative != record_relative:
+                raise _Invalid()
+    except (csv.Error, ValueError, OverflowError) as exc:
+        raise _Invalid() from exc
+    if not seen or record_relative not in seen or not entrypoint_valid:
+        raise _Invalid()
+
+
+def _attest_active_release(
+    guard: _FdGuard, integration_fd: int, state_home: Path, active_payload: bytes
+) -> _ActiveManifest:
+    attestation = _active_manifest_v2(active_payload, state_home)
+    guard.absolute_directory(attestation.data_home)
+    releases_fd = guard.directory(integration_fd, "releases")
+    release_fd = guard.directory(releases_fd, attestation.manifest.release_id)
+    initial_entries, initial_rows = _release_tree(release_fd)
+    if hashlib.sha256(b"".join(initial_rows)).hexdigest() != attestation.release_tree_sha256:
+        raise _Invalid()
+    def relative(path: Path) -> Path:
+        return path.relative_to(attestation.release_dir)
+
+    entrypoint = _open_release_file(
+        release_fd, relative(attestation.entrypoint_path), mode=0o600
+    )
+    launcher = _open_release_file(
+        release_fd, relative(attestation.launcher_path), mode=0o700
+    )
+    record = _open_release_file(release_fd, relative(attestation.record_path), mode=0o600)
+    wheel = _open_release_file(release_fd, relative(attestation.wheel_path), mode=0o600)
+    if (
+        hashlib.sha256(entrypoint).hexdigest() != attestation.entrypoint_sha256
+        or hashlib.sha256(launcher).hexdigest() != attestation.launcher_sha256
+        or hashlib.sha256(record).hexdigest() != attestation.record_sha256
+        or hashlib.sha256(wheel).hexdigest() != attestation.wheel_sha256
+        or b" -B -I -m codex_usage.integration_entrypoint" not in launcher
+        or b" PYTHONDONTWRITEBYTECODE=1 XDG_DATA_HOME=" not in launcher
+    ):
+        raise _Invalid()
+    _verify_record(release_fd, attestation, record)
+    metadata = _open_release_file(
+        release_fd,
+        relative(attestation.record_path.parent / "METADATA"),
+        mode=0o600,
+    )
+    try:
+        metadata_text = metadata.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _Invalid() from exc
+    if (
+        "Name: codex-usage-integration-producer\n" not in metadata_text
+        or "Version: 0.6.537\n" not in metadata_text
+    ):
+        raise _Invalid()
+    repeated_entries, repeated_rows = _release_tree(release_fd)
+    if repeated_entries != initial_entries or repeated_rows != initial_rows:
+        raise _Invalid()
+    return attestation.manifest
 
 
 def _pointer(value: dict[str, object]) -> tuple[str, str]:
@@ -819,6 +1704,511 @@ def _payload(
     )
 
 
+def _payload_token(value: object, maximum: int) -> str:
+    if (
+        type(value) is not str
+        or not 1 <= len(value) <= maximum
+        or not value.isascii()
+        or _ASCII_TOKEN_RE.fullmatch(value) is None
+        or _LOCAL_PATH_RE.search(value) is not None
+    ):
+        raise _Invalid()
+    return value
+
+
+def _payload_secret_key(key: str) -> bool:
+    normalized = key.casefold().replace("_", "")
+    return normalized in _PAYLOAD_SECRET_NAMES or normalized.endswith(
+        _PAYLOAD_SECRET_SUFFIXES
+    )
+
+
+def _scan_payload_secrets(value: object, *, depth: int = 0) -> None:
+    if depth > 64:
+        raise _Invalid()
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if (
+                type(key) is not str
+                or _PAYLOAD_KEY_RE.fullmatch(key) is None
+                or _payload_secret_key(key)
+            ):
+                raise _Invalid()
+            _scan_payload_secrets(nested, depth=depth + 1)
+        return
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            _scan_payload_secrets(nested, depth=depth + 1)
+        return
+    if isinstance(value, str):
+        if (
+            value.startswith("Bearer ")
+            or _JWT_RE.fullmatch(value)
+            or _PEM_PRIVATE_KEY_RE.search(value)
+            or _LOCAL_PATH_RE.search(value)
+        ):
+            raise _Invalid()
+        return
+    if value is None or type(value) in (bool, int, float):
+        return
+    raise _Invalid()
+
+
+def _payload_timestamp_text(value: object) -> str:
+    if type(value) is not str or len(value) > 64 or "T" not in value:
+        raise _Invalid()
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        raise _Invalid() from None
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise _Invalid()
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _payload_percent(value: object) -> float:
+    if type(value) not in (int, float):
+        raise _Invalid()
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise _Invalid() from None
+    if not math.isfinite(result) or not 0 <= result <= 100:
+        raise _Invalid()
+    return result
+
+
+def _payload_rate(value: object) -> float:
+    if type(value) not in (int, float):
+        raise _Invalid()
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise _Invalid() from None
+    if not math.isfinite(result) or not 0 <= result <= 100.0:
+        raise _Invalid()
+    return result
+
+
+def _serialize_payload_v2(value: object) -> bytes:
+    """Mirror the producer's schema-2 serializer before accepting its bytes."""
+    if type(value) is not dict:
+        raise _Invalid()
+    _exact(value, {"accounts", "generated_at", "schema_version"})
+    if type(value["schema_version"]) is not int or value["schema_version"] != 2:
+        raise _Invalid()
+    generated_at = _payload_timestamp_text(value["generated_at"])
+    generated_time = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    raw_accounts = value["accounts"]
+    if type(raw_accounts) is not list or len(raw_accounts) > _MAX_ACCOUNTS:
+        raise _Invalid()
+    accounts: list[dict[str, object]] = []
+    account_ids: set[str] = set()
+    for raw_account in raw_accounts:
+        if type(raw_account) is not dict:
+            raise _Invalid()
+        _exact(
+            raw_account,
+            {"account_id", "freshness", "limits", "status", "tracker_evidence"},
+        )
+        account_id = _payload_token(raw_account["account_id"], 64)
+        if _ACCOUNT_RE.fullmatch(account_id) is None or account_id in account_ids:
+            raise _Invalid()
+        status = raw_account["status"]
+        if type(status) is not str or status not in _PAYLOAD_STATUSES:
+            raise _Invalid()
+        freshness = raw_account["freshness"]
+        if type(freshness) is not dict:
+            raise _Invalid()
+        _exact(freshness, {"captured_at", "fresh_until", "stale"})
+        if type(freshness["stale"]) is not bool:
+            raise _Invalid()
+        captured_at = _payload_timestamp_text(freshness["captured_at"])
+        fresh_until = _payload_timestamp_text(freshness["fresh_until"])
+        captured_time = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+        fresh_until_time = datetime.fromisoformat(fresh_until.replace("Z", "+00:00"))
+        if (
+            captured_time > generated_time
+            or fresh_until_time != captured_time + timedelta(minutes=15)
+            or (generated_time > fresh_until_time and freshness["stale"] is not True)
+        ):
+            raise _Invalid()
+        raw_limits = raw_account["limits"]
+        if type(raw_limits) is not list or len(raw_limits) > _MAX_LIMITS:
+            raise _Invalid()
+        limits: list[dict[str, object]] = []
+        limit_ids: set[tuple[str, int]] = set()
+        for raw_limit in raw_limits:
+            if type(raw_limit) is not dict:
+                raise _Invalid()
+            if not {"pool", "window_seconds", "used_percent", "remaining_percent"} <= set(
+                raw_limit
+            ) or set(raw_limit) - {
+                "pool",
+                "window_seconds",
+                "used_percent",
+                "remaining_percent",
+                "reset_at",
+            }:
+                raise _Invalid()
+            window_seconds = raw_limit["window_seconds"]
+            if type(window_seconds) is not int or window_seconds not in _WINDOWS:
+                raise _Invalid()
+            used_percent = _payload_percent(raw_limit["used_percent"])
+            remaining_percent = _payload_percent(raw_limit["remaining_percent"])
+            if not math.isclose(
+                used_percent + remaining_percent,
+                100.0,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise _Invalid()
+            pool = _payload_token(raw_limit["pool"], 64)
+            identity = (pool, window_seconds)
+            if identity in limit_ids:
+                raise _Invalid()
+            limit_ids.add(identity)
+            limit: dict[str, object] = {
+                "pool": pool,
+                "remaining_percent": remaining_percent,
+                "used_percent": used_percent,
+                "window_seconds": window_seconds,
+            }
+            if "reset_at" in raw_limit:
+                limit["reset_at"] = _payload_timestamp_text(raw_limit["reset_at"])
+            limits.append(limit)
+        raw_evidence = raw_account["tracker_evidence"]
+        if type(raw_evidence) is not list or len(raw_evidence) > _MAX_TRENDS:
+            raise _Invalid()
+        evidence: list[dict[str, object]] = []
+        evidence_ids: set[tuple[str, int]] = set()
+        for raw_tracker in raw_evidence:
+            if type(raw_tracker) is not dict:
+                raise _Invalid()
+            _exact(
+                raw_tracker,
+                {
+                    "coverage",
+                    "ema_time_constant_seconds",
+                    "first_sample_at",
+                    "last_sample_at",
+                    "limit_window_seconds",
+                    "pool",
+                    "projected_used_percent_at_reset",
+                    "rate_percentage_points_per_second",
+                    "reset_generation",
+                    "sample_count",
+                },
+            )
+            coverage = raw_tracker["coverage"]
+            sample_count = raw_tracker["sample_count"]
+            window_seconds = raw_tracker["limit_window_seconds"]
+            if (
+                type(coverage) is not str
+                or coverage not in _TRACKER_COVERAGES
+                or type(raw_tracker["ema_time_constant_seconds"]) is not int
+                or raw_tracker["ema_time_constant_seconds"] != 3600
+                or type(window_seconds) is not int
+                or window_seconds not in _WINDOWS
+                or type(sample_count) is not int
+                or not 1 <= sample_count <= _MAX_HISTORY_SAMPLES
+                or (coverage == "insufficient") != (sample_count == 1)
+            ):
+                raise _Invalid()
+            pool = _payload_token(raw_tracker["pool"], 64)
+            identity = (pool, window_seconds)
+            if identity in evidence_ids:
+                raise _Invalid()
+            evidence_ids.add(identity)
+            first_sample_at = _payload_timestamp_text(raw_tracker["first_sample_at"])
+            last_sample_at = _payload_timestamp_text(raw_tracker["last_sample_at"])
+            first_sample_time = datetime.fromisoformat(first_sample_at.replace("Z", "+00:00"))
+            last_sample_time = datetime.fromisoformat(last_sample_at.replace("Z", "+00:00"))
+            if (
+                first_sample_time > last_sample_time
+                or (sample_count == 1 and first_sample_time != last_sample_time)
+                or (sample_count > 1 and first_sample_time >= last_sample_time)
+            ):
+                raise _Invalid()
+            evidence.append(
+                {
+                    "coverage": coverage,
+                    "ema_time_constant_seconds": 3600,
+                    "first_sample_at": first_sample_at,
+                    "last_sample_at": last_sample_at,
+                    "limit_window_seconds": window_seconds,
+                    "pool": pool,
+                    "projected_used_percent_at_reset": _payload_percent(
+                        raw_tracker["projected_used_percent_at_reset"]
+                    ),
+                    "rate_percentage_points_per_second": _payload_rate(
+                        raw_tracker["rate_percentage_points_per_second"]
+                    ),
+                    "reset_generation": _payload_token(
+                        raw_tracker["reset_generation"], 128
+                    ),
+                    "sample_count": sample_count,
+                }
+            )
+        limits_with_reset = {
+            (item["pool"], item["window_seconds"]): datetime.fromisoformat(
+                item["reset_at"].replace("Z", "+00:00")
+            )
+            for item in limits
+            if "reset_at" in item
+        }
+        if not evidence_ids.issubset(limits_with_reset):
+            raise _Invalid()
+        if status not in {"ok", "partial"} and (limits or evidence):
+            raise _Invalid()
+        for item in evidence:
+            last_sample_time = datetime.fromisoformat(
+                item["last_sample_at"].replace("Z", "+00:00")
+            )
+            identity = (item["pool"], item["limit_window_seconds"])
+            sample_age = generated_time - last_sample_time
+            if (
+                last_sample_time > captured_time
+                or limits_with_reset[identity] <= last_sample_time
+                or limits_with_reset[identity] <= generated_time
+                or (
+                    item["coverage"] in {"complete", "partial"}
+                    and sample_age > timedelta(minutes=15)
+                )
+                or (
+                    item["coverage"] == "stale"
+                    and sample_age <= timedelta(minutes=15)
+                )
+            ):
+                raise _Invalid()
+        account_ids.add(account_id)
+        accounts.append(
+            {
+                "account_id": account_id,
+                "freshness": {
+                    "captured_at": captured_at,
+                    "fresh_until": fresh_until,
+                    "stale": freshness["stale"],
+                },
+                "limits": sorted(
+                    limits, key=lambda item: (item["pool"], item["window_seconds"])
+                ),
+                "status": status,
+                "tracker_evidence": sorted(
+                    evidence,
+                    key=lambda item: (item["pool"], item["limit_window_seconds"]),
+                ),
+            }
+        )
+    document: dict[str, object] = {
+        "accounts": sorted(accounts, key=lambda item: item["account_id"]),
+        "generated_at": generated_at,
+        "schema_version": 2,
+    }
+    _scan_payload_secrets(document)
+    try:
+        return json.dumps(
+            document,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise _Invalid() from None
+
+
+def _payload_v2(
+    payload: bytes, now: datetime
+) -> tuple[tuple[AccountUsageEvidenceV2, ...], ReaderStatus, datetime | None, datetime]:
+    value = _canonical_json(payload, _MAX_PAYLOAD_BYTES)
+    if _serialize_payload_v2(value) != payload:
+        raise _Invalid()
+    _exact(value, {"accounts", "generated_at", "schema_version"})
+    if type(value["schema_version"]) is not int or value["schema_version"] != 2:
+        raise _Invalid()
+    generated_at = _canonical_timestamp(value["generated_at"])
+    raw_accounts = value["accounts"]
+    if type(raw_accounts) is not list or len(raw_accounts) > _MAX_ACCOUNTS:
+        raise _Invalid()
+    accounts: list[AccountUsageEvidenceV2] = []
+    account_ids: set[str] = set()
+    captured_values: set[datetime] = set()
+    stale = False
+    partial = False
+    for raw_account in raw_accounts:
+        if type(raw_account) is not dict:
+            raise _Invalid()
+        _exact(raw_account, {"account_id", "freshness", "limits", "status", "tracker_evidence"})
+        account_id = _payload_token(raw_account["account_id"], 64)
+        if account_id in {".", ".."} or _ACCOUNT_RE.fullmatch(account_id) is None:
+            raise _Invalid()
+        if account_id in account_ids:
+            raise _Invalid()
+        account_ids.add(account_id)
+        status = raw_account["status"]
+        if type(status) is not str or status not in _PAYLOAD_STATUSES:
+            raise _Invalid()
+        freshness = raw_account["freshness"]
+        if type(freshness) is not dict:
+            raise _Invalid()
+        _exact(freshness, {"captured_at", "fresh_until", "stale"})
+        if type(freshness["stale"]) is not bool:
+            raise _Invalid()
+        captured_at = _canonical_timestamp(freshness["captured_at"])
+        fresh_until = _canonical_timestamp(freshness["fresh_until"])
+        if (
+            captured_at > generated_at
+            or fresh_until != captured_at + timedelta(minutes=15)
+            or (generated_at > fresh_until and freshness["stale"] is not True)
+        ):
+            raise _Invalid()
+        captured_values.add(captured_at)
+        raw_limits = raw_account["limits"]
+        if type(raw_limits) is not list or len(raw_limits) > _MAX_LIMITS:
+            raise _Invalid()
+        limits: dict[tuple[str, int], tuple[float, float, datetime | None]] = {}
+        for raw_limit in raw_limits:
+            if type(raw_limit) is not dict:
+                raise _Invalid()
+            if not {"pool", "window_seconds", "used_percent", "remaining_percent"} <= set(
+                raw_limit
+            ) or set(raw_limit) - {
+                "pool",
+                "window_seconds",
+                "used_percent",
+                "remaining_percent",
+                "reset_at",
+            }:
+                raise _Invalid()
+            pool = _payload_token(raw_limit["pool"], 64)
+            window = raw_limit["window_seconds"]
+            if type(window) is not int or window not in _WINDOWS:
+                raise _Invalid()
+            used = _percent(raw_limit["used_percent"])
+            remaining = _percent(raw_limit["remaining_percent"])
+            if abs(used + remaining - 100.0) > 1e-9:
+                raise _Invalid()
+            reset_at = (
+                _canonical_timestamp(raw_limit["reset_at"])
+                if "reset_at" in raw_limit
+                else None
+            )
+            key = (pool, window)
+            if key in limits:
+                raise _Invalid()
+            limits[key] = (used, remaining, reset_at)
+        raw_trackers = raw_account["tracker_evidence"]
+        if type(raw_trackers) is not list or len(raw_trackers) > _MAX_TRENDS:
+            raise _Invalid()
+        trackers: dict[tuple[str, int], TrackerEvidenceV2] = {}
+        for raw_tracker in raw_trackers:
+            if type(raw_tracker) is not dict:
+                raise _Invalid()
+            _exact(
+                raw_tracker,
+                {
+                    "coverage",
+                    "ema_time_constant_seconds",
+                    "first_sample_at",
+                    "last_sample_at",
+                    "limit_window_seconds",
+                    "pool",
+                    "projected_used_percent_at_reset",
+                    "rate_percentage_points_per_second",
+                    "reset_generation",
+                    "sample_count",
+                },
+            )
+            coverage = raw_tracker["coverage"]
+            window = raw_tracker["limit_window_seconds"]
+            samples = raw_tracker["sample_count"]
+            if (
+                type(coverage) is not str
+                or coverage not in _TRACKER_COVERAGES
+                or type(raw_tracker["ema_time_constant_seconds"]) is not int
+                or raw_tracker["ema_time_constant_seconds"] != 3600
+                or type(window) is not int
+                or window not in _WINDOWS
+                or type(samples) is not int
+                or not 1 <= samples <= _MAX_HISTORY_SAMPLES
+                or (coverage == "insufficient") != (samples == 1)
+            ):
+                raise _Invalid()
+            pool = _payload_token(raw_tracker["pool"], 64)
+            first_sample = _canonical_timestamp(raw_tracker["first_sample_at"])
+            last_sample = _canonical_timestamp(raw_tracker["last_sample_at"])
+            reset_generation = _payload_token(raw_tracker["reset_generation"], 128)
+            if (
+                first_sample > last_sample
+                or (samples == 1 and first_sample != last_sample)
+                or (samples > 1 and first_sample >= last_sample)
+                or (pool, window) not in limits
+                or limits[(pool, window)][2] is None
+                or last_sample > captured_at
+                or limits[(pool, window)][2] <= last_sample
+                or limits[(pool, window)][2] <= generated_at
+                or (
+                    coverage in {"complete", "partial"}
+                    and generated_at - last_sample > timedelta(minutes=15)
+                )
+                or (
+                    coverage == "stale"
+                    and generated_at - last_sample <= timedelta(minutes=15)
+                )
+            ):
+                raise _Invalid()
+            _percent(raw_tracker["projected_used_percent_at_reset"])
+            rate = raw_tracker["rate_percentage_points_per_second"]
+            if (
+                isinstance(rate, bool)
+                or not isinstance(rate, (int, float))
+                or not math.isfinite(float(rate))
+                or not 0 <= float(rate) <= 100.0
+                or (pool, window) in trackers
+            ):
+                raise _Invalid()
+            trackers[(pool, window)] = TrackerEvidenceV2(
+                pool, window, reset_generation, coverage, last_sample
+            )
+        if status not in {"ok", "partial"} and (limits or trackers):
+            raise _Invalid()
+        if freshness["stale"] is True or now > fresh_until:
+            stale = True
+        if status != "ok" or any(
+            key not in trackers or trackers[key].coverage != "complete"
+            for key in limits
+        ):
+            partial = True
+        evidence_limits = tuple(
+            UsageLimitV2(
+                pool,
+                window,
+                trackers[(pool, window)].reset_generation,
+                used,
+                remaining,
+                reset_at,
+            )
+            for (pool, window), (used, remaining, reset_at) in sorted(limits.items())
+            if (pool, window) in trackers and reset_at is not None
+        )
+        accounts.append(
+            AccountUsageEvidenceV2(
+                account_id,
+                evidence_limits,
+                (),
+                tuple(trackers[key] for key in sorted(trackers)),
+            )
+        )
+    status: ReaderStatus = "stale" if stale else "partial" if partial else "complete"
+    return (
+        tuple(sorted(accounts, key=lambda account: account.account_id)),
+        status,
+        next(iter(captured_values)) if len(captured_values) == 1 else None,
+        generated_at,
+    )
+
+
 def _lock_root() -> Path:
     try:
         home = pwd.getpwuid(os.geteuid()).pw_dir
@@ -846,6 +2236,218 @@ def _acquire_shared(descriptor: int) -> None:
         raise _Busy() from exc
     except OSError as exc:
         raise _Invalid() from exc
+
+
+def _validate_generation_v2(
+    guard: _FdGuard,
+    generations_fd: int,
+    generation_id: str,
+    binding_sha256: str,
+    active: _ActiveManifest | None,
+    now: datetime,
+) -> _ValidatedGenerationV2:
+    generation_fd = guard.directory(generations_fd, generation_id)
+    try:
+        names = os.listdir(generation_fd)
+    except OSError as exc:
+        raise _Invalid() from exc
+    required_names = {
+        "account-usage-v2.binding.json",
+        "account-usage-v2.json",
+        "pool-authority-v2.json",
+    }
+    if not required_names.issubset(names):
+        raise _Unavailable()
+    if set(names) != required_names:
+        raise _Invalid()
+    binding_bytes = guard.read_file(
+        generation_fd,
+        "account-usage-v2.binding.json",
+        _MAX_BINDING_BYTES,
+        missing_is_unavailable=True,
+    )
+    binding = _binding_v2(binding_bytes)
+    if (
+        binding.generation_id != generation_id
+        or hashlib.sha256(binding_bytes).hexdigest() != binding_sha256
+    ):
+        raise _Invalid()
+    payload = guard.read_file(
+        generation_fd,
+        "account-usage-v2.json",
+        _MAX_PAYLOAD_BYTES,
+        missing_is_unavailable=True,
+    )
+    if (
+        len(payload) != binding.payload_size_bytes
+        or hashlib.sha256(payload).hexdigest() != binding.payload_sha256
+    ):
+        raise _Invalid()
+    accounts, status, captured_at, generated_at = _payload_v2(payload, now)
+    if binding.published_at != generated_at:
+        raise _Invalid()
+    authority_bytes = guard.read_file(
+        generation_fd,
+        "pool-authority-v2.json",
+        _MAX_POOL_AUTHORITY_BYTES,
+        missing_is_unavailable=True,
+    )
+    authority = _pool_authority_v2(authority_bytes)
+    if (
+        len(authority_bytes) != binding.pool_authority_size_bytes
+        or hashlib.sha256(authority_bytes).hexdigest() != binding.pool_authority_sha256
+        or authority.generation_id != binding.generation_id
+        or authority.release_id != binding.release_id
+        or authority.issued_at != binding.published_at
+        or authority.usage_payload_sha256 != binding.payload_sha256
+        or authority.usage_binding_sha256
+        != hashlib.sha256(_usage_binding_bytes(binding)).hexdigest()
+        or {account.account_id for account in accounts}
+        != {entry.account_id for entry in authority.authorities}
+    ):
+        raise _Invalid()
+    if active is not None and (
+        binding.active_manifest_sha256 != active.digest
+        or binding.release_id != active.release_id
+        or binding.source_manifest_sha256 != active.source_manifest_sha256
+    ):
+        raise _Invalid()
+    if now >= authority.expires_at:
+        status = "stale"
+    return _ValidatedGenerationV2(
+        accounts,
+        status,
+        captured_at,
+        generated_at,
+        authority.authorities,
+        binding,
+    )
+
+
+def _read_chain_v2(
+    state_home: Path, now: datetime
+) -> tuple[
+    tuple[AccountUsageEvidenceV2, ...],
+    ReaderStatus,
+    datetime | None,
+    datetime,
+    tuple[PoolAuthorityV2, ...],
+]:
+    if type(state_home) is not type(Path()) or not state_home.is_absolute():
+        raise _Invalid()
+    guard = _FdGuard()
+    locked: list[int] = []
+    try:
+        state_fd = guard.absolute_directory(state_home)
+        usage_fd = guard.directory(state_fd, "codex-usage")
+        integration_fd = guard.directory(usage_fd, "integration")
+        lock_fd = guard.private_lock_directory(_lock_root())
+        integration_path = state_home / "codex-usage" / "integration"
+        for target in ("producer-install", "current.json"):
+            descriptor = guard.lock(lock_fd, _evidence_lock_name(integration_path / target))
+            _acquire_shared(descriptor)
+            locked.append(descriptor)
+        active_bytes = guard.read_file(
+            integration_fd,
+            "active.json",
+            _MAX_MANIFEST_BYTES,
+            missing_is_unavailable=True,
+        )
+        active = _attest_active_release(guard, integration_fd, state_home, active_bytes)
+        generations_fd = guard.directory(integration_fd, "generations")
+        pointer_bytes = guard.read_file(
+            integration_fd,
+            "current.json",
+            _MAX_POINTER_BYTES,
+            missing_is_unavailable=True,
+        )
+        generation_id, binding_sha256, previous_id, previous_sha256 = _pointer_v1(
+            _canonical_json(pointer_bytes, _MAX_POINTER_BYTES)
+        )
+        current = _validate_generation_v2(
+            guard,
+            generations_fd,
+            generation_id,
+            binding_sha256,
+            active,
+            now,
+        )
+        previous: _ValidatedGenerationV2 | None = None
+        if previous_id is not None and previous_sha256 is not None:
+            previous = _validate_generation_v2(
+                guard,
+                generations_fd,
+                previous_id,
+                previous_sha256,
+                None,
+                now,
+            )
+        guard.revalidate()
+        repeated_active_bytes = guard.read_file(
+            integration_fd,
+            "active.json",
+            _MAX_MANIFEST_BYTES,
+            missing_is_unavailable=True,
+        )
+        repeated_active = _attest_active_release(
+            guard, integration_fd, state_home, repeated_active_bytes
+        )
+        repeated_pointer_bytes = guard.read_file(
+            integration_fd,
+            "current.json",
+            _MAX_POINTER_BYTES,
+            missing_is_unavailable=True,
+        )
+        if repeated_active != active or repeated_pointer_bytes != pointer_bytes:
+            raise _Invalid()
+        (
+            repeated_generation,
+            repeated_sha256,
+            repeated_previous_id,
+            repeated_previous_sha256,
+        ) = (
+            _pointer_v1(_canonical_json(repeated_pointer_bytes, _MAX_POINTER_BYTES))
+        )
+        repeated_current = _validate_generation_v2(
+            guard,
+            generations_fd,
+            repeated_generation,
+            repeated_sha256,
+            repeated_active,
+            now,
+        )
+        repeated_previous: _ValidatedGenerationV2 | None = None
+        if repeated_previous_id is not None and repeated_previous_sha256 is not None:
+            repeated_previous = _validate_generation_v2(
+                guard,
+                generations_fd,
+                repeated_previous_id,
+                repeated_previous_sha256,
+                None,
+                now,
+            )
+        if (
+            repeated_current != current
+            or repeated_previous != previous
+            or repeated_previous_id != previous_id
+            or repeated_previous_sha256 != previous_sha256
+        ):
+            raise _Invalid()
+        guard.revalidate()
+        return (
+            current.accounts,
+            current.status,
+            current.captured_at,
+            current.generated_at,
+            current.authorities,
+        )
+    finally:
+        for descriptor in reversed(locked):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        guard.close()
 
 
 def _read_chain(
@@ -921,10 +2523,10 @@ def read_usage_evidence_v2(
     """Read one V2 generation; no retry, fallback, cache, process, or mutation."""
     try:
         now = _clock(clock or (lambda: datetime.now(UTC)))
-        accounts, status, captured_at, generated_at = _read_chain(
+        accounts, status, captured_at, generated_at, authorities = _read_chain_v2(
             state_home or _default_state_home(), now
         )
-        return UsageEvidenceV2(accounts, status, captured_at, generated_at)
+        return UsageEvidenceV2(accounts, status, captured_at, generated_at, authorities)
     except _Busy:
         return UsageEvidenceV2((), "busy", None, None)
     except _Unavailable:
@@ -975,6 +2577,7 @@ def display_snapshot_from_evidence(
 __all__ = [
     "AccountUsage",
     "AccountUsageEvidenceV2",
+    "PoolAuthorityV2",
     "ReaderStatus",
     "TrackerEvidenceV2",
     "UsageCostWindow",

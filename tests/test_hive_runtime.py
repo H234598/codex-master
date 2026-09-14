@@ -20,14 +20,12 @@ from codex_master.hive.repositories import RepositoryRegistry
 from codex_master.server import AgentError, build_server_admission_runtime
 from codex_master.usage_snapshot import (
     AccountUsageEvidenceV2,
+    PoolAuthorityV2,
     TrackerEvidenceV2,
     UsageEvidenceV2,
     UsageLimitV2,
     UsageTrendV2,
 )
-import codex_master.hive.runtime as hive_runtime
-
-
 ROOT = Path(__file__).resolve().parents[1]
 SHADOW_CONFIG = ROOT / "tests" / "fixtures" / "hive" / "hive-shadow-valid.json"
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
@@ -385,7 +383,9 @@ def test_runtime_evidence_does_not_treat_unlocked_state_directory_as_ready(tmp_p
     assert evidence.mutation_performed is False
 
 
-def _attested_usage_evidence(*, now: datetime, status: str = "complete") -> UsageEvidenceV2:
+def _attested_usage_evidence(
+    *, now: datetime, status: str = "complete", with_authority: bool = False
+) -> UsageEvidenceV2:
     generation = "attested-generation"
     return UsageEvidenceV2(
         accounts=(
@@ -408,12 +408,26 @@ def _attested_usage_evidence(*, now: datetime, status: str = "complete") -> Usag
         status=status,  # type: ignore[arg-type]
         captured_at=now,
         generated_at=now,
+        pool_authorities=(
+            PoolAuthorityV2(
+                account_id="attested-pool",
+                pool_id="dynamic-pool",
+                provider="openai",
+                allowed_lifecycles=("persistent",),
+                allowed_model_families=("sol",),
+                hive_available=True,
+                persistent_leadership_eligible=True,
+                long_running_leadership_eligible=True,
+                reasoning_minimum="max",
+                reasoning_maximum="max",
+            ),
+        )
+        if with_authority
+        else (),
     )
 
 
-def test_enforced_pilot_gate_requires_an_attested_pool_reader_not_a_dynamic_mapping(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_enforced_pilot_gate_does_not_authorize_any_static_usage_or_authority_evidence() -> None:
     classes, source_config = config_bundle()
     classes = {
         **classes,
@@ -443,31 +457,29 @@ def test_enforced_pilot_gate_requires_an_attested_pool_reader_not_a_dynamic_mapp
         ),
     )
 
-    monkeypatch.setattr(
-        hive_runtime,
-        "read_usage_evidence_v2",
-        lambda *, clock: _attested_usage_evidence(now=NOW),
-    )
+    usage_only = _attested_usage_evidence(now=NOW)
+    usage_with_authority = _attested_usage_evidence(now=NOW, with_authority=True)
+    assert usage_only.status == "complete"
+    assert usage_only.pool_authorities == ()
+    assert usage_with_authority.status == "complete"
+    assert usage_with_authority.pool_authorities[0].account_id == "attested-pool"
 
     assert enforced_pilot_gate(config, classes, {"fresh": True, "model_family": "sol", "reasoning": "max", "long_lived": True}) == {
         "allowed": False,
         "reason_code": "pilot_account_attestation_invalid",
         "raw_output": "not_returned",
     }
-    ready = enforced_pilot_gate(config, classes, now=lambda: NOW)
-    assert ready == {"allowed": True, "reason_code": "pilot_ready", "raw_output": "not_returned"}
-    monkeypatch.setattr(
-        hive_runtime,
-        "read_usage_evidence_v2",
-        lambda *, clock: _attested_usage_evidence(now=NOW, status="stale"),
-    )
     assert enforced_pilot_gate(config, classes, now=lambda: NOW) == {
         "allowed": False,
         "reason_code": "pilot_account_attestation_invalid",
         "raw_output": "not_returned",
     }
-    monkeypatch.setattr(hive_runtime, "read_usage_evidence_v2", lambda *, clock: {"issuer": "unknown"})
-    assert enforced_pilot_gate(config, classes, now=lambda: NOW) == {
+    assert enforced_pilot_gate(config, classes, usage_only, now=lambda: NOW) == {
+        "allowed": False,
+        "reason_code": "pilot_account_attestation_invalid",
+        "raw_output": "not_returned",
+    }
+    assert enforced_pilot_gate(config, classes, usage_with_authority, now=lambda: NOW) == {
         "allowed": False,
         "reason_code": "pilot_account_attestation_invalid",
         "raw_output": "not_returned",
