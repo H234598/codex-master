@@ -3,12 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-import hashlib
-import json
-import os
 from pathlib import Path
-import platform
-import stat
 
 from the_hive.hive.evidence_receipts import EvidenceReceiptV1
 from the_hive.hive.indexed_tests import TestIndexV1
@@ -17,63 +12,11 @@ from the_hive.hive.evidence_runner import TestEvidenceRunner
 from the_hive.hive.evidence_store import TestStatusStore
 
 
-_MAX_INDEX_BYTES = 50 * 1024 * 1024
-
-
-def _digest(value: bytes) -> str:
-    return "sha256:" + hashlib.sha256(value).hexdigest()
-
-
-def load_test_index(repository_root: Path) -> TestIndexV1:
-    root = Path(repository_root).resolve()
-    target = root / ".hive" / "test-index.v1.json"
-    try:
-        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError:
-        raise ValueError("test.index_missing") from None
-    except OSError:
-        raise ValueError("test.index_invalid") from None
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > _MAX_INDEX_BYTES:
-            raise ValueError("test.index_invalid")
-        raw = os.read(descriptor, _MAX_INDEX_BYTES + 1)
-    finally:
-        os.close(descriptor)
-    if len(raw) > _MAX_INDEX_BYTES:
-        raise ValueError("test.index_invalid")
-    try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError, RecursionError):
-        raise ValueError("test.index_invalid") from None
-    index = TestIndexV1.from_mapping(value)
-    if raw != index.canonical_bytes():
-        raise ValueError("test.index_invalid")
-    return index
-
-
 def probe_test_index(repository_root: Path | None = None) -> dict[str, object]:
-    try:
-        index = load_test_index((repository_root or Path.cwd()).resolve())
-    except ValueError as exc:
-        reason = str(exc)
-        if reason not in {"test.index_missing", "test.index_invalid", "test.function_unindexed", "test.test_uncollectable", "test.assertion_missing"}:
-            reason = "test.index_invalid"
-        return {
-            "schema_version": 1,
-            "valid": False,
-            "reason_code": reason,
-            "raw_output": "not_returned",
-        }
     return {
         "schema_version": 1,
-        "repository_id": index.repository_id,
-        "index_generation": index.generation,
-        "index_digest": index.digest,
-        "valid": True,
-        "function_count": len(index.functions),
-        "test_count": len(index.tests),
-        "gate_count": len(index.gates),
+        "valid": False,
+        "reason_code": "test.index_missing",
         "raw_output": "not_returned",
     }
 
@@ -82,39 +25,7 @@ def build_local_test_service(
     repository_root: Path | None = None,
     state_root: Path | None = None,
 ) -> HiveTestEvidenceService:
-    root = (repository_root or Path.cwd()).resolve()
-    index = load_test_index(root)
-    if state_root is None:
-        base = Path(
-            os.environ.get("CODEX_MASTER_MCP_STATE")
-            or os.environ.get("CODEX_AGENT_MCP_STATE")
-            or "~/.local/state/codex-master-mcp"
-        ).expanduser()
-        state_root = base / "test-evidence" / "v1"
-    machine_material = bytearray(platform.machine().encode("utf-8"))
-    try:
-        machine_material.extend(Path("/etc/machine-id").read_bytes()[:256])
-    except OSError:
-        machine_material.extend(b"machine-id-unavailable")
-    machine_material.extend(os.fsencode(root))
-    executor = _digest(bytes(machine_material))
-    try:
-        boot_material = Path("/proc/sys/kernel/random/boot_id").read_bytes()[:256]
-    except OSError:
-        boot_material = f"process:{os.getpid()}".encode("ascii")
-    boot = _digest(boot_material)
-    environment = _digest(
-        f"python:{platform.python_version()};system:{platform.system()};machine:{platform.machine()}".encode()
-    )
-    store = TestStatusStore(Path(state_root))
-    runner = TestEvidenceRunner(
-        root,
-        store,
-        executor_fingerprint=executor,
-        boot_id_digest=boot,
-        environment_digest=environment,
-    )
-    return HiveTestEvidenceService(index, store, runner)
+    raise ValueError("test.index_missing")
 
 
 class HiveTestEvidenceService:
@@ -203,6 +114,5 @@ class HiveTestEvidenceService:
 __all__ = [
     "HiveTestEvidenceService",
     "build_local_test_service",
-    "load_test_index",
     "probe_test_index",
 ]
