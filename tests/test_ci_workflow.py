@@ -44,8 +44,8 @@ def test_manpage_gate_builds_and_renders_repository_source() -> None:
     workflow = workflow_text()
 
     assert "sudo apt-get install --no-install-recommends --yes groff-base" in workflow
-    assert './scripts/codex-master-manpage build --output-dir "${RUNNER_TEMP}/codex-master-man"' in workflow
-    assert "groff -man -Tutf8 man/man1/codex-master-mcp.1 >/dev/null" in workflow
+    assert './scripts/the-hive-manpage build --output-dir "${RUNNER_TEMP}/the-hive-man"' in workflow
+    assert "groff -man -Tutf8 man/man1/the-hive-mcp.1 >/dev/null" in workflow
 
 
 def test_external_actions_remain_full_sha_pinned_with_read_only_permissions() -> None:

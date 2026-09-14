@@ -9,8 +9,8 @@ import sys
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-INSTALLER = REPO_ROOT / "scripts" / "codex-master-manpage"
-MANPAGE_NAME = "codex-master-mcp.1.gz"
+INSTALLER = REPO_ROOT / "scripts" / "the-hive-manpage"
+MANPAGE_NAME = "the-hive-mcp.1.gz"
 
 
 def run_installer(*args: str) -> subprocess.CompletedProcess[str]:
@@ -30,7 +30,7 @@ def test_build_produces_deterministic_gzip_manpage(tmp_path: Path) -> None:
     artifact = tmp_path / MANPAGE_NAME
     first = artifact.read_bytes()
     rendered_source = gzip.decompress(first).decode("utf-8")
-    assert rendered_source.startswith('.TH "CODEX-MASTER-MCP" "1"')
+    assert rendered_source.startswith('.TH "THE-HIVE-MCP" "1"')
     assert b"\x00\x00\x00\x00" == first[4:8]
 
     result = run_installer("build", "--output-dir", os.fspath(tmp_path))

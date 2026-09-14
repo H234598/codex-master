@@ -70,8 +70,8 @@ jobs:
       - name: Check manpage
         run: |
           set -eu
-          ./scripts/codex-master-manpage build --output-dir "${RUNNER_TEMP}/codex-master-man"
-          groff -man -Tutf8 man/man1/codex-master-mcp.1 >/dev/null
+          ./scripts/the-hive-manpage build --output-dir "${RUNNER_TEMP}/the-hive-man"
+          groff -man -Tutf8 man/man1/the-hive-mcp.1 >/dev/null
 
       - name: Check committed whitespace
         env:

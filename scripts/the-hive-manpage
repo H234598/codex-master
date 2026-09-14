@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, install, or verify the codex-master-mcp(1) manpage."""
+"""Build, install, or verify the-hive-mcp(1) manpage."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ import tempfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SOURCE = REPO_ROOT / "man" / "man1" / "codex-master-mcp.1"
-ARTIFACT_NAME = "codex-master-mcp.1.gz"
+SOURCE = REPO_ROOT / "man" / "man1" / "the-hive-mcp.1"
+ARTIFACT_NAME = "the-hive-mcp.1.gz"
 
 
 class ManpageError(RuntimeError):
@@ -101,7 +101,7 @@ def verify(prefix: Path) -> Path:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Build, install, or verify codex-master-mcp(1)."
+        description="Build, install, or verify the-hive-mcp(1)."
     )
     subparsers = result.add_subparsers(dest="command", required=True)
 

@@ -1,36 +1,36 @@
-.TH "CODEX-MASTER-MCP" "1" "2026-08-14" "codex-master 0.10.5" "User Commands"
+.TH "THE-HIVE-MCP" "1" "2026-08-14" "the-hive 0.10.5" "User Commands"
 .SH NAME
-codex-master-mcp \- control the local Codex Agentinnen fleet and expose its MCP server
+the-hive-mcp \- control the local Codex Agentinnen fleet and expose its MCP server
 .SH SYNOPSIS
-.B codex-master-mcp
+.B the-hive-mcp
 .RI [ options ]
 .I command
 .RI [ command-options ]
 .PP
-.B python3 -m codex_master.server
+.B python3 -m the_hive.server
 .RI [ options ]
 .I command
 .RI [ command-options ]
 .SH DESCRIPTION
-.B codex-master-mcp
-is the command-line and MCP entry point for the local codex-master fleet.
+.B the-hive-mcp
+is the command-line and MCP entry point for the local fleet of The Hive.
 It manages sleeping Codex Agentinnen, assignments, leases, account-aware model
 selection, registry-backed provider series, and read-only Hive control-plane
 diagnostics.
 .PP
 The repository wrapper at
-.B bin/codex-master-mcp
+.B bin/the-hive-mcp
 sets
 .B PYTHONPATH
 to the repository's
 .B src
 directory and executes the Python module.  A package installation exposes the
 same entry point through the
-.B codex-master-mcp
+.B the-hive-mcp
 console script.
 .PP
 Run
-.B codex-master-mcp COMMAND --help
+.B the-hive-mcp COMMAND --help
 for command-specific arguments.  Commands that mutate sessions, homes,
 registries, plugin state, or external providers require explicit authority and
 their own safety gates.
@@ -149,7 +149,7 @@ Show read-only Selection service status.
 Manage the versioned fleet registry, accounts, provider models, series, Gemini
 plans, Ollama diagnostics, and related read-only or guarded mutation commands.
 Use
-.B codex-master-mcp fleet --help
+.B the-hive-mcp fleet --help
 for its subcommands.
 .TP
 .BR fleet-recovery-status , " " fleet-recovery-retry
@@ -202,20 +202,20 @@ Remove the installed MCP integration through the guarded uninstall path.
 Build deterministic compressed output without installing it:
 .PP
 .nf
-\&./scripts/codex-master-manpage build --output-dir /tmp/codex-master-man
+\&./scripts/the-hive-manpage build --output-dir /tmp/the-hive-man
 .fi
 .PP
 Install to the default user prefix
 .BR ~/.local :
 .PP
 .nf
-\&./scripts/codex-master-manpage install
+\&./scripts/the-hive-manpage install
 .fi
 .PP
 Verify the installed regular file, mode, and content:
 .PP
 .nf
-\&./scripts/codex-master-manpage verify
+\&./scripts/the-hive-manpage verify
 .fi
 .PP
 For isolated packaging or tests, pass an absolute
@@ -225,7 +225,7 @@ to
 and
 .BR verify .
 The resulting file is
-.BR PREFIX/share/man/man1/codex-master-mcp.1.gz .
+.BR PREFIX/share/man/man1/the-hive-mcp.1.gz .
 The installer refuses symlinks in its managed target path.
 .SH OPTIONS
 .TP
@@ -252,10 +252,10 @@ The repository wrapper prepends the repository's
 directory before running the Python module.
 .SH FILES
 .TP
-.B man/man1/codex-master-mcp.1
+.B man/man1/the-hive-mcp.1
 Canonical repository source for this manual page.
 .TP
-.B ~/.local/share/man/man1/codex-master-mcp.1.gz
+.B ~/.local/share/man/man1/the-hive-mcp.1.gz
 Default user-local installed manual page.
 .TP
 .B codex-agent-classes.json
@@ -271,25 +271,25 @@ separately.
 Inspect top-level commands:
 .PP
 .nf
-codex-master-mcp --help
+the-hive-mcp --help
 .fi
 .PP
 Request one advisory spawn offer:
 .PP
 .nf
-codex-master-mcp spawn-offers --required-slots 1
+the-hive-mcp spawn-offers --required-slots 1
 .fi
 .PP
 Inspect plugin state without changing it:
 .PP
 .nf
-codex-master-mcp plugin-status
+the-hive-mcp plugin-status
 .fi
 .PP
 Render the repository manpage locally:
 .PP
 .nf
-groff -man -Tutf8 man/man1/codex-master-mcp.1
+groff -man -Tutf8 man/man1/the-hive-mcp.1
 .fi
 .SH SEE ALSO
 .BR codex (1),
@@ -297,5 +297,5 @@ groff -man -Tutf8 man/man1/codex-master-mcp.1
 .BR groff (1),
 .BR gzip (1)
 .SH BUGS
-Report defects through the codex-master project issue tracker.  Do not include
+Report defects through the The Hive project issue tracker.  Do not include
 authentication files, provider secrets, raw prompts, or raw model output.
