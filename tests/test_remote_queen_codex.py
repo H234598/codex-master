@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from codex_master import remote_queen_codex as rq
-from codex_master.remote_queen_bootstrap import ManifestGenerationV1
-from codex_master.remote_queen_bootstrap import RemoteQueenBootstrapError
+from the_hive import remote_queen_codex as rq
+from the_hive.remote_queen_bootstrap import ManifestGenerationV1
+from the_hive.remote_queen_bootstrap import RemoteQueenBootstrapError
 
 
 DESIRED_GENERATION = "rq-codex-2026-08-29"

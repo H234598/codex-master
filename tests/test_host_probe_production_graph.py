@@ -9,9 +9,9 @@ from typing import cast
 
 import pytest
 
-from codex_master.admin_hosts import AgentBindingV1, HostRegistry
-from codex_master.admin_operations import AdminOperationError, AdminOperationStore
-from codex_master.agent_contracts import (
+from the_hive.admin_hosts import AgentBindingV1, HostRegistry
+from the_hive.admin_operations import AdminOperationError, AdminOperationStore
+from the_hive.agent_contracts import (
     AgentLeaseV1,
     AgentNoWorkV1,
     AgentPollV1,
@@ -20,21 +20,21 @@ from codex_master.agent_contracts import (
     parse_agent_receipt,
     serialize_agent_result,
 )
-from codex_master.agent_http import AgentHttpApplication
-from codex_master.agent_operations import (
+from the_hive.agent_http import AgentHttpApplication
+from the_hive.agent_operations import (
     AgentOperationError,
     AgentOperationRequestV1,
     AgentOperationStore,
 )
-from codex_master.host_agent import (
+from the_hive.host_agent import (
     HostAgent,
     HostAgentClient,
     HostAgentError,
     HostAgentExecutor,
     HostProbeExecutor,
 )
-from codex_master.host_agent_state import HostAgentState
-from codex_master.host_probe import (
+from the_hive.host_agent_state import HostAgentState
+from the_hive.host_probe import (
     HostProbeEvidenceV1,
     LocalHostProbeCollector,
     RemoteHostProbeAdapter,

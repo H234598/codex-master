@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from codex_master.fleet_overview import (
+from the_hive.fleet_overview import (
     FleetOverviewAgentContext,
     FleetOverviewAccountLimitRow,
     FleetOverviewAgentRow,
@@ -19,8 +19,8 @@ from codex_master.fleet_overview import (
     fleet_overview_document,
     render_fleet_overview,
 )
-import codex_master.fleet_overview as overview_module
-from codex_master.fleet_registry import (
+import the_hive.fleet_overview as overview_module
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetAccountV2,
@@ -35,7 +35,7 @@ from codex_master.fleet_registry import (
     SecretState,
     build_inventory,
 )
-from codex_master.usage_snapshot import (
+from the_hive.usage_snapshot import (
     AccountUsage,
     UsageCostWindow,
     UsageLimit,

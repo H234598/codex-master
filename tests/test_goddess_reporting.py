@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from codex_master.goddess_reporting import (
+from the_hive.goddess_reporting import (
     ReporterStateStore,
     aggregate_task_rows,
     build_hourly_report,

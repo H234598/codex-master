@@ -9,9 +9,9 @@ import threading
 
 import pytest
 
-from codex_master import host_agent_state
-from codex_master.agent_contracts import AgentLeaseV1, AgentResultV1, remote_envelope_digest
-from codex_master.host_agent_state import HostAgentState, HostAgentStateError
+from the_hive import host_agent_state
+from the_hive.agent_contracts import AgentLeaseV1, AgentResultV1, remote_envelope_digest
+from the_hive.host_agent_state import HostAgentState, HostAgentStateError
 
 
 def digest(value: object) -> str:

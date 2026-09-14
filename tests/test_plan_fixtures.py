@@ -3,11 +3,11 @@ import json
 
 import pytest
 
-from codex_master.hive.config import load_agent_class_catalog, load_hive_config
-from codex_master.selection import SelectionError, normalize_usage_v2
-from codex_master.selection.config import load_selection_policy
-from codex_master.selection.model_policy import load_model_policy
-from codex_master.selection.state import ResourceStateError, migrate_resource_state
+from the_hive.hive.config import load_agent_class_catalog, load_hive_config
+from the_hive.selection import SelectionError, normalize_usage_v2
+from the_hive.selection.config import load_selection_policy
+from the_hive.selection.model_policy import load_model_policy
+from the_hive.selection.state import ResourceStateError, migrate_resource_state
 
 
 ROOT = Path(__file__).resolve().parents[1]

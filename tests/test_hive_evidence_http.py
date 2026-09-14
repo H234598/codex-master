@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.hive.evidence_http import HiveTestHttpAdapter
+from the_hive.hive.evidence_http import HiveTestHttpAdapter
 
 from test_hive_test_service import service
 

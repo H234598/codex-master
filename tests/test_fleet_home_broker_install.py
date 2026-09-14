@@ -6,7 +6,7 @@ import pytest
 
 
 try:
-    from codex_master import fleet_home_broker_install as install
+    from the_hive import fleet_home_broker_install as install
 except ImportError:
     install = None
 

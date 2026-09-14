@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.remote_queen_bootstrap_cli import main
+from the_hive.remote_queen_bootstrap_cli import main
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "remote_queen_bootstrap"

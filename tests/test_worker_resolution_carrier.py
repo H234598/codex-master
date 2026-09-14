@@ -7,7 +7,7 @@ import pickle
 
 import pytest
 
-from codex_master.agent_resolver import (
+from the_hive.agent_resolver import (
     AgentClassPolicy,
     ModelPolicy,
     ResolutionRequest,
@@ -17,14 +17,14 @@ from codex_master.agent_resolver import (
     resolve_agent_selection,
     validate_resolution_decision_offer,
 )
-from codex_master.worker_resolution_carrier import (
+from the_hive.worker_resolution_carrier import (
     WorkerResolutionCarrierDenied,
     WorkerResolutionEvidenceV2,
     WorkerRegistryReservationIssuerV2,
     build_worker_resolution_carrier,
 )
-from codex_master.worker_resume import WorkerLifecycle
-from codex_master.worker_spawn_ledger import (
+from the_hive.worker_resume import WorkerLifecycle
+from the_hive.worker_spawn_ledger import (
     FenceEpoch,
     Generation,
     LeaseBindingConsumerInputV1,
@@ -147,7 +147,7 @@ def _carrier():
 
 
 def _bound_reservation(*, principal_id: str = "dw-" + "7" * 32):
-    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+    allocator_module = importlib.import_module("the_hive.runtime_account_allocator")
 
     class _Adapter:
         adapter_id = "adapter-carrier"
@@ -419,7 +419,7 @@ def test_redacted_carrier_deepcopy_is_denied() -> None:
 
 
 def test_resolution_payload_rejects_mutation() -> None:
-    import codex_master.worker_resolution_carrier as carrier_module
+    import the_hive.worker_resolution_carrier as carrier_module
 
     ticket, evidence, _carrier_value = _carrier()
     payload = carrier_module._ResolutionPayload(
@@ -440,7 +440,7 @@ def test_resolution_payload_rejects_mutation() -> None:
 
 
 def test_resolution_payload_deepcopy_is_denied() -> None:
-    import codex_master.worker_resolution_carrier as carrier_module
+    import the_hive.worker_resolution_carrier as carrier_module
 
     ticket, evidence, _carrier_value = _carrier()
     payload = carrier_module._ResolutionPayload(
@@ -502,7 +502,7 @@ def test_reservation_issuer_rejects_malformed_or_drifting_bindings(drift: str) -
     issuer = WorkerRegistryReservationIssuerV2(allocator)
     if drift == "allocator":
         foreign_allocator = importlib.import_module(
-            "codex_master.runtime_account_allocator"
+            "the_hive.runtime_account_allocator"
         ).RuntimeAccountAllocator(object())
         issuer = WorkerRegistryReservationIssuerV2(foreign_allocator)
     with pytest.raises(WorkerResolutionCarrierDenied):
@@ -549,7 +549,7 @@ def test_carrier_rejects_bool_as_fence_epoch() -> None:
 
 
 def test_bound_reservation_issuer_rejects_fake_allocator() -> None:
-    import codex_master.worker_resolution_carrier as carrier_module
+    import the_hive.worker_resolution_carrier as carrier_module
 
     with pytest.raises(
         WorkerResolutionCarrierDenied, match="runtime account allocator"
@@ -561,7 +561,7 @@ def test_reservation_issuer_rejects_opaque_receipt_forge_and_foreign_binding() -
     allocator, _ticket, current_ticket, carrier, binding, _reservation = (
         _bound_reservation()
     )
-    runtime = importlib.import_module("codex_master.runtime_account_allocator")
+    runtime = importlib.import_module("the_hive.runtime_account_allocator")
     forged_receipt = object.__new__(runtime.LeaseBindingReceiptV1)
     object.__setattr__(
         forged_receipt,
@@ -609,7 +609,7 @@ def test_carrier_primary_error_survives_real_guard_close_deny(
     allocator, _ticket, current_ticket, carrier, binding, _reservation = (
         _bound_reservation()
     )
-    runtime = importlib.import_module("codex_master.runtime_account_allocator")
+    runtime = importlib.import_module("the_hive.runtime_account_allocator")
     original = runtime.RuntimeAccountAllocator.lease_binding_reference_for
     primary = RuntimeError("carrier-primary-error")
 
@@ -644,7 +644,7 @@ def test_carrier_guard_close_deny_without_primary_is_hard(
     allocator, _ticket, current_ticket, carrier, binding, _reservation = (
         _bound_reservation()
     )
-    runtime = importlib.import_module("codex_master.runtime_account_allocator")
+    runtime = importlib.import_module("the_hive.runtime_account_allocator")
     original = runtime.RuntimeAccountAllocator.lease_binding_reference_for
 
     def drift_after_real_reference(self, verification):

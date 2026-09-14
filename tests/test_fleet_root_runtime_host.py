@@ -11,9 +11,9 @@ from threading import Barrier, Event, Thread
 
 import pytest
 
-import codex_master.fleet_root_runtime_host as host_module
-from codex_master.codex_usage_credential_authority import ProfileCredentialBinding
-from codex_master.fleet_registry import (
+import the_hive.fleet_root_runtime_host as host_module
+from the_hive.codex_usage_credential_authority import ProfileCredentialBinding
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetRuntimePrincipalV2,
@@ -27,13 +27,13 @@ from codex_master.fleet_registry import (
     fleet_document,
     normalize_fleet_document,
 )
-from codex_master.fleet_registry_v2_migration import (
+from the_hive.fleet_registry_v2_migration import (
     PreparedFleetRegistryV2Migration,
     RegistryV2MigrationError,
     RegistryV2QuiescenceEvidence,
     prepare_fleet_registry_v2_migration,
 )
-from codex_master.fleet_root_runtime_host import (
+from the_hive.fleet_root_runtime_host import (
     FleetRootRuntimeHost,
     FleetRootRuntimeHostError,
     RootAdmissionStopOwnership,
@@ -688,7 +688,7 @@ def test_module_has_no_runtime_effect_or_generic_state_setter() -> None:
         "hashlib",
         "json",
         "threading",
-        "codex_master",
+        "the_hive",
     }
     forbidden = {
         "set_count",

@@ -9,11 +9,11 @@ from typing import get_type_hints
 
 import pytest
 
-import codex_master.fleet_home_broker_seqpacket as seqpacket
-import codex_master.fleet_home_broker_wal as wal
-from codex_master.fleet_home_broker_dispatch import BrokerDispatchCommand
-from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
-from codex_master.fleet_home_broker_protocol import (
+import the_hive.fleet_home_broker_seqpacket as seqpacket
+import the_hive.fleet_home_broker_wal as wal
+from the_hive.fleet_home_broker_dispatch import BrokerDispatchCommand
+from the_hive.fleet_home_broker_linux import FdStat, PidfdIdentity
+from the_hive.fleet_home_broker_protocol import (
     AgentStartEnvironmentProjection,
     AgentStartEnvelope,
     AgentStartExecutablePin,
@@ -45,18 +45,18 @@ from codex_master.fleet_home_broker_protocol import (
     b2a_phase_for_checkpoint,
     encode_chpb_message,
 )
-from codex_master.fleet_control_release_v2 import (
+from the_hive.fleet_control_release_v2 import (
     ControlReleaseSpecV2,
     ReleasePayloadDigestV2,
 )
-from codex_master.fleet_home_broker_identity import BrokerIdentity
-from codex_master.fleet_home_broker_runtime import BrokerReleaseSpec, KernelPeerEvidence
-from codex_master.fleet_home_broker_seqpacket import (
+from the_hive.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_runtime import BrokerReleaseSpec, KernelPeerEvidence
+from the_hive.fleet_home_broker_seqpacket import (
     SeqpacketPeerError,
     reattest_agent_start_peer,
     reattest_seqpacket_peer,
 )
-from codex_master.fleet_home_broker_wal import append_status, encode_status_payload
+from the_hive.fleet_home_broker_wal import append_status, encode_status_payload
 
 
 PEER_PID = 1234
@@ -1436,7 +1436,7 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
         node
         for node in tree.body
         if isinstance(node, ast.ImportFrom)
-        and node.module == "codex_master.fleet_home_broker_wal"
+        and node.module == "the_hive.fleet_home_broker_wal"
     ]
     assert len(wal_imports) == 1
     assert [alias.name for alias in wal_imports[0].names] == [
@@ -1448,7 +1448,7 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
         node
         for node in tree.body
         if isinstance(node, ast.ImportFrom)
-        and node.module == "codex_master.fleet_home_broker_dispatch"
+        and node.module == "the_hive.fleet_home_broker_dispatch"
     ]
     assert len(dispatch_imports) == 1
     assert [alias.name for alias in dispatch_imports[0].names] == [

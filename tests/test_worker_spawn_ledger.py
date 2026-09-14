@@ -10,7 +10,7 @@ from threading import Barrier, Lock, Thread
 
 import pytest
 
-from codex_master.agent_resolver import (
+from the_hive.agent_resolver import (
     AgentClassPolicy,
     ModelPolicy,
     ResolutionRequest,
@@ -25,11 +25,11 @@ MODULE_PATH = (
 
 
 def _ledger_module():
-    return importlib.import_module("codex_master.worker_spawn_ledger")
+    return importlib.import_module("the_hive.worker_spawn_ledger")
 
 
 def _resume_module():
-    return importlib.import_module("codex_master.worker_resume")
+    return importlib.import_module("the_hive.worker_resume")
 
 
 def _digest(value: str) -> str:
@@ -93,7 +93,7 @@ def _central_contract():
 
 
 def _allocator(module):
-    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+    allocator_module = importlib.import_module("the_hive.runtime_account_allocator")
 
     class _Adapter:
         adapter_id = "adapter-ledger"
@@ -180,7 +180,7 @@ def _append(module, ledger, ticket, phase, *, lease_binding=None, teamlead=None)
 
 
 def _lease_binding(module, ledger, ticket):
-    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+    allocator_module = importlib.import_module("the_hive.runtime_account_allocator")
     decision, offer = _central_contract()
     p0_ticket = allocator_module.ValidatedAllocationTicket(
         ticket_id=ticket.ticket_id,
@@ -224,7 +224,7 @@ def _lease_binding(module, ledger, ticket):
 
 
 def _allocator_issued_binding_pair(module, offered, dimension: str):
-    runtime = importlib.import_module("codex_master.runtime_account_allocator")
+    runtime = importlib.import_module("the_hive.runtime_account_allocator")
     accounts = (_digest("e"), _digest("0") if dimension == "account" else _digest("e"))
     profiles = (_digest("f"), _digest("0") if dimension == "profile" else _digest("f"))
 
@@ -572,7 +572,7 @@ def test_ledger_imports_only_bound_allocator_runtime_boundary() -> None:
         "provider",
     }
 
-    assert "codex_master.runtime_account_allocator" in imports
+    assert "the_hive.runtime_account_allocator" in imports
     assert not {
         name
         for name in imports
@@ -1002,7 +1002,7 @@ def test_opaque_receipt_forge_and_foreign_allocator_deny_before_ledger_cas() -> 
     )
     offered = _append(module, ledger, claimed, module.SpawnPhase.OFFER_VALIDATED)
     binding = _lease_binding(module, ledger, offered)
-    runtime = importlib.import_module("codex_master.runtime_account_allocator")
+    runtime = importlib.import_module("the_hive.runtime_account_allocator")
     forged_receipt = object.__new__(runtime.LeaseBindingReceiptV1)
     object.__setattr__(
         forged_receipt,

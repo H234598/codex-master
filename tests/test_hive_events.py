@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.hive.events import HiveEventError, HiveEventStore
-from codex_master.hive.messages import validate_message
+from the_hive.hive.events import HiveEventError, HiveEventStore
+from the_hive.hive.messages import validate_message
 
 
 NOW = datetime(2026, 8, 16, 10, 5, tzinfo=UTC)

@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError, fields
 
 import pytest
 
-from codex_master.masterjet_runtime import MasterjetRuntime
+from the_hive.masterjet_runtime import MasterjetRuntime
 
 
 UNAVAILABLE = {

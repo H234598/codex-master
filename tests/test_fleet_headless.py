@@ -7,8 +7,8 @@ import time
 
 import pytest
 
-import codex_master.fleet_headless as fleet_headless
-from codex_master.fleet_headless import (
+import the_hive.fleet_headless as fleet_headless
+from the_hive.fleet_headless import (
     HEADLESS_CANCEL_GRACE_SECONDS,
     HEADLESS_TERM_GRACE_SECONDS,
     HeadlessJobError,

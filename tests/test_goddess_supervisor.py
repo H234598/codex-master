@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from codex_master.goddess_supervisor import (
+from the_hive.goddess_supervisor import (
     ReporterLeaderBusy,
     ReporterLeaderLease,
     active_reporter_required,

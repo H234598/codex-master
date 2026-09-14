@@ -13,7 +13,7 @@ import pytest
 
 
 def runner_module():
-    return importlib.import_module("codex_master.dynamic_teamlead_a3_runner")
+    return importlib.import_module("the_hive.dynamic_teamlead_a3_runner")
 
 
 def reconstructed_permit():

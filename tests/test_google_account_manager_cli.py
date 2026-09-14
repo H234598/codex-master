@@ -8,10 +8,10 @@ import time
 
 import pytest
 
-from codex_master import google_account_manager_cli as cli
-from codex_master import server
-from codex_master.google_account_manager_cli import _load_quota_evidence, build_parser
-from codex_master.google_cloud_provisioner import GoogleCloudProvisionerError
+from the_hive import google_account_manager_cli as cli
+from the_hive import server
+from the_hive.google_account_manager_cli import _load_quota_evidence, build_parser
+from the_hive.google_cloud_provisioner import GoogleCloudProvisionerError
 
 
 INVENTORY_FINGERPRINT = "sha256:" + "a" * 64

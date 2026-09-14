@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-import codex_master.resource_cgroup as resource_cgroup
-from codex_master.resource_cgroup import (
+import the_hive.resource_cgroup as resource_cgroup
+from the_hive.resource_cgroup import (
     CgroupPreflightError,
     CgroupPreflightV1,
     CgroupProfileV1,

@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from codex_master import fleet_markdown, server as server_module
-from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
-from codex_master.hive_policy import (
+from the_hive import fleet_markdown, server as server_module
+from the_hive.fleet_registry import AgentDescriptor, Provider, RunnerKind
+from the_hive.hive_policy import (
     MAX_COMMON_POLICY_BYTES,
     CommonPolicyError,
     load_common_policy,

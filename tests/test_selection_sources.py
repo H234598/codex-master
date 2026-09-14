@@ -1,4 +1,4 @@
-from codex_master.selection.sources import AccountIdentityResolver, BeeSnapshot, SelectionSourceProvider
+from the_hive.selection.sources import AccountIdentityResolver, BeeSnapshot, SelectionSourceProvider
 
 
 def test_account_identity_is_hmac_pseudonymous_and_usage_output_is_bounded() -> None:

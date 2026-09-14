@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master import pricing_inventory
+from the_hive import pricing_inventory
 
 
 MODEL = "gpt-5.6-sol"

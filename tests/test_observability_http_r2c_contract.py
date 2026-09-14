@@ -10,8 +10,8 @@ from contextlib import contextmanager
 
 import pytest
 
-import codex_master.observability_http_r2c_contract as observability_http
-from codex_master.observability_http_r2c_contract import MetricsHttpServer
+import the_hive.observability_http_r2c_contract as observability_http
+from the_hive.observability_http_r2c_contract import MetricsHttpServer
 
 
 @contextmanager

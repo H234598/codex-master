@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from codex_master.hive.indexed_tests import TestIndexV1 as IndexV1
-from codex_master.hive.evidence_planner import PlanRequestV1, TestPlanner
+from the_hive.hive.indexed_tests import TestIndexV1 as IndexV1
+from the_hive.hive.evidence_planner import PlanRequestV1, TestPlanner
 
 from test_hive_test_index import DIGEST_A, DIGEST_B, valid_index
 

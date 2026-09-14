@@ -7,9 +7,9 @@ import re
 
 import pytest
 
-import codex_master.fleet_home_broker_transport as transport
-from codex_master.fleet_home_broker_client import ScmFrame
-from codex_master.fleet_home_broker_protocol import (
+import the_hive.fleet_home_broker_transport as transport
+from the_hive.fleet_home_broker_client import ScmFrame
+from the_hive.fleet_home_broker_protocol import (
     AttestHomeRequest,
     BindingExpectation,
     BrokerCheckpoint,
@@ -578,9 +578,9 @@ def test_source_uses_only_allowed_imports_and_contains_no_forbidden_transport_to
         ("__future__", ("annotations",)),
         ("dataclasses", ("dataclass", "field")),
         ("typing", ("Protocol", "cast")),
-        ("codex_master.fleet_home_broker_client", ("ScmFrame",)),
+        ("the_hive.fleet_home_broker_client", ("ScmFrame",)),
         (
-            "codex_master.fleet_home_broker_protocol",
+            "the_hive.fleet_home_broker_protocol",
             (
                 "BrokerReply",
                 "BrokerRequest",
@@ -591,7 +591,7 @@ def test_source_uses_only_allowed_imports_and_contains_no_forbidden_transport_to
             ),
         ),
     ]
-    assert transport.ScmFrame.__module__ == "codex_master.fleet_home_broker_client"
+    assert transport.ScmFrame.__module__ == "the_hive.fleet_home_broker_client"
     assert transport.BrokerRequest is BrokerRequest
     for name in (
         "BrokerReply",
@@ -602,7 +602,7 @@ def test_source_uses_only_allowed_imports_and_contains_no_forbidden_transport_to
     ):
         assert (
             getattr(transport, name).__module__
-            == "codex_master.fleet_home_broker_protocol"
+            == "the_hive.fleet_home_broker_protocol"
         )
     forbidden = (
         "socket",

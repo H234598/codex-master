@@ -21,11 +21,11 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 import jwt
 import pytest
 
-import codex_master.admin_daemon as admin_daemon
-import codex_master.admin_assembly as admin_assembly
-from codex_master.admin_auth import MasterjetBearerVerifier, TotpStepUpVerifier
-from codex_master.admin_contracts import AdminPrincipalV1, AdminRequestV1
-from codex_master.admin_daemon import (
+import the_hive.admin_daemon as admin_daemon
+import the_hive.admin_assembly as admin_assembly
+from the_hive.admin_auth import MasterjetBearerVerifier, TotpStepUpVerifier
+from the_hive.admin_contracts import AdminPrincipalV1, AdminRequestV1
+from the_hive.admin_daemon import (
     AdminDaemon,
     AdminDaemonShutdownError,
     AdminDaemonStartupError,
@@ -34,17 +34,17 @@ from codex_master.admin_daemon import (
     JwksRefreshShutdownError,
     RefreshingCloudflareAccessVerifier,
 )
-from codex_master.admin_assembly import (
+from the_hive.admin_assembly import (
     CredentialQuotaCollector,
     assemble_admin_runtime,
     provision_agent_bindings_from_credential,
 )
-from codex_master.admin_hosts import HostRegistry, HostRegistryError
-from codex_master.admin_http import AdminHttpServer
-from codex_master.admin_service import MasterjetControlService
-from codex_master.admin_socket import UnixPeerCredentials
-from codex_master.google_oauth_authorization import GoogleOAuthProfileIdV1
-from codex_master.google_oauth_session import (
+from the_hive.admin_hosts import HostRegistry, HostRegistryError
+from the_hive.admin_http import AdminHttpServer
+from the_hive.admin_service import MasterjetControlService
+from the_hive.admin_socket import UnixPeerCredentials
+from the_hive.google_oauth_authorization import GoogleOAuthProfileIdV1
+from the_hive.google_oauth_session import (
     GoogleOAuthClientMaterialV1,
     GoogleOAuthSessionError,
 )
@@ -2117,8 +2117,8 @@ def test_installed_product_path_uses_credentials_both_adapters_and_sigterm(
                 os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
             )
             try:
-                from codex_master.admin_contracts import AdminRequestV1
-                from codex_master.admin_socket import AdminSocketClient
+                from the_hive.admin_contracts import AdminRequestV1
+                from the_hive.admin_socket import AdminSocketClient
 
                 client = AdminSocketClient(
                     socket_path,
@@ -2195,7 +2195,7 @@ def test_blocked_real_effect_subprocess_exits_by_deadline_and_unlinks_socket(
     notify_path = tmp_path / "blocked-notify.sock"
     child = """
 import threading
-from codex_master.admin_assembly import assemble_admin_runtime
+from the_hive.admin_assembly import assemble_admin_runtime
 
 runtime = assemble_admin_runtime()
 registry = runtime.service._account_registry
@@ -2229,8 +2229,8 @@ raise SystemExit(runtime.run())
                 os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
             )
             try:
-                from codex_master.admin_contracts import AdminRequestV1
-                from codex_master.admin_socket import (
+                from the_hive.admin_contracts import AdminRequestV1
+                from the_hive.admin_socket import (
                     AdminSocketClient,
                     AdminSocketError,
                 )

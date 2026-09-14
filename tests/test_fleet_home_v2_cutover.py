@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.fleet_home_v2_cutover import (
+from the_hive.fleet_home_v2_cutover import (
     MARKER_FILE,
     FleetHomeV2Artifact,
     FleetHomeV2Authority,

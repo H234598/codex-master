@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from codex_master.spark_retry import (
+from the_hive.spark_retry import (
     ResumeCapsuleV1,
     apply_resume_event,
     is_capacity_retry_code,

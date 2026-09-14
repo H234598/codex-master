@@ -5,9 +5,9 @@ from pathlib import Path
 import stat
 import json
 
-from codex_master.hive.evidence_receipts import evaluate_evidence_reuse
-from codex_master.hive.evidence_store import TestStatusStore as StatusStore
-from codex_master.hive.evidence_planner import evidence_context
+from the_hive.hive.evidence_receipts import evaluate_evidence_reuse
+from the_hive.hive.evidence_store import TestStatusStore as StatusStore
+from the_hive.hive.evidence_planner import evidence_context
 
 from test_hive_test_evidence import DIGEST_A, DIGEST_B, receipt
 from test_hive_test_index import IndexV1, valid_index

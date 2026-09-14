@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from codex_master.fleet_snapshot import (
+from the_hive.fleet_snapshot import (
     AgentProcessSnapshot,
     FleetSnapshot,
     ProcessSnapshot,
@@ -137,7 +137,7 @@ class FleetSnapshotTests(unittest.TestCase):
         )
 
     def test_fleet_watchdog_reuses_one_snapshot_for_selected_agent(self) -> None:
-        from codex_master import server
+        from the_hive import server
 
         sentinel = object()
         passed_snapshots = []
@@ -150,8 +150,8 @@ class FleetSnapshotTests(unittest.TestCase):
                 "lease": {"state": "unclaimed", "held_by_this_server": False},
             }
 
-        with patch("codex_master.server.create_fleet_snapshot", return_value=sentinel) as create:
-            with patch("codex_master.server.status_agent", side_effect=fake_status):
+        with patch("the_hive.server.create_fleet_snapshot", return_value=sentinel) as create:
+            with patch("the_hive.server.status_agent", side_effect=fake_status):
                 result = server.fleet_watchdog("a1", action="none", dry_run=True)
 
         create.assert_called_once()
@@ -159,7 +159,7 @@ class FleetSnapshotTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["watchdog_state"], "skipped_not_running")
 
     def test_fleet_watchdog_continues_when_snapshot_creation_fails(self) -> None:
-        from codex_master import server
+        from the_hive import server
 
         passed_snapshots = []
 
@@ -172,16 +172,16 @@ class FleetSnapshotTests(unittest.TestCase):
             }
 
         with patch(
-            "codex_master.server.create_fleet_snapshot",
+            "the_hive.server.create_fleet_snapshot",
             side_effect=RuntimeError("snapshot unavailable"),
-        ), patch("codex_master.server.status_agent", side_effect=fake_status):
+        ), patch("the_hive.server.status_agent", side_effect=fake_status):
             result = server.fleet_watchdog("a1", action="none", dry_run=True)
 
         self.assertEqual(passed_snapshots, [None])
         self.assertEqual(result["results"][0]["watchdog_state"], "skipped_not_running")
 
     def test_fleet_watchdog_skips_actions_when_tmux_snapshot_is_unavailable(self) -> None:
-        from codex_master import server
+        from the_hive import server
 
         status = {
             "agent": "a1",
@@ -190,10 +190,10 @@ class FleetSnapshotTests(unittest.TestCase):
             "lease": {"state": "held", "held_by_this_server": True},
             "response_state": {"state": "not_running"},
         }
-        with patch("codex_master.server.status_agent", return_value=status), patch(
-            "codex_master.server.release_agent"
-        ) as release, patch("codex_master.server.stop_agent") as stop, patch(
-            "codex_master.server.interrupt_agent"
+        with patch("the_hive.server.status_agent", return_value=status), patch(
+            "the_hive.server.release_agent"
+        ) as release, patch("the_hive.server.stop_agent") as stop, patch(
+            "the_hive.server.interrupt_agent"
         ) as interrupt:
             result = server._watchdog_agent_unlocked(
                 "a1",
@@ -301,8 +301,8 @@ class FleetSnapshotTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch("codex_master.fleet_snapshot._read_proc_environ", return_value=None), patch(
-                "codex_master.fleet_snapshot._resolve_proc_cwd", return_value=(None, True)
+            with patch("the_hive.fleet_snapshot._read_proc_environ", return_value=None), patch(
+                "the_hive.fleet_snapshot._resolve_proc_cwd", return_value=(None, True)
             ):
                 snapshot = create_fleet_snapshot(
                     agent_homes={"a1": home},
@@ -314,7 +314,7 @@ class FleetSnapshotTests(unittest.TestCase):
         self.assertEqual(summarize_agent_processes(snapshot, "a1")["process_count"], 0)
 
     def test_release_guard_rechecks_live_identity(self) -> None:
-        from codex_master import server
+        from the_hive import server
 
         clear_summary = {
             "process_count": 0,
@@ -322,8 +322,8 @@ class FleetSnapshotTests(unittest.TestCase):
             "managed_process_count": 0,
             "managed_process_ids": [],
         }
-        with patch("codex_master.server.tmux_alive", return_value=False), patch(
-            "codex_master.server.agent_home_process_summary", return_value=clear_summary
+        with patch("the_hive.server.tmux_alive", return_value=False), patch(
+            "the_hive.server.agent_home_process_summary", return_value=clear_summary
         ):
             self.assertTrue(server.watchdog_release_identity_is_current("a1", expected_running=False))
 
@@ -333,9 +333,9 @@ class FleetSnapshotTests(unittest.TestCase):
             "managed_process_count": 1,
             "managed_process_ids": [101],
         }
-        with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.agent_home_process_summary", return_value=running_summary
-        ), patch("codex_master.server.require_managed_tmux_session") as require:
+        with patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.agent_home_process_summary", return_value=running_summary
+        ), patch("the_hive.server.require_managed_tmux_session") as require:
             self.assertTrue(server.watchdog_release_identity_is_current("a1", expected_running=True))
         require.assert_called_once_with("a1", process_summary=running_summary)
 

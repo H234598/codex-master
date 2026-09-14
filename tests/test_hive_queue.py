@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from codex_master.hive.dispatch import WorkPackage
-from codex_master.hive.queue import QueueError, WorkQueue
+from the_hive.hive.dispatch import WorkPackage
+from the_hive.hive.queue import QueueError, WorkQueue
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

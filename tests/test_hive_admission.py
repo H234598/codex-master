@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from codex_master.admission import (
+from the_hive.admission import (
     AdmissionError,
     AdmissionPriority,
     AdmissionState,

@@ -4,7 +4,7 @@ from hashlib import sha256
 
 import pytest
 
-from codex_master.fleet_home_broker_identity import (
+from the_hive.fleet_home_broker_identity import (
     BrokerIdentity,
     IdentityValidationError,
     ImportClosure,

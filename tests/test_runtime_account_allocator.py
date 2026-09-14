@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from codex_master.agent_resolver import (
+from the_hive.agent_resolver import (
     AgentClassPolicy,
     ModelPolicy,
     ResolutionDecision as CentralResolutionDecision,

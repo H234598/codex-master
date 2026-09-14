@@ -2,7 +2,7 @@
 
 import pytest
 
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_protocol import (
     BrokerCheckpoint,
     BrokerObjectState,
     BrokerObservation,

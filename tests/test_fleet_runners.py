@@ -8,10 +8,10 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-import codex_master.fleet_runners as fleet_runners
-from codex_master.fleet_headless import HeadlessJobError, HeadlessProcessResult
-from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
-from codex_master.fleet_runners import (
+import the_hive.fleet_runners as fleet_runners
+from the_hive.fleet_headless import HeadlessJobError, HeadlessProcessResult
+from the_hive.fleet_registry import AgentDescriptor, Provider, RunnerKind
+from the_hive.fleet_runners import (
     FleetRunnerError,
     GEMINI_DEFAULT_LIGHT_MODEL,
     GEMINI_MODELS_URL,
@@ -264,7 +264,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
         captured_timeout.append(timeout_seconds)
         return timeout_result
 
-    monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     result = probe_gemini_cli("private-gemini-secret", executable)
 
     assert captured_timeout == [float(GEMINI_PROBE_TIMEOUT_SECONDS)]
@@ -494,7 +494,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
     if prepare == "headless_unreaped":
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             raise HeadlessJobError("headless_process_unreaped")
-        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+        monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "normal_exit":
         result_process = HeadlessProcessResult(
             returncode=0,
@@ -508,7 +508,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return result_process
-        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+        monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "terminal_structured_error":
         result_process = HeadlessProcessResult(
             returncode=0,
@@ -525,7 +525,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return result_process
-        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+        monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "terminal_result_without_model":
         result_process = HeadlessProcessResult(
             returncode=0,
@@ -539,7 +539,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return result_process
-        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+        monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare in {
         "timeout_no_output",
         "timeout_structured_no_terminal",
@@ -567,7 +567,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
-        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+        monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "timeout_stdout_terminal":
         timeout_result = HeadlessProcessResult(
             returncode=0,
@@ -584,7 +584,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
-        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+        monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "timeout_stdout_unclassified":
         timeout_result = HeadlessProcessResult(
             returncode=0,
@@ -598,7 +598,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
-        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+        monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare in {"timeout_stderr_only", "timeout_stdout_and_stderr"}:
         timeout_result = HeadlessProcessResult(
             returncode=0,
@@ -619,7 +619,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
-        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+        monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "timeout_open_reader":
         timeout_result = HeadlessProcessResult(
             returncode=0,
@@ -637,7 +637,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
-        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+        monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     elif prepare == "timeout_truncated_or_pipe_open":
         timeout_result = HeadlessProcessResult(
             returncode=0,
@@ -651,7 +651,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
             return timeout_result
-        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+        monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     else:
         executable.write_text("not executable", encoding="utf-8")
         executable.chmod(0o600)
@@ -719,7 +719,7 @@ def test_gemini_provider_probe_reports_structured_and_parser_diagnostic_codes(
     def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
         return result_process
 
-    monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    monkeypatch.setattr("the_hive.fleet_runners.run_bounded_process", _run_bounded)
     result = probe_gemini_cli("private-gemini-secret", executable)
 
     assert result.ok is False

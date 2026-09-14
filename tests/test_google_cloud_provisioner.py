@@ -5,8 +5,8 @@ import re
 
 import pytest
 
-from codex_master.google_cloud_api import GoogleCloudApiError
-from codex_master.google_cloud_provisioner import (
+from the_hive.google_cloud_api import GoogleCloudApiError
+from the_hive.google_cloud_provisioner import (
     GoogleCloudProvisionerError,
     GoogleQuotaEvidenceV1,
     ProvisionPartialReceipt,

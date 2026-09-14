@@ -7,12 +7,12 @@ import threading
 
 import pytest
 
-from codex_master import agent_ollama
-from codex_master.agent_ollama import (
+from the_hive import agent_ollama
+from the_hive.agent_ollama import (
     AgentOllamaError,
     AgentOllamaExecutor,
 )
-from codex_master.ollama_registry import (
+from the_hive.ollama_registry import (
     OllamaInstanceV1,
     OllamaModelV1,
     OllamaRegistryStore,
@@ -180,7 +180,7 @@ def test_default_port_allocator_uses_system_runtime(
             return 11436
 
     monkeypatch.setattr(
-        "codex_master.ollama_runtime.SystemOllamaRuntime",
+        "the_hive.ollama_runtime.SystemOllamaRuntime",
         lambda: DefaultRuntime(),
     )
     store, _executable = registry_at(tmp_path)

@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from codex_master.hive.evidence_receipts import (
+from the_hive.hive.evidence_receipts import (
     EvidenceContextV1,
     EvidenceReceiptV1,
     evaluate_evidence_reuse,

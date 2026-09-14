@@ -3,14 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.hive import principals as principals_module
-from codex_master.hive.principals import (
+from the_hive.hive import principals as principals_module
+from the_hive.hive.principals import (
     ExecutionBinding,
     Principal,
     PrincipalError,
     PrincipalRegistry,
 )
-from codex_master.hive.state import HiveStateStore
+from the_hive.hive.state import HiveStateStore
 
 
 DIGEST = "sha256:" + "a" * 64

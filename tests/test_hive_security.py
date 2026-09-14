@@ -5,22 +5,22 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from codex_master.admission import (
+from the_hive.admission import (
     AdmissionPriority,
     LeaseBinding,
     ResourceBinding,
     ScopeBinding,
     create_admission,
 )
-from codex_master.hive.dispatch import (
+from the_hive.hive.dispatch import (
     HiveDispatchError,
     plan_global_request,
     request_cooperative_pause,
 )
-from codex_master.hive.messages import HiveMessageError, validate_message
-from codex_master.hive.state import HiveStateError, HiveStateStore
-from codex_master.hive.types import DispatchPriority
-from codex_master.selection.reset_anchor import AnchorRecord, ResetAnchorPlanner
+from the_hive.hive.messages import HiveMessageError, validate_message
+from the_hive.hive.state import HiveStateError, HiveStateStore
+from the_hive.hive.types import DispatchPriority
+from the_hive.selection.reset_anchor import AnchorRecord, ResetAnchorPlanner
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

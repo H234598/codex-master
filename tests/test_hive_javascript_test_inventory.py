@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from codex_master.hive.javascript_test_inventory import JavaScriptTestIndexBuilder
-from codex_master.hive.indexed_tests import TestIndexV1 as IndexV1, combine_test_indexes
+from the_hive.hive.javascript_test_inventory import JavaScriptTestIndexBuilder
+from the_hive.hive.indexed_tests import TestIndexV1 as IndexV1, combine_test_indexes
 
 from test_hive_test_index import valid_index
 

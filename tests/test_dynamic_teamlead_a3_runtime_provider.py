@@ -8,28 +8,28 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
-from codex_master.dynamic_teamlead_a3_runtime_provider import (
+from the_hive.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
+from the_hive.dynamic_teamlead_a3_runtime_provider import (
     DynamicTeamleadA3RuntimeContext,
     DynamicTeamleadA3RuntimeProviderError,
     RootOwnedDynamicTeamleadStartPort,
     build_root_owned_dynamic_teamlead_start_port,
     validate_dynamic_teamlead_a3_runtime_context,
 )
-from codex_master.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
-from codex_master.dynamic_teamlead_coordinator import (
+from the_hive.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
+from the_hive.dynamic_teamlead_coordinator import (
     DynamicTeamleadCoordinatorCode,
     DynamicTeamleadCoordinatorError,
     DynamicTeamleadCoordinatorRequest,
 )
-from codex_master.dynamic_teamlead_start import dynamic_teamlead_start
-from codex_master.fleet_home_broker_identity import BrokerIdentity
-from codex_master.fleet_home_broker_client import ScmFrame
-from codex_master.fleet_home_broker_client_seqpacket import (
+from the_hive.dynamic_teamlead_start import dynamic_teamlead_start
+from the_hive.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_client import ScmFrame
+from the_hive.fleet_home_broker_client_seqpacket import (
     SeqpacketBrokerClientOperations,
 )
-from codex_master.fleet_home_broker_linux import FdStat
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_linux import FdStat
+from the_hive.fleet_home_broker_protocol import (
     AttestHomeRequest,
     BindingExpectation,
     ChpbMessageKind,
@@ -39,12 +39,12 @@ from codex_master.fleet_home_broker_protocol import (
     ProvisionHomeRequest,
     TransactionBinding,
 )
-from codex_master.fleet_home_broker_runtime import (
+from the_hive.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     TrustedPrincipalGrantContext,
 )
-from codex_master.dynamic_teamlead_a3_runner import RootDynamicTeamleadStartComposition
-from codex_master.fleet_registry import (
+from the_hive.dynamic_teamlead_a3_runner import RootDynamicTeamleadStartComposition
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccountV2,
     FleetRuntimePrincipalV2,
@@ -862,8 +862,8 @@ def test_provider_has_no_live_authority_or_state_imports() -> None:
     )
     tree = ast.parse(path.read_text(encoding="utf-8"))
     forbidden = {
-        "codex_master.server",
-        "codex_master.fleet_root_system_bus",
+        "the_hive.server",
+        "the_hive.fleet_root_system_bus",
         "os",
         "socket",
         "subprocess",
@@ -893,6 +893,6 @@ def test_provider_has_no_live_authority_or_state_imports() -> None:
     assert string_constants.isdisjoint(
         {
             "_ConsumerDynamicTeamleadRunnerExecutor",
-            "codex_master.fleet_root_system_bus",
+            "the_hive.fleet_root_system_bus",
         }
     )

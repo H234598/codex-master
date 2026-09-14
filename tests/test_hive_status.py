@@ -2,9 +2,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from codex_master.hive.messages import HiveMessageError, validate_message
-from codex_master.hive.principals import Principal, PrincipalRegistry
-from codex_master.hive.status import (
+from the_hive.hive.messages import HiveMessageError, validate_message
+from the_hive.hive.principals import Principal, PrincipalRegistry
+from the_hive.hive.status import (
     admission_status,
     aggregate_godbee_status,
     aggregate_queen_status,
@@ -18,7 +18,7 @@ from codex_master.hive.status import (
     queue_status,
     selection_status,
 )
-from codex_master.hive.runtime import HiveRuntimeEvidence
+from the_hive.hive.runtime import HiveRuntimeEvidence
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

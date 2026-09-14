@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from codex_master.hive.indexed_tests import TestIndexError as IndexError
-from codex_master.hive.indexed_tests import TestIndexV1 as IndexV1
+from the_hive.hive.indexed_tests import TestIndexError as IndexError
+from the_hive.hive.indexed_tests import TestIndexV1 as IndexV1
 
 
 DIGEST_A = "sha256:" + "a" * 64

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.fleet_home_broker_identity_contract import (
+from the_hive.fleet_home_broker_identity_contract import (
     BrokerCapabilityModel,
     BrokerIdentityCode,
     BrokerIdentityError,
@@ -19,7 +19,7 @@ from codex_master.fleet_home_broker_identity_contract import (
     validate_import_closure_manifest,
     validate_peer_cgroup_evidence,
 )
-from codex_master.fleet_home_broker_protocol import MAX_CHPB_GENERATION
+from the_hive.fleet_home_broker_protocol import MAX_CHPB_GENERATION
 
 
 def identity(*, mode=0o40700, dev=7, ino=9, uid=0, gid=0, nlink=2):
@@ -198,7 +198,7 @@ def test_import_closure_rejects_non_root_or_writable_identity():
 def test_identity_production_imports_are_stdlib_or_pb1_only():
     source = Path("src/codex_master/fleet_home_broker_identity_contract.py").read_text()
     tree = ast.parse(source)
-    allowed = {"dataclasses", "enum", "re", "typing", "codex_master.fleet_home_broker_protocol"}
+    allowed = {"dataclasses", "enum", "re", "typing", "the_hive.fleet_home_broker_protocol"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             assert all(alias.name in allowed for alias in node.names)

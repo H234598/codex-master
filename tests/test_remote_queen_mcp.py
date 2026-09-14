@@ -3,11 +3,11 @@ import inspect
 from dataclasses import FrozenInstanceError, fields, replace
 import pytest
 
-from codex_master.remote_queen_bootstrap import (
+from the_hive.remote_queen_bootstrap import (
     ManifestGenerationV1,
     RemoteQueenBootstrapError,
 )
-from codex_master.remote_queen_mcp import (
+from the_hive.remote_queen_mcp import (
     ADMIN_AUTHORITY_ID,
     ADMIN_CONTRACT_NAME,
     ADMIN_TRANSPORT,
@@ -812,7 +812,7 @@ def test_rollback_rejects_stale_generation_owner_result_digest_and_post_drift_be
 
 
 def test_ast_effect_gate_rejects_forbidden_imports_calls_and_admin_envelope_usage():
-    import codex_master.remote_queen_mcp as module
+    import the_hive.remote_queen_mcp as module
 
     tree = ast.parse(inspect.getsource(module))
     allowed_modules = {
@@ -822,7 +822,7 @@ def test_ast_effect_gate_rejects_forbidden_imports_calls_and_admin_envelope_usag
         "json",
         "re",
         "typing",
-        "codex_master.remote_queen_bootstrap",
+        "the_hive.remote_queen_bootstrap",
     }
     forbidden_modules = {
         "os",
@@ -843,12 +843,12 @@ def test_ast_effect_gate_rejects_forbidden_imports_calls_and_admin_envelope_usag
         "fabric",
         "anyio",
         "trio",
-        "codex_master.server",
-        "codex_master.admin_",
-        "codex_master.fleet_",
-        "codex_master.hive",
-        "codex_master.queen_runtime",
-        "codex_master.worker_resume",
+        "the_hive.server",
+        "the_hive.admin_",
+        "the_hive.fleet_",
+        "the_hive.hive",
+        "the_hive.queen_runtime",
+        "the_hive.worker_resume",
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -878,7 +878,7 @@ def test_ast_effect_gate_rejects_forbidden_imports_calls_and_admin_envelope_usag
 
 
 def test_importing_contract_has_no_port_calls_or_mutable_runtime_state():
-    import codex_master.remote_queen_mcp as module
+    import the_hive.remote_queen_mcp as module
 
     assert not [name for name in vars(module) if name.endswith("CACHE") or name.endswith("_CACHE")]
     assert not hasattr(module, "_PORT")

@@ -16,13 +16,13 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-from codex_master import agent_daemon
-from codex_master.agent_daemon import AgentApiServer, AgentCredentialFds, open_systemd_credentials
-from codex_master.admin_hosts import HostRegistry, HostRegistryError
-from codex_master.admin_hosts import AgentPrincipalV1
-from codex_master.admin_operations import AdminOperationError
-from codex_master.agent_http import AgentHttpResponse
-from codex_master.agent_operations import AgentOperationError, AgentOperationStore
+from the_hive import agent_daemon
+from the_hive.agent_daemon import AgentApiServer, AgentCredentialFds, open_systemd_credentials
+from the_hive.admin_hosts import HostRegistry, HostRegistryError
+from the_hive.admin_hosts import AgentPrincipalV1
+from the_hive.admin_operations import AdminOperationError
+from the_hive.agent_http import AgentHttpResponse
+from the_hive.agent_operations import AgentOperationError, AgentOperationStore
 
 
 class FakeContext:
@@ -86,23 +86,23 @@ def test_ollama_receipts_cross_real_agent_http_router_and_store_for_every_action
     """The Ollama owner receives the HTTP registry principal only at its typed edge."""
 
 
-    from codex_master.admin_contracts import OperationV1
-    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
-    from codex_master.agent_contracts import AgentResultV1
-    from codex_master.agent_http import AgentHttpApplication
-    from codex_master.agent_operations import AgentOperationStore
-    from codex_master.fleet_service import FleetPaths, FleetService
-    from codex_master.ollama_host_transport import (
+    from the_hive.admin_contracts import OperationV1
+    from the_hive.admin_hosts import AgentBindingV1, HostRegistry
+    from the_hive.agent_contracts import AgentResultV1
+    from the_hive.agent_http import AgentHttpApplication
+    from the_hive.agent_operations import AgentOperationStore
+    from the_hive.fleet_service import FleetPaths, FleetService
+    from the_hive.ollama_host_transport import (
         AgentQueueRemoteOllamaOperationPort,
         HostRegistryOllamaLeaseSource,
         OllamaHostTransport,
     )
-    from codex_master.ollama_registry import (
+    from the_hive.ollama_registry import (
         OllamaInstanceV1,
         OllamaModelV1,
         OllamaRegistryStore,
     )
-    from codex_master.server import build_fleet_private_io
+    from the_hive.server import build_fleet_private_io
 
     hosts = HostRegistry.for_test(tmp_path / "hosts")
     hosts.provision_agent_binding(
@@ -293,7 +293,7 @@ def _post_ollama_receipt(
     import hashlib
     import json
 
-    from codex_master.agent_contracts import (
+    from the_hive.agent_contracts import (
         AgentLeaseV1,
         AgentReceiptV1,
         AgentResultV1,
@@ -354,7 +354,7 @@ def _post_ollama_receipt(
 def _receipt_wire(receipt: object) -> bytes:
     import json
 
-    from codex_master.agent_contracts import AgentReceiptV1, serialize_agent_result
+    from the_hive.agent_contracts import AgentReceiptV1, serialize_agent_result
 
     assert type(receipt) is AgentReceiptV1
     wire = {

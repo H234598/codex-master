@@ -10,9 +10,9 @@ from threading import Event, Thread
 
 import pytest
 
-from codex_master.dynamic_teamlead_a3_runner import RootDynamicTeamleadRunnerPermit
-from codex_master.fleet_control_release_v2 import ControlReleaseSpecV2
-from codex_master.fleet_runners import DynamicTeamleadRunnerPlan
+from the_hive.dynamic_teamlead_a3_runner import RootDynamicTeamleadRunnerPermit
+from the_hive.fleet_control_release_v2 import ControlReleaseSpecV2
+from the_hive.fleet_runners import DynamicTeamleadRunnerPlan
 
 from test_fleet_control_release_v2 import SPEC as V2_RELEASE
 from test_fleet_root_system_bus import runner_plan, trusted_context
@@ -23,7 +23,7 @@ UNIT = "codex-master-agent@c1\\x2cc2.service"
 
 def runner_module():
     try:
-        return importlib.import_module("codex_master.dynamic_teamlead_systemd_runner")
+        return importlib.import_module("the_hive.dynamic_teamlead_systemd_runner")
     except Exception as exc:
         pytest.fail(f"runner module/symbol absent on P1: {type(exc).__name__}")
 

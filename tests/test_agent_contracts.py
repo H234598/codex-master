@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from codex_master.agent_contracts import (
+from the_hive.agent_contracts import (
     AgentContractError,
     AgentLeaseV1,
     AgentNoWorkV1,

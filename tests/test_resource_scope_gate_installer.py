@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from codex_master import server
+from the_hive import server
 
 
 def test_install_resource_scope_gate_requires_root_and_is_idempotent(tmp_path: Path) -> None:

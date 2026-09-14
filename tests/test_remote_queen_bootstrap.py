@@ -1,7 +1,7 @@
 import pytest
 
-import codex_master.remote_queen_bootstrap as rb
-from codex_master.remote_queen_bootstrap import (
+import the_hive.remote_queen_bootstrap as rb
+from the_hive.remote_queen_bootstrap import (
     RemoteQueenBootstrapError,
     SshTargetV1,
     parse_ssh_target,

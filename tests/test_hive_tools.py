@@ -2,10 +2,10 @@ import argparse
 
 import pytest
 
-from codex_master.hive.cli import add_hive_cli_parsers, run_hive_cli
-from codex_master.hive.migration import compare_legacy_and_hive_assignment, rollback_hive_state
-from codex_master.hive.tools import call_hive_tool, hive_tool_definitions
-from codex_master.hive.runtime import HiveRuntimeEvidence
+from the_hive.hive.cli import add_hive_cli_parsers, run_hive_cli
+from the_hive.hive.migration import compare_legacy_and_hive_assignment, rollback_hive_state
+from the_hive.hive.tools import call_hive_tool, hive_tool_definitions
+from the_hive.hive.runtime import HiveRuntimeEvidence
 
 
 def test_read_only_hive_tools_have_closed_schemas_and_bounded_output() -> None:

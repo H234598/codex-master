@@ -133,12 +133,12 @@ def test_positive_import_and_a3_call_gate_is_exact() -> None:
         for node in tree.body
         if isinstance(node, ast.ImportFrom)
         and node.module is not None
-        and node.module.startswith("codex_master")
+        and node.module.startswith("the_hive")
     ]
 
     assert len(project_imports) == 1
     project_import = project_imports[0]
-    assert project_import.module == "codex_master.dynamic_worker_coordinator"
+    assert project_import.module == "the_hive.dynamic_worker_coordinator"
     assert [(alias.name, alias.asname) for alias in project_import.names] == [
         ("DynamicWorkerPreStartPortV1", None),
         ("PreStartReceiptV1", None),
@@ -207,7 +207,7 @@ def test_positive_import_and_a3_call_gate_is_exact() -> None:
     assert not {
         module
         for module in imported_modules
-        if module != "codex_master.dynamic_worker_coordinator"
+        if module != "the_hive.dynamic_worker_coordinator"
         and any(fragment in module for fragment in forbidden_fragments)
     }
 

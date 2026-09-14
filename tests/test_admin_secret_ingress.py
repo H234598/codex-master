@@ -4,20 +4,20 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-import codex_master.admin_secret_ingress as ingress_module
+import the_hive.admin_secret_ingress as ingress_module
 
-from codex_master.admin_secret_ingress import (
+from the_hive.admin_secret_ingress import (
     AdminSecretIngressError,
     AdminSecretIngressOwner,
     SecretResolveClaimV1,
     SecretUploadClaimV1,
 )
-from codex_master.admin_service import (
+from the_hive.admin_service import (
     MasterjetControlService,
     SecretIngressCapabilityV1,
     SecretIngressResolutionV1,
 )
-from codex_master.credential_vault import CredentialVault
+from the_hive.credential_vault import CredentialVault
 from test_admin_service import command, principal, service_at
 
 

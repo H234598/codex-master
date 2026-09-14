@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from codex_master.dynamic_teamlead import (
+from the_hive.dynamic_teamlead import (
     DynamicTeamleadRequest,
     DynamicTeamleadError,
     DynamicTeamleadCode,
@@ -13,14 +13,14 @@ from codex_master.dynamic_teamlead import (
     prepare_dynamic_teamlead,
     require_committed_home_attestation,
 )
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_protocol import (
     BindingExpectation,
     BrokerReply,
     BrokerResultCode,
     CHPB_PROTOCOL,
     ChpbMessageKind,
 )
-from codex_master.fleet_registry import (
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetAccountV2,

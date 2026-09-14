@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from codex_master.selection import FairnessLedger, SelectionCandidate, SelectionPolicy, TaskKind, ModelRole
-from codex_master.selection.policy import evaluate_eligibility, generate_candidates, select_candidate
+from the_hive.selection import FairnessLedger, SelectionCandidate, SelectionPolicy, TaskKind, ModelRole
+from the_hive.selection.policy import evaluate_eligibility, generate_candidates, select_candidate
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

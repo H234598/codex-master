@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.dynamic_teamlead_root_ipc import (
+from the_hive.dynamic_teamlead_root_ipc import (
     RootControlExchangeOperations,
     SystemBusDynamicTeamleadStartControl,
 )

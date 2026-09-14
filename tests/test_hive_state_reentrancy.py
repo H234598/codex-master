@@ -2,10 +2,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 
-from codex_master.hive.authority import AuthorityContext, AuthorityEngine
-from codex_master.hive.principals import Principal, PrincipalRegistry
-from codex_master.hive.repositories import RepositoryBinding, RepositoryRegistry
-from codex_master.hive.state import HiveStateStore
+from the_hive.hive.authority import AuthorityContext, AuthorityEngine
+from the_hive.hive.principals import Principal, PrincipalRegistry
+from the_hive.hive.repositories import RepositoryBinding, RepositoryRegistry
+from the_hive.hive.state import HiveStateStore
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

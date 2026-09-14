@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from codex_master.admission import (
+from the_hive.admission import (
     AdmissionState,
     AdmissionStore,
     AdmissionPriority,
@@ -11,9 +11,9 @@ from codex_master.admission import (
     ScopeBinding,
     create_admission,
 )
-from codex_master.selection import ModelRole, SelectionCandidate, SelectionPolicy, TaskKind
-from codex_master.selection import AdmissionMode, AdmissionPolicy
-from codex_master.selection_service import (
+from the_hive.selection import ModelRole, SelectionCandidate, SelectionPolicy, TaskKind
+from the_hive.selection import AdmissionMode, AdmissionPolicy
+from the_hive.selection_service import (
     RetryableSelectionError,
     SelectionDeniedError,
     SelectionRequest,

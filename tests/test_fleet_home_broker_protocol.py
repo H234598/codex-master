@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-import codex_master.fleet_home_broker_protocol as protocol
-from codex_master.fleet_home_broker_protocol import (
+import the_hive.fleet_home_broker_protocol as protocol
+from the_hive.fleet_home_broker_protocol import (
     AgentStartClaim,
     AgentStartEnvironmentProjection,
     AgentStartEnvelope,
@@ -52,12 +52,12 @@ from codex_master.fleet_home_broker_protocol import (
     validate_transaction_binding,
     validate_transaction_status,
 )
-from codex_master.fleet_control_release_v2 import (
+from the_hive.fleet_control_release_v2 import (
     ControlReleaseSpecV2,
     ReleasePayloadDigestV2,
     encode_control_release_v2,
 )
-from codex_master.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_identity import BrokerIdentity
 
 
 AGENT = "bee_1"

@@ -451,7 +451,7 @@ def test_bootstrap_source_is_stdlib_only_and_has_no_package_import() -> None:
         elif isinstance(node, ast.ImportFrom):
             assert node.module in allowed
         elif isinstance(node, ast.Name):
-            assert node.id != "codex_master"
+            assert node.id != "the_hive"
 
 
 def test_wrappers_have_constants_modes_and_static_security_order() -> None:
@@ -510,7 +510,7 @@ def test_wrappers_have_constants_modes_and_static_security_order() -> None:
         agent_source.index('dispatch"]("agent"')
         < agent_source.index("sys.modules")
         < agent_source.index("sys.path.insert")
-        < agent_source.index('import_module("codex_master.fleet_agent_launcher")')
+        < agent_source.index('import_module("the_hive.fleet_agent_launcher")')
     )
     assert "realpath" in agent_source
     assert "commonpath" in agent_source

@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from codex_master.admission import (
+from the_hive.admission import (
     AdmissionPriority,
     AdmissionState,
     AdmissionStore,
@@ -18,19 +18,19 @@ from codex_master.admission import (
     ScopeBinding,
     create_admission,
 )
-from codex_master.admission_runtime import (
+from the_hive.admission_runtime import (
     ADMISSION_RUNTIME_GATES,
     AdmissionRuntimeError,
     RuntimeGateDecision,
     ServerAdmissionRuntime,
 )
-from codex_master import server
-from codex_master.hive import hourly_probe as hourly_probe_module
-from codex_master.hive.dispatch import plan_queen_assignment
-from codex_master.hive.hourly_probe import PROBE_GATE_LOCK_NAME, run_probe
-from codex_master.runtime_layout import RuntimeLayout
-from codex_master.server import AgentError, build_server_admission_runtime, build_server_lease_executor, build_server_selection_service
-from codex_master.selection_service import SelectionDeniedError, SelectionService
+from the_hive import server
+from the_hive.hive import hourly_probe as hourly_probe_module
+from the_hive.hive.dispatch import plan_queen_assignment
+from the_hive.hive.hourly_probe import PROBE_GATE_LOCK_NAME, run_probe
+from the_hive.runtime_layout import RuntimeLayout
+from the_hive.server import AgentError, build_server_admission_runtime, build_server_lease_executor, build_server_selection_service
+from the_hive.selection_service import SelectionDeniedError, SelectionService
 
 
 NOW = datetime.now(timezone.utc)

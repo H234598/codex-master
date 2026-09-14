@@ -7,10 +7,10 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock, patch
 
-from codex_master import control_center
-from codex_master.control_catalog import RISK_BY_TOOL
-from codex_master.fleet_control import OllamaPageState
-from codex_master.server import AgentError
+from the_hive import control_center
+from the_hive.control_catalog import RISK_BY_TOOL
+from the_hive.fleet_control import OllamaPageState
+from the_hive.server import AgentError
 
 
 def test_host_probe_page_button_runs_production_flow_and_refreshes_only_terminal() -> None:
@@ -1162,7 +1162,7 @@ class ControlCenterGtkBoundaryTest(unittest.TestCase):
         self.assertIs(Gtk, repository.Gtk)
         self.assertIs(GLib, repository.GLib)
 
-    @patch("codex_master.control_center.load_gtk")
+    @patch("the_hive.control_center.load_gtk")
     def test_launch_activation_reuses_one_window_and_honors_deep_link(
         self, mock_load
     ) -> None:
@@ -1189,7 +1189,7 @@ class ControlCenterGtkBoundaryTest(unittest.TestCase):
         window = Mock()
 
         with patch(
-            "codex_master.control_center.ControlCenterWindow",
+            "the_hive.control_center.ControlCenterWindow",
             return_value=window,
         ) as window_class:
             self.assertEqual(
@@ -1202,18 +1202,18 @@ class ControlCenterGtkBoundaryTest(unittest.TestCase):
 
 
 class ControlCenterCliTest(unittest.TestCase):
-    @patch("codex_master.control_center.launch_gtk_application", return_value=0)
-    @patch("codex_master.control_center.require_teamleader_tool_access")
-    @patch("codex_master.control_center.assert_install_context_allows_master_registration")
+    @patch("the_hive.control_center.launch_gtk_application", return_value=0)
+    @patch("the_hive.control_center.require_teamleader_tool_access")
+    @patch("the_hive.control_center.assert_install_context_allows_master_registration")
     def test_run_checks_main_context_and_role_then_launches(self, mock_context, mock_access, mock_launch) -> None:
         self.assertEqual(control_center.run_control_center([]), 0)
         mock_context.assert_called_once_with()
         mock_access.assert_called_once_with()
         mock_launch.assert_called_once_with([])
 
-    @patch("codex_master.control_center.launch_gtk_application", return_value=0)
-    @patch("codex_master.control_center.require_teamleader_tool_access")
-    @patch("codex_master.control_center.assert_install_context_allows_master_registration")
+    @patch("the_hive.control_center.launch_gtk_application", return_value=0)
+    @patch("the_hive.control_center.require_teamleader_tool_access")
+    @patch("the_hive.control_center.assert_install_context_allows_master_registration")
     def test_run_accepts_only_ollama_deep_link(
         self, _mock_context, _mock_access, mock_launch
     ) -> None:
@@ -1224,12 +1224,12 @@ class ControlCenterCliTest(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, "page is invalid"):
             control_center.run_control_center(["--page", "secrets"])
 
-    @patch("codex_master.control_center.load_gtk", side_effect=RuntimeError("GTK unavailable"))
+    @patch("the_hive.control_center.load_gtk", side_effect=RuntimeError("GTK unavailable"))
     def test_launch_fails_without_traceback_when_gtk_is_missing(self, _mock_load) -> None:
         with self.assertRaisesRegex(AgentError, "GTK is unavailable"):
             control_center.launch_gtk_application([])
 
-    @patch("codex_master.control_center.load_gtk")
+    @patch("the_hive.control_center.load_gtk")
     def test_launch_fails_closed_without_display(self, mock_load) -> None:
         fake_gtk = Mock()
         fake_gtk.init_check.return_value = (False, [])

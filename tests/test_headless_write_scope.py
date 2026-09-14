@@ -9,8 +9,8 @@ import threading
 
 import pytest
 
-import codex_master.headless_write_scope as headless_write_scope
-from codex_master.headless_write_scope import (
+import the_hive.headless_write_scope as headless_write_scope
+from the_hive.headless_write_scope import (
     HeadlessWriteScopeFailure,
     HeadlessWriteScopeStore,
 )

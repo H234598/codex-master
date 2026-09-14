@@ -4,18 +4,18 @@ import socket
 
 import pytest
 
-import codex_master.fleet_home_broker_runtime as broker_runtime
-from codex_master.fleet_home_broker_identity import BrokerIdentity
-from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
-from codex_master.fleet_home_broker_protocol import PrincipalBinding
-from codex_master.fleet_home_broker_runtime import (
+import the_hive.fleet_home_broker_runtime as broker_runtime
+from the_hive.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_linux import FdStat, PidfdIdentity
+from the_hive.fleet_home_broker_protocol import PrincipalBinding
+from the_hive.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     CredentialProjection,
     KernelPeerEvidence,
     StartGrant,
     attest_kernel_peer,
 )
-from codex_master.fleet_home_broker_system import (
+from the_hive.fleet_home_broker_system import (
     BrokerDirectoryEvidence,
     BrokerDirectoryExpectation,
     BrokerFedoraEnforcingEvidence,
@@ -35,8 +35,8 @@ from codex_master.fleet_home_broker_system import (
     BrokerUnitEvidence,
     build_broker_system_plan,
 )
-from codex_master.fleet_home_broker_transport import BrokerPeer
-from codex_master.fleet_root_runtime_host import (
+from the_hive.fleet_home_broker_transport import BrokerPeer
+from the_hive.fleet_root_runtime_host import (
     FleetRootRuntimeHost,
     RootHostParticipant,
     RootHostParticipantBinding,

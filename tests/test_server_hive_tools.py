@@ -6,11 +6,11 @@ from unittest.mock import patch
 
 import pytest
 
-from codex_master import server
-from codex_master.hive.dispatch import HiveDispatchError
-from codex_master.hive.events import HiveEventStore
-from codex_master.hive.messages import validate_message
-from codex_master.hive.config import load_agent_class_catalog, load_hive_config
+from the_hive import server
+from the_hive.hive.dispatch import HiveDispatchError
+from the_hive.hive.events import HiveEventStore
+from the_hive.hive.messages import validate_message
+from the_hive.hive.config import load_agent_class_catalog, load_hive_config
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
@@ -1164,7 +1164,7 @@ def test_red_probe_allows_recovery_then_worktree_management(
 def test_red_probe_allows_existing_home_cutover_operations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from codex_master.fleet_home_v2_cutover import FleetHomeV2PlanHandle
+    from the_hive.fleet_home_v2_cutover import FleetHomeV2PlanHandle
 
     class ProductCore:
         @staticmethod

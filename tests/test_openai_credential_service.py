@@ -16,9 +16,9 @@ from dataclasses import replace
 
 import pytest
 
-import codex_master.openai_credential_service as service_module
-from codex_master.credential_vault import CredentialVault, CredentialVaultError
-from codex_master.openai_credential_service import (
+import the_hive.openai_credential_service as service_module
+from the_hive.credential_vault import CredentialVault, CredentialVaultError
+from the_hive.openai_credential_service import (
     AuthorizedAuthIngress,
     OpenAIAccountIdentity,
     OpenAICredentialError,
@@ -1134,7 +1134,7 @@ def test_cross_process_revoke_removes_published_file_before_return(
                     "-c",
                     (
                         "from pathlib import Path; "
-                        "from codex_master.credential_vault import CredentialVault; "
+                        "from the_hive.credential_vault import CredentialVault; "
                         "CredentialVault.for_test(Path(__import__('sys').argv[1]), "
                         "key=b'k'*32).revoke_account('openai-one', "
                         "expected_generation=2)"

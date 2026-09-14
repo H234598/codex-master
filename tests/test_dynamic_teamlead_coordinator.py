@@ -3,14 +3,14 @@ from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path
 
 import pytest
-import codex_master.dynamic_teamlead_coordinator as coordinator_module
+import the_hive.dynamic_teamlead_coordinator as coordinator_module
 
-from codex_master.dynamic_teamlead import (
+from the_hive.dynamic_teamlead import (
     DynamicTeamleadError,
     DynamicTeamleadRequest,
     ProfileBinding,
 )
-from codex_master.dynamic_teamlead_coordinator import (
+from the_hive.dynamic_teamlead_coordinator import (
     MAX_DYNAMIC_TEAMLEAD_TERMINAL_POLLS,
     DynamicTeamleadCoordinatorCode,
     DynamicTeamleadCoordinatorError,
@@ -19,10 +19,10 @@ from codex_master.dynamic_teamlead_coordinator import (
     DynamicTeamleadLaunchPlan,
     coordinate_dynamic_teamlead,
 )
-from codex_master.fleet_home_broker_client import ScmFrame
-from codex_master.fleet_home_broker_identity import BrokerIdentity
-from codex_master.fleet_home_broker_linux import FdStat
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_client import ScmFrame
+from the_hive.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_linux import FdStat
+from the_hive.fleet_home_broker_protocol import (
     B2aRecoveryPhase,
     BrokerCheckpoint,
     BrokerObservation,
@@ -46,7 +46,7 @@ from codex_master.fleet_home_broker_protocol import (
     TransactionStatus,
     encode_chpb_message,
 )
-from codex_master.fleet_registry import (
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccountV2,
     FleetRuntimePrincipalV2,
@@ -984,11 +984,11 @@ def test_coordinator_imports_are_allowlisted() -> None:
         "dataclasses": {"dataclass", "replace"},
         "enum": {"Enum"},
         "typing": {"Protocol"},
-        "codex_master.dynamic_teamlead": None,
-        "codex_master.fleet_home_broker_client": None,
-        "codex_master.fleet_home_broker_protocol": None,
-        "codex_master.fleet_home_broker_identity": None,
-        "codex_master.fleet_registry": None,
+        "the_hive.dynamic_teamlead": None,
+        "the_hive.fleet_home_broker_client": None,
+        "the_hive.fleet_home_broker_protocol": None,
+        "the_hive.fleet_home_broker_identity": None,
+        "the_hive.fleet_registry": None,
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

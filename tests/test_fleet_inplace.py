@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-import codex_master.fleet_inplace as inplace
-from codex_master.fleet_inplace import (
+import the_hive.fleet_inplace as inplace
+from the_hive.fleet_inplace import (
     InplaceError,
     QHomeUpdate,
     apply_series_update,

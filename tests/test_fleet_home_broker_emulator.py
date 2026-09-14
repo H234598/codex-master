@@ -2,7 +2,7 @@ import dataclasses
 
 import pytest
 
-from codex_master.fleet_home_broker_emulator import (
+from the_hive.fleet_home_broker_emulator import (
     BrokerEmulatorState,
     EmulatorTransaction,
     handle_emulator_message,
@@ -11,7 +11,7 @@ from codex_master.fleet_home_broker_emulator import (
     persist_emulator_checkpoint,
     recover_emulator_transaction,
 )
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_protocol import (
     CANONICAL_AGENT_HOME,
     CHPB_PROTOCOL,
     AttestHomeRequest,
@@ -122,7 +122,7 @@ def attest(status_value):
 
 
 def request(transaction_id=T, request_id=REQUEST_ID, expected_agent=AGENT):
-    from codex_master.fleet_home_broker_protocol import BindingExpectation
+    from the_hive.fleet_home_broker_protocol import BindingExpectation
 
     return AttestHomeRequest(
         CHPB_PROTOCOL,
@@ -629,7 +629,7 @@ def test_same_request_same_principal_returns_byte_identical_cached_reply():
 def test_same_request_id_different_payload_returns_stale_generation_before_reuse():
     state, _ = _committed_state()
     first = handle_emulator_message(state, principal(), request(), now_ns=2)
-    from codex_master.fleet_home_broker_protocol import BindingExpectation
+    from the_hive.fleet_home_broker_protocol import BindingExpectation
 
     changed = dataclasses.replace(
         request(), expected=BindingExpectation(AGENT, 3, 9, 8, A, 4)
@@ -680,7 +680,7 @@ def test_policy_generation_and_projection_are_stale_before_request_id_reuse(
 ):
     state, _ = _committed_state()
     first = handle_emulator_message(state, principal(), request(), now_ns=2)
-    from codex_master.fleet_home_broker_protocol import BindingExpectation
+    from the_hive.fleet_home_broker_protocol import BindingExpectation
 
     changed = dataclasses.replace(
         request(),

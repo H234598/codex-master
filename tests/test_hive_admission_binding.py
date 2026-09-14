@@ -5,25 +5,25 @@ import subprocess
 
 import pytest
 
-from codex_master.admission import AdmissionPriority, AdmissionState, LeaseBinding
-from codex_master.dynamic_pool import (
+from the_hive.admission import AdmissionPriority, AdmissionState, LeaseBinding
+from the_hive.dynamic_pool import (
     DynamicPoolInventoryEntryV1,
     DynamicPoolInventoryV1,
 )
-from codex_master.hive.admission import HiveAdmissionError, create_assignment_admission
-from codex_master.hive.authority import AuthorityContext, AuthorityEngine
-from codex_master.hive.dispatch import (
+from the_hive.hive.admission import HiveAdmissionError, create_assignment_admission
+from the_hive.hive.authority import AuthorityContext, AuthorityEngine
+from the_hive.hive.dispatch import (
     AssignmentIntent,
     WorkPackage,
     plan_queen_assignment_from_selection,
 )
-from codex_master.hive.principals import Principal, PrincipalRegistry
-from codex_master.hive.repositories import RepositoryBinding, RepositoryRegistry
-from codex_master.hive.state import HiveStateStore
-from codex_master.hive.types import DispatchPriority, TaskComplexity
-from codex_master.selection import SelectionBand, SelectionResult
-from codex_master import server
-from codex_master.server import _server_hive_authority_gate
+from the_hive.hive.principals import Principal, PrincipalRegistry
+from the_hive.hive.repositories import RepositoryBinding, RepositoryRegistry
+from the_hive.hive.state import HiveStateStore
+from the_hive.hive.types import DispatchPriority, TaskComplexity
+from the_hive.selection import SelectionBand, SelectionResult
+from the_hive import server
+from the_hive.server import _server_hive_authority_gate
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

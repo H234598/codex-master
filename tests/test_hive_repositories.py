@@ -4,12 +4,12 @@ import sys
 
 import pytest
 
-from codex_master.hive.repositories import (
+from the_hive.hive.repositories import (
     RepositoryBinding,
     RepositoryError,
     RepositoryRegistry,
 )
-import codex_master.hive.repositories as repositories
+import the_hive.hive.repositories as repositories
 
 
 def make_repo(tmp_path: Path) -> Path:

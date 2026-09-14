@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import pytest
 
-from codex_master.admin_hosts import (
+from the_hive.admin_hosts import (
     AgentBindingV1,
     ControlHostV1,
     HostRegistry,

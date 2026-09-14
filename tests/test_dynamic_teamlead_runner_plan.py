@@ -7,16 +7,16 @@ from types import SimpleNamespace
 
 import pytest
 
-import codex_master.fleet_runners as runners
-from codex_master.dynamic_teamlead import (
+import the_hive.fleet_runners as runners
+from the_hive.dynamic_teamlead import (
     DynamicTeamleadRequest,
     ProfileBinding,
     prepare_dynamic_teamlead,
 )
-from codex_master.dynamic_teamlead_coordinator import DynamicTeamleadLaunchPlan
-from codex_master.fleet_home_broker_client import AttestedHome
-from codex_master.fleet_home_broker_identity import BrokerIdentity
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.dynamic_teamlead_coordinator import DynamicTeamleadLaunchPlan
+from the_hive.fleet_home_broker_client import AttestedHome
+from the_hive.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_protocol import (
     B2aRecoveryPhase,
     BrokerCheckpoint,
     BrokerObservation,
@@ -35,7 +35,7 @@ from codex_master.fleet_home_broker_protocol import (
     TransactionBinding,
     TransactionStatus,
 )
-from codex_master.fleet_registry import (
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccountV2,
     FleetRuntimePrincipalV2,

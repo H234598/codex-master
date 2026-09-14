@@ -128,7 +128,7 @@ def test_dynamic_teamlead_start_static_tool_contract_and_catalog_risk() -> None:
     assert direct_consumer_calls == []
     assert not any(
         isinstance(node, ast.ImportFrom)
-        and node.module == "codex_master.dynamic_teamlead_start"
+        and node.module == "the_hive.dynamic_teamlead_start"
         and any(alias.name == "dynamic_teamlead_start" for alias in node.names)
         for node in server.body
     )
@@ -221,12 +221,12 @@ def test_isolated_port_is_one_way_a3_flow_without_legacy_paths() -> None:
         for node in start.body
         if isinstance(node, ast.ImportFrom)
         and node.module
-        and node.module.startswith("codex_master.")
+        and node.module.startswith("the_hive.")
     }
     assert codex_imports == {
-        "codex_master.dynamic_teamlead_coordinator",
-        "codex_master.fleet_home_broker_client",
-        "codex_master.fleet_runners",
+        "the_hive.dynamic_teamlead_coordinator",
+        "the_hive.fleet_home_broker_client",
+        "the_hive.fleet_runners",
     }
 
     flow = _function(start, "dynamic_teamlead_start")

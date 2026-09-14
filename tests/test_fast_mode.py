@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master import fast_mode
+from the_hive import fast_mode
 
 
 NOW = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
@@ -53,7 +53,7 @@ def _race_worker(
     start: multiprocessing.synchronize.Barrier,
     results: multiprocessing.queues.Queue,
 ) -> None:
-    from codex_master import fast_mode as child_fast_mode
+    from the_hive import fast_mode as child_fast_mode
 
     now = datetime.fromisoformat(now_text)
     child_fast_mode._STATE_ROOT = Path(state_root)

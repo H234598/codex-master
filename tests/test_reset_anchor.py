@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from codex_master.selection.reset_anchor import (
+from the_hive.selection.reset_anchor import (
     AnchorRecord,
     AnchorStateMachine,
     LimitObservation,

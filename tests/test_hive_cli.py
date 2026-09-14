@@ -1,7 +1,7 @@
 import argparse
 
-from codex_master.hive.cli import add_hive_cli_parsers, run_hive_cli
-from codex_master.hive.runtime import HiveRuntimeEvidence
+from the_hive.hive.cli import add_hive_cli_parsers, run_hive_cli
+from the_hive.hive.runtime import HiveRuntimeEvidence
 
 
 ANCHOR_KEY = "sha256:" + "a" * 64

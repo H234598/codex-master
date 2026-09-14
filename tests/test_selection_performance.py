@@ -2,9 +2,9 @@ from datetime import datetime, timezone
 from time import perf_counter
 import unittest
 
-from codex_master.hive.dispatch import WorkPackage
-from codex_master.hive.queue import WorkQueue
-from codex_master.selection import (
+from the_hive.hive.dispatch import WorkPackage
+from the_hive.hive.queue import WorkQueue
+from the_hive.selection import (
     FairnessLedger,
     ModelRole,
     SelectionCandidate,

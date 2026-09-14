@@ -5,7 +5,7 @@ import stat
 
 import pytest
 
-from codex_master.hive.state import HiveStateError, HiveStateStore
+from the_hive.hive.state import HiveStateError, HiveStateStore
 
 
 def test_state_store_round_trips_private_json_and_jsonl(tmp_path: Path) -> None:
@@ -89,7 +89,7 @@ def test_shared_state_reuses_group_owned_lock_without_chmod(
             raise PermissionError
         original_fchmod(descriptor, mode)
 
-    monkeypatch.setattr("codex_master.hive.state.os.fchmod", deny_existing_lock_chmod)
+    monkeypatch.setattr("the_hive.hive.state.os.fchmod", deny_existing_lock_chmod)
 
     with HiveStateStore(root, shared_gid=os.getegid()).locked():
         pass
@@ -117,7 +117,7 @@ def test_shared_state_directory_creation_race_never_chmods_other_owner(
         original_chmod(path, mode)
 
     monkeypatch.setattr(Path, "mkdir", race_mkdir)
-    monkeypatch.setattr("codex_master.hive.state.os.chmod", deny_foreign_chmod)
+    monkeypatch.setattr("the_hive.hive.state.os.chmod", deny_foreign_chmod)
 
     HiveStateStore(root, shared_gid=os.getegid())
 
@@ -152,8 +152,8 @@ def test_shared_state_lock_creation_race_never_fchmods_other_owner(
             raise PermissionError
         original_fchmod(descriptor, mode)
 
-    monkeypatch.setattr("codex_master.hive.state.os.open", race_open)
-    monkeypatch.setattr("codex_master.hive.state.os.fchmod", deny_foreign_fchmod)
+    monkeypatch.setattr("the_hive.hive.state.os.open", race_open)
+    monkeypatch.setattr("the_hive.hive.state.os.fchmod", deny_foreign_fchmod)
 
     with HiveStateStore(root, shared_gid=os.getegid()).locked():
         pass
@@ -174,7 +174,7 @@ def test_state_store_reuses_exact_0700_root_without_chmod_and_existing_lock(
             raise PermissionError("root is read-only")
         original_chmod(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr("codex_master.hive.state.os.chmod", deny_root_chmod)
+    monkeypatch.setattr("the_hive.hive.state.os.chmod", deny_root_chmod)
 
     store = HiveStateStore(root)
     store.replace_private_bytes(PurePosixPath("resources/snapshot.bin"), b"complete")
@@ -252,7 +252,7 @@ def test_hive_state_raw_private_bytes_keep_nofollow_hardlink_parent_swap_and_ato
 
     expected_uid = os.geteuid()
     monkeypatch.setattr(HiveStateStore, "_validate_private_directory", staticmethod(lambda _info: None))
-    monkeypatch.setattr("codex_master.hive.state.os.geteuid", lambda: expected_uid + 1)
+    monkeypatch.setattr("the_hive.hive.state.os.geteuid", lambda: expected_uid + 1)
     with pytest.raises(HiveStateError, match="state_file_untrusted"):
         store.read_private_bytes(relative, max_bytes=64)
     monkeypatch.undo()

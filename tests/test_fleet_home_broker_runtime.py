@@ -12,10 +12,10 @@ import weakref
 
 import pytest
 
-from codex_master.fleet_home_broker_identity import BrokerIdentity
-from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
-from codex_master.fleet_home_broker_protocol import PrincipalBinding
-from codex_master.fleet_home_broker_runtime import (
+from the_hive.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_linux import FdStat, PidfdIdentity
+from the_hive.fleet_home_broker_protocol import PrincipalBinding
+from the_hive.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     CredentialProjection,
     CredentialProjectionProvider,
@@ -28,7 +28,7 @@ from codex_master.fleet_home_broker_runtime import (
     TrustedPrincipalGrantContext,
     attest_kernel_peer,
 )
-from codex_master.fleet_home_broker_transport import BrokerPeer
+from the_hive.fleet_home_broker_transport import BrokerPeer
 
 
 PEER = BrokerPeer(1234)
@@ -1073,7 +1073,7 @@ def test_issued_start_grant_serialization_fails_closed():
 
 
 def test_internal_grant_issuer_is_only_called_by_attestation_and_not_exported():
-    import codex_master.fleet_home_broker_runtime as runtime
+    import the_hive.fleet_home_broker_runtime as runtime
 
     source = Path(runtime.__file__).read_text()
     tree = ast.parse(source)
@@ -1113,7 +1113,7 @@ def test_internal_grant_issuer_is_only_called_by_attestation_and_not_exported():
 
 
 def test_trusted_operations_are_called_without_getattr_preprobes():
-    import codex_master.fleet_home_broker_runtime as runtime
+    import the_hive.fleet_home_broker_runtime as runtime
 
     tree = ast.parse(Path(runtime.__file__).read_text())
 
@@ -1145,7 +1145,7 @@ def test_runtime_module_imports_only_offline_contracts():
         "threading",
         "typing",
         "weakref",
-        "codex_master",
+        "the_hive",
     }
     forbidden = {
         "socket",
@@ -1171,7 +1171,7 @@ def test_runtime_module_imports_only_offline_contracts():
 
 
 def test_runtime_api_exports_only_a3a_surface():
-    import codex_master.fleet_home_broker_runtime as runtime
+    import the_hive.fleet_home_broker_runtime as runtime
 
     assert runtime.__all__ == (
         "BrokerReleaseSpec",

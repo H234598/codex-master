@@ -10,9 +10,9 @@ import subprocess
 import sys
 from typing import Iterator
 
-from codex_master import server
-from codex_master.admin_contracts import AdminPrincipalV1, OperationV1
-from codex_master.admin_socket import AdminSocketServer
+from the_hive import server
+from the_hive.admin_contracts import AdminPrincipalV1, OperationV1
+from the_hive.admin_socket import AdminSocketServer
 from test_admin_service import service_at
 
 
@@ -186,7 +186,7 @@ def test_real_host_probe_cli_uses_exact_parser_contract_and_internal_key(
             [
                 sys.executable,
                 "-m",
-                "codex_master.server",
+                "the_hive.server",
                 "fleet",
                 "host",
                 "probe",
@@ -201,7 +201,7 @@ def test_real_host_probe_cli_uses_exact_parser_contract_and_internal_key(
             [
                 sys.executable,
                 "-m",
-                "codex_master.server",
+                "the_hive.server",
                 "fleet",
                 "host",
                 "probe",
@@ -218,7 +218,7 @@ def test_real_host_probe_cli_uses_exact_parser_contract_and_internal_key(
             [
                 sys.executable,
                 "-m",
-                "codex_master.server",
+                "the_hive.server",
                 "fleet",
                 "host",
                 "probe",
@@ -232,7 +232,7 @@ def test_real_host_probe_cli_uses_exact_parser_contract_and_internal_key(
             [
                 sys.executable,
                 "-m",
-                "codex_master.server",
+                "the_hive.server",
                 "fleet",
                 "host",
                 "probe",
@@ -280,7 +280,7 @@ def test_real_registered_host_probe_mcp_call_forwards_caller_key(
     }
     with _admin_socket(tmp_path) as (socket_path, credential_directory, owners):
         completed = _run_child(
-            [sys.executable, "-m", "codex_master.server"],
+            [sys.executable, "-m", "the_hive.server"],
             input_text="\n".join(
                 (
                     json.dumps(list_request),
@@ -312,7 +312,7 @@ def test_real_cli_process_calls_attested_admin_socket(tmp_path: Path) -> None:
             [
                 sys.executable,
                 "-m",
-                "codex_master.server",
+                "the_hive.server",
                 "fleet",
                 "google",
                 "inventory",
@@ -376,7 +376,7 @@ def test_real_mcp_stdio_process_calls_same_attested_admin_socket(
     }
     with _admin_socket(tmp_path) as (socket_path, credential_directory, owners):
         completed = _run_child(
-            [sys.executable, "-m", "codex_master.server"],
+            [sys.executable, "-m", "the_hive.server"],
             input_text="\n".join(
                 (
                     json.dumps(list_request),
@@ -412,7 +412,7 @@ def test_real_cli_process_syncs_quota_evidence_without_restart(tmp_path: Path) -
             [
                 sys.executable,
                 "-m",
-                "codex_master.server",
+                "the_hive.server",
                 "fleet",
                 "google",
                 "quota-sync",

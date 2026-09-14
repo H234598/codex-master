@@ -11,8 +11,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from codex_master import server
-from codex_master.fleet_recovery import (
+from the_hive import server
+from the_hive.fleet_recovery import (
     EntryPhase,
     FleetRecoveryJournal,
     GMigrationJournal,
@@ -22,7 +22,7 @@ from codex_master.fleet_recovery import (
     RecoveryOperation,
     RecoveryPhase,
 )
-from codex_master.fleet_registry import (
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetSeries,

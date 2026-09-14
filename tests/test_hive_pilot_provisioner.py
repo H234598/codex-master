@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from codex_master.hive.pilot_provisioner import (
+from the_hive.hive.pilot_provisioner import (
     PilotProvisionerError,
     apply_pilot_provisioning,
     kill_switch_pilot_provisioning,
@@ -15,8 +15,8 @@ from codex_master.hive.pilot_provisioner import (
     rollback_pilot_provisioning,
     verify_pilot_provisioning,
 )
-from codex_master.hive.runtime import read_hive_runtime_evidence
-import codex_master.hive.pilot_provisioner as pilot_provisioner
+from the_hive.hive.runtime import read_hive_runtime_evidence
+import the_hive.hive.pilot_provisioner as pilot_provisioner
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -154,7 +154,7 @@ def test_apply_recovers_a_prepared_crash_without_exposing_partial_config(
     def crash(*_args: object, **_kwargs: object) -> None:
         raise PilotProvisionerError("config_write_failed")
 
-    monkeypatch.setattr("codex_master.hive.pilot_provisioner._replace_config_atomically", crash)
+    monkeypatch.setattr("the_hive.hive.pilot_provisioner._replace_config_atomically", crash)
     with pytest.raises(PilotProvisionerError, match="config_write_failed"):
         apply_pilot_provisioning(repository_root=repository, state_root=state_root)
 

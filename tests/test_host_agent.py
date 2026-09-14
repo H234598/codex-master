@@ -17,17 +17,17 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import pytest
-import codex_master.host_agent as host_agent_module
+import the_hive.host_agent as host_agent_module
 
-from codex_master.agent_ollama import AgentOllamaNoEffectError
-from codex_master.agent_contracts import (
+from the_hive.agent_ollama import AgentOllamaNoEffectError
+from the_hive.agent_contracts import (
     AgentLeaseV1,
     AgentNoWorkV1,
     AgentPollV1,
     AgentResultV1,
     remote_envelope_digest,
 )
-from codex_master.host_agent import (
+from the_hive.host_agent import (
     BACKOFF_SECONDS,
     MAX_RESPONSE_BYTES,
     HostAgent,
@@ -43,8 +43,8 @@ from codex_master.host_agent import (
     open_host_agent_credentials,
     run_poll_loop,
 )
-from codex_master.host_agent_state import HostAgentState, HostAgentStateError
-from codex_master.host_probe import LocalHostProbeCollector
+from the_hive.host_agent_state import HostAgentState, HostAgentStateError
+from the_hive.host_probe import LocalHostProbeCollector
 
 
 def _private_key_bytes(key: rsa.RSAPrivateKey) -> bytes:

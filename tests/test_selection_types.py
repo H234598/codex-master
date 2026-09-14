@@ -2,11 +2,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from codex_master.selection.types import SelectionPriority, SelectionValidationError, SystemClock, validate_selection_time
+from the_hive.selection.types import SelectionPriority, SelectionValidationError, SystemClock, validate_selection_time
 
 
 def test_selection_package_preserves_existing_core_and_adds_typed_priority() -> None:
-    from codex_master.selection import SelectionCandidate, SelectionPolicy
+    from the_hive.selection import SelectionCandidate, SelectionPolicy
 
     assert SelectionCandidate is not None
     assert SelectionPolicy is not None

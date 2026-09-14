@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.admission import (
+from the_hive.admission import (
     AdmissionPriority,
     AdmissionState,
     AdmissionStore,
@@ -13,10 +13,10 @@ from codex_master.admission import (
     ScopeBinding,
     create_admission,
 )
-from codex_master.admission_journal import CompletionJournal, CompletionJournalError, FileCompletionJournal
-from codex_master.admission_runtime import ADMISSION_RUNTIME_GATES, AdmissionRuntimeError, RuntimeGateDecision, ServerAdmissionRuntime
-from codex_master.hive.events import HiveEventStore
-from codex_master.selection_service import SelectionService
+from the_hive.admission_journal import CompletionJournal, CompletionJournalError, FileCompletionJournal
+from the_hive.admission_runtime import ADMISSION_RUNTIME_GATES, AdmissionRuntimeError, RuntimeGateDecision, ServerAdmissionRuntime
+from the_hive.hive.events import HiveEventStore
+from the_hive.selection_service import SelectionService
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-import codex_master.fleet_registry as fleet_registry
-from codex_master.agent_resolver import (
+import the_hive.fleet_registry as fleet_registry
+from the_hive.agent_resolver import (
     AgentClassPolicy,
     ModelPolicy,
     ResolutionRequest,
@@ -21,7 +21,7 @@ from codex_master.agent_resolver import (
     canonical_resolution_decision_digest,
     resolve_agent_selection,
 )
-from codex_master.fleet_registry import (
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetRuntimePrincipalV2,
@@ -49,13 +49,13 @@ from codex_master.fleet_registry import (
     public_fleet_snapshot,
     _next,
 )
-from codex_master.worker_resolution_carrier import (
+from the_hive.worker_resolution_carrier import (
     WorkerRegistryReservationIssuerV2,
     WorkerResolutionEvidenceV2,
     build_worker_resolution_carrier,
 )
-from codex_master.worker_resume import WorkerLifecycle
-from codex_master.worker_spawn_ledger import (
+from the_hive.worker_resume import WorkerLifecycle
+from the_hive.worker_spawn_ledger import (
     FenceEpoch,
     Generation,
     LeaseBindingConsumerInputV1,
@@ -157,7 +157,7 @@ def worker_registry_reservation(
         ticket_fence_epoch=ticket.fence_epoch,
     )
     carrier = build_worker_resolution_carrier(ticket, evidence)
-    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+    allocator_module = importlib.import_module("the_hive.runtime_account_allocator")
 
     class _Adapter:
         adapter_id = "adapter-registry"
@@ -1283,7 +1283,7 @@ def test_v2_generation_cas_preserves_type_and_member_ids() -> None:
 
 
 def _generation_for_test(snapshot: FleetSnapshotV2, expected: int) -> None:
-    from codex_master.fleet_registry import _generation
+    from the_hive.fleet_registry import _generation
 
     _generation(snapshot, expected)
 
@@ -1900,7 +1900,7 @@ def test_registry_rejects_opaque_forge_foreign_allocator_and_reference_before_ca
     snapshot = empty_worker_snapshot()
     allocator, reservation = worker_registry_reservation()
     planner = fleet_registry.DynamicWorkerRegistryPlannerV2(allocator)
-    runtime = importlib.import_module("codex_master.runtime_account_allocator")
+    runtime = importlib.import_module("the_hive.runtime_account_allocator")
 
     payload = object.__getattribute__(reservation, "_payload")
     binding = payload.binding_input

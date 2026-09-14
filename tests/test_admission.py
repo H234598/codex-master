@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from codex_master.admission import (
+from the_hive.admission import (
     DEFAULT_RESERVATION_TTL_SECONDS,
     MAX_ADMISSION_STATE_BYTES,
     MAX_RESERVATION_TTL_SECONDS,

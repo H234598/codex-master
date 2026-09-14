@@ -10,8 +10,8 @@ import stat
 
 import pytest
 
-import codex_master.fleet_home_recovery as recovery_module
-from codex_master.fleet_home_recovery import (
+import the_hive.fleet_home_recovery as recovery_module
+from the_hive.fleet_home_recovery import (
     MAX_FLEET_HOME_RECOVERY_BYTES,
     FleetHomeEntryKind,
     FleetHomeRecoveryAction,
@@ -2449,11 +2449,11 @@ def _relative_import_module(
 
 
 def _b2a_ast_findings(path: Path, source_root: Path, source: str) -> list[str]:
-    module_name = "codex_master.fleet_home_recovery"
-    recovery_path = source_root / "codex_master" / "fleet_home_recovery.py"
+    module_name = "the_hive.fleet_home_recovery"
+    recovery_path = source_root / "the_hive" / "fleet_home_recovery.py"
     if path == recovery_path:
         return []
-    server_path = source_root / "codex_master" / "server.py"
+    server_path = source_root / "the_hive" / "server.py"
     allowed = {
         "FleetHomeRecoveryValidationError",
         "FleetIdentityJournalPlan",
@@ -2576,62 +2576,62 @@ def test_ast_guard_selftests_relative_and_static_dynamic_imports() -> None:
     source_root = Path("/synthetic/src")
     cases = (
         (
-            source_root / "codex_master" / "relative.py",
+            source_root / "the_hive" / "relative.py",
             "from .fleet_home_recovery import plan_fleet_home_recovery_v2 as hidden",
         ),
         (
-            source_root / "codex_master" / "nested" / "relative.py",
+            source_root / "the_hive" / "nested" / "relative.py",
             "from ..fleet_home_recovery import plan_fleet_home_recovery_v2 as hidden",
         ),
         (
-            source_root / "codex_master" / "package_relative.py",
+            source_root / "the_hive" / "package_relative.py",
             "from . import fleet_home_recovery as hidden",
         ),
         (
-            source_root / "codex_master" / "package_absolute.py",
-            "from codex_master import fleet_home_recovery as hidden",
+            source_root / "the_hive" / "package_absolute.py",
+            "from the_hive import fleet_home_recovery as hidden",
         ),
         (
-            source_root / "codex_master" / "dynamic.py",
-            "import runpy\nPREFIX = 'codex_master.'\n"
+            source_root / "the_hive" / "dynamic.py",
+            "import runpy\nPREFIX = 'the_hive.'\n"
             "TARGET = PREFIX + 'fleet_home_recovery'\nrunpy.run_module(TARGET)",
         ),
         (
-            source_root / "codex_master" / "run_path.py",
-            "import runpy\nROOT = '/synthetic/src/codex_master/..'\n"
-            "TARGET = ROOT + '/codex_master/fleet_home_recovery.py'\n"
+            source_root / "the_hive" / "run_path.py",
+            "import runpy\nROOT = '/synthetic/src/the_hive/..'\n"
+            "TARGET = ROOT + '/the_hive/fleet_home_recovery.py'\n"
             "runpy.run_path(TARGET)",
         ),
         (
-            source_root / "codex_master" / "run_path_repo_relative.py",
-            "import runpy\nrunpy.run_path('src/codex_master/fleet_home_recovery.py')",
+            source_root / "the_hive" / "run_path_repo_relative.py",
+            "import runpy\nrunpy.run_path('src/the_hive/fleet_home_recovery.py')",
         ),
         (
-            source_root / "codex_master" / "run_path_source_relative.py",
-            "import runpy\nrunpy.run_path('codex_master/fleet_home_recovery.py')",
+            source_root / "the_hive" / "run_path_source_relative.py",
+            "import runpy\nrunpy.run_path('the_hive/fleet_home_recovery.py')",
         ),
         (
-            source_root / "codex_master" / "run_path_file_relative.py",
+            source_root / "the_hive" / "run_path_file_relative.py",
             "import runpy\nrunpy.run_path('fleet_home_recovery.py')",
         ),
         (
-            source_root / "codex_master" / "nested" / "fleet_home_recovery.py",
+            source_root / "the_hive" / "nested" / "fleet_home_recovery.py",
             "from ..fleet_home_recovery import plan_fleet_home_recovery_v2 as hidden",
         ),
     )
     assert all(_b2a_ast_findings(path, source_root, source) for path, source in cases)
     assert (
         _b2a_ast_findings(
-            source_root / "codex_master" / "fleet_home_recovery.py",
+            source_root / "the_hive" / "fleet_home_recovery.py",
             source_root,
-            "import runpy\nrunpy.run_module('codex_master.fleet_home_recovery')",
+            "import runpy\nrunpy.run_module('the_hive.fleet_home_recovery')",
         )
         == []
     )
 
 
 def test_recursive_ast_guard_allows_only_three_b1_server_references() -> None:
-    package = Path(__file__).parents[1] / "src" / "codex_master"
+    package = Path(__file__).parents[1] / "src" / "the_hive"
     source_root = package.parent
     findings: list[tuple[str, str]] = []
     for path in package.rglob("*.py"):

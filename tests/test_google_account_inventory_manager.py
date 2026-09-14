@@ -13,11 +13,11 @@ import weakref
 import pytest
 import yaml
 
-import codex_master.google_account_inventory_manager as manager_module
-from codex_master.admin_contracts import AdminContractError
-from codex_master.google_account_inventory import GoogleAccountInventoryError
-from codex_master.google_account_inventory import GoogleAccountInventoryLoader
-from codex_master.google_account_inventory_manager import (
+import the_hive.google_account_inventory_manager as manager_module
+from the_hive.admin_contracts import AdminContractError
+from the_hive.google_account_inventory import GoogleAccountInventoryError
+from the_hive.google_account_inventory import GoogleAccountInventoryLoader
+from the_hive.google_account_inventory_manager import (
     GoogleAccountInventoryManager,
     GoogleAccountInventoryStatusV1,
     _SecretLeasePurposeV1,

@@ -15,8 +15,8 @@ import threading
 import pytest
 
 from conftest import seal_runtime_image
-from codex_master.hive import hourly_probe as hourly_probe_module
-from codex_master.hive.hourly_probe import (
+from the_hive.hive import hourly_probe as hourly_probe_module
+from the_hive.hive.hourly_probe import (
     DETERMINISTIC_PROBE_HOURS_UTC,
     MAX_PROBE_AGE_SECONDS,
     evaluate,
@@ -24,8 +24,8 @@ from codex_master.hive.hourly_probe import (
     read_probe_gate,
     run_probe,
 )
-from codex_master.runtime_layout import RuntimeLayout
-from codex_master.runtime_process import BoundedProcessError, BoundedProcessResult
+from the_hive.runtime_layout import RuntimeLayout
+from the_hive.runtime_process import BoundedProcessError, BoundedProcessResult
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -168,7 +168,7 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     ):
         write(
             f"src/codex_master/{relative}",
-            (ROOT / "src" / "codex_master" / relative).read_text(encoding="utf-8"),
+            (ROOT / "src" / "the_hive" / relative).read_text(encoding="utf-8"),
         )
     for path in root.rglob("*"):
         if path.is_dir():
@@ -634,17 +634,17 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     ) in installed_service_text
     installed_cli = runtime_root / "bin" / "codex-master-mcp"
     installed_source = (
-        runtime_root / "src" / "codex_master" / "hive" / "hourly_probe.py"
+        runtime_root / "src" / "the_hive" / "hive" / "hourly_probe.py"
     )
     for path, mode in (
         (installed_cli, 0o755),
         (installed_source, 0o644),
         (
-            runtime_root / "src" / "codex_master" / "runtime_spawn_helper.c",
+            runtime_root / "src" / "the_hive" / "runtime_spawn_helper.c",
             0o644,
         ),
         (
-            runtime_root / "src" / "codex_master" / "_runtime_spawn_helper.so",
+            runtime_root / "src" / "the_hive" / "_runtime_spawn_helper.so",
             0o755,
         ),
         (runtime_root / ".codex-plugin" / "plugin.json", 0o644),
@@ -952,7 +952,7 @@ def test_runtime_spawn_helper_build_fails_closed_before_image_publication(
     with pytest.raises(install_error, match="install_runtime_helper_unavailable"):
         installer["_compile_runtime_spawn_helper"](stage=stage)
 
-    assert not (stage / "src" / "codex_master" / "_runtime_spawn_helper.so").exists()
+    assert not (stage / "src" / "the_hive" / "_runtime_spawn_helper.so").exists()
 
 
 def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen_home(
@@ -1020,7 +1020,7 @@ def _canonical_23510da_legacy_payload(root: Path) -> dict[str, object]:
             destination = (
                 root
                 / "src"
-                / "codex_master"
+                / "the_hive"
                 / Path(historical).relative_to("src/codex_master")
             )
         else:
@@ -1106,8 +1106,8 @@ def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
         "from pathlib import Path\n"
         "root = Path(sys.argv[1])\n"
         "sys.path.insert(0, str(root / 'src'))\n"
-        "sys.argv = [str(root / 'src' / 'codex_master' / 'server.py'), *sys.argv[2:]]\n"
-        "runpy.run_module('codex_master.server', run_name='__main__', alter_sys=True)\n"
+        "sys.argv = [str(root / 'src' / 'the_hive' / 'server.py'), *sys.argv[2:]]\n"
+        "runpy.run_module('the_hive.server', run_name='__main__', alter_sys=True)\n"
     )
     assert observed == [
         ("/usr/bin/python3", "-I", "-B", "-c", stage_server, str(stage), "--runtime-status-mcp"),

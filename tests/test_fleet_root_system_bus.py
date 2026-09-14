@@ -23,23 +23,23 @@ import dbus
 from gi.repository import GLib
 import pytest
 
-import codex_master.fleet_root_system_bus as system_bus
-import codex_master.fleet_home_broker_runtime as runtime
-import codex_master.fleet_home_broker_system as broker_system
-import codex_master.dynamic_teamlead_a3_runner as runner
-from codex_master.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
-from codex_master.dynamic_teamlead_a3_runtime_provider import (
+import the_hive.fleet_root_system_bus as system_bus
+import the_hive.fleet_home_broker_runtime as runtime
+import the_hive.fleet_home_broker_system as broker_system
+import the_hive.dynamic_teamlead_a3_runner as runner
+from the_hive.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
+from the_hive.dynamic_teamlead_a3_runtime_provider import (
     DynamicTeamleadA3RuntimeContext,
 )
-from codex_master.dynamic_teamlead_coordinator import DynamicTeamleadCoordinatorRequest
-from codex_master.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
-from codex_master.fleet_home_broker_identity import BrokerIdentity
-from codex_master.fleet_home_broker_client_seqpacket import (
+from the_hive.dynamic_teamlead_coordinator import DynamicTeamleadCoordinatorRequest
+from the_hive.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
+from the_hive.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_client_seqpacket import (
     SeqpacketBrokerClientOperations,
 )
-from codex_master.fleet_home_broker_protocol import PrincipalBinding
-from codex_master.fleet_home_broker_client import AttestedHome
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_protocol import PrincipalBinding
+from the_hive.fleet_home_broker_client import AttestedHome
+from the_hive.fleet_home_broker_protocol import (
     B2aRecoveryPhase,
     AttestHomeRequest,
     BindingExpectation,
@@ -59,12 +59,12 @@ from codex_master.fleet_home_broker_protocol import (
     TransactionBinding,
     TransactionStatus,
 )
-from codex_master.fleet_home_broker_runtime import (
+from the_hive.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     CredentialProjection,
     TrustedPrincipalGrantContext,
 )
-from codex_master.fleet_registry import (
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccountV2,
     FleetRuntimePrincipalV2,
@@ -74,15 +74,15 @@ from codex_master.fleet_registry import (
     RunnerKind,
     SecretState,
 )
-from codex_master.fleet_runners import DynamicTeamleadRunnerPlan
-from codex_master.fleet_root_runtime_host import (
+from the_hive.fleet_runners import DynamicTeamleadRunnerPlan
+from the_hive.fleet_root_runtime_host import (
     FleetRootRuntimeHost,
     FleetRootRuntimeHostError,
     RootHostParticipant,
     RootHostParticipantBinding,
     RootRuntimeActivityOwnership,
 )
-from codex_master.fleet_root_system_bus import (
+from the_hive.fleet_root_system_bus import (
     BUS_INTERFACE,
     BUS_METHOD,
     BUS_NAME,

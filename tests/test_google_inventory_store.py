@@ -7,9 +7,9 @@ import stat
 import pytest
 import yaml
 
-from codex_master import google_account_inventory
-from codex_master.google_account_inventory import GoogleAccountInventoryLoader
-from codex_master.google_inventory_store import (
+from the_hive import google_account_inventory
+from the_hive.google_account_inventory import GoogleAccountInventoryLoader
+from the_hive.google_inventory_store import (
     GoogleInventoryStore,
     GoogleInventoryStoreError,
 )

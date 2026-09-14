@@ -11,10 +11,10 @@ from uuid import UUID
 
 import pytest
 
-from codex_master import server as server_module
-from codex_master.fleet_recovery import normalize_g_migration_journal
-from codex_master.fleet_migration_materialization import MemberIdAllocation
-from codex_master.fleet_registry import (
+from the_hive import server as server_module
+from the_hive.fleet_recovery import normalize_g_migration_journal
+from the_hive.fleet_migration_materialization import MemberIdAllocation
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetSeries,
@@ -27,7 +27,7 @@ from codex_master.fleet_registry import (
     build_inventory,
     public_fleet_snapshot,
 )
-from codex_master.fleet_migration_apply import (
+from the_hive.fleet_migration_apply import (
     GMigrationApplyError,
     QUEEN_G_MANIFEST_V1,
     _materialize_g_migration_locked,

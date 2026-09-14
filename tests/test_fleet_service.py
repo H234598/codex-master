@@ -12,9 +12,9 @@ from pathlib import Path
 from types import MappingProxyType
 
 import pytest
-import codex_master.fleet_service as fleet_service_module
+import the_hive.fleet_service as fleet_service_module
 
-from codex_master.agent_resolver import (
+from the_hive.agent_resolver import (
     AgentClassPolicy,
     ModelPolicy,
     ResolutionRequest,
@@ -22,7 +22,7 @@ from codex_master.agent_resolver import (
     canonical_resolution_decision_digest,
     resolve_agent_selection,
 )
-from codex_master.fleet_registry import (
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetAccountV2,
@@ -40,19 +40,19 @@ from codex_master.fleet_registry import (
     normalize_fleet_document,
     DynamicWorkerRegistryPlannerV2,
 )
-from codex_master.fleet_runners import (
+from the_hive.fleet_runners import (
     ProviderError,
     ProviderErrorQuotaObservation,
     ProbeResult,
 )
-from codex_master.fleet_service import FleetConflictError, FleetRateLimitError
-from codex_master.worker_resolution_carrier import (
+from the_hive.fleet_service import FleetConflictError, FleetRateLimitError
+from the_hive.worker_resolution_carrier import (
     WorkerRegistryReservationIssuerV2,
     WorkerResolutionEvidenceV2,
     build_worker_resolution_carrier,
 )
-from codex_master.worker_resume import WorkerLifecycle
-from codex_master.worker_spawn_ledger import (
+from the_hive.worker_resume import WorkerLifecycle
+from the_hive.worker_spawn_ledger import (
     FenceEpoch,
     Generation,
     LeaseBindingConsumerInputV1,
@@ -63,7 +63,7 @@ from codex_master.worker_spawn_ledger import (
 
 
 def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetPaths
+    from the_hive.fleet_service import FleetPaths
 
     paths = FleetPaths.from_state_root(tmp_path)
 
@@ -97,8 +97,8 @@ def test_persisted_remote_readiness_requires_exact_document() -> None:
 def test_shared_remote_state_reuses_group_owned_directories_without_chmod(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from codex_master.fleet_service import FleetPaths, FleetService
-    from codex_master.server import build_fleet_private_io
+    from the_hive.fleet_service import FleetPaths, FleetService
+    from the_hive.server import build_fleet_private_io
 
     paths = FleetPaths.from_state_root(tmp_path / "shared")
     paths.root.mkdir(parents=True)
@@ -112,7 +112,7 @@ def test_shared_remote_state_reuses_group_owned_directories_without_chmod(
             raise PermissionError
         original_chmod(path, mode)
 
-    monkeypatch.setattr("codex_master.fleet_service.os.chmod", deny_existing_chmod)
+    monkeypatch.setattr("the_hive.fleet_service.os.chmod", deny_existing_chmod)
 
     FleetService(
         paths,
@@ -160,8 +160,8 @@ def _series(
 
 
 def _service(tmp_path: Path, snapshot: FleetSnapshot | None = None):
-    from codex_master.fleet_service import FleetPaths, FleetService
-    from codex_master.server import build_fleet_private_io
+    from the_hive.fleet_service import FleetPaths, FleetService
+    from the_hive.server import build_fleet_private_io
 
     paths = FleetPaths.from_state_root(tmp_path)
     private_io = replace(
@@ -175,7 +175,7 @@ def _service(tmp_path: Path, snapshot: FleetSnapshot | None = None):
 
 
 def _r3_service(tmp_path: Path, snapshot: FleetSnapshotV2):
-    from codex_master.fleet_service import FleetPaths, FleetPrivateIO, FleetService
+    from the_hive.fleet_service import FleetPaths, FleetPrivateIO, FleetService
 
     paths = FleetPaths.from_state_root(tmp_path)
 
@@ -297,7 +297,7 @@ def _worker_registry_reservation():
         ticket_fence_epoch=ticket.fence_epoch,
     )
     carrier = build_worker_resolution_carrier(ticket, evidence)
-    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+    allocator_module = importlib.import_module("the_hive.runtime_account_allocator")
 
     class _Adapter:
         adapter_id = "adapter-service"
@@ -386,7 +386,7 @@ def _worker_registry_reservation():
 def test_registry_snapshot_reads_registry_only_without_clock_or_limits(
     tmp_path: Path,
 ) -> None:
-    from codex_master.fleet_service import FleetPaths, FleetPrivateIO, FleetService
+    from the_hive.fleet_service import FleetPaths, FleetPrivateIO, FleetService
 
     expected = _configured_snapshot(generation=7)
     paths = FleetPaths.from_state_root(tmp_path)
@@ -457,7 +457,7 @@ def test_registry_snapshot_v2_never_calls_clock_sidecar_lock_or_write_callbacks(
         ),
         (),
     )
-    from codex_master.fleet_service import FleetPaths, FleetPrivateIO, FleetService
+    from the_hive.fleet_service import FleetPaths, FleetPrivateIO, FleetService
 
     paths = FleetPaths.from_state_root(tmp_path)
     callback_calls = {"registry": 0, "ensure": 0}
@@ -500,7 +500,7 @@ def _synthetic_g_binding_state(tmp_path: Path):
 def test_g_binding_evidence_never_creates_salt_or_mutates_registry(
     tmp_path: Path,
 ) -> None:
-    from codex_master.fleet_service import FleetSecretError
+    from the_hive.fleet_service import FleetSecretError
 
     service, paths = _service(tmp_path, _configured_snapshot())
     callback_called: list[bool] = []
@@ -549,7 +549,7 @@ def test_g_binding_evidence_returns_immutable_redacted_hmac_mapping(
 def test_g_binding_evidence_rejects_unsafe_salt_without_mutation(
     tmp_path: Path, salt_kind: str
 ) -> None:
-    from codex_master.fleet_service import FleetSecretError
+    from the_hive.fleet_service import FleetSecretError
 
     service, paths = _synthetic_g_binding_state(tmp_path)
     salt_path = paths.secrets / ".credential-binding-salt"
@@ -586,7 +586,7 @@ def test_g_binding_evidence_rejects_unsafe_salt_without_mutation(
 def test_g_binding_evidence_rejects_invalid_account_or_generation(
     tmp_path: Path, account_ids: object, expected_generation: int
 ) -> None:
-    from codex_master.fleet_service import FleetSecretError
+    from the_hive.fleet_service import FleetSecretError
 
     service, _paths = _service(tmp_path, _configured_snapshot())
     callback_called: list[bool] = []
@@ -604,7 +604,7 @@ def test_g_binding_evidence_rejects_invalid_account_or_generation(
 def test_g_binding_evidence_rejects_sidecar_drift_without_callback(
     tmp_path: Path, sidecar_kind: str
 ) -> None:
-    from codex_master.fleet_service import FleetSecretError
+    from the_hive.fleet_service import FleetSecretError
 
     service, paths = _synthetic_g_binding_state(tmp_path)
     secret_path = paths.secrets / "shared.secret"
@@ -657,7 +657,7 @@ def test_set_secret_writes_only_private_file_and_public_status(tmp_path: Path) -
 
 @pytest.mark.parametrize("secret", ["", "x" * (16 * 1024 + 1)])
 def test_set_secret_rejects_invalid_size(tmp_path: Path, secret: str) -> None:
-    from codex_master.fleet_service import FleetSecretError
+    from the_hive.fleet_service import FleetSecretError
 
     service, paths = _service(tmp_path, FleetSnapshot(1, 2, (_account(),), ()))
     with pytest.raises(FleetSecretError) as raised:
@@ -667,7 +667,7 @@ def test_set_secret_rejects_invalid_size(tmp_path: Path, secret: str) -> None:
 
 
 def test_set_secret_rejects_value_above_16_kib(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetSecretError
+    from the_hive.fleet_service import FleetSecretError
 
     service, paths = _service(tmp_path, FleetSnapshot(1, 2, (_account(),), ()))
 
@@ -687,7 +687,7 @@ def test_set_secret_accepts_exactly_16_kib(tmp_path: Path) -> None:
 
 
 def test_generation_conflict_does_not_overwrite_secret(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetConflictError
+    from the_hive.fleet_service import FleetConflictError
 
     service, paths = _service(tmp_path, FleetSnapshot(1, 2, (_account(),), ()))
     service.set_secret("shared", "first", expected_generation=2)
@@ -697,7 +697,7 @@ def test_generation_conflict_does_not_overwrite_secret(tmp_path: Path) -> None:
 
 
 def test_account_id_cannot_escape_secret_directory(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetSecretError
+    from the_hive.fleet_service import FleetSecretError
 
     service, paths = _service(tmp_path, FleetSnapshot(1, 2, (_account(),), ()))
     with pytest.raises(FleetSecretError):
@@ -708,7 +708,7 @@ def test_account_id_cannot_escape_secret_directory(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
 def test_set_secret_rejects_link_targets(tmp_path: Path, link_kind: str) -> None:
-    from codex_master.fleet_service import FleetSecretError
+    from the_hive.fleet_service import FleetSecretError
 
     service, paths = _service(tmp_path, FleetSnapshot(1, 2, (_account(),), ()))
     service.load()
@@ -725,7 +725,7 @@ def test_set_secret_rejects_link_targets(tmp_path: Path, link_kind: str) -> None
 
 
 def test_commit_rejects_stale_generation(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetConflictError
+    from the_hive.fleet_service import FleetConflictError
 
     service, _ = _service(tmp_path)
     current = service.load()
@@ -814,7 +814,7 @@ def test_fleet_service_persists_reloads_worker_evidence_and_redacts_public_snaps
 
 
 def test_fleet_service_stale_worker_commit_is_strict_no_write(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetConflictError
+    from the_hive.fleet_service import FleetConflictError
 
     service, paths = _r3_service(tmp_path, _empty_worker_snapshot())
     current = service.registry_snapshot()
@@ -866,7 +866,7 @@ def test_registry_operation_holds_guard_through_actual_fleet_service_cas(
 def test_registry_operation_stale_fleet_service_cas_has_no_write_or_retry(
     tmp_path: Path,
 ) -> None:
-    from codex_master.fleet_service import FleetConflictError
+    from the_hive.fleet_service import FleetConflictError
 
     service, paths = _r3_service(tmp_path, _empty_worker_snapshot())
     allocator, reservation = _worker_registry_reservation()
@@ -901,7 +901,7 @@ def test_registry_operation_stale_fleet_service_cas_has_no_write_or_retry(
 def test_process_loss_denies_foreign_releaser_without_registry_mutation(
     tmp_path: Path,
 ) -> None:
-    from codex_master.fleet_registry import FleetValidationError
+    from the_hive.fleet_registry import FleetValidationError
 
     service, paths = _r3_service(tmp_path, _empty_worker_snapshot())
     allocator, reservation = _worker_registry_reservation()
@@ -965,7 +965,7 @@ def test_invalid_limit_sidecar_is_quarantined_and_fail_closed(tmp_path: Path) ->
 def test_gemini_rate_reservation_blocks_bursts_across_service_instances(
     tmp_path: Path,
 ) -> None:
-    from codex_master.fleet_service import FleetRateLimitError
+    from the_hive.fleet_service import FleetRateLimitError
 
     service, paths = _service(tmp_path, _configured_snapshot())
     reservation = service.reserve_gemini_request("shared")
@@ -1149,7 +1149,7 @@ def test_gemini_rate_status_exposes_quota_profile_before_first_request(
 def test_gemini_rate_reservation_applies_exponential_429_cooldown(
     tmp_path: Path,
 ) -> None:
-    from codex_master.fleet_service import FleetRateLimitError
+    from the_hive.fleet_service import FleetRateLimitError
 
     service, paths = _service(tmp_path, _configured_snapshot())
     reservation = service.reserve_gemini_request("shared")
@@ -1444,7 +1444,7 @@ def test_probe_runs_without_registry_lock_and_sets_ready(tmp_path: Path) -> None
 def test_probe_rejects_generation_change_while_external_call_runs(
     tmp_path: Path,
 ) -> None:
-    from codex_master.fleet_service import FleetConflictError
+    from the_hive.fleet_service import FleetConflictError
 
     service, _ = _service(tmp_path, _configured_snapshot())
 
@@ -1883,8 +1883,8 @@ def test_probe_exception_is_redacted_from_public_result(tmp_path: Path) -> None:
 
 
 def test_private_io_distinguishes_missing_from_unsafe_files(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetPaths
-    from codex_master.server import AgentError, build_fleet_private_io
+    from the_hive.fleet_service import FleetPaths
+    from the_hive.server import AgentError, build_fleet_private_io
 
     paths = FleetPaths.from_state_root(tmp_path)
     io = build_fleet_private_io(paths)
@@ -1904,8 +1904,8 @@ def test_private_io_distinguishes_missing_from_unsafe_files(tmp_path: Path) -> N
 def test_private_io_rejects_symlink_and_hardlink_writes(
     tmp_path: Path, kind: str, link_kind: str
 ) -> None:
-    from codex_master.fleet_service import FleetPaths
-    from codex_master.server import AgentError, build_fleet_private_io
+    from the_hive.fleet_service import FleetPaths
+    from the_hive.server import AgentError, build_fleet_private_io
 
     paths = FleetPaths.from_state_root(tmp_path)
     io = build_fleet_private_io(paths)
@@ -1926,8 +1926,8 @@ def test_private_io_rejects_symlink_and_hardlink_writes(
 
 
 def test_private_lock_is_reentrant_and_redacts_paths(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetPaths
-    from codex_master.server import build_fleet_private_io
+    from the_hive.fleet_service import FleetPaths
+    from the_hive.server import build_fleet_private_io
 
     paths = FleetPaths.from_state_root(tmp_path / "private-state")
     io = build_fleet_private_io(paths)
@@ -1947,8 +1947,8 @@ def test_private_lock_is_reentrant_and_redacts_paths(tmp_path: Path) -> None:
 
 
 def test_private_lock_serializes_cross_thread_registry_access(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetPaths
-    from codex_master.server import build_fleet_private_io
+    from the_hive.fleet_service import FleetPaths
+    from the_hive.server import build_fleet_private_io
 
     io = build_fleet_private_io(FleetPaths.from_state_root(tmp_path / "private-state"))
     first_entered = threading.Event()
@@ -2007,7 +2007,7 @@ class _FleetOllamaTransport:
         return _FleetOllamaExecution(plan)
 
     def probe(self, execution, *, current_fence):
-        from codex_master.ollama_runtime import OllamaReadinessStatus
+        from the_hive.ollama_runtime import OllamaReadinessStatus
 
         self.calls.append(("probe", (execution, current_fence)))
         return OllamaReadinessStatus(
@@ -2026,14 +2026,14 @@ class _FleetOllamaTransport:
 
 
 def _ollama_model(ref: str, provider_id: str):
-    from codex_master.ollama_registry import OllamaModelV1
+    from the_hive.ollama_registry import OllamaModelV1
 
     return OllamaModelV1(ref, provider_id, True, True, True, "2026-08-30T12:00:00Z")
 
 
 def _ollama_instance(ref: str = "local-main", *, state: str = "planned"):
-    from codex_master.ollama_host_transport import CONTROL_HOST_REF
-    from codex_master.ollama_registry import OllamaInstanceV1
+    from the_hive.ollama_host_transport import CONTROL_HOST_REF
+    from the_hive.ollama_registry import OllamaInstanceV1
 
     return OllamaInstanceV1(
         ref,
@@ -2058,9 +2058,9 @@ def _ollama_fleet_service(
     stop_fails: bool = False,
     resource_attestation=None,
 ):
-    from codex_master.fleet_service import FleetPaths, FleetService
-    from codex_master.ollama_registry import OllamaRegistryStore
-    from codex_master.server import build_fleet_private_io
+    from the_hive.fleet_service import FleetPaths, FleetService
+    from the_hive.ollama_registry import OllamaRegistryStore
+    from the_hive.server import build_fleet_private_io
 
     paths = FleetPaths.from_state_root(tmp_path)
     private_io = replace(
@@ -2171,7 +2171,7 @@ def test_four_running_local_instances_block_fifth_before_host_plan(tmp_path: Pat
 def test_third_local_instance_requires_green_sixty_minute_attestation(
     tmp_path: Path,
 ) -> None:
-    from codex_master.fleet_service import OllamaResourceSnapshotV1
+    from the_hive.fleet_service import OllamaResourceSnapshotV1
 
     instances = tuple(
         replace(_ollama_instance(f"local-{letter}", state="running"), selected_model_refs=("model-a",))
@@ -2248,23 +2248,23 @@ def test_ollama_probe_withdraws_lanes_when_runtime_loses_readiness(
 def test_remote_apply_unknown_never_publishes_lane_and_plan_survives_restart(
     tmp_path: Path,
 ) -> None:
-    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
-    from codex_master.agent_contracts import (
+    from the_hive.admin_hosts import AgentBindingV1, HostRegistry
+    from the_hive.agent_contracts import (
         AgentPollV1,
         AgentResultV1,
     )
-    from codex_master.agent_operations import (
+    from the_hive.agent_operations import (
         AgentOperationStore,
         AgentPrincipalV1,
     )
-    from codex_master.fleet_service import FleetPaths, FleetService
-    from codex_master.ollama_host_transport import (
+    from the_hive.fleet_service import FleetPaths, FleetService
+    from the_hive.ollama_host_transport import (
         AgentQueueRemoteOllamaOperationPort,
         HostRegistryOllamaLeaseSource,
         OllamaHostTransport,
     )
-    from codex_master.ollama_registry import OllamaRegistryStore
-    from codex_master.server import build_fleet_private_io
+    from the_hive.ollama_registry import OllamaRegistryStore
+    from the_hive.server import build_fleet_private_io
 
     hosts = HostRegistry.for_test(tmp_path / "hosts")
     hosts.provision_agent_binding(
@@ -2348,21 +2348,21 @@ def test_remote_apply_unknown_never_publishes_lane_and_plan_survives_restart(
 def test_remote_resource_generation_drift_blocks_apply_before_queue_side_effect(
     tmp_path: Path,
 ) -> None:
-    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
-    from codex_master.agent_contracts import AgentPollV1, AgentResultV1
-    from codex_master.agent_operations import AgentOperationStore, AgentPrincipalV1
-    from codex_master.fleet_service import (
+    from the_hive.admin_hosts import AgentBindingV1, HostRegistry
+    from the_hive.agent_contracts import AgentPollV1, AgentResultV1
+    from the_hive.agent_operations import AgentOperationStore, AgentPrincipalV1
+    from the_hive.fleet_service import (
         FleetPaths,
         FleetService,
         OllamaResourceSnapshotV1,
     )
-    from codex_master.ollama_host_transport import (
+    from the_hive.ollama_host_transport import (
         AgentQueueRemoteOllamaOperationPort,
         HostRegistryOllamaLeaseSource,
         OllamaHostTransport,
     )
-    from codex_master.ollama_registry import OllamaRegistryStore
-    from codex_master.server import build_fleet_private_io
+    from the_hive.ollama_registry import OllamaRegistryStore
+    from the_hive.server import build_fleet_private_io
 
     hosts = HostRegistry.for_test(tmp_path / "hosts")
     hosts.provision_agent_binding(
@@ -2461,17 +2461,17 @@ def test_remote_completion_redelivery_recovers_every_owner_phase(
 ) -> None:
     """A receipt redelivery resumes after owner I/O without duplicating it."""
 
-    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
-    from codex_master.agent_contracts import AgentPollV1, AgentResultV1
-    from codex_master.agent_operations import AgentOperationStore, AgentPrincipalV1
-    from codex_master.fleet_service import FleetPaths, FleetService
-    from codex_master.ollama_host_transport import (
+    from the_hive.admin_hosts import AgentBindingV1, HostRegistry
+    from the_hive.agent_contracts import AgentPollV1, AgentResultV1
+    from the_hive.agent_operations import AgentOperationStore, AgentPrincipalV1
+    from the_hive.fleet_service import FleetPaths, FleetService
+    from the_hive.ollama_host_transport import (
         AgentQueueRemoteOllamaOperationPort,
         HostRegistryOllamaLeaseSource,
         OllamaHostTransport,
     )
-    from codex_master.ollama_registry import OllamaRegistryStore
-    from codex_master.server import build_fleet_private_io
+    from the_hive.ollama_registry import OllamaRegistryStore
+    from the_hive.server import build_fleet_private_io
 
     hosts = HostRegistry.for_test(tmp_path / "hosts")
     hosts.provision_agent_binding(
@@ -2664,18 +2664,18 @@ def test_remote_owner_index_crash_after_enqueue_recovers_every_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A fresh owner can complete every queue row left before index projection."""
-    from codex_master.admin_contracts import OperationV1
-    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
-    from codex_master.agent_contracts import AgentPollV1, AgentResultV1
-    from codex_master.agent_operations import AgentOperationStore, AgentPrincipalV1
-    from codex_master.fleet_service import FleetPaths, FleetService
-    from codex_master.ollama_host_transport import (
+    from the_hive.admin_contracts import OperationV1
+    from the_hive.admin_hosts import AgentBindingV1, HostRegistry
+    from the_hive.agent_contracts import AgentPollV1, AgentResultV1
+    from the_hive.agent_operations import AgentOperationStore, AgentPrincipalV1
+    from the_hive.fleet_service import FleetPaths, FleetService
+    from the_hive.ollama_host_transport import (
         AgentQueueRemoteOllamaOperationPort,
         HostRegistryOllamaLeaseSource,
         OllamaHostTransport,
     )
-    from codex_master.ollama_registry import OllamaRegistryStore
-    from codex_master.server import build_fleet_private_io
+    from the_hive.ollama_registry import OllamaRegistryStore
+    from the_hive.server import build_fleet_private_io
 
     hosts = HostRegistry.for_test(tmp_path / "hosts")
     hosts.provision_agent_binding(
@@ -2799,18 +2799,18 @@ def test_remote_operation_index_keeps_parallel_enqueues_from_separate_owners(
 ) -> None:
     """The durable index has one cross-process read/modify/write critical section."""
 
-    from codex_master.admin_contracts import OperationV1
-    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
-    from codex_master.agent_operations import AgentOperationStore
-    from codex_master.fleet_service import FleetPaths, FleetService
-    from codex_master.hive.state import HiveStateStore
-    from codex_master.ollama_host_transport import (
+    from the_hive.admin_contracts import OperationV1
+    from the_hive.admin_hosts import AgentBindingV1, HostRegistry
+    from the_hive.agent_operations import AgentOperationStore
+    from the_hive.fleet_service import FleetPaths, FleetService
+    from the_hive.hive.state import HiveStateStore
+    from the_hive.ollama_host_transport import (
         AgentQueueRemoteOllamaOperationPort,
         HostRegistryOllamaLeaseSource,
         OllamaHostTransport,
     )
-    from codex_master.ollama_registry import OllamaRegistryStore
-    from codex_master.server import build_fleet_private_io
+    from the_hive.ollama_registry import OllamaRegistryStore
+    from the_hive.server import build_fleet_private_io
 
     hosts = HostRegistry.for_test(tmp_path / "hosts")
     hosts.provision_agent_binding(
@@ -2903,7 +2903,7 @@ def test_remote_operation_index_keeps_parallel_enqueues_from_separate_owners(
 
 
 def _ollama_receipt(lease, state: str, result):
-    from codex_master.agent_contracts import AgentReceiptV1, serialize_agent_result
+    from the_hive.agent_contracts import AgentReceiptV1, serialize_agent_result
 
     encoded = json.dumps(
         serialize_agent_result(result), sort_keys=True, separators=(",", ":")
@@ -2928,17 +2928,17 @@ def _ollama_receipt(lease, state: str, result):
 def _remote_apply_receipt_before_queue_completion(tmp_path: Path):
     """Build a genuinely leased remote apply whose receipt has not completed."""
 
-    from codex_master.admin_hosts import AgentBindingV1, HostRegistry
-    from codex_master.agent_contracts import AgentPollV1, AgentResultV1
-    from codex_master.agent_operations import AgentOperationStore, AgentPrincipalV1
-    from codex_master.fleet_service import FleetPaths, FleetService
-    from codex_master.ollama_host_transport import (
+    from the_hive.admin_hosts import AgentBindingV1, HostRegistry
+    from the_hive.agent_contracts import AgentPollV1, AgentResultV1
+    from the_hive.agent_operations import AgentOperationStore, AgentPrincipalV1
+    from the_hive.fleet_service import FleetPaths, FleetService
+    from the_hive.ollama_host_transport import (
         AgentQueueRemoteOllamaOperationPort,
         HostRegistryOllamaLeaseSource,
         OllamaHostTransport,
     )
-    from codex_master.ollama_registry import OllamaRegistryStore
-    from codex_master.server import build_fleet_private_io
+    from the_hive.ollama_registry import OllamaRegistryStore
+    from the_hive.server import build_fleet_private_io
 
     hosts = HostRegistry.for_test(tmp_path / "hosts")
     hosts.provision_agent_binding(
@@ -3116,7 +3116,7 @@ def test_remote_apply_prepared_phase_does_not_trust_generation_drift(
 ) -> None:
     """A prepared receipt still needs the narrow original apply-CAS evidence."""
 
-    from codex_master.fleet_service import FleetService
+    from the_hive.fleet_service import FleetService
 
     (
         service,
@@ -3201,7 +3201,7 @@ def test_completed_remote_apply_receipt_rejects_conflicting_terminal_result(
 ) -> None:
     """Terminal replay remains bound to its state, result and result digest."""
 
-    from codex_master.agent_contracts import AgentResultV1
+    from the_hive.agent_contracts import AgentResultV1
 
     (
         service,

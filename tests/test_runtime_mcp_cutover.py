@@ -13,8 +13,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from conftest import seal_runtime_image
-import codex_master.server as server
-from codex_master.runtime_layout import RuntimeLayout
+import the_hive.server as server
+from the_hive.runtime_layout import RuntimeLayout
 
 
 def _write(root: Path, relative: str, content: str, mode: int = 0o644) -> None:

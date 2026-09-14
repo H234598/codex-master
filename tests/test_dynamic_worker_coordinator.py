@@ -11,7 +11,7 @@ import pickle
 
 import pytest
 
-from codex_master.agent_resolver import (
+from the_hive.agent_resolver import (
     AgentClassPolicy,
     ModelPolicy,
     ResolutionRequest,
@@ -19,19 +19,19 @@ from codex_master.agent_resolver import (
     canonical_resolution_decision_digest,
     resolve_agent_selection,
 )
-from codex_master.fleet_registry import FleetSnapshotV2
-from codex_master.runtime_account_allocator import (
+from the_hive.fleet_registry import FleetSnapshotV2
+from the_hive.runtime_account_allocator import (
     AccountReservation,
     CapacityEvidence,
     RuntimeAccountAllocator,
     ValidatedAllocationTicket,
 )
-from codex_master.worker_resolution_carrier import (
+from the_hive.worker_resolution_carrier import (
     WorkerResolutionEvidenceV2,
     build_worker_resolution_carrier,
 )
-from codex_master.worker_resume import WorkerLifecycle
-from codex_master.worker_spawn_ledger import (
+from the_hive.worker_resume import WorkerLifecycle
+from the_hive.worker_spawn_ledger import (
     CompensationStatusV1,
     FenceEpoch,
     Generation,
@@ -48,55 +48,55 @@ from codex_master.worker_spawn_ledger import (
 
 
 FUNCTION_TEST_MATRIX_V1: dict[str, str] = {
-    "codex_master.dynamic_worker_coordinator.coordinate_dynamic_worker_pre_start": (
+    "the_hive.dynamic_worker_coordinator.coordinate_dynamic_worker_pre_start": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_coordinate_dynamic_worker_pre_start_orders_bindings_intent_home_and_single_reserve_cas"
     ),
-    "codex_master.dynamic_worker_coordinator.compensate_dynamic_worker_not_started": (
+    "the_hive.dynamic_worker_coordinator.compensate_dynamic_worker_not_started": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_compensate_dynamic_worker_not_started_releases_exact_once_after_failure_intent"
     ),
-    "codex_master.dynamic_worker_coordinator.quarantine_dynamic_worker_unknown_or_started": (
+    "the_hive.dynamic_worker_coordinator.quarantine_dynamic_worker_unknown_or_started": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_quarantine_dynamic_worker_unknown_or_started_has_zero_release_cleanup_or_retry"
     ),
-    "codex_master.dynamic_worker_coordinator.PreStartReceiptV1": (
+    "the_hive.dynamic_worker_coordinator.PreStartReceiptV1": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_pre_start_receipt_is_bound_redacted_and_nonserializable"
     ),
-    "codex_master.dynamic_worker_coordinator.DynamicWorkerPreStartPortV1.coordinate": (
+    "the_hive.dynamic_worker_coordinator.DynamicWorkerPreStartPortV1.coordinate": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_b5_port_coordinate_returns_only_bound_prestart_receipt"
     ),
-    "codex_master.dynamic_worker_coordinator.DynamicWorkerPreStartPortV1.compensate_not_started": (
+    "the_hive.dynamic_worker_coordinator.DynamicWorkerPreStartPortV1.compensate_not_started": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_b5_port_compensates_once_only_with_live_bound_receipt"
     ),
-    "codex_master.dynamic_worker_coordinator.DynamicWorkerPreStartPortV1.quarantine_unknown_or_started": (
+    "the_hive.dynamic_worker_coordinator.DynamicWorkerPreStartPortV1.quarantine_unknown_or_started": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_b5_port_quarantine_is_single_use_and_non_destructive"
     ),
-    "codex_master.dynamic_worker_coordinator._DynamicWorkerAllocationPortV1.issue": (
+    "the_hive.dynamic_worker_coordinator._DynamicWorkerAllocationPortV1.issue": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_function_contract__dynamic_worker_coordinator___DynamicWorkerAllocationPortV1__issue"
     ),
-    "codex_master.dynamic_worker_coordinator._DynamicWorkerProjectionPortV1.project": (
+    "the_hive.dynamic_worker_coordinator._DynamicWorkerProjectionPortV1.project": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_function_contract__dynamic_worker_coordinator___DynamicWorkerProjectionPortV1__project"
     ),
-    "codex_master.dynamic_worker_coordinator._DynamicWorkerHomePortV1.commit": (
+    "the_hive.dynamic_worker_coordinator._DynamicWorkerHomePortV1.commit": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_function_contract__dynamic_worker_coordinator___DynamicWorkerHomePortV1__commit"
     ),
-    "codex_master.dynamic_worker_coordinator._DynamicWorkerHomePortV1.cleanup": (
+    "the_hive.dynamic_worker_coordinator._DynamicWorkerHomePortV1.cleanup": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_function_contract__dynamic_worker_coordinator___DynamicWorkerHomePortV1__cleanup"
     ),
-    "codex_master.dynamic_worker_coordinator._DynamicWorkerRegistryPortV1.read_snapshot": (
+    "the_hive.dynamic_worker_coordinator._DynamicWorkerRegistryPortV1.read_snapshot": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_function_contract__dynamic_worker_coordinator___DynamicWorkerRegistryPortV1__read_snapshot"
     ),
-    "codex_master.dynamic_worker_coordinator._DynamicWorkerRegistryPortV1.compare_and_swap": (
+    "the_hive.dynamic_worker_coordinator._DynamicWorkerRegistryPortV1.compare_and_swap": (
         "tests/test_dynamic_worker_coordinator.py::"
         "test_function_contract__dynamic_worker_coordinator___DynamicWorkerRegistryPortV1__compare_and_swap"
     ),
@@ -118,7 +118,7 @@ def _digest(character: str) -> str:
 
 
 def _coordinator():
-    return importlib.import_module("codex_master.dynamic_worker_coordinator")
+    return importlib.import_module("the_hive.dynamic_worker_coordinator")
 
 
 class _LedgerBackend(SpawnLedgerStatePort):
@@ -1215,7 +1215,7 @@ def test_function_matrix_ast_imports_public_surface_and_nodes_are_exact() -> Non
     expected = (
         definitions
         | callable_fields
-        | {"codex_master.dynamic_worker_coordinator.PreStartReceiptV1"}
+        | {"the_hive.dynamic_worker_coordinator.PreStartReceiptV1"}
     )
     assert expected == set(FUNCTION_TEST_MATRIX_V1)
     assert len(set(FUNCTION_TEST_MATRIX_V1.values())) == len(FUNCTION_TEST_MATRIX_V1)
@@ -1241,10 +1241,10 @@ def test_function_matrix_ast_imports_public_surface_and_nodes_are_exact() -> Non
         "__future__",
         "collections.abc",
         "dataclasses",
-        "codex_master.fleet_registry",
-        "codex_master.runtime_account_allocator",
-        "codex_master.worker_resolution_carrier",
-        "codex_master.worker_spawn_ledger",
+        "the_hive.fleet_registry",
+        "the_hive.runtime_account_allocator",
+        "the_hive.worker_resolution_carrier",
+        "the_hive.worker_spawn_ledger",
     }
     source = MODULE_PATH.read_text(encoding="utf-8")
     assert ".prepare(" not in source

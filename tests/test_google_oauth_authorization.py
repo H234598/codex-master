@@ -13,8 +13,8 @@ import webbrowser
 
 import pytest
 
-import codex_master.google_oauth_authorization as policy
-from codex_master.google_oauth_authorization import (
+import the_hive.google_oauth_authorization as policy
+from the_hive.google_oauth_authorization import (
     GoogleOAuthAuthorizationError,
     GoogleOAuthAuthorizationProfileV1,
     GoogleOAuthOperationV1,

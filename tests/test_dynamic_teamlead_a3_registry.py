@@ -5,8 +5,8 @@ import threading
 
 import pytest
 
-from codex_master.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
-from codex_master.fleet_registry import FleetSnapshot, FleetSnapshotV2
+from the_hive.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
+from the_hive.fleet_registry import FleetSnapshot, FleetSnapshotV2
 
 
 class InMemoryStore:

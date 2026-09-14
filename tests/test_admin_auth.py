@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 import jwt
 import pytest
 
-from codex_master.admin_auth import (
+from the_hive.admin_auth import (
     AdminAuthError,
     CloudflareAccessVerifier,
     MasterjetBearerVerifier,
@@ -372,7 +372,7 @@ def test_private_fd_partial_buffer_is_wiped_when_preadv_fails(
         held.append(target.obj)
         raise OSError("read failed")
 
-    monkeypatch.setattr("codex_master.admin_auth.os.preadv", failing_preadv)
+    monkeypatch.setattr("the_hive.admin_auth.os.preadv", failing_preadv)
     try:
         with pytest.raises(AdminAuthError, match="authority.credential_invalid"):
             MasterjetBearerVerifier.from_fd(fd, subject="svc", scopes=("fleet.read",))

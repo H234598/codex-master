@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
-from codex_master import limit_tracker_contract as limit_tracker
+from the_hive import limit_tracker_contract as limit_tracker
 
 
 def _timestamp(hours: float) -> str:

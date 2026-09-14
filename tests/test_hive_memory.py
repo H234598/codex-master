@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from codex_master.hive.memory import MemoryError, promote_queen_memory_to_global, promote_teamlead_report
-from codex_master.hive.principals import Principal
+from the_hive.hive.memory import MemoryError, promote_queen_memory_to_global, promote_teamlead_report
+from the_hive.hive.principals import Principal
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

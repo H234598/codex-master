@@ -1,7 +1,7 @@
 import pytest
 
-from codex_master.hive.types import TaskComplexity
-from codex_master.selection.task_classification import (
+from the_hive.hive.types import TaskComplexity
+from the_hive.selection.task_classification import (
     TaskClassificationError,
     TaskClassificationRequest,
     TaskClassifier,

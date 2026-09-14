@@ -23,47 +23,47 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import pytest
 
-from codex_master import agent_daemon, host_agent as host_agent_module
-from codex_master.admin_hosts import AgentBindingV1, AgentPrincipalV1, HostRegistry
-from codex_master.admin_auth import MasterjetBearerVerifier, TotpStepUpVerifier
-from codex_master.admin_http import AdminHttpServer
-from codex_master.admin_operations import AdminOperationStore
-from codex_master.agent_contracts import AgentReceiptV1
-from codex_master.agent_daemon import AgentApiServer
-from codex_master.agent_http import AgentHttpApplication
-from codex_master.agent_identity import AgentIdentityResolver
-from codex_master.agent_operations import AgentOperationRequestV1, AgentOperationStore
-from codex_master.agent_contracts import (
+from the_hive import agent_daemon, host_agent as host_agent_module
+from the_hive.admin_hosts import AgentBindingV1, AgentPrincipalV1, HostRegistry
+from the_hive.admin_auth import MasterjetBearerVerifier, TotpStepUpVerifier
+from the_hive.admin_http import AdminHttpServer
+from the_hive.admin_operations import AdminOperationStore
+from the_hive.agent_contracts import AgentReceiptV1
+from the_hive.agent_daemon import AgentApiServer
+from the_hive.agent_http import AgentHttpApplication
+from the_hive.agent_identity import AgentIdentityResolver
+from the_hive.agent_operations import AgentOperationRequestV1, AgentOperationStore
+from the_hive.agent_contracts import (
     AgentLeaseV1,
     AgentNoWorkV1,
     AgentPollV1,
     remote_envelope_digest,
 )
-from codex_master.agent_ollama import ProductionAgentOllamaAdapter
-from codex_master.fleet_service import FleetPaths, FleetService
-from codex_master.host_agent import (
+from the_hive.agent_ollama import ProductionAgentOllamaAdapter
+from the_hive.fleet_service import FleetPaths, FleetService
+from the_hive.host_agent import (
     HostAgent,
     HostAgentClient,
     HostAgentExecutor,
     HostProbeExecutor,
 )
-from codex_master.host_agent_state import HostAgentState
-from codex_master.host_probe import (
+from the_hive.host_agent_state import HostAgentState
+from the_hive.host_probe import (
     LocalHostProbeCollector,
     RemoteHostProbeAdapter,
     RemoteHostProbeCompletionOwner,
 )
-from codex_master.ollama_host_transport import (
+from the_hive.ollama_host_transport import (
     AgentQueueRemoteOllamaOperationPort,
     HostRegistryOllamaLeaseSource,
     OllamaHostTransport,
 )
-from codex_master.ollama_registry import (
+from the_hive.ollama_registry import (
     OllamaInstanceV1,
     OllamaModelV1,
     OllamaRegistryStore,
 )
-from codex_master.server import build_fleet_private_io
+from the_hive.server import build_fleet_private_io
 
 
 _CAPABILITIES_DIGEST = "sha256:" + "c" * 64
@@ -543,7 +543,7 @@ def test_remote_host_probe_updates_once_and_rejects_stale_or_cross_host_receipts
 
 
 def _receipt_wire(receipt: AgentReceiptV1) -> bytes:
-    from codex_master.agent_contracts import serialize_agent_result
+    from the_hive.agent_contracts import serialize_agent_result
 
     return json.dumps(
         {

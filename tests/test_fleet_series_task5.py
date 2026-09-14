@@ -11,12 +11,12 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from codex_master import server
-from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
-from codex_master.fleet_service import FleetConflictError
-from codex_master.hive import hourly_probe as hourly_probe_module
-from codex_master.hive.hourly_probe import run_probe
-from codex_master.runtime_layout import RuntimeLayout
+from the_hive import server
+from the_hive.fleet_registry import AgentDescriptor, Provider, RunnerKind
+from the_hive.fleet_service import FleetConflictError
+from the_hive.hive import hourly_probe as hourly_probe_module
+from the_hive.hive.hourly_probe import run_probe
+from the_hive.runtime_layout import RuntimeLayout
 
 
 @pytest.fixture(autouse=True)
@@ -449,10 +449,10 @@ import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from codex_master import server
-from codex_master.hive import hourly_probe as hourly_probe_module
-from codex_master.hive.hourly_probe import run_probe
-from codex_master.runtime_layout import RuntimeLayout
+from the_hive import server
+from the_hive.hive import hourly_probe as hourly_probe_module
+from the_hive.hive.hourly_probe import run_probe
+from the_hive.runtime_layout import RuntimeLayout
 
 mode, root_text, executable_text, crash_point = sys.argv[1:]
 root = Path(root_text)

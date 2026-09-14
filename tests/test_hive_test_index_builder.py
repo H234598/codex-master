@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.hive.indexed_tests import TestIndexError as IndexError
-from codex_master.hive.indexed_test_inventory import PythonTestIndexBuilder
+from the_hive.hive.indexed_tests import TestIndexError as IndexError
+from the_hive.hive.indexed_test_inventory import PythonTestIndexBuilder
 
 
 def write_project(root: Path, *, asserted: bool = True) -> dict[str, tuple[str, ...]]:

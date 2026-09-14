@@ -5,7 +5,7 @@ import math
 
 import pytest
 
-from codex_master.resource_ema import (
+from the_hive.resource_ema import (
     MAX_SNAPSHOT_BYTES,
     ResourceEMAAdmissionV1,
     ResourceEMAError,

@@ -4,8 +4,8 @@ import os
 
 import pytest
 
-from codex_master.selection import AdmissionMode
-from codex_master.selection.config import SelectionConfigError, load_selection_policy
+from the_hive.selection import AdmissionMode
+from the_hive.selection.config import SelectionConfigError, load_selection_policy
 
 
 ROOT = Path(__file__).resolve().parents[1]

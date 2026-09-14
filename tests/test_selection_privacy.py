@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.selection import (
+from the_hive.selection import (
     AdmissionMode,
     AdmissionPolicy,
     ModelRole,
@@ -16,8 +16,8 @@ from codex_master.selection import (
     normalize_usage_observation,
     preview_selection_admission,
 )
-from codex_master.selection.model_policy import ModelPolicyError, load_model_policy
-from codex_master.selection.sources import AccountIdentityResolver, SelectionSourceProvider
+from the_hive.selection.model_policy import ModelPolicyError, load_model_policy
+from the_hive.selection.sources import AccountIdentityResolver, SelectionSourceProvider
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

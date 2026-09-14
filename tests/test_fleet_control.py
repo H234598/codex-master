@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from codex_master.fleet_control import (
+from the_hive.fleet_control import (
     FleetControlError,
     account_secret_args,
     account_upsert_args,

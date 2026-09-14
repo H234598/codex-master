@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-import codex_master.fleet_home_broker_linux as linux
-from codex_master.fleet_home_broker_linux import (
+import the_hive.fleet_home_broker_linux as linux
+from the_hive.fleet_home_broker_linux import (
     AgentStartPeerObservation,
     FdStat,
     LinuxBoundaryError,
@@ -18,7 +18,7 @@ from codex_master.fleet_home_broker_linux import (
     open_pinned_child_directory,
     observe_agent_start_peer,
 )
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_protocol import (
     AgentStartEnvironmentProjection,
     AgentStartEnvelope,
     AgentStartExecutablePin,
@@ -35,11 +35,11 @@ from codex_master.fleet_home_broker_protocol import (
     TransactionBinding,
     ChpbTransactionOperation,
 )
-from codex_master.fleet_control_release_v2 import (
+from the_hive.fleet_control_release_v2 import (
     ControlReleaseSpecV2,
     ReleasePayloadDigestV2,
 )
-from codex_master.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_identity import BrokerIdentity
 
 
 CHILD_FD = 41
@@ -838,7 +838,7 @@ def test_linux_module_import_scope_excludes_real_system_and_lifecycle_apis():
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
             imported.add(node.module.split(".")[0])
 
-    assert imported <= {"__future__", "dataclasses", "typing", "codex_master"}
+    assert imported <= {"__future__", "dataclasses", "typing", "the_hive"}
 
 
 def test_agent_start_peer_observation_binds_peer_credentials_and_unit_instance():

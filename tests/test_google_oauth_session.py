@@ -13,13 +13,13 @@ import urllib.parse
 import pytest
 import yaml
 
-import codex_master.google_oauth_session as oauth_session
-from codex_master.credential_vault import CredentialVault
-from codex_master.google_account_inventory import GoogleAccountInventoryLoader
-from codex_master.google_account_inventory_manager import GoogleAccountInventoryManager
-from codex_master.google_oauth_authorization import GoogleOAuthProfileIdV1
+import the_hive.google_oauth_session as oauth_session
+from the_hive.credential_vault import CredentialVault
+from the_hive.google_account_inventory import GoogleAccountInventoryLoader
+from the_hive.google_account_inventory_manager import GoogleAccountInventoryManager
+from the_hive.google_oauth_authorization import GoogleOAuthProfileIdV1
 
-from codex_master.google_oauth_session import (
+from the_hive.google_oauth_session import (
     GoogleOAuthSessionReceipt,
     GoogleOAuthSessionError,
     _ProfileBrowser,

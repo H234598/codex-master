@@ -5,22 +5,22 @@ from hashlib import sha256
 
 import pytest
 
-from codex_master.fleet_home_broker import OfflineBrokerPlan
-from codex_master.fleet_home_broker_consumer import BrokerIntentResumeContext
-from codex_master.fleet_home_broker_dispatch import BrokerDispatchCommand
-from codex_master.fleet_home_broker_execution import RootBrokerExecutionComposition
-from codex_master.fleet_home_broker_identity import (
+from the_hive.fleet_home_broker import OfflineBrokerPlan
+from the_hive.fleet_home_broker_consumer import BrokerIntentResumeContext
+from the_hive.fleet_home_broker_dispatch import BrokerDispatchCommand
+from the_hive.fleet_home_broker_execution import RootBrokerExecutionComposition
+from the_hive.fleet_home_broker_identity import (
     BrokerIdentity,
     ImportClosure,
     ImportClosureEntry,
 )
-from codex_master.fleet_home_broker_intent import (
+from the_hive.fleet_home_broker_intent import (
     BrokerIntentOperation,
     BrokerIntentV1,
     canonical_intent_payload,
 )
-from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_linux import FdStat, PidfdIdentity
+from the_hive.fleet_home_broker_protocol import (
     BindingExpectation,
     BrokerCheckpoint,
     BrokerObjectState,
@@ -36,7 +36,7 @@ from codex_master.fleet_home_broker_protocol import (
     PrincipalBinding,
     TransactionBinding,
 )
-from codex_master.fleet_home_broker_wal import decode_wal_record
+from the_hive.fleet_home_broker_wal import decode_wal_record
 
 
 PEER_PID = 1234

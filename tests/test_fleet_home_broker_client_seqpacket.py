@@ -3,16 +3,16 @@ import pickle
 
 import pytest
 
-from codex_master.fleet_home_broker_client import BrokerClientError, ScmFrame
-from codex_master.fleet_home_broker_linux import FdStat
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_client import BrokerClientError, ScmFrame
+from the_hive.fleet_home_broker_linux import FdStat
+from the_hive.fleet_home_broker_protocol import (
     BindingExpectation,
     CHPB_PROTOCOL,
     ChpbMessageKind,
     QueryTransactionRequest,
     encode_chpb_message,
 )
-from codex_master.fleet_home_broker_client_seqpacket import (
+from the_hive.fleet_home_broker_client_seqpacket import (
     SeqpacketBrokerClientOperations,
 )
 

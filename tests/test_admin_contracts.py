@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from codex_master.admin_contracts import (
+from the_hive.admin_contracts import (
     ADMIN_OPERATION_METADATA,
     AdminContractError,
     AdminPrincipalV1,

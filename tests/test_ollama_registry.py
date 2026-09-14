@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from codex_master.ollama_registry import (
+from the_hive.ollama_registry import (
     OllamaInstanceV1,
     OllamaModelV1,
     OllamaRegistryError,
@@ -79,8 +79,8 @@ def test_shared_registry_reuses_group_owned_directory_and_lock_without_chmod(
             raise PermissionError
         original_fchmod(descriptor, mode)
 
-    monkeypatch.setattr("codex_master.ollama_registry.os.chmod", deny_existing_directory_chmod)
-    monkeypatch.setattr("codex_master.ollama_registry.os.fchmod", deny_existing_lock_chmod)
+    monkeypatch.setattr("the_hive.ollama_registry.os.chmod", deny_existing_directory_chmod)
+    monkeypatch.setattr("the_hive.ollama_registry.os.fchmod", deny_existing_lock_chmod)
 
     assert OllamaRegistryStore.for_test(root, shared_gid=os.getegid()).load().generation == 0
 
@@ -110,8 +110,8 @@ def test_shared_registry_lock_creation_race_never_fchmods_other_owner(
             raise PermissionError
         original_fchmod(descriptor, mode)
 
-    monkeypatch.setattr("codex_master.ollama_registry.os.open", race_open)
-    monkeypatch.setattr("codex_master.ollama_registry.os.fchmod", deny_foreign_fchmod)
+    monkeypatch.setattr("the_hive.ollama_registry.os.open", race_open)
+    monkeypatch.setattr("the_hive.ollama_registry.os.fchmod", deny_foreign_fchmod)
 
     assert OllamaRegistryStore.for_test(root, shared_gid=os.getegid()).load().generation == 0
 

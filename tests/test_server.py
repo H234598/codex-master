@@ -29,29 +29,29 @@ from unittest.mock import Mock, patch
 import pytest
 import yaml
 
-import codex_master.server as server_module
-import codex_master.resource_cgroup as resource_cgroup
-from codex_master import __version__
-from codex_master.hive.types import TaskComplexity
-from codex_master.hive.state import HiveStateStore
-from codex_master.masterjet_runtime import MasterjetRuntime
-from codex_master.runtime_layout import RuntimeLayout
-from codex_master.fleet_home_recovery import make_fleet_identity_journal_plan
-from codex_master.resource_cgroup import (
+import the_hive.server as server_module
+import the_hive.resource_cgroup as resource_cgroup
+from the_hive import __version__
+from the_hive.hive.types import TaskComplexity
+from the_hive.hive.state import HiveStateStore
+from the_hive.masterjet_runtime import MasterjetRuntime
+from the_hive.runtime_layout import RuntimeLayout
+from the_hive.fleet_home_recovery import make_fleet_identity_journal_plan
+from the_hive.resource_cgroup import (
     CgroupPreflightError,
     CgroupProfileV1,
     CgroupIoPressureEvidenceV1,
     PreparedAgentScope,
 )
-from codex_master.resource_monitor import (
+from the_hive.resource_monitor import (
     LegacyPressureV1,
     ResourceEvidenceStateV2,
     ResourceEvidenceV2,
     ResourceMeasurementsV2,
     ResourceSnapshotError,
 )
-from codex_master.selection.task_classification import TaskClassificationRequest, TaskClassifier
-from codex_master.usage_snapshot import (
+from the_hive.selection.task_classification import TaskClassificationRequest, TaskClassifier
+from the_hive.usage_snapshot import (
     AccountUsageEvidenceV2,
     TrackerEvidenceV2,
     UsageEvidenceV2,
@@ -60,7 +60,7 @@ from codex_master.usage_snapshot import (
     UsageTrendV2,
 )
 
-from codex_master.server import (
+from the_hive.server import (
     AgentError,
     AgentCapacityError,
     AgentBusyError,
@@ -1111,7 +1111,7 @@ LOW_HIVE_IO_PRESSURE = CgroupIoPressureEvidenceV1(
 
 
 def create_test_q_series(pool: Path, executable: Path):
-    from codex_master.fleet_registry import (
+    from the_hive.fleet_registry import (
         AuthKind,
         FleetAccount,
         FleetSnapshot,
@@ -1152,7 +1152,7 @@ def create_test_q_series(pool: Path, executable: Path):
 
 
 def create_test_observation_fleet(pool: Path):
-    from codex_master.fleet_registry import (
+    from the_hive.fleet_registry import (
         AuthKind,
         FleetAccount,
         FleetSeries,
@@ -1313,7 +1313,7 @@ def _synthetic_alias_journal(
 
 
 def _synthetic_alias_snapshot(*, generation: int = 219) -> Any:
-    from codex_master.fleet_registry import FleetAccountV2, FleetSeriesMember, FleetSeriesV2
+    from the_hive.fleet_registry import FleetAccountV2, FleetSeriesMember, FleetSeriesV2
 
     account = FleetAccountV2(
         "g-account",
@@ -1348,7 +1348,7 @@ def _synthetic_alias_snapshot(*, generation: int = 219) -> Any:
 
 
 def _overview_cli_test_snapshot(*, generation: int = 9) -> Any:
-    from codex_master.fleet_registry import (
+    from the_hive.fleet_registry import (
         AuthKind,
         FleetAccount,
         FleetSeries,
@@ -1753,7 +1753,7 @@ class ServerHelpersTest(unittest.TestCase):
             os.environ,
             {"CODEX_MASTER_SPAWN_PRIORITY": "developer_vm,mcp_host,sandbox"},
         ), patch(
-            "codex_master.server.spawn_admission_decision",
+            "the_hive.server.spawn_admission_decision",
             return_value={"allowed": True, "reason_codes": []},
         ):
             result = call_tool("agent_spawn_offers", {"required_slots": 1})
@@ -1764,7 +1764,7 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_spawn_offer_is_advisory_and_short_lived(self) -> None:
         with patch(
-            "codex_master.server.spawn_admission_decision",
+            "the_hive.server.spawn_admission_decision",
             return_value={
                 "allowed": True,
                 "reason_codes": ["memory_pressure_high", "PRIVATE_REASON_MUST_NOT_RETURN"],
@@ -1813,7 +1813,7 @@ class ServerHelpersTest(unittest.TestCase):
             os.environ,
             {"CODEX_MASTER_SPAWN_PRIORITY": "sandbox,mcp_host,mcp_host,developer_vm"},
         ), patch(
-            "codex_master.server.spawn_admission_decision",
+            "the_hive.server.spawn_admission_decision",
             return_value={"allowed": True, "reason_codes": []},
         ):
             result = agent_spawn_offers()
@@ -1825,7 +1825,7 @@ class ServerHelpersTest(unittest.TestCase):
             os.environ,
             {"CODEX_MASTER_SPAWN_PRIORITY": "developer_vm,sandbox"},
         ), patch(
-            "codex_master.server.spawn_admission_decision",
+            "the_hive.server.spawn_admission_decision",
             return_value={"allowed": True, "reason_codes": []},
         ):
             result = agent_spawn_offers()
@@ -1837,12 +1837,12 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_spawn_offer_resource_deny_is_retryable_without_state(self) -> None:
         with patch(
-            "codex_master.server.spawn_admission_decision",
+            "the_hive.server.spawn_admission_decision",
             return_value={
                 "allowed": False,
                 "reason_codes": ["memory_pressure_high"],
             },
-        ), patch("codex_master.server.ensure_state") as ensure_state:
+        ), patch("the_hive.server.ensure_state") as ensure_state:
             result = agent_spawn_offers(2)
 
         self.assertEqual(result["offers"], [])
@@ -1858,7 +1858,7 @@ class ServerHelpersTest(unittest.TestCase):
         for reasons in (None, secret, [secret], [None, 7, secret]):
             with self.subTest(reasons=reasons):
                 with patch(
-                    "codex_master.server.spawn_admission_decision",
+                    "the_hive.server.spawn_admission_decision",
                     return_value={"allowed": False, "reason_codes": reasons},
                 ):
                     result = agent_spawn_offers()
@@ -1871,7 +1871,7 @@ class ServerHelpersTest(unittest.TestCase):
             os.environ,
             {"CODEX_MASTER_SPAWN_PRIORITY": "mcp_host,mcp_host,developer_vm"},
         ), patch(
-            "codex_master.server.spawn_admission_decision",
+            "the_hive.server.spawn_admission_decision",
             return_value={
                 "allowed": False,
                 "reason_codes": ["memory_pressure_high"],
@@ -1890,9 +1890,9 @@ class ServerHelpersTest(unittest.TestCase):
             os.environ,
             {"CODEX_MASTER_SPAWN_PRIORITY": f"mcp_host;echo {secret},developer_vm,sandbox"},
         ), patch(
-            "codex_master.server.spawn_admission_decision",
+            "the_hive.server.spawn_admission_decision",
             return_value={"allowed": True, "reason_codes": []},
-        ), patch("codex_master.server.subprocess.run") as run:
+        ), patch("the_hive.server.subprocess.run") as run:
             result = agent_spawn_offers()
 
         self.assertEqual(result["offers"], [])
@@ -1901,12 +1901,12 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_spawn_offer_creates_no_lease_meta_or_assignment_audit(self) -> None:
         with patch(
-            "codex_master.server.spawn_admission_decision",
+            "the_hive.server.spawn_admission_decision",
             return_value={"allowed": True, "reason_codes": []},
-        ), patch("codex_master.server.ensure_state") as ensure_state, patch(
-            "codex_master.server.agent_lease_status"
-        ) as lease_status, patch("codex_master.server.write_meta") as write_meta, patch(
-            "codex_master.server.record_assignment"
+        ), patch("the_hive.server.ensure_state") as ensure_state, patch(
+            "the_hive.server.agent_lease_status"
+        ) as lease_status, patch("the_hive.server.write_meta") as write_meta, patch(
+            "the_hive.server.record_assignment"
         ) as record_assignment:
             result = agent_spawn_offers()
 
@@ -1932,10 +1932,10 @@ class ServerHelpersTest(unittest.TestCase):
             with self.subTest(allowed=admission["allowed"]), patch.dict(
                 os.environ, {"CODEX_MASTER_SPAWN_PRIORITY": "mcp_host"}
             ), patch(
-                "codex_master.server.spawn_admission_decision", return_value=admission
+                "the_hive.server.spawn_admission_decision", return_value=admission
             ):
                 mcp_result = call_tool("agent_spawn_offers", {"required_slots": 2})
-                with patch("codex_master.server.print_json", return_value=0) as print_json:
+                with patch("the_hive.server.print_json", return_value=0) as print_json:
                     self.assertEqual(main_cli(["spawn-offers", "--required-slots", "2"]), 0)
 
             self.assertEqual(print_json.call_args.args[0], mcp_result)
@@ -1952,7 +1952,7 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 2,
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision(2)
 
         self.assertTrue(result["allowed"])
@@ -1969,7 +1969,7 @@ class ServerHelpersTest(unittest.TestCase):
             "running_agents": 11,
             "reason_codes": [],
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision(10)
 
         self.assertTrue(result["allowed"])
@@ -1986,7 +1986,7 @@ class ServerHelpersTest(unittest.TestCase):
             "running_agents": None,
             "reason_codes": [],
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision()
 
         self.assertTrue(result["allowed"])
@@ -2026,10 +2026,10 @@ class ServerHelpersTest(unittest.TestCase):
             "running_agents": 3,
             "reason_codes": [],
         }
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
+            "the_hive.server.system_resource_snapshot", return_value=snapshot
         ), patch(
-            "codex_master.server.tmux_alive", return_value=True
+            "the_hive.server.tmux_alive", return_value=True
         ):
             result = server_module.ollama_resource_status("o4", task="read status")
 
@@ -2565,12 +2565,12 @@ class ServerHelpersTest(unittest.TestCase):
                 h2_ready=True,
             )
             with patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0), server_module._resource_gate_runtime_scope(runtime), patch(
-                "codex_master.server.read_resource_evidence_v2", return_value=facts
-            ) as read_facts, patch("codex_master.server._total_running_agent_count", return_value=2):
+                "the_hive.server.read_resource_evidence_v2", return_value=facts
+            ) as read_facts, patch("the_hive.server._total_running_agent_count", return_value=2):
                 result = agent_spawn_offers()
             with patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0), server_module._resource_gate_runtime_scope(runtime), patch(
-                "codex_master.server.read_resource_evidence_v2", return_value=facts
-            ) as denied_read_facts, patch("codex_master.server._total_running_agent_count", return_value=10):
+                "the_hive.server.read_resource_evidence_v2", return_value=facts
+            ) as denied_read_facts, patch("the_hive.server._total_running_agent_count", return_value=10):
                 denied = agent_spawn_offers()
 
         self.assertTrue(result["ok"])
@@ -2607,7 +2607,7 @@ class ServerHelpersTest(unittest.TestCase):
             )
             for name, evidence, expected_reasons in cases:
                 with self.subTest(name=name), server_module._resource_gate_runtime_scope(runtime), patch(
-                    "codex_master.server.read_resource_evidence_v2", return_value=evidence
+                    "the_hive.server.read_resource_evidence_v2", return_value=evidence
                 ):
                     result = server_module._resource_gate_snapshot(running_agents_override=2)
 
@@ -2761,15 +2761,15 @@ class ServerHelpersTest(unittest.TestCase):
             state = HiveStateStore(Path(directory))
             hive_runtime = SimpleNamespace(state=state)
             with patch.object(server_module, "build_current_hive_runtime", return_value=hive_runtime) as build_runtime, patch(
-                "codex_master.server.read_current_resource_boot_id",
+                "the_hive.server.read_current_resource_boot_id",
                 return_value="123e4567-e89b-12d3-a456-426614174000",
             ), patch(
-                "codex_master.server.read_resource_evidence_v2", return_value=facts
+                "the_hive.server.read_resource_evidence_v2", return_value=facts
             ) as read_facts, patch(
-                "codex_master.server.build_approved_cgroup_runtime",
+                "the_hive.server.build_approved_cgroup_runtime",
                 side_effect=CgroupPreflightError("cgroup_preflight_failed"),
             ), patch(
-                "codex_master.server._total_running_agent_count", return_value=1
+                "the_hive.server._total_running_agent_count", return_value=1
             ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
                 result = agent_spawn_offers()
 
@@ -2786,15 +2786,15 @@ class ServerHelpersTest(unittest.TestCase):
             with patch.object(
                 server_module, "build_current_hive_runtime", return_value=SimpleNamespace(state=state)
             ) as build_runtime, patch(
-                "codex_master.server.read_current_resource_boot_id",
+                "the_hive.server.read_current_resource_boot_id",
                 return_value="123e4567-e89b-12d3-a456-426614174000",
             ), patch(
-                "codex_master.server.read_resource_evidence_v2", return_value=facts
+                "the_hive.server.read_resource_evidence_v2", return_value=facts
             ) as read_facts, patch(
-                "codex_master.server.build_approved_cgroup_runtime",
+                "the_hive.server.build_approved_cgroup_runtime",
                 side_effect=CgroupPreflightError("cgroup_preflight_failed"),
             ), patch(
-                "codex_master.server._total_running_agent_count", return_value=1
+                "the_hive.server._total_running_agent_count", return_value=1
             ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
                 result = spawn_admission_decision()
 
@@ -2829,20 +2829,20 @@ class ServerHelpersTest(unittest.TestCase):
             with patch.object(
                 server_module, "build_current_hive_runtime", return_value=SimpleNamespace(state=state)
             ) as build_runtime, patch(
-                "codex_master.server.read_current_resource_boot_id",
+                "the_hive.server.read_current_resource_boot_id",
                 return_value="123e4567-e89b-12d3-a456-426614174000",
             ), patch(
-                "codex_master.server.read_resource_evidence_v2", return_value=facts
+                "the_hive.server.read_resource_evidence_v2", return_value=facts
             ) as read_facts, patch(
-                "codex_master.server.build_approved_cgroup_runtime",
+                "the_hive.server.build_approved_cgroup_runtime",
                 side_effect=CgroupPreflightError("cgroup_preflight_failed"),
             ), patch(
-                "codex_master.server.current_agent_inventory", return_value=inventory
+                "the_hive.server.current_agent_inventory", return_value=inventory
             ), patch(
-                "codex_master.server.effective_observation_inventory", return_value=(inventory, True)
+                "the_hive.server.effective_observation_inventory", return_value=(inventory, True)
             ), patch(
-                "codex_master.server._total_running_agent_count", return_value=1
-            ), patch("codex_master.server.tmux_alive", return_value=False), patch.object(
+                "the_hive.server._total_running_agent_count", return_value=1
+            ), patch("the_hive.server.tmux_alive", return_value=False), patch.object(
                 server_module, "_SPAWN_WARMUP_UNTIL_NS", 0
             ):
                 result = server_module.ollama_resource_status("o1", task="read one file")
@@ -2868,11 +2868,11 @@ class ServerHelpersTest(unittest.TestCase):
         def lifecycle(_agent: str, fn: Any, **_kwargs: Any) -> dict[str, Any]:
             return fn()
 
-        with patch("codex_master.server.agent_ids", return_value=("o1",)), patch(
-            "codex_master.server.require_broad_mutation_confirmation", return_value={"allowed": True}
-        ), patch("codex_master.server.call_agent_lifecycle", side_effect=lifecycle), patch(
-            "codex_master.server._start_agent_with_lease_unlocked", return_value={"status": "started"}
-        ), patch("codex_master.server._resource_gate_composer_scope", side_effect=composer):
+        with patch("the_hive.server.agent_ids", return_value=("o1",)), patch(
+            "the_hive.server.require_broad_mutation_confirmation", return_value={"allowed": True}
+        ), patch("the_hive.server.call_agent_lifecycle", side_effect=lifecycle), patch(
+            "the_hive.server._start_agent_with_lease_unlocked", return_value={"status": "started"}
+        ), patch("the_hive.server._resource_gate_composer_scope", side_effect=composer):
             start_result = call_tool("agent_start", {"agent": "o1"})
 
         self.assertEqual(start_result["results"][0]["status"], "started")
@@ -2887,12 +2887,12 @@ class ServerHelpersTest(unittest.TestCase):
         for tool_name, tool_args in assignment_args.items():
             with self.subTest(tool_name=tool_name):
                 events.clear()
-                with patch("codex_master.server.single_agent_id", return_value="o1"), patch(
-                    "codex_master.server._headless_descriptor", return_value=None
-                ), patch("codex_master.server._ollama_descriptor", return_value=SimpleNamespace()), patch(
-                    "codex_master.server.call_agent_lifecycle", side_effect=lifecycle
-                ), patch("codex_master.server._assign_agent_unlocked", return_value={"status": "assigned"}), patch(
-                    "codex_master.server._resource_gate_composer_scope", side_effect=composer
+                with patch("the_hive.server.single_agent_id", return_value="o1"), patch(
+                    "the_hive.server._headless_descriptor", return_value=None
+                ), patch("the_hive.server._ollama_descriptor", return_value=SimpleNamespace()), patch(
+                    "the_hive.server.call_agent_lifecycle", side_effect=lifecycle
+                ), patch("the_hive.server._assign_agent_unlocked", return_value={"status": "assigned"}), patch(
+                    "the_hive.server._resource_gate_composer_scope", side_effect=composer
                 ):
                     assign_result = call_tool(tool_name, tool_args)
 
@@ -2912,13 +2912,13 @@ class ServerHelpersTest(unittest.TestCase):
                 events.append("exit")
 
         descriptor = SimpleNamespace(provider=server_module.Provider.OLLAMA_LOCAL)
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server.canonical_agent_id", return_value="o1"
-        ), patch("codex_master.server._headless_descriptor", return_value=None), patch(
-            "codex_master.server._ollama_descriptor", return_value=descriptor
-        ), patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()), patch(
-            "codex_master.server._assign_agent_unlocked", return_value={"status": "assigned"}
-        ), patch("codex_master.server._resource_gate_composer_scope", side_effect=composer):
+        with patch("the_hive.server.require_fleet_recovery_ready"), patch(
+            "the_hive.server.canonical_agent_id", return_value="o1"
+        ), patch("the_hive.server._headless_descriptor", return_value=None), patch(
+            "the_hive.server._ollama_descriptor", return_value=descriptor
+        ), patch("the_hive.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()), patch(
+            "the_hive.server._assign_agent_unlocked", return_value={"status": "assigned"}
+        ), patch("the_hive.server._resource_gate_composer_scope", side_effect=composer):
             result = assign_agent("o1", role="arbeitsbiene", task="fix", scope=["src"], write_paths=["src/x.py"])
 
         self.assertEqual(result["status"], "assigned")
@@ -2931,25 +2931,25 @@ class ServerHelpersTest(unittest.TestCase):
         }
         usage = {"state": "clear", "blocked": False, "blocked_until_utc": None}
         admission = {"allowed": True, "reason_codes": []}
-        with patch("codex_master.server.normalize_applet_agents", return_value=["o1"]):
+        with patch("the_hive.server.normalize_applet_agents", return_value=["o1"]):
             token = server_module.issue_applet_action_token(
                 "start", "o1", server_module.applet_action_state(row, usage, admission), b"k" * 32
             )
-        with patch("codex_master.server.normalize_applet_agents", return_value=["o1"]), patch(
-            "codex_master.server.current_agent_inventory", return_value=SimpleNamespace(agents={"o1": object()})
+        with patch("the_hive.server.normalize_applet_agents", return_value=["o1"]), patch(
+            "the_hive.server.current_agent_inventory", return_value=SimpleNamespace(agents={"o1": object()})
         ), patch(
-            "codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
+            "the_hive.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
         ), patch(
-            "codex_master.server.read_applet_action_key", return_value=b"k" * 32
-        ), patch("codex_master.server.applet_agent_observation", return_value=row), patch(
-            "codex_master.server.codex_usage_watchdog_status", return_value=usage
+            "the_hive.server.read_applet_action_key", return_value=b"k" * 32
+        ), patch("the_hive.server.applet_agent_observation", return_value=row), patch(
+            "the_hive.server.codex_usage_watchdog_status", return_value=usage
         ), patch(
-            "codex_master.server.spawn_admission_decision",
+            "the_hive.server.spawn_admission_decision",
             side_effect=AssertionError("applet start must not preview resource facts"),
         ), patch(
-            "codex_master.server.read_meta", return_value={}
-        ), patch("codex_master.server._start_agent_with_lease_unlocked", return_value={"status": "started"}), patch(
-            "codex_master.server._resource_gate_composer_scope", side_effect=composer
+            "the_hive.server.read_meta", return_value={}
+        ), patch("the_hive.server._start_agent_with_lease_unlocked", return_value={"status": "started"}), patch(
+            "the_hive.server._resource_gate_composer_scope", side_effect=composer
         ):
             applet_result = server_module.applet_action("start", "o1", token)
 
@@ -2965,30 +2965,30 @@ class ServerHelpersTest(unittest.TestCase):
             runner.chmod(0o700)
             state = HiveStateStore(root / "hive")
             config = {"label": "A", "runner": runner, "home": root / "home", "session": "g5session"}
-            with patch.dict("codex_master.server.AGENTS", {"a": config}, clear=True), patch.object(
+            with patch.dict("the_hive.server.AGENTS", {"a": config}, clear=True), patch.object(
                 server_module, "build_current_hive_runtime", return_value=SimpleNamespace(state=state)
             ), patch(
-                "codex_master.server.read_current_resource_boot_id",
+                "the_hive.server.read_current_resource_boot_id",
                 return_value="123e4567-e89b-12d3-a456-426614174000",
             ), patch(
-                "codex_master.server.read_resource_evidence_v2", return_value=facts
+                "the_hive.server.read_resource_evidence_v2", return_value=facts
             ) as read_facts, patch(
-                "codex_master.server.build_approved_cgroup_runtime",
+                "the_hive.server.build_approved_cgroup_runtime",
                 side_effect=CgroupPreflightError("cgroup_preflight_failed"),
             ), patch(
-                "codex_master.server._total_running_agent_count", return_value=0
+                "the_hive.server._total_running_agent_count", return_value=0
             ), patch(
-                "codex_master.server.require_fleet_recovery_ready"
+                "the_hive.server.require_fleet_recovery_ready"
             ), patch(
-                "codex_master.server.ensure_state"
+                "the_hive.server.ensure_state"
             ), patch(
-                "codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
+                "the_hive.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
             ), patch(
-                "codex_master.server.spawn_admission_lock", return_value=contextlib.nullcontext()
+                "the_hive.server.spawn_admission_lock", return_value=contextlib.nullcontext()
             ), patch(
-                "codex_master.server.tmux_alive", return_value=False
+                "the_hive.server.tmux_alive", return_value=False
             ), patch(
-                "codex_master.server.run_tmux"
+                "the_hive.server.run_tmux"
             ) as run_tmux:
                 with self.assertRaises(AgentCapacityError) as raised:
                     start_agent("a", cwd=directory)
@@ -3011,7 +3011,7 @@ class ServerHelpersTest(unittest.TestCase):
             "running_agents": 1,
             "reason_codes": [],
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             with patch.object(
                 server_module,
                 "build_approved_cgroup_runtime",
@@ -3039,9 +3039,9 @@ class ServerHelpersTest(unittest.TestCase):
         previous = server_module._SPAWN_WARMUP_UNTIL_NS
         try:
             server_module._SPAWN_WARMUP_UNTIL_NS = 1
-            with patch("codex_master.server.system_resource_snapshot", return_value=free_slots):
+            with patch("the_hive.server.system_resource_snapshot", return_value=free_slots):
                 resumed = spawn_admission_decision(enforce_pressure=False)
-            with patch("codex_master.server.system_resource_snapshot", return_value=at_cap):
+            with patch("the_hive.server.system_resource_snapshot", return_value=at_cap):
                 capped = spawn_admission_decision(enforce_pressure=False)
         finally:
             server_module._SPAWN_WARMUP_UNTIL_NS = previous
@@ -3095,24 +3095,24 @@ class ServerHelpersTest(unittest.TestCase):
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
             state = root / "state"
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "g5session"}},
                 clear=False,
-            ), patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.tmux_alive", return_value=False
+            ), patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.tmux_alive", return_value=False
             ), patch(
-                "codex_master.server.require_managed_replacement_reservation",
+                "the_hive.server.require_managed_replacement_reservation",
                 return_value={"allowed": True, "reservation_id": "r", "managed_session": "g5session"},
             ), patch(
-                "codex_master.server.agent_home_process_summary", return_value=process_summary
+                "the_hive.server.agent_home_process_summary", return_value=process_summary
             ), patch(
-                "codex_master.server._total_running_agent_count", return_value=10
+                "the_hive.server._total_running_agent_count", return_value=10
             ), patch(
-                "codex_master.server.run_tmux",
+                "the_hive.server.run_tmux",
                 return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
             ) as run_tmux:
                 with self.assertRaises(AgentCapacityError) as raised:
@@ -3134,10 +3134,10 @@ class ServerHelpersTest(unittest.TestCase):
             ("r1",), {"r1": descriptor}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
         )
         with server_module.temporary_agent_inventory(inventory), patch(
-            "codex_master.server.read_meta",
+            "the_hive.server.read_meta",
             return_value={"agent": "r1", "session": "g5session", "tmux_socket": socket_name},
         ), patch(
-            "codex_master.server.run_tmux",
+            "the_hive.server.run_tmux",
             return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
         ) as run_tmux:
             self.assertTrue(server_module.tmux_alive("g5session"))
@@ -3173,7 +3173,7 @@ class ServerHelpersTest(unittest.TestCase):
         )
         for inventory, session in ((inventories[0], "other-session"), (inventories[1], "g5session")):
             with self.subTest(session=session), server_module.temporary_agent_inventory(inventory), patch(
-                "codex_master.server._run_bounded_command"
+                "the_hive.server._run_bounded_command"
             ) as run_command:
                 with self.assertRaisesRegex(AgentError, "private tmux routing metadata is invalid"):
                     run_tmux(["has-session", "-t", session], check=False)
@@ -3224,20 +3224,20 @@ class ServerHelpersTest(unittest.TestCase):
             with self.subTest(agent_ids=route_inventory.agent_ids), server_module.temporary_agent_inventory(
                 active_inventory
             ), patch(
-                "codex_master.server.effective_observation_inventory", return_value=(route_inventory, True)
-            ), patch("codex_master.server.read_meta", return_value={}) as read_meta, patch(
-                "codex_master.server.agent_home_process_summary", return_value=summary
-            ), patch("codex_master.server.latest_assignment_summary", return_value=None), patch(
-                "codex_master.server.agent_auth_status", return_value={}
-            ), patch("codex_master.server.agent_lease_status", return_value={}), patch(
-                "codex_master.server.codex_usage_watchdog_status", return_value={}
-            ), patch("codex_master.server.agent_limit_state", return_value={"limited": False}), patch(
-                "codex_master.server.ensure_state"
+                "the_hive.server.effective_observation_inventory", return_value=(route_inventory, True)
+            ), patch("the_hive.server.read_meta", return_value={}) as read_meta, patch(
+                "the_hive.server.agent_home_process_summary", return_value=summary
+            ), patch("the_hive.server.latest_assignment_summary", return_value=None), patch(
+                "the_hive.server.agent_auth_status", return_value={}
+            ), patch("the_hive.server.agent_lease_status", return_value={}), patch(
+                "the_hive.server.codex_usage_watchdog_status", return_value={}
+            ), patch("the_hive.server.agent_limit_state", return_value={"limited": False}), patch(
+                "the_hive.server.ensure_state"
             ), patch(
-                "codex_master.server.ensure_agent_lease_available",
+                "the_hive.server.ensure_agent_lease_available",
                 return_value={"state": "unclaimed", "raw_output": "not_returned"},
-            ), patch("codex_master.server.require_fleet_recovery_ready"), patch(
-                "codex_master.server._run_bounded_command"
+            ), patch("the_hive.server.require_fleet_recovery_ready"), patch(
+                "the_hive.server._run_bounded_command"
             ) as run_command:
                 status = server_module.status_agent("r1", initialize_state=False)
                 self.assertFalse(status["running"])
@@ -3271,10 +3271,10 @@ class ServerHelpersTest(unittest.TestCase):
         )
         private_alive = subprocess.CompletedProcess(["tmux"], 0, "", "")
         with server_module.temporary_agent_inventory(snapshot), patch(
-            "codex_master.server.read_meta",
+            "the_hive.server.read_meta",
             return_value={"agent": "r1", "session": "g5session", "tmux_socket": socket_name},
         ), patch(
-            "codex_master.server.run_tmux", side_effect=[private_alive]
+            "the_hive.server.run_tmux", side_effect=[private_alive]
         ) as run_tmux:
             sessions = server_module._managed_tmux_session_ids()
 
@@ -3293,18 +3293,18 @@ class ServerHelpersTest(unittest.TestCase):
             ("r1",), {"r1": descriptor}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
         )
         with server_module.temporary_agent_inventory(inventory), patch(
-            "codex_master.server.read_meta",
+            "the_hive.server.read_meta",
             return_value={"agent": "r1", "session": "g5session", "tmux_socket": socket_name},
-        ), patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server.require_invocation_status"
+        ), patch("the_hive.server.require_fleet_recovery_ready"), patch(
+            "the_hive.server.require_invocation_status"
         ), patch(
-            "codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
-        ), patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.require_managed_tmux_session"
+            "the_hive.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
+        ), patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.require_managed_tmux_session"
         ), patch(
-            "codex_master.server.wait_agent_input_ready", return_value={"ready": True, "raw_output": "not_returned"}
+            "the_hive.server.wait_agent_input_ready", return_value={"ready": True, "raw_output": "not_returned"}
         ), patch(
-            "codex_master.server.run_tmux", return_value=completed
+            "the_hive.server.run_tmux", return_value=completed
         ) as run_tmux:
             result = send_agent("r1", "hello")
 
@@ -3370,34 +3370,34 @@ class ServerHelpersTest(unittest.TestCase):
                 ("r",),
             )
             with server_module.temporary_agent_inventory(inventory), patch(
-                "codex_master.server.META_DIR", meta_dir
-            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.run_tmux", side_effect=fake_tmux
+                "the_hive.server.META_DIR", meta_dir
+            ), patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.run_tmux", side_effect=fake_tmux
             ) as run_tmux, patch(
-                "codex_master.server.ollama_resource_status",
+                "the_hive.server.ollama_resource_status",
                 return_value={"allowed": True, "reason_codes": [], "raw_output": "not_returned"},
             ), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 side_effect=lambda _agent: stopped_summary if stopped["value"] else process_summary,
             ), patch(
-                "codex_master.server.latest_assignment_summary", return_value=None
+                "the_hive.server.latest_assignment_summary", return_value=None
             ), patch(
-                "codex_master.server.agent_auth_status", return_value={"state": "not_applicable", "raw_output": "not_returned"}
+                "the_hive.server.agent_auth_status", return_value={"state": "not_applicable", "raw_output": "not_returned"}
             ), patch(
-                "codex_master.server.agent_limit_state", return_value={"state": "ready", "raw_output": "not_returned"}
+                "the_hive.server.agent_limit_state", return_value={"state": "ready", "raw_output": "not_returned"}
             ), patch(
-                "codex_master.server.agent_response_state", return_value={"state": "running_idle", "raw_output": "not_returned"}
+                "the_hive.server.agent_response_state", return_value={"state": "running_idle", "raw_output": "not_returned"}
             ), patch(
-                "codex_master.server.agent_lease_status", return_value={"state": "held", "held_by_this_server": True, "raw_output": "not_returned"}
-            ), patch("codex_master.server.ensure_agent_lease_available"), patch(
-                "codex_master.server.release_agent", return_value={"lease": {"state": "free", "raw_output": "not_returned"}}
+                "the_hive.server.agent_lease_status", return_value={"state": "held", "held_by_this_server": True, "raw_output": "not_returned"}
+            ), patch("the_hive.server.ensure_agent_lease_available"), patch(
+                "the_hive.server.release_agent", return_value={"lease": {"state": "free", "raw_output": "not_returned"}}
             ), patch(
-                "codex_master.server.require_invocation_status"
+                "the_hive.server.require_invocation_status"
             ), patch(
-                "codex_master.server.wait_agent_input_ready", return_value={"ready": True, "raw_output": "not_returned"}
+                "the_hive.server.wait_agent_input_ready", return_value={"ready": True, "raw_output": "not_returned"}
             ), patch(
-                "codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
-            ), patch("codex_master.server.require_managed_tmux_session"):
+                "the_hive.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
+            ), patch("the_hive.server.require_managed_tmux_session"):
                 server_module.write_meta(
                     "r1",
                     {"agent": "r1", "session": "g5session", "tmux_socket": socket_name},
@@ -3476,20 +3476,20 @@ class ServerHelpersTest(unittest.TestCase):
             task_profile="simple_only",
         )
         with patch.dict(
-            "codex_master.server.AGENTS",
+            "the_hive.server.AGENTS",
             {"a": {"label": "A", "runner": Path("/runner"), "home": Path("/home/a"), "session": "g5session"}},
             clear=False,
-        ), patch("codex_master.server.agent_ids", return_value=["a"]), patch(
-            "codex_master.server._ollama_descriptor", return_value=descriptor
-        ), patch("codex_master.server.ollama_resource_status", return_value=sensitive_gate), patch(
-            "codex_master.server.read_meta", return_value={}
-        ), patch("codex_master.server.agent_home_process_summary", return_value=process_summary), patch(
-            "codex_master.server.tmux_alive", return_value=False
-        ), patch("codex_master.server.latest_assignment_summary", return_value=None), patch(
-            "codex_master.server.agent_auth_status", return_value={"state": "not_applicable", "raw_output": "not_returned"}
-        ), patch("codex_master.server.agent_limit_state", return_value={"state": "ready", "raw_output": "not_returned"}), patch(
-            "codex_master.server.agent_response_state", return_value={"state": "stopped", "raw_output": "not_returned"}
-        ), patch("codex_master.server.agent_lease_status", return_value={"state": "free", "raw_output": "not_returned"}):
+        ), patch("the_hive.server.agent_ids", return_value=["a"]), patch(
+            "the_hive.server._ollama_descriptor", return_value=descriptor
+        ), patch("the_hive.server.ollama_resource_status", return_value=sensitive_gate), patch(
+            "the_hive.server.read_meta", return_value={}
+        ), patch("the_hive.server.agent_home_process_summary", return_value=process_summary), patch(
+            "the_hive.server.tmux_alive", return_value=False
+        ), patch("the_hive.server.latest_assignment_summary", return_value=None), patch(
+            "the_hive.server.agent_auth_status", return_value={"state": "not_applicable", "raw_output": "not_returned"}
+        ), patch("the_hive.server.agent_limit_state", return_value={"state": "ready", "raw_output": "not_returned"}), patch(
+            "the_hive.server.agent_response_state", return_value={"state": "stopped", "raw_output": "not_returned"}
+        ), patch("the_hive.server.agent_lease_status", return_value={"state": "free", "raw_output": "not_returned"}):
             response = handle_rpc(
                 {
                     "jsonrpc": "2.0",
@@ -3546,7 +3546,7 @@ class ServerHelpersTest(unittest.TestCase):
                     h2_ready=True,
                 )
                 with server_module._resource_gate_runtime_scope(runtime), patch(
-                    "codex_master.server.system_resource_snapshot", return_value=snapshot
+                    "the_hive.server.system_resource_snapshot", return_value=snapshot
                 ):
                     blocked = spawn_admission_decision()
                 runtime_after = server_module.ResourceGateRuntime(
@@ -3559,7 +3559,7 @@ class ServerHelpersTest(unittest.TestCase):
                     h2_ready=True,
                 )
                 with server_module._resource_gate_runtime_scope(runtime_after), patch(
-                    "codex_master.server.system_resource_snapshot", return_value=snapshot
+                    "the_hive.server.system_resource_snapshot", return_value=snapshot
                 ):
                     allowed = spawn_admission_decision()
         finally:
@@ -3665,30 +3665,30 @@ class ServerHelpersTest(unittest.TestCase):
                         yield
 
                 with patch.dict(
-                    "codex_master.server.AGENTS",
+                    "the_hive.server.AGENTS",
                     {"a": {"label": "A", "runner": runner, "home": root, "session": "g5session"}},
                     clear=False,
-                ), patch("codex_master.server.STATE_ROOT", state), patch(
-                    "codex_master.server.RAW_DIR", state / "raw"
-                ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                    "codex_master.server.LOCK_DIR", state / "locks"
-                ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                    "codex_master.server.tmux_alive", return_value=False
-                ), patch("codex_master.server.agent_home_process_summary", return_value=process_summary), patch(
-                    "codex_master.server._total_running_agent_count", return_value=10
+                ), patch("the_hive.server.STATE_ROOT", state), patch(
+                    "the_hive.server.RAW_DIR", state / "raw"
+                ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                    "the_hive.server.LOCK_DIR", state / "locks"
+                ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                    "the_hive.server.tmux_alive", return_value=False
+                ), patch("the_hive.server.agent_home_process_summary", return_value=process_summary), patch(
+                    "the_hive.server._total_running_agent_count", return_value=10
                 ), patch(
-                    "codex_master.server.require_managed_replacement_reservation",
+                    "the_hive.server.require_managed_replacement_reservation",
                     return_value={"allowed": True, "reservation_id": "r", "managed_session": "g5session"},
                 ), product_resource_dependencies(), patch(
-                    "codex_master.server.read_resource_evidence_v2", return_value=facts
+                    "the_hive.server.read_resource_evidence_v2", return_value=facts
                 ) as read_facts, patch(
-                    "codex_master.server.agent_base_args", return_value=[]
+                    "the_hive.server.agent_base_args", return_value=[]
                 ), patch(
-                    "codex_master.server.spawn_admission_lock", side_effect=tracked_spawn_lock
-                ), patch("codex_master.server.run_tmux", side_effect=tracked_run_tmux) as run_tmux, patch(
-                    "codex_master.server.write_meta", side_effect=tracked_write_meta
-                ), patch("codex_master.server._start_g5_warmup", side_effect=tracked_warmup), patch(
-                    "codex_master.server.pane_pid", return_value=3
+                    "the_hive.server.spawn_admission_lock", side_effect=tracked_spawn_lock
+                ), patch("the_hive.server.run_tmux", side_effect=tracked_run_tmux) as run_tmux, patch(
+                    "the_hive.server.write_meta", side_effect=tracked_write_meta
+                ), patch("the_hive.server._start_g5_warmup", side_effect=tracked_warmup), patch(
+                    "the_hive.server.pane_pid", return_value=3
                 ):
                     result = start_agent("a", cwd=directory, replacement_reservation_id="r")
                     warmup_until = server_module._SPAWN_WARMUP_UNTIL_NS
@@ -3788,19 +3788,19 @@ class ServerHelpersTest(unittest.TestCase):
                     except Exception as exc:  # pragma: no cover - asserted below
                         outcomes[agent] = exc
 
-                with patch.dict("codex_master.server.AGENTS", agents, clear=False), patch(
-                    "codex_master.server.STATE_ROOT", state
-                ), patch("codex_master.server.RAW_DIR", state / "raw"), patch(
-                    "codex_master.server.META_DIR", state / "meta"
-                ), patch("codex_master.server.LOCK_DIR", state / "locks"), patch(
-                    "codex_master.server.LEASE_DIR", state / "leases"
-                ), patch("codex_master.server.tmux_alive", return_value=False), patch(
-                    "codex_master.server.agent_home_process_summary", return_value=process_summary
-                ), patch("codex_master.server.require_spawn_capacity", side_effect=fake_admission), patch(
-                    "codex_master.server._g5_start_scope", side_effect=fake_scope
-                ), patch("codex_master.server.agent_base_args", return_value=[]), patch(
-                    "codex_master.server.prune_raw_logs"
-                ), patch("codex_master.server.run_tmux", side_effect=fake_tmux):
+                with patch.dict("the_hive.server.AGENTS", agents, clear=False), patch(
+                    "the_hive.server.STATE_ROOT", state
+                ), patch("the_hive.server.RAW_DIR", state / "raw"), patch(
+                    "the_hive.server.META_DIR", state / "meta"
+                ), patch("the_hive.server.LOCK_DIR", state / "locks"), patch(
+                    "the_hive.server.LEASE_DIR", state / "leases"
+                ), patch("the_hive.server.tmux_alive", return_value=False), patch(
+                    "the_hive.server.agent_home_process_summary", return_value=process_summary
+                ), patch("the_hive.server.require_spawn_capacity", side_effect=fake_admission), patch(
+                    "the_hive.server._g5_start_scope", side_effect=fake_scope
+                ), patch("the_hive.server.agent_base_args", return_value=[]), patch(
+                    "the_hive.server.prune_raw_logs"
+                ), patch("the_hive.server.run_tmux", side_effect=fake_tmux):
                     first = threading.Thread(target=start_in_thread, args=("a",))
                     second = threading.Thread(target=start_in_thread, args=("b",))
                     first.start()
@@ -3828,7 +3828,7 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 2,
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision()
 
         self.assertFalse(result["allowed"])
@@ -3843,7 +3843,7 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 2,
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision()
 
         self.assertFalse(result["allowed"])
@@ -3864,9 +3864,9 @@ class ServerHelpersTest(unittest.TestCase):
             "io_wait_percent": 0.0,
             "running_agents": 2,
         }
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-            "codex_master.server.system_resource_snapshot", return_value=snapshot
-        ), patch("codex_master.server.tmux_alive", return_value=False):
+        with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
+            "the_hive.server.system_resource_snapshot", return_value=snapshot
+        ), patch("the_hive.server.tmux_alive", return_value=False):
             with self.assertRaises(AgentCapacityError) as raised:
                 server_module.require_ollama_admission("o1")
 
@@ -3893,9 +3893,9 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 2,
         }
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-            "codex_master.server.system_resource_snapshot", return_value=snapshot
-        ), patch("codex_master.server.tmux_alive", side_effect=OSError("tmux secret /private/session")):
+        with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
+            "the_hive.server.system_resource_snapshot", return_value=snapshot
+        ), patch("the_hive.server.tmux_alive", side_effect=OSError("tmux secret /private/session")):
             result = server_module.require_ollama_admission("o1")
 
         self.assertIsNone(result)
@@ -3921,9 +3921,9 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 7 * 1024 - 1,
             "running_agents": 10,
         }
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-            "codex_master.server.system_resource_snapshot", return_value=snapshot
-        ) as read_snapshot, patch("codex_master.server.tmux_alive", return_value=True):
+        with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
+            "the_hive.server.system_resource_snapshot", return_value=snapshot
+        ) as read_snapshot, patch("the_hive.server.tmux_alive", return_value=True):
             result = server_module.ollama_resource_status("o1")
 
         read_snapshot.assert_called_once_with()
@@ -3957,9 +3957,9 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 9,
         }
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-            "codex_master.server.system_resource_snapshot", return_value=snapshot
-        ), patch("codex_master.server.tmux_alive", return_value=True):
+        with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
+            "the_hive.server.system_resource_snapshot", return_value=snapshot
+        ), patch("the_hive.server.tmux_alive", return_value=True):
             result = server_module.ollama_resource_status("o1")
 
         self.assertEqual(result["reason_codes"], ["cpu_pressure_high"])
@@ -3985,9 +3985,9 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 0,
         }
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-            "codex_master.server.system_resource_snapshot", return_value=snapshot
-        ), patch("codex_master.server.tmux_alive", return_value=False):
+        with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
+            "the_hive.server.system_resource_snapshot", return_value=snapshot
+        ), patch("the_hive.server.tmux_alive", return_value=False):
             result = server_module.ollama_resource_status("o1")
 
         self.assertEqual(result["reason_codes"], ["cpu_pressure_high"])
@@ -4014,9 +4014,9 @@ class ServerHelpersTest(unittest.TestCase):
             "running_agents": 2,
             "raw_output": "raw /private/proc output",
         }
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-            "codex_master.server.system_resource_snapshot", return_value=snapshot
-        ), patch("codex_master.server.tmux_alive", side_effect=RuntimeError("tmux exception /private/session")):
+        with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
+            "the_hive.server.system_resource_snapshot", return_value=snapshot
+        ), patch("the_hive.server.tmux_alive", side_effect=RuntimeError("tmux exception /private/session")):
             with self.assertRaises(AgentCapacityError) as raised:
                 server_module.require_ollama_admission("o1")
 
@@ -4049,19 +4049,19 @@ class ServerHelpersTest(unittest.TestCase):
             observed.append(server_module._RESOURCE_ADMISSION_CONTEXT.get())
             return {"status": "started"}
 
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server.current_agent_inventory", return_value=inventory
-        ), patch("codex_master.server._headless_descriptor", return_value=None), patch(
-            "codex_master.server._ollama_descriptor", return_value=descriptor
+        with patch("the_hive.server.require_fleet_recovery_ready"), patch(
+            "the_hive.server.current_agent_inventory", return_value=inventory
+        ), patch("the_hive.server._headless_descriptor", return_value=None), patch(
+            "the_hive.server._ollama_descriptor", return_value=descriptor
         ), patch(
-            "codex_master.server._resource_admission_decision",
+            "the_hive.server._resource_admission_decision",
             side_effect=AssertionError("ollama preview must not read facts"),
         ), patch(
-            "codex_master.server.claim_agent", return_value={"status": "claimed", "lease": {"state": "held"}}
-        ), patch("codex_master.server.agent_config", return_value={"session": "o1-session"}), patch(
-            "codex_master.server.tmux_alive", return_value=False
-        ), patch("codex_master.server.start_agent", side_effect=fake_start), patch(
-            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": False}
+            "the_hive.server.claim_agent", return_value={"status": "claimed", "lease": {"state": "held"}}
+        ), patch("the_hive.server.agent_config", return_value={"session": "o1-session"}), patch(
+            "the_hive.server.tmux_alive", return_value=False
+        ), patch("the_hive.server.start_agent", side_effect=fake_start), patch(
+            "the_hive.server.agent_lease_status", return_value={"held_by_this_server": False}
         ):
             result = server_module._start_agent_with_lease_unlocked("o1")
 
@@ -4093,33 +4093,33 @@ class ServerHelpersTest(unittest.TestCase):
             return {"status": "unchanged"}
 
         with (
-            patch("codex_master.server.require_fleet_recovery_ready"),
+            patch("the_hive.server.require_fleet_recovery_ready"),
             patch(
-                "codex_master.server.current_agent_inventory", return_value=inventory
+                "the_hive.server.current_agent_inventory", return_value=inventory
             ),
-            patch("codex_master.server._ollama_descriptor", return_value=descriptor),
+            patch("the_hive.server._ollama_descriptor", return_value=descriptor),
             patch(
-                "codex_master.server._resource_admission_decision",
+                "the_hive.server._resource_admission_decision",
                 side_effect=AssertionError("assignment must use spawn admission owner"),
             ),
             patch(
-                "codex_master.server.spawn_admission_decision", return_value=admission
+                "the_hive.server.spawn_admission_decision", return_value=admission
             ) as compose,
-            patch("codex_master.server.scope_check", return_value={"allowed": True}),
+            patch("the_hive.server.scope_check", return_value={"allowed": True}),
             patch(
-                "codex_master.server.resolver_class_for_agent",
+                "the_hive.server.resolver_class_for_agent",
                 return_value="arbeitsbiene",
             ),
             patch(
-                "codex_master.server.claim_for_agent_mutation",
+                "the_hive.server.claim_for_agent_mutation",
                 return_value=({"state": "held"}, False),
             ),
             patch(
-                "codex_master.server.ensure_assignment_session_model",
+                "the_hive.server.ensure_assignment_session_model",
                 side_effect=fake_ensure,
             ),
-            patch("codex_master.server.send_agent", return_value={"status": "sent"}),
-            patch("codex_master.server.record_assignment"),
+            patch("the_hive.server.send_agent", return_value={"status": "sent"}),
+            patch("the_hive.server.record_assignment"),
         ):
             result = server_module._assign_agent_unlocked(
                 "o1",
@@ -4148,16 +4148,16 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 2,
         }
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-            "codex_master.server.system_resource_snapshot", return_value=snapshot
-        ), patch("codex_master.server.tmux_alive", return_value=False):
+        with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
+            "the_hive.server.system_resource_snapshot", return_value=snapshot
+        ), patch("the_hive.server.tmux_alive", return_value=False):
             result = server_module.ollama_resource_status("o1")
 
         self.assertNotIn("temporarily_unenforced", result["benchmark_policy"])
 
     def test_spawn_admission_fails_closed_without_agent_count(self) -> None:
         with patch(
-            "codex_master.server.system_resource_snapshot",
+            "the_hive.server.system_resource_snapshot",
             return_value={"ok": False, "reason_codes": ["memory_metrics_unavailable"]},
         ):
             result = spawn_admission_decision()
@@ -4177,7 +4177,7 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 2,
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision()
 
         self.assertFalse(result["allowed"])
@@ -4189,7 +4189,7 @@ class ServerHelpersTest(unittest.TestCase):
     def test_spawn_admission_fails_closed_for_non_boolean_snapshot_ok(self) -> None:
         for ok in (None, 1, "true"):
             with self.subTest(ok=ok), patch(
-                "codex_master.server.system_resource_snapshot",
+                "the_hive.server.system_resource_snapshot",
                 return_value={
                     "ok": ok,
                     "load_per_cpu": 0.25,
@@ -4217,7 +4217,7 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 2,
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision()
 
         self.assertFalse(result["allowed"])
@@ -4233,7 +4233,7 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 2,
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision()
 
         self.assertFalse(result["allowed"])
@@ -4251,7 +4251,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "running_agents": 2,
             }
             with self.subTest(load=load), patch(
-                "codex_master.server.system_resource_snapshot", return_value=snapshot
+                "the_hive.server.system_resource_snapshot", return_value=snapshot
             ):
                 result = spawn_admission_decision()
 
@@ -4274,7 +4274,7 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_spawn_admission_enforces_host_pressure_without_running_total_cap(self) -> None:
         with patch(
-            "codex_master.server.system_resource_snapshot",
+            "the_hive.server.system_resource_snapshot",
             return_value={
                 "ok": False,
                 "load_per_cpu": 99.0,
@@ -4288,7 +4288,7 @@ class ServerHelpersTest(unittest.TestCase):
         ):
             allowed = spawn_admission_decision()
         with patch(
-            "codex_master.server.system_resource_snapshot",
+            "the_hive.server.system_resource_snapshot",
             return_value={
                 "ok": True,
                 "load_per_cpu": 0.25,
@@ -4313,7 +4313,7 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_spawn_admission_limits_only_one_operator_batch_to_ten_slots(self) -> None:
         with patch(
-            "codex_master.server.system_resource_snapshot",
+            "the_hive.server.system_resource_snapshot",
             return_value={
                 "ok": True,
                 "load_per_cpu": 0.25,
@@ -4330,15 +4330,15 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_system_resource_snapshot_counts_managed_and_native_bees_together(self) -> None:
         with patch(
-            "codex_master.server._managed_tmux_session_ids",
+            "the_hive.server._managed_tmux_session_ids",
             return_value=frozenset({"q1", "q2", "q3", "q4"}),
         ), patch(
-            "codex_master.server.native_agent_status",
+            "the_hive.server.native_agent_status",
             return_value={
                 "bridge_state": "ready",
                 "counts": {"active": 3, "unconfirmed": 2, "overflow": 0},
             },
-        ) as native_status, patch("codex_master.server._fresh_native_reservation_count", return_value=0):
+        ) as native_status, patch("the_hive.server._fresh_native_reservation_count", return_value=0):
             snapshot = system_resource_snapshot()
 
         self.assertEqual(snapshot["running_agents"], 9)
@@ -4347,13 +4347,13 @@ class ServerHelpersTest(unittest.TestCase):
     def test_total_count_joins_tmux_and_native_registries_without_cross_domain_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
-            ), patch("codex_master.server.time.time", return_value=1_001.0):
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
+            ), patch("the_hive.server.time.time", return_value=1_001.0):
                 server_module._write_native_agent_registry(
                     {
                         "schema_version": 2,
@@ -4395,14 +4395,14 @@ class ServerHelpersTest(unittest.TestCase):
             "counts": {"active": 8, "unconfirmed": 0, "overflow": 2},
         }
         with patch(
-            "codex_master.server._managed_tmux_session_ids",
+            "the_hive.server._managed_tmux_session_ids",
             return_value=frozenset({"codex_agent_b1_mcp", "codex_agent_q3_mcp"}),
         ), patch(
-            "codex_master.server.native_agent_status", return_value=native
+            "the_hive.server.native_agent_status", return_value=native
         ), patch(
-            "codex_master.server._fresh_native_reservation_count", return_value=0
+            "the_hive.server._fresh_native_reservation_count", return_value=0
         ), patch(
-            "codex_master.server.system_resource_snapshot",
+            "the_hive.server.system_resource_snapshot",
             return_value={
                 "ok": True,
                 "_g5_facts": True,
@@ -4416,10 +4416,10 @@ class ServerHelpersTest(unittest.TestCase):
                 "reason_codes": [],
             },
         ), patch(
-            "codex_master.server._typed_g5_cgroup_runtime",
+            "the_hive.server._typed_g5_cgroup_runtime",
             return_value=(object(), object()),
         ), patch(
-            "codex_master.server._g5_warmup_active", return_value=False
+            "the_hive.server._g5_warmup_active", return_value=False
         ):
             result = spawn_admission_decision(1)
 
@@ -4443,12 +4443,12 @@ class ServerHelpersTest(unittest.TestCase):
             "reason_codes": [],
         }
         with patch(
-            "codex_master.server._managed_tmux_session_ids",
+            "the_hive.server._managed_tmux_session_ids",
             return_value=frozenset({"q1", "q2", "q3", "q4"}),
         ), patch(
-            "codex_master.server.native_agent_status", return_value=native
-        ), patch("codex_master.server.system_resource_snapshot", return_value=healthy_snapshot), patch(
-            "codex_master.server._fresh_native_reservation_count", return_value=0
+            "the_hive.server.native_agent_status", return_value=native
+        ), patch("the_hive.server.system_resource_snapshot", return_value=healthy_snapshot), patch(
+            "the_hive.server._fresh_native_reservation_count", return_value=0
         ):
             one_slot = spawn_admission_decision(1)
             two_slots = spawn_admission_decision(2)
@@ -4472,22 +4472,22 @@ class ServerHelpersTest(unittest.TestCase):
             }
         )
         with patch(
-            "codex_master.server._managed_tmux_session_ids",
+            "the_hive.server._managed_tmux_session_ids",
             return_value=frozenset({"q1", "q2", "q3", "q4"}),
         ), patch(
-            "codex_master.server.native_agent_status", return_value=native
+            "the_hive.server.native_agent_status", return_value=native
         ), patch(
-            "codex_master.server.system_resource_snapshot", new=system_resource_snapshot
+            "the_hive.server.system_resource_snapshot", new=system_resource_snapshot
         ), patch(
-            "codex_master.server._typed_g5_cgroup_runtime",
+            "the_hive.server._typed_g5_cgroup_runtime",
             return_value=(object(), object()),
         ), patch(
-            "codex_master.server._g5_warmup_active", return_value=False
-        ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
-            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
-        ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
-            "codex_master.server._resource_meminfo", return_value=(50.0, 8192.0)
-        ), patch("codex_master.server._effective_cpu_count", return_value=4):
+            "the_hive.server._g5_warmup_active", return_value=False
+        ), patch("the_hive.server.os.cpu_count", return_value=4), patch(
+            "the_hive.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+        ), patch("the_hive.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
+            "the_hive.server._resource_meminfo", return_value=(50.0, 8192.0)
+        ), patch("the_hive.server._effective_cpu_count", return_value=4):
             result = spawn_admission_decision(1)
 
         self.assertTrue(result["allowed"])
@@ -4500,18 +4500,18 @@ class ServerHelpersTest(unittest.TestCase):
         agents = {"a1": {"session": "managed-session"}}
         with tempfile.TemporaryDirectory() as temporary, patch.object(
             server_module, "STATE_ROOT", Path(temporary) / "state"
-        ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
-            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
-        ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
-            "codex_master.server.Path.read_text", return_value=meminfo), patch(
-            "codex_master.server.run_tmux", return_value=tmux
-        ), patch.dict("codex_master.server.AGENTS", agents, clear=True), patch(
-            "codex_master.server.native_agent_status",
+        ), patch("the_hive.server.os.cpu_count", return_value=4), patch(
+            "the_hive.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+        ), patch("the_hive.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
+            "the_hive.server.Path.read_text", return_value=meminfo), patch(
+            "the_hive.server.run_tmux", return_value=tmux
+        ), patch.dict("the_hive.server.AGENTS", agents, clear=True), patch(
+            "the_hive.server.native_agent_status",
             return_value={
                 "bridge_state": "ready",
                 "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
             },
-        ), patch("codex_master.server._fresh_native_reservation_count", return_value=0):
+        ), patch("the_hive.server._fresh_native_reservation_count", return_value=0):
             snapshot = system_resource_snapshot()
 
         self.assertEqual(snapshot["running_agents"], 1)
@@ -4525,8 +4525,8 @@ class ServerHelpersTest(unittest.TestCase):
     def test_recent_cpu_usage_has_no_server_side_proc_fallback(self) -> None:
         first = "cpu 100 0 0 800 0 0 0 0 0 0\n"
         second = "cpu 110 0 0 810 5 0 0 0 0 0\n"
-        with patch("codex_master.server.Path.read_text", side_effect=[first, second]), patch(
-            "codex_master.server.time.sleep"
+        with patch("the_hive.server.Path.read_text", side_effect=[first, second]), patch(
+            "the_hive.server.time.sleep"
         ):
             usage = server_module._recent_cpu_usage()
 
@@ -4542,7 +4542,7 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 2,
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision()
 
         self.assertFalse(result["allowed"])
@@ -4555,7 +4555,7 @@ class ServerHelpersTest(unittest.TestCase):
         )
         for metrics, reason in cases:
             with self.subTest(reason=reason), patch(
-                "codex_master.server.system_resource_snapshot",
+                "the_hive.server.system_resource_snapshot",
                 return_value={
                     "ok": True,
                     **metrics,
@@ -4603,10 +4603,10 @@ class ServerHelpersTest(unittest.TestCase):
             "running_agents": 2,
             "reason_codes": [],
         }
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
+            "the_hive.server.system_resource_snapshot", return_value=snapshot
         ), patch(
-            "codex_master.server.tmux_alive",
+            "the_hive.server.tmux_alive",
             side_effect=lambda session, **_kwargs: session in {"o1-session", "o2-session"},
         ):
             result = server_module.ollama_resource_status("o1")
@@ -4625,7 +4625,7 @@ class ServerHelpersTest(unittest.TestCase):
         )
         for stderr in clean_errors:
             with self.subTest(stderr=stderr), patch(
-                "codex_master.server.run_tmux",
+                "the_hive.server.run_tmux",
                 return_value=subprocess.CompletedProcess(["tmux"], 1, "", stderr),
             ):
                 self.assertEqual(server_module._managed_tmux_session_count(), 0)
@@ -4644,7 +4644,7 @@ class ServerHelpersTest(unittest.TestCase):
         )
         for completed in failures:
             with self.subTest(returncode=completed.returncode, stderr=completed.stderr), patch(
-                "codex_master.server.run_tmux", return_value=completed
+                "the_hive.server.run_tmux", return_value=completed
             ):
                 snapshot = server_module.system_resource_snapshot()
 
@@ -4672,7 +4672,7 @@ class ServerHelpersTest(unittest.TestCase):
             )
 
         try:
-            with patch("codex_master.server.run_tmux", side_effect=isolated_tmux):
+            with patch("the_hive.server.run_tmux", side_effect=isolated_tmux):
                 self.assertEqual(server_module._managed_tmux_session_count(), 0)
         finally:
             subprocess.run(
@@ -4683,19 +4683,19 @@ class ServerHelpersTest(unittest.TestCase):
             )
 
     def test_system_resource_snapshot_fails_closed_without_injected_facts(self) -> None:
-        with patch("codex_master.server.os.cpu_count", return_value=4), patch(
-            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
-        ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
-            "codex_master.server.Path.read_text", return_value="MemTotal: 16384 kB\n"), patch(
-            "codex_master.server.run_tmux",
+        with patch("the_hive.server.os.cpu_count", return_value=4), patch(
+            "the_hive.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+        ), patch("the_hive.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
+            "the_hive.server.Path.read_text", return_value="MemTotal: 16384 kB\n"), patch(
+            "the_hive.server.run_tmux",
             return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
         ), patch(
-            "codex_master.server.native_agent_status",
+            "the_hive.server.native_agent_status",
             return_value={
                 "bridge_state": "ready",
                 "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
             },
-        ), patch("codex_master.server._fresh_native_reservation_count", return_value=0):
+        ), patch("the_hive.server._fresh_native_reservation_count", return_value=0):
             snapshot = system_resource_snapshot()
 
         self.assertFalse(snapshot["ok"])
@@ -4703,18 +4703,18 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("/proc/meminfo", json.dumps(snapshot))
 
     def test_system_resource_snapshot_never_derives_cpu_state_when_facts_are_missing(self) -> None:
-        with patch("codex_master.server.os.cpu_count", return_value=None), patch(
-            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
-        ), patch("codex_master.server.Path.read_text", return_value="MemTotal: 16384 kB\nMemAvailable: 8192 kB\n"), patch(
-            "codex_master.server.run_tmux",
+        with patch("the_hive.server.os.cpu_count", return_value=None), patch(
+            "the_hive.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+        ), patch("the_hive.server.Path.read_text", return_value="MemTotal: 16384 kB\nMemAvailable: 8192 kB\n"), patch(
+            "the_hive.server.run_tmux",
             return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
         ), patch(
-            "codex_master.server.native_agent_status",
+            "the_hive.server.native_agent_status",
             return_value={
                 "bridge_state": "ready",
                 "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
             },
-        ), patch("codex_master.server._fresh_native_reservation_count", return_value=0):
+        ), patch("the_hive.server._fresh_native_reservation_count", return_value=0):
             snapshot = system_resource_snapshot()
 
         self.assertFalse(snapshot["ok"])
@@ -4729,7 +4729,7 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 7 * 1024,
             "running_agents": 5,
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision()
 
         self.assertTrue(result["allowed"])
@@ -4746,7 +4746,7 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 8192,
             "running_agents": 6,
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision(5)
 
         self.assertTrue(result["allowed"])
@@ -4762,7 +4762,7 @@ class ServerHelpersTest(unittest.TestCase):
             "available_memory_mib": 7 * 1024 - 1,
             "running_agents": 2,
         }
-        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+        with patch("the_hive.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision()
 
         self.assertFalse(result["allowed"])
@@ -4783,7 +4783,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "running_agents": value if field == "running_agents" else 2,
             }
             with self.subTest(field=field), patch(
-                "codex_master.server.system_resource_snapshot", return_value=snapshot
+                "the_hive.server.system_resource_snapshot", return_value=snapshot
             ):
                 result = spawn_admission_decision()
 
@@ -4812,7 +4812,7 @@ class ServerHelpersTest(unittest.TestCase):
             }
             snapshot[field] = value
             with self.subTest(field=field, value=value), patch(
-                "codex_master.server.system_resource_snapshot", return_value=snapshot
+                "the_hive.server.system_resource_snapshot", return_value=snapshot
             ):
                 result = spawn_admission_decision()
 
@@ -4844,7 +4844,7 @@ class ServerHelpersTest(unittest.TestCase):
             }
             snapshot[field] = value
             with self.subTest(field=field, value=value), patch(
-                "codex_master.server.system_resource_snapshot", return_value=snapshot
+                "the_hive.server.system_resource_snapshot", return_value=snapshot
             ):
                 result = spawn_admission_decision()
 
@@ -4947,7 +4947,7 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_spawn_admission_rejects_invalid_policy_and_keeps_output_data_sparse(self) -> None:
         with patch(
-            "codex_master.server.system_resource_snapshot",
+            "the_hive.server.system_resource_snapshot",
             return_value={
                 "ok": True,
                 "load_per_cpu": 0.25,
@@ -4956,7 +4956,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "running_agents": 2,
             },
         ), patch(
-            "codex_master.server.spawn_resource_policy",
+            "the_hive.server.spawn_resource_policy",
             return_value={"max_load_per_cpu": float("nan")},
         ):
             result = spawn_admission_decision()
@@ -5005,10 +5005,10 @@ class ServerHelpersTest(unittest.TestCase):
             "raw_output": "not_returned",
         }
 
-        with patch("codex_master.server.spawn_admission_decision", return_value=allowed):
+        with patch("the_hive.server.spawn_admission_decision", return_value=allowed):
             self.assertEqual(server_module.require_spawn_capacity(), allowed)
 
-        with patch("codex_master.server.spawn_admission_decision", return_value=denied):
+        with patch("the_hive.server.spawn_admission_decision", return_value=denied):
             with self.assertRaises(AgentCapacityError) as raised:
                 server_module.require_spawn_capacity()
 
@@ -5026,7 +5026,7 @@ class ServerHelpersTest(unittest.TestCase):
             "reason_codes": ["PRIVATE_REASON_MUST_NOT_RETURN"],
         }
 
-        with patch("codex_master.server.spawn_admission_decision", return_value=malformed):
+        with patch("the_hive.server.spawn_admission_decision", return_value=malformed):
             with self.assertRaises(AgentCapacityError) as raised:
                 server_module.require_spawn_capacity()
 
@@ -5050,8 +5050,8 @@ class ServerHelpersTest(unittest.TestCase):
                         lock_path.symlink_to(target)
                     else:
                         lock_path.mkdir()
-                    with patch("codex_master.server.STATE_ROOT", state), patch(
-                        "codex_master.server.LOCK_DIR", locks
+                    with patch("the_hive.server.STATE_ROOT", state), patch(
+                        "the_hive.server.LOCK_DIR", locks
                     ):
                         with self.assertRaises(AgentError):
                             with server_module.spawn_admission_lock():
@@ -5094,8 +5094,8 @@ class ServerHelpersTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ):
                 first_thread = threading.Thread(target=first)
                 second_thread = threading.Thread(target=second)
@@ -5117,8 +5117,8 @@ class ServerHelpersTest(unittest.TestCase):
         body_error = OSError("protected body failed")
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ):
                 with self.assertRaises(OSError) as raised:
                     with server_module.spawn_admission_lock():
@@ -5288,11 +5288,11 @@ class ServerHelpersTest(unittest.TestCase):
         self._test_state_root = Path(state_tempdir.name) / "state"
         self.addCleanup(state_tempdir.cleanup)
         for patcher in (
-            patch("codex_master.server.STATE_ROOT", self._test_state_root),
-            patch("codex_master.server.RAW_DIR", self._test_state_root / "raw"),
-            patch("codex_master.server.META_DIR", self._test_state_root / "meta"),
-            patch("codex_master.server.LOCK_DIR", self._test_state_root / "locks"),
-            patch("codex_master.server.LEASE_DIR", self._test_state_root / "leases"),
+            patch("the_hive.server.STATE_ROOT", self._test_state_root),
+            patch("the_hive.server.RAW_DIR", self._test_state_root / "raw"),
+            patch("the_hive.server.META_DIR", self._test_state_root / "meta"),
+            patch("the_hive.server.LOCK_DIR", self._test_state_root / "locks"),
+            patch("the_hive.server.LEASE_DIR", self._test_state_root / "leases"),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -5305,7 +5305,7 @@ class ServerHelpersTest(unittest.TestCase):
             )
         )
         session_model = patch(
-            "codex_master.server.ensure_assignment_session_model",
+            "the_hive.server.ensure_assignment_session_model",
             return_value={
                 "status": "unchanged",
                 "previous_model": WRITE_AGENT_MODEL,
@@ -5317,7 +5317,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.addCleanup(session_model.stop)
         if not dedicated_scan_test:
             process_summary = patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "home": "not_returned",
                     "home_kind": "unknown",
@@ -5372,7 +5372,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent-pool installer smoke", readme)
 
     def test_read_json_file_rejects_regular_file_swap_before_open(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -5405,7 +5405,7 @@ class ServerHelpersTest(unittest.TestCase):
 
 
     def test_read_private_regular_text_rejects_regular_file_swap_before_open(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -5437,7 +5437,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(original.read_text(encoding="utf-8"), "expected = true\n")
 
     def test_read_private_regular_text_fails_closed_after_parent_swap(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -5468,7 +5468,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(swapped)
 
     def test_read_log_tail_rejects_regular_file_swap_before_open(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -5496,7 +5496,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(original.read_text(encoding="utf-8"), "expected\n")
 
     def test_bound_raw_log_file_rejects_regular_file_swap_before_update(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -5529,7 +5529,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), "external-secret-data\n")
 
     def test_write_bounded_raw_log_rejects_regular_file_swap_after_validation(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -5571,10 +5571,10 @@ class ServerHelpersTest(unittest.TestCase):
             path = raw_dir / "run.log"
             path.write_bytes(b"")
 
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
-            ), patch("codex_master.server.ensure_state"), patch(
-                "codex_master.server.sys.stdin", FakeStdin(b"short-report\n")
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            ), patch("the_hive.server.ensure_state"), patch(
+                "the_hive.server.sys.stdin", FakeStdin(b"short-report\n")
             ):
                 result = write_bounded_raw_log(path, max_bytes=128)
             content = path.read_bytes()
@@ -5587,9 +5587,9 @@ class ServerHelpersTest(unittest.TestCase):
             raw_dir = Path(tmpdir) / "raw"
             raw_dir.mkdir()
             path = raw_dir / "missing.log"
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
-            ), patch("codex_master.server.ensure_state"):
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            ), patch("the_hive.server.ensure_state"):
                 with self.assertRaisesRegex(AgentError, "outside managed raw log state"):
                     write_bounded_raw_log(path, max_bytes=128)
 
@@ -5711,7 +5711,7 @@ class ServerHelpersTest(unittest.TestCase):
                 },
             }
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": str(agent_home)}), patch.dict(
-                "codex_master.server.AGENTS", agents, clear=True
+                "the_hive.server.AGENTS", agents, clear=True
             ):
                 result = codex_home_context()
 
@@ -6020,7 +6020,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(target), str(raised.exception))
 
     def test_ensure_mcp_startup_timeout_rejects_parent_swap_before_write(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -6064,7 +6064,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(redirected_exists)
 
     def test_ensure_mcp_startup_timeout_rejects_config_swap_before_write(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -6224,8 +6224,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("SECRET_CONFIG_SHOULD_NOT_BE_READ", json.dumps(result, sort_keys=True))
         self.assertNotIn(str(target), json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server._codex_mcp_binding")
+    @patch("the_hive.server.run_command")
+    @patch("the_hive.server._codex_mcp_binding")
     def test_check_mcp_registration_rejects_substring_command_match(self, mock_binding, mock_run) -> None:
         mock_binding.return_value = contextlib.nullcontext(
             SimpleNamespace(
@@ -6261,8 +6261,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("command: /<redacted>", result["output_excerpt"])
         self.assertNotIn("/tmp/bin/codex-master-mcp-old", result["output_excerpt"])
 
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server._codex_mcp_binding")
+    @patch("the_hive.server.run_command")
+    @patch("the_hive.server._codex_mcp_binding")
     def test_check_mcp_registration_rejects_short_startup_timeout(self, mock_binding, mock_run) -> None:
         mock_binding.return_value = contextlib.nullcontext(
             SimpleNamespace(
@@ -6292,8 +6292,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["startup_timeout_ok"])
         self.assertFalse(result["ok"])
 
-    @patch("codex_master.server.run_command")
-    @patch("codex_master.server._codex_mcp_binding")
+    @patch("the_hive.server.run_command")
+    @patch("the_hive.server._codex_mcp_binding")
     def test_check_mcp_registration_distinguishes_absent_from_lookup_failure(
         self, mock_binding, mock_run
     ) -> None:
@@ -6925,7 +6925,7 @@ class ServerHelpersTest(unittest.TestCase):
             "visible_running_agents": ["c1", "a2"],
             "overflow": 0,
         }
-        with patch("codex_master.server.managed_applet_inventory", return_value=inventory) as mock_inventory:
+        with patch("the_hive.server.managed_applet_inventory", return_value=inventory) as mock_inventory:
             selected = agent_ids("active")
 
         self.assertEqual(selected, ["c1", "a2"])
@@ -7011,7 +7011,7 @@ class ServerHelpersTest(unittest.TestCase):
         prune.assert_not_called()
 
     def test_published_inventory_makes_d_e_f_selectable_without_restart(self) -> None:
-        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+        from the_hive.fleet_registry import build_inventory, normalize_fleet_document
 
         fleet = normalize_fleet_document(
             {
@@ -7044,7 +7044,7 @@ class ServerHelpersTest(unittest.TestCase):
             server_module.swap_agent_inventory(previous)
 
     def test_temporary_agent_inventory_restores_previous_pointer_after_exception(self) -> None:
-        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+        from the_hive.fleet_registry import build_inventory, normalize_fleet_document
 
         def inventory(prefix: str):
             fleet = normalize_fleet_document(
@@ -7081,7 +7081,7 @@ class ServerHelpersTest(unittest.TestCase):
             server_module.swap_agent_inventory(original)
 
     def test_agent_config_uses_explicit_captured_snapshot_after_publish_race(self) -> None:
-        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+        from the_hive.fleet_registry import build_inventory, normalize_fleet_document
 
         def inventory(prefix: str, root: Path):
             fleet = normalize_fleet_document(
@@ -7137,7 +7137,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertIs(server_module.agent_config("d1"), config)
 
     def test_selector_policy_uses_only_currently_enabled_series(self) -> None:
-        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+        from the_hive.fleet_registry import build_inventory, normalize_fleet_document
 
         fleet = normalize_fleet_document(
             {
@@ -7171,7 +7171,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(server_module.agent_ids("a-series"), [])
 
     def test_applet_normalizer_rejects_known_but_disabled_agent(self) -> None:
-        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+        from the_hive.fleet_registry import build_inventory, normalize_fleet_document
 
         fleet = normalize_fleet_document(
             {
@@ -7199,7 +7199,7 @@ class ServerHelpersTest(unittest.TestCase):
                 server_module.normalize_applet_agents(["d1"])
 
     def test_applet_inventory_omits_running_session_for_disabled_agent(self) -> None:
-        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+        from the_hive.fleet_registry import build_inventory, normalize_fleet_document
 
         fleet = normalize_fleet_document(
             {
@@ -7304,7 +7304,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertNotIn(secret, public_text)
 
     def test_legacy_migration_uses_pinned_legacy_inventory_with_foreign_active_snapshot(self) -> None:
-        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+        from the_hive.fleet_registry import build_inventory, normalize_fleet_document
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -7493,7 +7493,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertFalse(pool.exists())
 
     def test_fleet_wrapper_executes_pinned_binary_with_provider_environment(self) -> None:
-        from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
+        from the_hive.fleet_registry import AgentDescriptor, Provider, RunnerKind
 
         cases = (
             (Provider.OPENAI_CHATGPT, RunnerKind.CODEX_CLI, "CODEX_HOME", ()),
@@ -7566,7 +7566,7 @@ class ServerHelpersTest(unittest.TestCase):
                     self.assertNotIn("account", wrapper.read_text(encoding="utf-8"))
 
     def test_fleet_minimal_config_matches_runner_and_provider_contract(self) -> None:
-        from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
+        from the_hive.fleet_registry import AgentDescriptor, Provider, RunnerKind
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -7715,7 +7715,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(second["auth_skipped_existing_count"], 2)
 
     def test_fleet_gemini_materialization_is_recursive_private_and_exact(self) -> None:
-        from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
+        from the_hive.fleet_registry import AgentDescriptor, Provider, RunnerKind
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -7784,7 +7784,7 @@ class ServerHelpersTest(unittest.TestCase):
                 server_module._fleet_managed_home_state(pool, agent, strict_contents=True)
 
     def test_fleet_create_home_without_planned_hidden_name_in_transaction_is_fail_closed(self) -> None:
-        from codex_master.fleet_registry import FleetSnapshot
+        from the_hive.fleet_registry import FleetSnapshot
 
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state"
@@ -7949,7 +7949,7 @@ class ServerHelpersTest(unittest.TestCase):
             )
 
     def test_fleet_series_cas_conflict_removes_only_unchanged_new_homes(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -7986,7 +7986,7 @@ class ServerHelpersTest(unittest.TestCase):
     def test_fleet_series_account_change_is_metadata_only_and_invalid_target_is_noop(self) -> None:
         from datetime import datetime, timezone
 
-        from codex_master.fleet_registry import (
+        from the_hive.fleet_registry import (
             AuthKind,
             FleetAccount,
             FleetSnapshot,
@@ -8638,7 +8638,7 @@ google_accounts:
                 os.rename(moved, pool / "d5")
 
     def test_fleet_series_shrink_rolls_back_cas_then_removes_tail_descending(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -8790,7 +8790,7 @@ google_accounts:
             self.assertTrue((pool / "d2" / "config.toml").is_file())
 
     def test_fleet_series_managed_update_requires_disabled_and_restores_on_cas(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -8859,7 +8859,7 @@ google_accounts:
             )
 
     def test_fleet_q_series_update_is_in_place_and_preserves_runtime_identity(self) -> None:
-        from codex_master.fleet_registry import (
+        from the_hive.fleet_registry import (
             AuthKind,
             FleetAccount,
             FleetSnapshot,
@@ -9039,7 +9039,7 @@ google_accounts:
                     )
 
     def test_fleet_q_series_partial_failure_rolls_back_all_homes(self) -> None:
-        import codex_master.fleet_inplace as fleet_inplace
+        import the_hive.fleet_inplace as fleet_inplace
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -9265,7 +9265,7 @@ google_accounts:
                     self.assertEqual((runtime.stat().st_ino, runtime.read_bytes()), runtime_before)
 
     def test_fleet_q_series_cas_outcomes_reconcile_without_runtime_loss(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         for outcome in ("conflict", "uncertain_before", "uncertain_after"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
@@ -9644,7 +9644,7 @@ google_accounts:
     def test_fleet_series_runner_switch_partial_write_restores_old_managed_files(self) -> None:
         from datetime import datetime, timezone
 
-        from codex_master.fleet_registry import (
+        from the_hive.fleet_registry import (
             AuthKind,
             FleetAccount,
             FleetSnapshot,
@@ -10120,7 +10120,7 @@ google_accounts:
                 self.assertEqual(flat, expected)
 
     def test_fleet_home_target_propagates_contract_failure_without_writing(self) -> None:
-        from codex_master.hive_policy import CommonPolicyError
+        from the_hive.hive_policy import CommonPolicyError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -11694,7 +11694,7 @@ google_accounts:
     def test_fleet_plan_and_gate_use_one_registry_snapshot(self) -> None:
         from datetime import datetime, timezone
 
-        from codex_master.fleet_registry import (
+        from the_hive.fleet_registry import (
             AuthKind,
             FleetAccount,
             FleetSeries,
@@ -11815,7 +11815,7 @@ google_accounts:
             self.assertEqual(enabling_present["keep_count"], 2)
 
     def test_fleet_wrapper_never_executes_bash_or_taskset_from_path(self) -> None:
-        from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
+        from the_hive.fleet_registry import AgentDescriptor, Provider, RunnerKind
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -11849,7 +11849,7 @@ google_accounts:
             self.assertFalse(sentinel.exists())
 
     def test_fleet_combined_managed_update_and_resize_uses_one_cas_and_rolls_back_conflict(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -12232,7 +12232,7 @@ google_accounts:
                 self.assertEqual(len(quarantines), 1)
 
     def test_fleet_managed_cas_rollback_restores_exact_home_and_file_inodes(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         stopped = subprocess.CompletedProcess([], 1, "", "")
 
@@ -12289,7 +12289,7 @@ google_accounts:
                     self.assertFalse((pool / "d3").exists())
 
     def test_fleet_managed_rollback_refuses_modified_backup_snapshot(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -12539,7 +12539,7 @@ google_accounts:
             self.assertTrue(result["cleanup_pending"])
 
     def test_fleet_registry_delete_publishes_old_descriptor_before_releasing_reservations(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -12648,7 +12648,7 @@ google_accounts:
             self.assertEqual(recovery.authoritative_generation, stored.generation)
 
     def test_fleet_registry_delete_keeps_absent_reservation_before_publish(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -12720,7 +12720,7 @@ google_accounts:
             self.assertEqual(recovery.phase, server_module.RecoveryPhase.PUBLISHED)
 
     def test_fleet_registry_delete_keeps_reservation_for_unknown_third_descriptor(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -12945,7 +12945,7 @@ google_accounts:
             self.assertTrue((pool / "d1").is_dir())
 
     def test_fleet_grow_quarantines_created_home_absent_from_authoritative_snapshot(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -13008,7 +13008,7 @@ google_accounts:
             )
 
     def test_fleet_managed_update_restores_old_descriptor_after_divergent_commit(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         def home_snapshot(home: Path) -> dict[str, tuple[int, int, int, bytes]]:
             result: dict[str, tuple[int, int, int, bytes]] = {}
@@ -13078,7 +13078,7 @@ google_accounts:
             self.assertEqual(after, before)
 
     def test_fleet_managed_update_keeps_new_descriptor_and_old_backup_after_divergence(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -13185,7 +13185,7 @@ google_accounts:
             self.assertIsNone(recovery)
 
     def test_fleet_shrink_restores_staged_home_for_same_old_authoritative_descriptor(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -13248,7 +13248,7 @@ google_accounts:
             )
 
     def test_fleet_shrink_does_not_restore_or_publish_different_authoritative_descriptor(self) -> None:
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -13482,7 +13482,7 @@ google_accounts:
             real_mkdir = server_module.os.mkdir
 
             def inspect_then_mkdir(path: Path | str, mode=0o777, *, dir_fd=None):
-                from codex_master.server import _fleet_load_recovery_journal
+                from the_hive.server import _fleet_load_recovery_journal
 
                 journal = _fleet_load_recovery_journal()
                 if journal is not None and str(path).startswith(
@@ -13593,7 +13593,7 @@ google_accounts:
                 "pool_home_processes",
                 return_value=[],
             ), patch.object(server_module, "fleet_mutation_lock", side_effect=capture_lock):
-                from codex_master.server import (
+                from the_hive.server import (
                     _fleet_create_home,
                     FleetPaths,
                     _fleet_load_recovery_journal,
@@ -13624,7 +13624,7 @@ google_accounts:
             self.assertTrue(lock_calls, "fleet_series_apply should use fleet_mutation_lock")
 
     def test_fleet_registry_only_apply_and_disable_persist_cas_pending_then_clear_journal(self) -> None:
-        from codex_master.fleet_recovery import RecoveryOperation, RecoveryPhase
+        from the_hive.fleet_recovery import RecoveryOperation, RecoveryPhase
 
         for operation in ("apply", "disable"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp:
@@ -13707,8 +13707,8 @@ google_accounts:
     def test_fleet_registry_only_cas_classifies_planned_current_and_third_snapshots(self) -> None:
         from dataclasses import replace
 
-        from codex_master.fleet_recovery import RecoveryOperation, RecoveryPhase
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_recovery import RecoveryOperation, RecoveryPhase
+        from the_hive.fleet_service import FleetConflictError
 
         expected_errors = {
             "planned": "fleet_registry_commit_failed_after_cas",
@@ -13875,9 +13875,9 @@ google_accounts:
     def test_fleet_registry_only_publish_reload_rejects_same_generation_third_snapshot(self) -> None:
         from dataclasses import replace
 
-        from codex_master.fleet_recovery import RecoveryPhase
-        from codex_master.fleet_registry import fleet_document
-        from codex_master.fleet_service import FleetConflictError
+        from the_hive.fleet_recovery import RecoveryPhase
+        from the_hive.fleet_registry import fleet_document
+        from the_hive.fleet_service import FleetConflictError
 
         for cas_state in ("normal", "planned", "current"):
             with self.subTest(cas_state=cas_state), tempfile.TemporaryDirectory() as tmp:
@@ -14424,7 +14424,7 @@ google_accounts:
             def inspect_then_mkdir(path: Path | str, mode=0o777, *, dir_fd=None):
                 real_name = Path(path).name
                 if real_name.startswith(server_module.FLEET_TOMBSTONE_PREFIX) and dir_fd is not None:
-                    from codex_master.server import _fleet_load_recovery_journal
+                    from the_hive.server import _fleet_load_recovery_journal
 
                     journal = _fleet_load_recovery_journal()
                     if journal is not None and journal.entries:
@@ -14586,7 +14586,7 @@ google_accounts:
             self.assertTrue(quarantines[0].is_dir())
 
     def test_published_both_selector_follows_ordinal_policy(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         inventory = server_module.current_agent_inventory()
         with patch.dict(os.environ, {server_module.AGENT_SELECTOR_SERIES_ENV: "c,a,b"}), server_module.temporary_agent_inventory(inventory):
@@ -14613,7 +14613,7 @@ google_accounts:
         )
         self.assertFalse(result["broad_selection"]["required"])
 
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.status_agent")
     def test_multi_agent_status_results_are_paged_for_broad_selectors(self, mock_status_agent) -> None:
         mock_status_agent.side_effect = lambda agent, **_kwargs: {
             "agent": agent,
@@ -14630,7 +14630,7 @@ google_accounts:
             for index in range(1, 6)
         }
 
-        with patch.dict("codex_master.server.AGENTS", agents, clear=True):
+        with patch.dict("the_hive.server.AGENTS", agents, clear=True):
             result = call_tool("agent_status", {"agent": "all", "agents_offset": 1, "agents_limit": 2})
 
         self.assertEqual([item["agent"] for item in result["results"]], ["a2", "a3"])
@@ -14644,7 +14644,7 @@ google_accounts:
         mock_status_agent.assert_any_call("a3", initialize_state=False)
         self.assertEqual(mock_status_agent.call_count, 2)
 
-    @patch("codex_master.server.call_agent_lifecycle")
+    @patch("the_hive.server.call_agent_lifecycle")
     def test_mutating_broad_selectors_require_explicit_confirmation(self, mock_lifecycle) -> None:
         with self.assertRaisesRegex(AgentError, "allow_broad_selector=true") as raised_start:
             call_tool("agent_start", {"agent": "a-series"})
@@ -14656,7 +14656,7 @@ google_accounts:
         self.assertNotIn("a1", str(raised_stop.exception))
         self.assertNotIn("b1", str(raised_stop.exception))
 
-    @patch("codex_master.server.call_agent_lifecycle")
+    @patch("the_hive.server.call_agent_lifecycle")
     def test_mutating_broad_selectors_can_be_explicitly_confirmed(self, mock_lifecycle) -> None:
         mock_lifecycle.side_effect = lambda agent, fn: {
             "agent": agent,
@@ -14673,7 +14673,7 @@ google_accounts:
             for index in range(1, MAX_MUTATING_AGENTS_WITHOUT_CONFIRM + 2)
         }
 
-        with patch.dict("codex_master.server.AGENTS", agents, clear=True):
+        with patch.dict("the_hive.server.AGENTS", agents, clear=True):
             result = call_tool("agent_start", {"agent": "all", "allow_broad_selector": True})
 
         self.assertEqual(len(result["results"]), MAX_MUTATING_AGENTS_WITHOUT_CONFIRM + 1)
@@ -14683,7 +14683,7 @@ google_accounts:
         self.assertEqual(result["broad_selection"]["raw_output"], "not_returned")
         self.assertEqual(mock_lifecycle.call_count, MAX_MUTATING_AGENTS_WITHOUT_CONFIRM + 1)
 
-    @patch("codex_master.server.call_agent_lifecycle")
+    @patch("the_hive.server.call_agent_lifecycle")
     def test_multi_agent_mutation_preserves_structured_lease_errors(self, mock_lifecycle) -> None:
         mock_lifecycle.side_effect = AgentBusyError(
             "agent is busy",
@@ -14707,12 +14707,12 @@ google_accounts:
     def test_agent_selector_policy_can_switch_ordinal_rotation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state"
-            with patch.dict("os.environ", {}, clear=True), patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.SELECTOR_POLICY_FILE", state / "selector-policy.json"
+            with patch.dict("os.environ", {}, clear=True), patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.SELECTOR_POLICY_FILE", state / "selector-policy.json"
             ):
                 default_status = selector_policy_status()
                 preview = call_tool("agent_selector_preview", {"series": "A,B,C", "limit": 6})
@@ -14729,7 +14729,7 @@ google_accounts:
         self.assertNotIn(tmpdir, json.dumps(changed, sort_keys=True))
 
     def test_agent_selection_preview_uses_read_only_shadow_without_private_account_data(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         inventory = server_module._legacy_inventory()
         fleet_service = Mock()
@@ -14787,7 +14787,7 @@ google_accounts:
                 self.assertNotIn(descriptor.account_id, serialized)
 
     def test_agent_selection_preview_uses_current_usage_v2_for_sp1a(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         now = datetime.now(timezone.utc)
         descriptor = server_module.AgentDescriptor(
@@ -14860,7 +14860,7 @@ google_accounts:
         self.assertNotIn("BW_Work", json.dumps(result))
 
     def test_agent_selection_preview_enforced_remains_closed_without_reservation(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         inventory = server_module._legacy_inventory()
         fleet_service = Mock()
@@ -14925,13 +14925,13 @@ google_accounts:
                 except BaseException as exc:
                     errors.append(exc)
 
-            with patch.dict("os.environ", {}, clear=True), patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.SELECTOR_POLICY_FILE", state / "selector-policy.json"
-            ), patch("codex_master.server.replace_private_text", side_effect=blocking_replace):
+            with patch.dict("os.environ", {}, clear=True), patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.SELECTOR_POLICY_FILE", state / "selector-policy.json"
+            ), patch("the_hive.server.replace_private_text", side_effect=blocking_replace):
                 first = threading.Thread(target=set_policy, args=("first", "a,b"))
                 second = threading.Thread(target=set_policy, args=("second", "a,b,c"))
                 first.start()
@@ -15008,7 +15008,7 @@ google_accounts:
             home = Path(tmpdir) / "home"
             home.mkdir()
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -15027,7 +15027,7 @@ google_accounts:
                 (home / "auth.json").write_text("{}\n", encoding="utf-8")
                 (home / "auth.json").write_bytes(b"")
                 empty_file = agent_auth_status("a")
-                with patch("codex_master.server.os.open", side_effect=PermissionError):
+                with patch("the_hive.server.os.open", side_effect=PermissionError):
                     unreadable = agent_auth_status("a")
 
         self.assertFalse(missing["authenticated"])
@@ -15064,7 +15064,7 @@ google_accounts:
                 encoding="utf-8",
             )
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -15082,7 +15082,7 @@ google_accounts:
             secret = "SECRET_AUTH_MODE_" + ("x" * 500)
             (home / "auth.json").write_text(json.dumps({"auth_mode": secret}) + "\n", encoding="utf-8")
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -15107,7 +15107,7 @@ google_accounts:
                 encoding="utf-8",
             )
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -15117,7 +15117,7 @@ google_accounts:
         self.assertEqual(result["token_state"], "unexpired")
 
     def test_agent_auth_status_rejects_regular_file_swap_before_open(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -15154,7 +15154,7 @@ google_accounts:
             self.assertEqual(original.read_text(encoding="utf-8"), "expected\n")
 
     def test_agent_auth_status_rejects_parent_swap_before_open(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -15241,8 +15241,8 @@ google_accounts:
                     )
                 return subprocess.CompletedProcess(command, 1, stdout="", stderr="unexpected")
 
-            with patch("codex_master.server.run_command", side_effect=fake_run), patch(
-                "codex_master.server.shutil.which", return_value="/usr/bin/systemd-analyze"
+            with patch("the_hive.server.run_command", side_effect=fake_run), patch(
+                "the_hive.server.shutil.which", return_value="/usr/bin/systemd-analyze"
             ):
                 result = master_watchdog_status(root=root, systemd_user_dir=systemd_user)
 
@@ -15278,9 +15278,9 @@ google_accounts:
                 "ExecMainStartTimestamp": "",
             },
         }
-        with patch("codex_master.server.systemctl_user_show", side_effect=[timer, service]), patch(
-            "codex_master.server.watchdog_unit_file_status", return_value={"ok": True}
-        ), patch("codex_master.server.watchdog_security_status", return_value={"ok": True}):
+        with patch("the_hive.server.systemctl_user_show", side_effect=[timer, service]), patch(
+            "the_hive.server.watchdog_unit_file_status", return_value={"ok": True}
+        ), patch("the_hive.server.watchdog_security_status", return_value={"ok": True}):
             result = master_watchdog_status()
 
         self.assertFalse(result["checks"]["service_last_run_success"])
@@ -15300,9 +15300,9 @@ google_accounts:
                 "ExecMainStartTimestamp": "Sun 2026-06-07 18:45:00 CEST",
             },
         }
-        with patch("codex_master.server.systemctl_user_show", side_effect=[timer, service]), patch(
-            "codex_master.server.watchdog_unit_file_status", return_value={"ok": True}
-        ), patch("codex_master.server.watchdog_security_status", return_value={"ok": True}):
+        with patch("the_hive.server.systemctl_user_show", side_effect=[timer, service]), patch(
+            "the_hive.server.watchdog_unit_file_status", return_value={"ok": True}
+        ), patch("the_hive.server.watchdog_security_status", return_value={"ok": True}):
             result = master_watchdog_status()
 
         self.assertFalse(result["checks"]["service_last_run_success"])
@@ -15347,8 +15347,8 @@ google_accounts:
                     )
                 return subprocess.CompletedProcess(command, 1, stdout="", stderr="unexpected")
 
-            with patch("codex_master.server.run_command", side_effect=fake_run), patch(
-                "codex_master.server.shutil.which", return_value="/usr/bin/systemd-analyze"
+            with patch("the_hive.server.run_command", side_effect=fake_run), patch(
+                "the_hive.server.shutil.which", return_value="/usr/bin/systemd-analyze"
             ):
                 result = master_watchdog_status(root=root, systemd_user_dir=systemd_user)
 
@@ -15371,7 +15371,7 @@ google_accounts:
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
     def test_master_app_bridge_status_rejects_empty_connector_id_suffix(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -15464,7 +15464,7 @@ google_accounts:
                     return real_open(path, flags, mode)
                 return real_open(path, flags, mode, dir_fd=dir_fd)
 
-            with patch("codex_master.server.os.open", side_effect=swapping_open):
+            with patch("the_hive.server.os.open", side_effect=swapping_open):
                 result = plugin_cache_status(root, cache)
 
         self.assertTrue(swapped)
@@ -15487,7 +15487,7 @@ google_accounts:
             (root / "hooks").mkdir()
             (root / "skills" / "codex-master-fleet").mkdir(parents=True)
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master" / "__pycache__").mkdir(parents=True)
+            (root / "src" / "the_hive" / "__pycache__").mkdir(parents=True)
             (root / "tests" / "__pycache__").mkdir(parents=True)
             (root / ".git").mkdir()
             (root / ".pytest_cache").mkdir()
@@ -15522,10 +15522,10 @@ google_accounts:
             )
             (root / "hooks" / "native_bee_event.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             (root / "skills" / "codex-master-fleet" / "SKILL.md").write_text("skill", encoding="utf-8")
-            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
-            (root / "src" / "codex_master" / "__pycache__" / "server.pyc").write_bytes(b"cache")
-            (root / "src" / "codex_master" / ".env").write_text("SECRET=not-copied", encoding="utf-8")
-            (root / "src" / "codex_master" / "server.py.swp").write_text("swap", encoding="utf-8")
+            (root / "src" / "the_hive" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "src" / "the_hive" / "__pycache__" / "server.pyc").write_bytes(b"cache")
+            (root / "src" / "the_hive" / ".env").write_text("SECRET=not-copied", encoding="utf-8")
+            (root / "src" / "the_hive" / "server.py.swp").write_text("swap", encoding="utf-8")
             (root / "skills" / "codex-master-fleet" / "SKILL.md.tmp").write_text("tmp", encoding="utf-8")
             (root / "tests" / "test_server.py").write_text("should not copy", encoding="utf-8")
             (root / ".git" / "config").write_text("secret", encoding="utf-8")
@@ -15570,13 +15570,13 @@ google_accounts:
                 "scripts": (entry / "scripts" / "install-agent-pool").exists(),
                 "skill": (entry / "skills" / "codex-master-fleet" / "SKILL.md").exists(),
                 "systemd": (entry / "systemd" / "user").exists(),
-                "server": (entry / "src" / "codex_master" / "server.py").exists(),
+                "server": (entry / "src" / "the_hive" / "server.py").exists(),
                 "git": (entry / ".git").exists(),
                 "pytest_cache": (entry / ".pytest_cache").exists(),
                 "tests": (entry / "tests").exists(),
-                "pycache": (entry / "src" / "codex_master" / "__pycache__").exists(),
-                "hidden_env": (entry / "src" / "codex_master" / ".env").exists(),
-                "swap": (entry / "src" / "codex_master" / "server.py.swp").exists(),
+                "pycache": (entry / "src" / "the_hive" / "__pycache__").exists(),
+                "hidden_env": (entry / "src" / "the_hive" / ".env").exists(),
+                "swap": (entry / "src" / "the_hive" / "server.py.swp").exists(),
                 "tmp": (entry / "skills" / "codex-master-fleet" / "SKILL.md.tmp").exists(),
             }
 
@@ -15619,7 +15619,7 @@ google_accounts:
             (root / "bin").mkdir()
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / "src" / "the_hive").mkdir(parents=True)
             (root / ".codex-plugin" / "plugin.json").write_text(
                 json.dumps({"name": "codex-master", "version": version}), encoding="utf-8"
             )
@@ -15629,14 +15629,14 @@ google_accounts:
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
             (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "skills" / "SKILL.md").write_text("skill\n", encoding="utf-8")
-            (root / "src" / "codex_master" / "server.py").write_text("print('source')\n", encoding="utf-8")
+            (root / "src" / "the_hive" / "server.py").write_text("print('source')\n", encoding="utf-8")
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False):
                 sync_plugin_cache_from_repo(root, cache)
                 entry = cache / version
                 (entry / "README.md").write_text("old-cache\n", encoding="utf-8")
 
-                with patch("codex_master.server.os.replace", side_effect=OSError("injected replace failure")):
+                with patch("the_hive.server.os.replace", side_effect=OSError("injected replace failure")):
                     with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
                         sync_plugin_cache_from_repo(root, cache)
 
@@ -15657,7 +15657,7 @@ google_accounts:
             (root / "bin").mkdir()
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / "src" / "the_hive").mkdir(parents=True)
             payload = {"name": "codex-master", "version": "0.3.4+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
@@ -15666,7 +15666,7 @@ google_accounts:
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
             (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "skills" / "codex-master-fleet").symlink_to(root / "src", target_is_directory=True)
-            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "src" / "the_hive" / "server.py").write_text("print('ok')\n", encoding="utf-8")
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False):
                 with self.assertRaisesRegex(AgentError, "unsupported symlink"):
@@ -15692,7 +15692,7 @@ google_accounts:
             (root / "bin").mkdir()
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / "src" / "the_hive").mkdir(parents=True)
             payload = {"name": "codex-master", "version": version}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
@@ -15701,12 +15701,12 @@ google_accounts:
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
             (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
-            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "src" / "the_hive" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             fixed_uuid = type("FixedUuid", (), {"hex": "nonce"})()
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
-                "codex_master.server.now_id", return_value="fixed"
-            ), patch("codex_master.server.uuid.uuid4", return_value=fixed_uuid):
+                "the_hive.server.now_id", return_value="fixed"
+            ), patch("the_hive.server.uuid.uuid4", return_value=fixed_uuid):
                 with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache") as raised:
                     sync_plugin_cache_from_repo(root, cache)
             marker_content = marker.read_text(encoding="utf-8")
@@ -15723,7 +15723,7 @@ google_accounts:
             (root / "bin").mkdir()
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / "src" / "the_hive").mkdir(parents=True)
             payload = {"name": "codex-master", "version": "0.3.5+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
@@ -15732,9 +15732,9 @@ google_accounts:
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
             (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
-            server = root / "src" / "codex_master" / "server.py"
+            server = root / "src" / "the_hive" / "server.py"
             server.write_text("print('ok')\n", encoding="utf-8")
-            os.link(server, root / "src" / "codex_master" / "server-hardlink.py")
+            os.link(server, root / "src" / "the_hive" / "server-hardlink.py")
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False):
                 with self.assertRaisesRegex(AgentError, "unsupported hardlink"):
@@ -15754,7 +15754,7 @@ google_accounts:
             (root / "bin").mkdir()
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / "src" / "the_hive").mkdir(parents=True)
             payload = {"name": "codex-master", "version": "0.3.8+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
@@ -15763,7 +15763,7 @@ google_accounts:
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
             (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
-            server = root / "src" / "codex_master" / "server.py"
+            server = root / "src" / "the_hive" / "server.py"
             server.write_text("print('ok')\n", encoding="utf-8")
             redirected = tmp_path / "redirected.py"
             redirected.write_text("SECRET_SHOULD_NOT_COPY\n", encoding="utf-8")
@@ -15781,7 +15781,7 @@ google_accounts:
                 return real_open(path, flags, mode, dir_fd=dir_fd)
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
-                "codex_master.server.os.open", side_effect=swapping_open
+                "the_hive.server.os.open", side_effect=swapping_open
             ):
                 with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
                     sync_plugin_cache_from_repo(root, cache)
@@ -15801,7 +15801,7 @@ google_accounts:
             (root / "bin").mkdir()
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / "src" / "the_hive").mkdir(parents=True)
             payload = {"name": "codex-master", "version": "0.3.8+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
@@ -15812,10 +15812,10 @@ google_accounts:
             (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
             source_dir = root / "src"
             backup_dir = root / "src-backup"
-            (source_dir / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            (source_dir / "the_hive" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             redirected_dir = tmp_path / "redirected-src"
-            (redirected_dir / "codex_master").mkdir(parents=True)
-            (redirected_dir / "codex_master" / "server.py").write_text("SECRET_SHOULD_NOT_COPY\n", encoding="utf-8")
+            (redirected_dir / "the_hive").mkdir(parents=True)
+            (redirected_dir / "the_hive" / "server.py").write_text("SECRET_SHOULD_NOT_COPY\n", encoding="utf-8")
             real_open = os.open
             swapped = False
 
@@ -15830,7 +15830,7 @@ google_accounts:
                 return real_open(path, flags, mode, dir_fd=dir_fd)
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
-                "codex_master.server.os.open", side_effect=swapping_open
+                "the_hive.server.os.open", side_effect=swapping_open
             ):
                 with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
                     sync_plugin_cache_from_repo(root, cache)
@@ -15854,7 +15854,7 @@ google_accounts:
             (root / "bin").mkdir()
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / "src" / "the_hive").mkdir(parents=True)
             version = "0.3.8+codex.test"
             payload = {"name": "codex-master", "version": version}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -15864,7 +15864,7 @@ google_accounts:
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
             (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
-            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "src" / "the_hive" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             real_open = os.open
             swapped = False
 
@@ -15883,7 +15883,7 @@ google_accounts:
                 return real_open(path, flags, mode, dir_fd=dir_fd)
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
-                "codex_master.server.os.open", side_effect=swapping_open
+                "the_hive.server.os.open", side_effect=swapping_open
             ):
                 with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
                     sync_plugin_cache_from_repo(root, cache)
@@ -15895,7 +15895,7 @@ google_accounts:
         self.assertEqual(backup_entries, [])
 
     def test_sync_plugin_cache_rejects_real_cache_parent_swap_before_root_create(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -15930,7 +15930,7 @@ google_accounts:
         self.assertFalse(created_in_original)
 
     def test_sync_plugin_cache_rejects_real_source_root_swap_during_copy(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -15969,7 +15969,7 @@ google_accounts:
                 return real_path_present(path)
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
-                "codex_master.server.path_present_no_follow", side_effect=swap_source_root
+                "the_hive.server.path_present_no_follow", side_effect=swap_source_root
             ):
                 with self.assertRaisesRegex(AgentError, "plugin source changed during copy"):
                     sync_plugin_cache_from_repo(root, cache)
@@ -15978,7 +15978,7 @@ google_accounts:
             self.assertFalse((cache / version).exists())
 
     def test_sync_plugin_cache_from_repo_rejects_in_place_source_change_during_copy(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -15988,7 +15988,7 @@ google_accounts:
             (root / "bin").mkdir()
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / "src" / "the_hive").mkdir(parents=True)
             payload = {"name": "codex-master", "version": "0.3.4+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
@@ -16000,7 +16000,7 @@ google_accounts:
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
             (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "skills" / "SKILL.md").write_text("skill\n", encoding="utf-8")
-            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "src" / "the_hive" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             original_readme_stat = source_readme.stat()
             mutated = False
 
@@ -16025,7 +16025,7 @@ google_accounts:
                 return data
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
-                "codex_master.server.os.read", side_effect=corrupt_read
+                "the_hive.server.os.read", side_effect=corrupt_read
             ):
                 with self.assertRaisesRegex(AgentError, "plugin source changed during copy"):
                     sync_plugin_cache_from_repo(root, cache)
@@ -16045,7 +16045,7 @@ google_accounts:
             (root / "bin").mkdir()
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / "src" / "the_hive").mkdir(parents=True)
             current = "0.3.5+codex.current"
             payload = {"name": "codex-master", "version": current}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -16055,7 +16055,7 @@ google_accounts:
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
             (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
-            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "src" / "the_hive" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             cache.mkdir()
             old_versions = [f"0.3.{index}+codex.old" for index in range(5)]
             for index, version in enumerate(old_versions):
@@ -16094,7 +16094,7 @@ google_accounts:
         self.assertNotIn(str(cache), json.dumps(result, sort_keys=True))
 
     def test_prune_plugin_cache_versions_reports_invalid_keep_version_as_not_retained(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = Path(tmpdir) / "cache"
@@ -16124,7 +16124,7 @@ google_accounts:
         self.assertEqual(result["pruned_version_count"], 0)
 
     def test_sync_plugin_cache_serializes_retention_across_concurrent_syncs(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -16178,8 +16178,8 @@ google_accounts:
 
             state = tmp_path / "state"
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
-                "codex_master.server.STATE_ROOT", state
-            ), patch("codex_master.server.LOCK_DIR", state / "locks"), patch.object(
+                "the_hive.server.STATE_ROOT", state
+            ), patch("the_hive.server.LOCK_DIR", state / "locks"), patch.object(
                 server_module, "prune_plugin_cache_versions", side_effect=block_first_prune
             ):
                 first = threading.Thread(target=run_sync, args=("a", root_a))
@@ -16217,7 +16217,7 @@ google_accounts:
             (root / "bin").mkdir()
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
-            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / "src" / "the_hive").mkdir(parents=True)
             (root / ".codex-plugin" / "plugin.json").write_text(
                 json.dumps({"name": "codex-master", "version": current_version}), encoding="utf-8"
             )
@@ -16227,7 +16227,7 @@ google_accounts:
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
             (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
-            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "src" / "the_hive" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             old_manifest = redirected_cache / old_version / ".codex-plugin" / "plugin.json"
             old_manifest.parent.mkdir(parents=True)
             old_manifest.write_text(
@@ -16243,7 +16243,7 @@ google_accounts:
                 return real_prune(cache_root, keep_version=keep_version, max_versions=max_versions)
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
-                "codex_master.server.prune_plugin_cache_versions", side_effect=swap_then_prune
+                "the_hive.server.prune_plugin_cache_versions", side_effect=swap_then_prune
             ):
                 with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
                     sync_plugin_cache_from_repo(root, cache, retained_versions=1)
@@ -16253,7 +16253,7 @@ google_accounts:
             self.assertTrue(cache.is_symlink())
 
     def test_remove_real_plugin_cache_dir_rejects_directory_swap_before_recursive_delete(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -16280,7 +16280,7 @@ google_accounts:
             self.assertFalse((backup / "managed-cache").exists())
 
     def test_plugin_copy_cleanup_rejects_destination_swap(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -16305,7 +16305,7 @@ google_accounts:
             self.assertTrue(destination_backup.exists())
 
     def test_plugin_copy_keeps_recursive_destination_on_pinned_directory(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -16358,7 +16358,7 @@ google_accounts:
         self.assertNotIn(str(root), json.dumps(result, sort_keys=True))
 
     def test_plugin_declares_mcp_manifest_requires_exact_relative_target(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -16377,7 +16377,7 @@ google_accounts:
         self.assertEqual(valid["target"], ".mcp.json")
 
     def test_master_plugin_status_fails_when_mcp_manifest_is_not_a_file(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         def repo_status(path: Path) -> dict[str, Any]:
             regular_file = path.name != ".mcp.json"
@@ -16417,7 +16417,7 @@ google_accounts:
         self.assertFalse(result["mcp_manifest"]["regular_file"])
 
     def test_plugin_mcp_manifest_status_requires_master_server_declaration(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -16430,7 +16430,7 @@ google_accounts:
         self.assertEqual(result["reason"], "mcp_server_declaration_missing")
 
     def test_plugin_mcp_manifest_status_requires_server_command(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -16550,7 +16550,7 @@ google_accounts:
                 timeout=2,
             )
 
-    @patch("codex_master.server._run_mcp_probe")
+    @patch("the_hive.server._run_mcp_probe")
     def test_mcp_command_tools_list_self_test_is_data_sparse(self, mock_run) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -16568,7 +16568,7 @@ google_accounts:
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("/tmp/codex-master-mcp", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server._run_mcp_probe")
+    @patch("the_hive.server._run_mcp_probe")
     def test_mcp_command_tools_list_self_test_accepts_content_length_frames(self, mock_run) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -16590,7 +16590,7 @@ google_accounts:
         self.assertEqual(result["tool_count"], 1)
         self.assertTrue(result["required_tool_available"])
 
-    @patch("codex_master.server._run_mcp_probe")
+    @patch("the_hive.server._run_mcp_probe")
     def test_mcp_command_tools_list_self_test_requires_assignment_report(self, mock_run) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -16613,7 +16613,7 @@ google_accounts:
         self.assertTrue(result["required_tool_available"])
         self.assertFalse(result["required_tools_available"]["agent_assignment_report"])
 
-    @patch("codex_master.server._run_mcp_probe")
+    @patch("the_hive.server._run_mcp_probe")
     def test_mcp_command_tools_list_self_test_rejects_stderr_only_response(self, mock_run) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -16635,7 +16635,7 @@ google_accounts:
         self.assertEqual(result["tool_count"], 0)
         self.assertFalse(result["required_tool_available"])
 
-    @patch("codex_master.server._run_mcp_probe", side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"))
+    @patch("the_hive.server._run_mcp_probe", side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"))
     def test_mcp_self_tests_fail_closed_on_invalid_command_output(self, _mock_run) -> None:
         startup = mcp_command_startup_self_test(Path("/tmp/codex-master-mcp"))
         tools = mcp_command_tools_list_self_test(Path("/tmp/codex-master-mcp"))
@@ -16669,12 +16669,12 @@ google_accounts:
             write_proc("100", "node", ["/usr/bin/node", "/x/node_modules/@openai/codex/bin/codex.js"], {})
             write_proc("101", "codex", ["/tmp/codex"], {"CODEX_HOME": str(agent_home)})
             write_proc("102", "codex", ["/tmp/codex"], {"CODEX_HOME": str(custom_home)})
-            write_proc("103", "python3", ["python3", "-m", "codex_master.server"], {})
+            write_proc("103", "python3", ["python3", "-m", "the_hive.server"], {})
             write_proc("104", "bash", ["bash"], {})
             write_proc("105", "codex-code-mode-host", ["codex-code-mode-host"], {})
 
             with patch.dict("os.environ", {"HOME": str(home)}, clear=False), patch.dict(
-                "codex_master.server.AGENTS", agents, clear=True
+                "the_hive.server.AGENTS", agents, clear=True
             ):
                 result = codex_related_process_summary(root)
 
@@ -16721,14 +16721,14 @@ google_accounts:
         self.assertFalse(result["namespace_visibility"]["unknown_home_clients_need_manual_check"])
         self.assertEqual(result["namespace_visibility"]["raw_output"], "not_returned")
 
-    @patch("codex_master.server.codex_related_process_summary")
-    @patch("codex_master.server.codex_home_context")
-    @patch("codex_master.server.master_app_bridge_status")
-    @patch("codex_master.server.plugin_cache_status")
-    @patch("codex_master.server.codex_client_mcp_config_status")
-    @patch("codex_master.server.mcp_command_tools_list_self_test")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.check_mcp_registration")
+    @patch("the_hive.server.codex_related_process_summary")
+    @patch("the_hive.server.codex_home_context")
+    @patch("the_hive.server.master_app_bridge_status")
+    @patch("the_hive.server.plugin_cache_status")
+    @patch("the_hive.server.codex_client_mcp_config_status")
+    @patch("the_hive.server.mcp_command_tools_list_self_test")
+    @patch("the_hive.server.mcp_command_startup_self_test")
+    @patch("the_hive.server.check_mcp_registration")
     def test_master_namespace_status_explains_client_visibility_without_raw_output(
         self,
         mock_registration,
@@ -16766,10 +16766,10 @@ google_accounts:
         }
 
         with patch(
-            "codex_master.server._runtime_mcp_entrypoint",
+            "the_hive.server._runtime_mcp_entrypoint",
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
-            "codex_master.server._read_bound_mcp_health",
+            "the_hive.server._read_bound_mcp_health",
             return_value=server_module._BoundMcpHealth(
                 canonical_cli_available=True,
                 client_binding_available=True,
@@ -16802,14 +16802,14 @@ google_accounts:
         self.assertTrue(result["namespace_ready"])
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.codex_related_process_summary")
-    @patch("codex_master.server.codex_home_context")
-    @patch("codex_master.server.master_app_bridge_status")
-    @patch("codex_master.server.plugin_cache_status")
-    @patch("codex_master.server.codex_client_mcp_config_status")
-    @patch("codex_master.server.mcp_command_tools_list_self_test")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.check_mcp_registration")
+    @patch("the_hive.server.codex_related_process_summary")
+    @patch("the_hive.server.codex_home_context")
+    @patch("the_hive.server.master_app_bridge_status")
+    @patch("the_hive.server.plugin_cache_status")
+    @patch("the_hive.server.codex_client_mcp_config_status")
+    @patch("the_hive.server.mcp_command_tools_list_self_test")
+    @patch("the_hive.server.mcp_command_startup_self_test")
+    @patch("the_hive.server.check_mcp_registration")
     def test_master_namespace_status_fails_when_plugin_cache_is_stale(
         self,
         mock_registration,
@@ -16852,10 +16852,10 @@ google_accounts:
         }
 
         with patch(
-            "codex_master.server._runtime_mcp_entrypoint",
+            "the_hive.server._runtime_mcp_entrypoint",
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
-            "codex_master.server._read_bound_mcp_health",
+            "the_hive.server._read_bound_mcp_health",
             return_value=server_module._BoundMcpHealth(
                 canonical_cli_available=True,
                 client_binding_available=True,
@@ -16874,14 +16874,14 @@ google_accounts:
         self.assertEqual(result["plugin_cache"]["reason"], "repo_plugin_version_not_installed")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.codex_related_process_summary")
-    @patch("codex_master.server.codex_home_context")
-    @patch("codex_master.server.master_app_bridge_status")
-    @patch("codex_master.server.plugin_cache_status")
-    @patch("codex_master.server.codex_client_mcp_config_status")
-    @patch("codex_master.server.mcp_command_tools_list_self_test")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.check_mcp_registration")
+    @patch("the_hive.server.codex_related_process_summary")
+    @patch("the_hive.server.codex_home_context")
+    @patch("the_hive.server.master_app_bridge_status")
+    @patch("the_hive.server.plugin_cache_status")
+    @patch("the_hive.server.codex_client_mcp_config_status")
+    @patch("the_hive.server.mcp_command_tools_list_self_test")
+    @patch("the_hive.server.mcp_command_startup_self_test")
+    @patch("the_hive.server.check_mcp_registration")
     def test_master_namespace_status_fails_when_client_config_is_stale(
         self,
         mock_registration,
@@ -16923,10 +16923,10 @@ google_accounts:
         }
 
         with patch(
-            "codex_master.server._runtime_mcp_entrypoint",
+            "the_hive.server._runtime_mcp_entrypoint",
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
-            "codex_master.server._read_bound_mcp_health",
+            "the_hive.server._read_bound_mcp_health",
             return_value=server_module._BoundMcpHealth(
                 canonical_cli_available=True,
                 client_binding_available=True,
@@ -16945,14 +16945,14 @@ google_accounts:
         self.assertEqual(result["client_config"]["reason"], "mcp_command_mismatch")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.codex_related_process_summary")
-    @patch("codex_master.server.codex_home_context")
-    @patch("codex_master.server.master_app_bridge_status")
-    @patch("codex_master.server.plugin_cache_status")
-    @patch("codex_master.server.codex_client_mcp_config_status")
-    @patch("codex_master.server.mcp_command_tools_list_self_test")
-    @patch("codex_master.server.mcp_command_startup_self_test")
-    @patch("codex_master.server.check_mcp_registration")
+    @patch("the_hive.server.codex_related_process_summary")
+    @patch("the_hive.server.codex_home_context")
+    @patch("the_hive.server.master_app_bridge_status")
+    @patch("the_hive.server.plugin_cache_status")
+    @patch("the_hive.server.codex_client_mcp_config_status")
+    @patch("the_hive.server.mcp_command_tools_list_self_test")
+    @patch("the_hive.server.mcp_command_startup_self_test")
+    @patch("the_hive.server.check_mcp_registration")
     def test_master_namespace_status_fails_inside_managed_agent_home(
         self,
         mock_registration,
@@ -16992,10 +16992,10 @@ google_accounts:
         }
 
         with patch(
-            "codex_master.server._runtime_mcp_entrypoint",
+            "the_hive.server._runtime_mcp_entrypoint",
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
-            "codex_master.server._read_bound_mcp_health",
+            "the_hive.server._read_bound_mcp_health",
             return_value=server_module._BoundMcpHealth(
                 canonical_cli_available=True,
                 client_binding_available=True,
@@ -17014,9 +17014,9 @@ google_accounts:
         self.assertEqual(result["codex_home_context"]["home_kind"], "managed_agent_home")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.plugin_manifest_version")
-    @patch("codex_master.server.shutil.which", return_value="/usr/bin/gh")
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.plugin_manifest_version")
+    @patch("the_hive.server.shutil.which", return_value="/usr/bin/gh")
+    @patch("the_hive.server.run_command")
     def test_master_release_status_detects_release_drift_without_paths(
         self,
         mock_run_command,
@@ -17077,7 +17077,7 @@ google_accounts:
         self.assertEqual(plugin_base_version, project_version)
         self.assertGreater(tuple(int(part) for part in project_version.split(".")), (0, 9, 57))
 
-    @patch("codex_master.server.codex_client_mcp_config_status")
+    @patch("the_hive.server.codex_client_mcp_config_status")
     def test_master_timeout_policy_reports_unbounded_claim_wait_without_paths(self, mock_client_config) -> None:
         mock_client_config.return_value = {
             "ok": True,
@@ -17089,10 +17089,10 @@ google_accounts:
         }
 
         with patch(
-            "codex_master.server._runtime_mcp_entrypoint",
+            "the_hive.server._runtime_mcp_entrypoint",
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
-            "codex_master.server._read_bound_mcp_health",
+            "the_hive.server._read_bound_mcp_health",
             return_value=server_module._BoundMcpHealth(
                 canonical_cli_available=True,
                 client_binding_available=True,
@@ -17159,7 +17159,7 @@ google_accounts:
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server._run_bounded_command")
+    @patch("the_hive.server._run_bounded_command")
     def test_run_command_returns_bounded_timeout_result(self, mock_run) -> None:
         mock_run.side_effect = subprocess.TimeoutExpired(["git", "status"], DEFAULT_COMMAND_TIMEOUT_SECONDS)
 
@@ -17210,14 +17210,14 @@ google_accounts:
         self.assertEqual(result.returncode, server_module.COMMAND_OUTPUT_LIMIT_RETURN_CODE)
         self.assertEqual(result.stdout, "")
 
-    @patch("codex_master.server._run_bounded_command", side_effect=FileNotFoundError("git missing"))
+    @patch("the_hive.server._run_bounded_command", side_effect=FileNotFoundError("git missing"))
     def test_run_command_returns_unavailable_result(self, _mock_run) -> None:
         result = run_command(["git", "status"])
 
         self.assertEqual(result.returncode, COMMAND_UNAVAILABLE_RETURN_CODE)
         self.assertIn("git missing", result.stderr)
 
-    @patch("codex_master.server._run_bounded_command")
+    @patch("the_hive.server._run_bounded_command")
     def test_run_tmux_returns_bounded_timeout_result(self, mock_run) -> None:
         mock_run.side_effect = subprocess.TimeoutExpired(
             ["tmux", "capture-pane"], DEFAULT_TMUX_TIMEOUT_SECONDS, output="partial"
@@ -17230,7 +17230,7 @@ google_accounts:
         self.assertIn("timed out", result.stderr)
         self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_TMUX_TIMEOUT_SECONDS)
 
-    @patch("codex_master.server._run_bounded_command", side_effect=FileNotFoundError("tmux missing"))
+    @patch("the_hive.server._run_bounded_command", side_effect=FileNotFoundError("tmux missing"))
     def test_run_tmux_returns_unavailable_result(self, _mock_run) -> None:
         result = run_tmux(["has-session"], check=False)
 
@@ -17247,7 +17247,7 @@ google_accounts:
     def test_raw_log_metadata_fails_closed_on_future_mtime(self) -> None:
         fake_stat = Mock(st_mode=stat.S_IFREG, st_size=12, st_mtime=1060.0)
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(Path, "lstat", return_value=fake_stat), patch(
-            "codex_master.server.time.time", return_value=1000.0
+            "the_hive.server.time.time", return_value=1000.0
         ):
             result = raw_log_metadata(Path(tmpdir) / "agent.log")
 
@@ -17267,8 +17267,8 @@ google_accounts:
             os.utime(older, (1000, 1000))
             os.utime(newer, (1001, 1001))
 
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", root / "legacy"
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", root / "legacy"
             ):
                 result = latest_managed_raw_log("a")
                 self.assertEqual(result, newer)
@@ -17288,15 +17288,15 @@ google_accounts:
             os.utime(valid, (1000, 1000))
             os.utime(unrelated, (2000, 2000))
 
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", root / "legacy"
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", root / "legacy"
             ):
                 result = latest_managed_raw_log("a")
 
         self.assertEqual(result, valid)
 
     def test_agent_status_recovers_stale_raw_log_metadata_for_running_agent(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -17318,20 +17318,20 @@ google_accounts:
                 "external_processes_truncated": False,
                 "raw_output": "not_returned",
             }
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.ensure_state"
-            ), patch("codex_master.server.agent_home_process_summary", return_value=summary), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.pane_pid", return_value=123), patch(
-                "codex_master.server.pane_tail", return_value=""
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.ensure_state"
+            ), patch("the_hive.server.agent_home_process_summary", return_value=summary), patch(
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.pane_pid", return_value=123), patch(
+                "the_hive.server.pane_tail", return_value=""
             ), patch(
-                "codex_master.server.read_meta", return_value={"raw_log": "/tmp/managed-a.log"}
-            ), patch("codex_master.server.latest_assignment_summary", return_value=None), patch(
-                "codex_master.server.agent_auth_status", return_value={}
-            ), patch("codex_master.server.agent_lease_status", return_value={}), patch(
-                "codex_master.server.codex_usage_watchdog_status", return_value={}
+                "the_hive.server.read_meta", return_value={"raw_log": "/tmp/managed-a.log"}
+            ), patch("the_hive.server.latest_assignment_summary", return_value=None), patch(
+                "the_hive.server.agent_auth_status", return_value={}
+            ), patch("the_hive.server.agent_lease_status", return_value={}), patch(
+                "the_hive.server.codex_usage_watchdog_status", return_value={}
             ):
                 status = server_module.status_agent("a")
 
@@ -17339,7 +17339,7 @@ google_accounts:
         self.assertTrue(status["raw_log_path_valid"])
 
     def test_agent_status_recovers_missing_raw_log_metadata_for_running_agent(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -17361,26 +17361,26 @@ google_accounts:
                 "external_processes_truncated": False,
                 "raw_output": "not_returned",
             }
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.ensure_state"
-            ), patch("codex_master.server.agent_home_process_summary", return_value=summary), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.pane_pid", return_value=123), patch(
-                "codex_master.server.pane_tail", return_value=""
-            ), patch("codex_master.server.read_meta", return_value={}), patch(
-                "codex_master.server.latest_assignment_summary", return_value=None
-            ), patch("codex_master.server.agent_auth_status", return_value={}), patch(
-                "codex_master.server.agent_lease_status", return_value={}
-            ), patch("codex_master.server.codex_usage_watchdog_status", return_value={}):
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.ensure_state"
+            ), patch("the_hive.server.agent_home_process_summary", return_value=summary), patch(
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.pane_pid", return_value=123), patch(
+                "the_hive.server.pane_tail", return_value=""
+            ), patch("the_hive.server.read_meta", return_value={}), patch(
+                "the_hive.server.latest_assignment_summary", return_value=None
+            ), patch("the_hive.server.agent_auth_status", return_value={}), patch(
+                "the_hive.server.agent_lease_status", return_value={}
+            ), patch("the_hive.server.codex_usage_watchdog_status", return_value={}):
                 status = server_module.status_agent("a")
 
         self.assertEqual(status["raw_log_bytes"], len("current\n"))
         self.assertTrue(status["raw_log_path_valid"])
 
     def test_agent_status_fails_closed_after_raw_log_parent_swap(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -17417,21 +17417,21 @@ google_accounts:
                     swapped = True
                 return identity
 
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.ensure_state"
-            ), patch("codex_master.server.agent_home_process_summary", return_value=summary), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.pane_pid", return_value=123), patch(
-                "codex_master.server.pane_tail", return_value=""
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.ensure_state"
+            ), patch("the_hive.server.agent_home_process_summary", return_value=summary), patch(
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.pane_pid", return_value=123), patch(
+                "the_hive.server.pane_tail", return_value=""
             ), patch(
-                "codex_master.server.read_meta", return_value={"raw_log": str(log_path)}
-            ), patch("codex_master.server.allowed_agent_raw_log_identity", side_effect=swap_after_validation), patch(
-                "codex_master.server.latest_assignment_summary", return_value=None
-            ), patch("codex_master.server.agent_auth_status", return_value={}), patch(
-                "codex_master.server.agent_lease_status", return_value={}
-            ), patch("codex_master.server.codex_usage_watchdog_status", return_value={}
+                "the_hive.server.read_meta", return_value={"raw_log": str(log_path)}
+            ), patch("the_hive.server.allowed_agent_raw_log_identity", side_effect=swap_after_validation), patch(
+                "the_hive.server.latest_assignment_summary", return_value=None
+            ), patch("the_hive.server.agent_auth_status", return_value={}), patch(
+                "the_hive.server.agent_lease_status", return_value={}
+            ), patch("the_hive.server.codex_usage_watchdog_status", return_value={}
             ):
                 status = server_module.status_agent("a")
 
@@ -17440,7 +17440,7 @@ google_accounts:
         self.assertIsNone(status["raw_log_updated_at_utc"])
 
     def test_agent_status_rejects_raw_log_metadata_for_other_agent(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -17462,26 +17462,26 @@ google_accounts:
                 "external_processes_truncated": False,
                 "raw_output": "not_returned",
             }
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.ensure_state"
-            ), patch("codex_master.server.agent_home_process_summary", return_value=summary), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.pane_pid", return_value=123), patch(
-                "codex_master.server.pane_tail", return_value=""
-            ), patch("codex_master.server.read_meta", return_value={"raw_log": str(foreign)}), patch(
-                "codex_master.server.latest_assignment_summary", return_value=None
-            ), patch("codex_master.server.agent_auth_status", return_value={}), patch(
-                "codex_master.server.agent_lease_status", return_value={}
-            ), patch("codex_master.server.codex_usage_watchdog_status", return_value={}):
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.ensure_state"
+            ), patch("the_hive.server.agent_home_process_summary", return_value=summary), patch(
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.pane_pid", return_value=123), patch(
+                "the_hive.server.pane_tail", return_value=""
+            ), patch("the_hive.server.read_meta", return_value={"raw_log": str(foreign)}), patch(
+                "the_hive.server.latest_assignment_summary", return_value=None
+            ), patch("the_hive.server.agent_auth_status", return_value={}), patch(
+                "the_hive.server.agent_lease_status", return_value={}
+            ), patch("the_hive.server.codex_usage_watchdog_status", return_value={}):
                 status = server_module.status_agent("a")
 
         self.assertIsNone(status["raw_log_bytes"])
         self.assertFalse(status["raw_log_path_valid"])
 
     def test_agent_status_does_not_recover_legacy_log_from_foreign_raw_log_metadata(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -17511,26 +17511,26 @@ google_accounts:
                 "external_processes_truncated": False,
                 "raw_output": "not_returned",
             }
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.ensure_state"
-            ), patch("codex_master.server.agent_home_process_summary", return_value=summary), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.pane_pid", return_value=123), patch(
-                "codex_master.server.pane_tail", return_value=""
-            ), patch("codex_master.server.read_meta", return_value={"raw_log": str(foreign)}), patch(
-                "codex_master.server.latest_assignment_summary", return_value=None
-            ), patch("codex_master.server.agent_auth_status", return_value={}), patch(
-                "codex_master.server.agent_lease_status", return_value={}
-            ), patch("codex_master.server.codex_usage_watchdog_status", return_value={}):
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.ensure_state"
+            ), patch("the_hive.server.agent_home_process_summary", return_value=summary), patch(
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.pane_pid", return_value=123), patch(
+                "the_hive.server.pane_tail", return_value=""
+            ), patch("the_hive.server.read_meta", return_value={"raw_log": str(foreign)}), patch(
+                "the_hive.server.latest_assignment_summary", return_value=None
+            ), patch("the_hive.server.agent_auth_status", return_value={}), patch(
+                "the_hive.server.agent_lease_status", return_value={}
+            ), patch("the_hive.server.codex_usage_watchdog_status", return_value={}):
                 status = server_module.status_agent("a")
 
         self.assertEqual(status["raw_log_bytes"], len("current\n"))
         self.assertTrue(status["raw_log_path_valid"])
 
     def test_prune_raw_logs_recovers_from_nonregular_raw_log_metadata(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -17545,12 +17545,12 @@ google_accounts:
             os.utime(active, (1000, 1000))
             os.utime(newer, (1001, 1001))
             agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=True), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.META_DIR", root / "meta"
-            ), patch("codex_master.server.read_meta", return_value={"raw_log": str(invalid)}), patch(
-                "codex_master.server.managed_applet_inventory",
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=True), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.META_DIR", root / "meta"
+            ), patch("the_hive.server.read_meta", return_value={"raw_log": str(invalid)}), patch(
+                "the_hive.server.managed_applet_inventory",
                 return_value={"running_agents": ["a"], "visible_running_agents": ["a"], "overflow": 0},
             ):
                 server_module.prune_raw_logs(max_files=1)
@@ -17561,7 +17561,7 @@ google_accounts:
         self.assertTrue(newer_exists)
 
     def test_prune_raw_logs_preserves_recoverable_live_agent_log(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -17575,12 +17575,12 @@ google_accounts:
             os.utime(newer, (1001, 1001))
             agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
 
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=True), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.META_DIR", root / "meta"
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=True), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.META_DIR", root / "meta"
             ), patch(
-                "codex_master.server.managed_applet_inventory",
+                "the_hive.server.managed_applet_inventory",
                 return_value={"running_agents": ["a"], "visible_running_agents": ["a"], "overflow": 0},
             ):
                 result = server_module.prune_raw_logs(max_files=1)
@@ -17701,40 +17701,40 @@ google_accounts:
         )
 
     def test_serve_mcp_maps_parse_and_invalid_request_errors(self) -> None:
-        with patch("codex_master.server.ensure_state"), patch(
-            "codex_master.server.read_message",
+        with patch("the_hive.server.ensure_state"), patch(
+            "the_hive.server.read_message",
             side_effect=[json.JSONDecodeError("bad", "", 0), None],
-        ), patch("codex_master.server.write_message") as mock_write:
+        ), patch("the_hive.server.write_message") as mock_write:
             self.assertEqual(serve_mcp(), 0)
 
         self.assertEqual(mock_write.call_args_list[0].args[0]["error"]["code"], -32700)
-        with patch("codex_master.server.ensure_state"), patch(
-            "codex_master.server.read_message",
+        with patch("the_hive.server.ensure_state"), patch(
+            "the_hive.server.read_message",
             side_effect=[AgentError("RPC message must be an object"), None],
-        ), patch("codex_master.server.write_message") as mock_write:
+        ), patch("the_hive.server.write_message") as mock_write:
             self.assertEqual(serve_mcp(), 0)
 
         self.assertEqual(mock_write.call_args_list[0].args[0]["error"], {"code": -32600, "message": "Invalid Request"})
 
     def test_serve_mcp_restores_startup_inventory_after_disconnect(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         startup_inventory = server_module.current_agent_inventory()
         with server_module.temporary_agent_inventory(None), patch(
-            "codex_master.server.ensure_state"
-        ), patch("codex_master.server._fleet_initialize_recovery_startup_state"), patch(
-            "codex_master.server._publish_startup_fleet_inventory",
+            "the_hive.server.ensure_state"
+        ), patch("the_hive.server._fleet_initialize_recovery_startup_state"), patch(
+            "the_hive.server._publish_startup_fleet_inventory",
             side_effect=lambda: server_module.publish_agent_inventory(startup_inventory),
-        ), patch("codex_master.server.read_message", return_value=None):
+        ), patch("the_hive.server.read_message", return_value=None):
             self.assertEqual(server_module.serve_mcp(), 0)
             self.assertFalse(server_module.published_agent_inventory()[1])
 
     def test_changed_legacy_agent_configuration_ignores_stale_published_inventory(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         published = server_module.current_agent_inventory()
         with server_module.temporary_agent_inventory(published), patch.dict(
-            "codex_master.server.AGENTS",
+            "the_hive.server.AGENTS",
             {"legacy": {"label": "Legacy", "home": Path("/tmp/legacy-home"), "runner": Path("/tmp/codex")}},
             clear=True,
         ):
@@ -17745,7 +17745,7 @@ google_accounts:
         self.assertFalse(is_published)
 
     def test_readonly_fleet_service_cannot_quarantine_or_write(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as temporary:
             state_root = Path(temporary)
@@ -17763,7 +17763,7 @@ google_accounts:
                 self.assertFalse((fleet_root / "limits.recovery.json").exists())
 
     def test_private_optional_bytes_reads_complete_bounded_artifact(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -17876,7 +17876,7 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -17899,7 +17899,7 @@ google_accounts:
             )
             home.symlink_to(outside, target_is_directory=True)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -17916,7 +17916,7 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -18135,7 +18135,7 @@ google_accounts:
             agents={"q1": SimpleNamespace(series_prefix="q", skill_profile="teamleiterin")},
             agent_ids=("q1",),
         )
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory):
+        with patch("the_hive.server.current_agent_inventory", return_value=inventory):
             target_class, authority_class = server_module._resolver_target_selection_inputs(
                 "q1",
                 None,
@@ -18180,10 +18180,10 @@ google_accounts:
             "params": {"name": "agent_status", "arguments": {"agent": "a"}},
         }
         with patch(
-            "codex_master.server.require_teamleader_tool_access",
+            "the_hive.server.require_teamleader_tool_access",
             return_value=status,
         ), patch(
-            "codex_master.server.call_tool",
+            "the_hive.server.call_tool",
             return_value={"ok": True},
         ) as mock_call:
             response = handle_rpc(message, enforce_master_role=True)
@@ -18202,23 +18202,23 @@ google_accounts:
         def run_multi(selected: list[str], fn: Any, **_kwargs: Any) -> dict[str, Any]:
             return {agent: fn(agent) for agent in selected}
 
-        with patch("codex_master.server.agent_ids", return_value=["a1"]), patch(
-            "codex_master.server.require_broad_mutation_confirmation",
+        with patch("the_hive.server.agent_ids", return_value=["a1"]), patch(
+            "the_hive.server.require_broad_mutation_confirmation",
             return_value={"allowed": True},
         ), patch(
-            "codex_master.server.multi_agent_result",
+            "the_hive.server.multi_agent_result",
             side_effect=run_multi,
         ), patch(
-            "codex_master.server.call_agent_lifecycle",
+            "the_hive.server.call_agent_lifecycle",
             side_effect=run_lifecycle,
         ), patch(
-            "codex_master.server._start_agent_with_lease_unlocked",
+            "the_hive.server._start_agent_with_lease_unlocked",
             return_value={"status": "started"},
         ) as mock_start, patch(
-            "codex_master.server._headless_descriptor",
+            "the_hive.server._headless_descriptor",
             return_value=None,
         ), patch(
-            "codex_master.server._assign_agent_unlocked",
+            "the_hive.server._assign_agent_unlocked",
             return_value={"status": "assigned"},
         ) as mock_assign:
             call_tool(
@@ -18266,21 +18266,21 @@ google_accounts:
             "state": "authenticated",
             "raw_output": "not_returned",
         }
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server._headless_descriptor",
+        with patch("the_hive.server.require_fleet_recovery_ready"), patch(
+            "the_hive.server._headless_descriptor",
             return_value=None,
         ), patch(
-            "codex_master.server._ollama_descriptor",
+            "the_hive.server._ollama_descriptor",
             return_value=None,
         ), patch(
-            "codex_master.server.require_authenticated_agent_for_mutation",
+            "the_hive.server.require_authenticated_agent_for_mutation",
             return_value=auth_gate,
         ), patch(
-            "codex_master.server.ensure_agent_not_blocked_by_codex_usage",
+            "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
         ), patch(
-            "codex_master.server.require_ollama_admission",
+            "the_hive.server.require_ollama_admission",
         ), patch(
-            "codex_master.server.resolve_runtime_agent_selection",
+            "the_hive.server.resolve_runtime_agent_selection",
             side_effect=AgentError("resolver sentinel"),
         ) as resolver:
             with self.assertRaisesRegex(AgentError, "resolver sentinel"):
@@ -18332,24 +18332,24 @@ google_accounts:
         lease = {"state": "held", "holder": "test", "held_by_this_server": True}
         evidence = UsageEvidenceV2((), "unavailable", None, None)
         with (
-            patch("codex_master.server.require_fleet_recovery_ready"),
-            patch("codex_master.server._headless_descriptor", return_value=None),
-            patch("codex_master.server._ollama_descriptor", return_value=None),
+            patch("the_hive.server.require_fleet_recovery_ready"),
+            patch("the_hive.server._headless_descriptor", return_value=None),
+            patch("the_hive.server._ollama_descriptor", return_value=None),
             patch(
-                "codex_master.server.require_authenticated_agent_for_mutation",
+                "the_hive.server.require_authenticated_agent_for_mutation",
                 return_value=auth_gate,
             ),
             patch(
-                "codex_master.server.read_usage_evidence_v2", return_value=evidence
+                "the_hive.server.read_usage_evidence_v2", return_value=evidence
             ) as read_evidence,
-            patch("codex_master.server.derive_limit_decisions") as tracker,
+            patch("the_hive.server.derive_limit_decisions") as tracker,
             patch(
-                "codex_master.server.claim_agent",
+                "the_hive.server.claim_agent",
                 return_value={"status": "existing", "lease": lease},
             ),
-            patch("codex_master.server.tmux_alive", return_value=False),
+            patch("the_hive.server.tmux_alive", return_value=False),
             patch(
-                "codex_master.server.start_agent", return_value={"status": "started"}
+                "the_hive.server.start_agent", return_value={"status": "started"}
             ) as start,
         ):
             result = server_module._start_agent_with_lease_unlocked(
@@ -18403,23 +18403,23 @@ google_accounts:
             now,
         )
         with (
-            patch("codex_master.server.require_fleet_recovery_ready"),
-            patch("codex_master.server._headless_descriptor", return_value=None),
-            patch("codex_master.server._ollama_descriptor", return_value=None),
+            patch("the_hive.server.require_fleet_recovery_ready"),
+            patch("the_hive.server._headless_descriptor", return_value=None),
+            patch("the_hive.server._ollama_descriptor", return_value=None),
             patch(
-                "codex_master.server.require_authenticated_agent_for_mutation",
+                "the_hive.server.require_authenticated_agent_for_mutation",
                 return_value=auth_gate,
             ),
-            patch("codex_master.server.require_ollama_admission"),
+            patch("the_hive.server.require_ollama_admission"),
             patch(
-                "codex_master.server.read_usage_evidence_v2", return_value=evidence
+                "the_hive.server.read_usage_evidence_v2", return_value=evidence
             ) as read_evidence,
             patch(
-                "codex_master.server.derive_limit_decisions", return_value=()
+                "the_hive.server.derive_limit_decisions", return_value=()
             ) as tracker,
-            patch("codex_master.server.scope_check", return_value={"allowed": True}),
+            patch("the_hive.server.scope_check", return_value={"allowed": True}),
             patch(
-                "codex_master.server.current_agent_inventory",
+                "the_hive.server.current_agent_inventory",
                 return_value=SimpleNamespace(
                     agents={
                         "a1": SimpleNamespace(
@@ -18431,15 +18431,15 @@ google_accounts:
                 ),
             ),
             patch(
-                "codex_master.server.claim_for_agent_mutation",
+                "the_hive.server.claim_for_agent_mutation",
                 return_value=(lease, False),
             ),
             patch(
-                "codex_master.server.ensure_assignment_session_model",
+                "the_hive.server.ensure_assignment_session_model",
                 return_value={"status": "unchanged"},
             ),
-            patch("codex_master.server.send_agent", return_value={"status": "sent"}),
-            patch("codex_master.server.record_assignment") as record,
+            patch("the_hive.server.send_agent", return_value={"status": "sent"}),
+            patch("the_hive.server.record_assignment") as record,
         ):
             result = server_module._assign_agent_unlocked(
                 "a1",
@@ -18486,23 +18486,23 @@ google_accounts:
             "state": "authenticated",
             "raw_output": "not_returned",
         }
-        with patch("codex_master.server.canonical_agent_id", return_value="q1"), patch(
-            "codex_master.server.require_fleet_recovery_ready"
+        with patch("the_hive.server.canonical_agent_id", return_value="q1"), patch(
+            "the_hive.server.require_fleet_recovery_ready"
         ), patch(
-            "codex_master.server._headless_descriptor", return_value=None
+            "the_hive.server._headless_descriptor", return_value=None
         ), patch(
-            "codex_master.server._ollama_descriptor", return_value=None
+            "the_hive.server._ollama_descriptor", return_value=None
         ), patch(
-            "codex_master.server.require_authenticated_agent_for_mutation", return_value=auth_gate
+            "the_hive.server.require_authenticated_agent_for_mutation", return_value=auth_gate
         ), patch(
-            "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
+            "the_hive.server.ensure_agent_not_blocked_by_codex_usage"
         ), patch(
-            "codex_master.server.require_ollama_admission"
+            "the_hive.server.require_ollama_admission"
         ), patch(
-            "codex_master.server.resolve_runtime_agent_selection",
+            "the_hive.server.resolve_runtime_agent_selection",
             side_effect=AgentError("required_model_unavailable:gpt-5.6-terra"),
-        ), patch("codex_master.server.start_agent") as mock_start, patch(
-            "codex_master.server.send_agent"
+        ), patch("the_hive.server.start_agent") as mock_start, patch(
+            "the_hive.server.send_agent"
         ) as mock_send:
             with self.assertRaisesRegex(AgentError, "required_model_unavailable:gpt-5.6-terra"):
                 server_module._start_agent_with_lease_unlocked(
@@ -18522,32 +18522,32 @@ google_accounts:
             agents={"q1": SimpleNamespace(series_prefix="q", skill_profile="teamleiterin")},
             agent_ids=("q1",),
         )
-        with patch("codex_master.server.canonical_agent_id", return_value="q1"), patch(
-            "codex_master.server.current_agent_inventory", return_value=inventory
-        ), patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server._headless_descriptor", return_value=None
+        with patch("the_hive.server.canonical_agent_id", return_value="q1"), patch(
+            "the_hive.server.current_agent_inventory", return_value=inventory
+        ), patch("the_hive.server.require_fleet_recovery_ready"), patch(
+            "the_hive.server._headless_descriptor", return_value=None
         ), patch(
-            "codex_master.server._ollama_descriptor", return_value=None
+            "the_hive.server._ollama_descriptor", return_value=None
         ), patch(
-            "codex_master.server.require_authenticated_agent_for_mutation",
+            "the_hive.server.require_authenticated_agent_for_mutation",
             return_value={"authenticated": True},
         ), patch(
-            "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
+            "the_hive.server.ensure_agent_not_blocked_by_codex_usage"
         ), patch(
-            "codex_master.server.require_ollama_admission"
+            "the_hive.server.require_ollama_admission"
         ), patch(
-            "codex_master.server.claim_agent",
+            "the_hive.server.claim_agent",
             return_value={"status": "claimed", "lease": {"state": "held"}},
         ), patch(
-            "codex_master.server.agent_config",
+            "the_hive.server.agent_config",
             return_value={"session": "q1-tmux"},
         ), patch(
-            "codex_master.server.tmux_alive", return_value=False
+            "the_hive.server.tmux_alive", return_value=False
         ), patch(
-            "codex_master.server.start_agent",
+            "the_hive.server.start_agent",
             return_value={"status": "started"},
         ) as mock_start, patch(
-            "codex_master.server.agent_lease_status",
+            "the_hive.server.agent_lease_status",
             return_value={"held_by_this_server": False},
         ):
             with self.assertRaisesRegex(AgentError, "^dynamic_teamlead_legacy_target_forbidden$"):
@@ -18586,29 +18586,29 @@ google_accounts:
             }
             with (
                 patch(
-                    "codex_master.server.current_agent_inventory",
+                    "the_hive.server.current_agent_inventory",
                     return_value=inventory,
                 ),
-                patch("codex_master.server.require_fleet_recovery_ready"),
-                patch("codex_master.server._ollama_descriptor", return_value=None),
+                patch("the_hive.server.require_fleet_recovery_ready"),
+                patch("the_hive.server._ollama_descriptor", return_value=None),
                 patch(
-                    "codex_master.server.require_authenticated_agent_for_mutation",
+                    "the_hive.server.require_authenticated_agent_for_mutation",
                     return_value={"authenticated": True},
                 ),
-                patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+                patch("the_hive.server.ensure_agent_not_blocked_by_codex_usage"),
                 patch(
-                    "codex_master.server.require_ollama_admission",
+                    "the_hive.server.require_ollama_admission",
                     return_value={"allowed": True},
                 ),
                 patch(
-                    "codex_master.server.ensure_assignment_session_model",
+                    "the_hive.server.ensure_assignment_session_model",
                     return_value={"status": "unchanged"},
                 ),
                 patch(
-                    "codex_master.server.send_agent",
+                    "the_hive.server.send_agent",
                     return_value={"agent": descriptor.agent_id, "status": "sent"},
                 ),
-                patch("codex_master.server.record_assignment"),
+                patch("the_hive.server.record_assignment"),
             ):
                 return server_module._assign_agent_unlocked(
                     descriptor.agent_id,
@@ -18795,26 +18795,26 @@ google_accounts:
         }
         with (
             patch(
-                "codex_master.server.agent_auth_status",
+                "the_hive.server.agent_auth_status",
                 return_value={"authenticated": False, "auth_state": "missing"},
             ),
             patch(
-                "codex_master.server.read_usage_evidence_v2",
+                "the_hive.server.read_usage_evidence_v2",
                 return_value=UsageEvidenceV2((), "unavailable", None, None),
             ) as read_evidence,
             patch(
-                "codex_master.server.claim_for_agent_mutation",
+                "the_hive.server.claim_for_agent_mutation",
                 return_value=(lease, True),
             ),
             patch(
-                "codex_master.server.ensure_assignment_session_model",
+                "the_hive.server.ensure_assignment_session_model",
                 return_value={"status": "unchanged", "raw_output": "not_returned"},
             ),
             patch(
-                "codex_master.server.send_agent",
+                "the_hive.server.send_agent",
                 return_value={"status": "sent", "raw_output": "not_returned"},
             ),
-            patch("codex_master.server.record_assignment") as record,
+            patch("the_hive.server.record_assignment") as record,
         ):
             result = assign_agent(
                 "a",
@@ -18955,11 +18955,11 @@ google_accounts:
         self.assertIn('stabilen Namen "Seraphina"', prompt)
         self.assertIn("[WORK_BEE_TASK]", prompt)
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.write_meta")
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.write_meta")
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.run_tmux")
     def test_start_and_assignment_prompt_use_same_introduction_helper(
         self,
         mock_run_tmux,
@@ -18977,13 +18977,13 @@ google_accounts:
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.META_DIR", tmp_path / "meta"
-            ), patch("codex_master.server.now_id", return_value="fixed"), patch(
-                "codex_master.server.agent_home_process_summary",
+            ), patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.META_DIR", tmp_path / "meta"
+            ), patch("the_hive.server.now_id", return_value="fixed"), patch(
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 0,
                     "external_process_count": 0,
@@ -18993,15 +18993,15 @@ google_accounts:
                     "raw_output": "not_returned",
                 },
             ), patch(
-                "codex_master.server.require_spawn_capacity",
+                "the_hive.server.require_spawn_capacity",
                 return_value=ADMITTED_SPAWN_DECISION,
             ), patch(
-                "codex_master.server._g5_start_scope",
+                "the_hive.server._g5_start_scope",
                 side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
-            ), patch("codex_master.server._start_g5_warmup"), patch(
-                "codex_master.server.prune_raw_logs"
+            ), patch("the_hive.server._start_g5_warmup"), patch(
+                "the_hive.server.prune_raw_logs"
             ), patch(
-                "codex_master.server.apply_agent_introduction_policy",
+                "the_hive.server.apply_agent_introduction_policy",
                 return_value="SHARED_POLICY",
             ) as introduction_policy:
                 assigned_prompt = assignment_prompt(
@@ -19069,15 +19069,15 @@ google_accounts:
                 return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.ensure_state"), patch(
-                "codex_master.server.tmux_alive", return_value=False
-            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.META_DIR", root / "meta"
+            ), patch("the_hive.server.ensure_state"), patch(
+                "the_hive.server.tmux_alive", return_value=False
+            ), patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.META_DIR", root / "meta"
             ), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 0,
                     "external_process_count": 0,
@@ -19087,16 +19087,16 @@ google_accounts:
                     "raw_output": "not_returned",
                 },
             ), patch(
-                "codex_master.server.require_spawn_capacity",
+                "the_hive.server.require_spawn_capacity",
                 return_value=ADMITTED_SPAWN_DECISION,
             ), patch(
-                "codex_master.server._g5_start_scope", side_effect=fake_scope
-            ), patch("codex_master.server._start_g5_warmup"), patch(
-                "codex_master.server.prune_raw_logs"
+                "the_hive.server._g5_start_scope", side_effect=fake_scope
+            ), patch("the_hive.server._start_g5_warmup"), patch(
+                "the_hive.server.prune_raw_logs"
             ), patch(
-                "codex_master.server.run_tmux",
+                "the_hive.server.run_tmux",
                 side_effect=fake_run_tmux,
-            ) as run_tmux, patch("codex_master.server.write_meta") as write_meta:
+            ) as run_tmux, patch("the_hive.server.write_meta") as write_meta:
                 try:
                     result = start_agent("a", cwd=tmpdir)
                     self.assertEqual(result["status"], "started")
@@ -19160,10 +19160,10 @@ google_accounts:
                 "g5_native_runner": {"device": 1, "inode": 2, "scope_unit": "wrong.scope"},
             }
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}},
                 clear=False,
-            ), patch("codex_master.server.META_DIR", meta_dir):
+            ), patch("the_hive.server.META_DIR", meta_dir):
                 with self.assertRaisesRegex(AgentError, "private tmux routing metadata is invalid"):
                     write_meta("a", data)
 
@@ -19294,25 +19294,25 @@ google_accounts:
                     runner.write_text(wrapper, encoding="utf-8")
                     runner.chmod(0o700)
                     with patch.dict(
-                        "codex_master.server.AGENTS",
+                        "the_hive.server.AGENTS",
                         {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                         clear=False,
-                    ), patch("codex_master.server.ensure_state"), patch(
-                        "codex_master.server.tmux_alive", return_value=False
-                    ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                        "codex_master.server.META_DIR", root / "meta"
+                    ), patch("the_hive.server.ensure_state"), patch(
+                        "the_hive.server.tmux_alive", return_value=False
+                    ), patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                        "the_hive.server.META_DIR", root / "meta"
                     ), patch(
-                        "codex_master.server.agent_home_process_summary", return_value=process_summary
+                        "the_hive.server.agent_home_process_summary", return_value=process_summary
                     ), patch(
-                        "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+                        "the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
                     ), patch(
-                        "codex_master.server._g5_start_scope",
+                        "the_hive.server._g5_start_scope",
                         side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
-                    ), patch("codex_master.server._start_g5_warmup"), patch(
-                        "codex_master.server.prune_raw_logs"
+                    ), patch("the_hive.server._start_g5_warmup"), patch(
+                        "the_hive.server.prune_raw_logs"
                     ), patch(
-                        "codex_master.server.run_tmux", return_value=subprocess.CompletedProcess(["tmux"], 0, "", "")
-                    ), patch("codex_master.server.write_meta"):
+                        "the_hive.server.run_tmux", return_value=subprocess.CompletedProcess(["tmux"], 0, "", "")
+                    ), patch("the_hive.server.write_meta"):
                         with self.assertRaisesRegex(AgentError, f"^{code}$"):
                             start_agent("a", cwd=tmpdir)
                     server_module.close_runner_execution_fd("a")
@@ -19388,25 +19388,25 @@ google_accounts:
 
                     open_patch = patch.object(server_module.os, "open", side_effect=open_with_update)
                     with patch.dict(
-                        "codex_master.server.AGENTS",
+                        "the_hive.server.AGENTS",
                         {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                         clear=False,
-                    ), patch("codex_master.server.ensure_state"), patch(
-                        "codex_master.server.tmux_alive", return_value=False
-                    ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                        "codex_master.server.META_DIR", root / "meta"
+                    ), patch("the_hive.server.ensure_state"), patch(
+                        "the_hive.server.tmux_alive", return_value=False
+                    ), patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                        "the_hive.server.META_DIR", root / "meta"
                     ), patch(
-                        "codex_master.server.agent_home_process_summary", return_value=process_summary
+                        "the_hive.server.agent_home_process_summary", return_value=process_summary
                     ), patch(
-                        "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+                        "the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
                     ), patch(
-                        "codex_master.server._g5_start_scope",
+                        "the_hive.server._g5_start_scope",
                         side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
-                    ), patch("codex_master.server._start_g5_warmup"), patch(
-                        "codex_master.server.prune_raw_logs"
+                    ), patch("the_hive.server._start_g5_warmup"), patch(
+                        "the_hive.server.prune_raw_logs"
                     ), patch(
-                        "codex_master.server.run_tmux", return_value=subprocess.CompletedProcess(["tmux"], 0, "", "")
-                    ), patch("codex_master.server.write_meta"), open_patch:
+                        "the_hive.server.run_tmux", return_value=subprocess.CompletedProcess(["tmux"], 0, "", "")
+                    ), patch("the_hive.server.write_meta"), open_patch:
                         with self.assertRaisesRegex(AgentError, f"^{code}$"):
                             start_agent("a", cwd=tmpdir)
                     server_module.close_runner_execution_fd("a")
@@ -19441,16 +19441,16 @@ google_accounts:
                 return fd
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.ensure_state"), patch(
-                "codex_master.server.tmux_alive", return_value=False
+            ), patch("the_hive.server.ensure_state"), patch(
+                "the_hive.server.tmux_alive", return_value=False
             ), patch(
-                "codex_master.server.agent_home_process_summary", return_value=process_summary
+                "the_hive.server.agent_home_process_summary", return_value=process_summary
             ), patch(
-                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
-            ), patch("codex_master.server.run_tmux") as run_tmux, patch.object(
+                "the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+            ), patch("the_hive.server.run_tmux") as run_tmux, patch.object(
                 server_module.os, "open", side_effect=open_with_wrapper_swap
             ):
                 with self.assertRaisesRegex(AgentError, "^managed_codex_runner_changed$"):
@@ -19498,14 +19498,14 @@ google_accounts:
         )
 
     def test_call_tool_agent_start_threads_explicit_stable_name(self) -> None:
-        with patch("codex_master.server.agent_ids", return_value=["a1"]), patch(
-            "codex_master.server.require_broad_mutation_confirmation",
+        with patch("the_hive.server.agent_ids", return_value=["a1"]), patch(
+            "the_hive.server.require_broad_mutation_confirmation",
             return_value={"required": False},
         ), patch(
-            "codex_master.server.call_agent_lifecycle",
+            "the_hive.server.call_agent_lifecycle",
             side_effect=lambda _agent, fn: fn(),
         ), patch(
-            "codex_master.server._start_agent_with_lease_unlocked",
+            "the_hive.server._start_agent_with_lease_unlocked",
             return_value={"agent": "a1", "status": "started"},
         ) as start:
             call_tool(
@@ -19547,26 +19547,26 @@ google_accounts:
         }
         with (
             patch(
-                "codex_master.server.agent_auth_status",
+                "the_hive.server.agent_auth_status",
                 return_value={"authenticated": False, "auth_state": "missing"},
             ),
-            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch("the_hive.server.ensure_agent_not_blocked_by_codex_usage"),
             patch(
-                "codex_master.server.spawn_admission_decision", return_value=decision
+                "the_hive.server.spawn_admission_decision", return_value=decision
             ) as admission,
             patch(
-                "codex_master.server.claim_for_agent_mutation",
+                "the_hive.server.claim_for_agent_mutation",
                 return_value=(lease, True),
             ),
             patch(
-                "codex_master.server.ensure_assignment_session_model",
+                "the_hive.server.ensure_assignment_session_model",
                 return_value={"status": "unchanged", "raw_output": "not_returned"},
             ),
             patch(
-                "codex_master.server.send_agent",
+                "the_hive.server.send_agent",
                 return_value={"status": "sent", "raw_output": "not_returned"},
             ) as send,
-            patch("codex_master.server.record_assignment") as record,
+            patch("the_hive.server.record_assignment") as record,
         ):
             result = assign_agent(
                 "a",
@@ -19599,12 +19599,12 @@ google_accounts:
 
     def test_unauthenticated_assignment_still_honors_usage_block(self) -> None:
         with patch(
-            "codex_master.server.agent_auth_status",
+            "the_hive.server.agent_auth_status",
             return_value={"authenticated": False, "auth_state": "missing"},
         ), patch(
-            "codex_master.server.ensure_agent_not_blocked_by_codex_usage",
+            "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
             side_effect=AgentError("agent blocked by codex-usage watchdog"),
-        ), patch("codex_master.server.claim_for_agent_mutation") as mock_claim:
+        ), patch("the_hive.server.claim_for_agent_mutation") as mock_claim:
             with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
                 assign_agent(
                     "a",
@@ -19616,23 +19616,23 @@ google_accounts:
 
         mock_claim.assert_not_called()
 
-    @patch("codex_master.server.record_assignment", side_effect=AgentError("record failed"))
-    @patch("codex_master.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
+    @patch("the_hive.server.record_assignment", side_effect=AgentError("record failed"))
+    @patch("the_hive.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
     def test_agent_assign_does_not_invent_lease_when_recording_fails_without_restart(
         self, _mock_send, _mock_record
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
-                "codex_master.server.AGENTS",
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch.dict(
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}},
                 clear=False,
-            ), patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+            ), patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                 with self.assertRaisesRegex(AgentError, "record failed"):
                     assign_agent(
                         "a",
@@ -19647,11 +19647,11 @@ google_accounts:
         self.assertEqual(lease["state"], "unclaimed")
         self.assertFalse(lease["held_by_this_server"])
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.require_managed_tmux_session")
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.require_managed_tmux_session")
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.ensure_state")
     def test_safe_tail_tools_call_limits_and_redacts(
         self, _mock_ensure_state, mock_lease, _mock_identity, mock_pane_tail, _mock_tmux_alive
     ) -> None:
@@ -19687,11 +19687,11 @@ google_accounts:
         self.assertTrue(payload["redaction_applied"])
         self.assertEqual(payload["lease"]["state"], "unclaimed")
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.require_managed_tmux_session")
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.require_managed_tmux_session")
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.ensure_state")
     def test_safe_tail_tools_call_applies_char_limit(
         self, _mock_ensure_state, mock_lease, _mock_identity, mock_pane_tail, _mock_tmux_alive
     ) -> None:
@@ -19719,9 +19719,9 @@ google_accounts:
         self.assertTrue(payload["output"].startswith("... truncated to last characters ..."))
         self.assertNotIn("sk-verylongtoken01234567890", payload["output"])
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.pane_tail", return_value="")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.pane_tail", return_value="")
+    @patch("the_hive.server.ensure_state")
     def test_safe_tail_direct_calls_reject_invalid_limits(
         self, _mock_ensure_state, _mock_pane_tail, _mock_tmux_alive
     ) -> None:
@@ -19735,13 +19735,13 @@ google_accounts:
             safe_tail("a", lines=1, chars=MAX_TAIL_CHARS + 1)
 
     def test_safe_tail_rejects_unmanaged_tmux_session_before_capture(self) -> None:
-        with patch("codex_master.server.ensure_state"), patch(
-            "codex_master.server.ensure_agent_lease_available",
+        with patch("the_hive.server.ensure_state"), patch(
+            "the_hive.server.ensure_agent_lease_available",
             return_value={"state": "unclaimed", "holder": "none", "raw_output": "not_returned"},
-        ), patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.tmux_alive", return_value=True
+        ), patch("the_hive.server.read_meta", return_value={}), patch(
+            "the_hive.server.tmux_alive", return_value=True
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={
                 "process_count": 0,
                 "external_process_count": 0,
@@ -19750,26 +19750,26 @@ google_accounts:
                 "external_processes_truncated": False,
                 "raw_output": "not_returned",
             },
-        ), patch("codex_master.server.pane_tail") as mock_pane_tail:
+        ), patch("the_hive.server.pane_tail") as mock_pane_tail:
             with self.assertRaisesRegex(AgentError, "session identity could not be verified"):
                 safe_tail("a")
 
         mock_pane_tail.assert_not_called()
 
-    @patch("codex_master.server.pane_tail")
+    @patch("the_hive.server.pane_tail")
     def test_safe_tail_blocks_foreign_lease_before_reading_output(self, mock_pane_tail) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
-                    with patch("codex_master.server.ensure_state"), patch(
-                        "codex_master.server.read_meta"
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"):
+                    with patch("the_hive.server.ensure_state"), patch(
+                        "the_hive.server.read_meta"
                     ) as mock_read_meta:
                         response = handle_rpc(
                             {
@@ -19793,8 +19793,8 @@ google_accounts:
         mock_pane_tail.assert_not_called()
         mock_read_meta.assert_not_called()
 
-    @patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn())
-    @patch("codex_master.server.safe_tail", return_value={"agent": "a1", "raw_output": "not_returned"})
+    @patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn())
+    @patch("the_hive.server.safe_tail", return_value={"agent": "a1", "raw_output": "not_returned"})
     def test_safe_tail_tool_serializes_agent_lifecycle(self, mock_safe_tail, mock_lifecycle) -> None:
         response = handle_rpc(
             {
@@ -19810,10 +19810,10 @@ google_accounts:
         self.assertEqual(mock_lifecycle.call_args.args[0], "a1")
         mock_safe_tail.assert_called_once_with("a1", 40, 4000, "pane")
 
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.safe_tail")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.list_assignments")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.safe_tail")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.list_assignments")
     def test_assignment_report_returns_explicit_capped_excerpt_for_known_assignment(
         self, mock_list_assignments, mock_status_agent, mock_safe_tail, mock_pane_tail
     ) -> None:
@@ -19858,10 +19858,10 @@ google_accounts:
         mock_pane_tail.assert_not_called()
         mock_safe_tail.assert_called_once_with("a1", 3, 100, "log")
 
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.safe_tail")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.list_assignments")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.safe_tail")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.list_assignments")
     def test_assignment_report_returns_pending_for_running_working_assignment(
         self, mock_list_assignments, mock_status_agent, mock_safe_tail, mock_pane_tail
     ) -> None:
@@ -19895,10 +19895,10 @@ google_accounts:
         mock_pane_tail.assert_called_once_with("a1", 24, visible_only=True, verify_identity=True)
         mock_safe_tail.assert_not_called()
 
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.safe_tail")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.list_assignments")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.safe_tail")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.list_assignments")
     def test_assignment_report_log_source_reads_fresh_output_for_running_assignment_without_tui_gate(
         self, mock_list_assignments, mock_status_agent, mock_safe_tail, mock_pane_tail
     ) -> None:
@@ -19944,9 +19944,9 @@ google_accounts:
         mock_pane_tail.assert_not_called()
         mock_safe_tail.assert_called_once_with("a1", 3, 100, "log")
 
-    @patch("codex_master.server.safe_tail")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.list_assignments")
+    @patch("the_hive.server.safe_tail")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.list_assignments")
     def test_assignment_report_returns_no_output_for_stale_global_output(
         self, mock_list_assignments, mock_status_agent, mock_safe_tail
     ) -> None:
@@ -19977,10 +19977,10 @@ google_accounts:
         mock_status_agent.assert_called_once_with("a1", initialize_state=False)
         mock_safe_tail.assert_not_called()
 
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.safe_tail")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.list_assignments")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.safe_tail")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.list_assignments")
     def test_assignment_report_remains_pending_for_recent_running_output_without_ready_input(
         self, mock_list_assignments, mock_status_agent, mock_safe_tail, mock_pane_tail
     ) -> None:
@@ -20016,9 +20016,9 @@ google_accounts:
         mock_pane_tail.assert_called_once_with("a1", 24, visible_only=True, verify_identity=True)
         mock_safe_tail.assert_not_called()
 
-    @patch("codex_master.server.safe_tail")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.list_assignments")
+    @patch("the_hive.server.safe_tail")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.list_assignments")
     def test_assignment_report_rejects_future_log_timestamp(
         self, mock_list_assignments, mock_status_agent, mock_safe_tail
     ) -> None:
@@ -20035,16 +20035,16 @@ google_accounts:
             "lease": {"state": "unclaimed"},
         }
 
-        with patch("codex_master.server.time.time", return_value=1000.0):
+        with patch("the_hive.server.time.time", return_value=1000.0):
             result = assignment_report("a", "assign-1-a1", lines=3, chars=100, source="log")
 
         self.assertEqual(result["report_status"], "no_output")
         self.assertEqual(result["output"], "")
         mock_safe_tail.assert_not_called()
 
-    @patch("codex_master.server.safe_tail")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.list_assignments")
+    @patch("the_hive.server.safe_tail")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.list_assignments")
     def test_assignment_report_rejects_assignment_from_previous_session(
         self, mock_list_assignments, mock_status_agent, mock_safe_tail
     ) -> None:
@@ -20062,16 +20062,16 @@ google_accounts:
             "lease": {"state": "unclaimed"},
         }
 
-        with patch("codex_master.server.time.time", return_value=1300.0):
+        with patch("the_hive.server.time.time", return_value=1300.0):
             result = assignment_report("a", "assign-old-a1", lines=3, chars=100, source="log")
 
         self.assertEqual(result["report_status"], "no_output")
         self.assertEqual(result["output"], "")
         mock_safe_tail.assert_not_called()
 
-    @patch("codex_master.server.safe_tail")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.list_assignments")
+    @patch("the_hive.server.safe_tail")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.list_assignments")
     def test_assignment_report_does_not_misattributed_newer_assignment_output(
         self, mock_list_assignments, mock_status_agent, mock_safe_tail
     ) -> None:
@@ -20100,11 +20100,11 @@ google_accounts:
         self.assertEqual(result["output_chars"], 0)
         mock_safe_tail.assert_not_called()
 
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.safe_tail")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.agent_lease_status")
-    @patch("codex_master.server.list_assignments")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.safe_tail")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.agent_lease_status")
+    @patch("the_hive.server.list_assignments")
     def test_wait_timeout_then_report_rehabilitates_spark_health(
         self,
         mock_list_assignments,
@@ -20195,9 +20195,9 @@ google_accounts:
         self.assertEqual(wait_result["status"], "timeout")
         self.assertEqual(report_result["report_status"], "excerpt_available")
 
-    @patch("codex_master.server.safe_tail")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.list_assignments")
+    @patch("the_hive.server.safe_tail")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.list_assignments")
     def test_superseded_report_does_not_rehabilitate_spark_health(
         self, mock_list_assignments, mock_status_agent, mock_safe_tail
     ) -> None:
@@ -20246,7 +20246,7 @@ google_accounts:
 
         self.assertEqual(result["report_status"], "report_blocked_by_superseded_assignment")
 
-    @patch("codex_master.server.list_assignments", return_value={"records": []})
+    @patch("the_hive.server.list_assignments", return_value={"records": []})
     def test_assignment_report_requires_known_assignment(self, _mock_list_assignments) -> None:
         with self.assertRaisesRegex(AgentError, "assignment report not found"):
             assignment_report("a", "unknown-assignment")
@@ -20259,9 +20259,9 @@ google_accounts:
         with self.assertRaisesRegex(AgentError, "source must be 'pane' or 'log'"):
             assignment_report("a", "known-assignment", source="invalid")
 
-    @patch("codex_master.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
+    @patch("the_hive.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
     @patch(
-        "codex_master.server.list_assignments",
+        "the_hive.server.list_assignments",
         return_value={"records": [{"assignment_id": "assign-latest"}]},
     )
     def test_request_agent_report_resolves_latest_assignment_id(
@@ -20273,8 +20273,8 @@ google_accounts:
         self.assertEqual(result["result_tool"], "agent_assignment_report")
         self.assertIn("assign-latest", mock_send_agent.call_args.args[1])
 
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.ensure_state")
     def test_safe_tail_log_source_reads_caps_and_redacts(self, _mock_ensure_state, mock_lease) -> None:
         mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -20283,9 +20283,9 @@ google_accounts:
                 "first\nsecond\n\x1b[32mOPENAI_API_KEY=sk-logtoken1234567890\x1b[0m\n",
                 encoding="utf-8",
             )
-            with patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch(
-                "codex_master.server.read_meta", return_value={"raw_log": str(log_path)}
-            ), patch("codex_master.server.tmux_alive", return_value=False):
+            with patch("the_hive.server.RAW_DIR", Path(tmpdir)), patch(
+                "the_hive.server.read_meta", return_value={"raw_log": str(log_path)}
+            ), patch("the_hive.server.tmux_alive", return_value=False):
                 response = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -20314,8 +20314,8 @@ google_accounts:
         self.assertEqual(payload["raw_log"], "not_returned")
         self.assertNotIn(str(log_path), json.dumps(payload, sort_keys=True))
 
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.ensure_state")
     def test_safe_tail_log_source_recovers_missing_raw_log_metadata_for_running_agent(
         self, _mock_ensure_state, mock_lease
     ) -> None:
@@ -20337,22 +20337,22 @@ google_accounts:
                 "external_processes_truncated": False,
                 "raw_output": "not_returned",
             }
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.read_meta", return_value={}
-            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
-                "codex_master.server.pane_pid", return_value=123
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.read_meta", return_value={}
+            ), patch("the_hive.server.tmux_alive", return_value=True), patch(
+                "the_hive.server.pane_pid", return_value=123
             ), patch(
-                "codex_master.server.agent_home_process_summary", return_value=summary
+                "the_hive.server.agent_home_process_summary", return_value=summary
             ):
                 result = safe_tail("a", source="log")
 
         self.assertEqual(result["output"], "current")
         self.assertEqual(result["raw_log"], "not_returned")
 
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.ensure_state")
     def test_safe_tail_log_recovery_rejects_unmanaged_tmux_session(
         self, _mock_ensure_state, mock_lease
     ) -> None:
@@ -20371,18 +20371,18 @@ google_accounts:
                 "external_processes_truncated": False,
                 "raw_output": "not_returned",
             }
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.read_meta", return_value={}
-            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
-                "codex_master.server.agent_home_process_summary", return_value=foreign
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.read_meta", return_value={}
+            ), patch("the_hive.server.tmux_alive", return_value=True), patch(
+                "the_hive.server.agent_home_process_summary", return_value=foreign
             ):
                 with self.assertRaisesRegex(AgentError, "also used by an external process"):
                     safe_tail("a", source="log")
 
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.ensure_state")
     def test_safe_tail_log_rejects_unmanaged_tmux_with_valid_metadata(
         self, _mock_ensure_state, mock_lease
     ) -> None:
@@ -20402,22 +20402,22 @@ google_accounts:
                 "external_processes_truncated": False,
                 "raw_output": "not_returned",
             }
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.RAW_DIR", raw_dir
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.RAW_DIR", raw_dir
             ), patch(
-                "codex_master.server.read_meta", return_value={"raw_log": str(log_path)}
-            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
-                "codex_master.server.agent_home_process_summary", return_value=foreign
+                "the_hive.server.read_meta", return_value={"raw_log": str(log_path)}
+            ), patch("the_hive.server.tmux_alive", return_value=True), patch(
+                "the_hive.server.agent_home_process_summary", return_value=foreign
             ):
                 with self.assertRaisesRegex(AgentError, "also used by an external process"):
                     safe_tail("a", source="log")
 
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.ensure_state")
     def test_safe_tail_log_fails_closed_after_raw_log_parent_swap(
         self, _mock_ensure_state, mock_lease
     ) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -20442,24 +20442,24 @@ google_accounts:
                     swapped = True
                 return identity
 
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.read_meta", return_value={"raw_log": str(log_path)}
-            ), patch("codex_master.server.tmux_alive", return_value=False), patch(
-                "codex_master.server.allowed_agent_raw_log_identity", side_effect=swap_after_validation
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.read_meta", return_value={"raw_log": str(log_path)}
+            ), patch("the_hive.server.tmux_alive", return_value=False), patch(
+                "the_hive.server.allowed_agent_raw_log_identity", side_effect=swap_after_validation
             ):
                 result = safe_tail("a", source="log")
 
         self.assertTrue(swapped)
         self.assertEqual(result["output"], "")
 
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.ensure_state")
     def test_safe_tail_log_source_rejects_unmanaged_meta_path(self, _mock_ensure_state, mock_lease) -> None:
         mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
-        with patch("codex_master.server.tmux_alive", return_value=False), patch(
-            "codex_master.server.read_meta", return_value={"raw_log": "/etc/passwd"}
+        with patch("the_hive.server.tmux_alive", return_value=False), patch(
+            "the_hive.server.read_meta", return_value={"raw_log": "/etc/passwd"}
         ):
             response = handle_rpc(
                 {
@@ -20478,17 +20478,17 @@ google_accounts:
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertIn("outside managed raw log state", payload["error"])
 
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.ensure_state")
     def test_safe_tail_log_source_ignores_non_regular_log_file(self, _mock_ensure_state, mock_lease) -> None:
         mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir)
             fifo_path = raw_dir / "agent.log"
             os.mkfifo(fifo_path)
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.read_meta", return_value={"raw_log": str(fifo_path)}
-            ), patch("codex_master.server.tmux_alive", return_value=False):
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.read_meta", return_value={"raw_log": str(fifo_path)}
+            ), patch("the_hive.server.tmux_alive", return_value=False):
                 response = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -20628,11 +20628,11 @@ google_accounts:
         self.assertEqual(result["source"], "classified_from_bounded_pane_text")
         self.assertNotIn("0.144.5", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.pane_pid", return_value=None)
-    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.pane_pid", return_value=None)
+    @patch("the_hive.server.tmux_alive", return_value=False)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 0,
             "external_process_count": 0,
@@ -20659,13 +20659,13 @@ google_accounts:
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.read_meta", return_value={"raw_log": str(log_path), "model": DEFAULT_AGENT_MODEL}
+            ), patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.read_meta", return_value={"raw_log": str(log_path), "model": DEFAULT_AGENT_MODEL}
             ), patch(
-                "codex_master.server.latest_assignment_summary",
+                "the_hive.server.latest_assignment_summary",
                 return_value={"assignment_id": "1-a", "role": "arbeitsbiene", "model": WRITE_AGENT_MODEL},
             ):
                 response = handle_rpc(
@@ -20697,13 +20697,13 @@ google_accounts:
         self.assertNotIn(str(log_path), payload_text)
         self.assertNotIn(str(tmp_path), payload_text)
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.latest_assignment_summary", return_value=None)
-    @patch("codex_master.server.pane_tail", return_value="")
-    @patch("codex_master.server.pane_pid", return_value=456)
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.latest_assignment_summary", return_value=None)
+    @patch("the_hive.server.pane_tail", return_value="")
+    @patch("the_hive.server.pane_pid", return_value=456)
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "external_process_count": 0,
@@ -20729,11 +20729,11 @@ google_accounts:
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.read_meta", return_value={"raw_log": str(log_path)}
+            ), patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.read_meta", return_value={"raw_log": str(log_path)}
             ):
                 response = handle_rpc(
                     {
@@ -20760,7 +20760,7 @@ google_accounts:
         self.assertNotIn(str(tmp_path), payload_text)
 
     def test_agent_status_does_not_capture_unmanaged_tmux_session(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -20773,17 +20773,17 @@ google_accounts:
                 "external_processes_truncated": False,
                 "raw_output": "not_returned",
             }
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.ensure_state"
-            ), patch("codex_master.server.agent_home_process_summary", return_value=summary), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.pane_pid", return_value=123) as mock_pane_pid, patch(
-                "codex_master.server.pane_tail"
-            ) as mock_pane_tail, patch("codex_master.server.read_meta", return_value={}), patch(
-                "codex_master.server.latest_assignment_summary", return_value=None
-            ), patch("codex_master.server.agent_auth_status", return_value={}), patch(
-                "codex_master.server.agent_lease_status", return_value={}
-            ), patch("codex_master.server.codex_usage_watchdog_status", return_value={}):
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.ensure_state"
+            ), patch("the_hive.server.agent_home_process_summary", return_value=summary), patch(
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.pane_pid", return_value=123) as mock_pane_pid, patch(
+                "the_hive.server.pane_tail"
+            ) as mock_pane_tail, patch("the_hive.server.read_meta", return_value={}), patch(
+                "the_hive.server.latest_assignment_summary", return_value=None
+            ), patch("the_hive.server.agent_auth_status", return_value={}), patch(
+                "the_hive.server.agent_lease_status", return_value={}
+            ), patch("the_hive.server.codex_usage_watchdog_status", return_value={}):
                 status = server_module.status_agent("a")
 
         self.assertFalse(status["identity_guard"]["ok"])
@@ -20794,13 +20794,13 @@ google_accounts:
         mock_pane_tail.assert_not_called()
         mock_pane_pid.assert_not_called()
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.latest_assignment_summary", return_value=None)
-    @patch("codex_master.server.pane_tail", return_value="Find and fix a bug in @filename\n")
-    @patch("codex_master.server.pane_pid", return_value=456)
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.latest_assignment_summary", return_value=None)
+    @patch("the_hive.server.pane_tail", return_value="Find and fix a bug in @filename\n")
+    @patch("the_hive.server.pane_pid", return_value=456)
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "external_process_count": 0,
@@ -20822,10 +20822,10 @@ google_accounts:
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.read_meta", return_value={}):
+            ), patch("the_hive.server.read_meta", return_value={}):
                 response = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -20849,15 +20849,15 @@ google_accounts:
         self.assertNotIn(str(tmp_path), payload_text)
 
     def test_agent_status_uses_visible_tui_screen_not_scrollback(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
-                "codex_master.server.ensure_state"
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), patch(
+                "the_hive.server.ensure_state"
             ), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 1,
                     "managed_process_count": 1,
@@ -20868,26 +20868,26 @@ google_accounts:
                     "external_processes_truncated": False,
                     "raw_output": "not_returned",
                 },
-            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
-                "codex_master.server.pane_pid", return_value=123
+            ), patch("the_hive.server.tmux_alive", return_value=True), patch(
+                "the_hive.server.pane_pid", return_value=123
             ), patch(
-                "codex_master.server.pane_tail",
+                "the_hive.server.pane_tail",
                 side_effect=[
                     "Update available!\n› 1. Update now\n2. Skip\nPress enter to continue\n› Ready\n",
                     "› Ready\n",
                 ],
-            ), patch("codex_master.server.read_meta", return_value={}), patch(
-                "codex_master.server.latest_assignment_summary", return_value=None
-            ), patch("codex_master.server.agent_auth_status", return_value={}), patch(
-                "codex_master.server.agent_lease_status", return_value={}
-            ), patch("codex_master.server.codex_usage_watchdog_status", return_value={}):
+            ), patch("the_hive.server.read_meta", return_value={}), patch(
+                "the_hive.server.latest_assignment_summary", return_value=None
+            ), patch("the_hive.server.agent_auth_status", return_value={}), patch(
+                "the_hive.server.agent_lease_status", return_value={}
+            ), patch("the_hive.server.codex_usage_watchdog_status", return_value={}):
                 status = server_module.status_agent("a")
 
         self.assertEqual(status["tui_context"]["state"], "unknown")
         self.assertEqual(status["response_state"]["state"], "running_no_output_observed")
 
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_reports_activity_without_output(self, mock_status_agent, mock_sleep) -> None:
         mock_status_agent.side_effect = [
             {
@@ -20917,8 +20917,8 @@ google_accounts:
         self.assertNotIn("output", json.dumps(result["current"], sort_keys=True))
         mock_sleep.assert_called_once()
 
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_does_not_call_idle_transition_activity(self, mock_status_agent, mock_sleep) -> None:
         status = {
             "agent": "a",
@@ -20932,15 +20932,15 @@ google_accounts:
             {**status, "response_state": {"state": "running_idle"}},
         ]
 
-        with patch("codex_master.server.time.monotonic", side_effect=[0.0, 1.0, 2.0, 11.0, 12.0]):
+        with patch("the_hive.server.time.monotonic", side_effect=[0.0, 1.0, 2.0, 11.0, 12.0]):
             result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
 
         self.assertEqual(result["status"], "timeout")
         self.assertEqual(result["poll_count"], 1)
         mock_sleep.assert_called_once()
 
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_returns_blocked_by_limit_immediately(self, mock_status_agent, mock_sleep) -> None:
         mock_status_agent.return_value = {
             "agent": "a",
@@ -20959,8 +20959,8 @@ google_accounts:
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_not_called()
 
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_returns_tui_starter_context_immediately(self, mock_status_agent, mock_sleep) -> None:
         mock_status_agent.return_value = {
             "agent": "a",
@@ -20980,8 +20980,8 @@ google_accounts:
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_not_called()
 
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_waits_past_assigned_tui_starter_context_until_activity(
         self, mock_status_agent, mock_sleep
     ) -> None:
@@ -21015,8 +21015,8 @@ google_accounts:
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_called_once()
 
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_reports_activity_for_fresh_running_output(
         self, mock_status_agent, mock_sleep
     ) -> None:
@@ -21054,7 +21054,7 @@ google_accounts:
             return status_sequence.pop(0)
 
         mock_status_agent.side_effect = next_status
-        with patch("codex_master.server.time.time", return_value=1780826500.0):
+        with patch("the_hive.server.time.time", return_value=1780826500.0):
             result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
 
         self.assertEqual(result["status"], "activity_observed")
@@ -21063,10 +21063,10 @@ google_accounts:
         self.assertEqual(result["poll_count"], 1)
         mock_sleep.assert_called_once()
 
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.agent_lifecycle_lock")
-    @patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True})
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.agent_lifecycle_lock")
+    @patch("the_hive.server.agent_lease_status", return_value={"held_by_this_server": True})
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_ignores_preexisting_output_after_assignment(
         self, mock_status_agent, _mock_lease, mock_lifecycle_lock, mock_pane_tail
     ) -> None:
@@ -21093,9 +21093,9 @@ google_accounts:
         self.assertEqual(result["status"], "timeout")
         mock_pane_tail.assert_called_once_with("a1", 24, visible_only=True, verify_identity=True)
 
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_reports_activity_for_assigned_tui_starter_context_with_ready_input(
         self, mock_status_agent, mock_sleep, mock_pane_tail
     ) -> None:
@@ -21123,7 +21123,7 @@ google_accounts:
         mock_sleep.assert_not_called()
         mock_pane_tail.assert_called_once_with("a1", 24, visible_only=True, verify_identity=True)
 
-    @patch("codex_master.server.pane_tail")
+    @patch("the_hive.server.pane_tail")
     def test_wait_visible_input_ignores_future_assignment_log(self, mock_pane_tail) -> None:
         status = {
             "running": True,
@@ -21136,14 +21136,14 @@ google_accounts:
         }
         initial = {"last_assignment": status["last_assignment"]}
 
-        with patch("codex_master.server.time.time", return_value=1780826400.0):
+        with patch("the_hive.server.time.time", return_value=1780826400.0):
             result = wait_terminal_visible_input_status("a", status, initial)
 
         self.assertIsNone(result)
         mock_pane_tail.assert_not_called()
 
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_reports_activity_for_completed_assignment_with_fresh_log(
         self, mock_status_agent, mock_sleep
     ) -> None:
@@ -21168,8 +21168,8 @@ google_accounts:
         self.assertEqual(result["poll_count"], 0)
         mock_sleep.assert_not_called()
 
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_times_out_in_assigned_tui_starter_context_without_activity(
         self, mock_status_agent, mock_sleep
     ) -> None:
@@ -21265,7 +21265,7 @@ google_accounts:
 
         self.assertEqual(wait_terminal_status(current, initial), "identity_unverified")
 
-    @patch("codex_master.server.status_agent")
+    @patch("the_hive.server.status_agent")
     def test_wait_agent_prefers_not_running_over_stale_limit(
         self, mock_status_agent
     ) -> None:
@@ -21428,11 +21428,11 @@ google_accounts:
             "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
             "response_state": {"state": "identity_unverified"},
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.request_agent_report") as mock_report, patch(
-            "codex_master.server.interrupt_agent"
-        ) as mock_interrupt, patch("codex_master.server.stop_agent") as mock_stop:
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.request_agent_report") as mock_report, patch(
+            "the_hive.server.interrupt_agent"
+        ) as mock_interrupt, patch("the_hive.server.stop_agent") as mock_stop:
             result = fleet_watchdog("a")
 
         payload = result["results"][0]
@@ -21443,11 +21443,11 @@ google_accounts:
         mock_stop.assert_not_called()
 
     def test_watchdog_action_interrupt_does_not_release_when_lease_renews_between_check_and_release(self) -> None:
-        with patch("codex_master.server.interrupt_agent", return_value={"status": "interrupt_sent", "raw_output": "not_returned"}):
-            with patch("codex_master.server.agent_lease_status", return_value={
+        with patch("the_hive.server.interrupt_agent", return_value={"status": "interrupt_sent", "raw_output": "not_returned"}):
+            with patch("the_hive.server.agent_lease_status", return_value={
                 "state": "held", "held_by_this_server": True, "lease_id": "renewed-lease"
             }) as mock_lease_status, patch(
-                "codex_master.server.release_agent"
+                "the_hive.server.release_agent"
             ) as mock_release:
                 result = watchdog_action(
                     "a1",
@@ -21487,12 +21487,12 @@ google_accounts:
             "assignment_id": "assign-1",
             "send": {"status": "sent"},
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", side_effect=fake_read_meta), patch(
-            "codex_master.server.write_meta", side_effect=fake_write_meta
-        ), patch("codex_master.server.request_agent_report", return_value=report) as mock_report, patch(
-            "codex_master.server.interrupt_agent"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", side_effect=fake_read_meta), patch(
+            "the_hive.server.write_meta", side_effect=fake_write_meta
+        ), patch("the_hive.server.request_agent_report", return_value=report) as mock_report, patch(
+            "the_hive.server.interrupt_agent"
         ) as mock_interrupt:
             result = fleet_watchdog("a")
 
@@ -21507,10 +21507,10 @@ google_accounts:
         mock_interrupt.assert_not_called()
 
     def test_fleet_watchdog_dry_run_skips_lifecycle_lock(self) -> None:
-        with patch("codex_master.server.agent_ids", return_value=["a1"]), patch(
-            "codex_master.server._watchdog_agent_unlocked",
+        with patch("the_hive.server.agent_ids", return_value=["a1"]), patch(
+            "the_hive.server._watchdog_agent_unlocked",
             return_value={"agent": "a1", "watchdog_state": "would_request_report"},
-        ) as run_agent, patch("codex_master.server.call_agent_lifecycle") as lifecycle:
+        ) as run_agent, patch("the_hive.server.call_agent_lifecycle") as lifecycle:
             result = fleet_watchdog("a", dry_run=True)
 
         self.assertEqual(len(result["results"]), 1)
@@ -21528,12 +21528,12 @@ google_accounts:
                 "dry_run": True,
             },
         )
-        from codex_master.fleet_snapshot import FleetSnapshot as WatchdogSnapshot
+        from the_hive.fleet_snapshot import FleetSnapshot as WatchdogSnapshot
         self.assertIsInstance(call_args.kwargs["snapshot"], WatchdogSnapshot)
         lifecycle.assert_not_called()
 
     def test_fleet_watchdog_dry_run_does_not_initialize_state(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         status = {
             "agent": "a1",
@@ -21542,8 +21542,8 @@ google_accounts:
             "response_state": {"state": "not_running"},
             "last_assignment": None,
         }
-        with patch("codex_master.server.status_agent", return_value=status) as mock_status, patch(
-            "codex_master.server.ensure_state"
+        with patch("the_hive.server.status_agent", return_value=status) as mock_status, patch(
+            "the_hive.server.ensure_state"
         ) as ensure_state:
             result = server_module._watchdog_agent_unlocked(
                 "a1",
@@ -21560,7 +21560,7 @@ google_accounts:
         ensure_state.assert_not_called()
 
     def test_status_read_only_does_not_create_state(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -21624,14 +21624,14 @@ google_accounts:
         )
         action_result = {"agent": "a1", "status": "stopped", "lease": lease, "raw_output": "not_returned"}
 
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.claim_agent", return_value={"status": "claimed_expired", "lease": lease}
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value={}), patch(
+            "the_hive.server.claim_agent", return_value={"status": "claimed_expired", "lease": lease}
         ) as mock_claim, patch(
-            "codex_master.server.request_agent_report", side_effect=report_error
-        ), patch("codex_master.server.watchdog_action", return_value=action_result) as mock_action, patch(
-            "codex_master.server.update_watchdog_marker"
+            "the_hive.server.request_agent_report", side_effect=report_error
+        ), patch("the_hive.server.watchdog_action", return_value=action_result) as mock_action, patch(
+            "the_hive.server.update_watchdog_marker"
         ) as mock_marker:
             result = fleet_watchdog("a", action="stop", manage_unclaimed=True)
 
@@ -21687,18 +21687,18 @@ google_accounts:
         )
         with (
             patch(
-                "codex_master.server.call_agent_lifecycle",
+                "the_hive.server.call_agent_lifecycle",
                 side_effect=lambda _agent, fn: fn(),
             ),
-            patch("codex_master.server.status_agent", return_value=status),
-            patch("codex_master.server.read_meta", return_value={}),
+            patch("the_hive.server.status_agent", return_value=status),
+            patch("the_hive.server.read_meta", return_value={}),
             patch(
-                "codex_master.server.claim_agent",
+                "the_hive.server.claim_agent",
                 return_value={"status": "claimed_expired", "lease": lease},
             ),
-            patch("codex_master.server.request_agent_report", side_effect=report_error),
+            patch("the_hive.server.request_agent_report", side_effect=report_error),
             patch(
-                "codex_master.server.agent_lease_status",
+                "the_hive.server.agent_lease_status",
                 return_value={
                     "state": "expired",
                     "held_by_this_server": False,
@@ -21706,10 +21706,10 @@ google_accounts:
                 },
             ),
             patch(
-                "codex_master.server.watchdog_action",
+                "the_hive.server.watchdog_action",
                 return_value={"status": "stopped"},
             ),
-            patch("codex_master.server.update_watchdog_marker"),
+            patch("the_hive.server.update_watchdog_marker"),
         ):
             result = fleet_watchdog("a", action="stop", manage_unclaimed=True)
 
@@ -21741,11 +21741,11 @@ google_accounts:
         }
         report = {"status": "report_requested", "submitted": True, "assignment_id": "assign-1", "send": {"status": "sent"}}
 
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=meta_store), patch(
-            "codex_master.server.write_meta", side_effect=lambda _agent, data: meta_store.update(data)
-        ), patch("codex_master.server.request_agent_report", return_value=report):
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=meta_store), patch(
+            "the_hive.server.write_meta", side_effect=lambda _agent, data: meta_store.update(data)
+        ), patch("the_hive.server.request_agent_report", return_value=report):
             result = fleet_watchdog("a")
 
         self.assertEqual(result["results"][0]["watchdog_state"], "report_requested")
@@ -21770,14 +21770,14 @@ google_accounts:
             "assignment_id": "assign-1",
             "send": {"status": "sent"},
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=meta_store), patch(
-            "codex_master.server.write_meta", side_effect=lambda _agent, data: meta_store.update(data)
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=meta_store), patch(
+            "the_hive.server.write_meta", side_effect=lambda _agent, data: meta_store.update(data)
         ), patch(
-            "codex_master.server.claim_agent", return_value={"status": "claimed", "lease": lease}
+            "the_hive.server.claim_agent", return_value={"status": "claimed", "lease": lease}
         ) as mock_claim, patch(
-            "codex_master.server.request_agent_report", return_value=report
+            "the_hive.server.request_agent_report", return_value=report
         ) as mock_report:
             result = fleet_watchdog("a", manage_unclaimed=True)
 
@@ -21809,14 +21809,14 @@ google_accounts:
             "assignment_id": "assign-1",
             "send": {"status": "sent"},
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=meta_store), patch(
-            "codex_master.server.claim_agent", return_value={"status": "claimed", "lease": lease}
-        ), patch("codex_master.server.request_agent_report", return_value=report), patch(
-            "codex_master.server.update_watchdog_marker", side_effect=AgentError("marker write failed")
-        ), patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}), patch(
-            "codex_master.server.release_agent"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=meta_store), patch(
+            "the_hive.server.claim_agent", return_value={"status": "claimed", "lease": lease}
+        ), patch("the_hive.server.request_agent_report", return_value=report), patch(
+            "the_hive.server.update_watchdog_marker", side_effect=AgentError("marker write failed")
+        ), patch("the_hive.server.agent_lease_status", return_value={"held_by_this_server": True}), patch(
+            "the_hive.server.release_agent"
         ) as mock_release:
             result = fleet_watchdog("a", manage_unclaimed=True)
 
@@ -21837,13 +21837,13 @@ google_accounts:
         }
         lease = {"state": "held", "holder": "this_server", "held_by_this_server": True}
         report = {"status": "report_requested", "submitted": True, "assignment_id": "assign-1", "send": {"status": "sent"}}
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=meta_store), patch(
-            "codex_master.server.write_meta", side_effect=lambda _agent, data: meta_store.update(data)
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=meta_store), patch(
+            "the_hive.server.write_meta", side_effect=lambda _agent, data: meta_store.update(data)
         ), patch(
-            "codex_master.server.claim_agent", return_value={"status": "claimed", "lease": lease}
-        ) as mock_claim, patch("codex_master.server.request_agent_report", return_value=report):
+            "the_hive.server.claim_agent", return_value={"status": "claimed", "lease": lease}
+        ) as mock_claim, patch("the_hive.server.request_agent_report", return_value=report):
             result = fleet_watchdog("a", require_lease=False)
 
         self.assertEqual(result["results"][0]["watchdog_state"], "report_requested")
@@ -21872,12 +21872,12 @@ google_accounts:
                 "report_grace_seconds": DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
             }
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.time.time", return_value=1000.0
-        ), patch("codex_master.server.status_agent", return_value=status), patch(
-            "codex_master.server.read_meta", return_value=marker
-        ), patch("codex_master.server.request_agent_report") as mock_report, patch(
-            "codex_master.server.interrupt_agent"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.time.time", return_value=1000.0
+        ), patch("the_hive.server.status_agent", return_value=status), patch(
+            "the_hive.server.read_meta", return_value=marker
+        ), patch("the_hive.server.request_agent_report") as mock_report, patch(
+            "the_hive.server.interrupt_agent"
         ) as mock_interrupt:
             result = fleet_watchdog("a")
 
@@ -21910,14 +21910,14 @@ google_accounts:
                 "report_grace_seconds": DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
             }
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.time.time", return_value=1000.0
-        ), patch("codex_master.server.status_agent", return_value=status), patch(
-            "codex_master.server.read_meta", return_value=marker
-        ), patch("codex_master.server.write_meta") as mock_write_meta, patch(
-            "codex_master.server.request_agent_report"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.time.time", return_value=1000.0
+        ), patch("the_hive.server.status_agent", return_value=status), patch(
+            "the_hive.server.read_meta", return_value=marker
+        ), patch("the_hive.server.write_meta") as mock_write_meta, patch(
+            "the_hive.server.request_agent_report"
         ) as mock_report, patch(
-            "codex_master.server.interrupt_agent",
+            "the_hive.server.interrupt_agent",
             return_value={"agent": "a", "status": "interrupt_sent", "lease": status["lease"], "raw_output": "not_returned"},
         ) as mock_interrupt:
             result = fleet_watchdog("a")
@@ -21953,12 +21953,12 @@ google_accounts:
                 "report_grace_seconds": DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
             }
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.time.time", return_value=1000.0
-        ), patch("codex_master.server.status_agent", return_value=status), patch(
-            "codex_master.server.read_meta", return_value=marker
-        ), patch("codex_master.server.write_meta"), patch(
-            "codex_master.server.watchdog_action", return_value={"status": "interrupt_sent"}
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.time.time", return_value=1000.0
+        ), patch("the_hive.server.status_agent", return_value=status), patch(
+            "the_hive.server.read_meta", return_value=marker
+        ), patch("the_hive.server.write_meta"), patch(
+            "the_hive.server.watchdog_action", return_value={"status": "interrupt_sent"}
         ) as mock_action:
             result = fleet_watchdog("a")
 
@@ -22004,14 +22004,14 @@ google_accounts:
             "assignment_id": "assign-1",
             "send": {"status": "sent"},
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.time.time", return_value=1000.0
-        ), patch("codex_master.server.status_agent", return_value=status), patch(
-            "codex_master.server.read_meta", return_value=marker
-        ), patch("codex_master.server.write_meta") as mock_write_meta, patch(
-            "codex_master.server.request_agent_report", return_value=report
-        ) as mock_report, patch("codex_master.server.interrupt_agent") as mock_interrupt, patch(
-            "codex_master.server.release_agent"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.time.time", return_value=1000.0
+        ), patch("the_hive.server.status_agent", return_value=status), patch(
+            "the_hive.server.read_meta", return_value=marker
+        ), patch("the_hive.server.write_meta") as mock_write_meta, patch(
+            "the_hive.server.request_agent_report", return_value=report
+        ) as mock_report, patch("the_hive.server.interrupt_agent") as mock_interrupt, patch(
+            "the_hive.server.release_agent"
         ) as mock_release:
             result = fleet_watchdog("a")
 
@@ -22041,16 +22041,16 @@ google_accounts:
                 "release_lease_after_action": True,
             }
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=marker), patch(
-            "codex_master.server.agent_lease_status",
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=marker), patch(
+            "the_hive.server.agent_lease_status",
             return_value={"held_by_this_server": True},
         ), patch(
-            "codex_master.server.release_agent", return_value={"lease": {"state": "unclaimed"}}
+            "the_hive.server.release_agent", return_value={"lease": {"state": "unclaimed"}}
         ) as mock_release, patch(
-            "codex_master.server.watchdog_release_identity_is_current", return_value=True
-        ) as mock_identity, patch("codex_master.server.update_watchdog_marker") as mock_update:
+            "the_hive.server.watchdog_release_identity_is_current", return_value=True
+        ) as mock_identity, patch("the_hive.server.update_watchdog_marker") as mock_update:
             result = fleet_watchdog("a")
 
         payload = result["results"][0]
@@ -22081,12 +22081,12 @@ google_accounts:
                 "release_lease_after_action": True,
             }
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=marker), patch(
-            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
-        ) as mock_lease, patch("codex_master.server.release_agent") as mock_release, patch(
-            "codex_master.server.update_watchdog_marker"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=marker), patch(
+            "the_hive.server.agent_lease_status", return_value={"held_by_this_server": True}
+        ) as mock_lease, patch("the_hive.server.release_agent") as mock_release, patch(
+            "the_hive.server.update_watchdog_marker"
         ) as mock_update:
             result = fleet_watchdog("a")
 
@@ -22118,12 +22118,12 @@ google_accounts:
                 "release_lease_after_action": True,
             }
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=marker), patch(
-            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
-        ) as mock_lease, patch("codex_master.server.release_agent") as mock_release, patch(
-            "codex_master.server.update_watchdog_marker"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=marker), patch(
+            "the_hive.server.agent_lease_status", return_value={"held_by_this_server": True}
+        ) as mock_lease, patch("the_hive.server.release_agent") as mock_release, patch(
+            "the_hive.server.update_watchdog_marker"
         ) as mock_update:
             result = fleet_watchdog("a")
 
@@ -22153,12 +22153,12 @@ google_accounts:
                 "release_lease_after_action": "false",
             }
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=marker), patch(
-            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
-        ) as mock_lease, patch("codex_master.server.release_agent") as mock_release, patch(
-            "codex_master.server.update_watchdog_marker"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=marker), patch(
+            "the_hive.server.agent_lease_status", return_value={"held_by_this_server": True}
+        ) as mock_lease, patch("the_hive.server.release_agent") as mock_release, patch(
+            "the_hive.server.update_watchdog_marker"
         ) as mock_update:
             result = fleet_watchdog("a")
 
@@ -22187,18 +22187,18 @@ google_accounts:
                 "release_lease_after_action": True,
             }
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=marker), patch(
-            "codex_master.server.write_meta"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=marker), patch(
+            "the_hive.server.write_meta"
         ) as mock_write_meta, patch(
-            "codex_master.server.agent_lease_status",
+            "the_hive.server.agent_lease_status",
             return_value={"held_by_this_server": True},
         ) as mock_lease, patch(
-            "codex_master.server.release_agent",
+            "the_hive.server.release_agent",
             return_value={"lease": {"state": "unclaimed", "held_by_this_server": False}},
         ) as mock_release, patch(
-            "codex_master.server.watchdog_release_identity_is_current", return_value=True
+            "the_hive.server.watchdog_release_identity_is_current", return_value=True
         ) as mock_identity:
             result = fleet_watchdog("a", action="none")
 
@@ -22232,18 +22232,18 @@ google_accounts:
                 "release_lease_after_action": True,
             }
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=marker), patch(
-            "codex_master.server.write_meta"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=marker), patch(
+            "the_hive.server.write_meta"
         ) as mock_write_meta, patch(
-            "codex_master.server.agent_lease_status",
+            "the_hive.server.agent_lease_status",
             return_value={"held_by_this_server": True},
         ) as mock_lease, patch(
-            "codex_master.server.release_agent",
+            "the_hive.server.release_agent",
             return_value={"lease": {"state": "unclaimed", "held_by_this_server": False}},
         ) as mock_release:
-            with patch("codex_master.server.watchdog_release_identity_is_current", return_value=True) as mock_identity:
+            with patch("the_hive.server.watchdog_release_identity_is_current", return_value=True) as mock_identity:
                 result = fleet_watchdog("a")
 
         payload = result["results"][0]
@@ -22269,12 +22269,12 @@ google_accounts:
                 "release_lease_after_action": True,
             }
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value=marker), patch(
-            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
-        ) as mock_lease, patch("codex_master.server.release_agent") as mock_release, patch(
-            "codex_master.server.update_watchdog_marker"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.read_meta", return_value=marker), patch(
+            "the_hive.server.agent_lease_status", return_value={"held_by_this_server": True}
+        ) as mock_lease, patch("the_hive.server.release_agent") as mock_release, patch(
+            "the_hive.server.update_watchdog_marker"
         ) as mock_update:
             result = fleet_watchdog("a")
 
@@ -22295,10 +22295,10 @@ google_accounts:
             "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
             "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.request_agent_report") as mock_report, patch(
-            "codex_master.server.interrupt_agent"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.request_agent_report") as mock_report, patch(
+            "the_hive.server.interrupt_agent"
         ) as mock_interrupt:
             result = fleet_watchdog("a")
 
@@ -22319,10 +22319,10 @@ google_accounts:
             "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
             "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
         }
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.request_agent_report") as mock_report, patch(
-            "codex_master.server.interrupt_agent"
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "the_hive.server.status_agent", return_value=status
+        ), patch("the_hive.server.request_agent_report") as mock_report, patch(
+            "the_hive.server.interrupt_agent"
         ) as mock_interrupt:
             result = fleet_watchdog("a", require_lease=False)
 
@@ -22333,7 +22333,7 @@ google_accounts:
         mock_interrupt.assert_not_called()
 
     def test_codex_usage_watchdog_reads_one_attested_v2_dto(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         now = datetime.now(timezone.utc)
         descriptor = server_module.AgentDescriptor(
@@ -22465,14 +22465,14 @@ google_accounts:
         )
         with (
             patch(
-                "codex_master.server.current_agent_inventory", return_value=inventory
+                "the_hive.server.current_agent_inventory", return_value=inventory
             ),
             patch(
-                "codex_master.server.read_usage_evidence_v2",
+                "the_hive.server.read_usage_evidence_v2",
                 return_value=UsageEvidenceV2((), "unavailable", None, None),
             ) as read_evidence,
             patch(
-                "codex_master.server.read_meta",
+                "the_hive.server.read_meta",
                 side_effect=AssertionError("watchdog must not read metadata"),
             ),
         ):
@@ -22484,10 +22484,10 @@ google_accounts:
         self.assertFalse(status["blocked"])
 
     def test_fleet_usage_watchdog_dry_run_skips_lifecycle_lock(self) -> None:
-        with patch("codex_master.server.agent_ids", return_value=["a1"]), patch(
-            "codex_master.server.usage_watchdog_agent",
+        with patch("the_hive.server.agent_ids", return_value=["a1"]), patch(
+            "the_hive.server.usage_watchdog_agent",
             return_value={"agent": "a1", "usage_watchdog_state": "clear"},
-        ) as run_agent, patch("codex_master.server.call_agent_lifecycle") as lifecycle:
+        ) as run_agent, patch("the_hive.server.call_agent_lifecycle") as lifecycle:
             result = fleet_usage_watchdog("a1", dry_run=True)
 
         self.assertEqual(result["result_count"], 1)
@@ -22502,7 +22502,7 @@ google_accounts:
             captured["args"] = args
             return {"ok": True}
 
-        with patch("codex_master.server.call_validated_tool", side_effect=fake_call_validated_tool):
+        with patch("the_hive.server.call_validated_tool", side_effect=fake_call_validated_tool):
             result = main_cli(["usage-watchdog", "a1", "--dry-run"])
 
         self.assertEqual(result, 0)
@@ -22528,10 +22528,10 @@ google_accounts:
                 log_path = raw_dir / f"log-{index}.log"
                 log_path.write_bytes(bytes([65 + index]) * 200)
                 os.utime(log_path, (1000 + index, 1000 + index))
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
-            ), patch("codex_master.server.META_DIR", Path(tmpdir) / "meta"), patch(
-                "codex_master.server.LEGACY_META_DIR", Path(tmpdir) / "legacy" / "meta"
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            ), patch("the_hive.server.META_DIR", Path(tmpdir) / "meta"), patch(
+                "the_hive.server.LEGACY_META_DIR", Path(tmpdir) / "legacy" / "meta"
             ):
                 result = prune_raw_logs(max_files=2, max_bytes=80)
                 logs = sorted(raw_dir.glob("*.log"))
@@ -22569,16 +22569,16 @@ google_accounts:
                 "visible_running_agents": ["c2"],
                 "overflow": 0,
             }
-            with patch.dict("codex_master.server.AGENTS", agents, clear=True), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
-                "codex_master.server.META_DIR", meta_dir
-            ), patch("codex_master.server.LEGACY_META_DIR", legacy_meta_dir), patch(
-                "codex_master.server.managed_applet_inventory", return_value=inventory
-            ) as mock_inventory, patch("codex_master.server.tmux_alive") as mock_tmux_alive, patch(
-                "codex_master.server.read_meta", side_effect=fake_read_meta
+            with patch.dict("the_hive.server.AGENTS", agents, clear=True), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "the_hive.server.META_DIR", meta_dir
+            ), patch("the_hive.server.LEGACY_META_DIR", legacy_meta_dir), patch(
+                "the_hive.server.managed_applet_inventory", return_value=inventory
+            ) as mock_inventory, patch("the_hive.server.tmux_alive") as mock_tmux_alive, patch(
+                "the_hive.server.read_meta", side_effect=fake_read_meta
             ), patch(
-                "codex_master.server.latest_managed_raw_log", return_value=None
+                "the_hive.server.latest_managed_raw_log", return_value=None
             ):
                 server_module.protected_raw_log_paths()
 
@@ -22596,10 +22596,10 @@ google_accounts:
             target.chmod(0o644)
             link = raw_dir / "linked.log"
             link.symlink_to(target)
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
-            ), patch("codex_master.server.META_DIR", Path(tmpdir) / "meta"), patch(
-                "codex_master.server.LEGACY_META_DIR", Path(tmpdir) / "legacy" / "meta"
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            ), patch("the_hive.server.META_DIR", Path(tmpdir) / "meta"), patch(
+                "the_hive.server.LEGACY_META_DIR", Path(tmpdir) / "legacy" / "meta"
             ):
                 result = prune_raw_logs(max_files=2, max_bytes=80)
                 target_size = target.stat().st_size
@@ -22640,11 +22640,11 @@ google_accounts:
                     return True
                 return real_is_real(path)
 
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", tmp_path / "legacy"
-            ), patch("codex_master.server.META_DIR", tmp_path / "meta"), patch(
-                "codex_master.server.LEGACY_META_DIR", tmp_path / "legacy" / "meta"
-            ), patch("codex_master.server.is_real_directory_no_symlink", side_effect=swap_after_check):
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", tmp_path / "legacy"
+            ), patch("the_hive.server.META_DIR", tmp_path / "meta"), patch(
+                "the_hive.server.LEGACY_META_DIR", tmp_path / "legacy" / "meta"
+            ), patch("the_hive.server.is_real_directory_no_symlink", side_effect=swap_after_check):
                 prune_raw_logs(max_files=1, max_bytes=80)
             redirected_sizes = sorted(path.stat().st_size for path in redirected_raw.glob("*.log"))
             redirected_names = sorted(path.name for path in redirected_raw.glob("*.log"))
@@ -22656,7 +22656,7 @@ google_accounts:
         self.assertEqual(redirected_modes, [0o644, 0o644])
 
     def test_prune_raw_logs_rejects_log_swap_before_unlink(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -22679,9 +22679,9 @@ google_accounts:
                     outside_log.rename(old_log)
                 return real_harden(directory_fd, name, expected_stat)
 
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", root / "legacy"
-            ), patch("codex_master.server.harden_raw_log_at_dir_fd", side_effect=swap_before_unlink):
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", root / "legacy"
+            ), patch("the_hive.server.harden_raw_log_at_dir_fd", side_effect=swap_before_unlink):
                 result = server_module.prune_raw_logs(max_files=1, max_bytes=80)
 
             external_content = old_log.read_text(encoding="utf-8")
@@ -22692,7 +22692,7 @@ google_accounts:
         self.assertTrue(original_exists)
 
     def test_bound_raw_log_at_dir_fd_rejects_path_swap_before_replace(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -22756,7 +22756,7 @@ google_accounts:
             self.assertEqual(target.read_text(encoding="utf-8"), "attacker\n")
 
     def test_cleanup_failed_start_rejects_raw_log_swap_before_unlink(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -22792,7 +22792,7 @@ google_accounts:
         self.assertTrue(original_exists)
 
     def test_cleanup_failed_start_keeps_pinned_raw_log_parent_after_swap(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -22836,10 +22836,10 @@ google_accounts:
             legacy_raw = legacy_root / "raw"
             legacy_raw.symlink_to(outside_raw)
 
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", legacy_root
-            ), patch("codex_master.server.META_DIR", Path(tmpdir) / "meta"), patch(
-                "codex_master.server.LEGACY_META_DIR", legacy_root / "meta"
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", legacy_root
+            ), patch("the_hive.server.META_DIR", Path(tmpdir) / "meta"), patch(
+                "the_hive.server.LEGACY_META_DIR", legacy_root / "meta"
             ):
                 allowed = allowed_raw_log_path(str(legacy_raw / "outside.log"))
                 retention = raw_log_retention_status()
@@ -22866,8 +22866,8 @@ google_accounts:
             target.write_text("secret\n", encoding="utf-8")
             link.symlink_to(target)
 
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
             ):
                 allowed = allowed_raw_log_path(str(link))
 
@@ -22895,8 +22895,8 @@ google_accounts:
             link = raw_dir / "linked.log"
             os.link(target, link)
 
-            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", tmp / "legacy"
+            with patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", tmp / "legacy"
             ):
                 allowed = allowed_raw_log_path(str(link))
                 with self.assertRaisesRegex(AgentError, "private state path is not a regular file"):
@@ -22919,18 +22919,18 @@ google_accounts:
             raw_dir = state_root / "raw"
             raw_dir.symlink_to(outside_raw)
 
-            with patch("codex_master.server.STATE_ROOT", state_root), patch(
-                "codex_master.server.RAW_DIR", raw_dir
-            ), patch("codex_master.server.META_DIR", state_root / "meta"), patch(
-                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            with patch("the_hive.server.STATE_ROOT", state_root), patch(
+                "the_hive.server.RAW_DIR", raw_dir
+            ), patch("the_hive.server.META_DIR", state_root / "meta"), patch(
+                "the_hive.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
             ), patch(
-                "codex_master.server.LEGACY_META_DIR", Path(tmpdir) / "legacy" / "meta"
+                "the_hive.server.LEGACY_META_DIR", Path(tmpdir) / "legacy" / "meta"
             ):
                 with self.assertRaisesRegex(AgentError, "must not be a symlink"):
                     write_bounded_raw_log(raw_dir / "agent.log", max_bytes=128)
 
     def test_write_bounded_raw_log_rejects_out_of_policy_max_bytes_before_state(self) -> None:
-        with patch("codex_master.server.ensure_state") as mock_ensure_state:
+        with patch("the_hive.server.ensure_state") as mock_ensure_state:
             with self.assertRaisesRegex(AgentError, f"raw log max_bytes must be <= {MAX_RAW_LOG_BYTES}"):
                 write_bounded_raw_log(Path("/tmp/agent.log"), max_bytes=MAX_RAW_LOG_BYTES + 1)
 
@@ -22945,7 +22945,7 @@ google_accounts:
             link = meta_dir / "a1.json"
             link.symlink_to(target)
 
-            with patch("codex_master.server.META_DIR", meta_dir):
+            with patch("the_hive.server.META_DIR", meta_dir):
                 write_meta("a", {"safe": True})
 
             mode = stat.S_IMODE(link.stat().st_mode)
@@ -22959,7 +22959,7 @@ google_accounts:
         self.assertEqual(mode, 0o600)
 
     def test_replace_private_bytes_does_not_chmod_swapped_symlink_target(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -22988,7 +22988,7 @@ google_accounts:
             self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o644)
 
     def test_replace_private_bytes_rejects_parent_swap_before_temp_write(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -23017,7 +23017,7 @@ google_accounts:
             self.assertFalse((root / "managed-original" / "state.json").exists())
 
     def test_replace_private_bytes_fsyncs_temp_and_parent(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "state.json"
@@ -23029,7 +23029,7 @@ google_accounts:
             self.assertEqual(len(calls), 2)
 
     def test_pool_write_private_file_does_not_chmod_swapped_symlink_target(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -23072,8 +23072,8 @@ google_accounts:
             oversized_meta.write_text('{"payload": "' + ("x" * MAX_META_BYTES) + '"}\n', encoding="utf-8")
             non_object_meta = meta_dir / "a1.json"
 
-            with patch("codex_master.server.META_DIR", meta_dir), patch(
-                "codex_master.server.LEGACY_META_DIR", legacy_meta_dir
+            with patch("the_hive.server.META_DIR", meta_dir), patch(
+                "the_hive.server.LEGACY_META_DIR", legacy_meta_dir
             ):
                 symlink_result = read_meta("a")
                 hardlink_result = read_meta("c1")
@@ -23103,8 +23103,8 @@ google_accounts:
             legacy_meta_dir.mkdir(parents=True)
             legacy.write_text('{"safe": true}\n', encoding="utf-8")
 
-            with patch("codex_master.server.META_DIR", meta_dir), patch(
-                "codex_master.server.LEGACY_META_DIR", legacy_meta_dir
+            with patch("the_hive.server.META_DIR", meta_dir), patch(
+                "the_hive.server.LEGACY_META_DIR", legacy_meta_dir
             ):
                 result = read_meta("a")
 
@@ -23124,8 +23124,8 @@ google_accounts:
             primary.symlink_to(missing_target)
             legacy.write_text('{"legacy": "SHOULD_NOT_BE_USED"}\n', encoding="utf-8")
 
-            with patch("codex_master.server.META_DIR", meta_dir), patch(
-                "codex_master.server.LEGACY_META_DIR", legacy_meta_dir
+            with patch("the_hive.server.META_DIR", meta_dir), patch(
+                "the_hive.server.LEGACY_META_DIR", legacy_meta_dir
             ):
                 result = read_meta("a")
                 primary_still_symlink = primary.is_symlink()
@@ -23146,8 +23146,8 @@ google_accounts:
             tmp_path.symlink_to(target)
             fixed_uuid = type("FixedUuid", (), {"hex": "nonce"})()
 
-            with patch("codex_master.server.now_id", return_value="fixed"), patch(
-                "codex_master.server.uuid.uuid4", return_value=fixed_uuid
+            with patch("the_hive.server.now_id", return_value="fixed"), patch(
+                "the_hive.server.uuid.uuid4", return_value=fixed_uuid
             ):
                 with self.assertRaisesRegex(AgentError, "temp file without following symlinks") as raised:
                     replace_private_text(path, "safe\n")
@@ -23171,8 +23171,8 @@ google_accounts:
             predictable_tmp.symlink_to(target)
             fixed_uuid = type("FixedUuid", (), {"hex": "nonce"})()
 
-            with patch("codex_master.server.now_id", return_value="fixed"), patch(
-                "codex_master.server.uuid.uuid4", return_value=fixed_uuid
+            with patch("the_hive.server.now_id", return_value="fixed"), patch(
+                "the_hive.server.uuid.uuid4", return_value=fixed_uuid
             ):
                 replace_private_text(path, "safe\n")
 
@@ -23193,9 +23193,9 @@ google_accounts:
             state_root = Path(tmpdir) / "state"
             state_root.symlink_to(target)
 
-            with patch("codex_master.server.STATE_ROOT", state_root), patch(
-                "codex_master.server.RAW_DIR", state_root / "raw"
-            ), patch("codex_master.server.META_DIR", state_root / "meta"):
+            with patch("the_hive.server.STATE_ROOT", state_root), patch(
+                "the_hive.server.RAW_DIR", state_root / "raw"
+            ), patch("the_hive.server.META_DIR", state_root / "meta"):
                 with self.assertRaisesRegex(AgentError, "must not be a symlink") as raised:
                     ensure_state()
 
@@ -23224,7 +23224,7 @@ google_accounts:
         self.assertNotIn(str(real_parent), str(raised.exception))
 
     def test_ensure_private_dir_rejects_real_parent_swap_before_create(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -23261,7 +23261,7 @@ google_accounts:
         self.assertFalse(original_target_exists)
 
     def test_ensure_private_dir_does_not_chmod_swapped_symlink_target(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -23294,9 +23294,9 @@ google_accounts:
             state_root = Path(tmpdir) / "state"
             state_root.write_text("not a directory\n", encoding="utf-8")
 
-            with patch("codex_master.server.STATE_ROOT", state_root), patch(
-                "codex_master.server.RAW_DIR", state_root / "raw"
-            ), patch("codex_master.server.META_DIR", state_root / "meta"):
+            with patch("the_hive.server.STATE_ROOT", state_root), patch(
+                "the_hive.server.RAW_DIR", state_root / "raw"
+            ), patch("the_hive.server.META_DIR", state_root / "meta"):
                 with self.assertRaisesRegex(AgentError, "not a directory") as raised:
                     ensure_state()
 
@@ -23309,7 +23309,7 @@ google_accounts:
             link = Path(tmpdir) / "assignments.jsonl"
             link.symlink_to(target)
 
-            with patch("codex_master.server.ASSIGNMENT_LOG", link), patch("codex_master.server.ensure_state"):
+            with patch("the_hive.server.ASSIGNMENT_LOG", link), patch("the_hive.server.ensure_state"):
                 with self.assertRaisesRegex(AgentError, "without following symlinks") as raised:
                     record_assignment({"assignment_id": "1", "agent": "a"})
             target_content = target.read_text(encoding="utf-8")
@@ -23320,16 +23320,16 @@ google_accounts:
         self.assertEqual(target_content, "external\n")
         self.assertTrue(link_is_symlink)
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_record_assignment_prunes_by_bytes_before_append(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             assignment_log = root / "assignments.jsonl"
-            with patch("codex_master.server.STATE_ROOT", root / "state"), patch(
-                "codex_master.server.LOCK_DIR", root / "locks"
-            ), patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch(
-                "codex_master.server.MAX_ASSIGNMENT_LOG_BYTES", 150
-            ), patch("codex_master.server.MAX_ASSIGNMENT_LOG_RECORDS", 10):
+            with patch("the_hive.server.STATE_ROOT", root / "state"), patch(
+                "the_hive.server.LOCK_DIR", root / "locks"
+            ), patch("the_hive.server.ASSIGNMENT_LOG", assignment_log), patch(
+                "the_hive.server.MAX_ASSIGNMENT_LOG_BYTES", 150
+            ), patch("the_hive.server.MAX_ASSIGNMENT_LOG_RECORDS", 10):
                 record_assignment({"assignment_id": "1", "agent": "a", "payload": "x" * 60})
                 record_assignment({"assignment_id": "2", "agent": "a", "payload": "y" * 60})
 
@@ -23339,7 +23339,7 @@ google_accounts:
         self.assertEqual(records, [{"assignment_id": "2", "agent": "a", "payload": "y" * 60}])
         self.assertLessEqual(log_size, 150)
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_list_assignments_refuses_symlink_log_without_leaking_path(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "external.jsonl"
@@ -23347,7 +23347,7 @@ google_accounts:
             target.write_text('{"agent":"a","secret":"ASSIGNMENT_SECRET_SHOULD_NOT_LEAK"}\n', encoding="utf-8")
             link.symlink_to(target)
 
-            with patch("codex_master.server.ASSIGNMENT_LOG", link):
+            with patch("the_hive.server.ASSIGNMENT_LOG", link):
                 response = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -23365,13 +23365,13 @@ google_accounts:
         self.assertNotIn(str(target), payload_text)
         self.assertNotIn(str(link), payload_text)
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_list_assignments_refuses_broken_symlink_log(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             link = Path(tmpdir) / "assignments.jsonl"
             link.symlink_to("missing-assignments.jsonl")
 
-            with patch("codex_master.server.ASSIGNMENT_LOG", link):
+            with patch("the_hive.server.ASSIGNMENT_LOG", link):
                 response = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -23385,13 +23385,13 @@ google_accounts:
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["error"], "could_not_read_assignment_log")
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_list_assignments_refuses_oversized_log_without_leaking_path(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
             assignment_log.write_text("x" * (MAX_ASSIGNMENT_LOG_BYTES + 1), encoding="utf-8")
 
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+            with patch("the_hive.server.ASSIGNMENT_LOG", assignment_log):
                 response = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -23420,7 +23420,7 @@ google_accounts:
             managed.joinpath("environ").write_bytes(f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0".encode("utf-8"))
             managed.joinpath("status").write_text("Name:\tcodex\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8")
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -23479,19 +23479,19 @@ google_accounts:
                 },
             }
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": native, "home": home, "session": "session-a"}},
                 clear=False,
-            ), patch("codex_master.server.read_meta", return_value=meta), patch(
-                "codex_master.server.pane_pid", return_value=pid
+            ), patch("the_hive.server.read_meta", return_value=meta), patch(
+                "the_hive.server.pane_pid", return_value=pid
             ):
                 summary = agent_home_process_summary("a", proc_root)
             legacy_meta = {key: value for key, value in meta.items() if key != "g5_native_runner"}
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": native, "home": home, "session": "session-a"}},
                 clear=False,
-            ), patch("codex_master.server.read_meta", return_value=legacy_meta):
+            ), patch("the_hive.server.read_meta", return_value=legacy_meta):
                 legacy_summary = agent_home_process_summary("a", proc_root)
 
         self.assertEqual(summary["process_count"], 1)
@@ -23552,11 +23552,11 @@ google_accounts:
                     },
                 }
                 with patch.dict(
-                    "codex_master.server.AGENTS",
+                    "the_hive.server.AGENTS",
                     {"a": {"label": "A", "runner": native, "home": home, "session": "session-a"}},
                     clear=False,
-                ), patch("codex_master.server.read_meta", return_value=meta), patch(
-                    "codex_master.server.pane_pid", return_value=pane_pid
+                ), patch("the_hive.server.read_meta", return_value=meta), patch(
+                    "the_hive.server.pane_pid", return_value=pane_pid
                 ):
                     summary = agent_home_process_summary("a", proc_root)
 
@@ -23610,11 +23610,11 @@ google_accounts:
                 },
             }
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": home, "session": "session-a"}},
                 clear=False,
-            ), patch("codex_master.server.read_meta", return_value=meta), patch(
-                "codex_master.server.pane_pid", return_value=pid
+            ), patch("the_hive.server.read_meta", return_value=meta), patch(
+                "the_hive.server.pane_pid", return_value=pid
             ):
                 summary = agent_home_process_summary("a", proc_root)
 
@@ -23666,7 +23666,7 @@ google_accounts:
                     encoding="utf-8",
                 )
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -23699,7 +23699,7 @@ google_accounts:
                 encoding="utf-8",
             )
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -23762,7 +23762,7 @@ google_accounts:
                 return resolve_original(path, *args, **kwargs)
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ), patch.object(Path, "resolve", new=resolve_fixture_gnome_exe):
@@ -23853,7 +23853,7 @@ google_accounts:
                 return resolve_original(path, *args, **kwargs)
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ), patch.object(Path, "resolve", new=resolve_fixture_gnome_exe):
@@ -23949,7 +23949,7 @@ google_accounts:
                     target_is_directory=True,
                 )
                 with patch.dict(
-                    "codex_master.server.AGENTS",
+                    "the_hive.server.AGENTS",
                     {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                     clear=False,
                 ):
@@ -23988,7 +23988,7 @@ google_accounts:
                 if missing_evidence != "cwd":
                     process.joinpath("cwd").symlink_to("/", target_is_directory=True)
                 with patch.dict(
-                    "codex_master.server.AGENTS",
+                    "the_hive.server.AGENTS",
                     {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                     clear=False,
                 ):
@@ -24027,7 +24027,7 @@ google_accounts:
                 process.joinpath("exe").symlink_to("/usr/bin/dbus-daemon")
                 process.joinpath("cwd").symlink_to("/", target_is_directory=True)
                 with patch.dict(
-                    "codex_master.server.AGENTS",
+                    "the_hive.server.AGENTS",
                     {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                     clear=False,
                 ):
@@ -24092,7 +24092,7 @@ google_accounts:
                             b"\0".join(item.encode("utf-8") for item in parent_argv) + b"\0"
                         )
                 with patch.dict(
-                    "codex_master.server.AGENTS",
+                    "the_hive.server.AGENTS",
                     {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                     clear=False,
                 ):
@@ -24120,7 +24120,7 @@ google_accounts:
             )
             process.joinpath("cmdline").write_bytes(b"python3\0untrusted.py\0")
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -24142,7 +24142,7 @@ google_accounts:
                 "Name:\tcodex\nState:\tZ (zombie)\nPPid:\t1\n", encoding="utf-8"
             )
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -24167,7 +24167,7 @@ google_accounts:
             )
             process.joinpath("cwd").symlink_to(work, target_is_directory=True)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -24182,7 +24182,7 @@ google_accounts:
         proc_root.iterdir.side_effect = PermissionError("denied")
 
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
-            "codex_master.server.AGENTS",
+            "the_hive.server.AGENTS",
             {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": Path(tmpdir) / "home", "session": "a"}},
             clear=False,
         ):
@@ -24193,7 +24193,7 @@ google_accounts:
         self.assertIsNone(summary["managed_process_count"])
         self.assertEqual(summary["raw_output"], "not_returned")
 
-    @patch("codex_master.server.read_proc_environ", return_value=None)
+    @patch("the_hive.server.read_proc_environ", return_value=None)
     def test_agent_home_process_summary_fails_closed_on_unreadable_process_environment(
         self, _mock_read_proc_environ
     ) -> None:
@@ -24204,7 +24204,7 @@ google_accounts:
             process.joinpath("status").write_text("Name:\tcodex\n", encoding="utf-8")
             process.joinpath("cmdline").write_bytes(b"/usr/bin/codex\0")
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": Path(tmpdir) / "home", "session": "a"}},
                 clear=False,
             ):
@@ -24214,7 +24214,7 @@ google_accounts:
         self.assertIsNone(summary["external_process_count"])
         self.assertIsNone(summary["managed_process_count"])
 
-    @patch("codex_master.server.read_proc_environ", return_value={})
+    @patch("the_hive.server.read_proc_environ", return_value={})
     def test_agent_home_process_summary_uses_cwd_without_codex_home(
         self, _mock_read_proc_environ
     ) -> None:
@@ -24230,7 +24230,7 @@ google_accounts:
             )
             process.joinpath("cwd").symlink_to(home, target_is_directory=True)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -24241,7 +24241,7 @@ google_accounts:
         self.assertEqual(summary["external_process_count"], 1)
 
     def test_pool_home_processes_detects_process_cwd_inside_home(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -24259,9 +24259,9 @@ google_accounts:
         self.assertIsNotNone(processes)
         self.assertEqual([item["pid"] for item in processes], [100])
 
-    @patch("codex_master.server.read_proc_environ", return_value=None)
+    @patch("the_hive.server.read_proc_environ", return_value=None)
     def test_pool_home_processes_uses_cwd_when_environment_is_unreadable(self, _mock_read_proc_environ) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -24279,7 +24279,7 @@ google_accounts:
         self.assertEqual([item["pid"] for item in processes], [100])
 
     def test_pool_home_processes_resolves_relative_codex_home_from_process_cwd(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -24299,7 +24299,7 @@ google_accounts:
         self.assertEqual([item["pid"] for item in processes], [100])
 
     def test_pool_home_processes_detects_gemini_cli_home(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -24580,7 +24580,7 @@ google_accounts:
             lock_path = lock_dir / "agent-a1.lock"
             lock_path.symlink_to(target)
 
-            with patch("codex_master.server.STATE_ROOT", state_root), patch("codex_master.server.LOCK_DIR", lock_dir):
+            with patch("the_hive.server.STATE_ROOT", state_root), patch("the_hive.server.LOCK_DIR", lock_dir):
                 with self.assertRaisesRegex(AgentError, "without following symlinks"):
                     with agent_lifecycle_lock("a"):
                         pass
@@ -24621,11 +24621,11 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"):
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"):
                 ensure_state()
                 for record in (
                     {
@@ -24648,7 +24648,7 @@ google_accounts:
                         claim_agent("a1")
 
     def test_agent_lease_read_fails_closed_after_parent_swap(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -24681,7 +24681,7 @@ google_accounts:
         self.assertEqual(result, {"meta_error": "could_not_read"})
 
     def test_private_state_update_fails_closed_after_parent_swap(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -24710,7 +24710,7 @@ google_accounts:
         self.assertTrue(swapped)
 
     def test_private_new_file_fails_closed_after_parent_swap(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -24737,7 +24737,7 @@ google_accounts:
         self.assertTrue(swapped)
 
     def test_pool_private_bytes_read_fails_closed_after_parent_swap(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -24768,7 +24768,7 @@ google_accounts:
         self.assertTrue(swapped)
 
     def test_remove_agent_lease_path_rejects_regular_file_swap_before_unlink(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -24798,7 +24798,7 @@ google_accounts:
             self.assertEqual(lease.read_text(encoding="utf-8"), "foreign data\n")
 
     def test_remove_agent_lease_path_keeps_parent_pinned_during_unlink(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -24836,12 +24836,12 @@ google_accounts:
             claim_written = threading.Event()
             claim_finished = threading.Event()
             claim_errors: list[BaseException] = []
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.SERVER_INSTANCE_ID", "owner-one"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.SERVER_INSTANCE_ID", "owner-one"
             ):
 
                 claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
@@ -24864,7 +24864,7 @@ google_accounts:
                     path.unlink(missing_ok=True)
                     return True
 
-                from codex_master import server as server_module
+                from the_hive import server as server_module
 
                 real_write_agent_lease = server_module.write_agent_lease
 
@@ -24874,8 +24874,8 @@ google_accounts:
                     return record
 
                 worker = threading.Thread(target=concurrent_claim)
-                with patch("codex_master.server.remove_agent_lease", side_effect=remove_after_claim_starts), patch(
-                    "codex_master.server.write_agent_lease", side_effect=write_and_signal
+                with patch("the_hive.server.remove_agent_lease", side_effect=remove_after_claim_starts), patch(
+                    "the_hive.server.write_agent_lease", side_effect=write_and_signal
                 ):
                     worker.start()
                     release_agent("a", force=True)
@@ -24911,7 +24911,7 @@ google_accounts:
                 finally:
                     claim_finished.set()
 
-            from codex_master import server as server_module
+            from the_hive import server as server_module
 
             real_release_agent = server_module.release_agent
 
@@ -24921,20 +24921,20 @@ google_accounts:
                 claim_finished.wait(1)
                 return real_release_agent(agent, force=force)
 
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.SERVER_INSTANCE_ID", "owner-one"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.SERVER_INSTANCE_ID", "owner-one"
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"session": "session-a", "home": root, "runner": root / "codex"}},
                 clear=True,
-            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
-                "codex_master.server.pane_pid", return_value=123
+            ), patch("the_hive.server.tmux_alive", return_value=True), patch(
+                "the_hive.server.pane_pid", return_value=123
             ), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 side_effect=[
                     {
                         "process_count": 1,
@@ -24956,9 +24956,9 @@ google_accounts:
                     },
                 ],
             ), patch(
-                "codex_master.server.run_tmux", side_effect=fake_kill
+                "the_hive.server.run_tmux", side_effect=fake_kill
             ), patch(
-                "codex_master.server.release_agent", side_effect=release_after_claim_attempt
+                "the_hive.server.release_agent", side_effect=release_after_claim_attempt
             ):
                 worker = threading.Thread(target=concurrent_claim)
                 worker.start()
@@ -24994,7 +24994,7 @@ google_accounts:
                 release_before_send.append(release_finished.is_set())
                 return subprocess.CompletedProcess(argv, 0, "", "")
 
-            from codex_master import server as server_module
+            from the_hive import server as server_module
 
             real_release_agent = server_module.release_agent
 
@@ -25007,18 +25007,18 @@ google_accounts:
                 finally:
                     release_finished.set()
 
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
-                "codex_master.server.AGENTS",
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch.dict(
+                "the_hive.server.AGENTS",
                 {"a": {"session": "session-a", "home": root, "runner": root / "codex"}},
                 clear=True,
-            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
-                "codex_master.server.pane_pid", return_value=123
+            ), patch("the_hive.server.tmux_alive", return_value=True), patch(
+                "the_hive.server.pane_pid", return_value=123
             ), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 1,
                     "managed_process_count": 1,
@@ -25030,9 +25030,9 @@ google_accounts:
                     "raw_output": "not_returned",
                 },
             ), patch(
-                "codex_master.server.claim_agent", side_effect=fake_claim
-            ), patch("codex_master.server.run_tmux", side_effect=fake_interrupt), patch(
-                "codex_master.server.release_agent", side_effect=concurrent_release
+                "the_hive.server.claim_agent", side_effect=fake_claim
+            ), patch("the_hive.server.run_tmux", side_effect=fake_interrupt), patch(
+                "the_hive.server.release_agent", side_effect=concurrent_release
             ):
                 worker = threading.Thread(target=lambda: server_module.release_agent("a", force=True))
                 worker.start()
@@ -25048,16 +25048,16 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     first = claim_agent("b", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"):
                     response = handle_rpc(
                         {
                             "jsonrpc": "2.0",
@@ -25092,17 +25092,17 @@ google_accounts:
                 "raw_output": "not_returned",
                 "response_output": "not_returned",
             }
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     first = claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"), patch(
-                    "codex_master.server.status_agent", return_value=stopped_status
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"), patch(
+                    "the_hive.server.status_agent", return_value=stopped_status
                 ):
                     recovered = claim_agent("a", recover_stopped=True)
 
@@ -25127,17 +25127,17 @@ google_accounts:
                 "raw_output": "not_returned",
                 "response_output": "not_returned",
             }
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"), patch(
-                    "codex_master.server.status_agent", return_value=running_status
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"), patch(
+                    "the_hive.server.status_agent", return_value=running_status
                 ):
                     with self.assertRaises(AgentBusyError) as caught:
                         claim_agent("a", recover_stopped=True)
@@ -25159,15 +25159,15 @@ google_accounts:
                 "raw_output": "not_returned",
                 "response_output": "not_returned",
             }
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     first = claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"), patch(
-                    "codex_master.server.status_agent", return_value=running_status
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"), patch(
+                    "the_hive.server.status_agent", return_value=running_status
                 ):
                     with self.assertRaises(AgentBusyError) as caught:
                         claim_agent("a", force=True)
@@ -25178,7 +25178,7 @@ google_accounts:
         self.assertEqual(current["holder"], "other_server")
 
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -25190,8 +25190,8 @@ google_accounts:
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.run_tmux")
     def test_interrupt_force_does_not_replace_foreign_lease(
         self, mock_run_tmux, _mock_alive, _mock_processes
     ) -> None:
@@ -25199,18 +25199,18 @@ google_accounts:
             root = Path(tmpdir)
             state = root / "state"
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "send-keys"], 0, "", "")
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
-                "codex_master.server.AGENTS",
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch.dict(
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}},
                 clear=False,
-            ), patch("codex_master.server.pane_pid", return_value=123):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+            ), patch("the_hive.server.pane_pid", return_value=123):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"):
                     result = interrupt_agent("a", force=True)
                     current = agent_lease_status("a")
 
@@ -25231,17 +25231,17 @@ google_accounts:
                 "raw_output": "not_returned",
                 "response_output": "not_returned",
             }
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("b", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"), patch(
-                    "codex_master.server.status_agent", return_value=recent_status
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"), patch(
+                    "the_hive.server.status_agent", return_value=recent_status
                 ):
                     with self.assertRaises(AgentBusyError):
                         claim_agent("b", recover_stopped=True)
@@ -25250,16 +25250,16 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"):
                     blocked = handle_rpc(
                         {
                             "jsonrpc": "2.0",
@@ -25276,8 +25276,8 @@ google_accounts:
         self.assertEqual(forced["status"], "released")
         self.assertEqual(forced["lease"]["state"], "unclaimed")
 
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.start_agent")
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.start_agent")
     def test_start_agent_with_lease_releases_fresh_successful_start(self, mock_start_agent, _mock_tmux_alive) -> None:
         def fake_start(agent, cwd=None, prompt=None, lease=None, release_lease_on_failure=False, **kwargs):
             return {
@@ -25292,16 +25292,16 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     result = start_agent_with_lease("a", "/tmp/work", "hi", allow_unauthenticated=True)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"):
                     next_claim = claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
 
         self.assertEqual(result["status"], "started")
@@ -25311,30 +25311,30 @@ google_accounts:
 
     def test_start_agent_with_lease_keeps_claim_when_start_fails_with_home_process(self) -> None:
         with patch.dict(
-            "codex_master.server.AGENTS",
+            "the_hive.server.AGENTS",
             {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
             clear=True,
         ), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": False, "auth_state": "empty"}
-        ), patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
-            "codex_master.server.tmux_alive", return_value=False
+            "the_hive.server.agent_auth_status", return_value={"authenticated": False, "auth_state": "empty"}
+        ), patch("the_hive.server.ensure_agent_not_blocked_by_codex_usage"), patch(
+            "the_hive.server.tmux_alive", return_value=False
         ), patch(
-            "codex_master.server.claim_agent",
+            "the_hive.server.claim_agent",
             return_value={
                 "status": "claimed",
                 "lease": {"state": "held", "held_by_this_server": True},
             },
-        ), patch("codex_master.server.start_agent", side_effect=AgentError("tmux pipe-pane failed")), patch(
-            "codex_master.server.agent_home_process_summary",
+        ), patch("the_hive.server.start_agent", side_effect=AgentError("tmux pipe-pane failed")), patch(
+            "the_hive.server.agent_home_process_summary",
             return_value={"process_count": 1, "external_process_count": 1, "managed_process_count": 0},
-        ), patch("codex_master.server.release_agent") as mock_release:
+        ), patch("the_hive.server.release_agent") as mock_release:
             with self.assertRaisesRegex(AgentError, "tmux pipe-pane failed"):
                 start_agent_with_lease("a1", allow_unauthenticated=True)
 
         mock_release.assert_not_called()
 
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.start_agent")
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.start_agent")
     def test_start_agent_with_lease_keeps_existing_same_client_claim(self, mock_start_agent, _mock_tmux_alive) -> None:
         def fake_start(agent, cwd=None, prompt=None, lease=None, release_lease_on_failure=False, **kwargs):
             return {
@@ -25349,17 +25349,17 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
                     result = start_agent_with_lease("a", "/tmp/work", "hi", allow_unauthenticated=True)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"):
                     with self.assertRaisesRegex(AgentError, "leased by another MCP client"):
                         claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
 
@@ -25367,22 +25367,22 @@ google_accounts:
         self.assertEqual(result["lease"]["holder"], "this_server")
         self.assertFalse(mock_start_agent.call_args.kwargs["release_lease_on_failure"])
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.start_agent")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.start_agent")
     def test_start_agent_with_lease_blocks_running_foreign_lease(self, mock_start_agent, _mock_tmux_alive) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("b", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"):
                     with self.assertRaises(AgentBusyError) as caught:
                         start_agent_with_lease("b", "/tmp/work", "hi", allow_unauthenticated=True)
 
@@ -25391,9 +25391,9 @@ google_accounts:
         self.assertEqual(caught.exception.payload["raw_output"], "not_returned")
         mock_start_agent.assert_not_called()
 
-    @patch("codex_master.server.start_agent")
-    @patch("codex_master.server.claim_agent")
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.start_agent")
+    @patch("the_hive.server.claim_agent")
+    @patch("the_hive.server.tmux_alive", return_value=True)
     def test_start_agent_with_lease_rejects_running_model_mismatch(
         self, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
@@ -25412,19 +25412,19 @@ google_accounts:
         }
 
         with patch(
-            "codex_master.server.agent_auth_status",
+            "the_hive.server.agent_auth_status",
             return_value={"authenticated": True, "auth_state": "present_regular"},
         ):
             with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
                 start_agent_with_lease("a")
 
 
-    @patch("codex_master.server.release_agent")
-    @patch("codex_master.server.agent_home_process_summary", return_value={"process_count": 1})
-    @patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True})
-    @patch("codex_master.server.start_agent")
-    @patch("codex_master.server.claim_agent")
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.release_agent")
+    @patch("the_hive.server.agent_home_process_summary", return_value={"process_count": 1})
+    @patch("the_hive.server.agent_lease_status", return_value={"held_by_this_server": True})
+    @patch("the_hive.server.start_agent")
+    @patch("the_hive.server.claim_agent")
+    @patch("the_hive.server.tmux_alive", return_value=True)
     def test_start_agent_with_lease_releases_transient_claim_for_existing_session_failure(
         self,
         _mock_alive,
@@ -25453,9 +25453,9 @@ google_accounts:
 
         mock_release.assert_called_once_with("a1", force=True)
 
-    @patch("codex_master.server.start_agent")
-    @patch("codex_master.server.claim_agent")
-    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.start_agent")
+    @patch("the_hive.server.claim_agent")
+    @patch("the_hive.server.tmux_alive", return_value=False)
     def test_start_agent_with_lease_rechecks_raced_running_session_model(
         self, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
@@ -25474,17 +25474,17 @@ google_accounts:
         }
 
         with patch(
-            "codex_master.server.agent_lease_status",
+            "the_hive.server.agent_lease_status",
             return_value={"held_by_this_server": True},
-        ), patch("codex_master.server.release_agent") as mock_release:
+        ), patch("the_hive.server.release_agent") as mock_release:
             with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
                 start_agent_with_lease("a", allow_unauthenticated=True)
             mock_release.assert_called_once_with("a1", force=True)
 
 
-    @patch("codex_master.server.start_agent")
-    @patch("codex_master.server.claim_agent")
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.start_agent")
+    @patch("the_hive.server.claim_agent")
+    @patch("the_hive.server.tmux_alive", return_value=True)
     def test_start_agent_with_lease_rejects_running_reasoning_effort_mismatch(
         self, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
@@ -25502,17 +25502,17 @@ google_accounts:
             "raw_output": "not_returned",
         }
 
-        with patch("codex_master.server.agent_auth_status", return_value={"authenticated": True}):
+        with patch("the_hive.server.agent_auth_status", return_value={"authenticated": True}):
             with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
                 start_agent_with_lease("a", allow_unauthenticated=True)
 
 
     def test_start_agent_with_lease_claims_transient_lease_for_running_session(self) -> None:
         lease = {"state": "held", "holder": "this_server", "held_by_this_server": True}
-        with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.claim_agent", return_value={"status": "claimed", "lease": lease}
+        with patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.claim_agent", return_value={"status": "claimed", "lease": lease}
         ) as mock_claim, patch(
-            "codex_master.server.start_agent",
+            "the_hive.server.start_agent",
             return_value={
                 "agent": "a",
                 "status": "already_running",
@@ -25520,10 +25520,10 @@ google_accounts:
                 "raw_output": "not_returned",
             },
         ) as mock_start, patch(
-            "codex_master.server.agent_lease_status",
+            "the_hive.server.agent_lease_status",
             return_value={"held_by_this_server": True},
         ), patch(
-            "codex_master.server.release_agent", return_value={"lease": {"state": "unclaimed"}}
+            "the_hive.server.release_agent", return_value={"lease": {"state": "unclaimed"}}
         ) as mock_release:
             result = start_agent_with_lease("a", allow_unauthenticated=True)
 
@@ -25575,8 +25575,8 @@ google_accounts:
         self.assertEqual(result["identity"], "not_returned")
         self.assertEqual(result["raw_output"], "not_returned")
 
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.call_agent_lifecycle")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.call_agent_lifecycle")
     def test_agent_claim_wait_defaults_to_forever_and_retries_until_free(self, mock_lifecycle, mock_sleep) -> None:
         success = {
             "agent": "a",
@@ -25600,7 +25600,7 @@ google_accounts:
         self.assertEqual(result["poll_count"], 1)
         mock_sleep.assert_called_once_with(30.0)
 
-    @patch("codex_master.server.call_agent_lifecycle")
+    @patch("the_hive.server.call_agent_lifecycle")
     def test_agent_claim_wait_finite_seconds_has_no_600_second_maximum(self, mock_lifecycle) -> None:
         mock_lifecycle.return_value = {
             "agent": "a",
@@ -25617,7 +25617,7 @@ google_accounts:
         self.assertTrue(result["recover_stopped"])
         self.assertEqual(result["stopped_grace_seconds"], DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
 
-    @patch("codex_master.server.call_agent_lifecycle")
+    @patch("the_hive.server.call_agent_lifecycle")
     def test_agent_claim_wait_handles_huge_finite_wait_without_float_overflow(self, mock_lifecycle) -> None:
         mock_lifecycle.return_value = {
             "agent": "a",
@@ -25656,11 +25656,11 @@ google_accounts:
                 finally:
                     claim_done.set()
 
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"):
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"):
                 holder = threading.Thread(target=hold_lifecycle_lock)
                 holder.start()
                 self.assertTrue(lock_held.wait(1))
@@ -25720,14 +25720,14 @@ google_accounts:
             )
         )
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.run_tmux")
     def test_pane_tail_can_read_visible_screen_without_scrollback(self, mock_run_tmux, _mock_alive) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(
             ["tmux", "capture-pane"], 0, "› Ready\n", ""
         )
 
-        from codex_master.server import pane_tail
+        from the_hive.server import pane_tail
 
         self.assertEqual(pane_tail("a", 24, visible_only=True), "› Ready\n")
         mock_run_tmux.assert_called_once_with(
@@ -25741,19 +25741,19 @@ google_accounts:
             )
         )
 
-    @patch("codex_master.server.require_managed_tmux_session")
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.require_managed_tmux_session")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.run_tmux")
     def test_pane_tail_can_recheck_identity_before_capture(self, mock_run_tmux, _mock_alive, mock_identity) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "capture-pane"], 0, "› Ready\n", "")
 
-        from codex_master.server import pane_tail
+        from the_hive.server import pane_tail
 
         self.assertEqual(pane_tail("a", 24, verify_identity=True), "› Ready\n")
         mock_identity.assert_called_once_with("a1")
 
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.require_managed_tmux_session")
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.require_managed_tmux_session")
     def test_dismiss_codex_update_prompt_never_selects_update(self, _mock_identity, mock_run_tmux) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
 
@@ -25795,9 +25795,9 @@ google_accounts:
             events.append(args[-1])
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-        with patch("codex_master.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
-            "codex_master.server.run_tmux", side_effect=fake_run_tmux
-        ), patch("codex_master.server.require_managed_tmux_session"):
+        with patch("the_hive.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
+            "the_hive.server.run_tmux", side_effect=fake_run_tmux
+        ), patch("the_hive.server.require_managed_tmux_session"):
             result = dismiss_codex_update_prompt(
                 "a",
                 "Update available! 0.144.4 -> 0.144.5\n› 1. Update now\n2. Skip\nPress enter to continue\n",
@@ -25806,9 +25806,9 @@ google_accounts:
         self.assertTrue(result)
         self.assertEqual(events, ["lock", "Down", "Enter", "unlock"])
 
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.require_managed_tmux_session")
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.require_managed_tmux_session")
     def test_wait_agent_input_ready_skips_known_update_prompt(
         self, _mock_identity, mock_pane_tail, mock_run_tmux
     ) -> None:
@@ -25824,11 +25824,11 @@ google_accounts:
         self.assertTrue(result["update_prompt_dismissed"])
         self.assertEqual([call.args[0][-1] for call in mock_run_tmux.call_args_list], ["Down", "Enter"])
 
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.time.monotonic", side_effect=[0.0, 0.0, 0.0])
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.require_managed_tmux_session")
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.time.monotonic", side_effect=[0.0, 0.0, 0.0])
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.require_managed_tmux_session")
     def test_wait_agent_input_ready_handles_update_prompt_after_empty_poll(
         self, _mock_identity, mock_pane_tail, mock_run_tmux, _mock_monotonic, _mock_sleep
     ) -> None:
@@ -25844,9 +25844,9 @@ google_accounts:
         self.assertTrue(result["ready"])
         self.assertTrue(result["update_prompt_dismissed"])
 
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.require_managed_tmux_session")
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.require_managed_tmux_session")
     def test_wait_agent_input_ready_confirms_project_trust_prompt(
         self, _mock_identity, mock_pane_tail, mock_run_tmux
     ) -> None:
@@ -25862,9 +25862,9 @@ google_accounts:
         self.assertTrue(result["trust_prompt_dismissed"])
         self.assertEqual([call.args[0][-1] for call in mock_run_tmux.call_args_list], ["Enter"])
 
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.require_managed_tmux_session")
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.require_managed_tmux_session")
     def test_wait_agent_input_ready_ignores_stale_report_press_enter_prompt(
         self, _mock_identity, mock_pane_tail, mock_run_tmux
     ) -> None:
@@ -25880,11 +25880,11 @@ google_accounts:
         self.assertFalse(result["update_prompt_dismissed"])
         mock_run_tmux.assert_not_called()
 
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.time.monotonic", side_effect=[0.0, 2.0])
-    @patch("codex_master.server.time.sleep")
-    @patch("codex_master.server.pane_tail")
-    @patch("codex_master.server.require_managed_tmux_session")
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.time.monotonic", side_effect=[0.0, 2.0])
+    @patch("the_hive.server.time.sleep")
+    @patch("the_hive.server.pane_tail")
+    @patch("the_hive.server.require_managed_tmux_session")
     def test_wait_agent_input_ready_fails_closed_for_unknown_press_enter_prompt(
         self,
         _mock_identity,
@@ -25903,7 +25903,7 @@ google_accounts:
         mock_run_tmux.assert_not_called()
 
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -25915,9 +25915,9 @@ google_accounts:
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.run_tmux")
     def test_interrupt_releases_fresh_lease_when_tmux_fails(
         self, mock_run_tmux, _mock_pane_pid, _mock_alive, _mock_processes
     ) -> None:
@@ -25930,14 +25930,14 @@ google_accounts:
                 f"SECRET_INTERRUPT_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
             )
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
             ):
@@ -25952,7 +25952,7 @@ google_accounts:
         self.assertNotIn(tmpdir, error_text)
 
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         side_effect=[
             {
                 "process_count": 1,
@@ -25974,9 +25974,9 @@ google_accounts:
             },
         ],
     )
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.tmux_alive", side_effect=[True, False])
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.tmux_alive", side_effect=[True, False])
+    @patch("the_hive.server.run_tmux")
     def test_interrupt_treats_session_vanishing_before_send_as_not_running(
         self, mock_run_tmux, _mock_alive, _mock_pane_pid, _mock_processes
     ) -> None:
@@ -25984,12 +25984,12 @@ google_accounts:
             root = Path(tmpdir)
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "send-keys"], 1, "", "")
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
-                "codex_master.server.AGENTS",
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch.dict(
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
             ):
@@ -25998,14 +25998,14 @@ google_accounts:
         self.assertEqual(result["status"], "not_running")
         self.assertEqual(result["lease"]["state"], "unclaimed")
 
-    @patch("codex_master.server.start_agent", return_value={"agent": "a1", "status": "started"})
+    @patch("the_hive.server.start_agent", return_value={"agent": "a1", "status": "started"})
     @patch(
-        "codex_master.server.claim_agent",
+        "the_hive.server.claim_agent",
         return_value={"status": "claimed", "lease": {"state": "held", "held_by_this_server": True}},
     )
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_auth_status",
+        "the_hive.server.agent_auth_status",
         return_value={
             "authenticated": True,
             "auth_state": "present_regular",
@@ -26013,7 +26013,7 @@ google_accounts:
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.agent_lifecycle_lock")
+    @patch("the_hive.server.agent_lifecycle_lock")
     def test_call_tool_agent_start_acquires_lifecycle_lock(
         self, mock_lock, _mock_auth, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
@@ -26032,7 +26032,7 @@ google_accounts:
 
         mock_lock.side_effect = lambda agent: FakeLock(agent)
 
-        with patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"):
+        with patch("the_hive.server.ensure_agent_not_blocked_by_codex_usage"):
             result = call_tool("agent_start", {"agent": "a", "cwd": "/tmp/work", "prompt": "hi"})
 
         self.assertEqual(result["results"][0]["agent"], "a1")
@@ -26054,7 +26054,7 @@ google_accounts:
             agent_class="arbeitsbiene",
         )
 
-    @patch("codex_master.server.applet_status")
+    @patch("the_hive.server.applet_status")
     def test_call_tool_delegates_to_master_applet_status(self, mock_applet_status) -> None:
         mock_applet_status.return_value = {"schema_version": 1, "mode": "read_only"}
 
@@ -26063,7 +26063,7 @@ google_accounts:
         self.assertEqual(result["schema_version"], 1)
         mock_applet_status.assert_called_once_with(["a1", "b1"], schema_version=1)
 
-    @patch("codex_master.server.applet_status")
+    @patch("the_hive.server.applet_status")
     def test_validated_master_applet_status_keeps_schema_v3_route(self, mock_applet_status) -> None:
         expected = {"schema_version": 3, "raw_output": "not_returned"}
         mock_applet_status.return_value = expected
@@ -26076,8 +26076,8 @@ google_accounts:
         self.assertEqual(result, expected)
         mock_applet_status.assert_called_once_with([], schema_version=3)
 
-    @patch("codex_master.server._start_agent_with_lease_unlocked", return_value={"status": "started"})
-    @patch("codex_master.server.agent_lifecycle_lock")
+    @patch("the_hive.server._start_agent_with_lease_unlocked", return_value={"status": "started"})
+    @patch("the_hive.server.agent_lifecycle_lock")
     def test_direct_start_agent_with_lease_acquires_lifecycle_lock(self, mock_lock, mock_unlocked) -> None:
         events = []
 
@@ -26169,8 +26169,8 @@ google_accounts:
         )
         headless_start.assert_not_called()
 
-    @patch("codex_master.server._start_agent_unlocked", return_value={"status": "started"})
-    @patch("codex_master.server.agent_lifecycle_lock")
+    @patch("the_hive.server._start_agent_unlocked", return_value={"status": "started"})
+    @patch("the_hive.server.agent_lifecycle_lock")
     def test_direct_start_agent_acquires_lifecycle_lock(self, mock_lock, mock_unlocked) -> None:
         events = []
 
@@ -28187,8 +28187,8 @@ google_accounts:
 
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "replacement\n")
 
-    @patch("codex_master.server._assign_agent_unlocked", return_value={"status": "assigned"})
-    @patch("codex_master.server.agent_lifecycle_lock")
+    @patch("the_hive.server._assign_agent_unlocked", return_value={"status": "assigned"})
+    @patch("the_hive.server.agent_lifecycle_lock")
     def test_direct_assign_agent_acquires_lifecycle_lock(self, mock_lock, mock_unlocked) -> None:
         events = []
 
@@ -28220,8 +28220,8 @@ google_accounts:
             allow_unauthenticated=True,
         )
 
-    @patch("codex_master.server._request_agent_report_unlocked", return_value={"status": "report_requested"})
-    @patch("codex_master.server.agent_lifecycle_lock")
+    @patch("the_hive.server._request_agent_report_unlocked", return_value={"status": "report_requested"})
+    @patch("the_hive.server.agent_lifecycle_lock")
     def test_direct_request_agent_report_acquires_lifecycle_lock(self, mock_lock, mock_unlocked) -> None:
         events = []
 
@@ -28252,7 +28252,7 @@ google_accounts:
         )
 
     def test_direct_watchdog_agent_acquires_lifecycle_lock(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         events = []
 
@@ -28298,7 +28298,7 @@ google_accounts:
         )
 
     def test_direct_usage_watchdog_acquires_lifecycle_lock_when_mutating(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         events = []
 
@@ -28328,7 +28328,7 @@ google_accounts:
             "a1", dry_run=False, safe_shutdown_only=False
         )
 
-    @patch("codex_master.server.claim_agent_with_wait")
+    @patch("the_hive.server.claim_agent_with_wait")
     def test_mutating_tools_require_auth_by_default_and_allow_bootstrap_override(self, mock_claim_with_wait) -> None:
         mock_claim_with_wait.return_value = {
             "agent": "c2",
@@ -28339,12 +28339,12 @@ google_accounts:
             state = Path(tmpdir) / "state"
             home = Path(tmpdir) / "c2"
             home.mkdir()
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
-                "codex_master.server.AGENTS",
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch.dict(
+                "the_hive.server.AGENTS",
                 {"c2": {"label": "C2", "runner": home / "codex", "home": home, "session": "session-c2"}},
                 clear=False,
             ):
@@ -28374,7 +28374,7 @@ google_accounts:
         mock_claim_with_wait.assert_called_once()
 
     @patch(
-        "codex_master.server.codex_usage_watchdog_status",
+        "the_hive.server.codex_usage_watchdog_status",
         return_value={
             "agent": "a",
             "state": "blocked",
@@ -28384,7 +28384,7 @@ google_accounts:
             "source": "marker",
         },
     )
-    @patch("codex_master.server.tmux_alive")
+    @patch("the_hive.server.tmux_alive")
     def test_start_refuses_codex_usage_block_before_tmux(self, mock_alive, _mock_usage) -> None:
         with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
             start_agent_with_lease("a", allow_unauthenticated=True)
@@ -28392,7 +28392,7 @@ google_accounts:
         mock_alive.assert_not_called()
 
     @patch(
-        "codex_master.server.codex_usage_watchdog_status",
+        "the_hive.server.codex_usage_watchdog_status",
         return_value={
             "agent": "a",
             "state": "blocked",
@@ -28402,7 +28402,7 @@ google_accounts:
             "source": "marker",
         },
     )
-    @patch("codex_master.server.call_agent_lifecycle")
+    @patch("the_hive.server.call_agent_lifecycle")
     def test_claim_wait_refuses_codex_usage_block_before_lease(self, mock_lifecycle, _mock_usage) -> None:
         mock_lifecycle.side_effect = lambda _agent, fn, **_kwargs: fn()
 
@@ -28424,9 +28424,9 @@ google_accounts:
                 raise AgentError("agent a is blocked by codex-usage watchdog")
             return {"blocked": False}
 
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=fake_lifecycle), patch(
-            "codex_master.server.ensure_agent_not_blocked_by_codex_usage", side_effect=fake_usage_check
-        ), patch("codex_master.server.claim_agent") as mock_claim:
+        with patch("the_hive.server.call_agent_lifecycle", side_effect=fake_lifecycle), patch(
+            "the_hive.server.ensure_agent_not_blocked_by_codex_usage", side_effect=fake_usage_check
+        ), patch("the_hive.server.claim_agent") as mock_claim:
             with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
                 claim_agent_with_wait("a", wait_seconds=0)
 
@@ -28457,20 +28457,20 @@ google_accounts:
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
             state = root / "state"
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test-session"}},
                 clear=False,
-            ), patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.tmux_alive", return_value=False
+            ), patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.tmux_alive", return_value=False
             ), patch(
-                "codex_master.server.agent_home_process_summary", return_value=process_summary
+                "the_hive.server.agent_home_process_summary", return_value=process_summary
             ), patch(
-                "codex_master.server.require_spawn_capacity", side_effect=capacity_error, create=True
-            ) as require_capacity, patch("codex_master.server.run_tmux") as run_tmux_mock:
+                "the_hive.server.require_spawn_capacity", side_effect=capacity_error, create=True
+            ) as require_capacity, patch("the_hive.server.run_tmux") as run_tmux_mock:
                 with self.assertRaises(AgentError) as raised:
                     start_agent("a", cwd=tmpdir)
 
@@ -28566,28 +28566,28 @@ google_accounts:
                 agent: {"label": agent.upper(), "runner": runner, "home": root, "session": f"session-{agent}"}
                 for agent, runner in runners.items()
             }
-            with patch.dict("codex_master.server.AGENTS", agents, clear=True), patch(
-                "codex_master.server.STATE_ROOT", state
-            ), patch("codex_master.server.RAW_DIR", state / "raw"), patch(
-                "codex_master.server.META_DIR", state / "meta"
-            ), patch("codex_master.server.LOCK_DIR", state / "locks"), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+            with patch.dict("the_hive.server.AGENTS", agents, clear=True), patch(
+                "the_hive.server.STATE_ROOT", state
+            ), patch("the_hive.server.RAW_DIR", state / "raw"), patch(
+                "the_hive.server.META_DIR", state / "meta"
+            ), patch("the_hive.server.LOCK_DIR", state / "locks"), patch(
+                "the_hive.server.LEASE_DIR", state / "leases"
             ), patch(
-                "codex_master.server.agent_lifecycle_lock", side_effect=lambda *_args, **_kwargs: LifecycleLock()
+                "the_hive.server.agent_lifecycle_lock", side_effect=lambda *_args, **_kwargs: LifecycleLock()
             ), patch(
-                "codex_master.server.spawn_admission_lock", side_effect=lambda: AdmissionLock(), create=True
+                "the_hive.server.spawn_admission_lock", side_effect=lambda: AdmissionLock(), create=True
             ) as admission_lock, patch(
-                "codex_master.server.require_spawn_capacity", side_effect=require_capacity, create=True
-            ) as capacity_gate, patch("codex_master.server.tmux_alive", return_value=False), patch(
-                "codex_master.server.agent_home_process_summary", return_value=process_summary
+                "the_hive.server.require_spawn_capacity", side_effect=require_capacity, create=True
+            ) as capacity_gate, patch("the_hive.server.tmux_alive", return_value=False), patch(
+                "the_hive.server.agent_home_process_summary", return_value=process_summary
             ), patch(
-                "codex_master.server._g5_start_scope",
+                "the_hive.server._g5_start_scope",
                 side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
-            ), patch("codex_master.server._start_g5_warmup"), patch(
-                "codex_master.server.run_tmux", side_effect=fake_run_tmux
+            ), patch("the_hive.server._start_g5_warmup"), patch(
+                "the_hive.server.run_tmux", side_effect=fake_run_tmux
             ), patch(
-                "codex_master.server.pane_pid", return_value=123
-            ), patch("codex_master.server.write_meta"):
+                "the_hive.server.pane_pid", return_value=123
+            ), patch("the_hive.server.write_meta"):
                 first = threading.Thread(target=run, args=("a1", tmpdir))
                 second = threading.Thread(target=run, args=("b1", tmpdir))
                 first.start()
@@ -28623,26 +28623,26 @@ google_accounts:
             runner.write_text("#!/bin/sh\n", encoding="utf-8")
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test-session"}},
                 clear=False,
-            ), patch("codex_master.server.ensure_state"), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.agent_home_process_summary", return_value=process_summary), patch(
-                "codex_master.server.pane_pid", return_value=321
-            ), patch("codex_master.server.read_meta", return_value={}), patch(
-                "codex_master.server.require_spawn_capacity", create=True
+            ), patch("the_hive.server.ensure_state"), patch(
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.agent_home_process_summary", return_value=process_summary), patch(
+                "the_hive.server.pane_pid", return_value=321
+            ), patch("the_hive.server.read_meta", return_value={}), patch(
+                "the_hive.server.require_spawn_capacity", create=True
             ) as require_capacity:
                 result = start_agent("a", cwd=tmpdir)
 
         self.assertEqual(result["status"], "already_running")
         require_capacity.assert_not_called()
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.run_tmux")
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "external_process_count": 1,
@@ -28659,11 +28659,11 @@ google_accounts:
             runner = Path(tmpdir) / "codex"
             write_managed_codex_launcher_for_test(runner, Path(tmpdir))
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
             ), patch(
-                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+                "the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ):
                 with self.assertRaisesRegex(RuntimeError, "CODEX_HOME is already used"):
                     start_agent("a", cwd=tmpdir)
@@ -28671,11 +28671,11 @@ google_accounts:
         mock_summary.assert_called_once_with("a")
         mock_run_tmux.assert_not_called()
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.run_tmux")
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "external_process_count": 0,
@@ -28695,11 +28695,11 @@ google_accounts:
             runner.write_text("#!/bin/sh\n", encoding="utf-8")
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
             ), patch(
-                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+                "the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ):
                 with self.assertRaisesRegex(AgentError, "managed process\\(es\\) without the managed tmux session"):
                     start_agent("a", cwd=tmpdir)
@@ -28707,8 +28707,8 @@ google_accounts:
         mock_summary.assert_called_once_with("a")
         mock_run_tmux.assert_not_called()
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.run_tmux")
     def test_start_agent_refuses_symlink_runner(self, mock_run_tmux, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "target-codex"
@@ -28718,7 +28718,7 @@ google_accounts:
             runner.symlink_to(target)
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
             ):
@@ -28729,8 +28729,8 @@ google_accounts:
         self.assertTrue(runner_is_symlink)
         mock_run_tmux.assert_not_called()
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.run_tmux")
     def test_start_agent_refuses_hardlink_wrapper_before_tmux_metadata(
         self, mock_run_tmux, _mock_ensure_state
     ) -> None:
@@ -28741,7 +28741,7 @@ google_accounts:
             os.link(runner, root / "codex-hardlink")
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
             ):
@@ -28750,9 +28750,9 @@ google_accounts:
 
         mock_run_tmux.assert_not_called()
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.run_tmux")
     def test_start_agent_rejects_runner_swap_before_launch(
         self, mock_run_tmux, _mock_tmux_alive, _mock_ensure_state
     ) -> None:
@@ -28781,19 +28781,19 @@ google_accounts:
                 }
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.META_DIR", root / "meta"
-            ), patch("codex_master.server.agent_home_process_summary", side_effect=swap_after_process_scan), patch(
-                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+            ), patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.META_DIR", root / "meta"
+            ), patch("the_hive.server.agent_home_process_summary", side_effect=swap_after_process_scan), patch(
+                "the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ), patch(
-                "codex_master.server._g5_start_scope",
+                "the_hive.server._g5_start_scope",
                 side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
-            ), patch("codex_master.server._start_g5_warmup"), patch(
-                "codex_master.server.prune_raw_logs"
-            ), patch("codex_master.server.write_meta"):
+            ), patch("the_hive.server._start_g5_warmup"), patch(
+                "the_hive.server.prune_raw_logs"
+            ), patch("the_hive.server.write_meta"):
                 with self.assertRaisesRegex(AgentError, "managed_codex_runner_changed"):
                     start_agent("a", cwd=tmpdir)
 
@@ -28801,11 +28801,11 @@ google_accounts:
             self.assertTrue(runner.exists())
             mock_run_tmux.assert_not_called()
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.run_tmux")
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 0,
             "external_process_count": 0,
@@ -28826,11 +28826,11 @@ google_accounts:
             secret_cwd = tmp_path / "secret-cwd-do-not-return"
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
                 clear=False,
             ), patch(
-                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+                "the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ):
                 with self.assertRaisesRegex(AgentError, "cwd is not a directory") as raised:
                     start_agent("a", cwd=str(secret_cwd))
@@ -28840,9 +28840,9 @@ google_accounts:
         self.assertNotIn("secret-cwd-do-not-return", error_text)
         mock_run_tmux.assert_not_called()
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     @patch(
-        "codex_master.server.read_meta",
+        "the_hive.server.read_meta",
         return_value={
             "agent": "a",
             "backend": "tmux",
@@ -28854,10 +28854,10 @@ google_accounts:
             "model": "gpt-5.4-mini",
         },
     )
-    @patch("codex_master.server.pane_pid", return_value=321)
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.pane_pid", return_value=321)
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -28877,7 +28877,7 @@ google_accounts:
             runner.write_text("#!/bin/sh\n", encoding="utf-8")
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
             ):
@@ -28896,10 +28896,10 @@ google_accounts:
         self.assertNotIn("/tmp/private-agent", json.dumps(result, sort_keys=True))
         self.assertEqual(result["raw_output"], "not_returned")
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 0,
             "external_process_count": 0,
@@ -28918,17 +28918,17 @@ google_accounts:
             runner.write_text("#!/bin/sh\n", encoding="utf-8")
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
             ):
                 with self.assertRaisesRegex(AgentError, "session identity could not be verified"):
                     start_agent("a", cwd=tmpdir)
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": None,
             "external_process_count": None,
@@ -28946,18 +28946,18 @@ google_accounts:
             runner.write_text("#!/bin/sh\n", encoding="utf-8")
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
             ):
                 with self.assertRaisesRegex(AgentError, "process scan is unavailable"):
                     start_agent("a", cwd=tmpdir)
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.pane_pid", return_value=321)
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.pane_pid", return_value=321)
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 2,
             "external_process_count": 1,
@@ -28975,18 +28975,18 @@ google_accounts:
             runner.write_text("#!/bin/sh\n", encoding="utf-8")
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
             ):
                 with self.assertRaisesRegex(RuntimeError, "already running in tmux"):
                     start_agent("a", cwd=tmpdir)
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.write_meta")
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.tmux_alive", side_effect=[False, True])
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.write_meta")
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.tmux_alive", side_effect=[False, True])
+    @patch("the_hive.server.run_tmux")
     def test_start_agent_cleans_up_session_when_pipe_fails(
         self, mock_run_tmux, _mock_alive, _mock_pane_pid, _mock_write_meta, _mock_ensure_state
     ) -> None:
@@ -29009,13 +29009,13 @@ google_accounts:
 
             mock_run_tmux.side_effect = fake_run_tmux
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch(
-                "codex_master.server.META_DIR", Path(tmpdir)
-            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION), patch(
-                "codex_master.server._g5_start_scope",
+            ), patch("the_hive.server.RAW_DIR", Path(tmpdir)), patch(
+                "the_hive.server.META_DIR", Path(tmpdir)
+            ), patch("the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION), patch(
+                "the_hive.server._g5_start_scope",
                 side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
             ):
                 with self.assertRaisesRegex(RuntimeError, "pipe-pane failed") as raised:
@@ -29050,22 +29050,22 @@ google_accounts:
                 return subprocess.CompletedProcess(["tmux", *args], code, "", "")
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", root), patch(
-                "codex_master.server.META_DIR", root / "meta"
-            ), patch("codex_master.server.ensure_state"), patch(
-                "codex_master.server.tmux_alive", side_effect=[False, True]
-            ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux), patch(
-                "codex_master.server.agent_home_process_summary", side_effect=summaries
+            ), patch("the_hive.server.RAW_DIR", root), patch(
+                "the_hive.server.META_DIR", root / "meta"
+            ), patch("the_hive.server.ensure_state"), patch(
+                "the_hive.server.tmux_alive", side_effect=[False, True]
+            ), patch("the_hive.server.run_tmux", side_effect=fake_run_tmux), patch(
+                "the_hive.server.agent_home_process_summary", side_effect=summaries
             ) as mock_summary, patch(
-                "codex_master.server.agent_lease_status",
+                "the_hive.server.agent_lease_status",
                 return_value={"held_by_this_server": True},
-            ), patch("codex_master.server.release_agent") as mock_release, patch(
-                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+            ), patch("the_hive.server.release_agent") as mock_release, patch(
+                "the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ), patch(
-                "codex_master.server._g5_start_scope",
+                "the_hive.server._g5_start_scope",
                 side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
             ):
                 with self.assertRaisesRegex(AgentError, "tmux pipe-pane failed"):
@@ -29079,10 +29079,10 @@ google_accounts:
         self.assertEqual(mock_summary.call_count, 2)
         mock_release.assert_not_called()
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.write_meta", side_effect=AgentError("meta failed"))
-    @patch("codex_master.server.tmux_alive", side_effect=[False, True])
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.write_meta", side_effect=AgentError("meta failed"))
+    @patch("the_hive.server.tmux_alive", side_effect=[False, True])
+    @patch("the_hive.server.run_tmux")
     def test_start_agent_cleans_up_session_when_meta_write_fails(
         self, mock_run_tmux, _mock_alive, _mock_write_meta, _mock_ensure_state
     ) -> None:
@@ -29096,13 +29096,13 @@ google_accounts:
 
             mock_run_tmux.side_effect = fake_run_tmux
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", root), patch(
-                "codex_master.server.META_DIR", root
-            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION), patch(
-                "codex_master.server._g5_start_scope",
+            ), patch("the_hive.server.RAW_DIR", root), patch(
+                "the_hive.server.META_DIR", root
+            ), patch("the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION), patch(
+                "the_hive.server._g5_start_scope",
                 side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
             ):
                 with self.assertRaisesRegex(AgentError, "meta failed"):
@@ -29114,10 +29114,10 @@ google_accounts:
         self.assertEqual(len(kill_calls), 1)
         self.assertEqual(leftover_logs, [])
 
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -29129,8 +29129,8 @@ google_accounts:
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.run_tmux")
     def test_stop_agent_tmux_failure_is_data_sparse(
         self, mock_run_tmux, _mock_pane_pid, _mock_processes, _mock_alive, _mock_lease
     ) -> None:
@@ -29150,7 +29150,7 @@ google_accounts:
                 ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
             )
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
             ), server_module.temporary_agent_inventory(inventory):
@@ -29165,21 +29165,21 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
-                "codex_master.server.AGENTS",
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch.dict(
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}},
                 clear=True,
-            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
-                "codex_master.server.ensure_agent_lease_available", return_value={"state": "held"}
+            ), patch("the_hive.server.tmux_alive", return_value=True), patch(
+                "the_hive.server.ensure_agent_lease_available", return_value={"state": "held"}
             ), patch(
-                "codex_master.server.run_tmux",
+                "the_hive.server.run_tmux",
                 return_value=subprocess.CompletedProcess(["tmux", "kill-session"], 0, "", ""),
             ), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 1,
                     "managed_process_count": 1,
@@ -29190,18 +29190,18 @@ google_accounts:
                     "external_processes_truncated": False,
                     "raw_output": "not_returned",
                 },
-            ), patch("codex_master.server.pane_pid", return_value=123), patch(
-                "codex_master.server.release_agent"
+            ), patch("the_hive.server.pane_pid", return_value=123), patch(
+                "the_hive.server.release_agent"
             ) as mock_release:
                 with self.assertRaisesRegex(AgentError, "tmux stop failed"):
                     stop_agent("a")
 
         mock_release.assert_not_called()
 
-    @patch("codex_master.server.ensure_agent_lease_available")
-    @patch("codex_master.server.tmux_alive", side_effect=[True, False])
+    @patch("the_hive.server.ensure_agent_lease_available")
+    @patch("the_hive.server.tmux_alive", side_effect=[True, False])
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         side_effect=[
             {
                 "process_count": 1,
@@ -29223,8 +29223,8 @@ google_accounts:
             },
         ],
     )
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.run_tmux")
     def test_stop_agent_releases_lease_when_session_vanishes_before_kill(
         self, mock_run_tmux, _mock_pane_pid, _mock_processes, _mock_alive, _mock_lease
     ) -> None:
@@ -29238,11 +29238,11 @@ google_accounts:
             ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
         )
         with patch.dict(
-            "codex_master.server.AGENTS",
+            "the_hive.server.AGENTS",
             {"a": {"label": "A", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "test_session"}},
             clear=False,
         ), server_module.temporary_agent_inventory(inventory), patch(
-            "codex_master.server.release_agent",
+            "the_hive.server.release_agent",
             return_value={"lease": {"state": "unclaimed", "held_by_this_server": False}},
         ) as mock_release:
             result = stop_agent("a")
@@ -29250,19 +29250,19 @@ google_accounts:
         self.assertEqual(result["status"], "stopped")
         mock_release.assert_called_once_with("a", force=True)
 
-    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.tmux_alive", return_value=False)
     def test_stop_agent_releases_own_lease_when_already_not_running(self, _mock_alive) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
             ):
@@ -29274,20 +29274,20 @@ google_accounts:
         self.assertEqual(result["lease"]["state"], "unclaimed")
         self.assertEqual(result["lease"]["holder"], "none")
 
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.agent_home_process_summary", return_value={"process_count": 1})
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.agent_home_process_summary", return_value={"process_count": 1})
     def test_stop_agent_keeps_own_lease_when_not_running_but_home_process_remains(
         self, _mock_processes, _mock_alive
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
-                "codex_master.server.AGENTS",
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch.dict(
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
             ):
@@ -29300,61 +29300,61 @@ google_accounts:
 
         self.assertEqual(lease["state"], "held")
 
-    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.tmux_alive", return_value=False)
     def test_stop_agent_keeps_foreign_lease_when_already_not_running(self, _mock_alive) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
             ):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"):
                     result = stop_agent("a")
 
         self.assertEqual(result["status"], "not_running")
         self.assertEqual(result["lease"]["state"], "held")
         self.assertEqual(result["lease"]["holder"], "other_server")
 
-    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.tmux_alive", return_value=False)
     def test_stop_agent_force_releases_foreign_lease_when_already_not_running(self, _mock_alive) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.LEASE_DIR", state / "leases"
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
             ):
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"):
                     result = stop_agent("a", force=True)
 
         self.assertEqual(result["status"], "not_running")
         self.assertEqual(result["lease"]["state"], "unclaimed")
         self.assertEqual(result["lease"]["holder"], "none")
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.write_meta")
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.write_meta")
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.run_tmux")
     def test_start_agent_does_not_return_raw_log_path(
         self, mock_run_tmux, _mock_alive, _mock_pane_pid, mock_write_meta, _mock_ensure_state
     ) -> None:
@@ -29367,13 +29367,13 @@ google_accounts:
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", raw_dir), patch("codex_master.server.META_DIR", tmp_path / "meta"), patch(
-                "codex_master.server.now_id", return_value="fixed"
+            ), patch("the_hive.server.RAW_DIR", raw_dir), patch("the_hive.server.META_DIR", tmp_path / "meta"), patch(
+                "the_hive.server.now_id", return_value="fixed"
             ), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 0,
                     "external_process_count": 0,
@@ -29382,11 +29382,11 @@ google_accounts:
                     "external_processes_truncated": False,
                     "raw_output": "not_returned",
                 },
-            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION), patch(
-                "codex_master.server._g5_start_scope",
+            ), patch("the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION), patch(
+                "the_hive.server._g5_start_scope",
                 side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
-            ), patch("codex_master.server._start_g5_warmup"), patch(
-                "codex_master.server.prune_raw_logs"
+            ), patch("the_hive.server._start_g5_warmup"), patch(
+                "the_hive.server.prune_raw_logs"
             ) as mock_prune:
                 result = start_agent("a", cwd=tmpdir)
 
@@ -29397,10 +29397,10 @@ google_accounts:
         self.assertEqual(mock_write_meta.call_args.args[1]["raw_log"], raw_log_path)
         mock_prune.assert_called_once_with()
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.write_meta")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.write_meta")
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.run_tmux")
     def test_start_agent_removes_raw_log_when_new_session_fails(
         self, mock_run_tmux, _mock_alive, _mock_write_meta, _mock_ensure_state
     ) -> None:
@@ -29410,11 +29410,11 @@ google_accounts:
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "new-session"], 1, "", "start failed")
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch("codex_master.server.META_DIR", Path(tmpdir)), patch(
-                "codex_master.server.agent_home_process_summary",
+            ), patch("the_hive.server.RAW_DIR", Path(tmpdir)), patch("the_hive.server.META_DIR", Path(tmpdir)), patch(
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 0,
                     "external_process_count": 0,
@@ -29424,7 +29424,7 @@ google_accounts:
                     "raw_output": "not_returned",
                 },
             ), patch(
-                "codex_master.server.require_spawn_capacity",
+                "the_hive.server.require_spawn_capacity",
                 return_value={
                     "allowed": True,
                     "required_slots": 1,
@@ -29432,7 +29432,7 @@ google_accounts:
                     "raw_output": "not_returned",
                 },
             ), patch(
-                "codex_master.server._g5_start_scope",
+                "the_hive.server._g5_start_scope",
                 side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
             ):
                 with self.assertRaisesRegex(RuntimeError, "tmux start failed"):
@@ -29509,24 +29509,24 @@ google_accounts:
                     "home": root,
                     "session": f"session-{agent}",
                 }
-            with patch.dict("codex_master.server.AGENTS", agents, clear=True), patch(
-                "codex_master.server.STATE_ROOT", state
-            ), patch("codex_master.server.RAW_DIR", state / "raw"), patch(
-                "codex_master.server.META_DIR", state / "meta"
-            ), patch("codex_master.server.LOCK_DIR", state / "locks"), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+            with patch.dict("the_hive.server.AGENTS", agents, clear=True), patch(
+                "the_hive.server.STATE_ROOT", state
+            ), patch("the_hive.server.RAW_DIR", state / "raw"), patch(
+                "the_hive.server.META_DIR", state / "meta"
+            ), patch("the_hive.server.LOCK_DIR", state / "locks"), patch(
+                "the_hive.server.LEASE_DIR", state / "leases"
             ), patch(
-                "codex_master.server.require_spawn_capacity", side_effect=[admission, admission]
-            ) as require_capacity, patch("codex_master.server.tmux_alive", return_value=False), patch(
-                "codex_master.server.agent_home_process_summary", return_value=process_summary
+                "the_hive.server.require_spawn_capacity", side_effect=[admission, admission]
+            ) as require_capacity, patch("the_hive.server.tmux_alive", return_value=False), patch(
+                "the_hive.server.agent_home_process_summary", return_value=process_summary
             ), patch(
-                "codex_master.server._g5_start_scope", side_effect=fake_g5_start_scope
-            ), patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}), patch(
-                "codex_master.server.release_agent"
+                "the_hive.server._g5_start_scope", side_effect=fake_g5_start_scope
+            ), patch("the_hive.server.agent_lease_status", return_value={"held_by_this_server": True}), patch(
+                "the_hive.server.release_agent"
             ) as release_agent_mock, patch(
-                "codex_master.server.run_tmux", side_effect=fake_run_tmux
-            ), patch("codex_master.server.write_meta"), patch(
-                "codex_master.server.now_id", side_effect=["first", "second"]
+                "the_hive.server.run_tmux", side_effect=fake_run_tmux
+            ), patch("the_hive.server.write_meta"), patch(
+                "the_hive.server.now_id", side_effect=["first", "second"]
             ):
                 with self.assertRaisesRegex(AgentError, "tmux start failed"):
                     start_agent(
@@ -29574,24 +29574,24 @@ google_accounts:
             runner = root / "codex"
             write_managed_codex_launcher_for_test(runner, root)
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "session-a"}},
                 clear=True,
-            ), patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.require_spawn_capacity", return_value=admission
-            ), patch("codex_master.server.tmux_alive", return_value=False), patch(
-                "codex_master.server.agent_home_process_summary", return_value=process_summary
-            ), patch("codex_master.server.prune_raw_logs"), patch(
-                "codex_master.server._g5_start_scope", side_effect=scope_error
+            ), patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.require_spawn_capacity", return_value=admission
+            ), patch("the_hive.server.tmux_alive", return_value=False), patch(
+                "the_hive.server.agent_home_process_summary", return_value=process_summary
+            ), patch("the_hive.server.prune_raw_logs"), patch(
+                "the_hive.server._g5_start_scope", side_effect=scope_error
             ), patch(
-                "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
-            ), patch("codex_master.server.release_agent") as release_agent_mock, patch(
-                "codex_master.server.run_tmux"
-            ) as run_tmux_mock, patch("codex_master.server.now_id", return_value="scope"):
+                "the_hive.server.agent_lease_status", return_value={"held_by_this_server": True}
+            ), patch("the_hive.server.release_agent") as release_agent_mock, patch(
+                "the_hive.server.run_tmux"
+            ) as run_tmux_mock, patch("the_hive.server.now_id", return_value="scope"):
                 with self.assertRaisesRegex(AgentCapacityError, "capacity unavailable"):
                     start_agent(
                         "a",
@@ -29605,10 +29605,10 @@ google_accounts:
         release_agent_mock.assert_called_once_with("a", force=True)
         run_tmux_mock.assert_not_called()
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.write_meta")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.write_meta")
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.run_tmux")
     def test_start_agent_does_not_kill_session_when_new_session_fails(
         self, mock_run_tmux, _mock_alive, _mock_write_meta, _mock_ensure_state
     ) -> None:
@@ -29618,11 +29618,11 @@ google_accounts:
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "new-session"], 1, "", "duplicate session")
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch("codex_master.server.META_DIR", Path(tmpdir)), patch(
-                "codex_master.server.agent_home_process_summary",
+            ), patch("the_hive.server.RAW_DIR", Path(tmpdir)), patch("the_hive.server.META_DIR", Path(tmpdir)), patch(
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 0,
                     "external_process_count": 0,
@@ -29632,9 +29632,9 @@ google_accounts:
                     "raw_output": "not_returned",
                 },
             ), patch(
-                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+                "the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ), patch(
-                "codex_master.server._g5_start_scope",
+                "the_hive.server._g5_start_scope",
                 side_effect=lambda session, *_target: fake_g5_start_scope_for_test(session),
             ):
                 with self.assertRaisesRegex(RuntimeError, "tmux start failed"):
@@ -29647,10 +29647,10 @@ google_accounts:
         self.assertEqual(kill_calls[0].args[0][:2], ["-L", "g5-0123456789abcdef0123"])
         self.assertEqual(leftover_logs, [])
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.write_meta")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.write_meta")
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.run_tmux")
     def test_start_agent_omits_tmux_start_stderr(
         self, mock_run_tmux, _mock_alive, _mock_write_meta, _mock_ensure_state
     ) -> None:
@@ -29666,11 +29666,11 @@ google_accounts:
             )
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch("codex_master.server.META_DIR", Path(tmpdir)), patch(
-                "codex_master.server.agent_home_process_summary",
+            ), patch("the_hive.server.RAW_DIR", Path(tmpdir)), patch("the_hive.server.META_DIR", Path(tmpdir)), patch(
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 0,
                     "external_process_count": 0,
@@ -29679,7 +29679,7 @@ google_accounts:
                     "external_processes_truncated": False,
                     "raw_output": "not_returned",
                 },
-            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION):
+            ), patch("the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION):
                 with self.assertRaises(AgentError) as raised:
                     start_agent("a", cwd=tmpdir)
 
@@ -29689,9 +29689,9 @@ google_accounts:
         self.assertNotIn("SECRET_START_OUTPUT_SHOULD_NOT_RETURN", error_text)
         self.assertNotIn(str(tmpdir), error_text)
 
-    @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.tmux_alive", return_value=False)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.ensure_state")
+    @patch("the_hive.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.run_tmux")
     def test_start_agent_refuses_preexisting_raw_log_symlink(
         self, mock_run_tmux, _mock_alive, _mock_ensure_state
     ) -> None:
@@ -29706,13 +29706,13 @@ google_accounts:
             link.symlink_to(target)
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
-                "codex_master.server.META_DIR", Path(tmpdir) / "meta"
+            ), patch("the_hive.server.RAW_DIR", raw_dir), patch(
+                "the_hive.server.META_DIR", Path(tmpdir) / "meta"
             ), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 0,
                     "external_process_count": 0,
@@ -29722,9 +29722,9 @@ google_accounts:
                     "raw_output": "not_returned",
                 },
             ), patch(
-                "codex_master.server.now_id", return_value="fixed"
+                "the_hive.server.now_id", return_value="fixed"
             ), patch(
-                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+                "the_hive.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ):
                 with self.assertRaisesRegex(AgentError, "without following symlinks") as raised:
                     start_agent("a", cwd=tmpdir)
@@ -29737,7 +29737,7 @@ google_accounts:
         self.assertEqual(target_content, "external\n")
         self.assertTrue(link_is_symlink)
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_create_refuses_symlink_parent_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -29749,7 +29749,7 @@ google_accounts:
             link_parent.symlink_to(real_parent, target_is_directory=True)
             target = link_parent / "agent-a"
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(AgentError, "parent directories must be real directories") as raised:
                     worktree_create_for_agent("a", path=str(target))
 
@@ -29760,7 +29760,7 @@ google_accounts:
         self.assertNotIn(str(real_parent), str(raised.exception))
         self.assertFalse(redirected_target.exists())
 
-    @patch("codex_master.server._run_bounded_command")
+    @patch("the_hive.server._run_bounded_command")
     def test_worktree_create_pins_parent_before_git_call(self, mock_subprocess_run) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -29792,8 +29792,8 @@ google_accounts:
                 create=Mock(return_value=SimpleNamespace(attestation_id="test-scope"))
             )
 
-            with patch("codex_master.server.repo_root", return_value=repo), patch(
-                "codex_master.server._headless_write_scope_store",
+            with patch("the_hive.server.repo_root", return_value=repo), patch(
+                "the_hive.server._headless_write_scope_store",
                 return_value=scope_store,
             ):
                 result = worktree_create_for_agent("a", path=str(target))
@@ -29803,7 +29803,7 @@ google_accounts:
         self.assertNotEqual(observed[0].parent, outside)
         self.assertEqual(mock_subprocess_run.call_args.args[0], ["git", "worktree", "add", "-b", "agent-a", "."])
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_create_refuses_target_swap_before_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -29823,8 +29823,8 @@ google_accounts:
                     target.symlink_to(outside, target_is_directory=True)
                 return original_open(path, *args, **kwargs)
 
-            with patch("codex_master.server.open_directory_no_follow_matching", side_effect=race_target_open):
-                with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.open_directory_no_follow_matching", side_effect=race_target_open):
+                with patch("the_hive.server.repo_root", return_value=repo):
                     with self.assertRaisesRegex(
                         AgentError, "headless_attestation_rollback_incomplete"
                     ):
@@ -29837,7 +29837,7 @@ google_accounts:
         self.assertTrue(target_is_symlink)
         self.assertTrue(outside_empty)
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_create_refuses_broken_target_symlink_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir) / "repo"
@@ -29845,7 +29845,7 @@ google_accounts:
             target = repo / "agent-a"
             target.symlink_to(repo / "missing-target")
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(AgentError, "worktree path already exists") as raised:
                     worktree_create_for_agent("a", path=str(target))
             target_is_symlink = target.is_symlink()
@@ -29854,7 +29854,7 @@ google_accounts:
         self.assertNotIn(str(target), str(raised.exception))
         self.assertTrue(target_is_symlink)
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_create_relative_path_is_repo_scoped_and_parent_checked(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -29873,8 +29873,8 @@ google_accounts:
                 create=Mock(return_value=SimpleNamespace(attestation_id="test-scope"))
             )
 
-            with patch("codex_master.server.repo_root", return_value=repo), patch(
-                "codex_master.server._headless_write_scope_store",
+            with patch("the_hive.server.repo_root", return_value=repo), patch(
+                "the_hive.server._headless_write_scope_store",
                 return_value=scope_store,
             ):
                 result = worktree_create_for_agent("a", path=relative)
@@ -29887,7 +29887,7 @@ google_accounts:
         self.assertRegex(str(mock_run_command.call_args_list[-1].kwargs["cwd"]), r"^/proc/self/fd/\d+$")
         self.assertNotIn(str(repo), json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_create_base_ref_is_bounded_and_not_returned(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -29904,8 +29904,8 @@ google_accounts:
                 create=Mock(return_value=SimpleNamespace(attestation_id="test-scope"))
             )
 
-            with patch("codex_master.server.repo_root", return_value=repo), patch(
-                "codex_master.server._headless_write_scope_store",
+            with patch("the_hive.server.repo_root", return_value=repo), patch(
+                "the_hive.server._headless_write_scope_store",
                 return_value=scope_store,
             ):
                 result = worktree_create_for_agent("a", path=relative, base_ref="origin/main")
@@ -29916,26 +29916,26 @@ google_accounts:
         self.assertRegex(str(mock_run_command.call_args.kwargs["cwd"]), r"^/proc/self/fd/\d+$")
         self.assertNotIn("origin/main", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_create_rejects_unsafe_base_ref_without_git_call(self, mock_run_command) -> None:
         for base_ref in ("--detach", "main with space", "main\nSECRET_BASE_REF_SHOULD_NOT_RETURN"):
             with self.subTest(base_ref=base_ref):
                 with tempfile.TemporaryDirectory() as tmpdir:
                     repo = Path(tmpdir)
-                    with patch("codex_master.server.repo_root", return_value=repo):
+                    with patch("the_hive.server.repo_root", return_value=repo):
                         with self.assertRaisesRegex(AgentError, "base_ref contains unsupported characters") as raised:
                             worktree_create_for_agent("a", path=".codex-master-worktrees/agent-a", base_ref=base_ref)
 
                 self.assertNotIn("SECRET_BASE_REF_SHOULD_NOT_RETURN", str(raised.exception))
         mock_run_command.assert_not_called()
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_create_rejects_path_basename_that_git_parses_as_option(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             target = repo / ".codex-master-worktrees" / "--detach"
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(
                     AgentError, "worktree path basename is not a supported git branch name"
                 ):
@@ -29944,7 +29944,7 @@ google_accounts:
         mock_run_command.assert_not_called()
         self.assertFalse(target.exists())
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_create_git_failure_is_data_sparse(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -29962,7 +29962,7 @@ google_accounts:
 
             mock_run_command.side_effect = run_git
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(AgentError, "git worktree add failed") as raised:
                     worktree_create_for_agent("a", path=relative)
 
@@ -29970,7 +29970,7 @@ google_accounts:
         self.assertNotIn("SECRET_WORKTREE_OUTPUT_SHOULD_NOT_RETURN", error_text)
         self.assertNotIn(tmpdir, error_text)
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_create_refuses_relative_escape_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -29978,7 +29978,7 @@ google_accounts:
             outside = tmp_path / "outside"
             repo.mkdir()
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(AgentError, "worktree path must stay inside repo") as raised:
                     worktree_create_for_agent("a", path="../outside/agent-a")
 
@@ -29986,7 +29986,7 @@ google_accounts:
         self.assertFalse(outside.exists())
         self.assertNotIn(str(outside), str(raised.exception))
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_status_refuses_symlink_path_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir) / "repo"
@@ -29996,7 +29996,7 @@ google_accounts:
             real_dir.mkdir()
             link_dir.symlink_to(real_dir, target_is_directory=True)
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(AgentError, "worktree status path must be a real directory") as raised:
                     worktree_status(str(link_dir))
 
@@ -30004,7 +30004,7 @@ google_accounts:
         self.assertNotIn(str(link_dir), str(raised.exception))
         self.assertNotIn(str(real_dir), str(raised.exception))
 
-    @patch("codex_master.server._run_bounded_command")
+    @patch("the_hive.server._run_bounded_command")
     def test_worktree_status_pins_target_before_git_call(self, mock_subprocess_run) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -30025,14 +30025,14 @@ google_accounts:
 
             mock_subprocess_run.side_effect = race_before_git
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.repo_root", return_value=repo):
                 result = worktree_status(str(target))
 
         self.assertEqual(result["path_state"], "set")
         self.assertEqual(len(observed), 1)
         self.assertNotEqual(observed[0], outside)
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_status_refuses_non_directory_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir) / "repo"
@@ -30040,14 +30040,14 @@ google_accounts:
             file_path = repo / "not-a-dir"
             file_path.write_text("x\n", encoding="utf-8")
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(AgentError, "worktree status path must be a real directory") as raised:
                     worktree_status(str(file_path))
 
         mock_run_command.assert_not_called()
         self.assertNotIn(str(file_path), str(raised.exception))
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_status_relative_path_is_repo_scoped_and_real_directory(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -30058,7 +30058,7 @@ google_accounts:
                 subprocess.CompletedProcess(["git"], 0, f"worktree {repo}\nworktree {target}\n", ""),
             ]
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.repo_root", return_value=repo):
                 result = worktree_status(".codex-master-worktrees/agent-a")
 
         self.assertEqual(result["path"], "not_returned")
@@ -30070,7 +30070,7 @@ google_accounts:
         self.assertNotIn(str(target), result_text)
         self.assertIn("/<redacted>", result["worktrees"]["output_excerpt"])
 
-    @patch("codex_master.server.run_command")
+    @patch("the_hive.server.run_command")
     def test_worktree_status_refuses_relative_escape_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -30078,7 +30078,7 @@ google_accounts:
             outside = tmp_path / "outside"
             repo.mkdir()
 
-            with patch("codex_master.server.repo_root", return_value=repo):
+            with patch("the_hive.server.repo_root", return_value=repo):
                 with self.assertRaisesRegex(AgentError, "worktree status path must stay inside repo") as raised:
                     worktree_status("../outside")
 
@@ -30101,7 +30101,7 @@ google_accounts:
                 path.write_text("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK\n", encoding="utf-8")
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -30191,7 +30191,7 @@ google_accounts:
             symlink_root.symlink_to(outside_root)
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -30250,7 +30250,7 @@ google_accounts:
                 extra.write_text("extra\n", encoding="utf-8")
 
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"b": {"label": "B", "runner": home / "codex", "home": home, "session": "session-b"}},
                 clear=False,
             ):
@@ -30374,7 +30374,7 @@ google_accounts:
         self.assertEqual(payload["cwd"], "not_returned")
         self.assertEqual(payload["cwd_state"], "invalid")
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_assignments_redact_historical_absolute_paths(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
@@ -30397,7 +30397,7 @@ google_accounts:
                 encoding="utf-8",
             )
 
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+            with patch("the_hive.server.ASSIGNMENT_LOG", assignment_log):
                 response = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -30422,7 +30422,7 @@ google_accounts:
         self.assertNotIn("ASSIGNMENT_SECRET_SHOULD_NOT_LEAK", payload_text)
         self.assertNotIn("ASSIGNMENT_PROMPT_SHOULD_NOT_LEAK", payload_text)
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_assignment_selection_round_trip_is_datensparsam(self, _mock_ensure_state) -> None:
         selection = {
             "schema_version": 1,
@@ -30460,7 +30460,7 @@ google_accounts:
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+            with patch("the_hive.server.ASSIGNMENT_LOG", assignment_log):
                 record_assignment(
                     {
                         "assignment_id": "selection-round-trip-a",
@@ -30489,7 +30489,7 @@ google_accounts:
         ):
             self.assertNotIn(secret, payload_text)
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_assignment_selection_discards_untrusted_required_and_requested_values(
         self, _mock_ensure_state
     ) -> None:
@@ -30511,7 +30511,7 @@ google_accounts:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+            with patch("the_hive.server.ASSIGNMENT_LOG", assignment_log):
                 record_assignment(
                     {
                         "assignment_id": "selection-adversarial-a",
@@ -30539,7 +30539,7 @@ google_accounts:
         ):
             self.assertNotIn(secret, payload_text)
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_assignment_selection_omits_unknown_requested_model_but_keeps_reason(
         self, _mock_ensure_state
     ) -> None:
@@ -30560,7 +30560,7 @@ google_accounts:
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+            with patch("the_hive.server.ASSIGNMENT_LOG", assignment_log):
                 record_assignment({"assignment_id": "selection-unknown-model-a", "agent": "a", "selection": selection})
                 listed = list_assignments("a", limit=10)
 
@@ -30570,7 +30570,7 @@ google_accounts:
         self.assertEqual(safe_selection["reason_codes"], ["requested_model_unknown"])
         self.assertNotIn("gpt-5.4-mini", json.dumps(listed, sort_keys=True))
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_assignment_selection_drops_reasoning_without_requested_model(self, _mock_ensure_state) -> None:
         selection = {
             "schema_version": 1,
@@ -30589,7 +30589,7 @@ google_accounts:
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+            with patch("the_hive.server.ASSIGNMENT_LOG", assignment_log):
                 record_assignment({"assignment_id": "selection-no-requested-model-a", "agent": "a", "selection": selection})
                 listed = list_assignments("a", limit=10)
 
@@ -30598,7 +30598,7 @@ google_accounts:
         self.assertNotIn("reasoning", safe_selection["requested"])
         self.assertEqual(safe_selection["reason_codes"], ["model_defaulted"])
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_assignment_selection_drops_reasoning_for_unknown_requested_model(self, _mock_ensure_state) -> None:
         selection = {
             "schema_version": 1,
@@ -30617,7 +30617,7 @@ google_accounts:
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+            with patch("the_hive.server.ASSIGNMENT_LOG", assignment_log):
                 record_assignment({"assignment_id": "selection-unknown-model-reasoning-a", "agent": "a", "selection": selection})
                 listed = list_assignments("a", limit=10)
 
@@ -30627,7 +30627,7 @@ google_accounts:
         self.assertEqual(safe_selection["reason_codes"], ["requested_model_unknown"])
         self.assertNotIn("gpt-5.4-mini", json.dumps(listed, sort_keys=True))
 
-    @patch("codex_master.server.load_agent_class_catalog", side_effect=RuntimeError("catalog unavailable"))
+    @patch("the_hive.server.load_agent_class_catalog", side_effect=RuntimeError("catalog unavailable"))
     def test_assignment_selection_fails_closed_on_catalog_error(self, _mock_load_catalog) -> None:
         self.assertIsNone(
             server_module._sanitize_assignment_selection(
@@ -30641,11 +30641,11 @@ google_accounts:
             )
         )
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_list_assignments_rejects_invalid_limits(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+            with patch("the_hive.server.ASSIGNMENT_LOG", assignment_log):
                 with self.assertRaisesRegex(AgentError, "limit must be an integer"):
                     list_assignments("a", limit="10")
                 with self.assertRaisesRegex(AgentError, "limit must be >= 1"):
@@ -30653,7 +30653,7 @@ google_accounts:
                 with self.assertRaisesRegex(AgentError, f"limit must be <= {MAX_ASSIGNMENT_RECORDS}"):
                     list_assignments("a", limit=MAX_ASSIGNMENT_RECORDS + 1)
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_assignment_log_drops_non_object_json_records(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
@@ -30661,7 +30661,7 @@ google_accounts:
                 '["not", "a record"]\n{"agent": "a1", "assignment_id": "ok"}\nnull\n',
                 encoding="utf-8",
             )
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+            with patch("the_hive.server.ASSIGNMENT_LOG", assignment_log):
                 prune_assignment_log()
                 listed = list_assignments("a", limit=10)
             remaining = [json.loads(line) for line in assignment_log.read_text(encoding="utf-8").splitlines()]
@@ -30670,7 +30670,7 @@ google_accounts:
         self.assertEqual(listed["record_count"], 1)
         self.assertEqual(listed["records"][0]["assignment_id"], "ok")
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     def test_assignment_log_skips_unhashable_agent_values(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -30681,16 +30681,16 @@ google_accounts:
                 '{"agent": "a1", "assignment_id": "ok"}\n',
                 encoding="utf-8",
             )
-            with patch("codex_master.server.STATE_ROOT", root / "state"), patch(
-                "codex_master.server.LOCK_DIR", root / "locks"
-            ), patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+            with patch("the_hive.server.STATE_ROOT", root / "state"), patch(
+                "the_hive.server.LOCK_DIR", root / "locks"
+            ), patch("the_hive.server.ASSIGNMENT_LOG", assignment_log):
                 listed = list_assignments("a", limit=10)
 
         self.assertEqual(listed["record_count"], 1)
         self.assertEqual(listed["records"][0]["assignment_id"], "ok")
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.send_agent")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.send_agent")
     def test_agent_assign_sends_structured_prompt_without_returning_prompt(self, mock_send_agent, _mock_alive) -> None:
         mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -30702,14 +30702,14 @@ google_accounts:
             skill.parent.mkdir(parents=True, exist_ok=True)
             skill.write_text("Skill body must not be returned\n", encoding="utf-8")
 
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.ASSIGNMENT_LOG", assignment_log
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.ASSIGNMENT_LOG", assignment_log
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -30802,12 +30802,12 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             agent = {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), server_module.temporary_agent_inventory(
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), server_module.temporary_agent_inventory(
                 inventory_for(home)
             ), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.pane_pid", return_value=123), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.pane_pid", return_value=123), patch(
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 1,
                     "managed_process_count": 1,
@@ -30819,16 +30819,16 @@ google_accounts:
                     "raw_output": "not_returned",
                 },
             ), patch(
-                "codex_master.server.read_meta",
+                "the_hive.server.read_meta",
                 return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)},
             ), patch(
-                "codex_master.server.status_agent",
+                "the_hive.server.status_agent",
                 return_value={"response_state": {"state": "running_idle"}},
             ), patch(
-                "codex_master.server.run_tmux",
+                "the_hive.server.run_tmux",
                 return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
-            ), patch("codex_master.server.start_agent", return_value={"status": "started"}) as start:
-                with patch("codex_master.server.reserve_managed_replacement", return_value={"allowed": True, "reservation_id": "res-model"}), patch("codex_master.server.complete_managed_replacement"):
+            ), patch("the_hive.server.start_agent", return_value={"status": "started"}) as start:
+                with patch("the_hive.server.reserve_managed_replacement", return_value={"allowed": True, "reservation_id": "res-model"}), patch("the_hive.server.complete_managed_replacement"):
                     result = ensure_assignment_session_model(
                     "a",
                     model=WRITE_AGENT_MODEL,
@@ -30843,12 +30843,12 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             agent = {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), server_module.temporary_agent_inventory(
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), server_module.temporary_agent_inventory(
                 inventory_for(home)
             ), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.pane_pid", return_value=123), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.pane_pid", return_value=123), patch(
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 1,
                     "managed_process_count": 1,
@@ -30860,12 +30860,12 @@ google_accounts:
                     "raw_output": "not_returned",
                 },
             ), patch(
-                "codex_master.server.read_meta",
+                "the_hive.server.read_meta",
                 return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)},
             ), patch(
-                "codex_master.server.status_agent",
+                "the_hive.server.status_agent",
                 return_value={"response_state": {"state": "running_recent_output"}},
-            ), patch("codex_master.server.run_tmux") as tmux:
+            ), patch("the_hive.server.run_tmux") as tmux:
                 with self.assertRaisesRegex(AgentError, "controlled restart requires an inactive Agentin"):
                     ensure_assignment_session_model(
                         "a",
@@ -30974,16 +30974,16 @@ google_accounts:
             inventory = server_module.InventorySnapshot(
                 ("q3",), {"q3": descriptor}, {"q-series": ("q3",)}, {"q3": 0}, ("q",)
             )
-            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), server_module.temporary_agent_inventory(
+            with patch.dict("the_hive.server.AGENTS", {"q3": agent}, clear=False), server_module.temporary_agent_inventory(
                 inventory
             ), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}), patch("codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}), patch(
-                "codex_master.server.status_agent", return_value={"response_state": {"state": "running_idle"}}
-            ), patch("codex_master.server.spawn_admission_lock", recording_spawn_lock), patch("codex_master.server.reserve_managed_replacement", side_effect=lambda session: events.append("reserve") or {"allowed": True, "reservation_id": "res-token"}), patch(
-                "codex_master.server.run_tmux", side_effect=lambda *args, **kwargs: events.append("kill") or subprocess.CompletedProcess(["tmux"], 0, "", "")
-            ), patch("codex_master.server.start_agent", side_effect=lambda *args, **kwargs: events.append("start") or {"status": "started"}), patch(
-                "codex_master.server.complete_managed_replacement", side_effect=lambda *args, **kwargs: events.append("complete")
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.require_managed_tmux_session", return_value={"ok": True}), patch("the_hive.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}), patch(
+                "the_hive.server.status_agent", return_value={"response_state": {"state": "running_idle"}}
+            ), patch("the_hive.server.spawn_admission_lock", recording_spawn_lock), patch("the_hive.server.reserve_managed_replacement", side_effect=lambda session: events.append("reserve") or {"allowed": True, "reservation_id": "res-token"}), patch(
+                "the_hive.server.run_tmux", side_effect=lambda *args, **kwargs: events.append("kill") or subprocess.CompletedProcess(["tmux"], 0, "", "")
+            ), patch("the_hive.server.start_agent", side_effect=lambda *args, **kwargs: events.append("start") or {"status": "started"}), patch(
+                "the_hive.server.complete_managed_replacement", side_effect=lambda *args, **kwargs: events.append("complete")
             ) as complete:
                 result = ensure_assignment_session_model("q3", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease)
         self.assertEqual(result["status"], "restarted")
@@ -31021,23 +31021,23 @@ google_accounts:
             inventory = server_module.InventorySnapshot(
                 ("q3",), {"q3": descriptor}, {"q-series": ("q3",)}, {"q3": 0}, ("q",)
             )
-            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), server_module.temporary_agent_inventory(
+            with patch.dict("the_hive.server.AGENTS", {"q3": agent}, clear=False), server_module.temporary_agent_inventory(
                 inventory
             ), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}), patch(
-                "codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}
-            ), patch("codex_master.server.status_agent", return_value={"response_state": {"state": "running_idle"}}), patch(
-                "codex_master.server.spawn_admission_lock", recording_spawn_lock
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.require_managed_tmux_session", return_value={"ok": True}), patch(
+                "the_hive.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}
+            ), patch("the_hive.server.status_agent", return_value={"response_state": {"state": "running_idle"}}), patch(
+                "the_hive.server.spawn_admission_lock", recording_spawn_lock
             ), patch(
-                "codex_master.server.reserve_managed_replacement",
+                "the_hive.server.reserve_managed_replacement",
                 side_effect=lambda session: events.append("reserve") or {"allowed": True, "reservation_id": "res-token"},
             ), patch(
-                "codex_master.server.run_tmux",
+                "the_hive.server.run_tmux",
                 side_effect=lambda *args, **kwargs: events.append("kill")
                 or subprocess.CompletedProcess(["tmux"], 0, "", ""),
-            ), patch("codex_master.server.start_agent", side_effect=failed_start), patch(
-                "codex_master.server.complete_managed_replacement"
+            ), patch("the_hive.server.start_agent", side_effect=failed_start), patch(
+                "the_hive.server.complete_managed_replacement"
             ) as complete:
                 with self.assertRaisesRegex(AgentError, "simulated replacement start failure"):
                     ensure_assignment_session_model("q3", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease)
@@ -31105,24 +31105,24 @@ google_accounts:
             inventory = server_module.InventorySnapshot(
                 ("q3",), {"q3": descriptor}, {"q-series": ("q3",)}, {"q3": 0}, ("q",)
             )
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=1_000.0
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=1_000.0
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"q3": {"label": "Q3", "runner": root / "codex", "home": root, "session": "q3-session"}},
                 clear=False,
-            ), server_module.temporary_agent_inventory(inventory), patch("codex_master.server.tmux_alive", return_value=True), patch(
-                "codex_master.server.require_managed_tmux_session", return_value={"ok": True}
-            ), patch("codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(root)}), patch(
-                "codex_master.server.status_agent", return_value={"response_state": {"state": "running_idle"}}
-            ), patch("codex_master.server.spawn_admission_decision", return_value={"allowed": True}), patch(
-                "codex_master.server.reserve_managed_replacement",
+            ), server_module.temporary_agent_inventory(inventory), patch("the_hive.server.tmux_alive", return_value=True), patch(
+                "the_hive.server.require_managed_tmux_session", return_value={"ok": True}
+            ), patch("the_hive.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(root)}), patch(
+                "the_hive.server.status_agent", return_value={"response_state": {"state": "running_idle"}}
+            ), patch("the_hive.server.spawn_admission_decision", return_value={"allowed": True}), patch(
+                "the_hive.server.reserve_managed_replacement",
                 side_effect=lambda session: events.append("reserve") or {"allowed": True, "reservation_id": "res-token"},
-            ), patch("codex_master.server.run_tmux", side_effect=kill_and_wait), patch(
-                "codex_master.server.start_agent", side_effect=lambda *args, **kwargs: events.append("start") or {"status": "started"}
-            ), patch("codex_master.server.complete_managed_replacement", side_effect=lambda *args, **kwargs: events.append("complete")):
+            ), patch("the_hive.server.run_tmux", side_effect=kill_and_wait), patch(
+                "the_hive.server.start_agent", side_effect=lambda *args, **kwargs: events.append("start") or {"status": "started"}
+            ), patch("the_hive.server.complete_managed_replacement", side_effect=lambda *args, **kwargs: events.append("complete")):
                 server_module._write_native_agent_registry(
                     {
                         "schema_version": 2,
@@ -31170,15 +31170,15 @@ google_accounts:
             inventory = server_module.InventorySnapshot(
                 ("b1",), {"b1": descriptor}, {"b-series": ("b1",)}, {"b1": 0}, ("b",)
             )
-            with patch.dict("codex_master.server.AGENTS", {"b1": agent}, clear=False), server_module.temporary_agent_inventory(
+            with patch.dict("the_hive.server.AGENTS", {"b1": agent}, clear=False), server_module.temporary_agent_inventory(
                 inventory
             ), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}), patch(
-                "codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}
-            ), patch("codex_master.server.status_agent", return_value={"response_state": {"state": "running_idle"}}), patch(
-                "codex_master.server.reserve_managed_replacement", return_value=denial
-            ), patch("codex_master.server.run_tmux") as run_tmux, patch("codex_master.server.start_agent") as start_agent:
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.require_managed_tmux_session", return_value={"ok": True}), patch(
+                "the_hive.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}
+            ), patch("the_hive.server.status_agent", return_value={"response_state": {"state": "running_idle"}}), patch(
+                "the_hive.server.reserve_managed_replacement", return_value=denial
+            ), patch("the_hive.server.run_tmux") as run_tmux, patch("the_hive.server.start_agent") as start_agent:
                 with self.assertRaises(AgentCapacityError) as raised:
                     ensure_assignment_session_model("b1", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease)
         public = public_error_payload(raised.exception)
@@ -31197,15 +31197,15 @@ google_accounts:
             runner.write_text("#!/bin/sh\n", encoding="utf-8")
             runner.chmod(0o700)
             agent = {"label": "Q3", "runner": runner, "home": home, "session": "q3-session"}
-            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), patch(
-                "codex_master.server.agent_config", return_value={"runner": runner, "home": home, "session": "q3-session", "label": "Q3"}
-            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
-                "codex_master.server.agent_home_process_summary",
+            with patch.dict("the_hive.server.AGENTS", {"q3": agent}, clear=False), patch(
+                "the_hive.server.agent_config", return_value={"runner": runner, "home": home, "session": "q3-session", "label": "Q3"}
+            ), patch("the_hive.server.tmux_alive", return_value=True), patch(
+                "the_hive.server.agent_home_process_summary",
                 return_value={"external_process_count": 0, "managed_process_count": 1, "managed_process_ids": [123]},
-            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}) as guard, patch(
-                "codex_master.server.require_managed_replacement_reservation"
-            ) as validate, patch("codex_master.server.require_spawn_capacity") as capacity, patch(
-                "codex_master.server.run_tmux"
+            ), patch("the_hive.server.require_managed_tmux_session", return_value={"ok": True}) as guard, patch(
+                "the_hive.server.require_managed_replacement_reservation"
+            ) as validate, patch("the_hive.server.require_spawn_capacity") as capacity, patch(
+                "the_hive.server.run_tmux"
             ) as run_tmux:
                 with self.assertRaises(AgentCapacityError):
                     server_module._start_agent_unlocked("q3", replacement_reservation_id="res-token")
@@ -31230,13 +31230,13 @@ google_accounts:
             runner.chmod(0o700)
             agent = {"label": "Q3", "runner": runner, "home": home, "session": "q3-session"}
             summary = {"external_process_count": 0, "managed_process_count": 0, "managed_process_ids": [], "managed_root_process_ids": []}
-            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), patch(
-                "codex_master.server.agent_config", return_value={"runner": runner, "home": home, "session": "q3-session", "label": "Q3"}
-            ), patch("codex_master.server.tmux_alive", return_value=False), patch(
-                "codex_master.server.agent_home_process_summary", return_value=summary
-            ), patch("codex_master.server.require_managed_replacement_reservation", return_value=denial), patch(
-                "codex_master.server.require_spawn_capacity"
-            ) as capacity, patch("codex_master.server.run_tmux") as run_tmux:
+            with patch.dict("the_hive.server.AGENTS", {"q3": agent}, clear=False), patch(
+                "the_hive.server.agent_config", return_value={"runner": runner, "home": home, "session": "q3-session", "label": "Q3"}
+            ), patch("the_hive.server.tmux_alive", return_value=False), patch(
+                "the_hive.server.agent_home_process_summary", return_value=summary
+            ), patch("the_hive.server.require_managed_replacement_reservation", return_value=denial), patch(
+                "the_hive.server.require_spawn_capacity"
+            ) as capacity, patch("the_hive.server.run_tmux") as run_tmux:
                 with self.assertRaises(AgentCapacityError) as raised:
                     server_module._start_agent_unlocked("q3", replacement_reservation_id="bad-token")
         public = public_error_payload(raised.exception)
@@ -31258,12 +31258,12 @@ google_accounts:
             inventory = server_module.InventorySnapshot(
                 ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
             )
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), server_module.temporary_agent_inventory(
+            with patch.dict("the_hive.server.AGENTS", {"a": agent}, clear=False), server_module.temporary_agent_inventory(
                 inventory
             ), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.pane_pid", return_value=123), patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.tmux_alive", return_value=True
+            ), patch("the_hive.server.pane_pid", return_value=123), patch(
+                "the_hive.server.agent_home_process_summary",
                 return_value={
                     "process_count": 1,
                     "managed_process_count": 1,
@@ -31275,20 +31275,20 @@ google_accounts:
                     "raw_output": "not_returned",
                 },
             ), patch(
-                "codex_master.server.read_meta",
+                "the_hive.server.read_meta",
                 return_value={
                     "model": DEFAULT_AGENT_MODEL,
                     "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
                     "cwd": str(home),
                 },
             ), patch(
-                "codex_master.server.status_agent",
+                "the_hive.server.status_agent",
                 return_value={"response_state": {"state": "running_idle"}},
             ), patch(
-                "codex_master.server.run_tmux",
+                "the_hive.server.run_tmux",
                 return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
-            ), patch("codex_master.server.start_agent", return_value={"status": "started"}) as start:
-                with patch("codex_master.server.reserve_managed_replacement", return_value={"allowed": True, "reservation_id": "res-model"}), patch("codex_master.server.complete_managed_replacement"):
+            ), patch("the_hive.server.start_agent", return_value={"status": "started"}) as start:
+                with patch("the_hive.server.reserve_managed_replacement", return_value={"allowed": True, "reservation_id": "res-model"}), patch("the_hive.server.complete_managed_replacement"):
                     result = ensure_assignment_session_model(
                         "a",
                         model=DEFAULT_AGENT_MODEL,
@@ -31305,7 +31305,7 @@ google_accounts:
     ) -> None:
         with (
             patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {
                     "a1": {
                         "label": "A1",
@@ -31317,27 +31317,27 @@ google_accounts:
                 clear=True,
             ),
             patch(
-                "codex_master.server.agent_auth_status",
+                "the_hive.server.agent_auth_status",
                 return_value={"authenticated": False, "auth_state": "empty"},
             ),
-            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch("the_hive.server.ensure_agent_not_blocked_by_codex_usage"),
             patch(
-                "codex_master.server.claim_for_agent_mutation",
+                "the_hive.server.claim_for_agent_mutation",
                 return_value=({"state": "held", "held_by_this_server": True}, True),
             ) as mock_claim,
             patch(
-                "codex_master.server.ensure_assignment_session_model",
+                "the_hive.server.ensure_assignment_session_model",
                 side_effect=AgentError("orphaned process"),
             ) as mock_model,
             patch(
-                "codex_master.server.agent_lease_status",
+                "the_hive.server.agent_lease_status",
                 return_value={"held_by_this_server": True},
             ),
             patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 return_value={"process_count": 1},
             ),
-            patch("codex_master.server.release_agent") as mock_release,
+            patch("the_hive.server.release_agent") as mock_release,
         ):
             with self.assertRaisesRegex(AgentError, "orphaned process"):
                 assign_agent(
@@ -31370,35 +31370,35 @@ google_accounts:
             inventory = SimpleNamespace(agents={"q1": descriptor}, agent_ids=("q1",))
             with (
                 patch(
-                    "codex_master.server.ensure_assignment_session_model",
+                    "the_hive.server.ensure_assignment_session_model",
                     return_value={"status": "unchanged"},
                 ) as ensure_model,
                 patch(
-                    "codex_master.server.current_agent_inventory",
+                    "the_hive.server.current_agent_inventory",
                     return_value=inventory,
                 ),
                 patch(
-                    "codex_master.server.agent_config",
+                    "the_hive.server.agent_config",
                     return_value={"session": "q1-tmux", "home": home, "label": "Q1"},
                 ),
-                patch("codex_master.server._headless_descriptor", return_value=None),
-                patch("codex_master.server._ollama_descriptor", return_value=None),
+                patch("the_hive.server._headless_descriptor", return_value=None),
+                patch("the_hive.server._ollama_descriptor", return_value=None),
                 patch(
-                    "codex_master.server.require_ollama_admission",
+                    "the_hive.server.require_ollama_admission",
                     return_value={"allowed": True},
                 ),
                 patch(
-                    "codex_master.server.require_authenticated_agent_for_mutation",
+                    "the_hive.server.require_authenticated_agent_for_mutation",
                     return_value={"authenticated": True},
                 ),
-                patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
-                patch("codex_master.server.tmux_alive", return_value=True),
+                patch("the_hive.server.ensure_agent_not_blocked_by_codex_usage"),
+                patch("the_hive.server.tmux_alive", return_value=True),
                 patch(
-                    "codex_master.server.require_managed_tmux_session",
+                    "the_hive.server.require_managed_tmux_session",
                     return_value={"ok": True},
                 ),
                 patch(
-                    "codex_master.server.read_meta",
+                    "the_hive.server.read_meta",
                     return_value={
                         "agent_class": "arbeitsbiene",
                         "model": "gpt-5.6-luna",
@@ -31406,17 +31406,17 @@ google_accounts:
                     },
                 ),
                 patch(
-                    "codex_master.server.claim_for_agent_mutation",
+                    "the_hive.server.claim_for_agent_mutation",
                     return_value=({"state": "held"}, False),
                 ),
                 patch(
-                    "codex_master.server.send_agent",
+                    "the_hive.server.send_agent",
                     return_value={"agent": "q1", "status": "sent"},
                 ),
-                patch("codex_master.server.record_assignment"),
-                patch("codex_master.server.run_tmux") as run_tmux,
-                patch("codex_master.server.start_agent") as start_agent,
-                patch("codex_master.server.require_spawn_capacity") as require_capacity,
+                patch("the_hive.server.record_assignment"),
+                patch("the_hive.server.run_tmux") as run_tmux,
+                patch("the_hive.server.start_agent") as start_agent,
+                patch("the_hive.server.require_spawn_capacity") as require_capacity,
             ):
                 result = assign_agent(
                     "q1",
@@ -31446,7 +31446,7 @@ google_accounts:
     ) -> None:
         with (
             patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {
                     "a1": {
                         "label": "A1",
@@ -31458,30 +31458,30 @@ google_accounts:
                 clear=True,
             ),
             patch(
-                "codex_master.server.agent_auth_status",
+                "the_hive.server.agent_auth_status",
                 return_value={"authenticated": False, "auth_state": "empty"},
             ),
-            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch("the_hive.server.ensure_agent_not_blocked_by_codex_usage"),
             patch(
-                "codex_master.server.claim_for_agent_mutation",
+                "the_hive.server.claim_for_agent_mutation",
                 return_value=({"state": "held", "held_by_this_server": True}, True),
             ),
             patch(
-                "codex_master.server.ensure_assignment_session_model",
+                "the_hive.server.ensure_assignment_session_model",
                 return_value={"status": "restarted"},
             ),
             patch(
-                "codex_master.server.send_agent", side_effect=AgentError("send failed")
+                "the_hive.server.send_agent", side_effect=AgentError("send failed")
             ),
             patch(
-                "codex_master.server.agent_lease_status",
+                "the_hive.server.agent_lease_status",
                 return_value={"held_by_this_server": True},
             ),
             patch(
-                "codex_master.server.agent_home_process_summary",
+                "the_hive.server.agent_home_process_summary",
                 return_value={"process_count": 1},
             ),
-            patch("codex_master.server.release_agent") as mock_release,
+            patch("the_hive.server.release_agent") as mock_release,
         ):
             with self.assertRaisesRegex(AgentError, "send failed"):
                 assign_agent(
@@ -31494,9 +31494,9 @@ google_accounts:
 
         mock_release.assert_not_called()
 
-    @patch("codex_master.server.record_assignment")
-    @patch("codex_master.server.send_agent", side_effect=AgentError("send failed"))
-    @patch("codex_master.server.ensure_assignment_session_model")
+    @patch("the_hive.server.record_assignment")
+    @patch("the_hive.server.send_agent", side_effect=AgentError("send failed"))
+    @patch("the_hive.server.ensure_assignment_session_model")
     def test_agent_assign_does_not_persist_routing_after_send_failure(
         self,
         mock_switch,
@@ -31506,7 +31506,7 @@ google_accounts:
         mock_switch.return_value = {"status": "unchanged", "previous_model": DEFAULT_AGENT_MODEL}
 
         with patch.dict(
-            "codex_master.server.AGENTS",
+            "the_hive.server.AGENTS",
             {
                 "a1": {
                     "label": "A1",
@@ -31517,18 +31517,18 @@ google_accounts:
             },
             clear=True,
         ), patch(
-            "codex_master.server.agent_auth_status",
+            "the_hive.server.agent_auth_status",
             return_value={"authenticated": False, "auth_state": "empty"},
         ), patch(
-            "codex_master.server.claim_for_agent_mutation",
+            "the_hive.server.claim_for_agent_mutation",
             return_value=({"state": "held", "held_by_this_server": True}, True),
         ), patch(
-            "codex_master.server.agent_lease_status",
+            "the_hive.server.agent_lease_status",
             return_value={"held_by_this_server": True},
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={"process_count": 1},
-        ), patch("codex_master.server.release_agent") as mock_release:
+        ), patch("the_hive.server.release_agent") as mock_release:
             with self.assertRaisesRegex(AgentError, "send failed"):
                 assign_agent(
                     "a1",
@@ -31545,20 +31545,20 @@ google_accounts:
 
     def test_run_with_agent_lease_keeps_fresh_lease_when_home_process_remains(self) -> None:
         lease = {"state": "held", "held_by_this_server": True}
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         def fail(_lease: dict[str, Any]) -> dict[str, Any]:
             raise AgentError("send failed after paste")
 
-        with patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
-            "codex_master.server.claim_for_agent_mutation", return_value=(lease, True)
+        with patch("the_hive.server.ensure_agent_not_blocked_by_codex_usage"), patch(
+            "the_hive.server.claim_for_agent_mutation", return_value=(lease, True)
         ), patch(
-            "codex_master.server.agent_lease_status",
+            "the_hive.server.agent_lease_status",
             return_value={"held_by_this_server": True},
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={"process_count": 1},
-        ), patch("codex_master.server.release_agent") as mock_release:
+        ), patch("the_hive.server.release_agent") as mock_release:
             with self.assertRaisesRegex(AgentError, "send failed after paste"):
                 server_module.run_with_agent_lease("a", fail)
 
@@ -31568,7 +31568,7 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            from codex_master import server as server_module
+            from the_hive import server as server_module
 
             first_lease: dict[str, Any] = {}
 
@@ -31577,14 +31577,14 @@ google_accounts:
                 claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
                 raise AgentError("run failed after renewal")
 
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.ensure_agent_not_blocked_by_codex_usage"
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"session": "session-a", "home": root, "runner": root / "codex"}},
                 clear=True,
             ):
@@ -31597,19 +31597,19 @@ google_accounts:
         self.assertNotEqual(final.get("lease_id"), first_lease.get("lease_id"))
 
     def test_run_with_agent_lease_blocks_usage_before_claim(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with patch(
-            "codex_master.server.ensure_agent_not_blocked_by_codex_usage",
+            "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
             side_effect=AgentError("agent blocked by codex-usage watchdog"),
-        ), patch("codex_master.server.claim_for_agent_mutation") as mock_claim:
+        ), patch("the_hive.server.claim_for_agent_mutation") as mock_claim:
             with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
                 server_module.run_with_agent_lease("a", lambda _lease: {"status": "sent"})
 
         mock_claim.assert_not_called()
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.send_agent")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.send_agent")
     def test_agent_assign_live_data_requires_search_without_returning_prompt(self, mock_send_agent, _mock_alive) -> None:
         mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -31618,14 +31618,14 @@ google_accounts:
             state = home / "state"
             assignment_log = home / "assignments.jsonl"
 
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.ASSIGNMENT_LOG", assignment_log
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.ASSIGNMENT_LOG", assignment_log
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -31684,8 +31684,8 @@ google_accounts:
         self.assertNotIn("Wie ist das Wetter gerade in Berlin?", ledger_text)
         self.assertNotIn("Wetter Berlin heute", ledger_text)
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.send_agent")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.send_agent")
     def test_assignment_log_retention_prunes_metadata_records(self, mock_send_agent, _mock_alive) -> None:
         mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -31693,16 +31693,16 @@ google_accounts:
             (home / "auth.json").write_text("{}\n", encoding="utf-8")
             state = home / "state"
             assignment_log = home / "assignments.jsonl"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.ASSIGNMENT_LOG", assignment_log
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.ASSIGNMENT_LOG", assignment_log
             ), patch(
-                "codex_master.server.MAX_ASSIGNMENT_LOG_RECORDS", 3
+                "the_hive.server.MAX_ASSIGNMENT_LOG_RECORDS", 3
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -31750,11 +31750,11 @@ google_accounts:
         self.assertNotIn("Pruefe nur lesend", ledger_text)
 
     @patch(
-        "codex_master.server.spawn_admission_decision",
+        "the_hive.server.spawn_admission_decision",
         return_value={"allowed": True, "reason_codes": []},
     )
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.send_agent")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.send_agent")
     def test_agent_assign_allows_nested_subagents_only_when_explicit(
         self, mock_send_agent, _mock_alive, _mock_admission
     ) -> None:
@@ -31768,14 +31768,14 @@ google_accounts:
             skill.parent.mkdir(parents=True, exist_ok=True)
             skill.write_text("body\n", encoding="utf-8")
 
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.ASSIGNMENT_LOG", assignment_log
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.ASSIGNMENT_LOG", assignment_log
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"b": {"label": "B", "runner": home / "codex", "home": home, "session": "session-b"}},
                 clear=False,
             ):
@@ -31815,7 +31815,7 @@ google_accounts:
             home = Path(tmpdir)
             (home / "auth.json").write_text("{}\n", encoding="utf-8")
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -31924,7 +31924,7 @@ google_accounts:
         self.assertIn("context must contain at most", too_many_context_items["result"]["content"][0]["text"])
 
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -31936,10 +31936,10 @@ google_accounts:
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.wait_agent_input_ready")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.wait_agent_input_ready")
     def test_agent_assign_fails_closed_when_tui_input_is_not_ready(
         self, mock_wait_ready, mock_run_tmux, _mock_pane_pid, _mock_alive, _mock_processes
     ) -> None:
@@ -31955,14 +31955,14 @@ google_accounts:
             (home / "auth.json").write_text("{}\n", encoding="utf-8")
             state = home / "state"
             assignment_log = home / "assignments.jsonl"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
-                "codex_master.server.ASSIGNMENT_LOG", assignment_log
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.ASSIGNMENT_LOG", assignment_log
             ), patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -31997,7 +31997,7 @@ google_accounts:
         mock_run_tmux.assert_not_called()
 
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -32009,10 +32009,10 @@ google_accounts:
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.wait_agent_input_ready")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.wait_agent_input_ready")
     def test_agent_report_request_fails_closed_when_tui_input_is_not_ready(
         self, mock_wait_ready, mock_run_tmux, _mock_pane_pid, _mock_alive, _mock_processes
     ) -> None:
@@ -32027,12 +32027,12 @@ google_accounts:
             home = Path(tmpdir)
             (home / "auth.json").write_text("{}\n", encoding="utf-8")
             state = home / "state"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
-                "codex_master.server.AGENTS",
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch.dict(
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
             ):
@@ -32074,9 +32074,9 @@ google_accounts:
         self.assertTrue(response["result"]["isError"])
         self.assertIn("text must not exceed", response["result"]["content"][0]["text"])
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 0,
             "managed_process_count": 0,
@@ -32086,8 +32086,8 @@ google_accounts:
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.wait_agent_input_ready")
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.wait_agent_input_ready")
+    @patch("the_hive.server.run_tmux")
     def test_send_agent_rejects_unmanaged_tmux_session(
         self, mock_run_tmux, mock_wait_ready, _mock_processes, _mock_alive
     ) -> None:
@@ -32098,10 +32098,10 @@ google_accounts:
         mock_run_tmux.assert_not_called()
 
     def test_send_agent_rechecks_session_identity_before_paste(self) -> None:
-        with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.pane_pid", return_value=123
+        with patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.pane_pid", return_value=123
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={
                 "process_count": 1,
                 "managed_process_count": 1,
@@ -32112,10 +32112,10 @@ google_accounts:
                 "external_processes_truncated": False,
                 "raw_output": "not_returned",
             },
-        ), patch("codex_master.server.wait_agent_input_ready", return_value={"ready": True}), patch(
-            "codex_master.server.require_managed_tmux_session",
+        ), patch("the_hive.server.wait_agent_input_ready", return_value={"ready": True}), patch(
+            "the_hive.server.require_managed_tmux_session",
             side_effect=[None, None, AgentError("session identity could not be verified")],
-        ), patch("codex_master.server.run_tmux") as mock_run_tmux:
+        ), patch("the_hive.server.run_tmux") as mock_run_tmux:
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
             with self.assertRaisesRegex(AgentError, "session identity could not be verified"):
                 send_agent("a", "do not send")
@@ -32128,10 +32128,10 @@ google_accounts:
             del input_text, check, timeout
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-        with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.pane_pid", return_value=123
+        with patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.pane_pid", return_value=123
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={
                 "process_count": 3,
                 "managed_process_count": 1,
@@ -32143,8 +32143,8 @@ google_accounts:
                 "raw_output": "not_returned",
             },
         ), patch(
-            "codex_master.server.wait_agent_input_ready", return_value={"ready": True}
-        ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
+            "the_hive.server.wait_agent_input_ready", return_value={"ready": True}
+        ), patch("the_hive.server.run_tmux", side_effect=fake_run_tmux):
             result = send_agent("a", "continue", enter=False)
 
         self.assertEqual(result["status"], "sent")
@@ -32157,10 +32157,10 @@ google_accounts:
             calls.append({"args": args, "input_text": input_text, "check": check, "timeout": timeout})
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-        with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.pane_pid", return_value=123
+        with patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.pane_pid", return_value=123
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={
                 "process_count": 1,
                 "managed_process_count": 1,
@@ -32172,8 +32172,8 @@ google_accounts:
                 "raw_output": "not_returned",
             },
         ), patch(
-            "codex_master.server.pane_tail", return_value="› Ready"
-        ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
+            "the_hive.server.pane_tail", return_value="› Ready"
+        ), patch("the_hive.server.run_tmux", side_effect=fake_run_tmux):
             result = send_agent("a", "line 1\nline 2", enter=True)
 
         self.assertEqual(result["status"], "sent")
@@ -32194,10 +32194,10 @@ google_accounts:
             calls.append({"args": args, "input_text": input_text, "check": check, "timeout": timeout})
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-        with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.pane_pid", return_value=123
+        with patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.pane_pid", return_value=123
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={
                 "process_count": 1,
                 "managed_process_count": 1,
@@ -32209,8 +32209,8 @@ google_accounts:
                 "raw_output": "not_returned",
             },
         ), patch(
-            "codex_master.server.pane_tail", return_value="› Ready"
-        ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
+            "the_hive.server.pane_tail", return_value="› Ready"
+        ), patch("the_hive.server.run_tmux", side_effect=fake_run_tmux):
             result = send_agent("a", "single line", enter=False)
 
         self.assertEqual(result["paste_mode"], "plain_paste")
@@ -32237,10 +32237,10 @@ google_accounts:
                 events.append(args[0])
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-        with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.pane_pid", return_value=123
+        with patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.pane_pid", return_value=123
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={
                 "process_count": 1,
                 "managed_process_count": 1,
@@ -32252,9 +32252,9 @@ google_accounts:
                 "raw_output": "not_returned",
             },
         ), patch(
-            "codex_master.server.pane_tail", return_value="› Ready"
-        ), patch("codex_master.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
-            "codex_master.server.run_tmux", side_effect=fake_run_tmux
+            "the_hive.server.pane_tail", return_value="› Ready"
+        ), patch("the_hive.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
+            "the_hive.server.run_tmux", side_effect=fake_run_tmux
         ):
             result = send_agent("a", "single line", enter=True)
 
@@ -32288,10 +32288,10 @@ google_accounts:
             events.append(args[0])
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-        with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.pane_pid", return_value=123
+        with patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.pane_pid", return_value=123
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={
                 "process_count": 1,
                 "managed_process_count": 1,
@@ -32303,9 +32303,9 @@ google_accounts:
                 "raw_output": "not_returned",
             },
         ), patch(
-            "codex_master.server.wait_agent_input_ready", side_effect=fake_ready
-        ), patch("codex_master.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
-            "codex_master.server.run_tmux", side_effect=fake_run_tmux
+            "the_hive.server.wait_agent_input_ready", side_effect=fake_ready
+        ), patch("the_hive.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
+            "the_hive.server.run_tmux", side_effect=fake_run_tmux
         ):
             result = send_agent("a", "single line", enter=True)
 
@@ -32335,10 +32335,10 @@ google_accounts:
                 buffers.pop(name, None)
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-        with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.pane_pid", return_value=123
+        with patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.pane_pid", return_value=123
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={
                 "process_count": 1,
                 "managed_process_count": 1,
@@ -32350,9 +32350,9 @@ google_accounts:
                 "raw_output": "not_returned",
             },
         ), patch(
-            "codex_master.server.wait_agent_input_ready", return_value={"ready": True}
-        ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux), patch(
-            "codex_master.server.time.time", return_value=1234.0
+            "the_hive.server.wait_agent_input_ready", return_value={"ready": True}
+        ), patch("the_hive.server.run_tmux", side_effect=fake_run_tmux), patch(
+            "the_hive.server.time.time", return_value=1234.0
         ):
             first = send_agent("a", "first", enter=False)
             second = send_agent("a", "second", enter=False)
@@ -32370,10 +32370,10 @@ google_accounts:
             calls.append({"args": args, "input_text": input_text, "check": check, "timeout": timeout})
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-        with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.pane_pid", return_value=123
+        with patch("the_hive.server.tmux_alive", return_value=True), patch(
+            "the_hive.server.pane_pid", return_value=123
         ), patch(
-            "codex_master.server.agent_home_process_summary",
+            "the_hive.server.agent_home_process_summary",
             return_value={
                 "process_count": 1,
                 "managed_process_count": 1,
@@ -32385,8 +32385,8 @@ google_accounts:
                 "raw_output": "not_returned",
             },
         ), patch(
-            "codex_master.server.pane_tail", return_value="MCP startup incomplete"
-        ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
+            "the_hive.server.pane_tail", return_value="MCP startup incomplete"
+        ), patch("the_hive.server.run_tmux", side_effect=fake_run_tmux):
             with self.assertRaisesRegex(AgentInputNotReadyError, "input is not ready") as raised:
                 send_agent("a", "single line", ready_timeout_seconds=0)
 
@@ -32423,10 +32423,10 @@ google_accounts:
                             )
                         return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-                    with patch("codex_master.server.tmux_alive", return_value=True), patch(
-                        "codex_master.server.pane_pid", return_value=123
+                    with patch("the_hive.server.tmux_alive", return_value=True), patch(
+                        "the_hive.server.pane_pid", return_value=123
                     ), patch(
-                        "codex_master.server.agent_home_process_summary",
+                        "the_hive.server.agent_home_process_summary",
                         return_value={
                             "process_count": 1,
                             "managed_process_count": 1,
@@ -32438,8 +32438,8 @@ google_accounts:
                             "raw_output": "not_returned",
                         },
                     ), patch(
-                        "codex_master.server.pane_tail", return_value="› Ready"
-                    ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
+                        "the_hive.server.pane_tail", return_value="› Ready"
+                    ), patch("the_hive.server.run_tmux", side_effect=fake_run_tmux):
                         with self.assertRaisesRegex(AgentError, expected_error) as raised:
                             send_agent("a", "line 1\nline 2", enter=True)
 
@@ -32523,7 +32523,7 @@ class AppletStatusContractTest(unittest.TestCase):
             normalize_applet_agents(["a1", "a1"])
 
     @patch(
-        "codex_master.server.native_agent_status",
+        "the_hive.server.native_agent_status",
         return_value={
             "bridge_state": "ready",
             "counts": {"active": 1, "unconfirmed": 0, "overflow": 0},
@@ -32538,8 +32538,8 @@ class AppletStatusContractTest(unittest.TestCase):
             "truncated": False,
         },
     )
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.applet_agent_observation")
     def test_applet_status_schema_v2_lists_managed_inventory_once_and_pins_sleepers(
         self, mock_observation, mock_run_tmux, mock_native_status
     ) -> None:
@@ -32591,7 +32591,7 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertEqual(list_sessions_calls, 1)
 
     @patch(
-        "codex_master.server.native_agent_status",
+        "the_hive.server.native_agent_status",
         return_value={
             "bridge_state": "ready",
             "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
@@ -32600,10 +32600,10 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.run_tmux",
+        "the_hive.server.run_tmux",
         return_value=subprocess.CompletedProcess(["tmux"], 0, "\n", ""),
     )
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.applet_agent_observation")
     def test_applet_status_schema_v2_accepts_empty_inventory_and_keeps_pinned_sleepers(
         self, mock_observation, mock_run_tmux, _mock_native_status
     ) -> None:
@@ -32620,7 +32620,7 @@ class AppletStatusContractTest(unittest.TestCase):
         )
 
     @patch(
-        "codex_master.server.native_agent_status",
+        "the_hive.server.native_agent_status",
         return_value={
             "bridge_state": "ready",
             "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
@@ -32629,7 +32629,7 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.run_tmux",
+        "the_hive.server.run_tmux",
         return_value=subprocess.CompletedProcess(["tmux"], COMMAND_TIMEOUT_RETURN_CODE, "", "SECRET_TMUX_ERROR"),
     )
     def test_applet_status_schema_v2_inventory_error_has_no_fallback_rows(self, _mock_run_tmux, _mock_native_status) -> None:
@@ -32640,7 +32640,7 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertNotIn("SECRET_TMUX_ERROR", json.dumps(payload, sort_keys=True))
 
     @patch(
-        "codex_master.server.native_agent_status",
+        "the_hive.server.native_agent_status",
         return_value={
             "bridge_state": "ready",
             "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
@@ -32649,7 +32649,7 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.run_tmux",
+        "the_hive.server.run_tmux",
         return_value=subprocess.CompletedProcess(["tmux"], COMMAND_TIMEOUT_RETURN_CODE, "", "SECRET_TMUX_ERROR"),
     )
     def test_applet_status_schema_v2_inventory_error_discards_pinned_agents(
@@ -32663,7 +32663,7 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertNotIn("SECRET_TMUX_ERROR", json.dumps(payload, sort_keys=True))
 
     @patch(
-        "codex_master.server.native_agent_status",
+        "the_hive.server.native_agent_status",
         return_value={
             "bridge_state": "ready",
             "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
@@ -32671,8 +32671,8 @@ class AppletStatusContractTest(unittest.TestCase):
             "truncated": False,
         },
     )
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.applet_agent_observation")
     def test_applet_status_schema_v2_limits_visible_rows_and_reports_active_overflow(
         self, mock_observation, mock_run_tmux, _mock_native_status
     ) -> None:
@@ -32695,12 +32695,12 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertEqual(payload["counts"]["sleeping"], 0)
         self.assertEqual(payload["counts"]["overflow"], 1)
 
-    @patch("codex_master.server.native_agent_status", side_effect=AgentError("SECRET_NATIVE_STATUS"))
+    @patch("the_hive.server.native_agent_status", side_effect=AgentError("SECRET_NATIVE_STATUS"))
     @patch(
-        "codex_master.server.run_tmux",
+        "the_hive.server.run_tmux",
         return_value=subprocess.CompletedProcess(["tmux"], 0, AGENTS["a2"]["session"], ""),
     )
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.applet_agent_observation")
     def test_applet_status_schema_v2_native_bridge_degradation_keeps_managed_rows(
         self, mock_observation, _mock_run_tmux, _mock_native_status
     ) -> None:
@@ -32721,7 +32721,7 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertNotIn("SECRET_NATIVE_STATUS", json.dumps(payload, sort_keys=True))
 
     @patch(
-        "codex_master.server.native_agent_status",
+        "the_hive.server.native_agent_status",
         return_value={
             "bridge_state": "ready",
             "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
@@ -32730,13 +32730,13 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.run_tmux",
+        "the_hive.server.run_tmux",
         return_value=subprocess.CompletedProcess(["tmux"], 0, "\n", ""),
     )
-    @patch("codex_master.server.spawn_admission_decision")
-    @patch("codex_master.server.codex_usage_watchdog_status")
-    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.spawn_admission_decision")
+    @patch("the_hive.server.codex_usage_watchdog_status")
+    @patch("the_hive.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("the_hive.server.applet_agent_observation")
     def test_applet_status_schema_v2_offers_one_start_and_safe_stops(
         self,
         mock_observation,
@@ -32788,7 +32788,7 @@ class AppletStatusContractTest(unittest.TestCase):
         )
 
     @patch(
-        "codex_master.server.native_agent_status",
+        "the_hive.server.native_agent_status",
         return_value={
             "bridge_state": "ready",
             "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
@@ -32797,13 +32797,13 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.run_tmux",
+        "the_hive.server.run_tmux",
         return_value=subprocess.CompletedProcess(["tmux"], 0, "\n", ""),
     )
-    @patch("codex_master.server.spawn_admission_decision")
-    @patch("codex_master.server.codex_usage_watchdog_status")
-    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.spawn_admission_decision")
+    @patch("the_hive.server.codex_usage_watchdog_status")
+    @patch("the_hive.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("the_hive.server.applet_agent_observation")
 
     def test_applet_rows_uses_attested_usage_without_persisting_account(
         self,
@@ -32862,11 +32862,11 @@ class AppletStatusContractTest(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, "context token expired"):
             server_module.validate_applet_action_token(token, b"k" * 32, now=1100.0)
 
-    @patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext())
-    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
-    @patch("codex_master.server.spawn_admission_decision")
-    @patch("codex_master.server.codex_usage_watchdog_status")
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.agent_lifecycle_lock", return_value=contextlib.nullcontext())
+    @patch("the_hive.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("the_hive.server.spawn_admission_decision")
+    @patch("the_hive.server.codex_usage_watchdog_status")
+    @patch("the_hive.server.applet_agent_observation")
     def test_applet_action_rejects_stale_state_before_mutation(
         self,
         mock_observation,
@@ -32887,8 +32887,8 @@ class AppletStatusContractTest(unittest.TestCase):
         token = server_module.issue_applet_action_token("start", "a1", state, b"k" * 32)
         mock_observation.return_value = {**offered, "lease_state": "held", "control_state": "blocked"}
 
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server._start_agent_with_lease_unlocked"
+        with patch("the_hive.server.require_fleet_recovery_ready"), patch(
+            "the_hive.server._start_agent_with_lease_unlocked"
         ) as mock_start:
             with self.assertRaisesRegex(AgentError, "context token is stale"):
                 server_module.applet_action("start", "a1", token)
@@ -32919,13 +32919,13 @@ class AppletStatusContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(AgentError, "key is unavailable"):
                     server_module.read_applet_action_key()
 
-    @patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext())
-    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
-    @patch("codex_master.server.read_meta", return_value={})
-    @patch("codex_master.server.spawn_admission_decision")
-    @patch("codex_master.server.codex_usage_watchdog_status")
-    @patch("codex_master.server.applet_agent_observation")
-    @patch("codex_master.server._start_agent_with_lease_unlocked")
+    @patch("the_hive.server.agent_lifecycle_lock", return_value=contextlib.nullcontext())
+    @patch("the_hive.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("the_hive.server.read_meta", return_value={})
+    @patch("the_hive.server.spawn_admission_decision")
+    @patch("the_hive.server.codex_usage_watchdog_status")
+    @patch("the_hive.server.applet_agent_observation")
+    @patch("the_hive.server._start_agent_with_lease_unlocked")
     def test_applet_start_delegates_to_existing_safe_path_with_no_prompt_or_override(
         self,
         mock_start,
@@ -32951,7 +32951,7 @@ class AppletStatusContractTest(unittest.TestCase):
         state = server_module.applet_action_state(row, usage, admission, run_marker=None)
         token = server_module.issue_applet_action_token("start", "a1", state, b"k" * 32)
 
-        with patch("codex_master.server.require_fleet_recovery_ready"):
+        with patch("the_hive.server.require_fleet_recovery_ready"):
             result = server_module.applet_action("start", "a1", token)
 
         self.assertEqual(
@@ -32967,13 +32967,13 @@ class AppletStatusContractTest(unittest.TestCase):
         mock_start.assert_called_once_with("a1", cwd=str(Path.home()))
         mock_lifecycle_lock.assert_called_once_with("a1", timeout_seconds=1.0)
 
-    @patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext())
-    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
-    @patch("codex_master.server.read_meta", return_value={"run_id": "run-1"})
-    @patch("codex_master.server.codex_usage_watchdog_status")
-    @patch("codex_master.server.applet_agent_observation")
-    @patch("codex_master.server._claim_agent_unlocked")
-    @patch("codex_master.server._stop_agent_unlocked")
+    @patch("the_hive.server.agent_lifecycle_lock", return_value=contextlib.nullcontext())
+    @patch("the_hive.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("the_hive.server.read_meta", return_value={"run_id": "run-1"})
+    @patch("the_hive.server.codex_usage_watchdog_status")
+    @patch("the_hive.server.applet_agent_observation")
+    @patch("the_hive.server._claim_agent_unlocked")
+    @patch("the_hive.server._stop_agent_unlocked")
     def test_applet_stop_remains_available_during_account_limit_and_uses_transient_lease(
         self,
         mock_stop,
@@ -33025,7 +33025,7 @@ class AppletStatusContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(AgentError, "schema_version"):
                     applet_status(["a1"], schema_version=invalid_schema_version)
 
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.applet_agent_observation")
     def test_applet_status_keeps_sleeping_agents_healthy(self, mock_observation) -> None:
         mock_observation.return_value = self._row("a1")
 
@@ -33052,7 +33052,7 @@ class AppletStatusContractTest(unittest.TestCase):
             },
         )
 
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.applet_agent_observation")
     def test_applet_status_aggregates_independent_state_axes(self, mock_observation) -> None:
         mock_observation.side_effect = [
             self._row(
@@ -33078,7 +33078,7 @@ class AppletStatusContractTest(unittest.TestCase):
             {"tracked": 2, "running": 1, "sleeping": 1, "ready": 1, "blocked": 1, "issues": 1},
         )
 
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.applet_agent_observation")
     def test_applet_status_contains_fixed_error_rows_without_error_text(self, mock_observation) -> None:
         mock_observation.side_effect = [self._row("a1"), AgentError("SECRET /home/private prompt lease-owner")]
 
@@ -33101,15 +33101,15 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertNotIn("/home/private", json.dumps(result, sort_keys=True))
 
     @patch(
-        "codex_master.server.agent_lease_status",
+        "the_hive.server.agent_lease_status",
         return_value={"state": "unclaimed", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_auth_status",
+        "the_hive.server.agent_auth_status",
         return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -33120,7 +33120,7 @@ class AppletStatusContractTest(unittest.TestCase):
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.run_tmux")
     def test_applet_status_keeps_degraded_state_when_pane_pid_overflows(
         self, mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
     ) -> None:
@@ -33135,7 +33135,7 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertEqual(result["backend_state"], "degraded")
         self.assertEqual(result["control_state"], "blocked")
 
-    @patch("codex_master.server.applet_agent_observation", side_effect=AgentError("SECRET"))
+    @patch("the_hive.server.applet_agent_observation", side_effect=AgentError("SECRET"))
     def test_applet_status_is_unavailable_when_every_observation_fails(self, _mock_observation) -> None:
         result = applet_status(["a1", "b1"])
 
@@ -33144,8 +33144,8 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertEqual(result["control_state"], "unknown")
         self.assertEqual(result["counts"]["issues"], 2)
 
-    @patch("codex_master.server.applet_agent_observation")
-    @patch("codex_master.server.time.monotonic", side_effect=[0.0, 0.0, 9.0])
+    @patch("the_hive.server.applet_agent_observation")
+    @patch("the_hive.server.time.monotonic", side_effect=[0.0, 0.0, 9.0])
     def test_applet_status_stops_observing_after_soft_deadline(self, _mock_monotonic, mock_observation) -> None:
         mock_observation.return_value = self._row("a1")
 
@@ -33155,7 +33155,7 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertEqual(result["agents"][0]["backend_state"], "ok")
         self.assertEqual(result["agents"][1]["backend_state"], "error")
 
-    @patch("codex_master.server.applet_agent_observation")
+    @patch("the_hive.server.applet_agent_observation")
     def test_applet_status_six_agent_response_is_small_and_has_exact_fields(self, mock_observation) -> None:
         agents = ["a1", "a2", "a3", "a4", "a5", "b1"]
         mock_observation.side_effect = [self._row(agent) for agent in agents]
@@ -33188,12 +33188,12 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertLess(len(encoded), 32 * 1024)
         self.assertLess(len(encoded), 64 * 1024)
 
-    @patch("codex_master.server.agent_lifecycle_lock")
-    @patch("codex_master.server.status_agent")
-    @patch("codex_master.server.replace_private_text")
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.agent_lifecycle_lock")
+    @patch("the_hive.server.status_agent")
+    @patch("the_hive.server.replace_private_text")
+    @patch("the_hive.server.ensure_state")
     @patch(
-        "codex_master.server.agent_lease_status",
+        "the_hive.server.agent_lease_status",
         return_value={
             "state": "unclaimed",
             "holder": "SECRET_OWNER",
@@ -33203,7 +33203,7 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.agent_auth_status",
+        "the_hive.server.agent_auth_status",
         return_value={
             "authenticated": True,
             "auth_state": "present_regular",
@@ -33212,7 +33212,7 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -33224,7 +33224,7 @@ class AppletStatusContractTest(unittest.TestCase):
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.run_tmux")
     def test_applet_agent_observation_is_read_only_and_data_sparse(
         self,
         mock_run_tmux,
@@ -33266,10 +33266,10 @@ class AppletStatusContractTest(unittest.TestCase):
         ):
             self.assertNotIn(private_value, payload)
 
-    @patch("codex_master.server.agent_lease_status")
-    @patch("codex_master.server.agent_auth_status")
-    @patch("codex_master.server.agent_home_process_summary")
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.agent_lease_status")
+    @patch("the_hive.server.agent_auth_status")
+    @patch("the_hive.server.agent_home_process_summary")
+    @patch("the_hive.server.run_tmux")
     def test_applet_status_rejects_non_absence_session_returncodes(
         self, mock_run_tmux, mock_process_summary, mock_auth, mock_lease
     ) -> None:
@@ -33293,15 +33293,15 @@ class AppletStatusContractTest(unittest.TestCase):
                 mock_run_tmux.reset_mock()
 
     @patch(
-        "codex_master.server.agent_lease_status",
+        "the_hive.server.agent_lease_status",
         return_value={"state": "held", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_auth_status",
+        "the_hive.server.agent_auth_status",
         return_value={"authenticated": False, "auth_state": "missing", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 0,
             "managed_process_count": 0,
@@ -33313,7 +33313,7 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.run_tmux",
+        "the_hive.server.run_tmux",
         return_value=subprocess.CompletedProcess(["tmux"], 1, "", ""),
     )
     def test_applet_agent_observation_keeps_sleeping_separate_from_blocked_control(
@@ -33328,15 +33328,15 @@ class AppletStatusContractTest(unittest.TestCase):
         mock_run_tmux.assert_called_once()
 
     @patch(
-        "codex_master.server.agent_lease_status",
+        "the_hive.server.agent_lease_status",
         return_value={"state": "unclaimed", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_auth_status",
+        "the_hive.server.agent_auth_status",
         return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -33348,7 +33348,7 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.run_tmux",
+        "the_hive.server.run_tmux",
         return_value=subprocess.CompletedProcess(["tmux"], 1, "", ""),
     )
     def test_applet_agent_observation_blocks_stopped_agent_with_orphaned_process(
@@ -33367,15 +33367,15 @@ class AppletStatusContractTest(unittest.TestCase):
         )
 
     @patch(
-        "codex_master.server.agent_lease_status",
+        "the_hive.server.agent_lease_status",
         return_value={"state": "unclaimed", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_auth_status",
+        "the_hive.server.agent_auth_status",
         return_value={"authenticated": False, "auth_state": "unreadable", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 0,
             "managed_process_count": 0,
@@ -33387,7 +33387,7 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.run_tmux",
+        "the_hive.server.run_tmux",
         return_value=subprocess.CompletedProcess(["tmux"], 1, "", ""),
     )
     def test_applet_agent_observation_marks_unreadable_control_unknown(
@@ -33398,15 +33398,15 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertEqual(row, self._row("a1", control="unknown", auth="unknown"))
 
     @patch(
-        "codex_master.server.agent_lease_status",
+        "the_hive.server.agent_lease_status",
         return_value={"state": "unclaimed", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_auth_status",
+        "the_hive.server.agent_auth_status",
         return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": None,
             "managed_process_count": None,
@@ -33415,7 +33415,7 @@ class AppletStatusContractTest(unittest.TestCase):
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.run_tmux")
     def test_applet_agent_observation_degrades_unverified_running_identity(
         self, mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
     ) -> None:
@@ -33438,15 +33438,15 @@ class AppletStatusContractTest(unittest.TestCase):
                 )
 
     @patch(
-        "codex_master.server.agent_lease_status",
+        "the_hive.server.agent_lease_status",
         return_value={"state": "unclaimed", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_auth_status",
+        "the_hive.server.agent_auth_status",
         return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -33457,7 +33457,7 @@ class AppletStatusContractTest(unittest.TestCase):
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.run_tmux")
     def test_applet_agent_observation_known_running_true_skips_has_session(
         self, mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
     ) -> None:
@@ -33472,10 +33472,10 @@ class AppletStatusContractTest(unittest.TestCase):
             ["display-message", "-p", "-t", AGENTS["a1"]["session"], "#{pane_pid}"],
         )
 
-    @patch("codex_master.server.agent_home_process_summary")
-    @patch("codex_master.server.agent_auth_status")
-    @patch("codex_master.server.agent_lease_status")
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.agent_home_process_summary")
+    @patch("the_hive.server.agent_auth_status")
+    @patch("the_hive.server.agent_lease_status")
+    @patch("the_hive.server.run_tmux")
     def test_applet_agent_observation_rejects_display_message_nonzero_returncode(
         self, mock_run_tmux, mock_lease, mock_auth, mock_process_summary
     ) -> None:
@@ -33493,44 +33493,44 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertEqual(mock_process_summary.call_count, 1)
         self.assertEqual(len(mock_run_tmux.call_args_list), 2)
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.run_tmux")
     def test_pane_pid_returns_none_for_leading_zeros(self, mock_run_tmux, _mock_tmux_alive) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "00123\n", "")
 
         self.assertIsNone(pane_pid(AGENTS["a1"]["session"]))
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.run_tmux")
     def test_pane_pid_returns_none_for_overlong_numeric_text(self, mock_run_tmux, _mock_tmux_alive) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, f"{'2' * 5000}\n", "")
 
         self.assertIsNone(pane_pid(AGENTS["a1"]["session"]))
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.run_tmux")
     def test_pane_pid_returns_none_for_unicode_digits(self, mock_run_tmux, _mock_tmux_alive) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "１２３\n", "")
 
         self.assertIsNone(pane_pid(AGENTS["a1"]["session"]))
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.run_tmux")
     def test_pane_pid_returns_none_for_zero(self, mock_run_tmux, _mock_tmux_alive) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "0\n", "")
 
         self.assertIsNone(pane_pid(AGENTS["a1"]["session"]))
 
     @patch(
-        "codex_master.server.agent_lease_status",
+        "the_hive.server.agent_lease_status",
         return_value={"state": "unclaimed", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_auth_status",
+        "the_hive.server.agent_auth_status",
         return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -33541,8 +33541,8 @@ class AppletStatusContractTest(unittest.TestCase):
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.time.monotonic", return_value=1.0)
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.time.monotonic", return_value=1.0)
     def test_applet_agent_observation_rejects_noncanonical_pane_pid_for_identity(
         self, _mock_monotonic, mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
     ) -> None:
@@ -33567,15 +33567,15 @@ class AppletStatusContractTest(unittest.TestCase):
                 )
 
     @patch(
-        "codex_master.server.agent_lease_status",
+        "the_hive.server.agent_lease_status",
         return_value={"state": "unclaimed", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_auth_status",
+        "the_hive.server.agent_auth_status",
         return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
     )
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 0,
             "managed_process_count": 0,
@@ -33587,18 +33587,18 @@ class AppletStatusContractTest(unittest.TestCase):
         },
     )
     @patch(
-        "codex_master.server.run_tmux",
+        "the_hive.server.run_tmux",
         return_value=subprocess.CompletedProcess(["tmux"], 1, "", ""),
     )
-    @patch("codex_master.server.time.monotonic", side_effect=[0.0, 0.0, 0.0, 0.0, 9.0])
+    @patch("the_hive.server.time.monotonic", side_effect=[0.0, 0.0, 0.0, 0.0, 9.0])
     def test_applet_agent_observation_checks_deadline_after_lease_read(
         self, _mock_monotonic, _mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
     ) -> None:
         with self.assertRaisesRegex(AgentError, "deadline"):
             applet_agent_observation("a1", deadline=8.0)
 
-    @patch("codex_master.server.run_tmux")
-    @patch("codex_master.server.time.monotonic", return_value=5.0)
+    @patch("the_hive.server.run_tmux")
+    @patch("the_hive.server.time.monotonic", return_value=5.0)
     def test_applet_agent_observation_rejects_expired_deadline(self, _mock_monotonic, mock_run_tmux) -> None:
         with self.assertRaisesRegex(AgentError, "deadline"):
             applet_agent_observation("a1", deadline=5.0)
@@ -33863,8 +33863,8 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertNotIn("watchdog all", text)
         self.assertIn("--quiet", text)
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"ok": True})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"ok": True})
     def test_cli_tool_validation_drops_omitted_optional_arguments(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -33873,8 +33873,8 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result, 0)
         mock_call_tool.assert_called_once_with("agent_start", {"agent": "a"})
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})
     def test_cli_status_passes_agent_result_paging(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -33886,8 +33886,8 @@ class CliLifecycleTest(unittest.TestCase):
             {"agent": "all", "agents_offset": 30, "agents_limit": 10},
         )
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"schema_version": 1, "agents": []})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"schema_version": 1, "agents": []})
     def test_cli_applet_status_routes_to_master_applet_tool(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -33906,8 +33906,8 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertIn("error", payload)
         self.assertIn("applet_agents", payload["error"])
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"schema_version": 2, "agents": []})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"schema_version": 2, "agents": []})
     def test_cli_applet_status_schema_v2_allows_empty_agents(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -33917,7 +33917,7 @@ class CliLifecycleTest(unittest.TestCase):
         mock_call_tool.assert_called_once_with("master_applet_status", {"agents": [], "schema_version": 2})
 
     @patch("builtins.print")
-    @patch("codex_master.server.call_tool")
+    @patch("the_hive.server.call_tool")
     def test_cli_applet_status_errors_publicly_and_exit_1(self, mock_call_tool, mock_print) -> None:
         mock_call_tool.side_effect = AgentError("sk-verysecret-token-1234")
 
@@ -33929,8 +33929,8 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertIn("error", payload)
         self.assertNotIn("sk-verysecret-token-1234", mock_print.call_args.args[0])
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.applet_action")
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.applet_action")
     def test_cli_applet_action_uses_internal_facade_not_mcp_tool_catalog(
         self,
         mock_applet_action,
@@ -33951,7 +33951,7 @@ class CliLifecycleTest(unittest.TestCase):
         mock_applet_action.assert_called_once_with("start", "a1", "cGF5bG9hZA.c2ln")
         self.assertNotIn("applet_action", {tool["name"] for tool in server_module.TOOLS})
 
-    @patch("codex_master.control_center.run_control_center", return_value=0)
+    @patch("the_hive.control_center.run_control_center", return_value=0)
     def test_cli_control_center_routes_to_internal_gtk_frontend(self, mock_control_center) -> None:
         result = main_cli(["control-center"])
 
@@ -33959,14 +33959,14 @@ class CliLifecycleTest(unittest.TestCase):
         mock_control_center.assert_called_once_with([])
         self.assertNotIn("control_center", {tool["name"] for tool in server_module.TOOLS})
 
-    @patch("codex_master.control_center.run_control_center", return_value=0)
+    @patch("the_hive.control_center.run_control_center", return_value=0)
     def test_cli_control_center_forwards_ollama_page(self, mock_control_center) -> None:
         self.assertEqual(main_cli(["control-center", "--page", "ollama"]), 0)
         mock_control_center.assert_called_once_with(["--page", "ollama"])
 
-    @patch("codex_master.server.require_teamleader_tool_access")
-    @patch("codex_master.server.subprocess.Popen")
-    @patch("codex_master.server.os.posix_spawn", return_value=12345)
+    @patch("the_hive.server.require_teamleader_tool_access")
+    @patch("the_hive.server.subprocess.Popen")
+    @patch("the_hive.server.os.posix_spawn", return_value=12345)
     def test_detached_control_center_spawn_is_private_bounded_and_path_sparse(
         self,
         mock_spawn,
@@ -34046,8 +34046,8 @@ class CliLifecycleTest(unittest.TestCase):
                     command_path=command, environ={}, page="secrets"
                 )
 
-    @patch("codex_master.server.print_json", return_value=0)
-    @patch("codex_master.server.launch_control_center_detached")
+    @patch("the_hive.server.print_json", return_value=0)
+    @patch("the_hive.server.launch_control_center_detached")
     def test_cli_control_center_launch_routes_to_hidden_detach_helper(
         self,
         mock_launch,
@@ -34062,8 +34062,8 @@ class CliLifecycleTest(unittest.TestCase):
         mock_print.assert_called_once_with(payload)
         self.assertNotIn("control_center_launch", {tool["name"] for tool in server_module.TOOLS})
 
-    @patch("codex_master.server.print_json", return_value=0)
-    @patch("codex_master.server.launch_control_center_detached")
+    @patch("the_hive.server.print_json", return_value=0)
+    @patch("the_hive.server.launch_control_center_detached")
     def test_cli_control_center_launch_forwards_ollama_page(
         self,
         mock_launch,
@@ -34077,8 +34077,8 @@ class CliLifecycleTest(unittest.TestCase):
 
         mock_launch.assert_called_once_with(page="ollama")
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})
     def test_cli_start_can_confirm_broad_selector(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -34090,8 +34090,8 @@ class CliLifecycleTest(unittest.TestCase):
             {"agent": "all", "allow_broad_selector": True},
         )
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"status": "assigned", "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"status": "assigned", "raw_output": "not_returned"})
     def test_cli_assign_live_data_dispatches_data_sparse_assignment(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -34125,8 +34125,8 @@ class CliLifecycleTest(unittest.TestCase):
             },
         )
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"status": "assigned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"status": "assigned"})
     def test_cli_assign_write_transports_positive_task_evidence_without_model_override(
         self, mock_call_tool, mock_print_json
     ) -> None:
@@ -34160,8 +34160,8 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertTrue(payload["root_cause_known"])
         self.assertNotIn("model", payload)
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"status": "assigned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"status": "assigned"})
     def test_cli_assign_write_transports_explicit_resolver_tuple(
         self, mock_call_tool, mock_print_json
     ) -> None:
@@ -34262,7 +34262,7 @@ class CliLifecycleTest(unittest.TestCase):
             },
         )
 
-    @patch("codex_master.server.print_json")
+    @patch("the_hive.server.print_json")
     def test_cli_assign_write_explicit_persistent_luna_xhigh_keeps_matching_session(
         self, mock_print_json
     ) -> None:
@@ -34302,33 +34302,33 @@ class CliLifecycleTest(unittest.TestCase):
         ]
 
         patches = [
-            patch("codex_master.server._fleet_initialize_recovery_startup_state"),
-            patch("codex_master.server._publish_startup_fleet_inventory"),
-            patch("codex_master.server.agent_ids", return_value=["a1"]),
-            patch("codex_master.server.current_agent_inventory", return_value=inventory),
-            patch("codex_master.server.require_fleet_recovery_ready"),
-            patch("codex_master.server._headless_descriptor", return_value=None),
-            patch("codex_master.server._ollama_descriptor", return_value=None),
+            patch("the_hive.server._fleet_initialize_recovery_startup_state"),
+            patch("the_hive.server._publish_startup_fleet_inventory"),
+            patch("the_hive.server.agent_ids", return_value=["a1"]),
+            patch("the_hive.server.current_agent_inventory", return_value=inventory),
+            patch("the_hive.server.require_fleet_recovery_ready"),
+            patch("the_hive.server._headless_descriptor", return_value=None),
+            patch("the_hive.server._ollama_descriptor", return_value=None),
             patch(
-                "codex_master.server.require_authenticated_agent_for_mutation",
+                "the_hive.server.require_authenticated_agent_for_mutation",
                 return_value={"authenticated": True},
             ),
-            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
-            patch("codex_master.server.require_ollama_admission"),
-            patch("codex_master.server.scope_check", return_value={"allowed": True}),
-            patch("codex_master.server.claim_for_agent_mutation", return_value=(lease, False)),
+            patch("the_hive.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch("the_hive.server.require_ollama_admission"),
+            patch("the_hive.server.scope_check", return_value={"allowed": True}),
+            patch("the_hive.server.claim_for_agent_mutation", return_value=(lease, False)),
             patch(
-                "codex_master.server.ensure_assignment_session_model",
+                "the_hive.server.ensure_assignment_session_model",
                 return_value={"status": "unchanged"},
             ),
             patch(
-                "codex_master.server.agent_config",
+                "the_hive.server.agent_config",
                 return_value={"session": "a1-session", "home": Path("/tmp/home")},
             ),
-            patch("codex_master.server.tmux_alive", return_value=True),
-            patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}),
+            patch("the_hive.server.tmux_alive", return_value=True),
+            patch("the_hive.server.require_managed_tmux_session", return_value={"ok": True}),
             patch(
-                "codex_master.server.read_meta",
+                "the_hive.server.read_meta",
                 return_value={
                     "agent_class": "arbeitsbiene",
                     "model": "gpt-5.6-luna",
@@ -34336,16 +34336,16 @@ class CliLifecycleTest(unittest.TestCase):
                     "cwd": "/tmp",
                 },
             ),
-            patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()),
-            patch("codex_master.server.send_agent", return_value={"agent": "a1", "status": "sent"}),
-            patch("codex_master.server.record_assignment"),
+            patch("the_hive.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()),
+            patch("the_hive.server.send_agent", return_value={"agent": "a1", "status": "sent"}),
+            patch("the_hive.server.record_assignment"),
         ]
         with contextlib.ExitStack() as stack:
             for item in patches:
                 stack.enter_context(item)
-            reserve = stack.enter_context(patch("codex_master.server.reserve_managed_replacement"))
-            run_tmux = stack.enter_context(patch("codex_master.server.run_tmux"))
-            start_agent = stack.enter_context(patch("codex_master.server.start_agent"))
+            reserve = stack.enter_context(patch("the_hive.server.reserve_managed_replacement"))
+            run_tmux = stack.enter_context(patch("the_hive.server.run_tmux"))
+            start_agent = stack.enter_context(patch("the_hive.server.start_agent"))
             try:
                 result = main_cli(argv)
             except SystemExit as exc:
@@ -34371,8 +34371,8 @@ class CliLifecycleTest(unittest.TestCase):
             any(call.args and call.args[0] and call.args[0][0] == "kill-session" for call in run_tmux.call_args_list)
         )
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"status": "interrupt_sent", "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"status": "interrupt_sent", "raw_output": "not_returned"})
     def test_cli_interrupt_can_allow_unauthenticated(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -34384,9 +34384,9 @@ class CliLifecycleTest(unittest.TestCase):
             {"agent": "c2", "force": True, "allow_unauthenticated": True},
         )
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -34398,9 +34398,9 @@ class CliLifecycleTest(unittest.TestCase):
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.wait_agent_input_ready")
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.wait_agent_input_ready")
+    @patch("the_hive.server.run_tmux")
     def test_send_agent_success_response_is_data_sparse(
         self, mock_run_tmux, mock_ready, _mock_pane_pid, _mock_processes, _mock_alive
     ) -> None:
@@ -34423,11 +34423,11 @@ class CliLifecycleTest(unittest.TestCase):
                 ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
             )
             with patch.dict(
-                "codex_master.server.AGENTS",
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
             ), patch(
-                "codex_master.server.require_fleet_recovery_ready"
+                "the_hive.server.require_fleet_recovery_ready"
             ), server_module.temporary_agent_inventory(inventory):
                 result = send_agent("a", "hello", True)
 
@@ -34436,9 +34436,9 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["response_output"], "not_returned")
         self.assertNotIn("SECRET_OUTPUT", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("the_hive.server.tmux_alive", return_value=True)
     @patch(
-        "codex_master.server.agent_home_process_summary",
+        "the_hive.server.agent_home_process_summary",
         return_value={
             "process_count": 1,
             "managed_process_count": 1,
@@ -34450,8 +34450,8 @@ class CliLifecycleTest(unittest.TestCase):
             "raw_output": "not_returned",
         },
     )
-    @patch("codex_master.server.pane_pid", return_value=123)
-    @patch("codex_master.server.run_tmux")
+    @patch("the_hive.server.pane_pid", return_value=123)
+    @patch("the_hive.server.run_tmux")
     def test_interrupt_agent_success_response_is_data_sparse(
         self, mock_run_tmux, _mock_pane_pid, _mock_processes, _mock_alive
     ) -> None:
@@ -34467,12 +34467,12 @@ class CliLifecycleTest(unittest.TestCase):
             inventory = server_module.InventorySnapshot(
                 ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
             )
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.RAW_DIR", state / "raw"
-            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
-            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
-                "codex_master.server.AGENTS",
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch.dict(
+                "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
             ), server_module.temporary_agent_inventory(inventory):
@@ -34483,8 +34483,8 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["response_output"], "not_returned")
         self.assertNotIn("SECRET_OUTPUT", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
     def test_cli_claim_defaults_to_wait_forever(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -34504,8 +34504,8 @@ class CliLifecycleTest(unittest.TestCase):
             },
         )
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
     def test_cli_claim_no_wait_keeps_immediate_attempt_available(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -34526,8 +34526,8 @@ class CliLifecycleTest(unittest.TestCase):
             },
         )
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
     def test_cli_claim_finite_wait_is_unbounded_by_schema(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -34548,8 +34548,8 @@ class CliLifecycleTest(unittest.TestCase):
             },
         )
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
     def test_cli_claim_can_disable_stopped_lease_recovery(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -34569,7 +34569,7 @@ class CliLifecycleTest(unittest.TestCase):
             },
         )
 
-    @patch("codex_master.server.call_tool")
+    @patch("the_hive.server.call_tool")
     def test_cli_claim_rejects_conflicting_wait_modes(self, mock_call_tool) -> None:
         with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as raised:
             main_cli(["claim", "b", "--forever", "--no-wait"])
@@ -34581,7 +34581,7 @@ class CliLifecycleTest(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, "wait_forever and wait_seconds are mutually exclusive"):
             call_tool("agent_claim", {"agent": "a", "wait_forever": True, "wait_seconds": 30})
 
-    @patch("codex_master.server.call_tool")
+    @patch("the_hive.server.call_tool")
     @patch("builtins.print")
     def test_cli_tool_validation_rejects_out_of_bounds_arguments(self, mock_print, mock_call_tool) -> None:
         result = main_cli(["wait", "a", "--timeout-seconds", "-1"])
@@ -34591,8 +34591,8 @@ class CliLifecycleTest(unittest.TestCase):
         payload = json.loads(mock_print.call_args.args[0])
         self.assertEqual(payload["error"], "timeout_seconds must be >= 0")
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"status": "ok", "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"status": "ok", "raw_output": "not_returned"})
     def test_cli_watchdog_quiet_suppresses_success_json(self, mock_call_tool, mock_print_json) -> None:
         result = main_cli(["watchdog", "all", "--manage-unclaimed", "--quiet"])
 
@@ -34603,9 +34603,9 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertTrue(args["manage_unclaimed"])
         mock_print_json.assert_not_called()
 
-    @patch("codex_master.server.print_json")
+    @patch("the_hive.server.print_json")
     @patch(
-        "codex_master.server.call_tool",
+        "the_hive.server.call_tool",
         return_value={"status": "ok", "results": [{"agent": "a1", "error": "agent failed"}]},
     )
     def test_cli_watchdog_quiet_preserves_agent_errors(self, mock_call_tool, mock_print_json) -> None:
@@ -34616,8 +34616,8 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result, 1)
         mock_print_json.assert_called_once_with(payload)
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"ok": True, "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"ok": True, "raw_output": "not_returned"})
     def test_cli_watchdog_status_routes_to_master_tool(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -34627,8 +34627,8 @@ class CliLifecycleTest(unittest.TestCase):
         mock_call_tool.assert_called_once_with("master_watchdog_status", {})
         mock_print_json.assert_called_once()
 
-    @patch("codex_master.server.print_json")
-    @patch("codex_master.server.call_tool", return_value={"ok": True, "raw_output": "not_returned"})
+    @patch("the_hive.server.print_json")
+    @patch("the_hive.server.call_tool", return_value={"ok": True, "raw_output": "not_returned"})
     def test_cli_timeout_policy_routes_to_master_tool(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0
 
@@ -34638,7 +34638,7 @@ class CliLifecycleTest(unittest.TestCase):
         mock_call_tool.assert_called_once_with("master_timeout_policy", {})
         mock_print_json.assert_called_once()
 
-    @patch("codex_master.server.ensure_state")
+    @patch("the_hive.server.ensure_state")
     @patch("builtins.print")
     def test_cli_raw_log_writer_rejects_out_of_policy_max_bytes(self, mock_print, mock_ensure_state) -> None:
         result = main_cli(["raw-log-writer", "/tmp/agent.log", "--max-bytes", str(MAX_RAW_LOG_BYTES + 1)])
@@ -34667,7 +34667,7 @@ class CliLifecycleTest(unittest.TestCase):
 
 
 
-    @patch("codex_master.server._run_mcp_probe")
+    @patch("the_hive.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_is_data_sparse(self, mock_run) -> None:
         response = (
             '{"jsonrpc":"2.0","id":1,'
@@ -34687,7 +34687,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS)
 
-    @patch("codex_master.server._run_mcp_probe")
+    @patch("the_hive.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_accepts_content_length_frames(self, mock_run) -> None:
         response = {
             "jsonrpc": "2.0",
@@ -34712,7 +34712,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["raw_output"], "not_returned")
 
-    @patch("codex_master.server._run_mcp_probe")
+    @patch("the_hive.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_rejects_embedded_json(self, mock_run) -> None:
         mock_run.return_value = subprocess.CompletedProcess(
             ["codex-master-mcp"],
@@ -34732,7 +34732,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("SECRET", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server._run_mcp_probe")
+    @patch("the_hive.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_rejects_stderr_only_response(self, mock_run) -> None:
         response = (
             '{"jsonrpc":"2.0","id":1,'
@@ -34752,7 +34752,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["raw_output"], "not_returned")
 
-    @patch("codex_master.server._run_mcp_probe")
+    @patch("the_hive.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_handles_missing_command(self, mock_run) -> None:
         mock_run.side_effect = FileNotFoundError("SECRET_PATH_SHOULD_NOT_RETURN")
 
@@ -34810,15 +34810,15 @@ class CliLifecycleTest(unittest.TestCase):
 
 
 
-    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("the_hive.server.tmux_alive", return_value=False)
     @patch(
-        "codex_master.server.codex_client_mcp_config_status",
+        "the_hive.server.codex_client_mcp_config_status",
         return_value={"name": "codex_client_mcp_config", "ok": False},
     )
-    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
-    @patch("codex_master.server._codex_mcp_binding")
-    @patch("codex_master.server.shutil.which")
-    @patch("codex_master.server.print_json")
+    @patch("the_hive.server.check_mcp_registration", return_value={"registered": False, "ok": False})
+    @patch("the_hive.server._codex_mcp_binding")
+    @patch("the_hive.server.shutil.which")
+    @patch("the_hive.server.print_json")
     def test_cli_doctor_exposes_health_checks_without_secrets(
         self,
         mock_print_json,
@@ -34860,7 +34860,7 @@ class CliLifecycleTest(unittest.TestCase):
                 },
             ):
                 with patch.dict(
-                    "codex_master.server.AGENTS",
+                    "the_hive.server.AGENTS",
                     {
                         "a": {"label": "A", "runner": Path(tmp_home) / "a-runner", "home": Path(tmp_home) / "a", "session": "session-a"},
                         "b": {"label": "B", "runner": Path(tmp_home) / "b-runner", "home": Path(tmp_home) / "b", "session": "session-b"},
@@ -34871,17 +34871,17 @@ class CliLifecycleTest(unittest.TestCase):
                     (Path(tmp_home) / "a").mkdir(parents=True)
                     (Path(tmp_home) / "b-runner").write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
                     (Path(tmp_home) / "b").mkdir(parents=True)
-                    with patch("codex_master.server.STATE_ROOT", Path(tmp_home) / "state"), patch(
-                        "codex_master.server.RAW_DIR", Path(tmp_home) / "state" / "raw"
+                    with patch("the_hive.server.STATE_ROOT", Path(tmp_home) / "state"), patch(
+                        "the_hive.server.RAW_DIR", Path(tmp_home) / "state" / "raw"
                     ), patch(
-                        "codex_master.server.META_DIR", Path(tmp_home) / "state" / "meta"
-                    ), patch("codex_master.server.LEGACY_STATE_ROOT", Path(tmp_home) / "legacy-state"), patch(
-                        "codex_master.server.LEGACY_META_DIR", Path(tmp_home) / "legacy-state" / "meta"
+                        "the_hive.server.META_DIR", Path(tmp_home) / "state" / "meta"
+                    ), patch("the_hive.server.LEGACY_STATE_ROOT", Path(tmp_home) / "legacy-state"), patch(
+                        "the_hive.server.LEGACY_META_DIR", Path(tmp_home) / "legacy-state" / "meta"
                     ), patch(
-                        "codex_master.server._runtime_mcp_entrypoint",
+                        "the_hive.server._runtime_mcp_entrypoint",
                         return_value=Path("/runtime/bin/codex-master-mcp"),
                     ), patch(
-                        "codex_master.server.mcp_command_startup_self_test",
+                        "the_hive.server.mcp_command_startup_self_test",
                         return_value={"ok": False},
                     ):
                         result = main_cli(["doctor"])
@@ -34934,12 +34934,12 @@ class CliLifecycleTest(unittest.TestCase):
 class AgentPoolManagementTest(unittest.TestCase):
     def setUp(self) -> None:
         lease_status = patch(
-            "codex_master.server.agent_lease_status",
+            "the_hive.server.agent_lease_status",
             return_value={"state": "unclaimed"},
         )
         lease_status.start()
         self.addCleanup(lease_status.stop)
-        pool_scan = patch("codex_master.server.pool_home_processes", return_value=[])
+        pool_scan = patch("the_hive.server.pool_home_processes", return_value=[])
         pool_scan.start()
         self.addCleanup(pool_scan.stop)
 
@@ -35310,7 +35310,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("IndexError", dot_path_error)
 
     def test_agent_pool_alias_targets_use_selector_normalization(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35333,7 +35333,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertEqual(server_module.pool_selector_ids(normalized, "pair"), ["a1", "a2"])
 
     def test_agent_pool_install_status_copy_auth_and_destroy_are_data_sparse(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35439,7 +35439,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse(pool.exists())
 
     def test_agent_pool_install_rejects_partial_auth_copy_before_mutation(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35457,7 +35457,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse(pool.exists())
 
     def test_agent_pool_install_rejects_missing_auth_source_before_mutation(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35480,7 +35480,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse((pool / server_module.POOL_MARKER_FILE).exists())
 
     def test_agent_pool_install_writes_marker_only_after_auth_copy(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35518,7 +35518,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse((pool / server_module.POOL_MARKER_FILE).exists())
 
     def test_agent_pool_copy_auth_does_not_echo_custom_target_selector(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35551,7 +35551,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(pool), payload)
 
     def test_agent_pool_copy_auth_does_not_clobber_target_created_after_check(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35598,7 +35598,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), '{"token":"concurrent"}\n')
 
     def test_agent_pool_destroy_supports_custom_pool_ids(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35625,7 +35625,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertEqual(destroyed["removed_agent_entries"], 1)
 
     def test_agent_pool_destroy_force_does_not_remove_root_created_after_missing_check(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35673,7 +35673,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertTrue(pool_exists)
 
     def test_agent_pool_copy_auth_does_not_echo_custom_source_agent(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35715,7 +35715,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(pool), payload)
 
     def test_agent_pool_validate_does_not_echo_custom_series_alias_or_auth_names(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35758,7 +35758,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(pool), payload)
 
     def test_agent_pool_status_does_not_echo_custom_series_names(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35794,7 +35794,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(pool), payload)
 
     def test_agent_pool_status_does_not_count_files_through_symlinked_home(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35828,7 +35828,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertEqual(result["auth_count"], 0)
 
     def test_agent_pool_status_does_not_follow_symlinked_pool_root(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35859,7 +35859,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("outside-secret-root", payload)
 
     def test_agent_pool_status_rejects_pool_root_swap_before_scan(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35880,12 +35880,12 @@ class AgentPoolManagementTest(unittest.TestCase):
                     return "directory"
                 return original_state(path)
 
-            with patch("codex_master.server.pool_public_path_state", side_effect=race_root_state):
+            with patch("the_hive.server.pool_public_path_state", side_effect=race_root_state):
                 with self.assertRaisesRegex(AgentError, "pool root changed during status"):
                     server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
 
     def test_agent_pool_status_requires_regular_marker_and_configs_for_ok(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35926,7 +35926,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("outside-marker", payload)
 
     def test_agent_pool_status_rejects_stale_marker_for_current_spec(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35946,7 +35946,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertEqual(status["marker_state"], "file")
 
     def test_agent_pool_destroy_rejects_in_place_marker_change_before_unlink(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -35975,7 +35975,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((pool / "a1").exists())
 
     def test_agent_pool_destroy_rejects_marker_copied_to_different_root(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36007,7 +36007,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((pool_b / "x1").is_dir())
 
     def test_agent_pool_install_preserves_current_marker_on_repeat(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36042,7 +36042,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
 
     def test_agent_pool_status_detects_invalid_shared_asset_links_without_path_leak(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36088,7 +36088,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("outside-skills", payload)
 
     def test_agent_pool_status_accepts_links_to_resolved_template_source(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36120,7 +36120,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(status["shared_asset_template_source_missing_count"], 0)
 
     def test_agent_pool_status_and_destroy_use_canonical_pool_root_identity_for_marker(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36174,7 +36174,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertNotIn('"target_selector": "a-series"', text)
 
     def test_agent_pool_install_replaces_wrapper_and_config_symlinks_without_touching_targets(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36203,7 +36203,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(config_target.read_text(encoding="utf-8"), "external config secret\n")
 
     def test_agent_pool_install_skips_broken_shared_asset_symlink_without_replacing_it(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36223,7 +36223,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((pool / "a2" / "plugins").is_symlink())
 
     def test_agent_pool_install_rejects_symlinked_template_asset(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36246,7 +36246,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertFalse(status["ok"])
 
     def test_agent_pool_install_rejects_shared_asset_source_swap_during_link(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36295,7 +36295,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual((outside / "secret.txt").read_text(encoding="utf-8"), "external-secret\n")
 
     def test_agent_pool_install_keeps_shared_asset_link_on_pinned_parent_after_path_swap(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36342,7 +36342,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertFalse(replacement_link_exists)
 
     def test_agent_pool_copy_auth_treats_broken_target_symlink_as_existing(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36378,7 +36378,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual((pool / "a2" / "auth.json").read_text(encoding="utf-8"), '{"token":"secret"}\n')
 
     def test_agent_pool_copy_auth_rejects_symlinked_source_home_without_copying(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36406,7 +36406,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("external-secret", str(ctx.exception))
 
     def test_agent_pool_copy_auth_rejects_regular_source_swap_before_open(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36453,7 +36453,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual((tmp / "original-auth.json").read_text(encoding="utf-8"), "source-secret\n")
 
     def test_agent_pool_copy_auth_rejects_symlinked_pool_root_without_copying(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36481,7 +36481,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("external-secret", str(ctx.exception))
 
     def test_agent_pool_copy_auth_rejects_pool_root_swap_before_copy(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36611,7 +36611,7 @@ class AgentPoolManagementTest(unittest.TestCase):
                 self.assertNotIn("secret", payload_text.lower())
 
     def test_agent_pool_wrapper_quotes_codex_bin_special_chars_as_data(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36648,7 +36648,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("BAD", completed.stdout + completed.stderr)
 
     def test_agent_pool_wrapper_falls_back_when_requested_affinity_is_unavailable(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36687,7 +36687,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertIn("FALLBACK_OK:", completed.stdout)
 
     def test_agent_pool_normalizes_relative_codex_bin_for_wrapper(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36705,7 +36705,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertIn(f"CODEX_AGENT_BIN={fake_codex}", wrapper)
 
     def test_agent_pool_wrapper_treats_command_name_as_data_not_exec_option(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36768,7 +36768,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("outside-runtime-target", payload_text)
 
     def test_agent_pool_install_rejects_pool_root_swap_before_mutation(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36808,7 +36808,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse((pool / "a1").exists())
 
     def test_pool_root_operation_keeps_writes_on_open_directory_after_path_swap(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36826,7 +36826,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse((replacement / "sentinel").exists())
 
     def test_agent_pool_destroy_waits_for_concurrent_install(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -36886,9 +36886,9 @@ class AgentPoolManagementTest(unittest.TestCase):
 
             state = tmp / "state"
             with patch.object(server_module, "ensure_private_dir", side_effect=pause_install_home), patch(
-                "codex_master.server.STATE_ROOT", state
-            ), patch("codex_master.server.LOCK_DIR", state / "locks"), patch(
-                "codex_master.server.LEASE_DIR", state / "leases"
+                "the_hive.server.STATE_ROOT", state
+            ), patch("the_hive.server.LOCK_DIR", state / "locks"), patch(
+                "the_hive.server.LEASE_DIR", state / "leases"
             ):
                 installer = threading.Thread(target=run_install)
                 destroyer = threading.Thread(target=run_destroy)
@@ -36911,7 +36911,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse((pool / server_module.POOL_MARKER_FILE).exists())
 
     def test_remove_agent_pool_entry_rejects_directory_swap_before_rmtree(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -36945,7 +36945,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual((original / "keep.txt").read_text(encoding="utf-8"), "managed\n")
 
     def test_remove_agent_pool_entry_rejects_directory_swap_during_rmtree(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -36972,7 +36972,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse((original / "keep.txt").exists())
 
     def test_remove_agent_pool_entry_pins_parent_for_regular_unlink(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -37005,7 +37005,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "foreign\n")
 
     def test_agent_pool_destroy_requires_regular_marker_without_path_leak(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37038,7 +37038,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue(marker.is_symlink())
 
     def test_agent_pool_destroy_rejects_marker_for_different_spec(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37069,7 +37069,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((pool / server_module.POOL_MARKER_FILE).is_file())
 
     def test_agent_pool_destroy_rejects_marker_swap_before_unlink(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37107,7 +37107,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((pool / "a1").is_dir())
 
     def test_agent_pool_destroy_rejects_pool_home_process_before_removal(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37139,7 +37139,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((pool / server_module.POOL_MARKER_FILE).is_file())
 
     def test_agent_pool_destroy_rejects_active_lease_before_removal(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37166,7 +37166,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((pool / "a1").is_dir())
 
     def test_agent_pool_destroy_rejects_symlinked_pool_root_without_removing_external_entries(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37194,7 +37194,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("outside-secret-root", str(ctx.exception))
 
     def test_agent_pool_destroy_rejects_pool_root_swap_before_removal(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37234,7 +37234,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue(external_marker.is_file())
 
     def test_agent_pool_destroy_refuses_unsafe_rmtree_without_removing_pool(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37255,7 +37255,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((pool / "a1").is_dir())
 
     def test_agent_pool_destroy_reports_root_removal_failure(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37290,7 +37290,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse(pool.exists())
 
     def test_agent_pool_destroy_does_not_overwrite_marker_created_during_restore(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37326,7 +37326,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertEqual(marker_text, "foreign marker\n")
 
     def test_agent_pool_tools_are_registered_and_cli_invokes_pool_namespace(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         tool_names = {tool["name"] for tool in server_module.TOOLS}
         self.assertIn("agent_pool_validate", tool_names)
@@ -37342,7 +37342,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             tmp = Path(tmpdir)
             pool = tmp / "agents"
             spec_path = self._write_spec(tmp, pool)
-            with patch("codex_master.server.print_json", side_effect=_capture):
+            with patch("the_hive.server.print_json", side_effect=_capture):
                 result = server_module.main_cli(["pool", "validate", "--spec", str(spec_path), "--target-dir", str(pool)])
 
         self.assertEqual(result, 0)
@@ -37351,7 +37351,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertEqual(captured_payloads[0]["pool_root"], "not_returned")
 
     def test_agent_pool_spec_reader_rejects_symlink_and_oversized_without_path_leak(self) -> None:
-        from codex_master import server as server_module
+        from the_hive import server as server_module
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -37418,9 +37418,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+            with patch("the_hive.server.STATE_ROOT", state), patch("the_hive.server.LOCK_DIR", lock_dir), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
                 server_module.record_native_agent_event(start, now=1_000.0)
                 self.assertEqual(
                     server_module.native_agent_status(now=1_001.0),
@@ -37448,12 +37448,12 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 server_module.record_native_agent_event(
                     {
@@ -37486,16 +37486,16 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ), patch(
-                "codex_master.server._total_running_agent_count", return_value=10
+                "the_hive.server._total_running_agent_count", return_value=10
             ), patch(
-                "codex_master.server.system_resource_snapshot",
+                "the_hive.server.system_resource_snapshot",
                 return_value={
                     "ok": True,
                     "load_per_cpu": 0.25,
@@ -37545,12 +37545,12 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 server_module.record_native_agent_event(
                     {
@@ -37584,9 +37584,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+            with patch("the_hive.server.STATE_ROOT", state), patch("the_hive.server.LOCK_DIR", lock_dir), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
                 for event in (
                     {"hook_event_name": "SubagentStart", "session_id": "s1", "agent_id": "a-1", "agent_type": "explorer"},
                     {"hook_event_name": "SubagentStart", "session_id": "s1", "agent_id": "a-2", "agent_type": "explorer"},
@@ -37610,9 +37610,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+            with patch("the_hive.server.STATE_ROOT", state), patch("the_hive.server.LOCK_DIR", lock_dir), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
                 for index in range(2):
                     server_module.record_native_agent_event(
                         {
@@ -37645,9 +37645,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+            with patch("the_hive.server.STATE_ROOT", state), patch("the_hive.server.LOCK_DIR", lock_dir), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
                 server_module.record_native_agent_event(
                     {"hook_event_name": "SessionStart", "session_id": "thr_parent"},
                     now=1_000.0,
@@ -37671,10 +37671,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
             state.mkdir(parents=True)
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 for document in (
                     {"schema_version": 1, "agents": []},
@@ -37699,10 +37699,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             state.mkdir(parents=True)
             record_path.write_text(json.dumps({"schema_version": 1, "agents": []}) + "\n", encoding="utf-8")
             record_path.chmod(0o600)
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 total = server_module._total_running_agent_count(managed_ids=frozenset())
 
@@ -37717,10 +37717,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 server_module.record_native_agent_event(
                     {"hook_event_name": "SessionStart", "session_id": "parent-one"},
@@ -37744,14 +37744,14 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 for thread_id, managed_id in (("thread-q1", "q1-tmux"), ("thread-q2", "q2-tmux")):
                     with patch(
-                        "codex_master.server._trusted_managed_tmux_session_for_home",
+                        "the_hive.server._trusted_managed_tmux_session_for_home",
                         return_value=managed_id,
                     ):
                         server_module.record_native_agent_event(
@@ -37780,14 +37780,14 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 },
                 agent_ids=("q1",),
             )
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
-            ), patch("codex_master.server.effective_observation_inventory", return_value=(inventory, True)), patch(
-                "codex_master.server.require_managed_tmux_session", return_value={"ok": True}
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
+            ), patch("the_hive.server.effective_observation_inventory", return_value=(inventory, True)), patch(
+                "the_hive.server.require_managed_tmux_session", return_value={"ok": True}
             ), patch.dict(
                 os.environ, {"CODEX_HOME": str(home)}, clear=False
             ):
@@ -37807,13 +37807,13 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 agents={"q1": SimpleNamespace(home=Path(tmpdir) / "managed-q1", session="q1-tmux")},
                 agent_ids=("q1",),
             )
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
-            ), patch("codex_master.server.effective_observation_inventory", return_value=(inventory, True)), patch.dict(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
+            ), patch("the_hive.server.effective_observation_inventory", return_value=(inventory, True)), patch.dict(
                 os.environ, {"CODEX_HOME": str(Path(tmpdir) / "untrusted-home")}, clear=False
             ):
                 server_module.record_native_agent_event(
@@ -37836,14 +37836,14 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 agents={"q1": SimpleNamespace(home=home, session="q1-tmux")},
                 agent_ids=("q1",),
             )
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", state / "locks"
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
             ), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
-            ), patch("codex_master.server.effective_observation_inventory", return_value=(inventory, True)), patch(
-                "codex_master.server.require_managed_tmux_session",
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
+            ), patch("the_hive.server.effective_observation_inventory", return_value=(inventory, True)), patch(
+                "the_hive.server.require_managed_tmux_session",
                 side_effect=AgentError("tmux identity unavailable"),
             ), patch.dict(os.environ, {"CODEX_HOME": str(home)}, clear=False):
                 server_module.record_native_agent_event(
@@ -37860,10 +37860,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 server_module.record_native_agent_event(
                     {"hook_event_name": "SessionStart", "session_id": "parent-ended"},
@@ -37885,10 +37885,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 for session_id in ("parent-active", "parent-ended"):
                     server_module.record_native_agent_event(
@@ -37914,10 +37914,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 server_module.record_native_agent_event(
                     {"hook_event_name": "SessionStart", "session_id": "parent-ended"},
@@ -37927,17 +37927,17 @@ class NativeAgentRegistryTest(unittest.TestCase):
                     {"hook_event_name": "SessionEnd", "session_id": "parent-ended"},
                     now=1_001.0,
                 )
-                with patch("codex_master.server._managed_tmux_session_count", return_value=1), patch(
-                    "codex_master.server.time.time", return_value=1_002.0
-                ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
-                    "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
-                ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
-                    "codex_master.server._resource_meminfo", return_value=(50.0, 8192.0)
-                ), patch("codex_master.server._effective_cpu_count", return_value=4), patch(
-                    "codex_master.server._typed_g5_cgroup_runtime",
+                with patch("the_hive.server._managed_tmux_session_count", return_value=1), patch(
+                    "the_hive.server.time.time", return_value=1_002.0
+                ), patch("the_hive.server.os.cpu_count", return_value=4), patch(
+                    "the_hive.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+                ), patch("the_hive.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
+                    "the_hive.server._resource_meminfo", return_value=(50.0, 8192.0)
+                ), patch("the_hive.server._effective_cpu_count", return_value=4), patch(
+                    "the_hive.server._typed_g5_cgroup_runtime",
                     return_value=(object(), object()),
                 ), patch(
-                    "codex_master.server._g5_warmup_active", return_value=False
+                    "the_hive.server._g5_warmup_active", return_value=False
                 ):
                     result = spawn_admission_decision(1)
 
@@ -37950,10 +37950,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch(
-                "codex_master.server.LOCK_DIR", lock_dir
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            with patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.LOCK_DIR", lock_dir
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 server_module.record_native_agent_event(
                     {
@@ -37985,9 +37985,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+            with patch("the_hive.server.STATE_ROOT", state), patch("the_hive.server.LOCK_DIR", lock_dir), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
                 server_module.record_native_agent_event(
                     {"hook_event_name": "SubagentStart", "session_id": "s", "agent_id": "agent", "agent_type": "worker"},
                     now=1000.0,
@@ -38003,9 +38003,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+            with patch("the_hive.server.STATE_ROOT", state), patch("the_hive.server.LOCK_DIR", lock_dir), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
                 for index in range(7):
                     server_module.record_native_agent_event(
                         {
@@ -38028,9 +38028,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+            with patch("the_hive.server.STATE_ROOT", state), patch("the_hive.server.LOCK_DIR", lock_dir), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
                 for index in range(65):
                     server_module.record_native_agent_event(
                         {
@@ -38058,9 +38058,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_dir = state / "locks"
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
-            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+            with patch("the_hive.server.STATE_ROOT", state), patch("the_hive.server.LOCK_DIR", lock_dir), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
                 seed = {
                     "hook_event_name": "SubagentStart",
                     "session_id": "s1",
@@ -38087,15 +38087,15 @@ class NativeAgentRegistryTest(unittest.TestCase):
             record_path = state / "native-agents.json"
             lock_path = lock_dir / "native-agents.lock"
             state.mkdir(parents=True)
-            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            with patch("the_hive.server.STATE_ROOT", state), patch("the_hive.server.LOCK_DIR", lock_dir), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
             ):
                 target = state / "outside.json"
                 target.write_text("{}", encoding="utf-8")
                 symlink = state / "native-agents.json"
                 symlink.symlink_to(target)
 
-                with patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", symlink):
+                with patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", symlink):
                     result = server_module.native_agent_status()
                 self.assertEqual(result["bridge_state"], "degraded")
                 self.assertNotIn(str(tmpdir), json.dumps(result))
@@ -38106,19 +38106,19 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 if not hasattr(os, "link"):
                     self.skipTest("hard links unavailable")
                 os.link(real, hardlink)
-                with patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", hardlink):
+                with patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", hardlink):
                     result = server_module.native_agent_status()
                 self.assertEqual(result["bridge_state"], "degraded")
                 self.assertNotIn(str(tmpdir), json.dumps(result))
 
                 large = state / "oversized-native-agents.json"
                 large.write_bytes(b"x" * (server_module.MAX_NATIVE_AGENT_REGISTRY_BYTES + 1))
-                with patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", large):
+                with patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", large):
                     result = server_module.native_agent_status()
                 self.assertEqual(result["bridge_state"], "degraded")
 
             with native_agent_lock_blocked(record_path):
-                with patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path):
+                with patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path):
                     blocked = server_module.native_agent_status()
                 self.assertEqual(blocked["bridge_state"], "degraded")
 
@@ -38128,10 +38128,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             root = Path(tmpdir) / "state"
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=1_000.0
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=1_000.0
             ):
                 payload = {
                 "schema_version": 2,
@@ -38163,13 +38163,13 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_path = lock_dir / "native-agents.lock"
             state.mkdir()
             record_path.write_text("not-json", encoding="utf-8")
-            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+            with patch("the_hive.server.STATE_ROOT", state), patch("the_hive.server.LOCK_DIR", lock_dir), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
                 self.assertIsNone(server_module._fresh_native_reservation_count())
 
     def test_native_spawn_reservation_rejects_missing_ended_stale_or_future_parent(self) -> None:
-        with patch("codex_master.server.spawn_admission_decision", return_value={"allowed": True}):
+        with patch("the_hive.server.spawn_admission_decision", return_value={"allowed": True}):
             for state in (
                 [],
                 [{"session_id": "parent", "activity_state": "ended", "updated_at": 1_000.0}],
@@ -38178,10 +38178,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             ):
                 with self.subTest(state=state), tempfile.TemporaryDirectory() as tmpdir:
                     root = Path(tmpdir) / "state"
-                    with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                        "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
-                    ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
-                        "codex_master.server.time.time", return_value=1_000.0
+                    with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                        "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
+                    ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
+                        "the_hive.server.time.time", return_value=1_000.0
                     ):
                         root.mkdir()
                         server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": state, "reservations": []})
@@ -38193,18 +38193,18 @@ class NativeAgentRegistryTest(unittest.TestCase):
             root = Path(tmpdir) / "state"
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=900.0
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=900.0
             ):
                 server_module._write_native_agent_registry(
                     {"schema_version": 2, "agents": [], "sessions": [], "reservations": [{"reservation_id": "019fc541-a1e2-7a63-a4bf-b307fcb78457", "kind": "native_spawn", "created_at": 900.0, "parent_session_id": "019fc541-a1e2-7a63-a4bf-b307fcb78457"}]}
                 )
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=1_000.0
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=1_000.0
             ):
                 with server_module.native_agent_registry_lock():
                     registry, state = server_module._read_native_agent_registry()
@@ -38218,11 +38218,11 @@ class NativeAgentRegistryTest(unittest.TestCase):
             lock_path = root / "locks" / "native.lock"
             rid = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
             rid2 = "019fc541-a1e2-7a63-a4bf-b307fcb78458"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=1_000.0
-            ), patch("codex_master.server._trusted_managed_tmux_session_for_home", return_value=None):
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=1_000.0
+            ), patch("the_hive.server._trusted_managed_tmux_session_for_home", return_value=None):
                 server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [{"session_id": rid, "activity_state": "active", "updated_at": 1_000.0}], "reservations": [
                     {"reservation_id": rid, "kind": "native_spawn", "created_at": 990.0, "parent_session_id": rid},
                     {"reservation_id": rid2, "kind": "native_spawn", "created_at": 995.0, "parent_session_id": rid},
@@ -38237,10 +38237,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
     def test_subagent_start_without_reservation_counts_active_conservatively(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "state"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
-                "codex_master.server._trusted_managed_tmux_session_for_home", return_value=None
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
+                "the_hive.server._trusted_managed_tmux_session_for_home", return_value=None
             ):
                 server_module.record_native_agent_event({"hook_event_name": "SubagentStart", "session_id": "019fc541-a1e2-7a63-a4bf-b307fcb78457", "agent_id": "019fc541-a1e2-7a63-a4bf-b307fcb78458", "agent_type": "worker"}, now=1_000.0)
                 result = server_module.native_agent_status(now=1_001.0)
@@ -38254,11 +38254,11 @@ class NativeAgentRegistryTest(unittest.TestCase):
             root = Path(tmpdir) / "state"
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=1_000.0
-            ), patch("codex_master.server.uuid.uuid4", return_value=SimpleNamespace(hex=reservation_id)):
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=1_000.0
+            ), patch("the_hive.server.uuid.uuid4", return_value=SimpleNamespace(hex=reservation_id)):
                 server_module._write_native_agent_registry(
                     {"schema_version": 2, "agents": [], "sessions": [], "reservations": []}
                 )
@@ -38292,10 +38292,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             root = Path(tmpdir) / "state"
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=1_000.0
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=1_000.0
             ):
                 server_module._write_native_agent_registry(
                     {
@@ -38338,10 +38338,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
             root = Path(tmpdir) / "state"
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=1_000.0
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=1_000.0
             ):
                 server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": []})
 
@@ -38374,12 +38374,12 @@ class NativeAgentRegistryTest(unittest.TestCase):
             root = Path(tmpdir) / "state"
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=now
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=now
             ), patch(
-                "codex_master.server.native_agent_status",
+                "the_hive.server.native_agent_status",
                 return_value={"bridge_state": "ready", "counts": {"active": 1, "unconfirmed": 1, "overflow": 0}},
             ):
                 server_module._write_native_agent_registry(
@@ -38403,8 +38403,8 @@ class NativeAgentRegistryTest(unittest.TestCase):
         assert total == 6
 
     def test_spawn_admission_lock_is_reentrant_in_same_context(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir, patch("codex_master.server.STATE_ROOT", Path(tmpdir) / "state"), patch(
-            "codex_master.server.LOCK_DIR", Path(tmpdir) / "state" / "locks"
+        with tempfile.TemporaryDirectory() as tmpdir, patch("the_hive.server.STATE_ROOT", Path(tmpdir) / "state"), patch(
+            "the_hive.server.LOCK_DIR", Path(tmpdir) / "state" / "locks"
         ):
             with server_module.spawn_admission_lock():
                 with server_module.spawn_admission_lock():
@@ -38426,11 +38426,11 @@ class NativeAgentRegistryTest(unittest.TestCase):
                     {"reservation_id": replacement_id, "kind": "managed_replacement", "created_at": 1_000.0, "managed_session": "q3-session"},
                 ],
             }
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=1_000.0
-            ), patch("codex_master.server._managed_tmux_session_ids", side_effect=AssertionError("unexpected rescan")):
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=1_000.0
+            ), patch("the_hive.server._managed_tmux_session_ids", side_effect=AssertionError("unexpected rescan")):
                 server_module._write_native_agent_registry(payload)
                 self.assertEqual(
                     server_module._fresh_native_reservation_count(now=1_000.0, managed_ids=frozenset({"q3-session"})),
@@ -38443,15 +38443,15 @@ class NativeAgentRegistryTest(unittest.TestCase):
             root = Path(tmpdir) / "state"
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server._managed_tmux_session_ids", return_value=frozenset({"q3-session"})
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server._managed_tmux_session_ids", return_value=frozenset({"q3-session"})
             ), patch(
-                "codex_master.server.native_agent_status",
+                "the_hive.server.native_agent_status",
                 side_effect=AssertionError("replacement must not require session metrics"),
             ), patch(
-                "codex_master.server._total_running_agent_count",
+                "the_hive.server._total_running_agent_count",
                 side_effect=AssertionError("replacement must not consume global capacity"),
             ):
                 server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": []})
@@ -38467,17 +38467,17 @@ class NativeAgentRegistryTest(unittest.TestCase):
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
             patches = [
-                patch("codex_master.server.STATE_ROOT", root),
-                patch("codex_master.server.LOCK_DIR", root / "locks"),
-                patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path),
-                patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path),
-                patch("codex_master.server._managed_tmux_session_ids", return_value=frozenset({"q3-session"})),
-                patch("codex_master.server.native_agent_status", return_value={"bridge_state": "ready"}),
-                patch("codex_master.server.time.time", return_value=1_000.0),
+                patch("the_hive.server.STATE_ROOT", root),
+                patch("the_hive.server.LOCK_DIR", root / "locks"),
+                patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path),
+                patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path),
+                patch("the_hive.server._managed_tmux_session_ids", return_value=frozenset({"q3-session"})),
+                patch("the_hive.server.native_agent_status", return_value={"bridge_state": "ready"}),
+                patch("the_hive.server.time.time", return_value=1_000.0),
             ]
             with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
                 server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": []})
-                with patch("codex_master.server._total_running_agent_count", return_value=10):
+                with patch("the_hive.server._total_running_agent_count", return_value=10):
                     allowed = server_module.reserve_managed_replacement("q3-session")
                     duplicate = server_module.reserve_managed_replacement("q3-session")
                 registry, _ = server_module._read_native_agent_registry()
@@ -38489,12 +38489,12 @@ class NativeAgentRegistryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "state"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
-                "codex_master.server._managed_tmux_session_ids", return_value=frozenset({"q3-session"})
-            ), patch("codex_master.server.native_agent_status", return_value={"bridge_state": "ready"}), patch(
-                "codex_master.server._total_running_agent_count", return_value=11
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
+                "the_hive.server._managed_tmux_session_ids", return_value=frozenset({"q3-session"})
+            ), patch("the_hive.server.native_agent_status", return_value={"bridge_state": "ready"}), patch(
+                "the_hive.server._total_running_agent_count", return_value=11
             ):
                 server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": []})
                 allowed = server_module.reserve_managed_replacement("q3-session")
@@ -38505,10 +38505,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
         session_id = "019fc541-a1e2-7a63-a4bf-b307fcb78458"
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "state"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
-                "codex_master.server.time.time", return_value=1_000.0
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
+                "the_hive.server.time.time", return_value=1_000.0
             ):
                 server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": [
                     {"reservation_id": reservation_id, "kind": "managed_replacement", "created_at": 1_000.0, "managed_session": session_id}
@@ -38552,11 +38552,11 @@ class NativeAgentRegistryTest(unittest.TestCase):
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
             patches = (
-                patch("codex_master.server.STATE_ROOT", root),
-                patch("codex_master.server.LOCK_DIR", root / "locks"),
-                patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path),
-                patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path),
-                patch("codex_master.server.time.time", return_value=1_000.0),
+                patch("the_hive.server.STATE_ROOT", root),
+                patch("the_hive.server.LOCK_DIR", root / "locks"),
+                patch("the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path),
+                patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path),
+                patch("the_hive.server.time.time", return_value=1_000.0),
             )
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 server_module._write_native_agent_registry(
@@ -38581,27 +38581,27 @@ class NativeAgentRegistryTest(unittest.TestCase):
             root = Path(tmpdir) / "state"
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=1_000.0
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=1_000.0
             ):
                 server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": [
                     {"reservation_id": reservation_id, "kind": "managed_replacement", "created_at": 1_000.0, "managed_session": "q3-session"}
                 ]})
                 self.assertEqual(server_module._fresh_native_reservation_count(now=1_000.0, managed_ids=frozenset()), 1)
                 self.assertEqual(server_module._fresh_native_reservation_count(now=1_030.0, managed_ids=frozenset()), 1)
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
-                "codex_master.server.time.time", return_value=1_031.0
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "the_hive.server.time.time", return_value=1_031.0
             ), server_module.native_agent_registry_lock():
                 registry, state = server_module._read_native_agent_registry()
             self.assertEqual(state, "ready")
             self.assertEqual(registry["reservations"], [])
-            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
-                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
-            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch("codex_master.server.time.time", return_value=1_031.0):
+            with patch("the_hive.server.STATE_ROOT", root), patch("the_hive.server.LOCK_DIR", root / "locks"), patch(
+                "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch("the_hive.server.time.time", return_value=1_031.0):
                 self.assertEqual(server_module._fresh_native_reservation_count(now=1_031.0, managed_ids=frozenset()), 0)
 
 
@@ -41124,7 +41124,7 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
         self.assertEqual(status["visible_tool_count"], 88)
 
     def test_admin_capability_catalog_rejects_wire_shape_downgrade(self) -> None:
-        from codex_master.admin_contracts import (
+        from the_hive.admin_contracts import (
             ADMIN_OPERATION_CATALOG,
             ADMIN_OPERATION_CATALOG_DIGEST,
             ADMIN_OPERATION_METADATA,
@@ -41165,7 +41165,7 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
                 server_module._masterjet_admin_capabilities(payload)
 
     def test_admin_capability_catalog_requires_exact_integer_field_types(self) -> None:
-        from codex_master.admin_contracts import (
+        from the_hive.admin_contracts import (
             ADMIN_OPERATION_CATALOG,
             ADMIN_OPERATION_CATALOG_DIGEST,
             ADMIN_OPERATION_METADATA,
@@ -41269,7 +41269,7 @@ class MasterjetAdminAdapterTests(unittest.TestCase):
         self.assertEqual(self.owners.google_provisioner.apply_calls, 0)
 
     def test_admin_contract_process_signals_propagate(self) -> None:
-        from codex_master import admin_contracts
+        from the_hive import admin_contracts
 
         for signal in (KeyboardInterrupt(), SystemExit(9)):
             with self.subTest(signal=type(signal).__name__), self._binding(), patch.object(
@@ -41357,7 +41357,7 @@ def test_targetless_teamlead_agent_start_keeps_a1_b1_legacy_forbidden() -> None:
 
 
 def test_fleet_home_v2_cutover_adapter_owns_product_ports_and_operation_id() -> None:
-    from codex_master.fleet_home_v2_cutover import (
+    from the_hive.fleet_home_v2_cutover import (
         FleetHomeV2CutoverError,
         FleetHomeV2PlanHandle,
     )
@@ -41433,7 +41433,7 @@ def test_fleet_home_v2_cutover_adapter_owns_product_ports_and_operation_id() -> 
 def test_fleet_home_v2_product_authority_port_binds_common_policy_schema_one(
     tmp_path: Path,
 ) -> None:
-    from codex_master.fleet_home_v2_cutover import FleetHomeV2PlanHandle
+    from the_hive.fleet_home_v2_cutover import FleetHomeV2PlanHandle
 
     pool = tmp_path / "pool"
     pool.mkdir(mode=0o700)
@@ -41495,7 +41495,7 @@ def test_fleet_home_v2_product_authority_port_binds_common_policy_schema_one(
 
 
 def test_fleet_home_v2_quiescence_propagates_unexpected_filesystem_programming_error() -> None:
-    from codex_master.fleet_home_v2_cutover import (
+    from the_hive.fleet_home_v2_cutover import (
         FleetHomeV2Authority,
         FleetHomeV2Policy,
         LocalFleetHomeV2Filesystem,
@@ -41557,7 +41557,7 @@ def test_master_fleet_home_v2_cutover_registers_closed_g1_mcp_schema() -> None:
 
 
 def test_master_fleet_home_v2_cutover_mcp_plan_binds_g1_and_returns_opaque_handle() -> None:
-    from codex_master.fleet_home_v2_cutover import FleetHomeV2PlanHandle
+    from the_hive.fleet_home_v2_cutover import FleetHomeV2PlanHandle
 
     handle = FleetHomeV2PlanHandle("a" * 48)
     with patch.object(
@@ -41590,7 +41590,7 @@ def test_master_fleet_home_v2_cutover_mcp_plan_binds_g1_and_returns_opaque_handl
 
 
 def test_master_fleet_home_v2_cutover_reconstructs_string_handle_across_calls() -> None:
-    from codex_master.fleet_home_v2_cutover import FleetHomeV2PlanHandle, FleetHomeV2Result
+    from the_hive.fleet_home_v2_cutover import FleetHomeV2PlanHandle, FleetHomeV2Result
 
     operation_id = "b" * 48
     calls: list[tuple[str, object | None]] = []
@@ -41649,7 +41649,7 @@ def test_master_fleet_home_v2_cutover_reconstructs_string_handle_across_calls() 
 
 
 def test_master_fleet_home_v2_cutover_routes_each_followup_operation() -> None:
-    from codex_master.fleet_home_v2_cutover import FleetHomeV2PlanHandle, FleetHomeV2Result
+    from the_hive.fleet_home_v2_cutover import FleetHomeV2PlanHandle, FleetHomeV2Result
 
     seen: list[tuple[str, str]] = []
     states = {
@@ -41696,7 +41696,7 @@ def test_master_fleet_home_v2_cutover_rejects_wrong_combinations_before_adapter(
 
 
 def test_master_fleet_home_v2_cutover_maps_adapter_errors_without_raw_details() -> None:
-    from codex_master.fleet_home_v2_cutover import FleetHomeV2CutoverError
+    from the_hive.fleet_home_v2_cutover import FleetHomeV2CutoverError
 
     request = {
         "jsonrpc": "2.0",
@@ -41733,7 +41733,7 @@ def test_master_fleet_home_v2_cutover_maps_adapter_errors_without_raw_details() 
 
 
 def test_master_fleet_home_v2_cutover_returns_only_bounded_result_state() -> None:
-    from codex_master.fleet_home_v2_cutover import FleetHomeV2Result
+    from the_hive.fleet_home_v2_cutover import FleetHomeV2Result
 
     request = {
         "jsonrpc": "2.0",

@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from codex_master import server
-from codex_master.admission import (
+from the_hive import server
+from the_hive.admission import (
     AdmissionPriority,
     AdmissionRecord,
     AdmissionState,
@@ -18,8 +18,8 @@ from codex_master.admission import (
     ResourceBinding,
     ScopeBinding,
 )
-from codex_master.admission_runtime import RuntimeGateDecision
-from codex_master.fleet_registry import AgentDescriptor, InventorySnapshot, Provider, RunnerKind
+from the_hive.admission_runtime import RuntimeGateDecision
+from the_hive.fleet_registry import AgentDescriptor, InventorySnapshot, Provider, RunnerKind
 
 
 NOW = datetime(2026, 8, 30, 12, tzinfo=timezone.utc)

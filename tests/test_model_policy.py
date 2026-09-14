@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.selection.model_policy import ModelDefinition, ModelPolicyError, ModelPolicyRegistry, load_model_policy
+from the_hive.selection.model_policy import ModelDefinition, ModelPolicyError, ModelPolicyRegistry, load_model_policy
 
 
 def test_model_policy_resolves_exact_ids_and_aliases_without_duplicate_budget_keys() -> None:

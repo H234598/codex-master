@@ -7,9 +7,9 @@ import json
 from pathlib import Path
 
 import pytest
-import codex_master.agent_operations as agent_operations_module
+import the_hive.agent_operations as agent_operations_module
 
-from codex_master.agent_contracts import (
+from the_hive.agent_contracts import (
     AgentLeaseV1,
     AgentNoWorkV1,
     AgentPollV1,
@@ -17,7 +17,7 @@ from codex_master.agent_contracts import (
     AgentResultV1,
     serialize_agent_result,
 )
-from codex_master.agent_operations import (
+from the_hive.agent_operations import (
     MAX_AGENT_OPERATION_STATE_BYTES,
     MAX_AGENT_OPERATION_RECORDS,
     AgentAttemptExhaustionV1,
@@ -360,7 +360,7 @@ def test_queue_limit_is_1024_records(tmp_path: Path) -> None:
 def test_enqueue_idempotent_retry_at_capacity_returns_existing_view(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import codex_master.agent_operations as operations
+    import the_hive.agent_operations as operations
 
     monkeypatch.setattr(operations, "MAX_AGENT_OPERATION_RECORDS", 2)
     store = store_at(tmp_path)

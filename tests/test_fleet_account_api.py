@@ -10,8 +10,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from codex_master import server
-from codex_master.fleet_registry import (
+from the_hive import server
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetAccountV2,
@@ -26,8 +26,8 @@ from codex_master.fleet_registry import (
     RunnerKind,
     SecretState,
 )
-from codex_master.fleet_recovery import RecoveryPhase
-from codex_master.fleet_runners import (
+from the_hive.fleet_recovery import RecoveryPhase
+from the_hive.fleet_runners import (
     ProbeDiagnosticCode,
     ProbeResult,
     ProviderError,

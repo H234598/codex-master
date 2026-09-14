@@ -5,14 +5,14 @@ from datetime import datetime, timezone
 
 import pytest
 
-from codex_master.hive.decisions import (
+from the_hive.hive.decisions import (
     DecisionError,
     DecisionRecord,
     record_decision,
     supersede_decision,
     verify_decision_chain,
 )
-from codex_master.hive.principals import Principal
+from the_hive.hive.principals import Principal
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

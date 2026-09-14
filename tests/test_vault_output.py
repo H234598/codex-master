@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from codex_master.vault_output import write_hourly_report
+from the_hive.vault_output import write_hourly_report
 
 
 def test_vault_writer_uses_bounded_report_path_and_is_idempotent(tmp_path):

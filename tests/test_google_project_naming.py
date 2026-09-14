@@ -4,7 +4,7 @@ import re
 
 import pytest
 
-from codex_master.google_project_naming import (
+from the_hive.google_project_naming import (
     _ADJECTIVES,
     _NOUNS,
     GoogleProjectNamingError,
@@ -38,8 +38,8 @@ def test_generated_names_and_ids_obey_google_rules_and_avoid_internal_identity()
 def test_generator_retries_visible_name_and_project_id_collisions(monkeypatch) -> None:
     choices = iter(("Quietglow", "Aurorabay", "Brightbloom", "Meadowglen"))
     suffixes = iter(("a1b2c3", "d4e5f6"))
-    monkeypatch.setattr("codex_master.google_project_naming.secrets.choice", lambda _: next(choices))
-    monkeypatch.setattr("codex_master.google_project_naming.secrets.token_hex", lambda _: next(suffixes))
+    monkeypatch.setattr("the_hive.google_project_naming.secrets.choice", lambda _: next(choices))
+    monkeypatch.setattr("the_hive.google_project_naming.secrets.token_hex", lambda _: next(suffixes))
 
     identity = generate_pretty_project_identity(
         visible_names={"Quietglow Aurorabay"},

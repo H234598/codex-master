@@ -4,11 +4,11 @@ from unittest.mock import patch
 
 import pytest
 
-from codex_master.fleet_migration import (
+from the_hive.fleet_migration import (
     GMigrationPlanError,
     plan_g_series_migration,
 )
-from codex_master.fleet_registry import (
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetMigrationSeries,

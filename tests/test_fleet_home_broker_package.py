@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.fleet_home_broker_identity import ImportClosure, ImportClosureEntry
-from codex_master.fleet_home_broker_package import (
+from the_hive.fleet_home_broker_identity import ImportClosure, ImportClosureEntry
+from the_hive.fleet_home_broker_package import (
     BrokerPackageManifest,
     PackageEntry,
     PackageFileStat,

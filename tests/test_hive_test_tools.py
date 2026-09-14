@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.hive.evidence_service import build_local_test_service, load_test_index
-from codex_master.hive.tools import call_hive_tool, hive_tool_definitions
+from the_hive.hive.evidence_service import build_local_test_service, load_test_index
+from the_hive.hive.tools import call_hive_tool, hive_tool_definitions
 
 from test_hive_test_runner import project
 

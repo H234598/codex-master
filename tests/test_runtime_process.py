@@ -182,9 +182,9 @@ def test_bounded_runner_never_kills_a_reused_cgroup_generation(
 ) -> None:
     """A stale bound cgroup must not affect a new unit with the same path."""
 
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
+    from the_hive.runtime_process import BoundedProcessError, run_bounded
 
     unit = f"codex-master-runtime-inode-swap-{secrets.token_hex(16)}.service"
     foreign_ready = tmp_path / "foreign.ready"
@@ -297,9 +297,9 @@ def test_bounded_runner_never_stops_a_reused_unit_after_a_valid_snapshot(
 ) -> None:
     """A late same-name replacement must survive the old cgroup cleanup."""
 
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
+    from the_hive.runtime_process import BoundedProcessError, run_bounded
 
     unit = f"codex-master-runtime-late-swap-{secrets.token_hex(16)}.service"
     foreign_ready = tmp_path / "foreign.ready"
@@ -433,7 +433,7 @@ def test_bounded_runner_manager_lifetime_ends_a_unit_after_runner_sigkill(
 ) -> None:
     """The manager, not the runner, bounds a child after runner death."""
 
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
     unit = f"codex-master-runtime-runner-death-{secrets.token_hex(16)}.service"
     ready = tmp_path / "runner-death.ready"
@@ -461,7 +461,7 @@ def test_bounded_runner_manager_lifetime_ends_a_unit_after_runner_sigkill(
         tmp_path / "runner-death-supervisor.py",
         "import os\n"
         "from pathlib import Path\n"
-        "import codex_master.runtime_process as runtime_process\n"
+        "import the_hive.runtime_process as runtime_process\n"
         "runtime_process._unit_name = lambda: os.environ['RUNTIME_TEST_UNIT']\n"
         "try:\n"
         "    runtime_process.run_bounded(\n"
@@ -544,9 +544,9 @@ def test_bounded_runner_reports_a_bounded_manager_lifetime_when_cleanup_loses_au
 ) -> None:
     """Dual immediate-cleanup failure reports a manager-bounded lifetime."""
 
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
+    from the_hive.runtime_process import BoundedProcessError, run_bounded
 
     unit = f"codex-master-runtime-cleanup-loss-{secrets.token_hex(16)}.service"
     ready = tmp_path / "cleanup-loss.ready"
@@ -639,9 +639,9 @@ def test_bounded_runner_denies_a_user_manager_escape_from_the_runtime_unit(
 ) -> None:
     """A target cannot create a second same-UID user unit outside its cgroup."""
 
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
-    from codex_master.runtime_process import run_bounded
+    from the_hive.runtime_process import run_bounded
 
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
@@ -723,9 +723,9 @@ def test_bounded_runner_terminates_its_bound_cgroup_without_a_manager_stop(
 ) -> None:
     """The FD-bound kill terminates a known child without a named manager stop."""
 
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
+    from the_hive.runtime_process import BoundedProcessError, run_bounded
 
     ready = tmp_path / "stop-failure.ready"
     hold = tmp_path / "stop-failure.hold"
@@ -810,7 +810,7 @@ def test_bounded_runner_terminates_its_bound_cgroup_without_a_manager_stop(
 
 
 def test_runtime_spawn_helper_has_a_compiled_glibc_header_contract() -> None:
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
     helper = Path(runtime_process.__file__).with_name("runtime_spawn_helper.c")
     helper_source = helper.read_text(encoding="utf-8")
@@ -827,7 +827,7 @@ def test_runtime_spawn_helper_has_a_compiled_glibc_header_contract() -> None:
 def test_default_runtime_image_loads_its_manifest_bound_native_helper(
     runtime_image,
 ) -> None:
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
     helper = runtime_process._load_runtime_spawn_helper(runtime_image)
 
@@ -839,7 +839,7 @@ def test_default_runtime_image_loads_its_manifest_bound_native_helper(
 def test_bounded_runner_uses_an_explicit_minimal_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from codex_master.runtime_process import run_bounded
+    from the_hive.runtime_process import run_bounded
 
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
@@ -869,7 +869,7 @@ def test_bounded_runner_uses_an_explicit_minimal_environment(
 def test_bounded_runner_rejects_each_output_overflow(
     tmp_path: Path, stream: str
 ) -> None:
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
+    from the_hive.runtime_process import BoundedProcessError, run_bounded
 
     child = _script(
         tmp_path / f"overflow-{stream}.py",
@@ -890,7 +890,7 @@ def test_bounded_runner_rejects_each_output_overflow(
 def test_bounded_runner_times_out_and_terminates_the_whole_cgroup(
     tmp_path: Path,
 ) -> None:
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
+    from the_hive.runtime_process import BoundedProcessError, run_bounded
 
     child_pid = tmp_path / "child.pid"
     child = _script(
@@ -924,7 +924,7 @@ def test_bounded_runner_times_out_and_terminates_the_whole_cgroup(
 def test_bounded_runner_terminates_a_setsid_descendant_after_leader_exit(
     tmp_path: Path,
 ) -> None:
-    from codex_master.runtime_process import run_bounded
+    from the_hive.runtime_process import run_bounded
 
     descendant_pid = tmp_path / "setsid-descendant.pid"
     ready = tmp_path / "setsid-descendant.ready"
@@ -976,8 +976,8 @@ def test_bounded_runner_terminates_a_setsid_descendant_after_leader_exit(
 def test_bounded_runner_removes_the_actual_cgroup_after_every_outcome(
     tmp_path: Path, mode: str, failure_code: str | None
 ) -> None:
-    import codex_master.runtime_process as runtime_process
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
+    import the_hive.runtime_process as runtime_process
+    from the_hive.runtime_process import BoundedProcessError, run_bounded
 
     cgroup_marker = tmp_path / f"{mode}.cgroup"
     body = (
@@ -1026,7 +1026,7 @@ def test_bounded_runner_removes_the_actual_cgroup_after_every_outcome(
 def test_bounded_runner_times_out_while_a_child_does_not_read_64k_stdin(
     tmp_path: Path,
 ) -> None:
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
+    from the_hive.runtime_process import BoundedProcessError, run_bounded
 
     child = _script(
         tmp_path / "does-not-read-stdin.py",
@@ -1049,7 +1049,7 @@ def test_bounded_runner_times_out_while_a_child_does_not_read_64k_stdin(
 def test_bounded_runner_rejects_a_nul_cwd_without_starting_a_child(
     tmp_path: Path,
 ) -> None:
-    from codex_master.runtime_process import BoundedProcessError, run_bounded
+    from the_hive.runtime_process import BoundedProcessError, run_bounded
 
     marker = tmp_path / "started"
     child = _script(
@@ -1067,7 +1067,7 @@ def test_bounded_runner_rejects_a_nul_cwd_without_starting_a_child(
 def test_bounded_runner_fails_before_opening_fds_when_native_spawn_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
     marker = tmp_path / "started"
     child = _script(
@@ -1097,7 +1097,7 @@ def test_bounded_runner_fails_before_opening_fds_when_native_spawn_is_unavailabl
 def test_bounded_runner_handles_partial_stdin_and_epipe(
     tmp_path: Path,
 ) -> None:
-    from codex_master.runtime_process import run_bounded
+    from the_hive.runtime_process import run_bounded
 
     child = _script(
         tmp_path / "read-one-byte.py",
@@ -1119,7 +1119,7 @@ def test_bounded_runner_handles_partial_stdin_and_epipe(
 def test_bounded_runner_delivers_all_64k_stdin_within_the_shared_deadline(
     tmp_path: Path,
 ) -> None:
-    from codex_master.runtime_process import run_bounded
+    from the_hive.runtime_process import run_bounded
 
     child = _script(
         tmp_path / "read-all-stdin.py",
@@ -1166,7 +1166,7 @@ def _wait_until_process_is_not_live(process_id: int) -> None:
 def test_bounded_runner_repeatedly_reaps_descendants_after_leader_exit(
     tmp_path: Path, attempt: int
 ) -> None:
-    from codex_master.runtime_process import run_bounded
+    from the_hive.runtime_process import run_bounded
 
     descendant_pid = tmp_path / f"repeated-descendant-{attempt}.pid"
     descendant = (
@@ -1200,7 +1200,7 @@ def test_bounded_runner_repeatedly_reaps_descendants_after_leader_exit(
 def test_bounded_runner_fails_before_execution_when_cgroup_capability_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
     marker = tmp_path / "started"
     child = _script(
@@ -1230,7 +1230,7 @@ def test_bounded_runner_fails_before_execution_when_cgroup_capability_is_unavail
 def test_bounded_runner_fails_before_execution_when_pidfd_primitive_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
     marker = tmp_path / "started"
     child = _script(
@@ -1256,8 +1256,8 @@ def test_bound_helper_path_swap_never_loads_the_replacement_constructor(
     import shutil
     import subprocess
 
-    import codex_master.runtime_process as runtime_process
-    from codex_master.runtime_layout import RuntimeLayout
+    import the_hive.runtime_process as runtime_process
+    from the_hive.runtime_layout import RuntimeLayout
 
     image = tmp_path / "swappable-image"
     shutil.copytree(runtime_image.root, image)
@@ -1309,7 +1309,7 @@ def test_bound_helper_path_swap_never_loads_the_replacement_constructor(
 def test_bounded_runner_never_treats_a_lost_child_status_as_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
     process = SimpleNamespace(returncode=None, pidfd=17)
 
@@ -1327,7 +1327,7 @@ def test_bounded_runner_never_treats_a_lost_child_status_as_success(
 def test_reap_process_suppresses_a_lost_child_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
     process = SimpleNamespace(pidfd=17)
     waits = 0

@@ -5,8 +5,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from codex_master.fleet_overview import FleetOverviewAgentRow, FleetOverviewSeriesRow, FleetOverviewSnapshot
-from codex_master.hive_metrics_contract import HiveMetricsError, fleet_metric_values, pcp_htop_meter_config, render_openmetrics
+from the_hive.fleet_overview import FleetOverviewAgentRow, FleetOverviewSeriesRow, FleetOverviewSnapshot
+from the_hive.hive_metrics_contract import HiveMetricsError, fleet_metric_values, pcp_htop_meter_config, render_openmetrics
 
 
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)

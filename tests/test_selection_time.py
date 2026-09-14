@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from codex_master.selection.types import SelectionValidationError, SystemClock, validate_selection_time
+from the_hive.selection.types import SelectionValidationError, SystemClock, validate_selection_time
 
 
 def test_selection_time_normalizes_offsets_and_rejects_naive_values() -> None:

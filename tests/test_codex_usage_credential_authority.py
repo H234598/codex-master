@@ -11,8 +11,8 @@ from typing import Callable
 
 import pytest
 
-import codex_master.codex_usage_credential_authority as authority_module
-from codex_master.codex_usage_credential_authority import (
+import the_hive.codex_usage_credential_authority as authority_module
+from the_hive.codex_usage_credential_authority import (
     CodexUsageCredentialAuthority,
     CredentialAuthorityError,
     MAX_AUTH_BYTES,

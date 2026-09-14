@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from codex_master import server
+from the_hive import server
 
 
 class TeamleaderAuthorizationTest(unittest.TestCase):
@@ -75,7 +75,7 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
     def test_managed_agent_home_is_denied_even_if_digest_is_registered(self) -> None:
         managed_home = server.AGENTS["a1"]["home"]
         with patch.dict(os.environ, {"CODEX_HOME": str(managed_home)}, clear=False), patch(
-            "codex_master.server.read_teamleader_principals",
+            "the_hive.server.read_teamleader_principals",
             return_value={server.teamleader_principal_digest(managed_home)},
         ):
             status = server.master_tool_access_status()
@@ -91,13 +91,13 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             digest = server.teamleader_principal_digest(managed_home)
             record = {"class": "teamleiterin", "agent_id": "q1"}
             with patch.dict(os.environ, {"CODEX_HOME": str(managed_home)}, clear=False), patch(
-                "codex_master.server.codex_home_context",
+                "the_hive.server.codex_home_context",
                 return_value={"home_kind": "managed_agent_home", "matched_agent": "q1"},
             ), patch(
-                "codex_master.server.read_hive_principals",
+                "the_hive.server.read_hive_principals",
                 return_value={digest: record},
             ), patch(
-                "codex_master.server.managed_home_in_process_ancestry",
+                "the_hive.server.managed_home_in_process_ancestry",
                 return_value=True,
             ):
                 status = server.master_tool_access_status()
@@ -121,7 +121,7 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             )
             state_patch, lock_patch, registry_patch = self._paths(root)
             with state_patch, lock_patch, registry_patch, patch(
-                "codex_master.server.current_agent_inventory",
+                "the_hive.server.current_agent_inventory",
                 return_value=SimpleNamespace(agents={"q1": descriptor}),
             ):
                 result = server.enroll_managed_principal("q1", "teamleiterin")
@@ -139,13 +139,13 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             managed_home.mkdir()
             digest = server.teamleader_principal_digest(managed_home)
             with patch.dict(os.environ, {"CODEX_HOME": str(managed_home)}, clear=False), patch(
-                "codex_master.server.codex_home_context",
+                "the_hive.server.codex_home_context",
                 return_value={"home_kind": "managed_agent_home", "matched_agent": "d1"},
             ), patch(
-                "codex_master.server.read_hive_principals",
+                "the_hive.server.read_hive_principals",
                 return_value={digest: {"class": "teamleiterin", "agent_id": "q1"}},
             ), patch(
-                "codex_master.server.managed_home_in_process_ancestry",
+                "the_hive.server.managed_home_in_process_ancestry",
                 return_value=True,
             ):
                 status = server.master_tool_access_status()
@@ -172,8 +172,8 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
 
     def test_rpc_hides_catalog_and_rejects_cached_call_before_dispatch(self) -> None:
         denied = {"authorized": False, "role": "non_teamleader", "visible_tool_count": 0}
-        with patch("codex_master.server.master_tool_access_status", return_value=denied), patch(
-            "codex_master.server.call_tool"
+        with patch("the_hive.server.master_tool_access_status", return_value=denied), patch(
+            "the_hive.server.call_tool"
         ) as dispatch:
             listed = server.handle_rpc(
                 {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
@@ -205,7 +205,7 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             "principal_class": "koenigin",
             "visible_tool_count": len(visible_tools),
         }
-        with patch("codex_master.server.master_tool_access_status", return_value=allowed):
+        with patch("the_hive.server.master_tool_access_status", return_value=allowed):
             listed = server.handle_rpc(
                 {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                 enforce_master_role=True,
@@ -220,7 +220,7 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             "principal_class": "teamleiterin",
             "visible_tool_count": 1,
         }
-        with patch("codex_master.server.master_tool_access_status", return_value=allowed):
+        with patch("the_hive.server.master_tool_access_status", return_value=allowed):
             listed = server.handle_rpc(
                 {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                 enforce_master_role=True,
@@ -240,8 +240,8 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             "principal_class": "teamleiterin",
             "visible_tool_count": 1,
         }
-        with patch("codex_master.server.master_tool_access_status", return_value=allowed), patch(
-            "codex_master.server.call_tool"
+        with patch("the_hive.server.master_tool_access_status", return_value=allowed), patch(
+            "the_hive.server.call_tool"
         ) as dispatch:
             called = server.handle_rpc(
                 {
@@ -261,8 +261,8 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
         dispatch.assert_not_called()
 
     def test_internal_teamleader_dispatch_rechecks_role_before_validation(self) -> None:
-        with patch("codex_master.server.require_teamleader_tool_access", side_effect=server.AgentError("denied")), patch(
-            "codex_master.server.call_validated_tool"
+        with patch("the_hive.server.require_teamleader_tool_access", side_effect=server.AgentError("denied")), patch(
+            "the_hive.server.call_validated_tool"
         ) as dispatch:
             with self.assertRaisesRegex(server.AgentError, "denied"):
                 server.call_teamleader_tool("agent_status", {"agent": "a1"})
@@ -274,14 +274,14 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             "role": "teamleiterin",
             "principal_class": "teamleiterin",
         }
-        with patch("codex_master.server.require_teamleader_tool_access", return_value=allowed):
+        with patch("the_hive.server.require_teamleader_tool_access", return_value=allowed):
             catalog = server.teamleader_tool_catalog()
         catalog[0]["name"] = "changed"
         self.assertNotEqual(server.TOOLS[0]["name"], "changed")
 
     def test_cli_tools_rechecks_teamleader_role(self) -> None:
-        with patch("codex_master.server.require_teamleader_tool_access", side_effect=server.AgentError("denied")), patch(
-            "codex_master.server.print_json"
+        with patch("the_hive.server.require_teamleader_tool_access", side_effect=server.AgentError("denied")), patch(
+            "the_hive.server.print_json"
         ) as output, patch("builtins.print"):
             self.assertEqual(server.main_cli(["tools"]), 1)
         output.assert_not_called()
@@ -331,15 +331,15 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             wrapper = Path(tmp) / "wrapper"
             wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
             wrapper.chmod(0o700)
-            with patch("codex_master.server.assert_install_context_allows_master_registration"), patch(
-                "codex_master.server._runtime_mcp_entrypoint", return_value=wrapper
+            with patch("the_hive.server.assert_install_context_allows_master_registration"), patch(
+                "the_hive.server._runtime_mcp_entrypoint", return_value=wrapper
             ), patch(
-                "codex_master.server.enroll_current_teamleader",
+                "the_hive.server.enroll_current_teamleader",
                 return_value={"changed": True},
             ), patch(
-                "codex_master.server.revoke_current_teamleader"
+                "the_hive.server.revoke_current_teamleader"
             ) as revoke, patch(
-                "codex_master.server.mcp_command_startup_self_test",
+                "the_hive.server.mcp_command_startup_self_test",
                 return_value={"ok": False},
             ):
                 with self.assertRaisesRegex(server.AgentError, "startup self-test"):
@@ -352,15 +352,15 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
 
     def test_failure_after_preflight_also_rolls_back_new_enrollment(self) -> None:
         with patch(
-            "codex_master.server.assert_install_context_allows_master_registration"
+            "the_hive.server.assert_install_context_allows_master_registration"
         ), patch(
-            "codex_master.server.enroll_current_teamleader",
+            "the_hive.server.enroll_current_teamleader",
             return_value={"changed": True},
         ), patch(
-            "codex_master.server._install_enrolled_unlocked",
+            "the_hive.server._install_enrolled_unlocked",
             side_effect=server.AgentError("later failure"),
         ), patch(
-            "codex_master.server.revoke_current_teamleader"
+            "the_hive.server.revoke_current_teamleader"
         ) as revoke:
             with self.assertRaisesRegex(server.AgentError, "later failure"):
                 server._install_unlocked(register=True, binding=SimpleNamespace())
@@ -368,15 +368,15 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
 
     def test_keyboard_interrupt_after_enrollment_still_revokes(self) -> None:
         with patch(
-            "codex_master.server.assert_install_context_allows_master_registration"
+            "the_hive.server.assert_install_context_allows_master_registration"
         ), patch(
-            "codex_master.server.enroll_current_teamleader",
+            "the_hive.server.enroll_current_teamleader",
             return_value={"changed": True},
         ), patch(
-            "codex_master.server._install_enrolled_unlocked",
+            "the_hive.server._install_enrolled_unlocked",
             side_effect=KeyboardInterrupt,
         ), patch(
-            "codex_master.server.revoke_current_teamleader"
+            "the_hive.server.revoke_current_teamleader"
         ) as revoke:
             with self.assertRaises(KeyboardInterrupt):
                 server._install_unlocked(register=True, binding=SimpleNamespace())
@@ -384,16 +384,16 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
 
     def test_successful_mcp_uninstall_revokes_current_teamleader(self) -> None:
         with patch(
-            "codex_master.server._runtime_mcp_entrypoint",
+            "the_hive.server._runtime_mcp_entrypoint",
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
-            "codex_master.server.check_mcp_registration",
+            "the_hive.server.check_mcp_registration",
             return_value={"registered": True, "command_matches": True},
         ), patch(
-            "codex_master.server._run_bound_codex_mcp_command",
+            "the_hive.server._run_bound_codex_mcp_command",
             return_value=subprocess.CompletedProcess([], 0, "", ""),
         ), patch(
-            "codex_master.server.revoke_current_teamleader",
+            "the_hive.server.revoke_current_teamleader",
             return_value={"changed": True},
         ) as revoke:
             result = server._uninstall_unlocked(
@@ -404,13 +404,13 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
 
     def test_idempotent_uninstall_revokes_without_existing_mcp_registration(self) -> None:
         with patch(
-            "codex_master.server._runtime_mcp_entrypoint",
+            "the_hive.server._runtime_mcp_entrypoint",
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
-            "codex_master.server.check_mcp_registration",
+            "the_hive.server.check_mcp_registration",
             return_value={"registered": False, "lookup_status": "not_registered"},
         ), patch(
-            "codex_master.server.revoke_current_teamleader",
+            "the_hive.server.revoke_current_teamleader",
             return_value={"changed": True},
         ) as revoke:
             result = server._uninstall_unlocked(
@@ -421,19 +421,19 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
 
     def test_uninstall_revocation_failure_restores_mcp_registration(self) -> None:
         with patch(
-            "codex_master.server._runtime_mcp_entrypoint",
+            "the_hive.server._runtime_mcp_entrypoint",
             return_value=Path("/runtime/bin/codex-master-mcp"),
         ), patch(
-            "codex_master.server.check_mcp_registration",
+            "the_hive.server.check_mcp_registration",
             return_value={"registered": True, "command_matches": True},
         ), patch(
-            "codex_master.server._run_bound_codex_mcp_command",
+            "the_hive.server._run_bound_codex_mcp_command",
             side_effect=[
                 subprocess.CompletedProcess([], 0, "", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ],
         ) as command, patch(
-            "codex_master.server.revoke_current_teamleader",
+            "the_hive.server.revoke_current_teamleader",
             side_effect=server.AgentError("registry failure"),
         ):
             with self.assertRaisesRegex(server.AgentError, "registry failure"):

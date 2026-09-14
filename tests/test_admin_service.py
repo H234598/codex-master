@@ -8,9 +8,9 @@ import json
 from threading import Lock
 
 import pytest
-import codex_master.admin_service as admin_service_module
+import the_hive.admin_service as admin_service_module
 
-from codex_master.admin_contracts import (
+from the_hive.admin_contracts import (
     AdminContractError,
     AdminPrincipalV1,
     AdminRequestV1,
@@ -18,57 +18,57 @@ from codex_master.admin_contracts import (
     public_agent_result,
     public_operation_status,
 )
-from codex_master.admin_hosts import ControlHostV1
-from codex_master.admin_operations import AdminOperationPlan, AdminOperationStore
-from codex_master.agent_contracts import (
+from the_hive.admin_hosts import ControlHostV1
+from the_hive.admin_operations import AdminOperationPlan, AdminOperationStore
+from the_hive.agent_contracts import (
     AgentPollV1,
     AgentReceiptV1,
     AgentResultV1,
     serialize_agent_result,
 )
-from codex_master.agent_operations import (
+from the_hive.agent_operations import (
     AgentOperationRequestV1,
     AgentOperationStore,
     AgentPrincipalV1,
 )
-from codex_master.google_account_inventory import GoogleAccountInventoryError
-from codex_master.google_account_inventory_manager import (
+from the_hive.google_account_inventory import GoogleAccountInventoryError
+from the_hive.google_account_inventory_manager import (
     GoogleAccountInventoryStatusV1,
     InventoryManagerStateV1,
     InventorySourceTypeV1,
 )
-from codex_master.google_oauth_authorization import GoogleOAuthProfileIdV1
-from codex_master.google_billing_service import (
+from the_hive.google_oauth_authorization import GoogleOAuthProfileIdV1
+from the_hive.google_billing_service import (
     GoogleBillingError,
     GoogleBillingPlanV1,
     GoogleBillingReceiptV1,
 )
-from codex_master.google_cloud_provisioner import (
+from the_hive.google_cloud_provisioner import (
     FillToQuotaPlan,
     GoogleQuotaEvidenceV1,
     PlannedHiveProject,
     ProvisionReceipt,
 )
-from codex_master.google_oauth_session import (
+from the_hive.google_oauth_session import (
     GoogleOAuthClientImportPlanV1,
     GoogleOAuthClientImportReceiptV1,
     GoogleOAuthSessionReceipt,
     GoogleOAuthTransactionV1,
 )
-from codex_master.openai_credential_service import AuthSyncPlanV1, AuthSyncReceiptV1
-from codex_master.fleet_service import (
+from the_hive.openai_credential_service import AuthSyncPlanV1, AuthSyncReceiptV1
+from the_hive.fleet_service import (
     OllamaApplyResultV1,
     OllamaFleetPlanV1,
     OllamaHiveLaneV1,
 )
-from codex_master.ollama_registry import (
+from the_hive.ollama_registry import (
     OllamaInstanceV1,
     OllamaModelV1,
     OllamaRegistryV1,
 )
-from codex_master.ollama_runtime import OllamaReadinessStatus
-from codex_master.host_probe import HostProbeEvidenceV1
-from codex_master.admin_service import (
+from the_hive.ollama_runtime import OllamaReadinessStatus
+from the_hive.host_probe import HostProbeEvidenceV1
+from the_hive.admin_service import (
     AdminDenied,
     AdminServiceError,
     MasterjetControlService,

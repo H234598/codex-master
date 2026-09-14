@@ -12,10 +12,10 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from codex_master.hive import state as hive_state_module
-from codex_master import resource_monitor as resource_monitor_module
-from codex_master.hive.state import HiveStateError, HiveStateStore
-from codex_master.resource_monitor import (
+from the_hive.hive import state as hive_state_module
+from the_hive import resource_monitor as resource_monitor_module
+from the_hive.hive.state import HiveStateError, HiveStateStore
+from the_hive.resource_monitor import (
     HostResourceInputBackend,
     ResourceClocks,
     ResourceEvidenceStateV2,

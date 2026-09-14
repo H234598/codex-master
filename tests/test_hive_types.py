@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from codex_master.hive.types import (
+from the_hive.hive.types import (
     DispatchPriority,
     HiveValidationError,
     SystemClock,

@@ -2,8 +2,8 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
-import codex_master.server as server_module
-from codex_master.masterjet_runtime import MasterjetRuntime
+import the_hive.server as server_module
+from the_hive.masterjet_runtime import MasterjetRuntime
 
 
 MODULE_PATH = (

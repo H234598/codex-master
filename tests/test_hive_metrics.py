@@ -6,12 +6,12 @@ from itertools import count
 
 import pytest
 
-from codex_master.fleet_overview import (
+from the_hive.fleet_overview import (
     FleetOverviewAgentRow,
     FleetOverviewSeriesRow,
     FleetOverviewSnapshot,
 )
-from codex_master.hive_metrics import (
+from the_hive.hive_metrics import (
     FleetMetricBlockDevice,
     FleetMetricIoPsi,
     FleetMetricObservation,

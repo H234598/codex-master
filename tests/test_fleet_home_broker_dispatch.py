@@ -9,16 +9,16 @@ import inspect
 import pytest
 
 try:
-    import codex_master.fleet_home_broker_dispatch as dispatch
+    import the_hive.fleet_home_broker_dispatch as dispatch
 except ModuleNotFoundError:
     dispatch = None
-from codex_master.fleet_home_broker import OfflineBrokerPlan
-from codex_master.fleet_home_broker_identity import (
+from the_hive.fleet_home_broker import OfflineBrokerPlan
+from the_hive.fleet_home_broker_identity import (
     BrokerIdentity,
     ImportClosure,
     ImportClosureEntry,
 )
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_protocol import (
     AttestHomeRequest,
     BindingExpectation,
     BrokerCheckpoint,
@@ -44,7 +44,7 @@ from codex_master.fleet_home_broker_protocol import (
     b2a_phase_for_checkpoint,
     encode_chpb_message,
 )
-from codex_master.fleet_home_broker_transport import BrokerPeer, BrokerTransportResponse
+from the_hive.fleet_home_broker_transport import BrokerPeer, BrokerTransportResponse
 
 
 AGENT = "bee_1"
@@ -746,9 +746,9 @@ def test_imports_and_tokens_have_no_host_runtime_or_transaction_bootstrap_surfac
         ("dataclasses", ("dataclass",)),
         ("hashlib", None),
         ("typing", ("Protocol",)),
-        ("codex_master.fleet_home_broker", ("OfflineBrokerPlan",)),
+        ("the_hive.fleet_home_broker", ("OfflineBrokerPlan",)),
         (
-            "codex_master.fleet_home_broker_protocol",
+            "the_hive.fleet_home_broker_protocol",
             (
                 "AttestHomeRequest",
                 "BrokerReply",
@@ -771,7 +771,7 @@ def test_imports_and_tokens_have_no_host_runtime_or_transaction_bootstrap_surfac
             ),
         ),
         (
-            "codex_master.fleet_home_broker_transport",
+            "the_hive.fleet_home_broker_transport",
             ("BrokerPeer", "BrokerTransportResponse"),
         ),
     ]

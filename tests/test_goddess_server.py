@@ -4,9 +4,9 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from codex_master import server
-from codex_master.goddess_reporting import ReporterStateStore
-from codex_master.hive.events import HiveEventStore
+from the_hive import server
+from the_hive.goddess_reporting import ReporterStateStore
+from the_hive.hive.events import HiveEventStore
 
 
 def test_report_tools_are_published_with_closed_schemas():

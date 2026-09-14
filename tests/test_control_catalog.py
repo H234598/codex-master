@@ -3,8 +3,8 @@ from __future__ import annotations
 import dataclasses
 import unittest
 
-import codex_master.control_catalog as control_catalog
-from codex_master.control_catalog import (
+import the_hive.control_catalog as control_catalog
+from the_hive.control_catalog import (
     MAX_CATALOG_TOOLS,
     MAX_DESCRIPTOR_TEXT_CHARS,
     CatalogError,
@@ -17,7 +17,7 @@ from codex_master.control_catalog import (
     effective_risk,
     serialize_arguments,
 )
-from codex_master.server import TOOLS
+from the_hive.server import TOOLS
 
 
 EXPECTED_RISKS = {

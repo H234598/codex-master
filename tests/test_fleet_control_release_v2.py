@@ -10,7 +10,7 @@ import pickle
 
 import pytest
 
-from codex_master.fleet_control_release_v2 import (
+from the_hive.fleet_control_release_v2 import (
     ControlReleaseSpecV2,
     ControlReleaseV2Error,
     ReleasePayloadDigestV2,
@@ -388,7 +388,7 @@ def test_project_version_is_test_only_build_input() -> None:
 
 
 def test_production_module_imports_only_pure_stdlib_and_has_no_io_surface() -> None:
-    module_path = Path(__import__("codex_master.fleet_control_release_v2").fleet_control_release_v2.__file__)
+    module_path = Path(__import__("the_hive.fleet_control_release_v2").fleet_control_release_v2.__file__)
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
     imported = {
         node.module

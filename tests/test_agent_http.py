@@ -7,16 +7,16 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from codex_master.admin_hosts import AgentBindingV1, AgentPrincipalV1, HostRegistry
-from codex_master.agent_contracts import (
+from the_hive.admin_hosts import AgentBindingV1, AgentPrincipalV1, HostRegistry
+from the_hive.agent_contracts import (
     AgentLeaseV1,
     AgentNoWorkV1,
     AgentReceiptV1,
     AgentResultV1,
     serialize_agent_result,
 )
-from codex_master.agent_http import AgentHttpApplication
-from codex_master.agent_operations import (
+from the_hive.agent_http import AgentHttpApplication
+from the_hive.agent_operations import (
     AgentOperationError,
     AgentOperationRequestV1,
     AgentOperationStore,

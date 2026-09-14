@@ -17,10 +17,10 @@ from traceback import TracebackException
 import pytest
 import yaml
 
-import codex_master.google_inventory_token_vault as vault_module
-from codex_master.google_account_inventory import GoogleAccountInventoryLoader
-from codex_master.google_account_inventory_manager import GoogleAccountInventoryManager
-from codex_master.google_inventory_token_vault import (
+import the_hive.google_inventory_token_vault as vault_module
+from the_hive.google_account_inventory import GoogleAccountInventoryLoader
+from the_hive.google_account_inventory_manager import GoogleAccountInventoryManager
+from the_hive.google_inventory_token_vault import (
     GoogleInventoryReadonlyTokenVault,
     GoogleInventoryReadonlyTokenVaultError,
 )

@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from codex_master.hive.evidence_service import load_test_index
-from codex_master.hive.indexed_test_inventory import PythonTestIndexBuilder
-from codex_master.hive.indexed_tests import TestIndexV1 as IndexV1, combine_test_indexes
-from codex_master.hive.javascript_test_inventory import JavaScriptTestIndexBuilder
+from the_hive.hive.evidence_service import load_test_index
+from the_hive.hive.indexed_test_inventory import PythonTestIndexBuilder
+from the_hive.hive.indexed_tests import TestIndexV1 as IndexV1, combine_test_indexes
+from the_hive.hive.javascript_test_inventory import JavaScriptTestIndexBuilder
 
 
 ROOT = Path(__file__).resolve().parents[1]

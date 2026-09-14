@@ -11,10 +11,10 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from codex_master import resource_monitor_r2c_contract as resource_monitor_module
-from codex_master.hive import state as hive_state_module
-from codex_master.hive.state import HiveStateStore
-from codex_master.resource_monitor_r2c_contract import (
+from the_hive import resource_monitor_r2c_contract as resource_monitor_module
+from the_hive.hive import state as hive_state_module
+from the_hive.hive.state import HiveStateStore
+from the_hive.resource_monitor_r2c_contract import (
     CpuCountersV1,
     HostResourceInputBackend,
     LegacyPressureV1,

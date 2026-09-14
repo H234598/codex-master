@@ -3,8 +3,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from codex_master.hive import dispatch as dispatch_module
-from codex_master.hive.dispatch import (
+from the_hive.hive import dispatch as dispatch_module
+from the_hive.hive.dispatch import (
     AssignmentIntent,
     GlobalRequest,
     GlobalRequestPlan,
@@ -27,8 +27,8 @@ from codex_master.hive.dispatch import (
     transition_workpackage_at_checkpoint,
     transition_workpackage_from_report,
 )
-from codex_master.hive.messages import validate_message
-from codex_master.hive.types import DispatchPriority, TaskComplexity
+from the_hive.hive.messages import validate_message
+from the_hive.hive.types import DispatchPriority, TaskComplexity
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

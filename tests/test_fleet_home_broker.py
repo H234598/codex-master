@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.fleet_home_broker import (
+from the_hive.fleet_home_broker import (
     OfflineBrokerError,
     OfflineBrokerOperations,
     OfflineBrokerPlan,
@@ -15,13 +15,13 @@ from codex_master.fleet_home_broker import (
     begin_offline_transaction,
     recover_offline_transaction,
 )
-from codex_master.fleet_home_broker_identity import (
+from the_hive.fleet_home_broker_identity import (
     BrokerIdentity,
     ImportClosure,
     ImportClosureEntry,
 )
-from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_linux import FdStat, PidfdIdentity
+from the_hive.fleet_home_broker_protocol import (
     B2aRecoveryPhase,
     BrokerCheckpoint,
     BrokerObjectState,
@@ -36,7 +36,7 @@ from codex_master.fleet_home_broker_protocol import (
     b2a_phase_for_checkpoint,
     decide_broker_recovery,
 )
-from codex_master.fleet_home_broker_wal import (
+from the_hive.fleet_home_broker_wal import (
     append_status,
 )
 
@@ -313,7 +313,7 @@ def _status(
             BrokerCheckpoint.BLOCKED_DRIFT: "blocked_drift",
         }.get(checkpoint)
         if terminal is not None:
-            from codex_master.fleet_home_broker_protocol import BrokerResultCode
+            from the_hive.fleet_home_broker_protocol import BrokerResultCode
 
             terminal = BrokerResultCode(terminal)
     return TransactionStatus(
@@ -356,7 +356,7 @@ def test_public_types_are_frozen_slotted_and_api_has_no_client_transaction_id():
 
 
 def _blocked_decision_for_test():
-    from codex_master.fleet_home_broker_protocol import (
+    from the_hive.fleet_home_broker_protocol import (
         BrokerResultCode,
         RecoveryDecision,
     )

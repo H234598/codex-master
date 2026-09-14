@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.ollama_host_transport import (
+from the_hive.ollama_host_transport import (
     AgentQueueRemoteOllamaOperationPort,
     CONTROL_HOST_REF,
     HostRegistryOllamaLeaseSource,
@@ -20,19 +20,19 @@ from codex_master.ollama_host_transport import (
     OllamaRemoteStopRequestV1,
     Task3LocalOllamaHostAdapter,
 )
-from codex_master.ollama_registry import (
+from the_hive.ollama_registry import (
     OllamaInstanceV1,
     OllamaModelV1,
     OllamaRegistryV1,
 )
-from codex_master.ollama_runtime import OllamaReadinessStatus
-from codex_master.admin_contracts import OperationV1
-from codex_master.admin_hosts import AgentBindingV1, HostRegistry
-from codex_master.agent_operations import (
+from the_hive.ollama_runtime import OllamaReadinessStatus
+from the_hive.admin_contracts import OperationV1
+from the_hive.admin_hosts import AgentBindingV1, HostRegistry
+from the_hive.agent_operations import (
     AgentOperationStore,
     AgentPrincipalV1,
 )
-from codex_master.agent_contracts import AgentNoWorkV1, AgentPollV1
+from the_hive.agent_contracts import AgentNoWorkV1, AgentPollV1
 
 
 MODEL_GENERATION = 8

@@ -9,7 +9,7 @@ import urllib.request
 
 import pytest
 
-from codex_master.observability_http import MAX_METRICS_BYTES, MetricsHttpServer, TimedMetricsReader
+from the_hive.observability_http import MAX_METRICS_BYTES, MetricsHttpServer, TimedMetricsReader
 
 
 @contextmanager

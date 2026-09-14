@@ -5,8 +5,8 @@ import inspect
 
 import pytest
 
-import codex_master.fleet_home_broker_wal as wal
-from codex_master.fleet_home_broker_protocol import (
+import the_hive.fleet_home_broker_wal as wal
+from the_hive.fleet_home_broker_protocol import (
     BrokerCheckpoint,
     BrokerObjectState,
     BrokerObservation,
@@ -25,7 +25,7 @@ from codex_master.fleet_home_broker_protocol import (
     decide_broker_recovery,
     encode_chpb_message,
 )
-from codex_master.fleet_home_broker_wal import (
+from the_hive.fleet_home_broker_wal import (
     WalOperations,
     WalRecord,
     WalRecovery,

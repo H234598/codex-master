@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from codex_master.agent_state import resolve_agent_state_boundary
+from the_hive.agent_state import resolve_agent_state_boundary
 
 
 def test_local_admin_state_gets_one_sibling_agent_boundary() -> None:

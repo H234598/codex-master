@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-import codex_master.remote_queen_dependencies as deps
-from codex_master.remote_queen_bootstrap import (
+import the_hive.remote_queen_dependencies as deps
+from the_hive.remote_queen_bootstrap import (
     APT_PACKAGES,
     DNF_PACKAGES,
     HostFactsV1,

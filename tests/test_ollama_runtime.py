@@ -14,13 +14,13 @@ import time
 
 import pytest
 
-from codex_master import ollama_runtime
-from codex_master.ollama_registry import (
+from the_hive import ollama_runtime
+from the_hive.ollama_registry import (
     OllamaInstanceV1,
     OllamaModelV1,
     OllamaRegistryV1,
 )
-from codex_master.ollama_runtime import (
+from the_hive.ollama_runtime import (
     adopt_running_instance,
     OllamaHostSnapshot,
     OllamaRuntimeError,
@@ -141,15 +141,15 @@ def make_executable(path: Path) -> Path:
 def test_full_local_fleet_slice_is_idempotent_and_stops_only_failed_unit(
     tmp_path: Path,
 ) -> None:
-    from codex_master.fleet_service import FleetConflictError, FleetPaths, FleetService
-    from codex_master.ollama_host_transport import (
+    from the_hive.fleet_service import FleetConflictError, FleetPaths, FleetService
+    from the_hive.ollama_host_transport import (
         CONTROL_HOST_REF,
         OllamaHostLease,
         OllamaHostTransport,
         Task3LocalOllamaHostAdapter,
     )
-    from codex_master.ollama_registry import OllamaRegistryStore
-    from codex_master.server import build_fleet_private_io
+    from the_hive.ollama_registry import OllamaRegistryStore
+    from the_hive.server import build_fleet_private_io
 
     executable = make_executable(tmp_path / "fake-ollama")
     models_directory = make_models_directory(tmp_path / "models")
@@ -523,7 +523,7 @@ def test_helper_launch_does_not_import_code_from_configured_module_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_root = tmp_path / "attacker"
-    package = fake_root / "codex_master"
+    package = fake_root / "the_hive"
     package.mkdir(parents=True)
     marker = tmp_path / "imported"
     (package / "__init__.py").write_text("", encoding="utf-8")

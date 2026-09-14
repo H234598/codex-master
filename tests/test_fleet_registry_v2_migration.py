@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-import codex_master.fleet_registry_v2_migration as migration_module
-from codex_master.codex_usage_credential_authority import ProfileCredentialBinding
-from codex_master.fleet_registry import (
+import the_hive.fleet_registry_v2_migration as migration_module
+from the_hive.codex_usage_credential_authority import ProfileCredentialBinding
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetDynamicWorkerPrincipalV2,
@@ -31,7 +31,7 @@ from codex_master.fleet_registry import (
     fleet_document,
     normalize_fleet_document,
 )
-from codex_master.fleet_registry_v2_migration import (
+from the_hive.fleet_registry_v2_migration import (
     FleetRegistryV1RecoveryPlan,
     PreparedFleetRegistryV2Migration,
     RegistryV2MigrationError,

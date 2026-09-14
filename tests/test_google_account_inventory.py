@@ -12,8 +12,8 @@ import sys
 import pytest
 import yaml
 
-import codex_master.google_account_inventory as inventory
-from codex_master.google_account_inventory import (
+import the_hive.google_account_inventory as inventory
+from the_hive.google_account_inventory import (
     GoogleAccountInventoryDocumentV1,
     GoogleAccountInventoryError,
     GoogleAccountInventoryLoader,
@@ -119,9 +119,9 @@ import builtins
 from pathlib import Path
 import sys
 
-from codex_master.google_account_inventory import GoogleAccountInventoryError
-from codex_master.google_account_inventory import GoogleAccountInventoryLoader
-from codex_master.google_account_inventory import _StrictInventoryYamlLoader
+from the_hive.google_account_inventory import GoogleAccountInventoryError
+from the_hive.google_account_inventory import GoogleAccountInventoryLoader
+from the_hive.google_account_inventory import _StrictInventoryYamlLoader
 
 if sys.argv[2] == "disabled":
     sys.set_int_max_str_digits(0)

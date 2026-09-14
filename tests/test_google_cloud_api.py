@@ -5,8 +5,8 @@ import urllib.error
 
 import pytest
 
-from codex_master import google_cloud_api
-from codex_master.google_cloud_api import (
+from the_hive import google_cloud_api
+from the_hive.google_cloud_api import (
     GoogleCloudApi,
     GoogleCloudApiError,
     _UrlLibTransport,

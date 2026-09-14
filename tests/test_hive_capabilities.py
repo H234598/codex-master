@@ -5,15 +5,15 @@ from types import SimpleNamespace
 
 import pytest
 
-import codex_master.hive.capabilities as capabilities
-from codex_master.hive.capabilities import (
+import the_hive.hive.capabilities as capabilities
+from the_hive.hive.capabilities import (
     GODDESS_REPORT_AUTO_CAPABILITY,
     QUEEN_CLASSES,
     ROOT_EXECUTIVE_CLASSES,
     CapabilityError,
     requires_goddess_auto_report,
 )
-from codex_master.hive.principals import ExecutionBinding, Principal, PrincipalError, PrincipalRegistry
+from the_hive.hive.principals import ExecutionBinding, Principal, PrincipalError, PrincipalRegistry
 
 
 DIGEST = "sha256:" + "a" * 64

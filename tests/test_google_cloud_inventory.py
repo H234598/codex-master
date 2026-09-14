@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from codex_master.google_cloud_inventory import (
+from the_hive.google_cloud_inventory import (
     GoogleCloudInventoryError,
     rename_and_reconcile_existing_projects,
 )

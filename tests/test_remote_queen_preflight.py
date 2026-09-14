@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from codex_master import remote_queen_preflight
-from codex_master.remote_queen_bootstrap import (
+from the_hive import remote_queen_preflight
+from the_hive.remote_queen_bootstrap import (
     HostFactsV1,
     ManifestGenerationV1,
     RemoteQueenBootstrapError,
     SshTargetV1,
 )
-from codex_master.remote_queen_preflight import (
+from the_hive.remote_queen_preflight import (
     ManagedStateFactV1,
     ManagedStateIdV1,
     ManagedStateKindV1,
@@ -24,7 +24,7 @@ from codex_master.remote_queen_preflight import (
     collect_remote_queen_ssh_preflight,
     preflight_as_dict,
 )
-from codex_master.remote_queen_ssh import (
+from the_hive.remote_queen_ssh import (
     ApprovedHostKeyV1,
     KnownHostKeyV1,
     PresentedHostKeyV1,

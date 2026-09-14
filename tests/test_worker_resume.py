@@ -8,7 +8,7 @@ from threading import Barrier, Lock, Thread
 
 import pytest
 
-from codex_master.agent_resolver import (
+from the_hive.agent_resolver import (
     AgentClassPolicy,
     ModelPolicy,
     ResolutionRequest,
@@ -16,18 +16,18 @@ from codex_master.agent_resolver import (
     canonical_resolution_decision_digest,
     resolve_agent_selection,
 )
-from codex_master.spark_retry import ResumeCapsuleV1
+from the_hive.spark_retry import ResumeCapsuleV1
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "src/codex_master/worker_resume.py"
 
 
 def _resume_module():
-    return importlib.import_module("codex_master.worker_resume")
+    return importlib.import_module("the_hive.worker_resume")
 
 
 def _spawn_module():
-    return importlib.import_module("codex_master.worker_spawn_ledger")
+    return importlib.import_module("the_hive.worker_spawn_ledger")
 
 
 def _digest(value: str) -> str:
@@ -87,7 +87,7 @@ def _central_contract():
 
 
 def _allocator():
-    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+    allocator_module = importlib.import_module("the_hive.runtime_account_allocator")
 
     class _Adapter:
         adapter_id = "adapter-resume"
@@ -184,7 +184,7 @@ def _capsule(resume, ticket, *, digest: str = "2", generation: int = 2):
 
 def _lease_binding(ledger, ticket):
     spawn = _spawn_module()
-    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+    allocator_module = importlib.import_module("the_hive.runtime_account_allocator")
     decision, offer = _central_contract()
     p0_ticket = allocator_module.ValidatedAllocationTicket(
         ticket_id=ticket.ticket_id,

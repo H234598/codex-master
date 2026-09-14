@@ -6,7 +6,7 @@ import traceback
 
 import pytest
 
-from codex_master.hive.config import (
+from the_hive.hive.config import (
     AgentClassCatalogSnapshot,
     HiveConfigError,
     load_agent_class_catalog,

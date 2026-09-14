@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from codex_master.cache_telemetry import (
+from the_hive.cache_telemetry import (
     CacheCostEstimateV1,
     CacheTelemetryContextV1,
     CacheTelemetryValidationError,
@@ -21,7 +21,7 @@ from codex_master.cache_telemetry import (
     normalize_openai_chat_stream_final,
     normalize_openai_responses,
 )
-from codex_master.cache_telemetry_history import (
+from the_hive.cache_telemetry_history import (
     CacheTelemetryHistoryError,
     CacheTelemetryHistoryV1,
     aggregate_cache_telemetry,
@@ -254,7 +254,7 @@ def test_history_is_idempotent_retained_and_crash_safe_before_replace(tmp_path, 
     def crash_before_replace(*_args: object) -> None:
         raise OSError("simulated crash")
 
-    monkeypatch.setattr("codex_master.cache_telemetry_history.os.replace", crash_before_replace)
+    monkeypatch.setattr("the_hive.cache_telemetry_history.os.replace", crash_before_replace)
     with pytest.raises(CacheTelemetryHistoryError, match="history_replace_failed"):
         history.append(second, now=NOW)
     assert history_path.read_bytes() == before

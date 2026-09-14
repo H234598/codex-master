@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from codex_master.runtime_process import BoundedProcessError
+from the_hive.runtime_process import BoundedProcessError
 
 
 pytestmark = pytest.mark.usefixtures("runtime_spawn_helper")
@@ -18,8 +18,8 @@ pytestmark = pytest.mark.usefixtures("runtime_spawn_helper")
 
 def _runtime_modules():
     try:
-        layout = importlib.import_module("codex_master.runtime_layout")
-        status = importlib.import_module("codex_master.runtime_status")
+        layout = importlib.import_module("the_hive.runtime_layout")
+        status = importlib.import_module("the_hive.runtime_status")
     except ModuleNotFoundError:
         return None
     return layout, status

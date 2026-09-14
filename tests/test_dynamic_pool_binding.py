@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.admission import (
+from the_hive.admission import (
     AdmissionRecord,
     AdmissionPriority,
     AdmissionStore,
@@ -17,12 +17,12 @@ from codex_master.admission import (
     ScopeBinding,
     create_admission,
 )
-from codex_master.admission_runtime import (
+from the_hive.admission_runtime import (
     ADMISSION_RUNTIME_GATES,
     RuntimeGateDecision,
     ServerAdmissionRuntime,
 )
-from codex_master.dynamic_pool import (
+from the_hive.dynamic_pool import (
     AccountPoolBindingV1,
     DynamicPoolBindingError,
     DynamicPoolInventoryV1,
@@ -30,18 +30,18 @@ from codex_master.dynamic_pool import (
     exact_pool_authority_revalidation,
     resolve_dynamic_pool_selection,
 )
-from codex_master.hive.dispatch import (
+from the_hive.hive.dispatch import (
     HiveDispatchError,
     plan_queen_assignment_from_selection,
 )
-from codex_master.hive.principals import (
+from the_hive.hive.principals import (
     Principal,
     PrincipalError,
     PrincipalRegistry,
     execution_binding_from_admission,
 )
-from codex_master.hive.state import HiveStateStore
-from codex_master.selection import (
+from the_hive.hive.state import HiveStateStore
+from the_hive.selection import (
     ModelRole,
     SelectionBand,
     SelectionCandidate,
@@ -50,8 +50,8 @@ from codex_master.selection import (
     TaskKind,
     preview_selection,
 )
-from codex_master.selection_service import SelectionService
-from codex_master.usage_snapshot import PoolAuthorityV2, UsageEvidenceV2
+from the_hive.selection_service import SelectionService
+from the_hive.usage_snapshot import PoolAuthorityV2, UsageEvidenceV2
 
 
 NOW = datetime(2026, 9, 14, 12, tzinfo=timezone.utc)
@@ -489,14 +489,14 @@ def _structural_binding_issuer_sites(
             isinstance(node.func, ast.Name)
             and node.func.id == "__import__"
             and node.args
-            and literal_text(node.args[0]) == "codex_master.dynamic_pool"
+            and literal_text(node.args[0]) == "the_hive.dynamic_pool"
         ):
             return True
         if (
             isinstance(node.func, ast.Name)
             and node.func.id in import_module_names
             and node.args
-            and literal_text(node.args[0]) == "codex_master.dynamic_pool"
+            and literal_text(node.args[0]) == "the_hive.dynamic_pool"
         ):
             return True
         return (
@@ -504,7 +504,7 @@ def _structural_binding_issuer_sites(
             and node.func.attr == "import_module"
             and dotted_name(node.func.value) in importlib_module_names
             and node.args
-            and literal_text(node.args[0]) == "codex_master.dynamic_pool"
+            and literal_text(node.args[0]) == "the_hive.dynamic_pool"
         )
 
     sites = {"raw": set(), "factory": set(), "opaque": set()}
@@ -512,14 +512,14 @@ def _structural_binding_issuer_sites(
         tree = ast.parse(source, filename=relative)
         constructor_names = {"AccountPoolBindingV1"}
         factory_names = {"_make_account_pool_binding_v1"}
-        module_paths = {"codex_master.dynamic_pool"}
+        module_paths = {"the_hive.dynamic_pool"}
         root_module_names: set[str] = set()
         import_module_names: set[str] = set()
         importlib_module_names: set[str] = set()
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.ImportFrom)
-                and node.module == "codex_master.dynamic_pool"
+                and node.module == "the_hive.dynamic_pool"
             ):
                 for imported in node.names:
                     if imported.name == "AccountPoolBindingV1":
@@ -530,16 +530,16 @@ def _structural_binding_issuer_sites(
                         sites["opaque"].add(f"{relative}:{node.lineno}")
             elif isinstance(node, ast.Import):
                 for imported in node.names:
-                    if imported.name == "codex_master.dynamic_pool":
+                    if imported.name == "the_hive.dynamic_pool":
                         if imported.asname is None:
-                            root_module_names.add("codex_master")
+                            root_module_names.add("the_hive")
                         else:
                             module_paths.add(imported.asname)
-                    elif imported.name == "codex_master":
+                    elif imported.name == "the_hive":
                         root_module_names.add(imported.asname or imported.name)
                     elif imported.name == "importlib":
                         importlib_module_names.add(imported.asname or imported.name)
-            elif isinstance(node, ast.ImportFrom) and node.module == "codex_master":
+            elif isinstance(node, ast.ImportFrom) and node.module == "the_hive":
                 for imported in node.names:
                     if imported.name == "dynamic_pool":
                         module_paths.add(imported.asname or imported.name)

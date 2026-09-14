@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from codex_master.google_account_inventory import (
+from the_hive.google_account_inventory import (
     GoogleAccountInventoryError,
     GoogleAccountInventoryLoader,
 )

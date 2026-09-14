@@ -1,7 +1,7 @@
 import pytest
 
-from codex_master.selection import FairnessLedger
-from codex_master.selection.state import ResourceState, ResourceStateError, ResourceStateStore, migrate_resource_state
+from the_hive.selection import FairnessLedger
+from the_hive.selection.state import ResourceState, ResourceStateError, ResourceStateStore, migrate_resource_state
 
 
 def test_resource_state_uses_revision_cas_and_rejects_unknown_major_version() -> None:

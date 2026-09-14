@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import codex_master.server as server
+import the_hive.server as server
 
 
 class FleetDesktopEntryTest(unittest.TestCase):
@@ -151,7 +151,7 @@ class FleetDesktopEntryTest(unittest.TestCase):
                             Path("/usr/bin/codex-master-mcp"), path
                         )
             with patch(
-                "codex_master.server.os.getuid", return_value=owner.stat().st_uid + 1
+                "the_hive.server.os.getuid", return_value=owner.stat().st_uid + 1
             ):
                 with self.assertRaisesRegex(
                     server.AgentError, "desktop entry is unsafe"
@@ -221,7 +221,7 @@ class FleetDesktopEntryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "new-file"
             with patch(
-                "codex_master.server.os.fdopen",
+                "the_hive.server.os.fdopen",
                 side_effect=lambda fd, *_args, **_kwargs: InterruptingWriter(fd),
             ):
                 with self.assertRaises(KeyboardInterrupt):
@@ -238,7 +238,7 @@ class FleetDesktopEntryTest(unittest.TestCase):
 
             with (
                 patch(
-                    "codex_master.server.os.fchmod",
+                    "the_hive.server.os.fchmod",
                     side_effect=PermissionError("injected mode failure"),
                 ),
                 self.assertRaisesRegex(server.AgentError, "temp file mode"),
@@ -260,7 +260,7 @@ class FleetDesktopEntryTest(unittest.TestCase):
                 raise KeyboardInterrupt
 
             with patch(
-                "codex_master.server._replace_fleet_desktop_entry",
+                "the_hive.server._replace_fleet_desktop_entry",
                 side_effect=replace_then_interrupt,
             ):
                 with self.assertRaises(KeyboardInterrupt):
@@ -287,21 +287,21 @@ class FleetDesktopEntryTest(unittest.TestCase):
 
             with (
                 patch(
-                    "codex_master.server.install_lock",
+                    "the_hive.server.install_lock",
                     return_value=contextlib.nullcontext(),
                 ),
                 patch(
-                    "codex_master.server._codex_mcp_binding",
+                    "the_hive.server._codex_mcp_binding",
                     return_value=contextlib.nullcontext(SimpleNamespace()),
                 ),
-                patch("codex_master.server._runtime_mcp_entrypoint", return_value=wrapper),
+                patch("the_hive.server._runtime_mcp_entrypoint", return_value=wrapper),
                 patch(
-                    "codex_master.server.fleet_desktop_entry_path",
+                    "the_hive.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
                 ),
-                patch("codex_master.server.ensure_applet_action_key"),
+                patch("the_hive.server.ensure_applet_action_key"),
                 patch(
-                    "codex_master.server.install_fleet_desktop_entry",
+                    "the_hive.server.install_fleet_desktop_entry",
                     side_effect=install_then_interrupt,
                 ),
             ):
@@ -340,21 +340,21 @@ class FleetDesktopEntryTest(unittest.TestCase):
             desktop_path.write_text("old desktop\n", encoding="utf-8")
             with (
                 patch(
-                    "codex_master.server.install_lock",
+                    "the_hive.server.install_lock",
                     return_value=contextlib.nullcontext(),
                 ),
                 patch(
-                    "codex_master.server._codex_mcp_binding",
+                    "the_hive.server._codex_mcp_binding",
                     return_value=contextlib.nullcontext(SimpleNamespace()),
                 ),
-                patch("codex_master.server._runtime_mcp_entrypoint", return_value=wrapper),
+                patch("the_hive.server._runtime_mcp_entrypoint", return_value=wrapper),
                 patch(
-                    "codex_master.server.fleet_desktop_entry_path",
+                    "the_hive.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
                 ),
-                patch("codex_master.server.ensure_applet_action_key"),
+                patch("the_hive.server.ensure_applet_action_key"),
                 patch(
-                    "codex_master.server.sync_plugin_cache_from_repo",
+                    "the_hive.server.sync_plugin_cache_from_repo",
                     side_effect=server.AgentError("injected failure"),
                 ),
             ):
@@ -383,19 +383,19 @@ class FleetDesktopEntryTest(unittest.TestCase):
             server.install_fleet_desktop_entry(old_command, desktop_path)
             with (
                 patch(
-                    "codex_master.server.install_lock",
+                    "the_hive.server.install_lock",
                     return_value=contextlib.nullcontext(),
                 ),
                 patch(
-                    "codex_master.server._codex_mcp_binding",
+                    "the_hive.server._codex_mcp_binding",
                     return_value=contextlib.nullcontext(SimpleNamespace()),
                 ),
-                patch("codex_master.server._runtime_mcp_entrypoint", return_value=install_path),
+                patch("the_hive.server._runtime_mcp_entrypoint", return_value=install_path),
                 patch(
-                    "codex_master.server.fleet_desktop_entry_path",
+                    "the_hive.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
                 ),
-                patch("codex_master.server.ensure_applet_action_key"),
+                patch("the_hive.server.ensure_applet_action_key"),
             ):
                 result = server.install(
                     register=False,
@@ -461,24 +461,24 @@ class FleetDesktopEntryTest(unittest.TestCase):
             server.install_fleet_desktop_entry(entrypoint, desktop_path)
             with (
                 patch(
-                    "codex_master.server.install_lock",
+                    "the_hive.server.install_lock",
                     return_value=contextlib.nullcontext(),
                 ),
                 patch(
-                    "codex_master.server._codex_mcp_binding",
+                    "the_hive.server._codex_mcp_binding",
                     return_value=contextlib.nullcontext(SimpleNamespace()),
                 ),
-                patch("codex_master.server._runtime_mcp_entrypoint", return_value=entrypoint),
+                patch("the_hive.server._runtime_mcp_entrypoint", return_value=entrypoint),
                 patch(
-                    "codex_master.server.fleet_desktop_entry_path",
+                    "the_hive.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
                 ),
                 patch(
-                    "codex_master.server.check_mcp_registration",
+                    "the_hive.server.check_mcp_registration",
                     return_value={"registered": True, "command_matches": True},
                 ),
                 patch(
-                    "codex_master.server._run_bound_codex_mcp_command",
+                    "the_hive.server._run_bound_codex_mcp_command",
                     return_value=server.subprocess.CompletedProcess(
                         ["codex", "mcp", "remove"], 1, "", ""
                     ),
@@ -514,20 +514,20 @@ class FleetDesktopEntryTest(unittest.TestCase):
 
             with (
                 patch(
-                    "codex_master.server.install_lock",
+                    "the_hive.server.install_lock",
                     return_value=contextlib.nullcontext(),
                 ),
                 patch(
-                    "codex_master.server._codex_mcp_binding",
+                    "the_hive.server._codex_mcp_binding",
                     return_value=contextlib.nullcontext(SimpleNamespace()),
                 ),
-                patch("codex_master.server._runtime_mcp_entrypoint", return_value=entrypoint),
+                patch("the_hive.server._runtime_mcp_entrypoint", return_value=entrypoint),
                 patch(
-                    "codex_master.server.fleet_desktop_entry_path",
+                    "the_hive.server.fleet_desktop_entry_path",
                     return_value=desktop_path,
                 ),
                 patch(
-                    "codex_master.server.remove_fleet_desktop_entry",
+                    "the_hive.server.remove_fleet_desktop_entry",
                     side_effect=remove_then_interrupt,
                 ),
             ):
@@ -541,8 +541,8 @@ class FleetDesktopEntryTest(unittest.TestCase):
                 server.verify_fleet_desktop_entry(entrypoint, desktop_path)["ok"]
             )
 
-    @patch("codex_master.server.print_json", return_value=0)
-    @patch("codex_master.server.uninstall", return_value={"ok": True})
+    @patch("the_hive.server.print_json", return_value=0)
+    @patch("the_hive.server.uninstall", return_value={"ok": True})
     def test_cli_uninstall_preserves_desktop_entry(
         self, mock_uninstall, _mock_print_json
     ) -> None:
@@ -551,8 +551,8 @@ class FleetDesktopEntryTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(mock_uninstall.call_args.kwargs["remove_desktop"], False)
 
-    @patch("codex_master.server.print_json", return_value=0)
-    @patch("codex_master.server.install", return_value={"ok": True})
+    @patch("the_hive.server.print_json", return_value=0)
+    @patch("the_hive.server.install", return_value={"ok": True})
     def test_cli_install_requests_desktop_entry(
         self, mock_install, _mock_print_json
     ) -> None:

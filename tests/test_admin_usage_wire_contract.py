@@ -21,7 +21,7 @@ from codex_usage.masterjet_contracts import (  # noqa: E402
     parse_secret_ingress_session,
 )
 
-from codex_master.admin_contracts import (  # noqa: E402
+from the_hive.admin_contracts import (  # noqa: E402
     AdminContractError,
     parse_admin_request,
     public_agent_result,

@@ -14,8 +14,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from codex_master import server
-from codex_master.fleet_registry import (
+from the_hive import server
+from the_hive.fleet_registry import (
     AgentDescriptor,
     AuthKind,
     FleetAccount,
@@ -27,7 +27,7 @@ from codex_master.fleet_registry import (
     SecretState,
     build_inventory,
 )
-from codex_master.fleet_service import AccountGateDecision, FleetSecretError, GeminiGateDecision
+from the_hive.fleet_service import AccountGateDecision, FleetSecretError, GeminiGateDecision
 
 
 @pytest.fixture(autouse=True)

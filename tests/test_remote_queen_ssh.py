@@ -1,7 +1,7 @@
 import pytest
 
-from codex_master.remote_queen_bootstrap import SshTargetV1
-from codex_master.remote_queen_ssh import (
+from the_hive.remote_queen_bootstrap import SshTargetV1
+from the_hive.remote_queen_ssh import (
     MAX_SSH_CONNECT_TIMEOUT_SECONDS,
     MAX_SSH_OPERATION_TIMEOUT_SECONDS,
     MAX_SSH_STDERR_BYTES,
@@ -17,7 +17,7 @@ from codex_master.remote_queen_ssh import (
     approve_known_host_key,
     validate_ssh_operation_result,
 )
-from codex_master.remote_queen_bootstrap import RemoteQueenBootstrapError
+from the_hive.remote_queen_bootstrap import RemoteQueenBootstrapError
 
 
 TARGET = SshTargetV1(user="queen", host="example.test")

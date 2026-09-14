@@ -1,6 +1,6 @@
 import pytest
 
-from codex_master.hive.migration import (
+from the_hive.hive.migration import (
     compare_legacy_and_hive_assignment,
     enable_shadow_mode,
     migration_status,

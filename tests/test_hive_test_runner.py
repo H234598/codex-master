@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
-import codex_master.hive.evidence_runner as runner_module
-from codex_master.hive.indexed_test_inventory import PythonTestIndexBuilder
-from codex_master.hive.javascript_test_inventory import JavaScriptTestIndexBuilder
-from codex_master.hive.evidence_runner import TestEvidenceRunner as EvidenceRunner
-from codex_master.hive.evidence_store import TestStatusStore as StatusStore
+import the_hive.hive.evidence_runner as runner_module
+from the_hive.hive.indexed_test_inventory import PythonTestIndexBuilder
+from the_hive.hive.javascript_test_inventory import JavaScriptTestIndexBuilder
+from the_hive.hive.evidence_runner import TestEvidenceRunner as EvidenceRunner
+from the_hive.hive.evidence_store import TestStatusStore as StatusStore
 
 from test_hive_test_evidence import DIGEST_A, DIGEST_B
 

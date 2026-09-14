@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-import codex_master.usage_snapshot as usage_snapshot
+import the_hive.usage_snapshot as usage_snapshot
 
 
 PRODUCER_NOW = datetime(2026, 8, 31, 12, 1, tzinfo=UTC)

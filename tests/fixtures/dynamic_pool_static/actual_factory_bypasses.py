@@ -1,5 +1,5 @@
-from codex_master.dynamic_pool import _make_account_pool_binding_v1 as imported_factory
-import codex_master.dynamic_pool as pool
+from the_hive.dynamic_pool import _make_account_pool_binding_v1 as imported_factory
+import the_hive.dynamic_pool as pool
 
 imported_factory()
 pool._make_account_pool_binding_v1()

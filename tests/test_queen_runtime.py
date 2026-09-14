@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.queen_runtime import QueenRuntimeError, QueenRuntimeHomeManager
+from the_hive.queen_runtime import QueenRuntimeError, QueenRuntimeHomeManager
 
 
 def manager(tmp_path: Path) -> QueenRuntimeHomeManager:

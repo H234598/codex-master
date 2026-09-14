@@ -10,7 +10,7 @@ from io import BytesIO
 
 import pytest
 
-from codex_master.rename_contract import (
+from the_hive.rename_contract import (
     RenameContractError,
     RenameReleaseValidator,
     load_rename_matrix,
@@ -140,7 +140,7 @@ def _write_target_ready_tree(root: Path) -> None:
         path.write_text(existing + matrix.canonical[readiness.target_identifier], encoding="utf-8")
     contract = root / "src" / matrix.canonical["python"] / "rename_contract.v1.json"
     contract.parent.mkdir(parents=True, exist_ok=True)
-    contract.write_text(files("codex_master").joinpath("rename_contract.v1.json").read_text(), encoding="utf-8")
+    contract.write_text(files("the_hive").joinpath("rename_contract.v1.json").read_text(), encoding="utf-8")
     retirement = matrix.retirement_artifacts[0]
     target_caller = root / matrix.render_template(retirement.target_caller_path_template)
     target_caller.parent.mkdir(parents=True, exist_ok=True)
@@ -156,7 +156,7 @@ def _write_d73_tree_with_contract(root: Path) -> None:
     matrix = load_rename_matrix()
     contract = root / "src" / matrix.canonical["python"] / "rename_contract.v1.json"
     contract.parent.mkdir(parents=True, exist_ok=True)
-    contract.write_text(files("codex_master").joinpath("rename_contract.v1.json").read_text(), encoding="utf-8")
+    contract.write_text(files("the_hive").joinpath("rename_contract.v1.json").read_text(), encoding="utf-8")
     _commit_tree(root)
 
 
@@ -182,7 +182,7 @@ def test_matrix_binds_the_d74_d76_target_forms() -> None:
 
 
 def test_matrix_tampering_fails_closed() -> None:
-    raw = json.loads(files("codex_master").joinpath("rename_contract.v1.json").read_text())
+    raw = json.loads(files("the_hive").joinpath("rename_contract.v1.json").read_text())
     missing_form = copy.deepcopy(raw)
     missing_form["legacy_forms"] = []
     changed_target = copy.deepcopy(raw)

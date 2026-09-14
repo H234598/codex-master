@@ -9,8 +9,8 @@ import types
 
 import pytest
 
-import codex_master.fleet_home_broker_intent as intent_codec
-from codex_master.fleet_home_broker_intent import (
+import the_hive.fleet_home_broker_intent as intent_codec
+from the_hive.fleet_home_broker_intent import (
     MAX_BROKER_INTENT_BYTES,
     BrokerIntentCode,
     BrokerIntentError,

@@ -15,22 +15,22 @@ import threading
 
 import pytest
 
-from codex_master.admin_auth import MasterjetBearerVerifier, TotpStepUpVerifier
-from codex_master.admin_contracts import AdminPrincipalV1, AdminRequestV1, HiveProblemV1
-from codex_master.admin_http import (
+from the_hive.admin_auth import MasterjetBearerVerifier, TotpStepUpVerifier
+from the_hive.admin_contracts import AdminPrincipalV1, AdminRequestV1, HiveProblemV1
+from the_hive.admin_http import (
     AdminHttpServer,
     AdminHttpShutdownError,
     MAX_ADMIN_JSON_BYTES,
 )
-from codex_master.admin_service import (
+from the_hive.admin_service import (
     AdminDenied,
     AdminServiceError,
     SecretIngressCapabilityV1,
     MasterjetControlService,
 )
-from codex_master.credential_vault import CredentialVault
-from codex_master.admin_secret_ingress import AdminSecretIngressOwner
-from codex_master.hive.state import HiveStateError
+from the_hive.credential_vault import CredentialVault
+from the_hive.admin_secret_ingress import AdminSecretIngressOwner
+from the_hive.hive.state import HiveStateError
 from test_admin_service import service_at
 from test_openai_credential_service import (
     auth_json,

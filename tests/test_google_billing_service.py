@@ -9,18 +9,18 @@ import threading
 import pytest
 import yaml
 
-import codex_master.google_account_inventory_manager as manager_module
-from codex_master.google_account_inventory import GoogleAccountInventoryLoader
-from codex_master.google_account_inventory_manager import (
+import the_hive.google_account_inventory_manager as manager_module
+from the_hive.google_account_inventory import GoogleAccountInventoryLoader
+from the_hive.google_account_inventory_manager import (
     GoogleAccountInventoryManager,
 )
-from codex_master.google_billing_service import (
+from the_hive.google_billing_service import (
     GoogleBillingBindingObservationV1,
     GoogleBillingBindResultV1,
     GoogleBillingError,
     GoogleBillingService,
 )
-from codex_master.google_cloud_api import GoogleCloudApiError
+from the_hive.google_cloud_api import GoogleCloudApiError
 
 
 class Clock:

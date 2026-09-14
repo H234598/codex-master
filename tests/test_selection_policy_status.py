@@ -2,7 +2,7 @@ from pathlib import Path
 import json
 from unittest.mock import Mock, patch
 
-from codex_master import server
+from the_hive import server
 
 
 ROOT = Path(__file__).resolve().parents[1]

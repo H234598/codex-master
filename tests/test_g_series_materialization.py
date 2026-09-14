@@ -5,11 +5,11 @@ from uuid import UUID
 
 import pytest
 
-from codex_master.fleet_migration import (
+from the_hive.fleet_migration import (
     GSeriesMigrationPlan,
     plan_g_series_migration,
 )
-from codex_master.fleet_registry import (
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetAccountV2,
@@ -23,7 +23,7 @@ from codex_master.fleet_registry import (
     fleet_document,
     normalize_fleet_document,
 )
-from codex_master.fleet_migration_materialization import (
+from the_hive.fleet_migration_materialization import (
     GMigrationMaterializationError,
     MemberIdAllocation,
     allocate_final_member_ids,

@@ -153,7 +153,7 @@ class NativeBeeHookTest(unittest.TestCase):
             patch.object(sys, "stdin", stdin),
             patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
             patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
-            patch("codex_master.server.reserve_native_agent_spawn", return_value={"allowed": True, "reservation_id": "res-token"}) as reserve,
+            patch("the_hive.server.reserve_native_agent_spawn", return_value={"allowed": True, "reservation_id": "res-token"}) as reserve,
         ):
             assert spec is not None and spec.loader is not None
             spec.loader.exec_module(module)

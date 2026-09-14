@@ -10,8 +10,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from codex_master.admin_hosts import AgentBindingV1, HostRegistry, HostRegistryError
-from codex_master.agent_identity import AgentIdentityResolver
+from the_hive.admin_hosts import AgentBindingV1, HostRegistry, HostRegistryError
+from the_hive.agent_identity import AgentIdentityResolver
 
 
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)

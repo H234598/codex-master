@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from codex_master import server
+from the_hive import server
 
 
 def _requested_state() -> dict[str, object]:

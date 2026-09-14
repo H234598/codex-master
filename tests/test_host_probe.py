@@ -10,20 +10,20 @@ from typing import cast
 
 import pytest
 
-from codex_master.admin_hosts import (
+from the_hive.admin_hosts import (
     AgentPrincipalV1 as RegistryPrincipalV1,
     HostRegistry,
     HostRegistryError,
 )
-from codex_master.admin_operations import AdminOperationError, AdminOperationStore
-from codex_master.agent_contracts import (
+from the_hive.admin_operations import AdminOperationError, AdminOperationStore
+from the_hive.agent_contracts import (
     AgentLeaseV1,
     AgentPollV1,
     AgentReceiptV1,
     AgentResultV1,
     serialize_agent_result,
 )
-from codex_master.agent_operations import (
+from the_hive.agent_operations import (
     AgentAttemptExhaustionV1,
     AgentOperationDeadlineExpiryV1,
     AgentOperationError,
@@ -31,7 +31,7 @@ from codex_master.agent_operations import (
     AgentOperationStore,
     AgentPrincipalV1 as OperationPrincipalV1,
 )
-from codex_master.host_probe import (
+from the_hive.host_probe import (
     HostProbeError,
     HostProbeEvidenceV1,
     HostProbeRouter,

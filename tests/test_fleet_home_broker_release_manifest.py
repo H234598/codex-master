@@ -7,7 +7,7 @@ import stat
 import sys
 from pathlib import Path, PurePosixPath
 
-from codex_master.fleet_control_release_v2 import (
+from the_hive.fleet_control_release_v2 import (
     ControlReleaseSpecV2,
     ReleasePayloadDigestV2,
     decode_control_release_v2,

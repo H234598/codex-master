@@ -10,28 +10,28 @@ import subprocess
 
 import pytest
 
-from codex_master.hive.pilot_provisioner import apply_pilot_provisioning
-from codex_master.hive.hourly_probe import run_probe
-from codex_master.hive.runtime import (
+from the_hive.hive.pilot_provisioner import apply_pilot_provisioning
+from the_hive.hive.hourly_probe import run_probe
+from the_hive.hive.runtime import (
     HiveRuntimeError,
     HiveRuntimeEvidence,
     build_hive_runtime,
     read_hive_runtime_evidence,
 )
-from codex_master.hive.status import hive_doctor, hive_status
-from codex_master.hive.config import (
+from the_hive.hive.status import hive_doctor, hive_status
+from the_hive.hive.config import (
     load_agent_class_catalog_snapshot_bytes,
     load_hive_config_bytes,
 )
-from codex_master.runtime_layout import RuntimeLayout
-from codex_master.usage_snapshot import (
+from the_hive.runtime_layout import RuntimeLayout
+from the_hive.usage_snapshot import (
     AccountUsageEvidenceV2,
     TrackerEvidenceV2,
     UsageEvidenceV2,
     UsageLimitV2,
     UsageTrendV2,
 )
-import codex_master.hive.runtime as hive_runtime
+import the_hive.hive.runtime as hive_runtime
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -164,14 +164,14 @@ def _published_launcher_release(
     )
     # A real monitor would deliberately loop.  The launcher test instead uses
     # an attested server module whose two public dispatches immediately return.
-    (stage / "src" / "codex_master" / "server.py").write_text(
+    (stage / "src" / "the_hive" / "server.py").write_text(
         "import sys\n"
         "def run_resource_monitor():\n    return None\n"
         "if __name__ == '__main__' and sys.argv[1:] not in ([], ['--runtime-status-mcp']):\n"
         "    raise RuntimeError('MCP arguments were not preserved')\n",
         encoding="utf-8",
     )
-    (stage / "src" / "codex_master" / "server.py").chmod(0o644)
+    (stage / "src" / "the_hive" / "server.py").chmod(0o644)
     (stage / ".codex-master-runtime-manifest.json").unlink()
     installer["_write_runtime_image_manifest"](  # type: ignore[operator]
         root=stage,
@@ -199,8 +199,8 @@ def test_stable_launchers_require_one_attested_current_generation_without_checko
 ) -> None:
     release_root, generation, manifest_digest, _installer = _published_launcher_release(tmp_path)
     dirty_checkout = tmp_path / "dirty-checkout"
-    (dirty_checkout / "codex_master").mkdir(parents=True)
-    (dirty_checkout / "codex_master" / "server.py").write_text(
+    (dirty_checkout / "the_hive").mkdir(parents=True)
+    (dirty_checkout / "the_hive" / "server.py").write_text(
         "raise RuntimeError('dirty checkout imported')\n", encoding="utf-8"
     )
     plugin_cache = tmp_path / "plugin-cache"
@@ -320,8 +320,8 @@ def test_plugin_mcp_config_uses_only_the_authority_materialized_stable_launcher(
         "sha256": hashlib.sha256(stable.read_bytes()).hexdigest(),
     }
     dirty_checkout = tmp_path / "dirty-checkout"
-    (dirty_checkout / "codex_master").mkdir(parents=True)
-    (dirty_checkout / "codex_master" / "server.py").write_text(
+    (dirty_checkout / "the_hive").mkdir(parents=True)
+    (dirty_checkout / "the_hive" / "server.py").write_text(
         "raise RuntimeError('dirty checkout imported')\n", encoding="utf-8"
     )
     plugin_cache = tmp_path / "plugin-cache"
@@ -402,7 +402,7 @@ def test_complete_p2_runtime_image_binds_its_attested_root_without_a_checkout(
     monkeypatch.chdir(external_checkout)
     monkeypatch.setenv("CODEX_HOME", str(external_checkout / "attacker-codex-home"))
     monkeypatch.setenv("CODEX_MASTER_RUNTIME_ROOT", str(external_checkout))
-    monkeypatch.setattr(hive_runtime, "__file__", str(stage / "src" / "codex_master" / "hive" / "runtime.py"))
+    monkeypatch.setattr(hive_runtime, "__file__", str(stage / "src" / "the_hive" / "hive" / "runtime.py"))
     monkeypatch.setattr(hive_runtime, "_default_hive_state_root", lambda: state_root)
     monkeypatch.setattr(
         hive_runtime,
@@ -482,7 +482,7 @@ def test_missing_runtime_image_config_fails_closed_without_external_checkout(
     monkeypatch.chdir(external_checkout)
     monkeypatch.setenv("CODEX_HOME", str(external_checkout / "attacker-codex-home"))
     monkeypatch.setenv("CODEX_MASTER_RUNTIME_ROOT", str(external_checkout))
-    monkeypatch.setattr(hive_runtime, "__file__", str(stage / "src" / "codex_master" / "hive" / "runtime.py"))
+    monkeypatch.setattr(hive_runtime, "__file__", str(stage / "src" / "the_hive" / "hive" / "runtime.py"))
     monkeypatch.setattr(hive_runtime, "_default_hive_state_root", lambda: state_root)
 
     evidence = read_hive_runtime_evidence(now=lambda: NOW)
@@ -536,7 +536,7 @@ def test_image_diagnostics_reject_conflicting_authority_profile_capabilities(
         commit=TEST_STRUCTURAL_COMMIT,
     )
 
-    monkeypatch.setattr(hive_runtime, "__file__", str(stage / "src" / "codex_master" / "hive" / "runtime.py"))
+    monkeypatch.setattr(hive_runtime, "__file__", str(stage / "src" / "the_hive" / "hive" / "runtime.py"))
     monkeypatch.setattr(hive_runtime, "_default_hive_state_root", lambda: state_root)
 
     evidence = read_hive_runtime_evidence(now=lambda: NOW)

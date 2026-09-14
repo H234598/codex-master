@@ -12,8 +12,8 @@ import traceback
 
 import pytest
 
-import codex_master.fleet_home_broker_intent_store as intent_store_module
-from codex_master.fleet_home_broker_intent import (
+import the_hive.fleet_home_broker_intent_store as intent_store_module
+from the_hive.fleet_home_broker_intent import (
     BrokerIntentCode,
     BrokerIntentError,
     BrokerIntentOperation,
@@ -21,7 +21,7 @@ from codex_master.fleet_home_broker_intent import (
     canonical_intent_payload,
     encode_broker_intent,
 )
-from codex_master.fleet_home_broker_intent_store import (
+from the_hive.fleet_home_broker_intent_store import (
     BrokerIntentClaimBytes,
     BrokerIntentFileIdentity,
     BrokerIntentStoreOperations,
@@ -30,8 +30,8 @@ from codex_master.fleet_home_broker_intent_store import (
     claim_broker_intent,
     publish_broker_intent,
 )
-from codex_master.fleet_home_broker_identity_contract import ObjectIdentity
-from codex_master.fleet_home_broker_linux_contract import (
+from the_hive.fleet_home_broker_identity_contract import ObjectIdentity
+from the_hive.fleet_home_broker_linux_contract import (
     LinuxBrokerCode,
     LinuxBrokerError,
     PinnedFd,

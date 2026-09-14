@@ -8,9 +8,9 @@ from typing import Iterator, Mapping
 
 import pytest
 
-from codex_master.hive import control_plane_store as control_plane_store_module
-from codex_master.hive.control_plane_store import HiveControlPlaneStore
-from codex_master.hive.state import HiveStateError, HiveStateStore
+from the_hive.hive import control_plane_store as control_plane_store_module
+from the_hive.hive.control_plane_store import HiveControlPlaneStore
+from the_hive.hive.state import HiveStateError, HiveStateStore
 
 
 NOW = datetime(2026, 8, 16, 20, 45, tzinfo=timezone.utc)

@@ -2,8 +2,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from codex_master.hive.types import TaskComplexity
-from codex_master.agent_resolver import (
+from the_hive.hive.types import TaskComplexity
+from the_hive.agent_resolver import (
     AgentClassPolicy,
     ModelPolicy,
     ResolutionRequest,
@@ -12,9 +12,9 @@ from codex_master.agent_resolver import (
     resolve_agent_selection,
     validate_canonical_agent_tuple,
 )
-from codex_master.hive.config import load_agent_class_catalog
-from codex_master.selection.model_policy import load_model_policy
-from codex_master.server import (
+from the_hive.hive.config import load_agent_class_catalog
+from the_hive.selection.model_policy import load_model_policy
+from the_hive.server import (
     AgentError,
     _main_cli_impl,
     agent_base_args,
@@ -24,7 +24,7 @@ from codex_master.server import (
     resolve_runtime_agent_selection,
     validate_codex_usage_routing_decision,
 )
-from codex_master.selection.task_classification import TaskClassificationRequest, TaskClassifier
+from the_hive.selection.task_classification import TaskClassificationRequest, TaskClassifier
 import pytest
 
 
@@ -833,7 +833,7 @@ def test_agent_base_args_accepts_second_sol_family_member_red_then_green(
         ),
         public=lambda: base_registry.public() + (alternate_public,),
     )
-    monkeypatch.setattr("codex_master.server.load_model_policy", lambda _path: registry)
+    monkeypatch.setattr("the_hive.server.load_model_policy", lambda _path: registry)
 
     assert agent_base_args(alternate_definition.model_id, reasoning, agent_class=class_id)[:2] == [
         "--model", alternate_definition.model_id,
@@ -845,7 +845,7 @@ def test_assign_write_cli_rejects_ultra_before_dispatch(capsys: pytest.CaptureFi
         "assign-write", "a1", "--task", "P0 parser-only negative",
         "--reasoning-effort", "ultra",
     ]
-    with patch("codex_master.server.call_validated_tool") as call_validated_tool:
+    with patch("the_hive.server.call_validated_tool") as call_validated_tool:
         with pytest.raises(SystemExit) as raised:
             _main_cli_impl(argv)
     assert raised.value.code == 2
@@ -920,10 +920,10 @@ def test_selection_options_keeps_q_target_bound_to_requester_authority() -> None
         agents={"q1": SimpleNamespace(series_prefix="q", skill_profile="teamleiterin")},
         agent_ids=("q1",),
     )
-    with patch("codex_master.server.canonical_agent_id", return_value="q1"), patch(
-        "codex_master.server.current_agent_inventory", return_value=inventory
+    with patch("the_hive.server.canonical_agent_id", return_value="q1"), patch(
+        "the_hive.server.current_agent_inventory", return_value=inventory
     ), patch(
-        "codex_master.server.ensure_agent_not_blocked_by_codex_usage",
+        "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
         return_value={"blocked": False},
     ):
         offer = agent_selection_options("q1", requester_class="teamleiterin")
@@ -945,10 +945,10 @@ def test_selection_options_hides_teamlead_for_worker_authority() -> None:
         agents={"q1": SimpleNamespace(series_prefix="q", skill_profile="teamleiterin")},
         agent_ids=("q1",),
     )
-    with patch("codex_master.server.canonical_agent_id", return_value="q1"), patch(
-        "codex_master.server.current_agent_inventory", return_value=inventory
+    with patch("the_hive.server.canonical_agent_id", return_value="q1"), patch(
+        "the_hive.server.current_agent_inventory", return_value=inventory
     ), patch(
-        "codex_master.server.ensure_agent_not_blocked_by_codex_usage",
+        "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
         return_value={"blocked": False},
     ):
         offer = agent_selection_options("q1", requester_class="arbeitsbiene")
@@ -974,7 +974,7 @@ def test_skill_profile_cannot_bind_worker_targets_to_leadership() -> None:
             }
         },
     )()
-    with patch("codex_master.server.current_agent_inventory", return_value=inventory):
+    with patch("the_hive.server.current_agent_inventory", return_value=inventory):
         assert resolver_class_for_agent("a1", None) is None
         assert resolver_class_for_agent("c1", "arbeitsbiene") == "arbeitsbiene"
 
@@ -993,7 +993,7 @@ def test_q_target_does_not_bind_leadership_from_series_metadata() -> None:
             }
         },
     )()
-    with patch("codex_master.server.current_agent_inventory", return_value=inventory):
+    with patch("the_hive.server.current_agent_inventory", return_value=inventory):
         assert resolver_class_for_agent(
             "q1",
             "arbeitsbiene",

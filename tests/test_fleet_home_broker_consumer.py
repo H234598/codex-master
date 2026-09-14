@@ -12,9 +12,9 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-import codex_master.fleet_home_broker_intent_store as intent_store_module
-from codex_master.fleet_home_broker import OfflineBrokerPlan
-from codex_master.fleet_home_broker_consumer import (
+import the_hive.fleet_home_broker_intent_store as intent_store_module
+from the_hive.fleet_home_broker import OfflineBrokerPlan
+from the_hive.fleet_home_broker_consumer import (
     BrokerExecutionComposition,
     BrokerIntentConsumeCode,
     BrokerIntentConsumeResult,
@@ -22,30 +22,30 @@ from codex_master.fleet_home_broker_consumer import (
     BrokerIntentResolver,
     consume_one_broker_intent,
 )
-from codex_master.fleet_home_broker_dispatch import BrokerDispatchOperations
-from codex_master.fleet_home_broker_execution import RootBrokerExecutionComposition
-import codex_master.fleet_home_broker_consumer as consumer
-from codex_master.fleet_home_broker_identity import (
+from the_hive.fleet_home_broker_dispatch import BrokerDispatchOperations
+from the_hive.fleet_home_broker_execution import RootBrokerExecutionComposition
+import the_hive.fleet_home_broker_consumer as consumer
+from the_hive.fleet_home_broker_identity import (
     BrokerIdentity,
     ImportClosure,
     ImportClosureEntry,
 )
-from codex_master.fleet_home_broker_intent import (
+from the_hive.fleet_home_broker_intent import (
     BrokerIntentOperation,
     BrokerIntentV1,
     canonical_intent_payload,
     encode_broker_intent,
 )
-from codex_master.fleet_home_broker_intent_store import (
+from the_hive.fleet_home_broker_intent_store import (
     BrokerIntentClaimBytes,
     BrokerIntentFileIdentity,
     LinuxBrokerIntentStore,
     claim_broker_intent,
 )
-from codex_master.fleet_home_broker_identity_contract import ObjectIdentity
-from codex_master.fleet_home_broker_linux_contract import PinnedFd
-from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_identity_contract import ObjectIdentity
+from the_hive.fleet_home_broker_linux_contract import PinnedFd
+from the_hive.fleet_home_broker_linux import FdStat, PidfdIdentity
+from the_hive.fleet_home_broker_protocol import (
     BrokerCheckpoint,
     BrokerObjectState,
     BrokerObservation,
@@ -61,7 +61,7 @@ from codex_master.fleet_home_broker_protocol import (
     TransactionStatus,
     b2a_phase_for_checkpoint,
 )
-from codex_master.fleet_home_broker_transport import BrokerTransportResponse
+from the_hive.fleet_home_broker_transport import BrokerTransportResponse
 
 
 class EmptyStore:

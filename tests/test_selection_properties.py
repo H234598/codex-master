@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from codex_master.selection import FairnessLedger, ModelRole, SelectionCandidate, SelectionPolicy, TaskKind
-from codex_master.selection.policy import evaluate_eligibility, priority_key, select_candidate
+from the_hive.selection import FairnessLedger, ModelRole, SelectionCandidate, SelectionPolicy, TaskKind
+from the_hive.selection.policy import evaluate_eligibility, priority_key, select_candidate
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

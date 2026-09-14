@@ -10,8 +10,8 @@ from typing import Any
 
 import pytest
 
-from codex_master.admin_contracts import OperationV1
-from codex_master.admin_operations import (
+from the_hive.admin_contracts import OperationV1
+from the_hive.admin_operations import (
     MAX_HOST_PROBE_LIFECYCLE_OWNERS,
     MAX_HOST_PROBE_LIFECYCLE_STATE_BYTES,
     MAX_OPERATION_RECORDS,
@@ -701,7 +701,7 @@ def test_host_probe_owner_rejects_reused_agent_operation_id_without_mutation(
 
 
 def test_host_probe_owner_capacity_is_bounded(tmp_path, monkeypatch) -> None:
-    import codex_master.admin_operations as operations
+    import the_hive.admin_operations as operations
 
     monkeypatch.setattr(operations, "MAX_HOST_PROBE_LIFECYCLE_OWNERS", 2)
     store = store_at(tmp_path)

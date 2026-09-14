@@ -11,8 +11,8 @@ from types import MappingProxyType
 import pytest
 from unittest.mock import patch
 
-from codex_master import server
-from codex_master.fleet_recovery import (
+from the_hive import server
+from the_hive.fleet_recovery import (
     ArtifactDigest,
     DescriptorState,
     EntryPhase,
@@ -43,9 +43,9 @@ from codex_master.fleet_recovery import (
     g_migration_journal_document,
     normalize_g_migration_journal,
 )
-from codex_master.fleet_migration_materialization import MemberIdAllocation
-from codex_master.fleet_registry import AgentDescriptor, FleetSnapshot, Provider, RunnerKind
-from codex_master.server import AgentError, FleetPaths
+from the_hive.fleet_migration_materialization import MemberIdAllocation
+from the_hive.fleet_registry import AgentDescriptor, FleetSnapshot, Provider, RunnerKind
+from the_hive.server import AgentError, FleetPaths
 
 
 def prepare_unsafe_recovery_file(paths: FleetPaths, unsafe: str) -> None:
@@ -468,7 +468,7 @@ def test_advance_recovery_phase_rejects_blocking_errors_in_later_phases() -> Non
 
 
 def test_recovery_load_rejects_unsafe_journal(tmp_path: Path) -> None:
-    from codex_master.server import (
+    from the_hive.server import (
         _fleet_load_recovery_journal,
     )
 
@@ -483,7 +483,7 @@ def test_recovery_load_rejects_unsafe_journal(tmp_path: Path) -> None:
 
 
 def test_recovery_store_fsyncs_file_and_parent_before_success(tmp_path: Path) -> None:
-    from codex_master.server import (
+    from the_hive.server import (
         _fleet_store_recovery_journal,
         _fleet_load_recovery_journal as real_load,
     )
@@ -504,7 +504,7 @@ def test_recovery_store_fsyncs_file_and_parent_before_success(tmp_path: Path) ->
 
 
 def test_recovery_store_keeps_foreign_temp_swapped_before_replace(tmp_path: Path) -> None:
-    import codex_master.server as server_module
+    import the_hive.server as server_module
 
     paths = FleetPaths.from_state_root(tmp_path)
     journal = sample_journal()
@@ -549,7 +549,7 @@ def test_recovery_store_keeps_foreign_temp_swapped_before_replace(tmp_path: Path
 
 
 def test_recovery_remove_keeps_journal_swapped_after_load(tmp_path: Path) -> None:
-    import codex_master.server as server_module
+    import the_hive.server as server_module
 
     paths = FleetPaths.from_state_root(tmp_path)
     expected = replace(sample_journal(), phase=RecoveryPhase.COMPLETE)
@@ -593,7 +593,7 @@ def test_recovery_remove_keeps_journal_swapped_after_load(tmp_path: Path) -> Non
 
 
 def test_recovery_remove_fails_closed_when_parent_fsync_fails(tmp_path: Path) -> None:
-    import codex_master.server as server_module
+    import the_hive.server as server_module
 
     paths = FleetPaths.from_state_root(tmp_path)
     expected = replace(sample_journal(), phase=RecoveryPhase.COMPLETE)
@@ -606,7 +606,7 @@ def test_recovery_remove_fails_closed_when_parent_fsync_fails(tmp_path: Path) ->
 
 
 def test_recovery_remove_complete_journal_unlinks_and_fsyncs_parent(tmp_path: Path) -> None:
-    import codex_master.server as server_module
+    import the_hive.server as server_module
 
     paths = FleetPaths.from_state_root(tmp_path)
     expected = replace(sample_journal(), phase=RecoveryPhase.COMPLETE)
@@ -617,11 +617,11 @@ def test_recovery_remove_complete_journal_unlinks_and_fsyncs_parent(tmp_path: Pa
 
 
 def test_reconciler_continues_every_mutation_class_after_first_failure(tmp_path: Path) -> None:
-    from codex_master.server import (
+    from the_hive.server import (
         _fleet_execute_recovery_plan,
         _FleetRecoveryTransaction,
     )
-    from codex_master.fleet_recovery import RecoveryAction
+    from the_hive.fleet_recovery import RecoveryAction
 
     entries = tuple(
         replace(
@@ -665,7 +665,7 @@ def test_reconciler_continues_every_mutation_class_after_first_failure(tmp_path:
             return authoritative
 
     with patch.object(
-        __import__("codex_master.server", fromlist=["_fleet_execute_recovery_action"]),
+        __import__("the_hive.server", fromlist=["_fleet_execute_recovery_action"]),
         "_fleet_execute_recovery_action",
         side_effect=execute,
     ), patch.object(
@@ -681,13 +681,13 @@ def test_reconciler_continues_every_mutation_class_after_first_failure(tmp_path:
 
 
 def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(tmp_path: Path) -> None:
-    from codex_master.server import (
+    from the_hive.server import (
         FLEET_TOMBSTONE_PREFIX,
         _fleet_execute_recovery_plan,
         _FleetRecoveryTransaction,
         _fleet_verify_authoritative_materialization,
     )
-    from codex_master.fleet_recovery import (
+    from the_hive.fleet_recovery import (
         RecoveryAction,
         RecoveryActionKind,
         RecoveryPlan,
@@ -726,17 +726,17 @@ def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(tmp_p
         return True
 
     with patch.object(
-        __import__("codex_master.server", fromlist=["current_fleet_service"]),
+        __import__("the_hive.server", fromlist=["current_fleet_service"]),
         "current_fleet_service",
         return_value=service,
     ):
         with patch.object(
-            __import__("codex_master.server", fromlist=["_fleet_execute_recovery_action"]),
+            __import__("the_hive.server", fromlist=["_fleet_execute_recovery_action"]),
             "_fleet_execute_recovery_action",
             side_effect=execute,
         ):
             with patch.object(
-                __import__("codex_master.server", fromlist=["_fleet_verify_authoritative_materialization"]),
+                __import__("the_hive.server", fromlist=["_fleet_verify_authoritative_materialization"]),
                 "_fleet_verify_authoritative_materialization",
                 side_effect=lambda snapshot, actual: verified.append(snapshot) or _fleet_verify_authoritative_materialization(snapshot, actual),
             ):
@@ -747,11 +747,11 @@ def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(tmp_p
 
 
 def test_recovery_plan_execution_blocks_if_post_plan_load_fails(tmp_path: Path) -> None:
-    from codex_master.server import (
+    from the_hive.server import (
         _fleet_execute_recovery_plan,
         _FleetRecoveryTransaction,
     )
-    from codex_master.fleet_registry import FleetSnapshot
+    from the_hive.fleet_registry import FleetSnapshot
 
     entries = (replace(sample_entry(), agent_id="d1"),)
     journal = replace(
@@ -781,12 +781,12 @@ def test_recovery_plan_execution_blocks_if_post_plan_load_fails(tmp_path: Path) 
 
     service = _Service()
     with patch.object(
-        __import__("codex_master.server", fromlist=["current_fleet_service"]),
+        __import__("the_hive.server", fromlist=["current_fleet_service"]),
         "current_fleet_service",
         return_value=service,
     ):
         with patch.object(
-            __import__("codex_master.server", fromlist=["_fleet_execute_recovery_action"]),
+            __import__("the_hive.server", fromlist=["_fleet_execute_recovery_action"]),
             "_fleet_execute_recovery_action",
             return_value=True,
         ):
@@ -801,10 +801,10 @@ def test_recovery_plan_execution_blocks_if_post_plan_load_fails(tmp_path: Path) 
 
 
 def test_reconcile_disallows_legacy_inputs_without_persistent_journal() -> None:
-    from codex_master.server import (
+    from the_hive.server import (
         _fleet_reconcile_divergent_materialization,
     )
-    from codex_master.fleet_registry import FleetSnapshot
+    from the_hive.fleet_registry import FleetSnapshot
 
     current = FleetSnapshot(1, 1, (), ())
     planned = FleetSnapshot(1, 2, (), ())
@@ -822,7 +822,7 @@ def test_reconcile_disallows_legacy_inputs_without_persistent_journal() -> None:
 def test_reconcile_uses_persisted_journal_when_transaction_memory_is_empty(
     tmp_path: Path,
 ) -> None:
-    import codex_master.server as server_module
+    import the_hive.server as server_module
 
     entry = replace(
         sample_entry(MutationKind.TOMBSTONE),
@@ -885,7 +885,7 @@ def test_reconcile_fails_closed_without_persisted_journal(
     tmp_path: Path,
     persisted_state: str,
 ) -> None:
-    import codex_master.server as server_module
+    import the_hive.server as server_module
 
     journal = replace(
         sample_journal(),
@@ -920,7 +920,7 @@ def test_reconcile_fails_closed_without_persisted_journal(
 
 
 def test_reconcile_accepts_persisted_empty_registry_only_journal(tmp_path: Path) -> None:
-    import codex_master.server as server_module
+    import the_hive.server as server_module
 
     current = FleetSnapshot(1, 2, (), ())
     planned = FleetSnapshot(1, 3, (), ())
@@ -962,7 +962,7 @@ def test_reconcile_rejects_empty_non_registry_only_journal(
     tmp_path: Path,
     operation: RecoveryOperation,
 ) -> None:
-    import codex_master.server as server_module
+    import the_hive.server as server_module
 
     current = FleetSnapshot(1, 2, (), ())
     planned = FleetSnapshot(1, 3, (), ())
@@ -995,7 +995,7 @@ def test_reconcile_rejects_empty_non_registry_only_journal(
 def test_registry_only_publish_rejects_different_generation_before_snapshot_divergence(
     tmp_path: Path,
 ) -> None:
-    import codex_master.server as server_module
+    import the_hive.server as server_module
 
     current = FleetSnapshot(1, 2, (), ())
     stored = FleetSnapshot(1, 3, (), ())

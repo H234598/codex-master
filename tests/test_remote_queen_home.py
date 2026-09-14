@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from codex_master import remote_queen_home
-from codex_master.remote_queen_bootstrap import ManifestGenerationV1, RemoteQueenBootstrapError
-from codex_master.remote_queen_home import (
+from the_hive import remote_queen_home
+from the_hive.remote_queen_bootstrap import ManifestGenerationV1, RemoteQueenBootstrapError
+from the_hive.remote_queen_home import (
     GENERIC_RULES_PATH,
     QUEEN_BRANCH,
     QUEEN_HOME_PARENT,
@@ -687,7 +687,7 @@ def _assert_allowed_imports(source):
         "enum": {"Enum"},
         "pathlib": {"PurePosixPath"},
         "typing": {"Protocol"},
-        "codex_master.remote_queen_bootstrap": {
+        "the_hive.remote_queen_bootstrap": {
             "ManifestGenerationV1",
             "RemoteQueenBootstrapError",
         },
@@ -705,13 +705,13 @@ def _assert_allowed_imports(source):
 
 
 def test_ast_import_gate_rejects_qualified_unapproved_project_importfrom():
-    source = "from codex_master.remote_queen_mcp import RemoteMcpFactV1"
+    source = "from the_hive.remote_queen_mcp import RemoteMcpFactV1"
     with pytest.raises(AssertionError):
         _assert_allowed_imports(source)
 
 
 def test_production_ast_has_only_allowed_dependencies_and_no_effect_calls():
-    source_path = Path(__file__).parents[1] / "src" / "codex_master" / "remote_queen_home.py"
+    source_path = Path(__file__).parents[1] / "src" / "the_hive" / "remote_queen_home.py"
     source = source_path.read_text(encoding="utf-8")
     tree = ast.parse(source)
     forbidden = {
@@ -732,6 +732,6 @@ def test_production_ast_has_only_allowed_dependencies_and_no_effect_calls():
             assert node.id not in forbidden
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             assert node.func.id not in forbidden
-    assert "codex_master.remote_queen_mcp" not in source
-    assert "codex_master.queen_runtime" not in source
-    assert "codex_master.worker_resume" not in source
+    assert "the_hive.remote_queen_mcp" not in source
+    assert "the_hive.queen_runtime" not in source
+    assert "the_hive.worker_resume" not in source

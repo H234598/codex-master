@@ -11,7 +11,7 @@ import pytest
 
 def _runtime_layout_module():
     try:
-        return importlib.import_module("codex_master.runtime_layout")
+        return importlib.import_module("the_hive.runtime_layout")
     except ModuleNotFoundError:
         return None
 
@@ -69,16 +69,16 @@ def materialize_runtime_image(tmp_path: Path) -> Path:
     _write_file(root / "skills" / "codex-master-fleet" / "SKILL.md", "---\nname: codex-master-fleet\n---\n")
     _write_file(root / "codex-hive.json", json.dumps({"schema_version": 1, "mode": "shadow"}))
     _write_file(root / "codex-agent-classes.json", json.dumps({"schema_version": 1, "classes": []}))
-    _write_file(root / "src" / "codex_master" / "_runtime_spawn_helper.so", "test helper", 0o755)
-    _write_file(root / "src" / "codex_master" / "hive" / "cli.py", "# image module\n")
+    _write_file(root / "src" / "the_hive" / "_runtime_spawn_helper.so", "test helper", 0o755)
+    _write_file(root / "src" / "the_hive" / "hive" / "cli.py", "# image module\n")
     for relative in (
         "admission.py", "admission_runtime.py", "dynamic_pool.py", "hive/__init__.py",
         "hive/admission.py", "hive/dispatch.py", "hive/principals.py", "selection.py",
         "selection_service.py", "server.py",
     ):
         _write_file(
-            root / "src" / "codex_master" / relative,
-            (Path(__file__).resolve().parents[1] / "src" / "codex_master" / relative).read_text(encoding="utf-8"),
+            root / "src" / "the_hive" / relative,
+            (Path(__file__).resolve().parents[1] / "src" / "the_hive" / relative).read_text(encoding="utf-8"),
         )
     for path in root.rglob("*"):
         if path.is_dir():
@@ -101,7 +101,7 @@ def test_runtime_layout_is_immutable_and_derived_only_from_a_valid_image(tmp_pat
     assert layout.mcp_entrypoint == root / "bin" / "codex-master-mcp"
     assert layout.probe_entrypoint == root / "bin" / "codex-master-hive-hourly-probe"
     assert layout.metadata_root == root
-    assert layout.spawn_helper == root / "src" / "codex_master" / "_runtime_spawn_helper.so"
+    assert layout.spawn_helper == root / "src" / "the_hive" / "_runtime_spawn_helper.so"
     assert len(layout.spawn_helper_digest) == 64
     assert layout.manifest_digest.startswith("sha256:")
     with pytest.raises(FrozenInstanceError):
@@ -180,7 +180,7 @@ def test_runtime_layout_rejects_linked_and_outside_entrypoints(tmp_path: Path) -
             mcp_entrypoint=target,
             probe_entrypoint=restored / "bin" / "codex-master-hive-hourly-probe",
             metadata_root=restored,
-            spawn_helper=restored / "src" / "codex_master" / "_runtime_spawn_helper.so",
+            spawn_helper=restored / "src" / "the_hive" / "_runtime_spawn_helper.so",
             spawn_helper_digest="0" * 64,
             root_device=valid_layout.root_device,
             root_inode=valid_layout.root_inode,
@@ -192,7 +192,7 @@ def test_runtime_layout_rejects_a_helper_or_manifest_digest_deviation(tmp_path: 
     module = _runtime_layout_module()
     assert module is not None
     root = materialize_runtime_image(tmp_path)
-    helper = root / "src" / "codex_master" / "_runtime_spawn_helper.so"
+    helper = root / "src" / "the_hive" / "_runtime_spawn_helper.so"
     helper.write_bytes(b"swapped helper")
 
     with pytest.raises(module.LayoutError):
@@ -232,7 +232,7 @@ def test_runtime_layout_rejects_a_replaced_generation_or_manifest_digest(tmp_pat
 
 
 def test_runtime_image_repository_root_is_not_public_or_registry_compatible(tmp_path: Path) -> None:
-    from codex_master.hive.repositories import (
+    from the_hive.hive.repositories import (
         RepositoryBinding,
         RepositoryError,
         RepositoryRegistry,
@@ -246,7 +246,7 @@ def test_runtime_image_repository_root_is_not_public_or_registry_compatible(tmp_
     assert "RuntimeImageRepositoryRoot" not in module.__all__
     assert not hasattr(module, "RuntimeImageRepositoryRoot")
     with pytest.raises(ImportError):
-        exec("from codex_master.runtime_layout import RuntimeImageRepositoryRoot", {})
+        exec("from the_hive.runtime_layout import RuntimeImageRepositoryRoot", {})
     with pytest.raises(AttributeError):
         module.RuntimeImageRepositoryRoot(layout)  # type: ignore[attr-defined]
     with pytest.raises(AttributeError):
@@ -345,7 +345,7 @@ def test_runtime_layout_derives_from_a_module_path_without_environment_overrides
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "untrusted-codex-home"))
     monkeypatch.setenv("CODEX_MASTER_RUNTIME_ROOT", str(tmp_path / "untrusted-runtime"))
 
-    layout = module.RuntimeLayout.from_module_path(root / "src" / "codex_master" / "hive" / "cli.py")
+    layout = module.RuntimeLayout.from_module_path(root / "src" / "the_hive" / "hive" / "cli.py")
 
     assert layout.root == root
     with pytest.raises(module.LayoutError):

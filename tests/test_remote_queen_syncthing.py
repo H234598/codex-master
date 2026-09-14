@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from codex_master import remote_queen_syncthing
-from codex_master.remote_queen_bootstrap import ManifestGenerationV1
-from codex_master.remote_queen_syncthing import (
+from the_hive import remote_queen_syncthing
+from the_hive.remote_queen_bootstrap import ManifestGenerationV1
+from the_hive.remote_queen_syncthing import (
     ALLOWED_GUI_LISTEN_ADDRESSES,
     ANNOTATION_SIDECAR_PATTERN,
     VAULT_EXCLUDED_PATHS,
@@ -43,7 +43,7 @@ from codex_master.remote_queen_syncthing import (
     syncthing_vault_plan_as_dict,
     verify_remote_queen_syncthing_vault,
 )
-from codex_master.remote_queen_bootstrap import RemoteQueenBootstrapError
+from the_hive.remote_queen_bootstrap import RemoteQueenBootstrapError
 
 
 def test_optional_string_validator_accepts_none_or_exact_string_only() -> None:
@@ -1119,7 +1119,7 @@ def test_import_gate_has_no_forbidden_imports_or_calls():
     source_path = (
         Path(__file__).parents[1]
         / "src"
-        / "codex_master"
+        / "the_hive"
         / "remote_queen_syncthing.py"
     )
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
@@ -1249,7 +1249,7 @@ def test_vault_unchanged_and_no_live_command_strings():
     source_path = (
         Path(__file__).parents[1]
         / "src"
-        / "codex_master"
+        / "the_hive"
         / "remote_queen_syncthing.py"
     )
     source = source_path.read_text(encoding="utf-8").lower()

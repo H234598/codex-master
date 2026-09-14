@@ -6,9 +6,9 @@ import traceback
 
 import pytest
 
-from codex_master.hive.config import load_agent_class_catalog, load_agent_class_catalog_snapshot, load_hive_config
-from codex_master.hive.events import HiveEventStore
-from codex_master.hive.runtime import (
+from the_hive.hive.config import load_agent_class_catalog, load_agent_class_catalog_snapshot, load_hive_config
+from the_hive.hive.events import HiveEventStore
+from the_hive.hive.runtime import (
     HiveRuntimeError,
     HiveRuntimeEvidence,
     _compose_hive_runtime_from_catalog_snapshot,
@@ -16,9 +16,9 @@ from codex_master.hive.runtime import (
     enforced_pilot_gate,
     read_hive_runtime_evidence,
 )
-from codex_master.hive.repositories import RepositoryRegistry
-from codex_master.server import AgentError, build_server_admission_runtime
-from codex_master.usage_snapshot import (
+from the_hive.hive.repositories import RepositoryRegistry
+from the_hive.server import AgentError, build_server_admission_runtime
+from the_hive.usage_snapshot import (
     AccountUsageEvidenceV2,
     PoolAuthorityV2,
     TrackerEvidenceV2,

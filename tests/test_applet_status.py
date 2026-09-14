@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from codex_master import server
-from codex_master.fleet_registry import (
+from the_hive import server
+from the_hive.fleet_registry import (
     FleetAccount,
     FleetSeries,
     FleetSnapshot,
@@ -17,8 +17,8 @@ from codex_master.fleet_registry import (
     SecretState,
     build_inventory,
 )
-from codex_master.fleet_service import AccountGateDecision
-from codex_master.resource_monitor import ResourceOperatorStatus
+from the_hive.fleet_service import AccountGateDecision
+from the_hive.resource_monitor import ResourceOperatorStatus
 
 
 class FakeService:

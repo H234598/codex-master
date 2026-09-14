@@ -11,7 +11,7 @@ import subprocess
 
 import pytest
 
-from codex_master.runtime_layout import LayoutError, RuntimeLayout
+from the_hive.runtime_layout import LayoutError, RuntimeLayout
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,7 +155,7 @@ def test_f25_manifest_rejects_a_regenerated_nonanchor_d69_server_blob(
     installer["_build_runtime_image"](  # type: ignore[operator]
         repository=repository, stage=stage, generation=F25, commit=F25
     )
-    server = stage / "src" / "codex_master" / "server.py"
+    server = stage / "src" / "the_hive" / "server.py"
     server.write_text(server.read_text(encoding="utf-8") + "\n# altered\n", encoding="utf-8")
     server.chmod(0o644)
     (stage / ".codex-master-runtime-manifest.json").unlink()
@@ -174,7 +174,7 @@ def test_dirty_d69_source_cannot_claim_the_f25_release_before_pointer_mutation(t
         repository,
         ignore=shutil.ignore_patterns(".git", ".local", ".pytest_cache", "__pycache__"),
     )
-    dirty = repository / "src" / "codex_master" / "dynamic_pool.py"
+    dirty = repository / "src" / "the_hive" / "dynamic_pool.py"
     dirty.write_text(dirty.read_text(encoding="utf-8") + "\n# dirty\n", encoding="utf-8")
     stage = tmp_path / ".codex-master-runtime.stage.dirty"
     stage.mkdir(mode=0o700)
@@ -266,7 +266,7 @@ def test_named_generation_pointer_pair_rejects_manifest_mode_and_pointer_drift(t
     ).hexdigest()
     layout = RuntimeLayout.from_current_release(release_root, "first", digest)
     assert layout.root == release_root / "generations" / "first"
-    changed = layout.root / "src" / "codex_master" / "resource_monitor.py"
+    changed = layout.root / "src" / "the_hive" / "resource_monitor.py"
     changed.chmod(0o755)
     with pytest.raises(LayoutError):
         RuntimeLayout.from_current_release(release_root, "first", digest)

@@ -17,20 +17,20 @@ from typing import Iterator
 
 import pytest
 
-import codex_master.admin_socket as admin_socket
-from codex_master.admin_contracts import (
+import the_hive.admin_socket as admin_socket
+from the_hive.admin_contracts import (
     AdminPrincipalV1,
     AdminRequestV1,
     HiveProblemV1,
     public_admin_result,
 )
-from codex_master.admin_hosts import ControlHostV1
-from codex_master.admin_service import (
+from the_hive.admin_hosts import ControlHostV1
+from the_hive.admin_service import (
     MasterjetControlService,
     SecretIngressSessionV1,
     SecretIngressUploadReceiptV1,
 )
-from codex_master.admin_socket import (
+from the_hive.admin_socket import (
     MAX_ADMIN_REQUEST_BYTES,
     MAX_ADMIN_SECRET_BYTES,
     AdminSocketClient,

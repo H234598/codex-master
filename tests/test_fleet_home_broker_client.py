@@ -10,8 +10,8 @@ from typing import get_type_hints
 
 import pytest
 
-from codex_master.fleet_home_broker_linux import FdStat
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_linux import FdStat
+from the_hive.fleet_home_broker_protocol import (
     AgentStartClaim,
     AgentStartEnvironmentProjection,
     AgentStartEnvelope,
@@ -43,14 +43,14 @@ from codex_master.fleet_home_broker_protocol import (
     TransactionStatus,
     encode_chpb_message,
 )
-from codex_master.fleet_control_release_v2 import (
+from the_hive.fleet_control_release_v2 import (
     ControlReleaseSpecV2,
     ReleasePayloadDigestV2,
 )
-from codex_master.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_identity import BrokerIdentity
 
 
-client = importlib.import_module("codex_master.fleet_home_broker_client")
+client = importlib.import_module("the_hive.fleet_home_broker_client")
 
 REQUEST_ID = "a" * 32
 TRANSACTION_ID = "b" * 32

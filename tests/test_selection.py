@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from codex_master.selection import (
+from the_hive.selection import (
     AdmissionMode,
     AdmissionPolicy,
     FairnessLedger,

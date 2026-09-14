@@ -14,7 +14,7 @@ _TEST_MANIFEST_COMMIT = "a" * 40
 def seal_runtime_image(root: Path, *, commit: str = _TEST_MANIFEST_COMMIT) -> None:
     """Add the real helper and canonical manifest to a private test image."""
 
-    helper = root / "src" / "codex_master" / "_runtime_spawn_helper.so"
+    helper = root / "src" / "the_hive" / "_runtime_spawn_helper.so"
     helper.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     completed = subprocess.run(
         [
@@ -28,7 +28,7 @@ def seal_runtime_image(root: Path, *, commit: str = _TEST_MANIFEST_COMMIT) -> No
             "-Wextra",
             "-o",
             str(helper),
-            str(ROOT / "src" / "codex_master" / "runtime_spawn_helper.c"),
+            str(ROOT / "src" / "the_hive" / "runtime_spawn_helper.c"),
         ],
         check=False,
         capture_output=True,
@@ -50,7 +50,7 @@ def seal_runtime_image(root: Path, *, commit: str = _TEST_MANIFEST_COMMIT) -> No
 def runtime_image(tmp_path_factory: pytest.TempPathFactory):
     """Materialize the production Runtime Image contract once for runner tests."""
 
-    from codex_master.runtime_layout import RuntimeLayout
+    from the_hive.runtime_layout import RuntimeLayout
 
     stage = tmp_path_factory.mktemp("runtime-image") / "codex-master-runtime"
     stage.mkdir(mode=0o700)
@@ -67,7 +67,7 @@ def runtime_image(tmp_path_factory: pytest.TempPathFactory):
 def runtime_spawn_helper(runtime_image, monkeypatch: pytest.MonkeyPatch):
     """Route runner unit tests through the complete production image contract."""
 
-    import codex_master.runtime_process as runtime_process
+    import the_hive.runtime_process as runtime_process
 
     monkeypatch.setattr(
         runtime_process.RuntimeLayout,

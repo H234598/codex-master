@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.fleet_home_broker_client import AttestedHome
-from codex_master.fleet_home_broker_identity import BrokerIdentity
-from codex_master.fleet_home_broker_linux import FdStat
-from codex_master.fleet_home_broker_protocol import (
+from the_hive.fleet_home_broker_client import AttestedHome
+from the_hive.fleet_home_broker_identity import BrokerIdentity
+from the_hive.fleet_home_broker_linux import FdStat
+from the_hive.fleet_home_broker_protocol import (
     B2aRecoveryPhase,
     BindingExpectation,
     BrokerCheckpoint,
@@ -30,7 +30,7 @@ from codex_master.fleet_home_broker_protocol import (
 )
 
 
-launcher = importlib.import_module("codex_master.fleet_agent_launcher")
+launcher = importlib.import_module("the_hive.fleet_agent_launcher")
 
 SCM_FD = 31
 PARENT_FD = 41

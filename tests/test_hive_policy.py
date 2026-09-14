@@ -14,7 +14,7 @@ CANONICAL_HEADER = (
 
 def load_policy_api():
     try:
-        return importlib.import_module("codex_master.hive_policy")
+        return importlib.import_module("the_hive.hive_policy")
     except ModuleNotFoundError:
         pytest.fail("codex_master.hive_policy contract API is missing")
 

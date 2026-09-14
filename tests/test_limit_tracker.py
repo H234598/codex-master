@@ -14,8 +14,8 @@ from typing import Any
 
 import pytest
 
-from codex_master import limit_tracker
-from codex_master.usage_snapshot import (
+from the_hive import limit_tracker
+from the_hive.usage_snapshot import (
     AccountUsageEvidenceV2,
     TrackerEvidenceV2,
     UsageEvidenceV2,
@@ -328,7 +328,7 @@ def m3_evidence(
 
 
 def derive_m3(value: UsageEvidenceV2):
-    tracker_module = importlib.import_module("codex_master.limit_tracker")
+    tracker_module = importlib.import_module("the_hive.limit_tracker")
     return tracker_module.derive_limit_decisions(value, now=NOW)
 
 
@@ -370,7 +370,7 @@ def test_m3_noncomplete_or_mismatched_evidence_never_activates(
 def test_m3_tracker_is_deterministic_and_explicit_now_gates_reset() -> None:
     value = m3_evidence()
 
-    tracker_module = importlib.import_module("codex_master.limit_tracker")
+    tracker_module = importlib.import_module("the_hive.limit_tracker")
     before_reset = tracker_module.derive_limit_decisions(value, now=NOW)
     after_reset = tracker_module.derive_limit_decisions(
         value, now=NOW + timedelta(hours=1)

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_master.fleet_registry import (
+from the_hive.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetSeries,
@@ -16,7 +16,7 @@ from codex_master.fleet_registry import (
     RunnerKind,
     SecretState,
 )
-from codex_master.fleet_runners import ProbeResult, ProviderErrorQuotaObservation
+from the_hive.fleet_runners import ProbeResult, ProviderErrorQuotaObservation
 
 
 NOW = datetime(2026, 8, 3, 12, tzinfo=timezone.utc)
@@ -51,8 +51,8 @@ def _series(prefix: str, account_id: str, model: str) -> FleetSeries:
 
 
 def _service(tmp_path: Path, accounts: tuple[FleetAccount, ...], series: tuple[FleetSeries, ...]):
-    from codex_master.fleet_service import FleetPaths, FleetService
-    from codex_master.server import build_fleet_private_io
+    from the_hive.fleet_service import FleetPaths, FleetService
+    from the_hive.server import build_fleet_private_io
 
     paths = FleetPaths.from_state_root(tmp_path)
     service = FleetService(
@@ -355,7 +355,7 @@ def test_event_ledger_replaces_unstructured_failure_reason_with_redacted_code(tm
 def test_every_gate_diagnostic_is_redacted_and_legacy_codes_map_exactly(
     legacy_code: str, expected_code: str,
 ) -> None:
-    from codex_master.fleet_service import GEMINI_GATE_DIAGNOSTICS, map_gemini_gate_code
+    from the_hive.fleet_service import GEMINI_GATE_DIAGNOSTICS, map_gemini_gate_code
 
     mapped = map_gemini_gate_code(legacy_code)
     assert mapped == expected_code
@@ -369,7 +369,7 @@ def test_every_gate_diagnostic_is_redacted_and_legacy_codes_map_exactly(
 
 
 def test_all_gate_diagnostics_have_safe_complete_metadata() -> None:
-    from codex_master.fleet_service import GEMINI_GATE_DIAGNOSTICS
+    from the_hive.fleet_service import GEMINI_GATE_DIAGNOSTICS
 
     for code, diagnostic in GEMINI_GATE_DIAGNOSTICS.items():
         assert code.startswith("gemini_")

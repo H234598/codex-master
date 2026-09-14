@@ -12,8 +12,8 @@ from types import SimpleNamespace
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-import codex_master.credential_vault as credential_vault
-from codex_master.credential_vault import (
+import the_hive.credential_vault as credential_vault
+from the_hive.credential_vault import (
     MAX_LEASE_SECONDS,
     MAX_PROJECTION_BYTES,
     CredentialCleanupTarget,
@@ -269,7 +269,7 @@ def test_migration_cleans_identical_legacy_record_beside_schema2(
 def test_migration_recovers_after_crash_before_old_record_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from codex_master.hive.state import HiveStateError, HiveStateStore
+    from the_hive.hive.state import HiveStateError, HiveStateStore
 
     write_legacy_vault(tmp_path, generation=7, plaintext=b"legacy-secret")
 
@@ -293,7 +293,7 @@ def test_migration_recovers_after_crash_before_old_record_removal(
 def test_migration_recovers_after_move_before_schema2_rewrite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from codex_master.hive.state import HiveStateError, HiveStateStore
+    from the_hive.hive.state import HiveStateError, HiveStateStore
 
     write_legacy_vault(tmp_path, generation=7, plaintext=b"legacy-secret")
     real_replace = HiveStateStore.replace_private_bytes
@@ -689,7 +689,7 @@ def test_aad_binds_account_ref(tmp_path: Path) -> None:
 def test_failed_atomic_replace_preserves_previous_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import codex_master.hive.state as state_module
+    import the_hive.hive.state as state_module
 
     vault = vault_at(tmp_path)
     vault.store_projection("openai-one", 1, b"first")
@@ -838,7 +838,7 @@ def test_revoke_cas_is_concurrent_and_restart_safe(tmp_path: Path) -> None:
 def test_failed_tombstone_replace_preserves_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import codex_master.hive.state as state_module
+    import the_hive.hive.state as state_module
 
     vault = vault_at(tmp_path)
     vault.store_projection("openai-one", 7, b"still-active")
@@ -962,7 +962,7 @@ def test_key_fd_rejects_post_read_metadata_change(
     field: str,
     replacement: int,
 ) -> None:
-    import codex_master.credential_vault as vault_module
+    import the_hive.credential_vault as vault_module
 
     key_path = tmp_path / "master-key"
     key_path.write_bytes(KEY)
@@ -990,7 +990,7 @@ def test_key_fd_rejects_post_read_metadata_change(
 def test_key_fd_rejects_equal_length_content_race(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import codex_master.credential_vault as vault_module
+    import the_hive.credential_vault as vault_module
 
     key_path = tmp_path / "master-key"
     key_path.write_bytes(KEY)
@@ -1017,7 +1017,7 @@ def test_key_fd_rejects_equal_length_content_race(
 def test_key_fd_rejects_offset_change_during_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import codex_master.credential_vault as vault_module
+    import the_hive.credential_vault as vault_module
 
     key_path = tmp_path / "master-key"
     key_path.write_bytes(KEY)
@@ -1035,7 +1035,7 @@ def test_key_fd_rejects_offset_change_during_read(
 def test_key_buffer_is_zeroed_when_post_read_fstat_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import codex_master.credential_vault as vault_module
+    import the_hive.credential_vault as vault_module
 
     key_path = tmp_path / "master-key"
     key_path.write_bytes(KEY)
@@ -1072,7 +1072,7 @@ def test_key_buffer_is_zeroed_when_post_read_fstat_fails(
 def test_entropy_failures_are_code_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import codex_master.credential_vault as vault_module
+    import the_hive.credential_vault as vault_module
 
     vault = vault_at(tmp_path)
     monkeypatch.setattr(

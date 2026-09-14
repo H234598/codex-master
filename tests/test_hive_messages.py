@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from codex_master.hive.messages import HiveMessageError, record_child_report, validate_message
+from the_hive.hive.messages import HiveMessageError, record_child_report, validate_message
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)

@@ -4,9 +4,9 @@ import errno
 
 import pytest
 
-from codex_master.fleet_home_broker_identity_contract import ObjectIdentity
-from codex_master.fleet_home_broker_protocol import CANONICAL_AGENT_HOME
-from codex_master.fleet_home_broker_linux_contract import (
+from the_hive.fleet_home_broker_identity_contract import ObjectIdentity
+from the_hive.fleet_home_broker_protocol import CANONICAL_AGENT_HOME
+from the_hive.fleet_home_broker_linux_contract import (
     O_CLOEXEC,
     REQUIRED_RESOLVE_FLAGS,
     IdmappedMountContract,
