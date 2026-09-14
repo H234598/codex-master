@@ -745,7 +745,7 @@ def test_tracked_product_code_allows_binding_construction_only_in_the_resolver_m
             text=True,
         ).stdout.splitlines()
     )
-    tracked.add("src/codex_master/dynamic_pool.py")
+    tracked.add("src/the_hive/dynamic_pool.py")
     sources = {
         relative: (root / relative).read_text(encoding="utf-8")
         for relative in sorted(tracked)
@@ -754,10 +754,10 @@ def test_tracked_product_code_allows_binding_construction_only_in_the_resolver_m
 
     sites = _structural_binding_issuer_sites(sources)
 
-    assert sites["raw"] == {"src/codex_master/dynamic_pool.py:72"}
+    assert sites["raw"] == {"src/the_hive/dynamic_pool.py:72"}
     assert sites["factory"] == {
-        "src/codex_master/dynamic_pool.py:102",
-        "src/codex_master/dynamic_pool.py:120",
-        "src/codex_master/dynamic_pool.py:177",
+        "src/the_hive/dynamic_pool.py:102",
+        "src/the_hive/dynamic_pool.py:120",
+        "src/the_hive/dynamic_pool.py:177",
     }
     assert sites["opaque"] == set()
