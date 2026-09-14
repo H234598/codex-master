@@ -7,7 +7,7 @@ import pytest
 
 
 MODULE = runpy.run_path(
-    Path(__file__).parents[1] / "bin/codex-master-publish-plan-path"
+    Path(__file__).parents[1] / "bin/the-hive-publish-plan-path"
 )
 
 

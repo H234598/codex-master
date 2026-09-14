@@ -6,7 +6,7 @@ Wenn ein vollständiger Plan außerhalb des aktuellen Worktrees gespeichert
 wird, muss danach ausgeführt werden:
 
 ```sh
-bin/codex-master-publish-plan-path /absoluter/pfad/zum/plan.md
+bin/the-hive-publish-plan-path /absoluter/pfad/zum/plan.md
 ```
 
 Das Werkzeug prüft die Datei und schreibt den vollständigen validierten
