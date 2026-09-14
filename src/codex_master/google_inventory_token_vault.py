@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 from dataclasses import dataclass
 import errno
 import fcntl
@@ -188,14 +189,14 @@ class _FileIdentity:
 
 @dataclass(frozen=True, slots=True)
 class _MutationThreatBoundary:
-    detects_observable_swaps_through_last_attestation: bool
-    unsandboxed_same_uid_after_last_attestation_in_scope: bool
+    observable_attestation_mismatches_fail_closed: bool
+    unsandboxed_same_uid_non_atomic_name_windows_in_scope: bool
     future_isolation: str
 
 
 _MUTATION_THREAT_BOUNDARY: Final[_MutationThreatBoundary] = _MutationThreatBoundary(
-    detects_observable_swaps_through_last_attestation=True,
-    unsandboxed_same_uid_after_last_attestation_in_scope=False,
+    observable_attestation_mismatches_fail_closed=True,
+    unsandboxed_same_uid_non_atomic_name_windows_in_scope=False,
     future_isolation="separate_uid_or_root_broker",
 )
 
@@ -208,6 +209,7 @@ class _DirectoryNode:
         "expected_owner",
         "exact_mode",
         "reject_group_world_write",
+        "scan_entries",
     )
 
     def __init__(
@@ -219,6 +221,7 @@ class _DirectoryNode:
         expected_owner: int,
         exact_mode: int | None,
         reject_group_world_write: bool,
+        scan_entries: bool = True,
     ) -> None:
         self.fd = fd
         self.name = name
@@ -226,6 +229,7 @@ class _DirectoryNode:
         self.expected_owner = expected_owner
         self.exact_mode = exact_mode
         self.reject_group_world_write = reject_group_world_write
+        self.scan_entries = scan_entries
 
     def __repr__(self) -> str:
         return "<private inventory token vault directory node>"
@@ -356,6 +360,21 @@ def _directory_identity_code(
     return None
 
 
+def _directory_object_code(
+    metadata: os.stat_result, identity: _DirectoryIdentity
+) -> str | None:
+    current = _directory_identity(metadata)
+    if (
+        current.device != identity.device
+        or current.inode != identity.inode
+        or current.file_type != identity.file_type
+    ):
+        return "credential.inventory_token_vault_path_invalid"
+    if current.owner != identity.owner:
+        return "credential.inventory_token_vault_permissions"
+    return None
+
+
 def _validated_directory_identity(
     fd: int,
     *,
@@ -425,6 +444,7 @@ def _append_directory_component(
     expected_owner: int,
     exact_mode: int | None,
     reject_group_world_write: bool,
+    expected_identity: _DirectoryIdentity | None = None,
 ) -> str | None:
     code = _revalidate_directory_capability(capability)
     if code is not None:
@@ -451,6 +471,8 @@ def _append_directory_component(
             return code
         named = os.stat(private_name, dir_fd=capability.fd, follow_symlinks=False)
         code = _directory_identity_code(named, identity)
+        if code is None and expected_identity is not None:
+            code = _directory_identity_code(named, expected_identity)
         if code is not None:
             close_fd = fd
             fd = None
@@ -476,14 +498,12 @@ def _append_directory_component(
         return _classify_oserror(error)
 
 
-def _append_user_tokens_directory_components(
+def _append_user_oauth_parent_directory_components(
     capability: _DirectoryCapability, *, effective_uid: int
 ) -> str | None:
     policies = (
         (".config", None, True),
         ("codex-master-mcp", None, True),
-        ("google-oauth", 0o700, False),
-        ("tokens", 0o700, False),
     )
     for component, exact_mode, reject_write in policies:
         code = _append_directory_component(
@@ -496,6 +516,336 @@ def _append_user_tokens_directory_components(
         if code is not None:
             return code
     return None
+
+
+def _append_user_tokens_directory_components(
+    capability: _DirectoryCapability, *, effective_uid: int
+) -> str | None:
+    code = _append_user_oauth_parent_directory_components(
+        capability, effective_uid=effective_uid
+    )
+    if code is not None:
+        return code
+    for component in ("google-oauth", "tokens"):
+        code = _append_directory_component(
+            capability,
+            component,
+            expected_owner=effective_uid,
+            exact_mode=0o700,
+            reject_group_world_write=False,
+        )
+        if code is not None:
+            return code
+    return None
+
+
+def _fchmod_held_directory(fd: int, mode: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    fchmodat = getattr(libc, "fchmodat", None)
+    if fchmodat is None:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+    fchmodat.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+        ctypes.c_int,
+    ]
+    fchmodat.restype = ctypes.c_int
+    if fchmodat(fd, b"", mode, 0x1000) != 0:
+        current_errno = ctypes.get_errno()
+        raise OSError(current_errno, os.strerror(current_errno))
+
+
+def _attach_created_directory_node(
+    capability: _DirectoryCapability,
+    private_name: _PrivateName,
+    fd: int,
+    identity: _DirectoryIdentity,
+    *,
+    scan_entries: bool,
+) -> tuple[str | None, _DirectoryNode | None]:
+    node = _DirectoryNode(
+        fd,
+        private_name,
+        identity,
+        expected_owner=os.geteuid(),
+        exact_mode=identity.permissions,
+        reject_group_world_write=False,
+        scan_entries=scan_entries,
+    )
+    capability.nodes.append(node)
+    code = _revalidate_directory_capability(capability)
+    if code is not None:
+        capability.nodes.pop()
+        return code, None
+    return None, node
+
+
+def _rollback_unopened_created_directory(
+    capability: _DirectoryCapability, private_name: _PrivateName
+) -> bool:
+    if _revalidate_directory_capability(capability) is not None:
+        return False
+    try:
+        metadata = os.stat(private_name, dir_fd=capability.fd, follow_symlinks=False)
+    except OSError:
+        return False
+    code = _directory_metadata_code(
+        metadata,
+        expected_owner=os.geteuid(),
+        exact_mode=None,
+        reject_group_world_write=False,
+    )
+    identity = _directory_identity(metadata)
+    if code is not None or identity.permissions & ~0o700:
+        return False
+    if _revalidate_directory_capability(capability) is not None:
+        return False
+    try:
+        current = os.stat(private_name, dir_fd=capability.fd, follow_symlinks=False)
+    except OSError:
+        return False
+    code = _directory_metadata_code(
+        current,
+        expected_owner=os.geteuid(),
+        exact_mode=identity.permissions,
+        reject_group_world_write=False,
+    )
+    if code is not None or _directory_identity_code(current, identity) is not None:
+        return False
+    try:
+        os.rmdir(private_name, dir_fd=capability.fd)
+    except OSError:
+        return False
+    return True
+
+
+def _ensure_private_directory_component(
+    capability: _DirectoryCapability, name: str
+) -> tuple[str | None, bool]:
+    code = _append_directory_component(
+        capability,
+        name,
+        expected_owner=os.geteuid(),
+        exact_mode=0o700,
+        reject_group_world_write=False,
+    )
+    if code is None:
+        return None, False
+    if code != "credential.inventory_token_vault_unavailable":
+        return code, False
+    private_name: _PrivateName | None = _PrivateName(name)
+    created_fd: int | None = None
+    try:
+        code = _attest_name_missing(capability, private_name)
+        if code is not None:
+            return code, False
+        try:
+            os.mkdir(private_name, mode=0o700, dir_fd=capability.fd)
+        except FileExistsError:
+            code = _append_directory_component(
+                capability,
+                name,
+                expected_owner=os.geteuid(),
+                exact_mode=0o700,
+                reject_group_world_write=False,
+            )
+            return code, False
+        except OSError as error:
+            if error.errno in (
+                errno.EACCES,
+                errno.EPERM,
+                errno.ELOOP,
+                errno.ENOTDIR,
+                errno.ENOENT,
+                errno.ENODEV,
+                errno.ESTALE,
+            ):
+                return _classify_oserror(error), False
+            return "credential.inventory_token_vault_write_failed", False
+
+        primary_code: str | None = None
+        try:
+            created_fd = os.open(
+                private_name,
+                os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=capability.fd,
+            )
+        except OSError as error:
+            if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                return "credential.inventory_token_vault_path_invalid", False
+            primary_code = "credential.inventory_token_vault_write_failed"
+            try:
+                created_fd = os.open(
+                    private_name,
+                    os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=capability.fd,
+                )
+            except OSError as recovery_error:
+                if recovery_error.errno in (errno.ELOOP, errno.ENOTDIR):
+                    return "credential.inventory_token_vault_path_invalid", False
+                _rollback_unopened_created_directory(capability, private_name)
+                return primary_code, False
+
+        try:
+            created_metadata = os.fstat(created_fd)
+        except OSError:
+            primary_code = "credential.inventory_token_vault_write_failed"
+            try:
+                created_metadata = os.fstat(created_fd)
+            except OSError:
+                return primary_code, False
+        code = _directory_metadata_code(
+            created_metadata,
+            expected_owner=os.geteuid(),
+            exact_mode=None,
+            reject_group_world_write=False,
+        )
+        if code is not None:
+            return code, False
+        initial_identity = _directory_identity(created_metadata)
+
+        try:
+            _fchmod_held_directory(created_fd, 0o700)
+        except Exception:
+            primary_code = "credential.inventory_token_vault_write_failed"
+
+        try:
+            current_metadata = os.fstat(created_fd)
+        except OSError:
+            primary_code = "credential.inventory_token_vault_write_failed"
+            try:
+                current_metadata = os.fstat(created_fd)
+            except OSError:
+                return primary_code, False
+        code = _directory_object_code(current_metadata, initial_identity)
+        if code is not None:
+            return code, False
+        current_identity = _directory_identity(current_metadata)
+        code = _directory_metadata_code(
+            current_metadata,
+            expected_owner=os.geteuid(),
+            exact_mode=None,
+            reject_group_world_write=False,
+        )
+        if code is not None:
+            return code, False
+        if current_identity.permissions != 0o700 and primary_code is None:
+            primary_code = "credential.inventory_token_vault_write_failed"
+
+        node_fd = created_fd
+        scan_entries = False
+        if current_identity.permissions == 0o700:
+            readable_fd: int | None = None
+            try:
+                readable_fd = os.open(
+                    ".",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=created_fd,
+                )
+                readable_code, readable_identity = _validated_directory_identity(
+                    readable_fd,
+                    expected_owner=os.geteuid(),
+                    exact_mode=0o700,
+                    reject_group_world_write=False,
+                )
+                if readable_code is not None or readable_identity is None:
+                    if readable_code in (
+                        "credential.inventory_token_vault_path_invalid",
+                        "credential.inventory_token_vault_permissions",
+                    ):
+                        return readable_code, False
+                    primary_code = "credential.inventory_token_vault_write_failed"
+                else:
+                    readable_metadata = os.fstat(readable_fd)
+                    code = _directory_identity_code(readable_metadata, current_identity)
+                    if code is not None:
+                        return code, False
+                    node_fd = readable_fd
+                    readable_fd = None
+                    scan_entries = True
+            except OSError:
+                primary_code = "credential.inventory_token_vault_write_failed"
+            finally:
+                if readable_fd is not None:
+                    _close_fd(readable_fd)
+        if node_fd != created_fd:
+            if not _close_fd(created_fd):
+                primary_code = "credential.inventory_token_vault_write_failed"
+            created_fd = node_fd
+
+        assert private_name is not None
+        code, node = _attach_created_directory_node(
+            capability,
+            private_name,
+            created_fd,
+            current_identity,
+            scan_entries=scan_entries,
+        )
+        if code == "credential.inventory_token_vault_unavailable":
+            primary_code = "credential.inventory_token_vault_write_failed"
+            code, node = _attach_created_directory_node(
+                capability,
+                private_name,
+                created_fd,
+                current_identity,
+                scan_entries=scan_entries,
+            )
+        if code is not None or node is None:
+            if code in (
+                "credential.inventory_token_vault_path_invalid",
+                "credential.inventory_token_vault_permissions",
+            ):
+                return code, False
+            return "credential.inventory_token_vault_write_failed", False
+        created_fd = None
+        private_name = None
+        return primary_code, True
+    finally:
+        if created_fd is not None:
+            _close_fd(created_fd)
+        if private_name is not None:
+            private_name.clear()
+
+
+def _rollback_created_directories(
+    capability: _DirectoryCapability,
+    created_nodes: list[_DirectoryNode],
+) -> bool:
+    clean = True
+    for node in reversed(created_nodes):
+        if len(capability.nodes) < 2 or capability.nodes[-1] is not node:
+            clean = False
+            continue
+        if _revalidate_directory_capability(capability) is not None:
+            clean = False
+            continue
+        if node.scan_entries:
+            try:
+                with os.scandir(node.fd) as entries:
+                    empty = next(entries, None) is None
+            except OSError:
+                clean = False
+                continue
+            if not empty:
+                clean = False
+                continue
+        if _revalidate_directory_capability(capability) is not None:
+            clean = False
+            continue
+        assert node.name is not None
+        try:
+            os.rmdir(node.name, dir_fd=capability.nodes[-2].fd)
+        except OSError:
+            clean = False
+            continue
+        capability.nodes.pop()
+        fd = node.fd
+        node.fd = -1
+        if not _close_fd(fd):
+            clean = False
+        node.name.clear()
+    return clean
 
 
 def _close_directory_capability(
@@ -515,7 +865,51 @@ def _close_directory_capability(
     return clean
 
 
-def _open_production_tokens_directory() -> tuple[
+def _duplicate_directory_capability_leaf(
+    source: _DirectoryCapability,
+) -> tuple[str | None, _DirectoryCapability | None]:
+    code = _revalidate_directory_capability(source)
+    if code is not None or not source.nodes:
+        return code or "credential.inventory_token_vault_path_invalid", None
+    source_node = source.nodes[-1]
+    try:
+        fd = os.dup(source_node.fd)
+    except OSError as error:
+        return _classify_oserror(error), None
+    code, identity = _validated_directory_identity(
+        fd,
+        expected_owner=source_node.expected_owner,
+        exact_mode=source_node.exact_mode,
+        reject_group_world_write=source_node.reject_group_world_write,
+    )
+    if code is None and identity is not None:
+        try:
+            current = os.fstat(fd)
+        except OSError:
+            _close_fd(fd)
+            return "credential.inventory_token_vault_write_failed", None
+        code = _directory_identity_code(current, source_node.identity)
+    if code is not None or identity is None:
+        _close_fd(fd)
+        return code, None
+    return (
+        None,
+        _DirectoryCapability(
+            [
+                _DirectoryNode(
+                    fd,
+                    None,
+                    identity,
+                    expected_owner=source_node.expected_owner,
+                    exact_mode=source_node.exact_mode,
+                    reject_group_world_write=source_node.reject_group_world_write,
+                )
+            ]
+        ),
+    )
+
+
+def _open_production_user_home_directory() -> tuple[
     str | None, _DirectoryCapability | None
 ]:
     root_fd: int | None = None
@@ -559,12 +953,6 @@ def _open_production_tokens_directory() -> tuple[
             if code is not None:
                 _close_directory_capability(capability)
                 return code, None
-        code = _append_user_tokens_directory_components(
-            capability, effective_uid=effective_uid
-        )
-        if code is not None:
-            _close_directory_capability(capability)
-            return code, None
         code = _revalidate_directory_capability(capability)
         if code is not None:
             _close_directory_capability(capability)
@@ -575,6 +963,68 @@ def _open_production_tokens_directory() -> tuple[
             _close_fd(root_fd)
         _close_directory_capability(capability)
         return _classify_oserror(error), None
+
+
+def _open_production_tokens_directory() -> tuple[
+    str | None, _DirectoryCapability | None
+]:
+    code, capability = _open_production_user_home_directory()
+    if code is not None or capability is None:
+        return code, None
+    code = _append_user_tokens_directory_components(
+        capability, effective_uid=os.geteuid()
+    )
+    if code is None:
+        code = _revalidate_directory_capability(capability)
+    if code is not None:
+        _close_directory_capability(capability)
+        return code, None
+    return None, capability
+
+
+def _preflight_inventory_oauth_secret_tree(
+    _test_user_home_capability: _DirectoryCapability | None = None,
+) -> None:
+    code: str | None = None
+    capability: _DirectoryCapability | None = None
+    created_nodes: list[_DirectoryNode] = []
+    try:
+        if _test_user_home_capability is None:
+            code, capability = _open_production_user_home_directory()
+        elif type(_test_user_home_capability) is _DirectoryCapability:
+            code, capability = _duplicate_directory_capability_leaf(
+                _test_user_home_capability
+            )
+        else:
+            code = "credential.inventory_token_vault_request_invalid"
+        if code is None and capability is not None:
+            code = _append_user_oauth_parent_directory_components(
+                capability, effective_uid=os.geteuid()
+            )
+        if code is None and capability is not None:
+            for component in ("google-oauth", "tokens"):
+                code, created = _ensure_private_directory_component(
+                    capability, component
+                )
+                if created:
+                    created_nodes.append(capability.nodes[-1])
+                if code is not None:
+                    break
+        if code is None and capability is not None:
+            code = _revalidate_directory_capability(capability)
+    except Exception:
+        code = "credential.inventory_token_vault_write_failed"
+    finally:
+        if code is not None and capability is not None and created_nodes:
+            _rollback_created_directories(capability, created_nodes)
+        created_nodes.clear()
+        cleanup_failed = not _close_directory_capability(capability)
+        capability = None
+        _test_user_home_capability = None
+        if code is None and cleanup_failed:
+            code = "credential.inventory_token_vault_write_failed"
+    if code is not None:
+        _raise(code)
 
 
 def _private_file_metadata_code(metadata: os.stat_result) -> str | None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import base64
+import errno
 import hashlib
 import inspect
 import json
@@ -235,6 +236,66 @@ def _fixed_user_vault_tree(tmp_path: Path) -> dict[str, Path]:
     }
 
 
+def _preflight_parent_tree(tmp_path: Path) -> dict[str, Path]:
+    home = tmp_path / "home"
+    config = home / ".config"
+    application = config / "codex-master-mcp"
+    home.mkdir(mode=0o700)
+    config.mkdir(mode=0o755)
+    application.mkdir(mode=0o755)
+    return {
+        "home": home,
+        "config": config,
+        "application": application,
+        "oauth": application / "google-oauth",
+        "tokens": application / "google-oauth/tokens",
+    }
+
+
+def _test_user_home_capability(home: Path):
+    fd = os.open(
+        home,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    code, identity = vault_module._validated_directory_identity(
+        fd,
+        expected_owner=os.geteuid(),
+        exact_mode=None,
+        reject_group_world_write=True,
+    )
+    assert code is None and identity is not None
+    return vault_module._DirectoryCapability(
+        [
+            vault_module._DirectoryNode(
+                fd,
+                None,
+                identity,
+                expected_owner=os.geteuid(),
+                exact_mode=None,
+                reject_group_world_write=True,
+            )
+        ]
+    )
+
+
+def _call_preflight(home: Path) -> None:
+    capability = _test_user_home_capability(home)
+    try:
+        vault_module._preflight_inventory_oauth_secret_tree(capability)
+        assert vault_module._revalidate_directory_capability(capability) is None
+    finally:
+        vault_module._close_directory_capability(capability)
+
+
+def _assert_empty_secret_tree(tree: dict[str, Path]) -> None:
+    assert tree["oauth"].is_dir()
+    assert stat.S_IMODE(os.lstat(tree["oauth"]).st_mode) == 0o700
+    assert tree["tokens"].is_dir()
+    assert stat.S_IMODE(os.lstat(tree["tokens"]).st_mode) == 0o700
+    assert {entry.name for entry in tree["oauth"].iterdir()} == {"tokens"}
+    assert not tuple(tree["tokens"].iterdir())
+
+
 def _open_fixed_user_vault_tree(
     home: Path, *, expected_owner: int | None = None
 ) -> tuple[str | None, object]:
@@ -399,6 +460,91 @@ def _process_raced_mutation(
     output.put((result, token == bytearray(len(token))))  # type: ignore[union-attr]
 
 
+def _process_preflight_parent_swap(
+    home: str,
+    ready: object,
+    proceed: object,
+    output: object,
+) -> None:
+    capability = _test_user_home_capability(Path(home))
+    try:
+        if not hasattr(vault_module, "_preflight_inventory_oauth_secret_tree"):
+            ready.set()  # type: ignore[union-attr]
+            output.put(("raw", "missing-preflight"))  # type: ignore[union-attr]
+            return
+        original_append = vault_module._append_directory_component
+
+        def blocked_append(
+            directory_capability: object,
+            name: str,
+            **kwargs: object,
+        ):
+            if name == "google-oauth":
+                ready.set()  # type: ignore[union-attr]
+                if not proceed.wait(timeout=5):  # type: ignore[union-attr]
+                    raise RuntimeError("preflight parent barrier timed out")
+            return original_append(
+                directory_capability,
+                name,
+                **kwargs,  # type: ignore[arg-type]
+            )
+
+        vault_module._append_directory_component = blocked_append  # type: ignore[assignment]
+        try:
+            vault_module._preflight_inventory_oauth_secret_tree(capability)
+        except GoogleInventoryReadonlyTokenVaultError as error:
+            result = ("error", error.code)
+        except BaseException as error:
+            result = ("raw", type(error).__name__)
+        else:
+            result = ("ok", None)
+        output.put(result)  # type: ignore[union-attr]
+    finally:
+        vault_module._close_directory_capability(capability)
+
+
+def _process_preflight_rollback_swap(
+    home: str,
+    ready: object,
+    proceed: object,
+    output: object,
+) -> None:
+    capability = _test_user_home_capability(Path(home))
+    try:
+        if not hasattr(vault_module, "_ensure_private_directory_component"):
+            ready.set()  # type: ignore[union-attr]
+            output.put(("raw", "missing-private-directory-ensure"))  # type: ignore[union-attr]
+            return
+        original_ensure = vault_module._ensure_private_directory_component
+
+        def blocked_ensure(
+            directory_capability: object,
+            name: str,
+        ):
+            result = original_ensure(
+                directory_capability,
+                name,  # type: ignore[arg-type]
+            )
+            if name == "google-oauth" and result == (None, True):
+                ready.set()  # type: ignore[union-attr]
+                if not proceed.wait(timeout=5):  # type: ignore[union-attr]
+                    raise RuntimeError("preflight rollback barrier timed out")
+            return result
+
+        vault_module._ensure_private_directory_component = blocked_ensure  # type: ignore[assignment]
+        try:
+            vault_module._preflight_inventory_oauth_secret_tree(capability)
+        except GoogleInventoryReadonlyTokenVaultError as error:
+            result = ("error", error.code)
+        except BaseException as error:
+            result = ("raw", type(error).__name__)
+        else:
+            result = ("ok", None)
+        output.put(result)  # type: ignore[union-attr]
+    finally:
+        vault_module._close_directory_capability(capability)
+
+
 def _run_raced_mutation(
     vault: GoogleInventoryReadonlyTokenVault,
     manager: GoogleAccountInventoryManager,
@@ -440,6 +586,522 @@ def _assert_no_race_secret(
             content = path.read_bytes()
             assert marker not in content
             assert encoded not in content
+
+
+def test_preflight_creates_only_missing_secret_directories_via_private_capability(
+    tmp_path: Path,
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    code, tokens_capability = _open_fixed_user_vault_tree(tree["home"])
+    try:
+        assert code == "credential.inventory_token_vault_unavailable"
+        assert tokens_capability is not None
+    finally:
+        vault_module._close_directory_capability(tokens_capability)
+    capability = _test_user_home_capability(tree["home"])
+    try:
+        assert vault_module._preflight_inventory_oauth_secret_tree(capability) is None
+        assert vault_module._revalidate_directory_capability(capability) is None
+    finally:
+        vault_module._close_directory_capability(capability)
+
+    _assert_empty_secret_tree(tree)
+    code, tokens_capability = _open_fixed_user_vault_tree(tree["home"])
+    try:
+        assert code is None
+        assert vault_module._revalidate_directory_capability(tokens_capability) is None
+    finally:
+        vault_module._close_directory_capability(tokens_capability)
+
+
+def test_preflight_is_idempotent_and_keeps_existing_secret_tree_empty(
+    tmp_path: Path,
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    _call_preflight(tree["home"])
+    before = (_directory_state(tree["oauth"]), _directory_state(tree["tokens"]))
+
+    _call_preflight(tree["home"])
+
+    assert (_directory_state(tree["oauth"]), _directory_state(tree["tokens"])) == (
+        before
+    )
+    _assert_empty_secret_tree(tree)
+
+
+def test_preflight_creates_private_directories_under_restrictive_caller_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+
+    def forbidden_umask(_mode: int) -> int:
+        raise AssertionError("production must not inspect or change caller umask")
+
+    previous_umask = os.umask(0o777)
+    error: BaseException | None = None
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(vault_module.os, "umask", forbidden_umask)
+            try:
+                _call_preflight(tree["home"])
+            except BaseException as caught:
+                error = caught
+    finally:
+        caller_umask = os.umask(previous_umask)
+
+    assert caller_umask == 0o777
+    if error is not None:
+        raise error
+    _assert_empty_secret_tree(tree)
+
+
+def test_preflight_rejects_wrong_owner_without_creating_secret_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    capability = _test_user_home_capability(tree["home"])
+    effective_uid = os.geteuid()
+    monkeypatch.setattr(vault_module.os, "geteuid", lambda: effective_uid + 1)
+    try:
+        assert (
+            _error_code(
+                lambda: vault_module._preflight_inventory_oauth_secret_tree(capability)
+            )
+            == "credential.inventory_token_vault_permissions"
+        )
+    finally:
+        vault_module._close_directory_capability(capability)
+
+    assert not os.path.lexists(tree["oauth"])
+
+
+@pytest.mark.parametrize(
+    ("component", "mode"),
+    (("config", 0o775), ("application", 0o757)),
+)
+def test_preflight_rejects_writable_nonsecret_parent_without_creation(
+    tmp_path: Path, component: str, mode: int
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    tree[component].chmod(mode)
+    before = _directory_state(tree[component])
+
+    assert _error_code(lambda: _call_preflight(tree["home"])) == (
+        "credential.inventory_token_vault_permissions"
+    )
+
+    assert _directory_state(tree[component]) == before
+    assert not os.path.lexists(tree["oauth"])
+
+
+@pytest.mark.parametrize("drift", ("config_symlink", "application_file"))
+def test_preflight_rejects_nonsecret_symlink_or_type_drift_without_creation(
+    tmp_path: Path, drift: str
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    if drift == "config_symlink":
+        real_config = tree["home"] / ".config-real"
+        tree["config"].rename(real_config)
+        tree["config"].symlink_to(real_config, target_is_directory=True)
+        application = real_config / "codex-master-mcp"
+    else:
+        tree["application"].rmdir()
+        tree["application"].write_bytes(b"not-a-directory")
+        tree["application"].chmod(0o600)
+        application = tree["application"]
+
+    assert _error_code(lambda: _call_preflight(tree["home"])) == (
+        "credential.inventory_token_vault_path_invalid"
+    )
+
+    assert not os.path.lexists(application / "google-oauth")
+
+
+@pytest.mark.parametrize("component", ("oauth", "tokens"))
+def test_preflight_rejects_nonprivate_existing_secret_directory_without_repair(
+    tmp_path: Path, component: str
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    tree["oauth"].mkdir(mode=0o700)
+    tree["oauth"].chmod(0o700)
+    if component == "tokens":
+        tree["tokens"].mkdir(mode=0o755)
+        tree["tokens"].chmod(0o755)
+        target = tree["tokens"]
+    else:
+        tree["oauth"].chmod(0o755)
+        target = tree["oauth"]
+    before = _directory_state(target)
+
+    assert _error_code(lambda: _call_preflight(tree["home"])) == (
+        "credential.inventory_token_vault_permissions"
+    )
+
+    assert _directory_state(target) == before
+    assert stat.S_IMODE(os.lstat(target).st_mode) == 0o755
+    assert not any(path.is_file() for path in tree["oauth"].rglob("*"))
+
+
+def test_preflight_rolls_back_attested_empty_first_directory_after_partial_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    original_mkdir = vault_module.os.mkdir
+    marker = "preflight-partial-failure-marker"
+
+    def fail_tokens(path: object, *args: object, **kwargs: object) -> None:
+        if os.fspath(path) == "tokens":  # type: ignore[arg-type]
+            raise OSError(errno.EIO, marker)
+        original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(vault_module.os, "mkdir", fail_tokens)
+    try:
+        _call_preflight(tree["home"])
+    except GoogleInventoryReadonlyTokenVaultError as caught:
+        error = caught
+    else:
+        raise AssertionError("expected preflight creation failure")
+
+    assert error.code == "credential.inventory_token_vault_write_failed"
+    assert not os.path.lexists(tree["oauth"])
+    assert not os.path.lexists(tree["tokens"])
+    _assert_error_graph_redacted(error, markers=(marker,))
+
+
+def test_preflight_fd_open_failure_rolls_back_own_zero_mode_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    original_open = vault_module.os.open
+    marker = "preflight-post-mkdir-open-marker"
+    google_oauth_opens = 0
+
+    def fail_first_post_mkdir_open(
+        path: object, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal google_oauth_opens
+        if os.fspath(path) == "google-oauth":  # type: ignore[arg-type]
+            google_oauth_opens += 1
+            if google_oauth_opens == 2:
+                raise OSError(errno.EIO, marker)
+        return original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(vault_module.os, "open", fail_first_post_mkdir_open)
+    previous_umask = os.umask(0o777)
+    try:
+        try:
+            _call_preflight(tree["home"])
+        except GoogleInventoryReadonlyTokenVaultError as caught:
+            error = caught
+        else:
+            raise AssertionError("expected post-mkdir open failure")
+    finally:
+        caller_umask = os.umask(previous_umask)
+
+    assert error.code == "credential.inventory_token_vault_write_failed"
+    assert caller_umask == 0o777
+    assert google_oauth_opens == 3
+    assert not os.path.lexists(tree["oauth"])
+    _assert_error_graph_redacted(error, markers=(marker,))
+
+
+def test_preflight_persistent_fd_open_failure_leaves_no_zero_mode_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    original_open = vault_module.os.open
+    marker = "preflight-persistent-open-marker"
+    failed_opens = 0
+
+    def fail_created_leaf_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal failed_opens
+        if (
+            os.fspath(path) == "google-oauth"  # type: ignore[arg-type]
+            and flags & os.O_PATH
+        ):
+            failed_opens += 1
+            raise OSError(errno.EIO, marker)
+        return original_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(vault_module.os, "open", fail_created_leaf_open)
+    previous_umask = os.umask(0o777)
+    try:
+        try:
+            _call_preflight(tree["home"])
+        except GoogleInventoryReadonlyTokenVaultError as caught:
+            error = caught
+        else:
+            raise AssertionError("expected persistent post-mkdir open failure")
+    finally:
+        caller_umask = os.umask(previous_umask)
+
+    assert error.code == "credential.inventory_token_vault_write_failed"
+    assert caller_umask == 0o777
+    assert failed_opens == 2
+    assert not os.path.lexists(tree["oauth"])
+    _assert_error_graph_redacted(error, markers=(marker,))
+
+
+def test_preflight_fchmod_failure_rolls_back_own_zero_mode_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    marker = "preflight-fchmod-marker"
+    attempts = 0
+
+    def fail_fchmod(_fd: int, mode: int) -> None:
+        nonlocal attempts
+        attempts += 1
+        assert mode == 0o700
+        raise OSError(errno.EIO, marker)
+
+    monkeypatch.setattr(
+        vault_module, "_fchmod_held_directory", fail_fchmod, raising=False
+    )
+    previous_umask = os.umask(0o777)
+    try:
+        try:
+            _call_preflight(tree["home"])
+        except GoogleInventoryReadonlyTokenVaultError as caught:
+            error = caught
+        else:
+            raise AssertionError("expected fchmod failure")
+    finally:
+        caller_umask = os.umask(previous_umask)
+
+    assert error.code == "credential.inventory_token_vault_write_failed"
+    assert caller_umask == 0o777
+    assert attempts == 1
+    assert not os.path.lexists(tree["oauth"])
+    _assert_error_graph_redacted(error, markers=(marker,))
+
+
+def test_preflight_reattest_failure_rolls_back_own_private_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    original_stat = vault_module.os.stat
+    marker = "preflight-reattest-marker"
+    failed = False
+
+    def fail_first_private_named_stat(path: object, *args: object, **kwargs: object):
+        nonlocal failed
+        metadata = original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+        if (
+            not failed
+            and os.fspath(path) == "google-oauth"  # type: ignore[arg-type]
+            and stat.S_IMODE(metadata.st_mode) == 0o700
+        ):
+            failed = True
+            raise OSError(errno.EIO, marker)
+        return metadata
+
+    monkeypatch.setattr(vault_module.os, "stat", fail_first_private_named_stat)
+    previous_umask = os.umask(0o777)
+    try:
+        try:
+            _call_preflight(tree["home"])
+        except GoogleInventoryReadonlyTokenVaultError as caught:
+            error = caught
+        else:
+            raise AssertionError("expected reattestation failure")
+    finally:
+        caller_umask = os.umask(previous_umask)
+
+    assert error.code == "credential.inventory_token_vault_write_failed"
+    assert caller_umask == 0o777
+    assert failed
+    assert not os.path.lexists(tree["oauth"])
+    _assert_error_graph_redacted(error, markers=(marker,))
+
+
+def test_preflight_duplicate_capability_fstat_failure_closes_duplicate_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    capability = _test_user_home_capability(tree["home"])
+    original_dup = vault_module.os.dup
+    original_fstat = vault_module.os.fstat
+    original_close = vault_module.os.close
+    duplicate_fd: int | None = None
+    duplicate_fstats = 0
+    duplicate_closed = False
+    marker = "preflight-duplicate-fstat-marker"
+
+    def track_dup(fd: int) -> int:
+        nonlocal duplicate_fd
+        duplicate_fd = original_dup(fd)
+        return duplicate_fd
+
+    def fail_second_duplicate_fstat(fd: int):
+        nonlocal duplicate_fstats
+        if fd == duplicate_fd:
+            duplicate_fstats += 1
+            if duplicate_fstats == 2:
+                raise OSError(errno.EIO, marker)
+        return original_fstat(fd)
+
+    def track_close(fd: int) -> None:
+        nonlocal duplicate_closed
+        if fd == duplicate_fd:
+            duplicate_closed = True
+        original_close(fd)
+
+    monkeypatch.setattr(vault_module.os, "dup", track_dup)
+    monkeypatch.setattr(vault_module.os, "fstat", fail_second_duplicate_fstat)
+    monkeypatch.setattr(vault_module.os, "close", track_close)
+    try:
+        try:
+            vault_module._preflight_inventory_oauth_secret_tree(capability)
+        except GoogleInventoryReadonlyTokenVaultError as caught:
+            error = caught
+        else:
+            raise AssertionError("expected duplicate capability failure")
+    finally:
+        vault_module._close_directory_capability(capability)
+
+    assert error.code == "credential.inventory_token_vault_write_failed"
+    assert duplicate_fstats == 2
+    assert duplicate_closed
+    assert not os.path.lexists(tree["oauth"])
+    _assert_error_graph_redacted(error, markers=(marker,))
+
+
+def test_preflight_rollback_keeps_directory_filled_before_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    original_mkdir = vault_module.os.mkdir
+    marker = "preflight-filled-directory-marker"
+
+    def fill_then_fail(path: object, *args: object, **kwargs: object) -> None:
+        if os.fspath(path) == "tokens":  # type: ignore[arg-type]
+            sentinel = tree["oauth"] / "mutator-sentinel"
+            sentinel.write_bytes(b"external-test-content")
+            sentinel.chmod(0o600)
+            raise OSError(errno.EIO, marker)
+        original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(vault_module.os, "mkdir", fill_then_fail)
+    assert _error_code(lambda: _call_preflight(tree["home"])) == (
+        "credential.inventory_token_vault_write_failed"
+    )
+
+    assert tree["oauth"].is_dir()
+    assert (tree["oauth"] / "mutator-sentinel").read_bytes() == (
+        b"external-test-content"
+    )
+    assert not os.path.lexists(tree["tokens"])
+
+
+def test_subprocess_preflight_parent_swap_is_detected_before_secret_creation(
+    tmp_path: Path,
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    proceed = context.Event()
+    output = context.Queue()
+    process = context.Process(
+        target=_process_preflight_parent_swap,
+        args=(os.fspath(tree["home"]), ready, proceed, output),
+    )
+    process.start()
+    old_application = tree["config"] / "codex-master-mcp-before-swap"
+    try:
+        assert ready.wait(timeout=5)
+        tree["application"].rename(old_application)
+        tree["application"].mkdir(mode=0o755)
+        tree["application"].chmod(0o755)
+        proceed.set()
+        result = output.get(timeout=5)
+    finally:
+        proceed.set()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+
+    assert process.exitcode == 0
+    assert result == ("error", "credential.inventory_token_vault_path_invalid")
+    assert not os.path.lexists(old_application / "google-oauth")
+    assert not os.path.lexists(tree["application"] / "google-oauth")
+
+
+def test_subprocess_preflight_rollback_attestation_keeps_replacement_directory(
+    tmp_path: Path,
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    proceed = context.Event()
+    output = context.Queue()
+    process = context.Process(
+        target=_process_preflight_rollback_swap,
+        args=(os.fspath(tree["home"]), ready, proceed, output),
+    )
+    process.start()
+    created_before_swap = tree["application"] / "google-oauth-before-swap"
+    try:
+        assert ready.wait(timeout=5)
+        if tree["oauth"].is_dir():
+            tree["oauth"].rename(created_before_swap)
+            tree["oauth"].mkdir(mode=0o700)
+            tree["oauth"].chmod(0o700)
+        proceed.set()
+        result = output.get(timeout=5)
+    finally:
+        proceed.set()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+
+    assert process.exitcode == 0
+    assert result == ("error", "credential.inventory_token_vault_path_invalid")
+    assert created_before_swap.is_dir()
+    assert tree["oauth"].is_dir()
+    assert not os.path.lexists(created_before_swap / "tokens")
+    assert not os.path.lexists(tree["tokens"])
+
+
+def test_same_uid_mkdir_to_first_attestation_swap_is_an_out_of_scope_counterexample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _preflight_parent_tree(tmp_path)
+    original_mkdir = vault_module.os.mkdir
+    created_before_swap = tree["application"] / "google-oauth-before-attestation"
+    swapped = False
+
+    def mkdir_then_swap(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+        if not swapped and os.fspath(path) == "google-oauth":  # type: ignore[arg-type]
+            parent_fd = kwargs["dir_fd"]
+            os.rename(
+                "google-oauth",
+                "google-oauth-before-attestation",
+                src_dir_fd=parent_fd,  # type: ignore[arg-type]
+                dst_dir_fd=parent_fd,  # type: ignore[arg-type]
+            )
+            original_mkdir(
+                "google-oauth",
+                mode=0o700,
+                dir_fd=parent_fd,  # type: ignore[arg-type]
+            )
+            swapped = True
+
+    monkeypatch.setattr(vault_module.os, "mkdir", mkdir_then_swap)
+
+    _call_preflight(tree["home"])
+
+    boundary = vault_module._MUTATION_THREAT_BOUNDARY
+    assert swapped
+    assert not boundary.unsandboxed_same_uid_non_atomic_name_windows_in_scope
+    assert created_before_swap.is_dir()
+    assert tree["tokens"].is_dir()
 
 
 def test_current_host_production_open_allows_0755_nonsecret_parents_and_is_read_only() -> (
@@ -598,13 +1260,11 @@ def test_temp_user_chain_missing_secret_subtree_is_unavailable_and_not_created(
     assert not os.path.lexists(oauth)
 
 
-def test_private_mutation_contract_excludes_unsandboxed_same_uid_last_syscall_swap() -> (
-    None
-):
+def test_private_mutation_contract_excludes_unsandboxed_same_uid_name_windows() -> None:
     boundary = vault_module._MUTATION_THREAT_BOUNDARY
 
-    assert boundary.detects_observable_swaps_through_last_attestation
-    assert not boundary.unsandboxed_same_uid_after_last_attestation_in_scope
+    assert boundary.observable_attestation_mismatches_fail_closed
+    assert not boundary.unsandboxed_same_uid_non_atomic_name_windows_in_scope
     assert boundary.future_isolation == "separate_uid_or_root_broker"
 
 
@@ -1938,7 +2598,9 @@ def test_directory_node_repr_is_a_fixed_redacted_capability_label() -> None:
     )
 
 
-def test_open_production_tokens_directory_classifies_root_open_failure(monkeypatch) -> None:
+def test_open_production_tokens_directory_classifies_root_open_failure(
+    monkeypatch,
+) -> None:
     def denied(*args, **kwargs):
         raise OSError(vault_module.errno.EACCES, "denied")
 
@@ -1965,6 +2627,7 @@ def test_validate_regular_private_fd_requires_a_single_owner_only_regular_file(
         )
     finally:
         os.close(fd)
+
 
 @pytest.mark.parametrize(
     "invalid_b64",
