@@ -1,7 +1,7 @@
 {
-  "uuid": "codex-master@H234598",
+  "uuid": "the-hive@H234598",
   "name": "Flottenmanagement",
-  "description": "Steuert und überwacht die Codex-Master-Agentinnenflotte.",
+  "description": "Steuert und überwacht die Agentinnenflotte von The Hive.",
   "version": "1.0.0",
   "icon": "network-workgroup",
   "author": "H234598",

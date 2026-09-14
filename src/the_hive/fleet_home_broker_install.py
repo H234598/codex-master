@@ -157,6 +157,13 @@ def build_home_broker_install_plan() -> InstallPlan:
                     0,
                     0o644,
                 ),
+                InstallFile(
+                    "systemd/system/the-hive-home-broker.socket",
+                    "/usr/lib/systemd/system/the-hive-home-broker.socket",
+                    0,
+                    0,
+                    0o644,
+                ),
             ),
             key=lambda entry: entry.target_path,
         )

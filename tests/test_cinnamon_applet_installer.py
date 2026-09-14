@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from importlib.machinery import SourceFileLoader
+import io
 import json
 import os
 from pathlib import Path
@@ -16,8 +17,8 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOL_SOURCE = ROOT / "scripts" / "codex-master-cinnamon-applet"
-UUID = "codex-master@H234598"
+TOOL_SOURCE = ROOT / "scripts" / "the-hive-cinnamon-applet"
+UUID = "the-hive@H234598"
 
 
 class CinnamonAppletInstallerTest(unittest.TestCase):
@@ -81,7 +82,7 @@ if sys.argv[1] == "monitor":
             sys.stdout.fileno(),
             b"Monitoring signals on object /org/Cinnamon owned by org.Cinnamon\\n"
             b"/org/Cinnamon: org.Cinnamon.XletAddedComplete "
-            b"(true, 'codex-master@H234598')\\n",
+            b"(true, 'the-hive@H234598')\\n",
         )
     else:
         print("Monitoring signals on object /org/Cinnamon owned by org.Cinnamon", flush=True)
@@ -93,7 +94,7 @@ if sys.argv[1] == "monitor":
                 raise SystemExit(9)
             success = "false" if mode == "signal-fail" else "true"
             print(
-                f"/org/Cinnamon: org.Cinnamon.XletAddedComplete ({success}, 'codex-master@H234598')",
+                f"/org/Cinnamon: org.Cinnamon.XletAddedComplete ({success}, 'the-hive@H234598')",
                 flush=True,
             )
             raise SystemExit
@@ -111,11 +112,11 @@ if method.endswith("GetRunningXletUUIDs"):
     if mode == "missing":
         print("(@as [],)")
     elif mode == "spoofed":
-        print("({'running': 'codex-master@H234598'},)")
+        print("({'running': 'the-hive@H234598'},)")
     elif mode == "large":
         print("X" * 70000)
     else:
-        print("(['codex-master@H234598'],)")
+        print("(['the-hive@H234598'],)")
 else:
     print("()" if method.endswith("ReloadXlet") else "(true,)")
 """,
@@ -152,7 +153,7 @@ else:
         }
 
     def _load_tool_module(self):
-        name = f"codex_master_cinnamon_installer_{id(self)}"
+        name = f"the_hive_cinnamon_installer_{id(self)}"
         loader = SourceFileLoader(name, str(self.tool))
         spec = importlib.util.spec_from_loader(name, loader)
         if spec is None or spec.loader is None:
@@ -160,6 +161,16 @@ else:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_help_uses_the_hive_identity(self) -> None:
+        module = self._load_tool_module()
+        with mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout:
+            with self.assertRaises(SystemExit) as raised:
+                module.parse_args(["--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("The Hive", stdout.getvalue())
+        self.assertNotIn("codex-master", stdout.getvalue())
 
     def test_dry_run_changes_nothing_and_calls_no_dbus(self) -> None:
         result = self._run("install", "--dry-run")

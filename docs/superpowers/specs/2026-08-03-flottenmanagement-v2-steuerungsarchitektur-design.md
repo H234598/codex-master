@@ -83,8 +83,8 @@ diese Handlungen ist keine Live-Abnahme behauptet.
 
 ```sh
 ./bin/codex-master-mcp install
-./scripts/codex-master-cinnamon-applet install
-./scripts/codex-master-cinnamon-applet verify
+./scripts/the-hive-cinnamon-applet install
+./scripts/the-hive-cinnamon-applet verify
 ```
 
 Danach muss eine neue Codex-Sitzung geöffnet werden. Dort `/hooks` ausführen,

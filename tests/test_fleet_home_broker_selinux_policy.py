@@ -11,6 +11,8 @@ BROKER_EXEC = "the_hive_home_broker_exec_t"
 BROKER_PACKAGE = "the_hive_home_broker_package_t"
 BROKER_CONFIG = "the_hive_home_broker_config_t"
 BROKER_STATE = "the_hive_home_broker_state_t"
+CONTROL_DOMAIN = "the_hive_control_t"
+BROKER_RUNTIME = "the_hive_home_broker_runtime_t"
 AGENT_DOMAIN = "the_hive_agent_t"
 AGENT_EXEC = "the_hive_agent_exec_t"
 AGENT_HOME = "the_hive_agent_home_t"
@@ -22,6 +24,8 @@ TYPE_NAMES = {
     BROKER_PACKAGE,
     BROKER_CONFIG,
     BROKER_STATE,
+    CONTROL_DOMAIN,
+    BROKER_RUNTIME,
     AGENT_DOMAIN,
     AGENT_EXEC,
     AGENT_HOME,
@@ -35,6 +39,8 @@ TYPE_ATTRIBUTES = {
     (BROKER_PACKAGE, "file_type"),
     (BROKER_CONFIG, "file_type"),
     (BROKER_STATE, "file_type"),
+    (CONTROL_DOMAIN, "domain"),
+    (BROKER_RUNTIME, "file_type"),
     (AGENT_DOMAIN, "domain"),
     (AGENT_EXEC, "exec_type"),
     (AGENT_EXEC, "file_type"),
@@ -163,6 +169,7 @@ EXPECTED_ALLOWS = (
     ),
     _allow(BROKER_DOMAIN, BROKER_EXEC, "file", "entrypoint"),
     _allow(AGENT_DOMAIN, AGENT_EXEC, "file", "entrypoint"),
+    _allow(CONTROL_DOMAIN, BROKER_RUNTIME, "sock_file", "write"),
 )
 
 
@@ -269,7 +276,7 @@ def test_policy_declares_exact_domains_types_requirements_and_allow_matrix() -> 
 
 def _parse_filecontexts(filecontexts: str) -> list[tuple[str, str | None, str]]:
     line_pattern = re.compile(
-        r"^(?P<path>\S+)(?:\s+(?P<ftype>--|-d))?\s+"
+        r"^(?P<path>\S+)(?:\s+(?P<ftype>--|-d|-s))?\s+"
         r"gen_context\(system_u:object_r:(?P<type>[a-z0-9_]+),s0\)$"
     )
     entries = []
@@ -288,6 +295,7 @@ def test_filecontexts_use_exact_paths_and_distinct_file_type_selectors() -> None
         ("/usr/libexec/the-hive-broker-verify", "--", BROKER_EXEC),
         ("/var/lib/codex-master-home-broker(/.*)?", None, BROKER_STATE),
         ("/etc/the-hive/home-broker.conf", "--", BROKER_CONFIG),
+        ("/run/the-hive-home-broker\\.sock", "-s", BROKER_RUNTIME),
         ("/usr/libexec/the-hive-agent-launcher", "--", AGENT_EXEC),
         ("/run/the-hive-agent", "-d", AGENT_ENDPOINT),
         ("/run/the-hive-agent/home(/.*)?", None, AGENT_HOME),
@@ -297,6 +305,7 @@ def test_filecontexts_use_exact_paths_and_distinct_file_type_selectors() -> None
     assert sum(ftype is None for _, ftype, _ in expected) == 3
     assert sum(ftype == "--" for _, ftype, _ in expected) == 4
     assert sum(ftype == "-d" for _, ftype, _ in expected) == 1
+    assert sum(ftype == "-s" for _, ftype, _ in expected) == 1
     assert not re.search(
         r"s0:c\d|\bcategory\b|\bmls\b|\bmcs\b|unconfined|default_t|user_home_t|var_t|etc_t",
         filecontexts,

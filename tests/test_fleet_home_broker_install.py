@@ -138,6 +138,13 @@ def _expected_files() -> tuple[tuple[str, str, int, int, int], ...]:
             0o644,
         ),
         (
+            "systemd/system/the-hive-home-broker.socket",
+            "/usr/lib/systemd/system/the-hive-home-broker.socket",
+            0,
+            0,
+            0o644,
+        ),
+        (
             "systemd/libexec/the-hive-agent-launcher",
             "/usr/libexec/the-hive-agent-launcher",
             0,
@@ -228,7 +235,7 @@ def test_builder_returns_exact_sorted_duplicate_free_install_closure() -> None:
     )
     assert actual == tuple(sorted(_expected_files(), key=lambda entry: entry[1]))
     assert actual == tuple(sorted(actual, key=lambda entry: entry[1]))
-    assert len(actual) == 18
+    assert len(actual) == 19
     assert len({entry[1] for entry in actual}) == len(actual)
     assert len(set(actual)) == len(actual)
     assert sum(entry[0] == MANIFEST_SOURCE for entry in actual) == 1
@@ -350,6 +357,7 @@ def test_plan_module_has_no_host_io_digest_or_activation_surface() -> None:
 def test_units_have_no_activation_section() -> None:
     for path in (
         REPO_ROOT / "systemd/system/the-hive-home-broker.service",
+        REPO_ROOT / "systemd/system/the-hive-home-broker.socket",
         REPO_ROOT / "systemd/system/the-hive-agent@.service",
     ):
         source = path.read_text(encoding="utf-8")

@@ -7,11 +7,15 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const source = fs.readFileSync(
-  path.join(root, "cinnamon/applets/codex-master@H234598/applet.js"),
+  path.join(root, "cinnamon/applets/the-hive@H234598/applet.js"),
   "utf8"
 );
+const metadata = JSON.parse(fs.readFileSync(
+  path.join(root, "cinnamon/applets/the-hive@H234598/metadata.json"),
+  "utf8"
+));
 const settingsSchema = JSON.parse(fs.readFileSync(
-  path.join(root, "cinnamon/applets/codex-master@H234598/settings-schema.json"),
+  path.join(root, "cinnamon/applets/the-hive@H234598/settings-schema.json"),
   "utf8"
 ));
 const START_CONTEXT_VALUE = "c3RhcnQ.c2ln";
@@ -20,6 +24,12 @@ const OTHER_CONTEXT_VALUE = "YW5kZXJl.c2ln";
 const MALFORMED_CONTEXT_VALUE = "attacker token";
 const EXTRA_FIELD = "secret";
 const EXTRA_VALUE = "must-not-be-stored";
+
+test("applet identity uses the canonical The Hive UUID and runtime", () => {
+  assert.equal(metadata.uuid, "the-hive@H234598");
+  assert.match(metadata.description, /The Hive/);
+  assert.doesNotMatch(source, /codex-master(?:-runtime|-mcp)?/);
+});
 
 function makeBytes(value) {
   return typeof value === "string" ? new TextEncoder().encode(value) : value;
@@ -806,7 +816,7 @@ test("overview settings expose the approved defaults", () => {
   assert.equal(settingsSchema["overview-detail"].default, true);
 
   const { main } = loadApplet();
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   assert.equal(applet.overviewIntervalSeconds, 30);
   assert.equal(applet.overviewSessionNoActiveOnly, false);
   assert.equal(applet.overviewCompact, true);
@@ -815,7 +825,7 @@ test("overview settings expose the approved defaults", () => {
 
 test("ollama menu shows bounded readiness summary", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
   assert.equal(applet.renderOllamaSummary({
     ready_instances: 2,
@@ -834,12 +844,12 @@ test("ollama menu shows bounded readiness summary", () => {
 
 test("ollama action opens exact control center page", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
   applet._ollamaManageItem.activate();
 
   assert.deepEqual(Array.from(fixture.launcherSpawns[0].argv), [
-    "/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp",
+    "/home/tester/.local/lib/the-hive-runtime/bin/the-hive-mcp",
     "control-center-launch",
     "--page",
     "ollama",
@@ -849,10 +859,10 @@ test("ollama action opens exact control center page", () => {
 test("overview argv is shell-free and adds only explicit session flag", () => {
   const first = loadApplet();
   first.setHome("/tmp/overview-home");
-  const firstApplet = first.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const firstApplet = first.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   firstApplet._refreshOverview();
   assert.deepEqual(Array.from(first.launcherSpawns[0].argv), [
-    "/tmp/overview-home/.local/lib/codex-master-runtime/bin/codex-master-mcp",
+    "/tmp/overview-home/.local/lib/the-hive-runtime/bin/the-hive-mcp",
     "fleet",
     "overview",
     "--format",
@@ -861,10 +871,10 @@ test("overview argv is shell-free and adds only explicit session flag", () => {
 
   const second = loadApplet();
   second.setSetting("overview-session-no-active-only", true);
-  const secondApplet = second.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const secondApplet = second.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   secondApplet._refreshOverview();
   assert.deepEqual(Array.from(second.launcherSpawns[0].argv), [
-    "/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp",
+    "/home/tester/.local/lib/the-hive-runtime/bin/the-hive-mcp",
     "fleet",
     "overview",
     "--format",
@@ -875,7 +885,7 @@ test("overview argv is shell-free and adds only explicit session flag", () => {
 
 test("overview launcher preserves only approved state roots and strips foreign environment", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet._refreshOverview();
   const launch = fixture.launcherSpawns[0];
   assert.ok(!launch.unsetCalls.includes("CODEX_USAGE_INTEGRATION_STATE_HOME"));
@@ -887,7 +897,7 @@ test("overview launcher preserves only approved state roots and strips foreign e
 
 test("overview refresh is single-flight and separate from status state", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const statusState = applet._statusViewState;
   applet._refreshOverview();
   applet._refreshOverview();
@@ -902,7 +912,7 @@ test("overview refresh is single-flight and separate from status state", () => {
 
 test("malformed overview stays unavailable and preserves status state", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const statusPayload = samplePayload();
   applet._statusLastGood = statusPayload;
   applet._statusViewState = "ready";
@@ -917,7 +927,7 @@ test("malformed overview stays unavailable and preserves status state", () => {
 test("overview accepts fresh, stale, and unavailable data with data-sparse rendering", () => {
   for (const [freshness, expectedText] of [["fresh", "frisch"], ["stale", "veraltet"]]) {
     const fixture = loadApplet();
-    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
     queuePayloadProcess(fixture, sampleOverviewPayload({
       integration_freshness: freshness,
       agents: sampleOverviewPayload().agents.map((row) => ({ ...row, usage_freshness: freshness })),
@@ -930,7 +940,7 @@ test("overview accepts fresh, stale, and unavailable data with data-sparse rende
   }
 
   const unavailable = loadApplet();
-  const unavailableApplet = unavailable.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const unavailableApplet = unavailable.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   queuePayloadProcess(unavailable, sampleOverviewPayload({
     integration_freshness: "unavailable",
     series: [],
@@ -953,7 +963,7 @@ test("overview settings validate strictly and restart only overview work", () =>
   ];
   for (const [key, value, expected] of cases) {
     const fixture = loadApplet();
-    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
     fixture.setSetting(key, value);
     const property = {
       "overview-interval-seconds": "overviewIntervalSeconds",
@@ -969,7 +979,7 @@ test("overview settings validate strictly and restart only overview work", () =>
 
 test("overview timeout and late callbacks never touch status state", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const statusPayload = samplePayload();
   applet._statusLastGood = statusPayload;
   applet._statusViewState = "ready";
@@ -994,7 +1004,7 @@ test("opening menu starts first overview refresh and then one overview timer", (
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload());
   queuePayloadProcess(fixture, sampleOverviewPayload());
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
   applet.on_applet_clicked();
   assert.equal(fixture.subprocesses.length, 2);
@@ -1020,7 +1030,7 @@ test("overview rejects null created_at and non-exact series totals", () => {
     }),
   ]) {
     const fixture = loadApplet();
-    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
     queuePayloadProcess(fixture, payload);
     applet._refreshOverview();
     fixture.subprocesses[0].emitDone();
@@ -1031,7 +1041,7 @@ test("overview rejects null created_at and non-exact series totals", () => {
 
 test("overview UTC validation compares calendar components and keeps null reset optional", () => {
   const { main } = loadApplet();
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   for (const value of [
     "2026-02-29T00:00:00Z",
     "2026-02-31T00:00:00Z",
@@ -1049,7 +1059,7 @@ test("overview UTC validation compares calendar components and keeps null reset 
 
 test("overview agents must map into series while inactive series members may be omitted", () => {
   const { main } = loadApplet();
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const foreignAgent = sampleOverviewPayload({
     agents: sampleOverviewPayload().agents.map((row) => ({ ...row, agent_id: "b1" })),
   });
@@ -1068,7 +1078,7 @@ test("overview agents must map into series while inactive series members may be 
 
 test("overview setting changes replace timer or cancel active IO without status mutation", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   queuePayloadProcess(fixture, sampleOverviewPayload());
   applet._refreshOverview();
   fixture.subprocesses[0].emitDone();
@@ -1114,7 +1124,7 @@ test("metadata failure is safe", () => {
 
 test("status click still uses menu cleanup cleanup paths", () => {
   const { main, spawned } = loadApplet();
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const menu = applet.menu;
   const manager = applet.menuManager;
   const contextMenu = applet._applet_context_menu;
@@ -1154,7 +1164,7 @@ test("status click still uses menu cleanup cleanup paths", () => {
 test("applet click actor and toggle failures stay inside the UI callback", () => {
   for (const failure of ["actor", "toggle"]) {
     const fixture = loadApplet();
-    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
     if (failure === "actor") {
       applet.menu.actor.is_finalized = () => { throw new Error("injected actor state failure"); };
     } else {
@@ -1171,7 +1181,7 @@ test("applet click actor and toggle failures stay inside the UI callback", () =>
 test("settings launcher failure stays inside menu callback", () => {
   const fixture = loadApplet();
   fixture.setSpawnError("injected cinnamon-settings spawn failure");
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
   assert.doesNotThrow(() => applet.menu.items[1].activate());
   assert.equal(fixture.spawned.length, 0);
@@ -1180,7 +1190,7 @@ test("settings launcher failure stays inside menu callback", () => {
 
 test("signal connection failures do not escape or retain invalid handles", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const baseline = applet._signalConnections.length;
   const targets = [
     { connect() { return 1; } },
@@ -1203,7 +1213,7 @@ test("removal drops signal handles Cinnamon already disconnected", () => {
   const fixture = loadApplet();
   let logCalls = 0;
   fixture.setGlobalLogger(() => { logCalls += 1; });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
   for (const connection of applet._signalConnections) {
     connection.target.handlers.delete(connection.id);
@@ -1222,7 +1232,7 @@ test("removal drops signal handles Cinnamon already disconnected", () => {
 test("single removal retries transient menu cleanup failures", () => {
   for (const failure of ["close", "remove", "menu-destroy", "manager-destroy"]) {
     const { main } = loadApplet();
-    const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
     const menu = applet.menu;
     const manager = applet.menuManager;
     menu.isOpen = true;
@@ -1248,7 +1258,7 @@ test("single removal retries transient menu cleanup failures", () => {
 
 test("native submenu references survive failed main menu cleanup retry", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const menu = applet.menu;
   const manager = applet.menuManager;
   const nativeSubmenuItem = applet._nativeSubmenuItem;
@@ -1281,7 +1291,7 @@ test("native submenu references survive failed main menu cleanup retry", () => {
 
 test("removal releases status actor wrapper references", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet._statusLastGood = samplePayload();
   assert.notEqual(applet._statusSummaryItem, null);
   assert.equal(applet._statusRowItems.length, 6);
@@ -1320,7 +1330,7 @@ test("builds fixed mcp argv and validierte ids", async () => {
   });
 
   const { main, launcherSpawns } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
 
   statusItem.activate();
@@ -1328,7 +1338,7 @@ test("builds fixed mcp argv and validierte ids", async () => {
   await Promise.resolve();
 
   const launch = launcherSpawns.at(-1);
-  assert.equal(launch.argv[0], "/tmp/home/.local/lib/codex-master-runtime/bin/codex-master-mcp");
+  assert.equal(launch.argv[0], "/tmp/home/.local/lib/the-hive-runtime/bin/the-hive-mcp");
   assert.equal(launch.argv[1], "applet-status");
   assert.equal(launch.argv[2], "--schema-version");
   assert.equal(launch.argv[3], "4");
@@ -1377,14 +1387,14 @@ test("builds fixed mcp argv and validierte ids", async () => {
 
 test("control-center uses one fixed bounded detach helper", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const controlCenterItem = applet.menu.items[2];
 
   assert.equal(getMenuItemText(controlCenterItem), "Steuerzentrale öffnen");
   controlCenterItem.activate();
   assert.equal(fixture.subprocesses.length, 1);
   assert.deepEqual(Array.from(fixture.launcherSpawns[0].argv), [
-    "/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp",
+    "/home/tester/.local/lib/the-hive-runtime/bin/the-hive-mcp",
     "control-center-launch",
   ]);
   assert.deepEqual(Array.from(fixture.launcherSpawns[0].envCalls), [
@@ -1409,7 +1419,7 @@ test("control-center uses one fixed bounded detach helper", () => {
 
 test("control-center detach helper timeout is bounded and never retries", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const controlCenterItem = applet.menu.items[2];
 
   controlCenterItem.activate();
@@ -1424,7 +1434,7 @@ test("control-center detach helper timeout is bounded and never retries", () => 
 
 test("removal terminates only active detach helper and clears its resources", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[2].activate();
   const helper = fixture.subprocesses[0];
 
@@ -1438,7 +1448,7 @@ test("removal terminates only active detach helper and clears its resources", ()
 
 test("argv preparation failure stays inside refresh callback", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   fixture.GLib.get_home_dir = () => { throw new Error("injected home lookup failure"); };
 
   assert.doesNotThrow(() => applet.menu.items[0].activate());
@@ -1502,7 +1512,7 @@ test("single-flight keeps one pending refresh", async () => {
   });
 
   const { main, subprocesses } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
 
   statusItem.activate();
@@ -1536,7 +1546,7 @@ test("stdout cap, stderr cap, and timeout each cancel and force_exit exactly onc
     }));
 
     const { main, subprocesses, runTimeouts } = fixture;
-    const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
     applet.menu.items[0].activate();
     const cancellable = applet._statusActiveState.cancellable;
     if (failure === "timeout") runTimeouts();
@@ -1564,7 +1574,7 @@ test("status buffering retains chunks instead of one JS array element per byte",
     wait_async(_, callback) { this.waitCallbacks.push(callback); },
   }));
 
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
 
   const state = applet._statusActiveState;
@@ -1590,7 +1600,7 @@ test("stderr is bounded by byte count without retaining diagnostic chunks", () =
     wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
     wait_finish() {},
   }));
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const state = applet._statusActiveState;
 
@@ -1614,7 +1624,7 @@ test("stdout overflow releases accumulated status data before process exit", () 
     wait_async(_, callback) { this.waitCallbacks.push(callback); },
   }));
 
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
 
   const state = applet._statusActiveState;
@@ -1643,7 +1653,7 @@ test("late stdout after timeout is drained without rebuilding the status buffer"
     wait_async(_, callback) { this.waitCallbacks.push(callback); },
   }));
 
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   fixture.runTimeouts();
 
@@ -1660,7 +1670,7 @@ test("late stdout after timeout is drained without rebuilding the status buffer"
 test("status timeout registration failure fails closed without leaking process state", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   fixture.GLib.timeout_add = () => { throw new Error("injected timeout registration failure"); };
 
   assert.doesNotThrow(() => applet.menu.items[0].activate());
@@ -1680,7 +1690,7 @@ test("status timeout registration failure fails closed without leaking process s
 test("invalid timeout source id fails closed without an unbounded process", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload(), { holdEof: true, forceExitFailures: 1 });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   fixture.GLib.timeout_add = () => 0;
 
   applet.menu.items[0].activate();
@@ -1732,7 +1742,7 @@ test("invalid timeout handle retries a failed replacement wait once", () => {
       },
     };
   });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   fixture.GLib.timeout_add = () => 0;
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
@@ -1786,7 +1796,7 @@ test("timerless replacement wait retries a transient cancellable construction fa
     };
   });
   fixture.GLib.timeout_add = () => 0;
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
 
@@ -1830,7 +1840,7 @@ test("timerless replacement wait bounds permanent cancellable construction failu
     };
   });
   fixture.GLib.timeout_add = () => 0;
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
   const state = applet._statusActiveState;
@@ -1848,7 +1858,7 @@ test("timerless replacement wait bounds permanent cancellable construction failu
 test("cancellable construction failure keeps the process managed", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload());
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   fixture.Gio.Cancellable = class {
     constructor() { throw new Error("injected cancellable construction failure"); }
   };
@@ -1896,7 +1906,7 @@ test("invalid utf8/json/schema/types do not overwrite last-good", async () => {
   });
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
 
   statusItem.activate();
@@ -1955,7 +1965,7 @@ test("stale generation callback cannot overwrite fresh result", async () => {
   });
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet._statusLastGood = newer;
   applet._statusActiveGeneration = 2;
   applet._finalizeStatusProcess({
@@ -2003,7 +2013,7 @@ test("readers run via async before wait completion", async () => {
   });
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
 
   statusItem.activate();
@@ -2048,7 +2058,7 @@ test("finalize waits for wait + both stream EOFs", async () => {
   });
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
 
   statusItem.activate();
@@ -2065,7 +2075,7 @@ test("finalize waits for wait + both stream EOFs", async () => {
 test("timeout cancels inherited pipes that outlive a confirmed process exit", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
   const state = applet._statusActiveState;
@@ -2090,7 +2100,7 @@ test("timeout cancels inherited pipes that outlive a confirmed process exit", ()
 test("timeout removal failure defers finalization to timer without wedging", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload());
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
   fixture.GLib.source_remove = () => { throw new Error("injected timeout removal failure"); };
@@ -2111,7 +2121,7 @@ test("timeout removal failure defers finalization to timer without wedging", () 
 test("reentrant timeout callback during finalization cannot remove a live applet", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload());
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
   const statusTimer = fixture.activeTimers("timeout")[0];
@@ -2167,7 +2177,7 @@ test("real backend payload with sleeping and expired states is accepted", async 
   }));
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
   statusItem.activate();
   fixture.subprocesses[0].emitDone();
@@ -2197,7 +2207,7 @@ test("menu title remains exactly Flottenmanagement", async () => {
   }));
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
   statusItem.activate();
   fixture.subprocesses[0].emitDone();
@@ -2232,7 +2242,7 @@ test("read_bytes_async uses count,priority,cancellable,callback signature", asyn
   });
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
 
   statusItem.activate();
@@ -2276,7 +2286,7 @@ test("reader callback/finish exception triggers stream failure and no payload", 
   });
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
   statusItem.activate();
   fixture.subprocesses[0].emitDone();
@@ -2335,7 +2345,7 @@ test("validator rejects missing snapshot state fields", async () => {
   }));
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
   statusItem.activate();
   fixture.subprocesses[0].emitDone();
@@ -2346,7 +2356,7 @@ test("validator rejects missing snapshot state fields", async () => {
 
 test("exact python error row is accepted and aggregates to python unavailable snapshot", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const payload = {
     schema_version: 4,
     mode: "read_only",
@@ -2401,7 +2411,7 @@ test("exact python error row is accepted and aggregates to python unavailable sn
 
 test("exact python error row mixed with a normal row is accepted", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const payload = {
     schema_version: 4,
     mode: "read_only",
@@ -2460,7 +2470,7 @@ test("exact python error row mixed with a normal row is accepted", () => {
 
 test("exact python stopped-orphan row is accepted", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const payload = samplePayload();
   payload.agents[0].activity_state = "sleeping";
   realignCounts(payload);
@@ -2484,7 +2494,7 @@ test("exact python stopped-orphan row is accepted", () => {
 
 test("validator rejects syntactically valid but backend-impossible row combinations", async () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const base = samplePayload();
   const valid = JSON.parse(JSON.stringify(base));
   assert.equal(applet._maybeApplyStatusPayload(valid), true);
@@ -2595,7 +2605,7 @@ test("validator rejects missing/invalid counts, raw_output and duplicate/foreign
   badNativeDisplay.native_agents.agents = [sampleNativeAgent({ display_id: "bad/id" })];
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
 
   const bads = [
@@ -2661,7 +2671,7 @@ test("invalid utf8 byte in stdout is rejected even if JSON shape stays parseable
   }));
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
 
   statusItem.activate();
@@ -2706,7 +2716,7 @@ test("packet accessor exceptions fail closed and refresh recovers", async () => 
     },
   }));
 
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const statusItem = applet.menu.items[0];
 
   assert.doesNotThrow(() => statusItem.activate());
@@ -2742,7 +2752,7 @@ test("pipe accessor exceptions fail closed and refresh recovers", async () => {
     },
   }));
 
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const statusItem = applet.menu.items[0];
 
   assert.doesNotThrow(() => statusItem.activate());
@@ -2781,7 +2791,7 @@ test("process success accessor exceptions fail closed and pending refresh recove
     },
   }));
 
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const statusItem = applet.menu.items[0];
   statusItem.activate();
   const failedProcess = fixture.subprocesses[0];
@@ -2803,7 +2813,7 @@ test("final render exception cannot block cleanup or pending refresh", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload());
   queuePayloadProcess(fixture, samplePayload());
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const originalRender = applet._renderStatus.bind(applet);
   let renderCalls = 0;
   applet._renderStatus = () => {
@@ -2831,7 +2841,7 @@ test("logger failure cannot pierce the status render boundary", () => {
   queuePayloadProcess(fixture, samplePayload());
   queuePayloadProcess(fixture, samplePayload());
   fixture.setGlobalLogger(() => { throw new Error("injected logger failure"); });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const originalRender = applet._renderStatus.bind(applet);
   let renderCalls = 0;
   applet._renderStatus = () => {
@@ -2857,8 +2867,8 @@ test("cleanup logging has a fixed Cinnamon heap budget", () => {
   let logCalls = 0;
   fixture.setGlobalLogger(() => { logCalls += 1; });
   const applets = [
-    fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1),
-    fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 2),
+    fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1),
+    fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 2),
   ];
   for (const applet of applets) {
     applet._renderStatus = () => { throw new Error("persistent render failure"); };
@@ -2896,7 +2906,7 @@ test("reader exceptions set streamFailed, force_exit once, and finalize", async 
   }));
 
   const { main } = fixture;
-  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
 
   statusItem.activate();
@@ -2970,7 +2980,7 @@ test("cancelled stream failure waits for a successful kill retry", () => {
       },
     };
   });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
   const failedState = applet._statusActiveState;
@@ -3017,7 +3027,7 @@ test("removal cancels an in-flight replacement wait", () => {
       },
     };
   });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
 
@@ -3037,7 +3047,7 @@ test("removal cancels an in-flight replacement wait", () => {
 });
 
 test("settings schema contains the bounded fleet settings and Ghostty terminal default", () => {
-  const schemaPath = path.join(root, "cinnamon/applets/codex-master@H234598/settings-schema.json");
+  const schemaPath = path.join(root, "cinnamon/applets/the-hive@H234598/settings-schema.json");
   const schema = JSON.parse(fs.readFileSync(schemaPath, "utf8"));
 
   assert.deepEqual(Object.keys(schema).sort(), [
@@ -3083,7 +3093,7 @@ test("settings schema contains the bounded fleet settings and Ghostty terminal d
 
 test("panel and settings icons plus display mode are live-configurable", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const settingsItem = applet.menu.items[1];
 
   assert.equal(applet.panelIcon, "hive-01-core");
@@ -3115,7 +3125,7 @@ test("panel and settings icons plus display mode are live-configurable", () => {
 
 test("invalid icon and panel display settings fail closed to safe defaults", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
   fixture.setSetting("panel-icon", "../../outside");
   assert.equal(applet.panelIcon, "hive-01-core");
@@ -3132,7 +3142,7 @@ test("invalid icon and panel display settings fail closed to safe defaults", () 
 
 test("fleet status terminal uses Ghostty by default and the configured executable", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const terminalStatusItem = applet.menu.items[3];
 
   assert.equal(getMenuItemText(terminalStatusItem), "Flottenstatus im Terminal");
@@ -3142,7 +3152,7 @@ test("fleet status terminal uses Ghostty by default and the configured executabl
     "-e",
     "/bin/bash",
     "-c",
-    "'/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
+    "'/home/tester/.local/lib/the-hive-runtime/bin/the-hive-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
   ]);
 
   fixture.setSetting("terminal-command", "gnome-terminal");
@@ -3152,7 +3162,7 @@ test("fleet status terminal uses Ghostty by default and the configured executabl
     "--",
     "/bin/bash",
     "-c",
-    "'/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
+    "'/home/tester/.local/lib/the-hive-runtime/bin/the-hive-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
   ]);
 
   fixture.setSetting("terminal-command", "konsole");
@@ -3162,13 +3172,13 @@ test("fleet status terminal uses Ghostty by default and the configured executabl
     "-e",
     "/bin/bash",
     "-c",
-    "'/home/tester/.local/lib/codex-master-runtime/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
+    "'/home/tester/.local/lib/the-hive-runtime/bin/the-hive-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
   ]);
 });
 
 test("settings parser canonicalizes bounded concrete ids and never launches attacker text", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
   assert.equal(fixture.settingsInstances.length, 1);
   assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"]);
@@ -3194,7 +3204,7 @@ test("settings parser canonicalizes bounded concrete ids and never launches atta
 
 test("oversized tracked-agent setting is rejected before string splitting", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   fixture.guardOversizedStringSplit(128);
   const oversized = "a1,".repeat(64) + "a1";
 
@@ -3208,7 +3218,7 @@ test("rejected settings binding finalizes partial settings and fails closed", ()
   const fixture = loadApplet();
   fixture.rejectSettingsBinding("background-refresh");
 
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
   assert.equal(fixture.settingsInstances[0].finalizeCount, 1);
   assert.equal(applet.settings, null);
@@ -3224,7 +3234,7 @@ test("failed partial settings finalization stays owned and retryable", () => {
     fixture.rejectSettingsBinding("background-refresh");
     fixture.failSettingsFinalizes(finalizeFailures);
 
-    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, finalizeFailures);
+    const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, finalizeFailures);
     const settings = fixture.settingsInstances[0];
 
     assert.equal(settings.finalizeCount, 2);
@@ -3260,7 +3270,7 @@ test("scalar setting normalization never writes through Cinnamon bindings", () =
 
   for (const item of cases) {
     const fixture = loadApplet();
-    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
     const settings = fixture.settingsInstances[0];
 
     fixture.setSetting(item.key, item.value);
@@ -3274,7 +3284,7 @@ test("scalar setting normalization never writes through Cinnamon bindings", () =
 
 test("quick-control UI keeps title and separates activity backend and stale state", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const payload = samplePayload();
 
   assert.equal(applet._maybeApplyStatusPayload(payload), true);
@@ -3303,7 +3313,7 @@ test("quick-control UI keeps title and separates activity backend and stale stat
 
 test("quick control preallocates fixed rows and validates one start plus safe stops", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const payload = samplePayload();
   payload.agents[0] = {
     ...payload.agents[0],
@@ -3342,7 +3352,7 @@ test("quick control preallocates fixed rows and validates one start plus safe st
 
 test("start confirmation launches one fixed action argv then exactly one status refresh", async () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const initial = samplePayload();
   const refreshed = samplePayload();
   refreshed.agents[1] = {
@@ -3396,7 +3406,7 @@ test("start confirmation launches one fixed action argv then exactly one status 
 
 test("confirmation cancel and mutation timeout never retry", async () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   assert.equal(applet._maybeApplyStatusPayload(samplePayload()), true);
 
   applet._startActionItem.activate();
@@ -3426,7 +3436,7 @@ test("confirmation cancel and mutation timeout never retry", async () => {
 
 test("quick-control object identities survive 500 renders and action removal", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const submenu = applet._quickControlSubmenuItem;
   const startItem = applet._startActionItem;
   const stopItems = applet._stopActionItems.slice();
@@ -3462,7 +3472,7 @@ test("quick-control object identities survive 500 renders and action removal", (
 
 test("schema v2 allocates one native submenu with six stable child rows", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const payload = samplePayload();
   payload.native_agents.counts.active = 1;
   payload.native_agents.counts.unconfirmed = 1;
@@ -3492,7 +3502,7 @@ test("schema v2 allocates one native submenu with six stable child rows", () => 
 
 test("native submenu keeps six object identities across 500 v2 render cycles", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const readyPayload = samplePayload();
   readyPayload.native_agents.counts.active = 1;
   readyPayload.native_agents.agents = [sampleNativeAgent()];
@@ -3516,7 +3526,7 @@ test("native submenu keeps six object identities across 500 v2 render cycles", (
 
 test("native overflow reuses sixth row without allocating a seventh", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const payload = samplePayload();
   payload.native_agents = {
     bridge_state: "ready",
@@ -3537,7 +3547,7 @@ test("native overflow reuses sixth row without allocating a seventh", () => {
 
 test("schema v2 bridge degradation keeps managed rows and shows native diagnostic", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const payload = samplePayload();
   payload.native_agents = {
     bridge_state: "degraded",
@@ -3555,7 +3565,7 @@ test("schema v2 bridge degradation keeps managed rows and shows native diagnosti
 
 test("argv uses schema-version 4 before validated pinned ids", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
   fixture.setSetting("tracked-agents", " A2, b3, a2, C100 ");
   applet.menu.items[0].activate();
@@ -3566,7 +3576,7 @@ test("argv uses schema-version 4 before validated pinned ids", () => {
 
 test("applet invalid or mismatched resource generation is unavailable", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const good = samplePayload();
 
   assert.equal(applet._resourceGenerationHighWater, 0);
@@ -3620,7 +3630,7 @@ test("applet invalid or mismatched resource generation is unavailable", () => {
 
 test("applet never reads monitor path or spawns second status process", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const before = fixture.launcherSpawns.length;
 
   applet._refreshStatus();
@@ -3635,7 +3645,7 @@ test("applet never reads monitor path or spawns second status process", () => {
 
 test("refresh-on-open and bounded opt-in background timer preserve single-flight", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
   applet.on_applet_clicked();
   assert.equal(fixture.subprocesses.length, 2, "menu-open starts status and overview refreshes");
@@ -3662,7 +3672,7 @@ test("background timer registration failure does not prevent applet load", () =>
   let applet = null;
 
   assert.doesNotThrow(() => {
-    applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   });
 
   assert.equal(applet._backgroundRefreshSource, 0);
@@ -3677,7 +3687,7 @@ test("invalid background timer source ids fail settings closed", () => {
     fixture.setSetting("background-refresh", true);
     fixture.GLib.timeout_add_seconds = () => invalidSourceId;
 
-    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
 
     assert.equal(applet._backgroundRefreshSource, 0);
     assert.equal(fixture.activeTimers("background").length, 0);
@@ -3688,7 +3698,7 @@ test("invalid background timer source ids fail settings closed", () => {
 
 test("background timer removal failure cannot keep disabled refresh running", () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   fixture.setSetting("background-refresh", true);
   assert.equal(fixture.activeTimers("background").length, 1);
   fixture.GLib.source_remove = () => { throw new Error("injected background removal failure"); };
@@ -3708,7 +3718,7 @@ test("failed refresh keeps last-good visibly stale", () => {
   const fixture = loadApplet();
   const payload = samplePayload();
   queuePayloadProcess(fixture, payload);
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const statusItem = applet.menu.items[0];
 
   statusItem.activate();
@@ -3726,7 +3736,7 @@ test("failed refresh keeps last-good visibly stale", () => {
 test("removal during stream timeout and pending refresh tears down once", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   fixture.setSetting("background-refresh", true);
   const statusItem = applet.menu.items[0];
 
@@ -3788,7 +3798,7 @@ test("successful stream callback after removal starts no further read", () => {
     wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
     wait_finish() {},
   }));
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
 
@@ -3805,7 +3815,7 @@ test("successful stream callback after removal starts no further read", () => {
 test("status timeout self-removes after removal cleanup cannot remove its source", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
   const statusId = fixture.activeTimers("timeout")[0].id;
@@ -3832,7 +3842,7 @@ test("status timeout self-removes after removal cleanup cannot remove its source
 test("background cleanup failure does not retain cleaned status process", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   fixture.setSetting("background-refresh", true);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
@@ -3875,7 +3885,7 @@ test("single removal retries a failed force_exit without losing process state", 
       wait_finish() {},
     };
   });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
 
@@ -3918,7 +3928,7 @@ test("timeout retries force_exit failure and refresh recovers", () => {
     };
   });
   queuePayloadProcess(fixture, samplePayload());
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const statusItem = applet.menu.items[0];
   statusItem.activate();
   const process = fixture.subprocesses[0];
@@ -3977,7 +3987,7 @@ test("successful wait after timeout does not require kill confirmation", () => {
       },
     };
   });
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   applet.menu.items[0].activate();
   const process = fixture.subprocesses[0];
 
@@ -3994,7 +4004,7 @@ test("successful wait after timeout does not require kill confirmation", () => {
 
 test("500 completed refreshes leave no active resources", async () => {
   const fixture = loadApplet();
-  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
   const statusItem = applet.menu.items[0];
 
   for (let cycle = 0; cycle < 500; cycle += 1) {
@@ -4023,7 +4033,7 @@ test("100 injected add-remove cycles release processes streams signals timers an
   for (let cycle = 0; cycle < 100; cycle += 1) {
     const fixture = loadApplet();
     queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
-    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, cycle + 1);
+    const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, cycle + 1);
     const menu = applet.menu;
     const manager = applet.menuManager;
     const contextMenu = applet._applet_context_menu;
@@ -4080,7 +4090,7 @@ test("hostile settings matrix never reaches argv or background work", () => {
 
   for (const value of hostileValues) {
     const fixture = loadApplet();
-    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
     fixture.setSetting("tracked-agents", value);
     fixture.setSetting("background-refresh", true);
     applet.menu.items[0].activate();
@@ -4130,7 +4140,7 @@ test("hostile backend matrix is rejected without retaining attacker data", async
         for (const callback of callbacks) callback(this, null);
       },
     }));
-    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const applet = fixture.main({ uuid: "the-hive@H234598" }, "top", 24, 1);
     applet.menu.items[0].activate();
     fixture.subprocesses[0].emitDone();
     await Promise.resolve();

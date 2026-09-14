@@ -694,12 +694,12 @@ Bis dahin bleibt ein VM-Backend vollstaendig weggelassen.
 cd /home/teladi/codex-master
 # Die interaktive Registrierung wird ausschließlich aus dem validierten Runtime-Image ausgeführt.
 # Der Checkout selbst ist kein zulässiger MCP-Entrypoint.
-~/.local/lib/codex-master-runtime/bin/codex-master-mcp install
-~/.local/lib/codex-master-runtime/bin/codex-master-mcp doctor
-~/.local/lib/codex-master-runtime/bin/codex-master-mcp uninstall
-python3 scripts/codex-master-cinnamon-applet install --dry-run
-python3 scripts/codex-master-cinnamon-applet install --no-reload
-python3 scripts/codex-master-cinnamon-applet verify
+~/.local/lib/the-hive-runtime/bin/the-hive-mcp install
+~/.local/lib/the-hive-runtime/bin/the-hive-mcp doctor
+~/.local/lib/the-hive-runtime/bin/the-hive-mcp uninstall
+python3 scripts/the-hive-cinnamon-applet install --dry-run
+python3 scripts/the-hive-cinnamon-applet install --no-reload
+python3 scripts/the-hive-cinnamon-applet verify
 
 python3 -m codex_master.server start both --cwd /home/teladi/codex-master
 python3 -m codex_master.server status
@@ -876,9 +876,9 @@ Install MCP/plugin and applet with the repository-owned installers:
 
 ```sh
 ./bin/codex-master-mcp install
-./scripts/codex-master-cinnamon-applet install --dry-run
-./scripts/codex-master-cinnamon-applet install
-./scripts/codex-master-cinnamon-applet verify
+./scripts/the-hive-cinnamon-applet install --dry-run
+./scripts/the-hive-cinnamon-applet install
+./scripts/the-hive-cinnamon-applet verify
 ```
 
 The complete CLI reference is the repository manpage
@@ -904,7 +904,7 @@ Native-Bienen lifecycle coverage is active.
 Rollback the active applet tree with:
 
 ```sh
-./scripts/codex-master-cinnamon-applet rollback
+./scripts/the-hive-cinnamon-applet rollback
 ```
 
 `install` stages and hashes regular non-hardlinked source files, rejects
@@ -938,7 +938,7 @@ failed. Verify the installed files and CLI first; do not interpret ordinary
 
 `install`
 - accepts only the immutable, validated Runtime-Image entrypoint at
-  `~/.local/lib/codex-master-runtime/bin/codex-master-mcp`
+  `~/.local/lib/the-hive-runtime/bin/the-hive-mcp`
 - directly probes that entrypoint with MCP `initialize` before registering it
 - uses only the documented `/usr/local/bin/codex` identity for registration;
   its source and resolved executable are validated as root- or effective-user

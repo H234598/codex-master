@@ -1,0 +1,8 @@
+[Unit]
+Description=The Hive home broker socket
+
+[Socket]
+ListenSequentialPacket=/run/the-hive-home-broker.sock
+SocketMode=0600
+Service=the-hive-home-broker.service
+RemoveOnStop=yes

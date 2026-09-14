@@ -276,10 +276,10 @@ def agent_start_release():
             ReleasePayloadDigestV2("systemd_units", "d" * 64),
         ),
         CHPB_PROTOCOL,
-        "org.codex_master.HomeBrokerControl2",
+        "org.the_hive.HomeBrokerControl2",
         "StartDynamicTeamlead",
-        "codex-master-agent@.service",
-        "/usr/libexec/codex-master-agent-launcher",
+        "the-hive-agent@.service",
+        "/usr/libexec/the-hive-agent-launcher",
     )
 
 
@@ -303,9 +303,9 @@ def agent_start_envelope():
         13,
         PRINCIPAL,
         EXPECTED,
-        "codex-master-agent@c1\\x2cc2.service",
+        "the-hive-agent@c1\\x2cc2.service",
         identity,
-        AgentStartExecutablePin("/usr/libexec/codex-master-agent-launcher", "f" * 64),
+        AgentStartExecutablePin("/usr/libexec/the-hive-agent-launcher", "f" * 64),
         AgentStartEnvironmentProjection(
             (
                 ("CODEX_HOME", CANONICAL_AGENT_HOME),

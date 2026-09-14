@@ -19,6 +19,10 @@ type the_hive_home_broker_config_t;
 typeattribute the_hive_home_broker_config_t file_type;
 type the_hive_home_broker_state_t;
 typeattribute the_hive_home_broker_state_t file_type;
+type the_hive_control_t;
+typeattribute the_hive_control_t domain;
+type the_hive_home_broker_runtime_t;
+typeattribute the_hive_home_broker_runtime_t file_type;
 
 type the_hive_agent_t;
 typeattribute the_hive_agent_t domain;
@@ -47,6 +51,7 @@ allow the_hive_home_broker_t the_hive_home_broker_config_t:dir { getattr open re
 allow the_hive_home_broker_t the_hive_home_broker_config_t:file { getattr open read };
 allow the_hive_home_broker_t the_hive_home_broker_state_t:dir { add_name getattr open read remove_name search setattr write };
 allow the_hive_home_broker_t the_hive_home_broker_state_t:file { append create getattr open read setattr unlink write };
+allow the_hive_control_t the_hive_home_broker_runtime_t:sock_file write;
 
 allow the_hive_agent_t the_hive_agent_home_t:dir { add_name getattr open read remove_name search setattr write };
 allow the_hive_agent_t the_hive_agent_home_t:file { append create getattr open read setattr unlink write };

@@ -9,7 +9,7 @@ const St = imports.gi.St;
 const ByteArray = imports.byteArray;
 
 const LABEL = "Flottenmanagement";
-const UUID = "codex-master@H234598";
+const UUID = "the-hive@H234598";
 const APPLET_STATUS_TIMEOUT_MILLISECONDS = 10 * 1000;
 const APPLET_ACTION_TIMEOUT_MILLISECONDS = 120 * 1000;
 const CONTROL_CENTER_LAUNCH_TIMEOUT_MILLISECONDS = 10 * 1000;
@@ -646,7 +646,7 @@ FlottenmanagementApplet.prototype = {
     _trackedStatusArgv() {
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
         return [
-            home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp",
+            home + "/.local/lib/the-hive-runtime/bin/the-hive-mcp",
             APPLET_STATUS_COMMAND,
             "--schema-version",
             String(APPLET_STATUS_SCHEMA_VERSION),
@@ -703,7 +703,7 @@ FlottenmanagementApplet.prototype = {
         const terminal = this._normalizeTerminalCommand(this.terminalCommand);
         if (!terminal) return;
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
-        const statusCommand = home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp";
+        const statusCommand = home + "/.local/lib/the-hive-runtime/bin/the-hive-mcp";
         const shellQuote = (value) => `'${String(value).replace(/'/g, "'\\''")}'`;
         const terminalName = terminal.split("/").pop();
         const terminalExecutionArgs = terminalName === "gnome-terminal" ? ["--"] : ["-e"];
@@ -730,7 +730,7 @@ FlottenmanagementApplet.prototype = {
 
     _controlCenterArgv(page = null) {
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
-        const argv = [home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp", "control-center-launch"];
+        const argv = [home + "/.local/lib/the-hive-runtime/bin/the-hive-mcp", "control-center-launch"];
         if (page === "ollama") argv.push("--page", "ollama");
         return argv;
     },
@@ -746,7 +746,7 @@ FlottenmanagementApplet.prototype = {
         }
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
         return [
-            home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp",
+            home + "/.local/lib/the-hive-runtime/bin/the-hive-mcp",
             APPLET_ACTION_COMMAND,
             actionRequest.action,
             actionRequest.agent,
@@ -848,7 +848,7 @@ FlottenmanagementApplet.prototype = {
             throw new Error("Overview home unavailable");
         }
         const argv = [
-            home + "/.local/lib/codex-master-runtime/bin/codex-master-mcp",
+            home + "/.local/lib/the-hive-runtime/bin/the-hive-mcp",
             "fleet",
             APPLET_OVERVIEW_COMMAND,
             "--format",

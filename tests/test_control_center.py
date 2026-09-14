@@ -547,6 +547,16 @@ class ControlCenterViewModelTest(unittest.TestCase):
 
 
 class ControlCenterControllerTest(unittest.TestCase):
+    def test_operation_controller_uses_the_hive_thread_prefix(self) -> None:
+        controller = control_center.OperationController(
+            dispatch=lambda _name, _args: {"ok": True},
+            schedule=lambda callback, *args: (callback(*args), 1)[1],
+        )
+        try:
+            self.assertEqual(controller._executor._thread_name_prefix, "the-hive-control")
+        finally:
+            self.assertTrue(controller.close())
+
     def test_backend_timeout_policy_and_prepared_abort_restore_idle_dispatcher(self) -> None:
         self.assertEqual(
             control_center.backend_timeout_seconds(
@@ -642,7 +652,7 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertEqual(dispatcher("agent_status", {}), {"ok": True, "name": "agent_status"})
 
     def test_subprocess_dispatcher_defaults_to_the_runtime_image_entrypoint(self) -> None:
-        entrypoint = Path("/tmp/codex-master-runtime/bin/codex-master-mcp")
+        entrypoint = Path("/tmp/the-hive-runtime/bin/the-hive-mcp")
 
         with patch.object(control_center, "runtime_mcp_entrypoint", return_value=entrypoint):
             dispatcher = control_center.SubprocessToolDispatcher()
@@ -1196,6 +1206,15 @@ class ControlCenterGtkBoundaryTest(unittest.TestCase):
                 control_center.launch_gtk_application(["--page", "ollama"]), 23
             )
 
+        Gtk.init_check.assert_called_once_with(
+            ["the-hive-control-center", "--page", "ollama"]
+        )
+        Gtk.Application.assert_called_once_with(
+            application_id="de.teladi.TheHive.ControlCenter"
+        )
+        application.run.assert_called_once_with(
+            ["the-hive-control-center", "--page", "ollama"]
+        )
         window_class.assert_called_once_with(Gtk, mock_load.return_value[1], application)
         self.assertEqual(window.show.call_args_list[0].args, ("ollama",))
         self.assertEqual(window.show.call_count, 2)

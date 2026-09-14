@@ -7,11 +7,10 @@ sources, and its SELinux source and file contexts. It records evidence and
 release boundaries only; it does not install, activate, connect, or invoke
 anything.
 
-No installation, policy load, unit activation, or runtime invocation occurs in this runbook.
+No installation, policy load, unit activation, connection, or runtime invocation occurs in this runbook.
 
-Explizit unconnected; kein Socket/SCM/Netzpfad. The broker and agent are not
-connected by this runbook. `AF_UNIX` is an offline unit restriction, not a
-runtime connection contract.
+The socket unit is a tracked release artifact only. This runbook neither
+activates it nor establishes a broker/agent connection.
 
 The root-owned manifest/verifier is a release-artifact boundary; the verifier checks declared entries for uid/gid zero.
 
@@ -25,14 +24,16 @@ The closed inventory for this audit is:
   canonical bytes, SHA-256, and Python import closure verification.
 - `systemd/system/the-hive-home-broker.service` — root-owned broker
   verifier unit source.
+- `systemd/system/the-hive-home-broker.socket` — bound broker socket unit
+  source.
 - `systemd/system/the-hive-agent@.service` — dynamic-user agent launcher
   unit source.
 - `systemd/selinux/the_hive_home_broker.te` — broker and agent policy
   source for static review.
 - `systemd/selinux/the_hive_home_broker.fc` — static file-context source.
 
-No additional path is introduced by this runbook. Evidence is limited to
-these named artifacts and the release artifact boundary described below.
+Evidence is limited to these named artifacts and the release artifact boundary
+described below.
 
 ## Offline evidence checklist
 
@@ -75,8 +76,10 @@ separate:
   activation edge is part of this runbook.
 - Check `RestrictAddressFamilies=AF_UNIX` and
   `SystemCallFilter=~@mount @module @keyring bpf` in both unit sources.
-- Check that the source does not introduce a socket, SCM, or network path.
-  The units remain explicitly unconnected.
+- Check that the socket unit binds only
+  `/run/the-hive-home-broker.sock`, has `SocketMode=0600`, targets the broker
+  service, and has no `[Install]` activation edge. The audit does not activate
+  the socket or infer a broker/agent connection.
 
 The unit audit is source review only. It does not establish Fedora runtime
 semantics, filesystem ownership, activation state, or live permissions.
@@ -94,8 +97,9 @@ Perform only a statische Source/Filecontexts-Audit of
   network permission may be added.
 - Confirm every file-context security level is `s0 ohne Kategorie`. No MCS
   category, SELinux user, static UID, or static GID is encoded in the source.
-- Treat the broker and agent as explicitly unconnected. No socket/SCM/Netzpfad
-  may be inferred from a type name or from static file-context text.
+- Treat the broker and agent as explicitly unconnected. The sole broker socket
+  file-context is `/run/the-hive-home-broker.sock` with the declared runtime
+  type; no SCM or network path may be inferred from it.
 
 This SELinux review is static source and file-context review only. It does
 not load policy, relabel files, change enforcement, or validate a running

@@ -4,7 +4,7 @@ Description=The Hive agent launcher
 [Service]
 Type=exec
 DynamicUser=yes
-ExecStart=/usr/bin/python3 -I -E -s -P /usr/libexec/the-hive-agent-launcher
+ExecStart=/usr/libexec/the-hive-agent-launcher
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

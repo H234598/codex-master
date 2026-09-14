@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 import importlib
 import json
@@ -22,7 +23,9 @@ def _write_file(path: Path, text: str, mode: int = 0o644) -> None:
     path.chmod(mode)
 
 
-def materialize_runtime_image(tmp_path: Path) -> Path:
+def materialize_runtime_image(
+    tmp_path: Path, *, before_manifest: Callable[[Path], None] | None = None
+) -> Path:
     root = tmp_path / "the-hive-runtime"
     root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     root.mkdir(mode=0o700)
@@ -86,6 +89,8 @@ def materialize_runtime_image(tmp_path: Path) -> Path:
     installer = runpy.run_path(
         str(Path(__file__).resolve().parents[1] / "scripts" / "the-hive-hive-hourly-probe-install")
     )
+    if before_manifest is not None:
+        before_manifest(root)
     installer["_write_runtime_image_manifest"](root=root, commit="a" * 40)
     return root
 
@@ -325,19 +330,26 @@ def test_runtime_layout_rejects_legacy_plugin_skill_metadata_bindings(
 ) -> None:
     module = _runtime_layout_module()
     assert module is not None
-    root = materialize_runtime_image(tmp_path)
+    def add_legacy_binding(root: Path) -> None:
+        if legacy_binding == "plugin_name":
+            plugin_path = root / ".codex-plugin" / "plugin.json"
+            plugin = json.loads(plugin_path.read_text(encoding="utf-8"))
+            plugin["name"] = "codex-master"
+            plugin_path.write_text(json.dumps(plugin), encoding="utf-8")
+        elif legacy_binding == "app_key":
+            app_path = root / ".app.json"
+            app_path.write_text(
+                json.dumps({"apps": {"codex-master": {"id": "connector"}}}),
+                encoding="utf-8",
+            )
+        else:
+            target = root / "skills" / "the-hive-fleet"
+            target.rename(root / "skills" / "codex-master-fleet")
 
-    if legacy_binding == "plugin_name":
-        plugin_path = root / ".codex-plugin" / "plugin.json"
-        plugin = json.loads(plugin_path.read_text(encoding="utf-8"))
-        plugin["name"] = "codex-master"
-        plugin_path.write_text(json.dumps(plugin), encoding="utf-8")
-    elif legacy_binding == "app_key":
-        app_path = root / ".app.json"
-        app_path.write_text(json.dumps({"apps": {"codex-master": {"id": "connector"}}}), encoding="utf-8")
-    else:
-        target = root / "skills" / "the-hive-fleet"
-        target.rename(root / "skills" / "codex-master-fleet")
+    root = materialize_runtime_image(tmp_path, before_manifest=add_legacy_binding)
+    manifest, digest = module._validated_manifest(root)
+    assert manifest["schema_version"] == 2
+    assert digest.startswith("sha256:")
 
     with pytest.raises(module.LayoutError):
         module.RuntimeLayout.from_runtime_root(root)

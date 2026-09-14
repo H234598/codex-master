@@ -19,7 +19,7 @@ import time
 from typing import Any
 
 
-UUID = "codex-master@H234598"
+UUID = "the-hive@H234598"
 DBUS_TIMEOUT_SECONDS = 10.0
 DBUS_OUTPUT_LIMIT_BYTES = 64 * 1024
 RELOAD_SIGNAL_TIMEOUT_SECONDS = 5.0
@@ -715,7 +715,7 @@ def verify() -> dict[str, Any]:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Install and verify the codex-master Cinnamon applet.")
+    parser = argparse.ArgumentParser(description="Install and verify The Hive Cinnamon applet.")
     commands = parser.add_subparsers(dest="command", required=True)
     install_parser = commands.add_parser("install")
     install_parser.add_argument("--dry-run", action="store_true")

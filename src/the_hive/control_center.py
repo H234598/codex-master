@@ -1,4 +1,4 @@
-"""GTK control center for codex-master.
+"""GTK control center for The Hive.
 
 Business state stays independent from GTK so contract and concurrency behavior
 remain headless-testable.
@@ -47,7 +47,7 @@ from the_hive.fleet_control import (
 )
 
 
-APPLICATION_ID = "de.teladi.CodexMaster.ControlCenter"
+APPLICATION_ID = "de.teladi.TheHive.ControlCenter"
 PAGE_SIZE = 20
 MAX_FILTER_CHARS = 64
 MAX_PAGE_ROWS = 20
@@ -700,7 +700,7 @@ class OperationController:
     ) -> None:
         self._dispatch = dispatch or SubprocessToolDispatcher()
         self._schedule = schedule
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-master-control")
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="the-hive-control")
         self._lock = threading.Lock()
         self._busy = False
         self._closed = False
@@ -1940,7 +1940,7 @@ def launch_gtk_application(args: list[str]) -> int:
         Gtk, GLib = load_gtk()
     except RuntimeError as exc:
         raise AgentError("control-center GTK is unavailable") from exc
-    initialized, _gtk_args = Gtk.init_check(["codex-master-control-center", *args])
+    initialized, _gtk_args = Gtk.init_check(["the-hive-control-center", *args])
     if not initialized:
         raise AgentError("control-center display is unavailable")
     application = Gtk.Application(application_id=APPLICATION_ID)
@@ -1955,7 +1955,7 @@ def launch_gtk_application(args: list[str]) -> int:
         window.show(page)
 
     application.connect("activate", activate)
-    return int(application.run(["codex-master-control-center", *args]))
+    return int(application.run(["the-hive-control-center", *args]))
 
 
 def run_control_center(args: list[str] | None = None) -> int:

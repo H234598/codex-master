@@ -3,6 +3,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[1]
 BROKER_UNIT = REPO_ROOT / "systemd/system/the-hive-home-broker.service"
+SOCKET_UNIT = REPO_ROOT / "systemd/system/the-hive-home-broker.socket"
 AGENT_UNIT = REPO_ROOT / "systemd/system/the-hive-agent@.service"
 
 
@@ -24,6 +25,20 @@ def _parse_unit(path: Path) -> dict[str, dict[str, list[str]]]:
         assert separator, f"invalid directive at line {line_number}"
         sections[section].setdefault(key, []).append(value)
     return sections
+
+
+def test_broker_socket_unit_has_the_bound_release_contract():
+    unit = _parse_unit(SOCKET_UNIT)
+
+    assert set(unit) == {"Unit", "Socket"}
+    assert unit["Unit"] == {"Description": ["The Hive home broker socket"]}
+    assert unit["Socket"] == {
+        "ListenSequentialPacket": ["/run/the-hive-home-broker.sock"],
+        "SocketMode": ["0600"],
+        "Service": ["the-hive-home-broker.service"],
+        "RemoveOnStop": ["yes"],
+    }
+    assert "Install" not in unit
 
 
 def test_broker_unit_has_static_root_verifier_contract():
@@ -58,9 +73,7 @@ def test_broker_unit_has_static_root_verifier_contract():
     assert service["Environment"] == ["PATH=/usr/sbin:/usr/bin"]
     assert service["StateDirectory"] == ["codex-master-home-broker"]
     assert service["StateDirectoryMode"] == ["0700"]
-    assert service["ExecStart"] == [
-        "/usr/bin/python3 -I -E -s -P /usr/libexec/the-hive-home-broker"
-    ]
+    assert service["ExecStart"] == ["/usr/libexec/the-hive-home-broker"]
     assert service["NoNewPrivileges"] == ["yes"]
     assert service["ProtectSystem"] == ["strict"]
     assert service["ProtectHome"] == ["yes"]
@@ -140,9 +153,7 @@ def test_agent_template_has_dynamic_user_launcher_contract_without_activation_ed
     assert service["PrivateMounts"] == ["yes"]
     assert "User" not in service
     assert "Group" not in service
-    assert service["ExecStart"] == [
-        "/usr/bin/python3 -I -E -s -P /usr/libexec/the-hive-agent-launcher"
-    ]
+    assert service["ExecStart"] == ["/usr/libexec/the-hive-agent-launcher"]
     assert service["NoNewPrivileges"] == ["yes"]
     assert service["ProtectSystem"] == ["strict"]
     assert service["ProtectHome"] == ["yes"]
