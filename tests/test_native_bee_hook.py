@@ -16,6 +16,7 @@ HOOK = REPO_ROOT / "hooks" / "native_bee_event.py"
 SPAWN_HOOK = REPO_ROOT / "hooks" / "native_spawn_admission.py"
 HOOKS_MANIFEST = REPO_ROOT / "hooks" / "hooks.json"
 PLUGIN_MANIFEST = REPO_ROOT / ".codex-plugin" / "plugin.json"
+APP_MANIFEST = REPO_ROOT / ".app.json"
 
 
 class NativeBeeHookTest(unittest.TestCase):
@@ -164,9 +165,23 @@ class NativeBeeHookTest(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         reserve.assert_called_once_with(payload)
 
-    def test_plugin_manifest_points_at_hooks_manifest(self) -> None:
+    def test_plugin_and_app_manifests_bind_only_the_canonical_the_hive_identity(self) -> None:
         payload = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
+        self.assertEqual(payload["name"], "the-hive")
+        self.assertEqual(payload["homepage"], "https://github.com/H234598/the-hive")
+        self.assertEqual(payload["repository"], "https://github.com/H234598/the-hive")
+        self.assertIn("the-hive-mcp", payload["description"])
+        self.assertNotIn("codex-master-mcp", payload["description"])
+        self.assertNotIn("compatibility alias", payload["description"].casefold())
+        self.assertNotIn("compatibility alias", payload["interface"]["longDescription"].casefold())
         self.assertEqual(payload["hooks"], "./hooks/hooks.json")
+        self.assertEqual(json.loads(APP_MANIFEST.read_text(encoding="utf-8"))["apps"], {"the-hive": {"id": "connector_26697a678b7ec999dc005131eb5c087c"}})
+
+    def test_hooks_import_only_the_canonical_python_server_package(self) -> None:
+        for hook in (HOOK, SPAWN_HOOK):
+            source = hook.read_text(encoding="utf-8")
+            self.assertIn("from the_hive.server import", source)
+            self.assertNotIn("from codex_master.server import", source)
 
     def test_pretooluse_spawn_hook_denies_when_state_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

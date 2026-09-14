@@ -67,7 +67,7 @@ START_TIME = 7
 PRINCIPAL = PrincipalBinding(
     "bee_1", 3, 9, 17, 29, "1" * 32, "c0,c1", 4
 )
-EXPECTED_LABEL = b"system_u:system_r:codex_master_agent_t:s0:c0,c1\0"
+EXPECTED_LABEL = b"system_u:system_r:the_hive_agent_t:s0:c0,c1\0"
 SO_PEERSEC_NAME_MAX_BYTES = 255
 WAL_MAGIC = b"CHPB/2-WAL-Magic"
 
@@ -83,15 +83,15 @@ def release_spec(**changes: object) -> BrokerReleaseSpec:
         "provider_abi": "provider-v1",
         "unit_digest": "f" * 64,
         "selinux_digest": "0" * 64,
-        "socket_unit": "codex-master-home-broker.socket",
-        "service_unit": "codex-master-home-broker.service",
-        "system_bus_name": "org.codex_master.HomeBrokerControl",
-        "system_bus_path": "/org/codex_master/HomeBrokerControl",
-        "system_bus_interface": "org.codex_master.HomeBrokerControl1",
-        "broker_domain": "codex_master_home_broker_t",
-        "gateway_domain": "codex_master_control_t",
-        "socket_type": "codex_master_home_broker_runtime_t",
-        "agent_domain": "codex_master_agent_t",
+        "socket_unit": "the-hive-home-broker.socket",
+        "service_unit": "the-hive-home-broker.service",
+        "system_bus_name": "org.the_hive.HomeBrokerControl",
+        "system_bus_path": "/org/the_hive/HomeBrokerControl",
+        "system_bus_interface": "org.the_hive.HomeBrokerControl1",
+        "broker_domain": "the_hive_home_broker_t",
+        "gateway_domain": "the_hive_control_t",
+        "socket_type": "the_hive_home_broker_runtime_t",
+        "agent_domain": "the_hive_agent_t",
     }
     values.update(changes)
     return BrokerReleaseSpec(**values)
@@ -107,7 +107,7 @@ def agent_start_envelope() -> AgentStartEnvelope:
     )
     attestation = HomeAttestation(
         binding,
-        "/run/codex-master-agent/home",
+        "/run/the-hive-agent/home",
         DirectoryIdentity(0, 1, 0o40700),
         "a" * 64,
         "c0,c1",
@@ -122,10 +122,10 @@ def agent_start_envelope() -> AgentStartEnvelope:
             ReleasePayloadDigestV2("systemd_units", "4" * 64),
         ),
         CHPB_PROTOCOL,
-        "org.codex_master.HomeBrokerControl2",
+        "org.the_hive.HomeBrokerControl2",
         "StartDynamicTeamlead",
-        "codex-master-agent@.service",
-        "/usr/libexec/codex-master-agent-launcher",
+        "the-hive-agent@.service",
+        "/usr/libexec/the-hive-agent-launcher",
     )
     return AgentStartEnvelope(
         CHPB_PROTOCOL,
@@ -136,18 +136,18 @@ def agent_start_envelope() -> AgentStartEnvelope:
         13,
         PRINCIPAL,
         BindingExpectation("bee_1", 3, 9, 7, "a" * 64, 4),
-        "codex-master-agent@c0\\x2cc1.service",
+        "the-hive-agent@c0\\x2cc1.service",
         BrokerIdentity(
             "bee_1", 3, "c0,c1", "slot-1", 7, "a" * 64, "b" * 64, 4
         ),
         AgentStartExecutablePin(
-            "/usr/libexec/codex-master-agent-launcher", "b" * 64
+            "/usr/libexec/the-hive-agent-launcher", "b" * 64
         ),
         AgentStartEnvironmentProjection(
             (
-                ("CODEX_HOME", "/run/codex-master-agent/home"),
-                ("GEMINI_CLI_HOME", "/run/codex-master-agent/home"),
-                ("HOME", "/run/codex-master-agent/home"),
+                ("CODEX_HOME", "/run/the-hive-agent/home"),
+                ("GEMINI_CLI_HOME", "/run/the-hive-agent/home"),
+                ("HOME", "/run/the-hive-agent/home"),
             )
         ),
         attestation,
@@ -945,7 +945,7 @@ def test_wal_composition_does_not_use_peersec_mcs_as_root_owned_key(
     assert_wal_composition_denied(
         RecordingOperations(
             events,
-            context=b"system_u:system_r:codex_master_agent_t:s0:c0,c2\0",
+            context=b"system_u:system_r:the_hive_agent_t:s0:c0,c2\0",
         ),
         RecordingLinuxOperations(events),
         wal_operations,
@@ -1271,18 +1271,18 @@ def test_non_enforcing_or_non_bool_selinux_state_is_denied(enforcing: object) ->
     "context",
     [
         None,
-        "system_u:system_r:codex_master_agent_t:s0:c0,c1\0",
-        b"system_u:system_r:codex_master_agent_t:s0:c0,c1",
-        b"system_u:system_r:codex_master_agent_t:s0:c0,c1\0\0",
-        b"system_u:system_r:codex_master_agent_t\0:s0:c0,c1\0",
-        b"system_u:system_r:codex_master_agent_t:s0:c0,c1\0extra",
-        b"system_u:system_r:codex_master_agent_t:s0:c0,c1\0\xff",
-        b"system_u::codex_master_agent_t:s0:c0,c1\0",
+        "system_u:system_r:the_hive_agent_t:s0:c0,c1\0",
+        b"system_u:system_r:the_hive_agent_t:s0:c0,c1",
+        b"system_u:system_r:the_hive_agent_t:s0:c0,c1\0\0",
+        b"system_u:system_r:the_hive_agent_t\0:s0:c0,c1\0",
+        b"system_u:system_r:the_hive_agent_t:s0:c0,c1\0extra",
+        b"system_u:system_r:the_hive_agent_t:s0:c0,c1\0\xff",
+        b"system_u::the_hive_agent_t:s0:c0,c1\0",
         b"system_u:system_r:wrong_agent_t:s0:c0,c1\0",
-        b"system_u:system_r:codex_master_agent_t:s1:c0,c1\0",
-        b"system_u:system_r:codex_master_agent_t:s0:c0,c2\0",
-        b"system_u:system_r:codex_master_agent_t:s0:\0",
-        b"system_u:system_r:codex_master_agent_t:s0:c0,c1\xff",
+        b"system_u:system_r:the_hive_agent_t:s1:c0,c1\0",
+        b"system_u:system_r:the_hive_agent_t:s0:c0,c2\0",
+        b"system_u:system_r:the_hive_agent_t:s0:\0",
+        b"system_u:system_r:the_hive_agent_t:s0:c0,c1\xff",
     ],
 )
 def test_malformed_or_unbound_peer_security_context_is_denied(
@@ -1297,7 +1297,7 @@ def test_malformed_or_unbound_peer_security_context_is_denied(
 
 def test_peer_security_context_accepts_linux_name_max_bytes() -> None:
     events: list[tuple[object, ...]] = []
-    fixed = b":system_r:codex_master_agent_t:s0:c1022,c1023\0"
+    fixed = b":system_r:the_hive_agent_t:s0:c1022,c1023\0"
     context = b"u" * (SO_PEERSEC_NAME_MAX_BYTES - len(fixed)) + fixed
     expected = replace(PRINCIPAL, mcs_pair="c1022,c1023")
 
@@ -1314,7 +1314,7 @@ def test_peer_security_context_accepts_linux_name_max_bytes() -> None:
 
 def test_peer_security_context_rejects_linux_name_max_plus_one_before_decode() -> None:
     events: list[tuple[object, ...]] = []
-    fixed = b":system_r:codex_master_agent_t:s0:c1022,c1023\0"
+    fixed = b":system_r:the_hive_agent_t:s0:c1022,c1023\0"
     context = b"u" + b"u" * (SO_PEERSEC_NAME_MAX_BYTES - len(fixed)) + fixed
     expected = replace(PRINCIPAL, mcs_pair="c1022,c1023")
 
@@ -1370,7 +1370,7 @@ def test_peer_security_context_checks_size_before_decode() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("agent_domain", "codex_master_agent_exec_t"),
+        ("agent_domain", "the_hive_agent_exec_t"),
         ("agent_domain", "unconfined_t"),
         ("agent_domain", None),
         ("socket_type", "untrusted_runtime_t"),
@@ -2595,7 +2595,7 @@ def test_receive_admitted_seqpacket_request_propagates_canonical_decode_errors(
 
 
 def test_agent_start_peer_reattestation_binds_so_peercred_and_peersec():
-    unit_name = "codex-master-agent@c0\\x2cc1.service"
+    unit_name = "the-hive-agent@c0\\x2cc1.service"
     control_group = f"/user.slice/user-1000.slice/{unit_name}"
     events: list[tuple[object, ...]] = []
     operations = RecordingOperations(events, credentials=(PEER_PID, 1000, 1001))
@@ -2635,7 +2635,7 @@ def test_agent_start_peer_reattestation_rejects_socket_credential_and_label_drif
     operations,
 ):
     events = operations.events
-    unit_name = "codex-master-agent@c0\\x2cc1.service"
+    unit_name = "the-hive-agent@c0\\x2cc1.service"
     control_group = f"/user.slice/user-1000.slice/{unit_name}"
     linux_operations = RecordingLinuxOperations(
         events,
@@ -2653,19 +2653,19 @@ def test_agent_start_peer_reattestation_rejects_socket_credential_and_label_drif
 @pytest.mark.parametrize(
     "context",
     (
-        b"other_u:system_r:codex_master_agent_t:s0:c0,c1\0",
-        b"system_u:other_r:codex_master_agent_t:s0:c0,c1\0",
+        b"other_u:system_r:the_hive_agent_t:s0:c0,c1\0",
+        b"system_u:other_r:the_hive_agent_t:s0:c0,c1\0",
         b"system_u:system_r:wrong_t:s0:c0,c1\0",
-        b"system_u:system_r:codex_master_agent_t:s0:c0,c2\0",
-        b"system_u:system_r:codex_master_agent_t:s0:c0,c1",
-        b"system_u:system_r:codex_master_agent_t:s0:c0,c1\0\0",
-        b"system_u:system_r:codex_master_agent_t:s0:c0,c1\xff\0",
+        b"system_u:system_r:the_hive_agent_t:s0:c0,c2\0",
+        b"system_u:system_r:the_hive_agent_t:s0:c0,c1",
+        b"system_u:system_r:the_hive_agent_t:s0:c0,c1\0\0",
+        b"system_u:system_r:the_hive_agent_t:s0:c0,c1\xff\0",
     ),
 )
 def test_agent_start_peer_reattestation_rejects_inexact_full_peersec(context):
     events: list[tuple[object, ...]] = []
     operations = RecordingOperations(events, context=context)
-    unit_name = "codex-master-agent@c0\\x2cc1.service"
+    unit_name = "the-hive-agent@c0\\x2cc1.service"
     control_group = f"/user.slice/user-1000.slice/{unit_name}"
     linux_operations = RecordingLinuxOperations(
         events,

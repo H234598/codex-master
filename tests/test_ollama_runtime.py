@@ -449,7 +449,7 @@ def test_start_uses_fixed_argv_allowlisted_environment_and_exact_cpu_properties(
         "--quiet",
         "--collect",
         f"--unit={result.unit_name}",
-        "--slice=codex-master.slice",
+        "--slice=the-hive.slice",
         "--property=AllowedCPUs=0-3",
         "--property=CPUQuota=350%",
         "--property=CPUWeight=40",

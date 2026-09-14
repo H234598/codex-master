@@ -60,11 +60,11 @@ _REQUIRED_FILES: tuple[tuple[str, int], ...] = (
     (".mcp.json", 0o644),
     (".app.json", 0o644),
     ("hooks/hooks.json", 0o644),
-    ("skills/codex-master-fleet/SKILL.md", 0o644),
+    ("skills/the-hive-fleet/SKILL.md", 0o644),
     ("codex-hive.json", 0o644),
     ("codex-agent-classes.json", 0o644),
-    ("systemd/user/codex-master-resource-monitor.service", 0o644),
-    ("systemd/user/codex-master.slice", 0o644),
+    ("systemd/user/the-hive-resource-monitor.service", 0o644),
+    ("systemd/user/the-hive.slice", 0o644),
     (_RUNTIME_SPAWN_HELPER, 0o755),
     (_MANIFEST_NAME, 0o644),
 )
@@ -225,7 +225,7 @@ def _exact_relative_reference(value: object, expected: str) -> None:
 
 def _validate_metadata(root: Path) -> None:
     plugin = _read_json_object(root, ".codex-plugin/plugin.json")
-    if plugin.get("name") != "codex-master" or not isinstance(plugin.get("version"), str):
+    if plugin.get("name") != "the-hive" or not isinstance(plugin.get("version"), str):
         raise _invalid()
     _exact_relative_reference(plugin.get("skills"), "./skills/")
     _exact_relative_reference(plugin.get("mcpServers"), "./.mcp.json")
@@ -252,14 +252,14 @@ def _validate_metadata(root: Path) -> None:
         raise _invalid()
 
     apps = _read_json_object(root, ".app.json").get("apps")
-    if not isinstance(apps, dict) or not isinstance(apps.get("codex-master"), dict):
+    if not isinstance(apps, dict) or not isinstance(apps.get("the-hive"), dict):
         raise _invalid()
     hooks = _read_json_object(root, "hooks/hooks.json").get("hooks")
     if not isinstance(hooks, dict):
         raise _invalid()
     _read_json_object(root, "codex-hive.json")
     _read_json_object(root, "codex-agent-classes.json")
-    if not _read_regular_text(root, "skills/codex-master-fleet/SKILL.md", max_bytes=_MAX_METADATA_BYTES).strip():
+    if not _read_regular_text(root, "skills/the-hive-fleet/SKILL.md", max_bytes=_MAX_METADATA_BYTES).strip():
         raise _invalid()
 
 
@@ -273,8 +273,8 @@ def _release_metadata(manifest: dict[str, object]) -> dict[str, object]:
         "python_tree": "src/the_hive",
         "monitor_entrypoint": "bin/the-hive-resource-monitor",
         "h4_units": [
-            "systemd/user/codex-master-resource-monitor.service",
-            "systemd/user/codex-master.slice",
+            "systemd/user/the-hive-resource-monitor.service",
+            "systemd/user/the-hive.slice",
         ],
         "bind_sources": [
             "bin/the-hive-resource-monitor", "src/the_hive",

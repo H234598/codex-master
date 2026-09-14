@@ -440,7 +440,7 @@ def main() -> int:
             )
             return 0
         try:
-            from codex_master.server import activate_native_agent_resume
+            from the_hive.server import activate_native_agent_resume
 
             result = activate_native_agent_resume(payload)
         except Exception:

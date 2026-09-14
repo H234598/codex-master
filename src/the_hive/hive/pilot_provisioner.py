@@ -4,7 +4,7 @@ This module owns only the offline administrative transition from the checked-in
 empty Shadow config to the explicitly authorised pilot.  It intentionally
 does not issue an account attestation, start a process, install anything, or
 provide a second status/controller path.  Runtime/Doctor continue to assemble
-the authoritative state through :mod:`codex_master.hive.runtime`.
+the authoritative state through :mod:`the_hive.hive.runtime`.
 """
 
 from __future__ import annotations
@@ -801,7 +801,7 @@ def main(arguments: list[str] | None = None) -> int:
     """Run the sole tracked administrative interface for this offline slice."""
 
     parser = argparse.ArgumentParser(
-        prog="codex-master-hive-pilot-provisioner",
+        prog="the-hive-hive-pilot-provisioner",
         description="Plan or reversibly administer the single local Hive enforced pilot.",
     )
     subparsers = parser.add_subparsers(dest="operation", required=True)

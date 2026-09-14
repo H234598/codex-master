@@ -11,11 +11,11 @@ import pytest
 
 REPO_ROOT = Path(__file__).parents[1]
 LIBEXEC = REPO_ROOT / "systemd/libexec"
-BOOTSTRAP_FILE = LIBEXEC / "codex_master_bootstrap.py"
+BOOTSTRAP_FILE = LIBEXEC / "the_hive_bootstrap.py"
 WRAPPERS = (
-    LIBEXEC / "codex-master-broker-verify",
-    LIBEXEC / "codex-master-home-broker",
-    LIBEXEC / "codex-master-agent-launcher",
+    LIBEXEC / "the-hive-broker-verify",
+    LIBEXEC / "the-hive-home-broker",
+    LIBEXEC / "the-hive-agent-launcher",
 )
 BOOTSTRAP = runpy.run_path(str(BOOTSTRAP_FILE))
 BootstrapError = BOOTSTRAP["BootstrapError"]
@@ -29,10 +29,10 @@ run_after_verified = BOOTSTRAP["run_after_verified"]
 
 PAYLOAD_ROOT = BOOTSTRAP["PAYLOAD_ROOT"]
 MANIFEST_PATH = BOOTSTRAP["MANIFEST_PATH"]
-FAILURE = "codex-master bootstrap verification failed"
+FAILURE = "the-hive bootstrap verification failed"
 PAYLOAD = {
-    "bin/codex-master-home-broker": (b"broker", 0o755),
-    "python/codex_master/fleet_agent_launcher.py": (b"agent", 0o644),
+    "bin/the-hive-home-broker": (b"broker", 0o755),
+    "python/the_hive/fleet_agent_launcher.py": (b"agent", 0o644),
 }
 
 
@@ -48,7 +48,7 @@ def _document(
     payload_entries: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
-        "format": "codex-master-home-broker-manifest-v1",
+        "format": "the-hive-home-broker-manifest-v1",
         "payload_version": "0.10.5",
         "payload_entries": payload_entries
         if payload_entries is not None
@@ -201,7 +201,7 @@ def test_parse_manifest_rejects_removed_or_invalid_top_level_schema(change) -> N
 
 def test_parse_manifest_rejects_duplicate_nested_entry_keys() -> None:
     raw = (
-        b'{"format":"codex-master-home-broker-manifest-v1",'
+        b'{"format":"the-hive-home-broker-manifest-v1",'
         b'"payload_version":"0.10.5","payload_entries":['
         b'{"path":"a","path":"b","sha256":"' + b"a" * 64 + b'","mode":420}]}'
     )
@@ -307,14 +307,14 @@ def test_dispatch_verifies_exact_payload_closure_for_all_modes() -> None:
 @pytest.mark.parametrize(
     "paths",
     [
-        ("bin/codex-master-home-broker",),
+        ("bin/the-hive-home-broker",),
         (
-            "bin/codex-master-home-broker",
-            "python/codex_master/fleet_agent_launcher.py",
+            "bin/the-hive-home-broker",
+            "python/the_hive/fleet_agent_launcher.py",
             "extra",
         ),
-        ("bin/codex-master-home-broker", "bin/codex-master-home-broker"),
-        ("../secret", "python/codex_master/fleet_agent_launcher.py"),
+        ("bin/the-hive-home-broker", "bin/the-hive-home-broker"),
+        ("../secret", "python/the_hive/fleet_agent_launcher.py"),
     ],
 )
 def test_dispatch_rejects_missing_extra_duplicate_or_traversal_paths(paths) -> None:
@@ -340,7 +340,7 @@ def test_dispatch_rejects_missing_extra_duplicate_or_traversal_paths(paths) -> N
 )
 def test_dispatch_rejects_untrusted_payload_stat(stat_value: FileStat) -> None:
     operations = _operations()
-    operations.stats[PAYLOAD_ROOT + "/bin/codex-master-home-broker"] = stat_value
+    operations.stats[PAYLOAD_ROOT + "/bin/the-hive-home-broker"] = stat_value
 
     _raises_bootstrap(dispatch, "verify", operations)
 
@@ -364,7 +364,7 @@ def test_dispatch_rejects_untrusted_manifest_stat(stat_value: FileStat) -> None:
 
 def test_dispatch_rejects_payload_hash_drift() -> None:
     operations = _operations()
-    operations.contents[PAYLOAD_ROOT + "/bin/codex-master-home-broker"] = b"changed"
+    operations.contents[PAYLOAD_ROOT + "/bin/the-hive-home-broker"] = b"changed"
 
     _raises_bootstrap(dispatch, "verify", operations)
 
@@ -456,14 +456,14 @@ def test_bootstrap_source_is_stdlib_only_and_has_no_package_import() -> None:
 
 def test_wrappers_have_constants_modes_and_static_security_order() -> None:
     constants = {
-        "PAYLOAD_PARENT": '"/usr/lib/codex-master-home-broker"',
+        "PAYLOAD_PARENT": '"/usr/lib/the-hive-home-broker"',
         "PAYLOAD_VERSION": '"0.10.5"',
-        "PAYLOAD_ROOT": '"/usr/lib/codex-master-home-broker/0.10.5"',
-        "MANIFEST_PATH": '"/usr/lib/codex-master-home-broker/manifest-v1.json"',
-        "BOOTSTRAP_PATH": '"/usr/libexec/codex_master_bootstrap.py"',
-        "BROKER_VERIFY_PATH": '"/usr/libexec/codex-master-broker-verify"',
-        "BROKER_PATH": '"/usr/libexec/codex-master-home-broker"',
-        "AGENT_PATH": '"/usr/libexec/codex-master-agent-launcher"',
+        "PAYLOAD_ROOT": '"/usr/lib/the-hive-home-broker/0.10.5"',
+        "MANIFEST_PATH": '"/usr/lib/the-hive-home-broker/manifest-v1.json"',
+        "BOOTSTRAP_PATH": '"/usr/libexec/the_hive_bootstrap.py"',
+        "BROKER_VERIFY_PATH": '"/usr/libexec/the-hive-broker-verify"',
+        "BROKER_PATH": '"/usr/libexec/the-hive-home-broker"',
+        "AGENT_PATH": '"/usr/libexec/the-hive-agent-launcher"',
         "PYTHON": '"/usr/bin/python3"',
         "INERT_EXIT_CODE": "INERT_EXIT_CODE = 78",
     }
@@ -500,7 +500,7 @@ def test_wrappers_have_constants_modes_and_static_security_order() -> None:
         "except Exception"
     )
     assert broker_source.index('dispatch"]("broker"') < broker_source.index(
-        'verified.payload_root + "/bin/codex-master-home-broker"'
+        'verified.payload_root + "/bin/the-hive-home-broker"'
     )
 
     agent_source = WRAPPERS[2].read_text(encoding="utf-8")

@@ -1,0 +1,13 @@
+[Unit]
+Description=The Hive Göttinnenbericht stündlich ausführen
+Documentation=man:systemd.timer(5)
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+AccuracySec=1m
+Persistent=true
+Unit=the-hive-goddess-report.service
+
+[Install]
+WantedBy=timers.target

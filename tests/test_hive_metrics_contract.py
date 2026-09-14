@@ -52,20 +52,20 @@ def overview(
 
 def test_fleet_metrics_count_active_observations_and_registered_homes_separately() -> None:
     values = fleet_metric_values(overview(registered_homes=13), native_active=3, observed_at=NOW)
-    assert values["codex_master_bees_native"] == 3
-    assert values["codex_master_bees_codex"] == 3
-    assert values["codex_master_bees_gemini"] == 1
-    assert values["codex_master_bees_claude"] == 1
-    assert values["codex_master_bees_huggingface"] == 1
-    assert values["codex_master_bees_ollama"] == 1
-    assert values["codex_master_bees_deepseek"] == 1
-    assert values["codex_master_bees_goddess"] == 1
-    assert values["codex_master_bees_queen"] == 1
-    assert values["codex_master_bees_teamleader"] == 1
-    assert values["codex_master_bees_worker"] == 4
-    assert values["codex_master_bees_rogue"] == 1
-    assert values["codex_master_bees_total"] == 11
-    assert values["codex_master_homes_registered"] == 13
+    assert values["the_hive_bees_native"] == 3
+    assert values["the_hive_bees_codex"] == 3
+    assert values["the_hive_bees_gemini"] == 1
+    assert values["the_hive_bees_claude"] == 1
+    assert values["the_hive_bees_huggingface"] == 1
+    assert values["the_hive_bees_ollama"] == 1
+    assert values["the_hive_bees_deepseek"] == 1
+    assert values["the_hive_bees_goddess"] == 1
+    assert values["the_hive_bees_queen"] == 1
+    assert values["the_hive_bees_teamleader"] == 1
+    assert values["the_hive_bees_worker"] == 4
+    assert values["the_hive_bees_rogue"] == 1
+    assert values["the_hive_bees_total"] == 11
+    assert values["the_hive_homes_registered"] == 13
 
 
 def test_fleet_metrics_expose_unknown_provider_and_role_counts() -> None:
@@ -77,21 +77,21 @@ def test_fleet_metrics_expose_unknown_provider_and_role_counts() -> None:
         native_active=0,
         observed_at=NOW,
     )
-    assert values["codex_master_bees_total"] == 10
-    assert values["codex_master_bees_provider_unknown"] == 1
-    assert values["codex_master_bees_role_unknown"] == 2
+    assert values["the_hive_bees_total"] == 10
+    assert values["the_hive_bees_provider_unknown"] == 1
+    assert values["the_hive_bees_role_unknown"] == 2
 
 
 def test_stale_snapshot_keeps_last_valid_values_at_exact_60_second_boundary() -> None:
     snapshot = overview()
     at_boundary = fleet_metric_values(snapshot, native_active=3, observed_at=NOW + timedelta(seconds=60))
     stale = fleet_metric_values(snapshot, native_active=3, observed_at=NOW + timedelta(seconds=60, microseconds=1))
-    assert at_boundary["codex_master_snapshot_stale"] == 0
-    assert stale["codex_master_snapshot_stale"] == 1
-    assert stale["codex_master_snapshot_age_seconds"] == 60.000001
-    assert stale["codex_master_snapshot_observed_at_seconds"] == NOW.timestamp()
-    assert stale["codex_master_bees_total"] == 11
-    assert stale["codex_master_bees_codex"] == 3
+    assert at_boundary["the_hive_snapshot_stale"] == 0
+    assert stale["the_hive_snapshot_stale"] == 1
+    assert stale["the_hive_snapshot_age_seconds"] == 60.000001
+    assert stale["the_hive_snapshot_observed_at_seconds"] == NOW.timestamp()
+    assert stale["the_hive_bees_total"] == 11
+    assert stale["the_hive_bees_codex"] == 3
 
 
 def test_invalid_observation_is_not_masked_as_stale() -> None:
@@ -112,13 +112,13 @@ def test_invalid_snapshot_schema_remains_a_metrics_error() -> None:
 
 def test_openmetrics_and_pcp_names_are_stable() -> None:
     rendered = render_openmetrics(fleet_metric_values(overview(), native_active=3, observed_at=NOW))
-    assert "# TYPE codex_master_bees_native gauge" in rendered
+    assert "# TYPE the_hive_bees_native gauge" in rendered
     assert rendered.endswith("# EOF\n")
     meters = pcp_htop_meter_config()
-    assert "[codex_master_provider_bees]" in meters
-    assert "native.metric = openmetrics.codexmaster.codex_master_bees_native" in meters
-    assert "ollama.metric = openmetrics.codexmaster.codex_master_bees_ollama" in meters
-    assert "deepseek.metric = openmetrics.codexmaster.codex_master_bees_deepseek" in meters
-    assert "unknown.metric = openmetrics.codexmaster.codex_master_bees_provider_unknown" in meters
-    assert "[codex_master_role_bees]" in meters
-    assert "unknown.metric = openmetrics.codexmaster.codex_master_bees_role_unknown" in meters
+    assert "[the_hive_provider_bees]" in meters
+    assert "native.metric = openmetrics.thehive.the_hive_bees_native" in meters
+    assert "ollama.metric = openmetrics.thehive.the_hive_bees_ollama" in meters
+    assert "deepseek.metric = openmetrics.thehive.the_hive_bees_deepseek" in meters
+    assert "unknown.metric = openmetrics.thehive.the_hive_bees_provider_unknown" in meters
+    assert "[the_hive_role_bees]" in meters
+    assert "unknown.metric = openmetrics.thehive.the_hive_bees_role_unknown" in meters

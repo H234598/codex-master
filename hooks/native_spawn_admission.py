@@ -39,7 +39,7 @@ def main() -> int:
             return _deny("invalid_pretooluse_input", ["invalid_input"])
         if not isinstance(payload.get("tool_input"), dict) or not isinstance(payload.get("cwd"), str):
             return _deny("invalid_pretooluse_input", ["invalid_input"])
-        from codex_master.server import reserve_native_agent_spawn
+        from the_hive.server import reserve_native_agent_spawn
         result = reserve_native_agent_spawn(payload)
         if not isinstance(result, dict) or result.get("allowed") is not True:
             code = result.get("error_code", "spawn_capacity_unavailable") if isinstance(result, dict) else "reservation_unavailable"

@@ -370,15 +370,15 @@ def project_hive_metrics(
 def pcp_htop_meter_config() -> tuple[str, str]:
     return (
         "[textmeter provider_runtime]\n"
-        "metrics = codex_master_bees_native,codex_master_bees_codex,"
-        "codex_master_bees_gemini,codex_master_bees_claude,"
-        "codex_master_bees_hf,codex_master_bees_ollama,"
-        "codex_master_bees_deepseek,codex_master_bees_unknown\n"
+        "metrics = the_hive_bees_native,the_hive_bees_codex,"
+        "the_hive_bees_gemini,the_hive_bees_claude,"
+        "the_hive_bees_hf,the_hive_bees_ollama,"
+        "the_hive_bees_deepseek,the_hive_bees_unknown\n"
         "labels = Native,Codex/OpenAI,Gemini,Claude,HF,Ollama,DeepSeek,unknown\n",
         "[textmeter hierarchy]\n"
-        "metrics = codex_master_roles_godbee,codex_master_roles_queen,"
-        "codex_master_roles_team_lead,codex_master_roles_worker,"
-        "codex_master_roles_rogue,codex_master_roles_unknown\n"
+        "metrics = the_hive_roles_godbee,the_hive_roles_queen,"
+        "the_hive_roles_team_lead,the_hive_roles_worker,"
+        "the_hive_roles_rogue,the_hive_roles_unknown\n"
         "labels = Gottbiene,Königin,TL,Arbeiterin,Rogue,unknown\n",
     )
 
@@ -389,16 +389,16 @@ def _metric_values_from_projection(
     if projection.state == "invalid" or projection.active_bees is None:
         raise HiveMetricsError("invalid_metric_input")
     values: dict[str, int | float] = {
-        "codex_master_bees_total": projection.active_bees,
-        "codex_master_homes_registered": projection.registered_homes,
-        "codex_master_hive_metrics_stale": int(projection.state == "stale"),
-        "codex_master_hive_metrics_invalid": 0,
-        "codex_master_hive_metrics_age_seconds": projection.age_seconds or 0.0,
+        "the_hive_bees_total": projection.active_bees,
+        "the_hive_homes_registered": projection.registered_homes,
+        "the_hive_hive_metrics_stale": int(projection.state == "stale"),
+        "the_hive_hive_metrics_invalid": 0,
+        "the_hive_hive_metrics_age_seconds": projection.age_seconds or 0.0,
     }
     for bucket, value in projection.provider_counts or ():
-        values[f"codex_master_bees_{bucket}"] = value
+        values[f"the_hive_bees_{bucket}"] = value
     for bucket, value in projection.role_counts or ():
-        values[f"codex_master_roles_{bucket}"] = value
+        values[f"the_hive_roles_{bucket}"] = value
     return values
 
 

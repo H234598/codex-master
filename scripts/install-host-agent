@@ -21,29 +21,29 @@ ROOT_UID = 0
 ROOT_GID = 0
 MASTER_ROLE = "master"
 WORKER_ROLE = "worker"
-ADMIN_UNIT = "codex-master-admin.service"
-AGENT_API_UNIT = "codex-master-agent-api.service"
-HOST_AGENT_UNIT = "codex-master-host-agent.service"
+ADMIN_UNIT = "the-hive-admin.service"
+AGENT_API_UNIT = "the-hive-agent-api.service"
+HOST_AGENT_UNIT = "the-hive-host-agent.service"
 UNIT_NAMES = (ADMIN_UNIT, AGENT_API_UNIT, HOST_AGENT_UNIT)
 ROLE_UNITS = {
     MASTER_ROLE: (ADMIN_UNIT, AGENT_API_UNIT),
     WORKER_ROLE: (HOST_AGENT_UNIT,),
 }
 ROLE_LAYOUT_NAMES = {
-    MASTER_ROLE: "codex-master-agent-api.conf",
-    WORKER_ROLE: "codex-master-host-agent.conf",
+    MASTER_ROLE: "the-hive-agent-api.conf",
+    WORKER_ROLE: "the-hive-host-agent.conf",
 }
 ROLE_USERS = {
-    MASTER_ROLE: ("codex-master-admin", "codex-master-agent-api"),
-    WORKER_ROLE: ("codex-master-host-agent",),
+    MASTER_ROLE: ("the-hive-admin", "the-hive-agent-api"),
+    WORKER_ROLE: ("the-hive-host-agent",),
 }
 ROLE_GROUPS = {
     MASTER_ROLE: (
-        "codex-master-admin",
-        "codex-master-agent-api",
-        "codex-master-agent-state",
+        "the-hive-admin",
+        "the-hive-agent-api",
+        "the-hive-agent-state",
     ),
-    WORKER_ROLE: ("codex-master-host-agent",),
+    WORKER_ROLE: ("the-hive-host-agent",),
 }
 ROLE_STATE_DIRECTORIES = {
     MASTER_ROLE: (
@@ -83,7 +83,7 @@ _ROLE_CREDENTIALS = {
 }
 _OPEN_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _OPEN_FILE = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-_UNIT_BINDIR_TOKEN = b"@CODEX_MASTER_BINDIR@"
+_UNIT_BINDIR_TOKEN = b"@THE_HIVE_BINDIR@"
 _MAX_UNIT_BYTES = 64 * 1024
 
 
@@ -139,9 +139,9 @@ class _ProvisioningState(NamedTuple):
 
 def _packaged_source_directory() -> Path:
     executable = Path(__file__).resolve()
-    candidates = [Path(sysconfig.get_path("data")) / "lib" / "codex-master"]
+    candidates = [Path(sysconfig.get_path("data")) / "lib" / "the-hive"]
     if len(executable.parents) >= 3:
-        candidates.append(executable.parents[2] / "lib" / "codex-master")
+        candidates.append(executable.parents[2] / "lib" / "the-hive")
     candidates.append(executable.parents[1])
     for candidate in candidates:
         if (candidate / "systemd").is_dir():
@@ -153,7 +153,7 @@ def _installed_scripts_directory() -> Path:
     executable = Path(__file__).resolve()
     if (
         len(executable.parents) >= 3
-        and executable.parent.name == "codex-master"
+        and executable.parent.name == "the-hive"
         and executable.parent.parent.name == "libexec"
     ):
         directory = executable.parents[2] / "bin"
@@ -287,7 +287,7 @@ def _open_rendered_unit_source(path: Path) -> int:
         bindir = os.fspath(_installed_scripts_directory()).encode("ascii")
         rendered = raw.replace(_UNIT_BINDIR_TOKEN, bindir)
         rendered_descriptor = os.memfd_create(
-            "codex-master-systemd-unit", getattr(os, "MFD_CLOEXEC", 0)
+            "the-hive-systemd-unit", getattr(os, "MFD_CLOEXEC", 0)
         )
         remaining = memoryview(rendered)
         while remaining:
@@ -379,16 +379,16 @@ def _destination_directories(
         opened["etc"] = _open_or_create_directory(destination_root, "etc", 0o755)
         if "credentials" in required:
             opened["credentials"] = _open_or_create_directory(
-                opened["etc"], "codex-master", 0o700
+                opened["etc"], "the-hive", 0o700
             )
         if "admin_credentials" in required:
             opened["admin_credentials"] = _open_or_create_directory(
-                opened["etc"], "codex-master-admin", 0o700
+                opened["etc"], "the-hive-admin", 0o700
             )
         elif role == WORKER_ROLE:
             try:
                 os.stat(
-                    "codex-master-admin",
+                    "the-hive-admin",
                     dir_fd=opened["etc"],
                     follow_symlinks=False,
                 )
@@ -396,7 +396,7 @@ def _destination_directories(
                 pass
             else:
                 opened["admin_credentials"] = _open_or_create_directory(
-                    opened["etc"], "codex-master-admin", 0o700
+                    opened["etc"], "the-hive-admin", 0o700
                 )
         opened["systemd"] = _open_or_create_directory(opened["etc"], "systemd", 0o755)
         opened["units"] = _open_or_create_directory(opened["systemd"], "system", 0o755)

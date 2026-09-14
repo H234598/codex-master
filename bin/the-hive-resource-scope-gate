@@ -14,7 +14,7 @@ import time
 
 
 _TMUX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-_CONTROL_SOCKET_NAME = re.compile(r"^codex-master-resource-[a-f0-9]{32}$")
+_CONTROL_SOCKET_NAME = re.compile(r"^the-hive-resource-[a-f0-9]{32}$")
 _TMUX_PATH = "/usr/bin/tmux"
 _DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _CGROUP_COMPONENT = re.compile(rb"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$")
@@ -236,7 +236,7 @@ def main() -> None:
         "LANG": "C",
         "LC_ALL": "C",
         "PATH": "/usr/bin:/bin",
-        "CODEX_MASTER_RUNNER_EXEC_PATH": f"/proc/{holder_pid}/fd/{runner_fd}",
+        "THE_HIVE_RUNNER_EXEC_PATH": f"/proc/{holder_pid}/fd/{runner_fd}",
     }
     child_pid = os.fork()
     if child_pid == 0:

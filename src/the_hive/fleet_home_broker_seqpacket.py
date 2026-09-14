@@ -189,11 +189,11 @@ def _peer_security_context(
 
 def _agent_start_security_context(value: object, expected_mcs_pair: str) -> str:
     label = _peer_security_context(
-        value, "codex_master_agent_t", expected_mcs_pair
+        value, "the_hive_agent_t", expected_mcs_pair
     )
     if (
         label
-        != f"system_u:system_r:codex_master_agent_t:s0:{expected_mcs_pair}"
+        != f"system_u:system_r:the_hive_agent_t:s0:{expected_mcs_pair}"
     ):
         raise ValueError
     return label

@@ -14,10 +14,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install-host-agent"
-UNIT_NAME = "codex-master-host-agent.service"
+UNIT_NAME = "the-hive-host-agent.service"
 UNIT_NAMES = (
-    "codex-master-admin.service",
-    "codex-master-agent-api.service",
+    "the-hive-admin.service",
+    "the-hive-agent-api.service",
     UNIT_NAME,
 )
 SECRET = b"credential-bytes-must-never-appear-in-output"
@@ -150,14 +150,14 @@ def prepared_installer(
     for name, unit in units.items():
         command = name.removesuffix(".service")
         unit.write_text(
-            "[Service]\nExecStart=@CODEX_MASTER_BINDIR@/" + command + "\n",
+            "[Service]\nExecStart=@THE_HIVE_BINDIR@/" + command + "\n",
             encoding="utf-8",
         )
         unit.chmod(0o644)
-    sysusers = tmp_path / "codex-master-host-agent.sysusers"
-    sysusers.write_text("g codex-master-agent-state -\n", encoding="utf-8")
+    sysusers = tmp_path / "the-hive-host-agent.sysusers"
+    sysusers.write_text("g the-hive-agent-state -\n", encoding="utf-8")
     sysusers.chmod(0o644)
-    tmpfiles = tmp_path / "codex-master-host-agent.tmpfiles"
+    tmpfiles = tmp_path / "the-hive-host-agent.tmpfiles"
     tmpfiles.write_text("d /var/lib/codex-master-agent 2770 root root -\n", encoding="utf-8")
     tmpfiles.chmod(0o644)
     monkeypatch.setattr(module, "UNIT_SOURCES", units)
@@ -195,17 +195,17 @@ def test_worker_role_never_accepts_or_installs_master_credentials(
 
     assert module.main(_role_arguments("worker", sources, destination)) == 0
 
-    credentials = destination / "etc" / "codex-master"
+    credentials = destination / "etc" / "the-hive"
     assert {path.name for path in credentials.iterdir()} == {
         "agent-client.key",
         "agent-client.crt",
         "agent-master-ca.crt",
         "agent-config.json",
     }
-    assert not (destination / "etc" / "codex-master-admin").exists()
+    assert not (destination / "etc" / "the-hive-admin").exists()
     assert {
         path.name for path in (destination / "etc" / "systemd" / "system").iterdir()
-    } == {"codex-master-host-agent.service"}
+    } == {"the-hive-host-agent.service"}
 
 
 def test_master_role_never_accepts_or_installs_worker_credentials(
@@ -215,7 +215,7 @@ def test_master_role_never_accepts_or_installs_worker_credentials(
 
     assert module.main(_role_arguments("master", sources, destination)) == 0
 
-    credentials = destination / "etc" / "codex-master"
+    credentials = destination / "etc" / "the-hive"
     assert {path.name for path in credentials.iterdir()} == {
         "agent-server.key",
         "agent-server.crt",
@@ -224,7 +224,7 @@ def test_master_role_never_accepts_or_installs_worker_credentials(
     }
     assert {
         path.name
-        for path in (destination / "etc" / "codex-master-admin").iterdir()
+        for path in (destination / "etc" / "the-hive-admin").iterdir()
     } == {
         "admin-config.json",
         "admin-bearer",
@@ -237,8 +237,8 @@ def test_master_role_never_accepts_or_installs_worker_credentials(
     assert {
         path.name for path in (destination / "etc" / "systemd" / "system").iterdir()
     } == {
-        "codex-master-admin.service",
-        "codex-master-agent-api.service",
+        "the-hive-admin.service",
+        "the-hive-agent-api.service",
     }
 
 
@@ -256,7 +256,7 @@ def test_in_place_role_upgrade_removes_foreign_installer_artifacts(
     assert module.main(_role_arguments(first_role, sources, destination)) == 0
     assert module.main(_role_arguments(second_role, sources, destination)) == 0
 
-    credentials = destination / "etc" / "codex-master"
+    credentials = destination / "etc" / "the-hive"
     expected_credentials = {
         "master": {
             "agent-server.key",
@@ -273,14 +273,14 @@ def test_in_place_role_upgrade_removes_foreign_installer_artifacts(
     }[second_role]
     expected_units = {
         "master": {
-            "codex-master-admin.service",
-            "codex-master-agent-api.service",
+            "the-hive-admin.service",
+            "the-hive-agent-api.service",
         },
-        "worker": {"codex-master-host-agent.service"},
+        "worker": {"the-hive-host-agent.service"},
     }[second_role]
     expected_layout = {
-        "master": "codex-master-agent-api.conf",
-        "worker": "codex-master-host-agent.conf",
+        "master": "the-hive-agent-api.conf",
+        "worker": "the-hive-host-agent.conf",
     }[second_role]
     assert {path.name for path in credentials.iterdir()} == expected_credentials
     assert {
@@ -292,7 +292,7 @@ def test_in_place_role_upgrade_removes_foreign_installer_artifacts(
     assert {
         path.name for path in (destination / "usr/lib/tmpfiles.d").iterdir()
     } == {expected_layout}
-    admin_credentials = destination / "etc/codex-master-admin"
+    admin_credentials = destination / "etc/the-hive-admin"
     if second_role == "master":
         assert len(list(admin_credentials.iterdir())) == 7
     else:
@@ -332,8 +332,8 @@ def test_packaged_installer_finds_data_beside_its_install_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _load_installer()
-    executable = tmp_path / "libexec" / "codex-master" / "install-host-agent"
-    data = tmp_path / "lib" / "codex-master"
+    executable = tmp_path / "libexec" / "the-hive" / "install-host-agent"
+    data = tmp_path / "lib" / "the-hive"
     (data / "systemd").mkdir(parents=True)
     monkeypatch.setattr(module, "__file__", os.fspath(executable))
     monkeypatch.setattr(module.sysconfig, "get_path", lambda _name: "/missing")
@@ -348,10 +348,10 @@ def test_installed_scripts_directory_follows_packaged_installer_prefix(
     monkeypatch.setattr(
         module,
         "__file__",
-        "/opt/codex-master-venv/libexec/codex-master/install-host-agent",
+        "/opt/the-hive-venv/libexec/the-hive/install-host-agent",
     )
 
-    assert module._installed_scripts_directory() == Path("/opt/codex-master-venv/bin")
+    assert module._installed_scripts_directory() == Path("/opt/the-hive-venv/bin")
 
 
 def test_installed_scripts_directory_rejects_systemd_dollar_expansion(
@@ -361,7 +361,7 @@ def test_installed_scripts_directory_rejects_systemd_dollar_expansion(
     monkeypatch.setattr(
         module,
         "__file__",
-        "/opt/codex$master/libexec/codex-master/install-host-agent",
+        "/opt/codex$master/libexec/the-hive/install-host-agent",
     )
 
     with pytest.raises(module.InstallerError):
@@ -376,15 +376,15 @@ def test_installer_renders_unit_entrypoint_from_its_install_prefix(
     monkeypatch.setattr(
         module,
         "__file__",
-        "/opt/codex-master-venv/libexec/codex-master/install-host-agent",
+        "/opt/the-hive-venv/libexec/the-hive/install-host-agent",
     )
 
     assert module.main(_arguments(sources, destination)) == 0
 
-    installed = destination / "etc/systemd/system/codex-master-host-agent.service"
+    installed = destination / "etc/systemd/system/the-hive-host-agent.service"
     assert installed.read_text(encoding="utf-8") == (
         "[Service]\n"
-        "ExecStart=/opt/codex-master-venv/bin/codex-master-host-agent\n"
+        "ExecStart=/opt/the-hive-venv/bin/the-hive-host-agent\n"
     )
 
 
@@ -449,7 +449,7 @@ def test_install_is_atomic_idempotent_and_uses_exact_modes(
     arguments = _arguments(sources, destination)
 
     assert module.main(arguments) == 0
-    credentials = destination / "etc" / "codex-master"
+    credentials = destination / "etc" / "the-hive"
     installed = {
         path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
         for path in credentials.iterdir()
@@ -460,13 +460,13 @@ def test_install_is_atomic_idempotent_and_uses_exact_modes(
         "agent-master-ca.crt": (SECRET + b"agent-master-ca", 0o444),
         "agent-config.json": (sources["agent-config"].read_bytes(), 0o400),
     }
-    assert not (destination / "etc" / "codex-master-admin").exists()
+    assert not (destination / "etc" / "the-hive-admin").exists()
     assert {
         path.name
         for path in (destination / "etc" / "systemd" / "system").iterdir()
     } == {UNIT_NAME}
-    assert (destination / "usr" / "lib" / "sysusers.d" / "codex-master-host-agent.conf").is_file()
-    assert (destination / "usr" / "lib" / "tmpfiles.d" / "codex-master-host-agent.conf").is_file()
+    assert (destination / "usr" / "lib" / "sysusers.d" / "the-hive-host-agent.conf").is_file()
+    assert (destination / "usr" / "lib" / "tmpfiles.d" / "the-hive-host-agent.conf").is_file()
     assert all(uid_gid == (os.geteuid(), os.getegid()) for uid_gid in fchown_calls)
     assert not list(credentials.glob(".*.tmp"))
 
@@ -539,14 +539,14 @@ def test_master_enable_starts_admin_and_agent_api_units(
         [
             "/usr/bin/systemctl",
             "enable",
-            "codex-master-admin.service",
-            "codex-master-agent-api.service",
+            "the-hive-admin.service",
+            "the-hive-agent-api.service",
         ],
         [
             "/usr/bin/systemctl",
             "restart",
-            "codex-master-admin.service",
-            "codex-master-agent-api.service",
+            "the-hive-admin.service",
+            "the-hive-agent-api.service",
         ],
     ]
 
@@ -570,7 +570,7 @@ def test_role_switch_stops_and_disables_only_foreign_units(
             "/usr/bin/systemctl",
             "disable",
             "--now",
-            "codex-master-host-agent.service",
+            "the-hive-host-agent.service",
         ],
         ["/usr/bin/systemctl", "daemon-reload"],
     ]
@@ -624,13 +624,13 @@ def test_live_role_switch_failure_restores_exact_foreign_service_state(
             (),
             role="master",
             live=True,
-            existing_units=("codex-master-host-agent.service",),
+            existing_units=("the-hive-host-agent.service",),
             after_commit=lambda: events.append("finalize")
             or (_ for _ in ()).throw(OSError()),
         )
 
     assert events == [
-        ("capture", ("codex-master-host-agent.service",)),
+        ("capture", ("the-hive-host-agent.service",)),
         ("capture-provisioning", "master"),
         "disable",
         "commit",
@@ -691,11 +691,11 @@ def test_provisioning_rollback_removes_only_new_role_state(
     module = _load_installer()
     removed_directories: list[Path] = []
     commands: list[list[str]] = []
-    existing_users = {"codex-master-admin", "codex-master-agent-api"}
+    existing_users = {"the-hive-admin", "the-hive-agent-api"}
     existing_groups = {
-        "codex-master-admin",
-        "codex-master-agent-api",
-        "codex-master-agent-state",
+        "the-hive-admin",
+        "the-hive-agent-api",
+        "the-hive-agent-state",
     }
 
     def user(name: str) -> object:
@@ -726,11 +726,11 @@ def test_provisioning_rollback_removes_only_new_role_state(
 
     monkeypatch.setattr(module.subprocess, "run", run)
     state = module._ProvisioningState(
-        users=frozenset({"codex-master-admin"}),
-        groups=frozenset({"codex-master-admin", "codex-master-agent-state"}),
+        users=frozenset({"the-hive-admin"}),
+        groups=frozenset({"the-hive-admin", "the-hive-agent-state"}),
         group_memberships=(
-            ("codex-master-admin", frozenset()),
-            ("codex-master-agent-state", frozenset()),
+            ("the-hive-admin", frozenset()),
+            ("the-hive-agent-state", frozenset()),
         ),
         directories=(),
     )
@@ -742,8 +742,8 @@ def test_provisioning_rollback_removes_only_new_role_state(
         Path("/var/lib/codex-master-admin"),
     ]
     assert commands == [
-        ["/usr/sbin/userdel", "codex-master-agent-api"],
-        ["/usr/sbin/groupdel", "codex-master-agent-api"],
+        ["/usr/sbin/userdel", "the-hive-agent-api"],
+        ["/usr/sbin/groupdel", "the-hive-agent-api"],
     ]
 
 
@@ -916,21 +916,21 @@ def test_service_state_restore_removes_new_role_and_preserves_previous_state(
     def fake_run(argv: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
         returncode = 0 if argv[1:] in (
-            ["is-enabled", "--quiet", "codex-master-admin.service"],
-            ["is-active", "--quiet", "codex-master-agent-api.service"],
+            ["is-enabled", "--quiet", "the-hive-admin.service"],
+            ["is-active", "--quiet", "the-hive-agent-api.service"],
         ) else 1 if argv[1] == "is-enabled" else 3
         return subprocess.CompletedProcess(argv, returncode)
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
 
     states = module._capture_service_states(
-        ("codex-master-admin.service", "codex-master-agent-api.service")
+        ("the-hive-admin.service", "the-hive-agent-api.service")
     )
     module._restore_service_states("worker", states)
 
     assert states == (
-        module._ServiceState("codex-master-admin.service", True, False),
-        module._ServiceState("codex-master-agent-api.service", False, True),
+        module._ServiceState("the-hive-admin.service", True, False),
+        module._ServiceState("the-hive-agent-api.service", False, True),
     )
     assert calls[-8:] == [
         ["/usr/bin/systemctl", "daemon-reload"],
@@ -938,24 +938,24 @@ def test_service_state_restore_removes_new_role_and_preserves_previous_state(
             "/usr/bin/systemctl",
             "disable",
             "--now",
-            "codex-master-host-agent.service",
+            "the-hive-host-agent.service",
         ],
         [
             "/usr/bin/systemctl",
             "is-enabled",
             "--quiet",
-            "codex-master-host-agent.service",
+            "the-hive-host-agent.service",
         ],
         [
             "/usr/bin/systemctl",
             "is-active",
             "--quiet",
-            "codex-master-host-agent.service",
+            "the-hive-host-agent.service",
         ],
-        ["/usr/bin/systemctl", "enable", "codex-master-admin.service"],
-        ["/usr/bin/systemctl", "stop", "codex-master-admin.service"],
-        ["/usr/bin/systemctl", "disable", "codex-master-agent-api.service"],
-        ["/usr/bin/systemctl", "start", "codex-master-agent-api.service"],
+        ["/usr/bin/systemctl", "enable", "the-hive-admin.service"],
+        ["/usr/bin/systemctl", "stop", "the-hive-admin.service"],
+        ["/usr/bin/systemctl", "disable", "the-hive-agent-api.service"],
+        ["/usr/bin/systemctl", "start", "the-hive-agent-api.service"],
     ]
 
 
@@ -977,13 +977,13 @@ def test_static_layout_provisioner_is_scoped_to_its_destination_root(
         [
             "/usr/bin/systemd-sysusers",
             f"--root={tmp_path}",
-            f"{tmp_path}/usr/lib/sysusers.d/codex-master-host-agent.conf",
+            f"{tmp_path}/usr/lib/sysusers.d/the-hive-host-agent.conf",
         ],
         [
             "/usr/bin/systemd-tmpfiles",
             f"--root={tmp_path}",
             "--create",
-            f"{tmp_path}/usr/lib/tmpfiles.d/codex-master-host-agent.conf",
+            f"{tmp_path}/usr/lib/tmpfiles.d/the-hive-host-agent.conf",
         ],
     ]
 
@@ -1048,7 +1048,7 @@ def test_installer_rejects_an_existing_target_directory_with_the_wrong_mode(
     (destination / "etc").mkdir(mode=0o700)
 
     assert module.main(_arguments(sources, destination)) == 1
-    assert not (destination / "etc" / "codex-master").exists()
+    assert not (destination / "etc" / "the-hive").exists()
 
 
 def test_copy_failure_leaves_no_partial_credential_set(
@@ -1071,7 +1071,7 @@ def test_copy_failure_leaves_no_partial_credential_set(
     monkeypatch.setattr(module, "_copy_atomically", fail_third_copy)
 
     assert module.main(_arguments(sources, destination)) == 1
-    credentials = destination / "etc" / "codex-master"
+    credentials = destination / "etc" / "the-hive"
     assert not credentials.exists() or list(credentials.iterdir()) == []
 
 
@@ -1082,7 +1082,7 @@ def test_commit_failure_restores_the_previous_complete_generation(
     module, sources, destination, _fchown_calls = prepared_installer
     arguments = _arguments(sources, destination)
     assert module.main(arguments) == 0
-    credentials = destination / "etc" / "codex-master"
+    credentials = destination / "etc" / "the-hive"
     original = {path.name: path.read_bytes() for path in credentials.iterdir()}
     for name, payload, mode in (
         ("agent-client-key", b"replacement-key", 0o400),

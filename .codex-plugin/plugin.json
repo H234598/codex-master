@@ -1,12 +1,12 @@
 {
-  "name": "codex-master",
+  "name": "the-hive",
   "version": "0.10.5+codex.20260808003125",
-  "description": "The Hive plugin for controlling a sleeping Agentinnen fleet through a data-sparse local MCP server. codex-master-mcp and Masterjet remain compatibility aliases.",
+  "description": "The Hive plugin controls a sleeping Agentinnen fleet through the data-sparse the-hive-mcp server. Masterjet remains a separately named component.",
   "author": {
     "name": "teladi"
   },
-  "homepage": "https://github.com/H234598/codex-master",
-  "repository": "https://github.com/H234598/codex-master",
+  "homepage": "https://github.com/H234598/the-hive",
+  "repository": "https://github.com/H234598/the-hive",
   "license": "MIT",
   "keywords": [
     "codex",
@@ -24,7 +24,7 @@
   "interface": {
     "displayName": "The Hive",
     "shortDescription": "Control isolated Agentinnen with The Hive local MCP.",
-    "longDescription": "Adds The Hive local MCP server (technical alias codex-master-mcp) plus fleet-management skills and an App Bridge manifest for starting, assigning, auditing, and safely inspecting a scalable sleeping Agentinnen fleet. Masterjet remains a compatible colloquial alias; the tool surface is data-sparse by default.",
+    "longDescription": "Adds the-hive-mcp plus fleet-management skills and an App Bridge manifest for starting, assigning, auditing, and safely inspecting a scalable sleeping Agentinnen fleet. Masterjet remains a separately named component; the tool surface is data-sparse by default.",
     "developerName": "teladi",
     "category": "Developer Tools",
     "capabilities": [
@@ -33,9 +33,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Use Codex Master to start Agentin A1 and Agentin B1",
-      "Assign a read-only Exploriererin task with codex-master-mcp",
-      "Check codex-master App Bridge and MCP status"
+      "Use The Hive to start Agentin A1 and Agentin B1",
+      "Assign a read-only Exploriererin task with the-hive-mcp",
+      "Check the-hive App Bridge and MCP status"
     ],
     "brandColor": "#1F7A64"
   }

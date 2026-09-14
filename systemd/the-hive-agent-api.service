@@ -1,0 +1,43 @@
+[Unit]
+Description=The Hive isolated host-agent TLS API
+Wants=network-online.target
+Requires=the-hive-admin.service
+After=network-online.target the-hive-admin.service
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=the-hive-agent-api
+Group=the-hive-agent-api
+SupplementaryGroups=the-hive-agent-state
+WorkingDirectory=/var/empty
+UMask=0007
+ReadWritePaths=/var/lib/codex-master-agent
+LoadCredential=agent-server-key:/etc/the-hive/agent-server.key
+LoadCredential=agent-server-cert:/etc/the-hive/agent-server.crt
+LoadCredential=agent-client-ca:/etc/the-hive/agent-client-ca.crt
+LoadCredential=agent-listen-address:/etc/the-hive/agent-listen-address
+ExecStart=@THE_HIVE_BINDIR@/the-hive-agent-api --listen-address-credential --port=9443
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateMounts=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

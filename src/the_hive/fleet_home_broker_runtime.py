@@ -221,15 +221,15 @@ def _validate_release_spec(value: object) -> BrokerReleaseSpec:
         or value.joint_release_version != 1
         or value.release_id != "0.11.0"
         or value.chpb_abi != "CHPB/2"
-        or value.socket_unit != "codex-master-home-broker.socket"
-        or value.service_unit != "codex-master-home-broker.service"
-        or value.system_bus_name != "org.codex_master.HomeBrokerControl"
-        or value.system_bus_path != "/org/codex_master/HomeBrokerControl"
-        or value.system_bus_interface != "org.codex_master.HomeBrokerControl1"
-        or value.broker_domain != "codex_master_home_broker_t"
-        or value.gateway_domain != "codex_master_control_t"
-        or value.socket_type != "codex_master_home_broker_runtime_t"
-        or value.agent_domain != "codex_master_agent_t"
+        or value.socket_unit != "the-hive-home-broker.socket"
+        or value.service_unit != "the-hive-home-broker.service"
+        or value.system_bus_name != "org.the_hive.HomeBrokerControl"
+        or value.system_bus_path != "/org/the_hive/HomeBrokerControl"
+        or value.system_bus_interface != "org.the_hive.HomeBrokerControl1"
+        or value.broker_domain != "the_hive_home_broker_t"
+        or value.gateway_domain != "the_hive_control_t"
+        or value.socket_type != "the_hive_home_broker_runtime_t"
+        or value.agent_domain != "the_hive_agent_t"
     ):
         _fail("broker release is invalid")
     digests = (

@@ -11,9 +11,12 @@ import the_hive.server as server
 
 
 class FleetDesktopEntryTest(unittest.TestCase):
+    def test_uses_the_hive_desktop_application_id(self) -> None:
+        assert server.FLEET_DESKTOP_ENTRY_NAME == "de.teladi.TheHive.ControlCenter.desktop"
+
     def test_serializes_fixed_control_center_command(self) -> None:
         content = server.fleet_desktop_entry_bytes(
-            Path("/home/user/Codex Fleet/bin/codex-master-mcp")
+            Path("/home/user/Codex Fleet/bin/the-hive-mcp")
         )
 
         self.assertEqual(
@@ -22,7 +25,7 @@ class FleetDesktopEntryTest(unittest.TestCase):
             "Type=Application\n"
             "Name=Flottenmanagement\n"
             "Comment=Codex-Flotte steuern und verwalten\n"
-            'Exec="/home/user/Codex Fleet/bin/codex-master-mcp" control-center-launch\n'
+            'Exec="/home/user/Codex Fleet/bin/the-hive-mcp" control-center-launch\n'
             "Icon=utilities-system-monitor\n"
             "Terminal=false\n"
             "Categories=System;\n"
@@ -30,7 +33,7 @@ class FleetDesktopEntryTest(unittest.TestCase):
         )
 
     def test_recognizes_legacy_generated_entry_only_for_safe_cleanup(self) -> None:
-        command = Path("/home/user/.local/lib/codex-master-runtime/bin/codex-master-mcp")
+        command = Path("/home/user/.local/lib/codex-master-runtime/bin/the-hive-mcp")
         current = server.fleet_desktop_entry_bytes(command)
         legacy = current.replace(b" control-center-launch\n", b" control-center\n")
 
@@ -44,7 +47,7 @@ class FleetDesktopEntryTest(unittest.TestCase):
 
     def test_rejects_relative_or_control_character_command_path(self) -> None:
         for path in (
-            Path("relative/codex-master-mcp"),
+            Path("relative/the-hive-mcp"),
             Path("/tmp/bad\ncommand"),
             Path("/tmp/bad=command"),
             Path("/tmp/nicht-ascii-ä"),

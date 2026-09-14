@@ -2,8 +2,8 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).parents[1]
-BROKER_UNIT = REPO_ROOT / "systemd/system/codex-master-home-broker.service"
-AGENT_UNIT = REPO_ROOT / "systemd/system/codex-master-agent@.service"
+BROKER_UNIT = REPO_ROOT / "systemd/system/the-hive-home-broker.service"
+AGENT_UNIT = REPO_ROOT / "systemd/system/the-hive-agent@.service"
 
 
 def _parse_unit(path: Path) -> dict[str, dict[str, list[str]]]:
@@ -59,7 +59,7 @@ def test_broker_unit_has_static_root_verifier_contract():
     assert service["StateDirectory"] == ["codex-master-home-broker"]
     assert service["StateDirectoryMode"] == ["0700"]
     assert service["ExecStart"] == [
-        "/usr/bin/python3 -I -E -s -P /usr/libexec/codex-master-home-broker"
+        "/usr/bin/python3 -I -E -s -P /usr/libexec/the-hive-home-broker"
     ]
     assert service["NoNewPrivileges"] == ["yes"]
     assert service["ProtectSystem"] == ["strict"]
@@ -141,7 +141,7 @@ def test_agent_template_has_dynamic_user_launcher_contract_without_activation_ed
     assert "User" not in service
     assert "Group" not in service
     assert service["ExecStart"] == [
-        "/usr/bin/python3 -I -E -s -P /usr/libexec/codex-master-agent-launcher"
+        "/usr/bin/python3 -I -E -s -P /usr/libexec/the-hive-agent-launcher"
     ]
     assert service["NoNewPrivileges"] == ["yes"]
     assert service["ProtectSystem"] == ["strict"]

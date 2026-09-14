@@ -1,3 +1,0 @@
-[Unit]
-Description=Codex Master Resource Slice
-Documentation=man:systemd.slice(5)

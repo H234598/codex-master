@@ -39,17 +39,17 @@ where = ["src"]
 the_hive = ["markdown/*.md", "markdown/classes/*.md", "rename_contract.v1.json"]
 
 [tool.setuptools.data-files]
-"lib/codex-master/systemd" = [
-  "systemd/codex-master-admin.service",
-  "systemd/codex-master-agent-api.service",
-  "systemd/codex-master-host-agent.service",
+"lib/the-hive/systemd" = [
+  "systemd/the-hive-admin.service",
+  "systemd/the-hive-agent-api.service",
+  "systemd/the-hive-host-agent.service",
 ]
-"lib/codex-master/systemd/sysusers.d" = [
-  "systemd/sysusers.d/codex-master-agent-api.conf",
-  "systemd/sysusers.d/codex-master-host-agent.conf",
+"lib/the-hive/systemd/sysusers.d" = [
+  "systemd/sysusers.d/the-hive-agent-api.conf",
+  "systemd/sysusers.d/the-hive-host-agent.conf",
 ]
-"lib/codex-master/systemd/tmpfiles.d" = [
-  "systemd/tmpfiles.d/codex-master-agent-api.conf",
-  "systemd/tmpfiles.d/codex-master-host-agent.conf",
+"lib/the-hive/systemd/tmpfiles.d" = [
+  "systemd/tmpfiles.d/the-hive-agent-api.conf",
+  "systemd/tmpfiles.d/the-hive-host-agent.conf",
 ]
-"libexec/codex-master" = ["scripts/install-host-agent"]
+"libexec/the-hive" = ["scripts/install-host-agent"]

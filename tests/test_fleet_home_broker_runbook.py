@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 
 
-RUNBOOK = Path(__file__).parents[1] / "docs/operations/codex-master-home-broker.md"
+RUNBOOK = Path(__file__).parents[1] / "docs/operations/the-hive-home-broker.md"
 
 
 def _read_runbook() -> str:
@@ -26,11 +26,11 @@ def test_runbook_separates_scope_evidence_audits_and_release_handoff() -> None:
     assert all(
         artifact in text
         for artifact in (
-            "src/codex_master/fleet_home_broker_package.py",
-            "systemd/system/codex-master-home-broker.service",
-            "systemd/system/codex-master-agent@.service",
-            "systemd/selinux/codex_master_home_broker.te",
-            "systemd/selinux/codex_master_home_broker.fc",
+            "src/the_hive/fleet_home_broker_package.py",
+            "systemd/system/the-hive-home-broker.service",
+            "systemd/system/the-hive-agent@.service",
+            "systemd/selinux/the_hive_home_broker.te",
+            "systemd/selinux/the_hive_home_broker.fc",
         )
     )
 

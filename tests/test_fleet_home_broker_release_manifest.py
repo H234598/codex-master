@@ -16,106 +16,106 @@ from the_hive.fleet_control_release_v2 import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = REPO_ROOT / "src/codex_master/fleet_home_broker_install.py"
-MANIFEST_PATH = REPO_ROOT / "systemd/manifest/codex-master-home-broker-manifest-v1.json"
-MANIFEST_SOURCE = "systemd/manifest/codex-master-home-broker-manifest-v1.json"
-MANIFEST_TARGET = "/usr/lib/codex-master-home-broker/manifest-v1.json"
-PAYLOAD_ROOT = "/usr/lib/codex-master-home-broker/0.10.5"
+MODULE_PATH = REPO_ROOT / "src/the_hive/fleet_home_broker_install.py"
+MANIFEST_PATH = REPO_ROOT / "systemd/manifest/the-hive-home-broker-manifest-v1.json"
+MANIFEST_SOURCE = "systemd/manifest/the-hive-home-broker-manifest-v1.json"
+MANIFEST_TARGET = "/usr/lib/the-hive-home-broker/manifest-v1.json"
+PAYLOAD_ROOT = "/usr/lib/the-hive-home-broker/0.10.5"
 
 EXPECTED_PAYLOAD = (
     (
-        "bin/codex-master-home-broker",
-        "bin/codex-master-home-broker",
+        "bin/the-hive-home-broker",
+        "bin/the-hive-home-broker",
         "84efd30a9390b8ac9bb4310763337aa035e798ee759dc30c8104146ad2d02569",
         493,
     ),
     (
-        "python/codex_master/__init__.py",
-        "src/codex_master/__init__.py",
-        "8f58d472923fd7b7e729e7a947940c2ccb8521edc0fd5630c7389abc6dd3d678",
+        "python/the_hive/__init__.py",
+        "src/the_hive/__init__.py",
+        "34fb60a2addf955f310134f6e4670241e320936298337ebd9894cce85767cc6b",
         420,
     ),
     (
-        "python/codex_master/fleet_agent_launcher.py",
-        "src/codex_master/fleet_agent_launcher.py",
-        "e9509de8c0a3813f7cb0f918648ea2393f60608ce66d29320022761f17c467a3",
+        "python/the_hive/fleet_agent_launcher.py",
+        "src/the_hive/fleet_agent_launcher.py",
+        "bf02b3d0b39ed56b81f06ed69d951c44ad08f08e427e8324138e40ae47a173b4",
         420,
     ),
     (
-        "python/codex_master/fleet_home_broker.py",
-        "src/codex_master/fleet_home_broker.py",
+        "python/the_hive/fleet_home_broker.py",
+        "src/the_hive/fleet_home_broker.py",
         "58db3221acf9c16420c7cf7da7c4c21586536f4f5a6b112d27721e6ea056e316",
         420,
     ),
     (
-        "python/codex_master/fleet_home_broker_client.py",
-        "src/codex_master/fleet_home_broker_client.py",
-        "c75697379ff1c5a32fb5c7c9ea07a837418415a6fdf0568b0ada2ad93d905fb4",
+        "python/the_hive/fleet_home_broker_client.py",
+        "src/the_hive/fleet_home_broker_client.py",
+        "3868f1b86aedfdc1eb861082260a1e0dc3026a82ec0651ca6b67a957b88853a6",
         420,
     ),
     (
-        "python/codex_master/fleet_home_broker_identity.py",
-        "src/codex_master/fleet_home_broker_identity.py",
+        "python/the_hive/fleet_home_broker_identity.py",
+        "src/the_hive/fleet_home_broker_identity.py",
         "e1020cac4275441a9720d2ea9029288cbf2f2289054278e2508e4169d0990c49",
         420,
     ),
     (
-        "python/codex_master/fleet_home_broker_linux.py",
-        "src/codex_master/fleet_home_broker_linux.py",
-        "1746cb2f493381356a6543ee1b7d8f9ddf966a16137ea373fa5d131c6443fefc",
+        "python/the_hive/fleet_home_broker_linux.py",
+        "src/the_hive/fleet_home_broker_linux.py",
+        "63067a170efa8dec4f80007d6b4a249cfd1f04d46a1c53191896dc9b0a570f5f",
         420,
     ),
     (
-        "python/codex_master/fleet_home_broker_package.py",
-        "src/codex_master/fleet_home_broker_package.py",
+        "python/the_hive/fleet_home_broker_package.py",
+        "src/the_hive/fleet_home_broker_package.py",
         "7989c0c92dab6cf1ea7ce3d4b8de6433756525bd5bd9f293e1041a9ccf0c5de6",
         420,
     ),
     (
-        "python/codex_master/fleet_home_broker_protocol.py",
-        "src/codex_master/fleet_home_broker_protocol.py",
-        "33f06d9257bd2e6aec311fc99fbd662d46bf26310d6130be7ad673d42d709249",
+        "python/the_hive/fleet_home_broker_protocol.py",
+        "src/the_hive/fleet_home_broker_protocol.py",
+        "f748e44c665883d9842f4259472fdbd651ee7f7fd03cd953230263f42a9d1596",
         420,
     ),
     (
-        "python/codex_master/fleet_home_broker_wal.py",
-        "src/codex_master/fleet_home_broker_wal.py",
+        "python/the_hive/fleet_home_broker_wal.py",
+        "src/the_hive/fleet_home_broker_wal.py",
         "f720caf69b6b036315dcfd86691c89be5f5ec8e6c8acd125b68f786f25213920",
         420,
     ),
 )
 
 EXPECTED_MANIFEST_BYTES = (
-    b'{"format":"codex-master-home-broker-manifest-v1",'
+    b'{"format":"the-hive-home-broker-manifest-v1",'
     b'"payload_version":"0.10.5","payload_entries":['
-    b'{"path":"bin/codex-master-home-broker","sha256":"'
+    b'{"path":"bin/the-hive-home-broker","sha256":"'
     b'84efd30a9390b8ac9bb4310763337aa035e798ee759dc30c8104146ad2d02569",'
     b'"mode":493},'
-    b'{"path":"python/codex_master/__init__.py","sha256":"'
-    b'8f58d472923fd7b7e729e7a947940c2ccb8521edc0fd5630c7389abc6dd3d678",'
+    b'{"path":"python/the_hive/__init__.py","sha256":"'
+    b'34fb60a2addf955f310134f6e4670241e320936298337ebd9894cce85767cc6b",'
     b'"mode":420},'
-    b'{"path":"python/codex_master/fleet_agent_launcher.py","sha256":"'
-    b'e9509de8c0a3813f7cb0f918648ea2393f60608ce66d29320022761f17c467a3",'
+    b'{"path":"python/the_hive/fleet_agent_launcher.py","sha256":"'
+    b'bf02b3d0b39ed56b81f06ed69d951c44ad08f08e427e8324138e40ae47a173b4",'
     b'"mode":420},'
-    b'{"path":"python/codex_master/fleet_home_broker.py","sha256":"'
+    b'{"path":"python/the_hive/fleet_home_broker.py","sha256":"'
     b'58db3221acf9c16420c7cf7da7c4c21586536f4f5a6b112d27721e6ea056e316",'
     b'"mode":420},'
-    b'{"path":"python/codex_master/fleet_home_broker_client.py","sha256":"'
-    b'c75697379ff1c5a32fb5c7c9ea07a837418415a6fdf0568b0ada2ad93d905fb4",'
+    b'{"path":"python/the_hive/fleet_home_broker_client.py","sha256":"'
+    b'3868f1b86aedfdc1eb861082260a1e0dc3026a82ec0651ca6b67a957b88853a6",'
     b'"mode":420},'
-    b'{"path":"python/codex_master/fleet_home_broker_identity.py","sha256":"'
+    b'{"path":"python/the_hive/fleet_home_broker_identity.py","sha256":"'
     b'e1020cac4275441a9720d2ea9029288cbf2f2289054278e2508e4169d0990c49",'
     b'"mode":420},'
-    b'{"path":"python/codex_master/fleet_home_broker_linux.py","sha256":"'
-    b'1746cb2f493381356a6543ee1b7d8f9ddf966a16137ea373fa5d131c6443fefc",'
+    b'{"path":"python/the_hive/fleet_home_broker_linux.py","sha256":"'
+    b'63067a170efa8dec4f80007d6b4a249cfd1f04d46a1c53191896dc9b0a570f5f",'
     b'"mode":420},'
-    b'{"path":"python/codex_master/fleet_home_broker_package.py","sha256":"'
+    b'{"path":"python/the_hive/fleet_home_broker_package.py","sha256":"'
     b'7989c0c92dab6cf1ea7ce3d4b8de6433756525bd5bd9f293e1041a9ccf0c5de6",'
     b'"mode":420},'
-    b'{"path":"python/codex_master/fleet_home_broker_protocol.py","sha256":"'
-    b'33f06d9257bd2e6aec311fc99fbd662d46bf26310d6130be7ad673d42d709249",'
+    b'{"path":"python/the_hive/fleet_home_broker_protocol.py","sha256":"'
+    b'f748e44c665883d9842f4259472fdbd651ee7f7fd03cd953230263f42a9d1596",'
     b'"mode":420},'
-    b'{"path":"python/codex_master/fleet_home_broker_wal.py","sha256":"'
+    b'{"path":"python/the_hive/fleet_home_broker_wal.py","sha256":"'
     b'f720caf69b6b036315dcfd86691c89be5f5ec8e6c8acd125b68f786f25213920",'
     b'"mode":420}'
     b"]}\n"
@@ -145,7 +145,7 @@ def test_manifest_has_exact_canonical_bytes_and_schema() -> None:
         "payload_version",
         "payload_entries",
     ]
-    assert pairs[0][1] == "codex-master-home-broker-manifest-v1"
+    assert pairs[0][1] == "the-hive-home-broker-manifest-v1"
     assert pairs[1][1] == "0.10.5"
 
     entries = pairs[2][1]
@@ -229,7 +229,7 @@ def test_manifest_payload_closure_and_e3_install_mapping_are_exact() -> None:
 
 
 def test_v1_decoder_rejects_v2_bytes_without_compatibility_fallback() -> None:
-    bootstrap_path = REPO_ROOT / "systemd/libexec/codex_master_bootstrap.py"
+    bootstrap_path = REPO_ROOT / "systemd/libexec/the_hive_bootstrap.py"
     spec = importlib.util.spec_from_file_location("test_v1_bootstrap", bootstrap_path)
     assert spec is not None and spec.loader is not None
     bootstrap = importlib.util.module_from_spec(spec)
@@ -246,10 +246,10 @@ def test_v1_decoder_rejects_v2_bytes_without_compatibility_fallback() -> None:
             ReleasePayloadDigestV2("systemd_units", "d" * 64),
         ),
         broker_protocol="CHPB/2",
-        system_bus_interface="org.codex_master.HomeBrokerControl2",
+        system_bus_interface="org.the_hive.HomeBrokerControl2",
         system_bus_method="StartDynamicTeamlead",
-        agent_unit_template="codex-master-agent@.service",
-        launcher_path="/usr/libexec/codex-master-agent-launcher",
+        agent_unit_template="the-hive-agent@.service",
+        launcher_path="/usr/libexec/the-hive-agent-launcher",
     )
     v2_bytes = encode_control_release_v2(control_v2)
     assert decode_control_release_v2(v2_bytes, "0.10.5") == control_v2

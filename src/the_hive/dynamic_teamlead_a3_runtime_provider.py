@@ -76,15 +76,15 @@ def validate_dynamic_teamlead_a3_runtime_context(
         or release.joint_release_version != 1
         or release.release_id != "0.11.0"
         or release.chpb_abi != "CHPB/2"
-        or release.socket_unit != "codex-master-home-broker.socket"
-        or release.service_unit != "codex-master-home-broker.service"
-        or release.system_bus_name != "org.codex_master.HomeBrokerControl"
-        or release.system_bus_path != "/org/codex_master/HomeBrokerControl"
-        or release.system_bus_interface != "org.codex_master.HomeBrokerControl1"
-        or release.broker_domain != "codex_master_home_broker_t"
-        or release.gateway_domain != "codex_master_control_t"
-        or release.socket_type != "codex_master_home_broker_runtime_t"
-        or release.agent_domain != "codex_master_agent_t"
+        or release.socket_unit != "the-hive-home-broker.socket"
+        or release.service_unit != "the-hive-home-broker.service"
+        or release.system_bus_name != "org.the_hive.HomeBrokerControl"
+        or release.system_bus_path != "/org/the_hive/HomeBrokerControl"
+        or release.system_bus_interface != "org.the_hive.HomeBrokerControl1"
+        or release.broker_domain != "the_hive_home_broker_t"
+        or release.gateway_domain != "the_hive_control_t"
+        or release.socket_type != "the_hive_home_broker_runtime_t"
+        or release.agent_domain != "the_hive_agent_t"
         or type(release.policy_abi) is not str
         or not release.policy_abi
         or type(release.provider_abi) is not str

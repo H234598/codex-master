@@ -126,13 +126,13 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     write("bin/the-hive-mcp-stable", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
-    write("systemd/user/codex-master-resource-monitor.service", "[Service]\n")
-    write("systemd/user/codex-master.slice", "[Slice]\n")
+    write("systemd/user/the-hive-resource-monitor.service", "[Service]\n")
+    write("systemd/user/the-hive.slice", "[Slice]\n")
     write(
         ".codex-plugin/plugin.json",
         json.dumps(
             {
-                "name": "codex-master",
+                "name": "the-hive",
                 "version": "0",
                 "skills": "./skills/",
                 "mcpServers": "./.mcp.json",
@@ -156,9 +156,9 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
             }
         ),
     )
-    write(".app.json", json.dumps({"apps": {"codex-master": {}}}))
+    write(".app.json", json.dumps({"apps": {"the-hive": {}}}))
     write("hooks/hooks.json", json.dumps({"hooks": {}}))
-    write("skills/codex-master-fleet/SKILL.md", "---\nname: codex-master-fleet\n---\n")
+    write("skills/the-hive-fleet/SKILL.md", "---\nname: the-hive-fleet\n---\n")
     write("codex-hive.json", "{}")
     write("codex-agent-classes.json", "{}")
     for relative in (
@@ -526,8 +526,8 @@ def test_bounded_hive_diagnostic_names_the_timed_out_phase(
 
 
 def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
-    timer = ROOT / "systemd" / "user" / "codex-master-hive-hourly-probe.timer"
-    service = ROOT / "systemd" / "user" / "codex-master-hive-hourly-probe.service"
+    timer = ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.timer"
+    service = ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
     timer_text = timer.read_text(encoding="utf-8")
     service_text = service.read_text(encoding="utf-8")
     assert "OnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00" in timer_text
@@ -539,7 +539,7 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
     assert "%h/codex-master/codex-hive.json" not in service_text
     assert "%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind" not in service_text
     assert (
-        "%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@:%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@:norbind"
+        "%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:norbind"
         in service_text
     )
     assert (
@@ -547,7 +547,7 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
         in service_text
     )
     assert (
-        "ExecStart=%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@/bin/codex-master-hive-hourly-probe %h/.local/lib/codex-master-runtime @MASTERJET_GENERATION@ @MASTERJET_MANIFEST_DIGEST@ --json"
+        "ExecStart=%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@/bin/the-hive-hive-hourly-probe %h/.local/lib/the-hive-runtime @MASTERJET_GENERATION@ @MASTERJET_MANIFEST_DIGEST@ --json"
         in service_text
     )
     assert "libexec" not in service_text
@@ -610,7 +610,7 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
                 / ".config"
                 / "systemd"
                 / "user"
-                / "codex-master-hive-hourly-probe.service"
+                / "the-hive-hive-hourly-probe.service"
             )
             .stat()
             .st_mode
@@ -618,7 +618,7 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         == 0o644
     )
     installed_service = (
-        home / ".config" / "systemd" / "user" / "codex-master-hive-hourly-probe.service"
+        home / ".config" / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
     )
     assert (
         f"TimeoutStartSec={math.ceil(hourly_probe_module.RUNTIME_IMAGE_PROBE_TOTAL_TIMEOUT_SECONDS)}s"
@@ -627,9 +627,9 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     installed_service_text = installed_service.read_text(encoding="utf-8")
     assert "@MASTERJET_" not in installed_service_text
     assert (
-        "ExecStart=%h/.local/lib/codex-master-runtime/generations/"
-        f"{generation}/bin/codex-master-hive-hourly-probe "
-        "%h/.local/lib/codex-master-runtime "
+        "ExecStart=%h/.local/lib/the-hive-runtime/generations/"
+        f"{generation}/bin/the-hive-hive-hourly-probe "
+        "%h/.local/lib/the-hive-runtime "
         f"{generation} {installed['manifest_digest']} --json"
     ) in installed_service_text
     installed_cli = runtime_root / "bin" / "the-hive-mcp"
@@ -651,7 +651,7 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         (runtime_root / ".mcp.json", 0o644),
         (runtime_root / ".app.json", 0o644),
         (runtime_root / "hooks" / "hooks.json", 0o644),
-        (runtime_root / "skills" / "codex-master-fleet" / "SKILL.md", 0o644),
+        (runtime_root / "skills" / "the-hive-fleet" / "SKILL.md", 0o644),
         (runtime_root / "codex-hive.json", 0o644),
         (runtime_root / "codex-agent-classes.json", 0o644),
     ):

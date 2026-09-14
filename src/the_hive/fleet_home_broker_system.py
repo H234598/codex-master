@@ -16,10 +16,10 @@ from the_hive.fleet_home_broker_runtime import (
 from the_hive.fleet_root_runtime_host import RootRuntimeActivityOwnership
 
 
-DIRECTORY_PATH = "/run/codex-master-home-broker"
-SOCKET_PATH = "/run/codex-master-home-broker/broker.sock"
+DIRECTORY_PATH = "/run/the-hive-home-broker"
+SOCKET_PATH = "/run/the-hive-home-broker/broker.sock"
 BROKER_OWNER = "root"
-BROKER_GROUP = "codex-master-broker"
+BROKER_GROUP = "the-hive-broker"
 DIRECTORY_MODE = 0o750
 SOCKET_MODE = 0o660
 

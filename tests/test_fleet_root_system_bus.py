@@ -105,8 +105,8 @@ from the_hive.fleet_root_system_bus import (
 
 
 GENERATION = 7
-PEER_LABEL = b"system_u:system_r:codex_master_control_t:s0:c1,c2"
-GATEWAY_LABEL = b"system_u:system_r:codex_master_control_t:s0"
+PEER_LABEL = b"system_u:system_r:the_hive_control_t:s0:c1,c2"
+GATEWAY_LABEL = b"system_u:system_r:the_hive_control_t:s0"
 INVOCATION = bytes.fromhex("11" * 16)
 TL_AGENT_ID = "tl-" + "a" * 32
 PROFILE_ID = "profile.one"
@@ -126,15 +126,15 @@ def release_spec() -> BrokerReleaseSpec:
         "provider-v1",
         "3" * 64,
         "4" * 64,
-        "codex-master-home-broker.socket",
-        "codex-master-home-broker.service",
-        "org.codex_master.HomeBrokerControl",
-        "/org/codex_master/HomeBrokerControl",
-        "org.codex_master.HomeBrokerControl1",
-        "codex_master_home_broker_t",
-        "codex_master_control_t",
-        "codex_master_home_broker_runtime_t",
-        "codex_master_agent_t",
+        "the-hive-home-broker.socket",
+        "the-hive-home-broker.service",
+        "org.the_hive.HomeBrokerControl",
+        "/org/the_hive/HomeBrokerControl",
+        "org.the_hive.HomeBrokerControl1",
+        "the_hive_home_broker_t",
+        "the_hive_control_t",
+        "the_hive_home_broker_runtime_t",
+        "the_hive_agent_t",
     )
 
 
@@ -428,19 +428,19 @@ class GrantOperations(ScriptedOperations):
 def r2a_evidence(**changes: object) -> broker_system.BrokerSystemEvidence:
     values = {
         "directory": broker_system.BrokerDirectoryEvidence(
-            "/run/codex-master-home-broker",
+            "/run/the-hive-home-broker",
             broker_system.BrokerNodeType.DIRECTORY,
             "root",
-            "codex-master-broker",
+            "the-hive-broker",
             0o750,
             17,
             29,
         ),
         "socket": broker_system.BrokerSocketEvidence(
-            "/run/codex-master-home-broker/broker.sock",
+            "/run/the-hive-home-broker/broker.sock",
             broker_system.BrokerNodeType.SOCKET,
             "root",
-            "codex-master-broker",
+            "the-hive-broker",
             0o660,
             socket.AF_UNIX,
             socket.SOCK_SEQPACKET,
@@ -451,15 +451,15 @@ def r2a_evidence(**changes: object) -> broker_system.BrokerSystemEvidence:
             BUS_NAME, BUS_PATH, BUS_INTERFACE
         ),
         "selinux": broker_system.BrokerSelinuxEvidence(
-            "codex_master_home_broker_t",
-            "codex_master_control_t",
-            "codex_master_home_broker_runtime_t",
+            "the_hive_home_broker_t",
+            "the_hive_control_t",
+            "the_hive_home_broker_runtime_t",
         ),
         "enforcing": broker_system.BrokerFedoraEnforcingEvidence(True),
         "mcs": broker_system.BrokerMcsEvidence("c1,c2"),
         "unit": broker_system.BrokerUnitEvidence(
-            "codex-master-home-broker.socket",
-            "codex-master-home-broker.service",
+            "the-hive-home-broker.socket",
+            "the-hive-home-broker.service",
             False,
             True,
         ),
@@ -1410,7 +1410,7 @@ def test_trusted_consumer_composes_r2b_to_r2a_with_same_ownership_once(
         assert r2a_operations.calls == [
             "observe",
             "observe",
-            ("start", "codex-master-home-broker.socket"),
+            ("start", "the-hive-home-broker.socket"),
         ]
         assert host.snapshot().active_principals_or_agents == 1
         service.close()
@@ -1442,7 +1442,7 @@ def test_trusted_consumer_r2a_drift_or_start_failure_ends_same_ownership_and_clo
         assert operations.open_fds == set()
         assert boundary._receipts == {}
         assert r2a_operations.closed == [101, 102]
-        assert r2a_operations.calls.count(("start", "codex-master-home-broker.socket")) <= 1
+        assert r2a_operations.calls.count(("start", "the-hive-home-broker.socket")) <= 1
         assert host.snapshot().active_principals_or_agents == 0
         assert host.snapshot().runtime_broker_epoch == before.runtime_broker_epoch + 2
     finally:
@@ -1529,7 +1529,7 @@ def test_second_start_while_trusted_receipt_is_active_fails_before_projection(
 
 
 def test_r2b_service_and_consumer_have_no_generic_sink_surface() -> None:
-    source_path = Path(__file__).parents[1] / "src/codex_master/fleet_root_system_bus.py"
+    source_path = Path(__file__).parents[1] / "src/the_hive/fleet_root_system_bus.py"
     source = source_path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(source_path))
 
@@ -2659,11 +2659,11 @@ def test_service_cleanup_failure_ends_ownership_without_consumer(
 
 def test_gateway_s0_and_peer_mcs_are_validated_separately() -> None:
     assert _selinux_context(GATEWAY_LABEL, peer=False) == (
-        "codex_master_control_t",
+        "the_hive_control_t",
         "",
     )
     assert _selinux_context(PEER_LABEL, peer=True) == (
-        "codex_master_control_t",
+        "the_hive_control_t",
         "c1,c2",
     )
     operations = ScriptedOperations()
@@ -2684,9 +2684,9 @@ def test_gateway_s0_and_peer_mcs_are_validated_separately() -> None:
     "gateway_label",
     (
         b"system_u:system_r:other_t:s0",
-        b"system_u:system_r:codex_master_control_t:s0:c1,c2",
-        b"system_u:system_r:codex_master_control_t:s1",
-        b"system_u:system_r:codex_master_control_t:",
+        b"system_u:system_r:the_hive_control_t:s0:c1,c2",
+        b"system_u:system_r:the_hive_control_t:s1",
+        b"system_u:system_r:the_hive_control_t:",
         b"malformed",
     ),
 )
@@ -3495,7 +3495,7 @@ def test_control1_source_and_registration_surface_remain_p1_identical() -> None:
         if line.startswith(("BUS_NAME =", "BUS_PATH =", "BUS_INTERFACE =", "BUS_METHOD ="))
     )
     assert hashlib.sha256(control1_lines.encode("utf-8")).hexdigest() == (
-        "d0400c6d843724d2abd44ae9f4d9737e038c88795a88044684bc7b0a0625b386"
+            "b7358a8a065184fb0803e1f96ba84822b54ef196c12736224e197a7a13b21b74"
     )
 
     method_decorators = [

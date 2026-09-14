@@ -34,10 +34,10 @@ ROLES = (
 )
 ABI = {
     "broker_protocol": "CHPB/2",
-    "system_bus_interface": "org.codex_master.HomeBrokerControl2",
+    "system_bus_interface": "org.the_hive.HomeBrokerControl2",
     "system_bus_method": "StartDynamicTeamlead",
-    "agent_unit_template": "codex-master-agent@.service",
-    "launcher_path": "/usr/libexec/codex-master-agent-launcher",
+    "agent_unit_template": "the-hive-agent@.service",
+    "launcher_path": "/usr/libexec/the-hive-agent-launcher",
 }
 FIXTURES = {
     role: f"{role}-bundle\n".encode("ascii") for role in ROLES
@@ -74,10 +74,10 @@ GOLDEN_BYTES = (
     + b'"},{"role":"systemd_units","sha256":"'
     + hashlib.sha256(FIXTURES["systemd_units"]).hexdigest().encode("ascii")
     + b'"}],"broker_protocol":"CHPB/2",'
-    b'"system_bus_interface":"org.codex_master.HomeBrokerControl2",'
+    b'"system_bus_interface":"org.the_hive.HomeBrokerControl2",'
     b'"system_bus_method":"StartDynamicTeamlead",'
-    b'"agent_unit_template":"codex-master-agent@.service",'
-    b'"launcher_path":"/usr/libexec/codex-master-agent-launcher"}\n'
+    b'"agent_unit_template":"the-hive-agent@.service",'
+    b'"launcher_path":"/usr/libexec/the-hive-agent-launcher"}\n'
 )
 
 
@@ -159,9 +159,9 @@ def test_payload_digest_rejects_wrong_exact_types_roles_and_sha256(
         ("system_bus_method", None),
         ("system_bus_method", 1),
         ("agent_unit_template", None),
-        ("agent_unit_template", ("codex-master-agent@.service",)),
+        ("agent_unit_template", ("the-hive-agent@.service",)),
         ("launcher_path", None),
-        ("launcher_path", {"path": "/usr/libexec/codex-master-agent-launcher"}),
+        ("launcher_path", {"path": "/usr/libexec/the-hive-agent-launcher"}),
     ],
 )
 def test_spec_rejects_wrong_exact_types_and_abi_values(field: str, value: object) -> None:

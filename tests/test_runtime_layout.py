@@ -34,13 +34,13 @@ def materialize_runtime_image(tmp_path: Path) -> Path:
         0o755,
     )
     _write_file(root / "bin" / "the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
-    _write_file(root / "systemd" / "user" / "codex-master-resource-monitor.service", "[Service]\n")
-    _write_file(root / "systemd" / "user" / "codex-master.slice", "[Slice]\n")
+    _write_file(root / "systemd" / "user" / "the-hive-resource-monitor.service", "[Service]\n")
+    _write_file(root / "systemd" / "user" / "the-hive.slice", "[Slice]\n")
     _write_file(
         root / ".codex-plugin" / "plugin.json",
         json.dumps(
             {
-                "name": "codex-master",
+                "name": "the-hive",
                 "version": "0.10.5",
                 "skills": "./skills/",
                 "mcpServers": "./.mcp.json",
@@ -64,9 +64,9 @@ def materialize_runtime_image(tmp_path: Path) -> Path:
             }
         ),
     )
-    _write_file(root / ".app.json", json.dumps({"apps": {"codex-master": {"id": "connector"}}}))
+    _write_file(root / ".app.json", json.dumps({"apps": {"the-hive": {"id": "connector"}}}))
     _write_file(root / "hooks" / "hooks.json", json.dumps({"hooks": {}}))
-    _write_file(root / "skills" / "codex-master-fleet" / "SKILL.md", "---\nname: codex-master-fleet\n---\n")
+    _write_file(root / "skills" / "the-hive-fleet" / "SKILL.md", "---\nname: the-hive-fleet\n---\n")
     _write_file(root / "codex-hive.json", json.dumps({"schema_version": 1, "mode": "shadow"}))
     _write_file(root / "codex-agent-classes.json", json.dumps({"schema_version": 1, "classes": []}))
     _write_file(root / "src" / "the_hive" / "_runtime_spawn_helper.so", "test helper", 0o755)
@@ -141,7 +141,7 @@ def test_runtime_layout_rejects_an_image_reached_through_a_linked_parent(tmp_pat
         ".mcp.json",
         ".app.json",
         "hooks/hooks.json",
-        "skills/codex-master-fleet/SKILL.md",
+        "skills/the-hive-fleet/SKILL.md",
         "codex-hive.json",
         "codex-agent-classes.json",
         "src/the_hive/_runtime_spawn_helper.so",
@@ -304,7 +304,7 @@ def test_runtime_layout_rejects_escaping_metadata_references(tmp_path: Path) -> 
     plugin.write_text(
         json.dumps(
             {
-                "name": "codex-master",
+                "name": "the-hive",
                 "version": "0.10.5",
                 "skills": "./skills/",
                 "mcpServers": "../.mcp.json",
@@ -314,6 +314,30 @@ def test_runtime_layout_rejects_escaping_metadata_references(tmp_path: Path) -> 
         ),
         encoding="utf-8",
     )
+
+    with pytest.raises(module.LayoutError):
+        module.RuntimeLayout.from_runtime_root(root)
+
+
+@pytest.mark.parametrize("legacy_binding", ("plugin_name", "app_key", "skill_path"))
+def test_runtime_layout_rejects_legacy_plugin_skill_metadata_bindings(
+    tmp_path: Path, legacy_binding: str
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+
+    if legacy_binding == "plugin_name":
+        plugin_path = root / ".codex-plugin" / "plugin.json"
+        plugin = json.loads(plugin_path.read_text(encoding="utf-8"))
+        plugin["name"] = "codex-master"
+        plugin_path.write_text(json.dumps(plugin), encoding="utf-8")
+    elif legacy_binding == "app_key":
+        app_path = root / ".app.json"
+        app_path.write_text(json.dumps({"apps": {"codex-master": {"id": "connector"}}}), encoding="utf-8")
+    else:
+        target = root / "skills" / "the-hive-fleet"
+        target.rename(root / "skills" / "codex-master-fleet")
 
     with pytest.raises(module.LayoutError):
         module.RuntimeLayout.from_runtime_root(root)

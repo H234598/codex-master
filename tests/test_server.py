@@ -210,6 +210,8 @@ from the_hive.server import (
     mcp_startup_timeout_seconds,
     updated_mcp_startup_timeout_config,
     mcp_command_tools_list_self_test,
+    mcp_initialize_probe_payload,
+    mcp_tools_list_probe_payload,
     mcp_tools_list_probe_result,
     master_namespace_status,
     master_release_status,
@@ -769,12 +771,12 @@ class PreflightSystemdRunner:
             "--user",
             "--no-pager",
             "show",
-            "codex-master.slice",
+            "the-hive.slice",
             "--property=ControlGroup",
         )
         return resource_cgroup.CommandResultV1(
             returncode=0,
-            stdout=b"ControlGroup=/user.slice/codex-master.slice\n",
+            stdout=b"ControlGroup=/user.slice/the-hive.slice\n",
             stderr=b"",
         )
 
@@ -811,7 +813,7 @@ class RebindingSystemdRunner(PreflightSystemdRunner):
         if (
             argv[0] == "/usr/bin/systemctl"
             and argv[3] == "show"
-            and argv[4] == "codex-master.slice"
+            and argv[4] == "the-hive.slice"
             and "--property=ControlGroup" in argv
         ):
             assert self._control_slice_sequence
@@ -913,11 +915,11 @@ class ScopeSystemdRunner:
         self.calls.append(argv)
         if argv[0] == "/usr/bin/systemctl" and argv[3:5] == (
             "show",
-            "codex-master.slice",
+            "the-hive.slice",
         ):
             return self._result(
                 0,
-                stdout=b"ControlGroup=/user.slice/codex-master.slice\n",
+                stdout=b"ControlGroup=/user.slice/the-hive.slice\n",
             )
         if argv[0] == "/usr/bin/systemctl" and (
             "--property=Id" in argv or "--property=LoadState" in argv
@@ -927,7 +929,7 @@ class ScopeSystemdRunner:
             return self._result(
                 0,
                 stdout=(
-                    f"ControlGroup=/user.slice/codex-master.slice/{self.unit_name}\n"
+                    f"ControlGroup=/user.slice/the-hive.slice/{self.unit_name}\n"
                     "DelegateControllers=cpu cpuset memory pids io\n"
                 ).encode(),
             )
@@ -953,7 +955,7 @@ class ScopeSystemdRunner:
         self.unit_name = next(
             argument.split("=", 1)[1] for argument in argv if argument.startswith("--unit=")
         )
-        scope_root = self.cgroup_root / "user.slice" / "codex-master.slice" / self.unit_name
+        scope_root = self.cgroup_root / "user.slice" / "the-hive.slice" / self.unit_name
         scope_root.mkdir()
         documents = {
             "cpuset.cpus.effective": b"4-11\n",
@@ -999,7 +1001,7 @@ def write_cgroup_preflight_facts_for_test(
     ),
 ) -> Path:
     cgroup_root = directory / "cgroup"
-    slice_root = cgroup_root / "user.slice" / "codex-master.slice"
+    slice_root = cgroup_root / "user.slice" / "the-hive.slice"
     slice_root.mkdir(parents=True)
     (slice_root / "cgroup.controllers").write_bytes(controllers)
     (slice_root / "cgroup.subtree_control").write_bytes(subtree_controllers)
@@ -2111,7 +2113,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertTrue(server_module._resource_monitor_cgroup_preflight(runtime))
             self.assertEqual(tuple(runner.calls), bound_calls)
 
-            shutil.rmtree(root / "cgroup" / "user.slice" / "codex-master.slice")
+            shutil.rmtree(root / "cgroup" / "user.slice" / "the-hive.slice")
             self.assertFalse(server_module._resource_monitor_cgroup_preflight(runtime))
             self.assertFalse(server_module._resource_monitor_cgroup_preflight(runtime))
             self.assertEqual(tuple(runner.calls), bound_calls)
@@ -2307,8 +2309,8 @@ class ServerHelpersTest(unittest.TestCase):
         read_facts.assert_called_once()
 
     def test_spawn_admission_binds_and_prefers_dynamic_control_group_in_flow(self) -> None:
-        first_slice = "/user.slice/codex-master.slice"
-        second_slice = "/user.slice/user-1000.slice/user@1000.service/codex.slice/codex-master.slice"
+        first_slice = "/user.slice/the-hive.slice"
+        second_slice = "/user.slice/user-1000.slice/user@1000.service/codex.slice/the-hive.slice"
         facts = resource_evidence_v2_for_test(ResourceEvidenceStateV2.READY)
         runner = RebindingSystemdRunner(
             control_slice_sequence=(first_slice, second_slice),
@@ -6470,6 +6472,25 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(skill_props["plugins_offset"]["minimum"], 0)
         self.assertEqual(skill_props["plugins_limit"]["default"], MAX_CAPABILITY_PLUGINS)
         self.assertEqual(skill_props["plugins_limit"]["maximum"], MAX_SKILL_NAMES)
+
+    def test_mcp_probe_payloads_identify_the_hive(self) -> None:
+        install_probe = json.loads(mcp_initialize_probe_payload())
+        tools_probe = [
+            json.loads(line) for line in mcp_tools_list_probe_payload().splitlines()
+        ]
+
+        self.assertEqual(
+            install_probe["params"]["clientInfo"],
+            {"name": "the-hive-install-probe", "version": "0"},
+        )
+        self.assertEqual(
+            tools_probe[0]["params"]["clientInfo"],
+            {"name": "the-hive-tools-probe", "version": "0"},
+        )
+        self.assertEqual(
+            [message["method"] for message in tools_probe],
+            ["initialize", "notifications/initialized", "tools/list"],
+        )
 
     def test_agent_selectors_scale_to_series_pool_with_legacy_aliases(self) -> None:
         with patch.object(
@@ -15189,20 +15210,20 @@ google_accounts:
 
     def test_master_watchdog_status_reports_hardened_systemd_state_without_paths(self) -> None:
         source_root = Path(__file__).resolve().parents[1]
-        service_text = (source_root / "systemd" / "user" / "codex-master-watchdog.service").read_text(encoding="utf-8")
-        timer_text = (source_root / "systemd" / "user" / "codex-master-watchdog.timer").read_text(encoding="utf-8")
+        service_text = (source_root / "systemd" / "user" / "the-hive-watchdog.service").read_text(encoding="utf-8")
+        timer_text = (source_root / "systemd" / "user" / "the-hive-watchdog.timer").read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo"
             systemd_user = Path(tmp) / "systemd-user"
             (root / "systemd" / "user").mkdir(parents=True)
             systemd_user.mkdir()
-            (root / "systemd" / "user" / "codex-master-watchdog.service").write_text(service_text, encoding="utf-8")
-            (root / "systemd" / "user" / "codex-master-watchdog.timer").write_text(timer_text, encoding="utf-8")
-            (systemd_user / "codex-master-watchdog.service").write_text(service_text, encoding="utf-8")
-            (systemd_user / "codex-master-watchdog.timer").write_text(timer_text, encoding="utf-8")
+            (root / "systemd" / "user" / "the-hive-watchdog.service").write_text(service_text, encoding="utf-8")
+            (root / "systemd" / "user" / "the-hive-watchdog.timer").write_text(timer_text, encoding="utf-8")
+            (systemd_user / "the-hive-watchdog.service").write_text(service_text, encoding="utf-8")
+            (systemd_user / "the-hive-watchdog.timer").write_text(timer_text, encoding="utf-8")
 
             def fake_run(command, *, check=False, cwd=None, env=None, timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS):
-                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "codex-master-watchdog.timer":
+                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "the-hive-watchdog.timer":
                     return subprocess.CompletedProcess(
                         command,
                         0,
@@ -15211,13 +15232,13 @@ google_accounts:
                             "ActiveState=active\n"
                             "SubState=waiting\n"
                             "Result=success\n"
-                            "Unit=codex-master-watchdog.service\n"
+                            "Unit=the-hive-watchdog.service\n"
                             "NextElapseUSecRealtime=Sun 2026-06-07 19:00:00 CEST\n"
                             "LastTriggerUSec=Sun 2026-06-07 18:45:00 CEST\n"
                         ),
                         stderr="",
                     )
-                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "codex-master-watchdog.service":
+                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "the-hive-watchdog.service":
                     return subprocess.CompletedProcess(
                         command,
                         0,
@@ -15236,7 +15257,7 @@ google_accounts:
                     return subprocess.CompletedProcess(
                         command,
                         0,
-                        stdout="Overall exposure level for codex-master-watchdog.service: 3.1 OK\n",
+                        stdout="Overall exposure level for the-hive-watchdog.service: 3.1 OK\n",
                         stderr="",
                     )
                 return subprocess.CompletedProcess(command, 1, stdout="", stderr="unexpected")
@@ -15310,28 +15331,28 @@ google_accounts:
 
     def test_master_watchdog_status_detects_missing_hardening_directive(self) -> None:
         source_root = Path(__file__).resolve().parents[1]
-        service_text = (source_root / "systemd" / "user" / "codex-master-watchdog.service").read_text(encoding="utf-8")
-        timer_text = (source_root / "systemd" / "user" / "codex-master-watchdog.timer").read_text(encoding="utf-8")
+        service_text = (source_root / "systemd" / "user" / "the-hive-watchdog.service").read_text(encoding="utf-8")
+        timer_text = (source_root / "systemd" / "user" / "the-hive-watchdog.timer").read_text(encoding="utf-8")
         weakened_service = service_text.replace("IPAddressDeny=any\n", "")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo"
             systemd_user = Path(tmp) / "systemd-user"
             (root / "systemd" / "user").mkdir(parents=True)
             systemd_user.mkdir()
-            (root / "systemd" / "user" / "codex-master-watchdog.service").write_text(service_text, encoding="utf-8")
-            (root / "systemd" / "user" / "codex-master-watchdog.timer").write_text(timer_text, encoding="utf-8")
-            (systemd_user / "codex-master-watchdog.service").write_text(weakened_service, encoding="utf-8")
-            (systemd_user / "codex-master-watchdog.timer").write_text(timer_text, encoding="utf-8")
+            (root / "systemd" / "user" / "the-hive-watchdog.service").write_text(service_text, encoding="utf-8")
+            (root / "systemd" / "user" / "the-hive-watchdog.timer").write_text(timer_text, encoding="utf-8")
+            (systemd_user / "the-hive-watchdog.service").write_text(weakened_service, encoding="utf-8")
+            (systemd_user / "the-hive-watchdog.timer").write_text(timer_text, encoding="utf-8")
 
             def fake_run(command, *, check=False, cwd=None, env=None, timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS):
-                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "codex-master-watchdog.timer":
+                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "the-hive-watchdog.timer":
                     return subprocess.CompletedProcess(
                         command,
                         0,
                         stdout="LoadState=loaded\nActiveState=active\nSubState=waiting\nResult=success\n",
                         stderr="",
                     )
-                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "codex-master-watchdog.service":
+                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "the-hive-watchdog.service":
                     return subprocess.CompletedProcess(
                         command,
                         0,
@@ -15342,7 +15363,7 @@ google_accounts:
                     return subprocess.CompletedProcess(
                         command,
                         0,
-                        stdout="Overall exposure level for codex-master-watchdog.service: 3.1 OK\n",
+                        stdout="Overall exposure level for the-hive-watchdog.service: 3.1 OK\n",
                         stderr="",
                     )
                 return subprocess.CompletedProcess(command, 1, stdout="", stderr="unexpected")
@@ -15363,7 +15384,7 @@ google_accounts:
         result = master_app_bridge_status()
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["app_name"], "codex-master")
+        self.assertEqual(result["app_name"], "the-hive")
         self.assertEqual(result["connector_id"], "connector_26697a678b7ec999dc005131eb5c087c")
         self.assertEqual(result["connector_id_kind"], "connector")
         self.assertTrue(result["connector_id_format_ok"])
@@ -15380,7 +15401,7 @@ google_accounts:
                 json.dumps({"apps": "./.app.json"}), encoding="utf-8"
             )
             (root / ".app.json").write_text(
-                json.dumps({"apps": {"codex-master": {"id": "connector_"}}}), encoding="utf-8"
+                json.dumps({"apps": {"the-hive": {"id": "connector_"}}}), encoding="utf-8"
             )
 
             with patch.object(server_module, "repo_root", return_value=root):
@@ -15398,7 +15419,7 @@ google_accounts:
             cached_manifest = cache / "0.2.18+codex.test" / ".codex-plugin" / "plugin.json"
             manifest.parent.mkdir(parents=True)
             cached_manifest.parent.mkdir(parents=True)
-            payload = {"name": "codex-master", "version": "0.2.18+codex.test"}
+            payload = {"name": "the-hive", "version": "0.2.18+codex.test"}
             manifest.write_text(json.dumps(payload), encoding="utf-8")
             cached_manifest.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -15421,7 +15442,7 @@ google_accounts:
             target_manifest = target / ".codex-plugin" / "plugin.json"
             manifest.parent.mkdir(parents=True)
             target_manifest.parent.mkdir(parents=True)
-            payload = {"name": "codex-master", "version": "0.2.18+codex.test"}
+            payload = {"name": "the-hive", "version": "0.2.18+codex.test"}
             manifest.write_text(json.dumps(payload), encoding="utf-8")
             target_manifest.write_text(json.dumps(payload), encoding="utf-8")
             cache.mkdir()
@@ -15447,7 +15468,7 @@ google_accounts:
             redirected_manifest = redirected_cache / version / ".codex-plugin" / "plugin.json"
             manifest.parent.mkdir(parents=True)
             redirected_manifest.parent.mkdir(parents=True)
-            payload = {"name": "codex-master", "version": version}
+            payload = {"name": "the-hive", "version": version}
             manifest.write_text(json.dumps(payload), encoding="utf-8")
             redirected_manifest.write_text(json.dumps(payload), encoding="utf-8")
             cache.mkdir()
@@ -15485,20 +15506,20 @@ google_accounts:
             (root / "schemas").mkdir()
             (root / "scripts").mkdir()
             (root / "hooks").mkdir()
-            (root / "skills" / "codex-master-fleet").mkdir(parents=True)
+            (root / "skills" / "the-hive-fleet").mkdir(parents=True)
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive" / "__pycache__").mkdir(parents=True)
             (root / "tests" / "__pycache__").mkdir(parents=True)
             (root / ".git").mkdir()
             (root / ".pytest_cache").mkdir()
-            payload = {"name": "codex-master", "version": "0.3.4+codex.test"}
+            payload = {"name": "the-hive", "version": "0.3.4+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
             (root / "README.md").write_text("readme", encoding="utf-8")
             (root / "codex-agent-pool.json").write_text("{}", encoding="utf-8")
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
-            bin_wrapper = root / "bin" / "codex-master-mcp"
+            bin_wrapper = root / "bin" / "the-hive-mcp"
             bin_wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
             bin_wrapper.chmod(bin_wrapper.stat().st_mode | stat.S_IXUSR)
             (root / "docs" / "agent-pool.md").write_text("doc", encoding="utf-8")
@@ -15521,18 +15542,18 @@ google_accounts:
                 encoding="utf-8",
             )
             (root / "hooks" / "native_bee_event.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
-            (root / "skills" / "codex-master-fleet" / "SKILL.md").write_text("skill", encoding="utf-8")
+            (root / "skills" / "the-hive-fleet" / "SKILL.md").write_text("skill", encoding="utf-8")
             (root / "src" / "the_hive" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             (root / "src" / "the_hive" / "__pycache__" / "server.pyc").write_bytes(b"cache")
             (root / "src" / "the_hive" / ".env").write_text("SECRET=not-copied", encoding="utf-8")
             (root / "src" / "the_hive" / "server.py.swp").write_text("swap", encoding="utf-8")
-            (root / "skills" / "codex-master-fleet" / "SKILL.md.tmp").write_text("tmp", encoding="utf-8")
+            (root / "skills" / "the-hive-fleet" / "SKILL.md.tmp").write_text("tmp", encoding="utf-8")
             (root / "tests" / "test_server.py").write_text("should not copy", encoding="utf-8")
             (root / ".git" / "config").write_text("secret", encoding="utf-8")
             (root / ".pytest_cache" / "README.md").write_text("cache", encoding="utf-8")
             managed_home = tmp_path / "managed-teamleiterin-q1"
             managed_home.mkdir()
-            cache = managed_home / "plugins" / "cache" / "personal" / "codex-master"
+            cache = managed_home / "plugins" / "cache" / "personal" / "the-hive"
             auth_file = managed_home / "auth.json"
             config_file = managed_home / "config.toml"
             trust_file = managed_home / ".codex-trust"
@@ -15560,15 +15581,15 @@ google_accounts:
                 "app": (entry / ".app.json").exists(),
                 "mcp": (entry / ".mcp.json").exists(),
                 "pool_spec": (entry / "codex-agent-pool.json").exists(),
-                "bin": (entry / "bin" / "codex-master-mcp").exists(),
-                "bin_executable": os.access(entry / "bin" / "codex-master-mcp", os.X_OK),
+                "bin": (entry / "bin" / "the-hive-mcp").exists(),
+                "bin_executable": os.access(entry / "bin" / "the-hive-mcp", os.X_OK),
                 "docs": (entry / "docs" / "agent-pool.md").exists(),
                 "examples": (entry / "examples" / "codex-agent-pool.json").exists(),
                 "hooks": (entry / "hooks" / "hooks.json").exists(),
                 "hook_script": (entry / "hooks" / "native_bee_event.py").exists(),
                 "schemas": (entry / "schemas" / "codex-agent-pool.schema.json").exists(),
                 "scripts": (entry / "scripts" / "install-agent-pool").exists(),
-                "skill": (entry / "skills" / "codex-master-fleet" / "SKILL.md").exists(),
+                "skill": (entry / "skills" / "the-hive-fleet" / "SKILL.md").exists(),
                 "systemd": (entry / "systemd" / "user").exists(),
                 "server": (entry / "src" / "the_hive" / "server.py").exists(),
                 "git": (entry / ".git").exists(),
@@ -15577,7 +15598,7 @@ google_accounts:
                 "pycache": (entry / "src" / "the_hive" / "__pycache__").exists(),
                 "hidden_env": (entry / "src" / "the_hive" / ".env").exists(),
                 "swap": (entry / "src" / "the_hive" / "server.py.swp").exists(),
-                "tmp": (entry / "skills" / "codex-master-fleet" / "SKILL.md.tmp").exists(),
+                "tmp": (entry / "skills" / "the-hive-fleet" / "SKILL.md.tmp").exists(),
             }
 
         self.assertTrue(result["ok"])
@@ -15621,7 +15642,7 @@ google_accounts:
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive").mkdir(parents=True)
             (root / ".codex-plugin" / "plugin.json").write_text(
-                json.dumps({"name": "codex-master", "version": version}), encoding="utf-8"
+                json.dumps({"name": "the-hive", "version": version}), encoding="utf-8"
             )
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -15658,7 +15679,7 @@ google_accounts:
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive").mkdir(parents=True)
-            payload = {"name": "codex-master", "version": "0.3.4+codex.test"}
+            payload = {"name": "the-hive", "version": "0.3.4+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -15693,7 +15714,7 @@ google_accounts:
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive").mkdir(parents=True)
-            payload = {"name": "codex-master", "version": version}
+            payload = {"name": "the-hive", "version": version}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -15724,7 +15745,7 @@ google_accounts:
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive").mkdir(parents=True)
-            payload = {"name": "codex-master", "version": "0.3.5+codex.test"}
+            payload = {"name": "the-hive", "version": "0.3.5+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -15755,7 +15776,7 @@ google_accounts:
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive").mkdir(parents=True)
-            payload = {"name": "codex-master", "version": "0.3.8+codex.test"}
+            payload = {"name": "the-hive", "version": "0.3.8+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -15802,7 +15823,7 @@ google_accounts:
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive").mkdir(parents=True)
-            payload = {"name": "codex-master", "version": "0.3.8+codex.test"}
+            payload = {"name": "the-hive", "version": "0.3.8+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -15856,7 +15877,7 @@ google_accounts:
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive").mkdir(parents=True)
             version = "0.3.8+codex.test"
-            payload = {"name": "codex-master", "version": version}
+            payload = {"name": "the-hive", "version": version}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -15944,7 +15965,7 @@ google_accounts:
                 for relative in (".codex-plugin", "bin", "skills", "src", "systemd"):
                     (repo / relative).mkdir(parents=True, exist_ok=True)
                 (repo / ".codex-plugin" / "plugin.json").write_text(
-                    json.dumps({"name": "codex-master", "version": version}), encoding="utf-8"
+                    json.dumps({"name": "the-hive", "version": version}), encoding="utf-8"
                 )
                 for relative, content in {
                     ".app.json": "{}",
@@ -15989,7 +16010,7 @@ google_accounts:
             (root / "skills").mkdir()
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive").mkdir(parents=True)
-            payload = {"name": "codex-master", "version": "0.3.4+codex.test"}
+            payload = {"name": "the-hive", "version": "0.3.4+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -16047,7 +16068,7 @@ google_accounts:
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive").mkdir(parents=True)
             current = "0.3.5+codex.current"
-            payload = {"name": "codex-master", "version": current}
+            payload = {"name": "the-hive", "version": current}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -16061,7 +16082,7 @@ google_accounts:
             for index, version in enumerate(old_versions):
                 manifest = cache / version / ".codex-plugin" / "plugin.json"
                 manifest.parent.mkdir(parents=True)
-                manifest.write_text(json.dumps({"name": "codex-master", "version": version}), encoding="utf-8")
+                manifest.write_text(json.dumps({"name": "the-hive", "version": version}), encoding="utf-8")
                 os.utime(cache / version, (1000 + index, 1000 + index))
             invalid = cache / "0.3.99+codex.invalid"
             invalid.mkdir()
@@ -16112,7 +16133,7 @@ google_accounts:
             valid_dir.mkdir()
             (valid_dir / ".codex-plugin").mkdir()
             (valid_dir / ".codex-plugin" / "plugin.json").write_text(
-                json.dumps({"name": "codex-master", "version": valid_version}),
+                json.dumps({"name": "the-hive", "version": valid_version}),
                 encoding="utf-8",
             )
 
@@ -16136,7 +16157,7 @@ google_accounts:
                 for relative in (".codex-plugin", "bin", "skills", "src", "systemd"):
                     (root / relative).mkdir(parents=True)
                 (root / ".codex-plugin" / "plugin.json").write_text(
-                    json.dumps({"name": "codex-master", "version": version}), encoding="utf-8"
+                    json.dumps({"name": "the-hive", "version": version}), encoding="utf-8"
                 )
                 for relative, content in {
                     ".app.json": "{}",
@@ -16219,7 +16240,7 @@ google_accounts:
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "the_hive").mkdir(parents=True)
             (root / ".codex-plugin" / "plugin.json").write_text(
-                json.dumps({"name": "codex-master", "version": current_version}), encoding="utf-8"
+                json.dumps({"name": "the-hive", "version": current_version}), encoding="utf-8"
             )
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -16231,7 +16252,7 @@ google_accounts:
             old_manifest = redirected_cache / old_version / ".codex-plugin" / "plugin.json"
             old_manifest.parent.mkdir(parents=True)
             old_manifest.write_text(
-                json.dumps({"name": "codex-master", "version": old_version}), encoding="utf-8"
+                json.dumps({"name": "the-hive", "version": old_version}), encoding="utf-8"
             )
             cache.mkdir()
 
@@ -16348,7 +16369,7 @@ google_accounts:
             root = Path(tmpdir)
             manifest = root / ".codex-plugin" / "plugin.json"
             manifest.parent.mkdir()
-            manifest.write_text(json.dumps({"name": "codex-master", "version": "0.2.18+codex.test"}), encoding="utf-8")
+            manifest.write_text(json.dumps({"name": "the-hive", "version": "0.2.18+codex.test"}), encoding="utf-8")
 
             result = plugin_manifest_version(root)
 
@@ -16672,6 +16693,7 @@ google_accounts:
             write_proc("103", "python3", ["python3", "-m", "the_hive.server"], {})
             write_proc("104", "bash", ["bash"], {})
             write_proc("105", "codex-code-mode-host", ["codex-code-mode-host"], {})
+            write_proc("106", "the-hive-mcp", ["/tmp/the-hive-mcp"], {})
 
             with patch.dict("os.environ", {"HOME": str(home)}, clear=False), patch.dict(
                 "the_hive.server.AGENTS", agents, clear=True
@@ -16679,7 +16701,7 @@ google_accounts:
                 result = codex_related_process_summary(root)
 
         self.assertEqual(result["codex_client_process_count"], 4)
-        self.assertEqual(result["mcp_server_process_count"], 1)
+        self.assertEqual(result["mcp_server_process_count"], 2)
         self.assertEqual(result["home_kind_counts"]["unknown"], 2)
         self.assertEqual(result["home_kind_counts"]["managed_agent_home"], 1)
         self.assertEqual(result["home_kind_counts"]["custom_home"], 1)
@@ -19105,7 +19127,9 @@ google_accounts:
                     self.assertEqual(runner_target.owner_pid, os.getpid())
                     self.assertEqual((runner_target.device, runner_target.inode), (native.stat().st_dev, native.stat().st_ino))
                     send_keys = next(call.args[0] for call in run_tmux.call_args_list if "send-keys" in call.args[0])
-                    self.assertIn('"${CODEX_MASTER_RUNNER_EXEC_PATH:?}"', send_keys[-2])
+                    self.assertIn("THE_HIVE_MCP=1 CODEX_AGENT_MCP=1", send_keys[-2])
+                    self.assertNotIn("CODEX_MASTER_MCP=1", send_keys[-2])
+                    self.assertIn('"${THE_HIVE_RUNNER_EXEC_PATH:?}"', send_keys[-2])
                     self.assertNotIn(f"/proc/{os.getpid()}/fd/", send_keys[-2])
                     self.assertIn(f"CODEX_HOME={root}", send_keys[-2])
                     self.assertIn("-u CODEX_ACCESS_TOKEN -u OPENAI_API_KEY", send_keys[-2])
@@ -23415,7 +23439,9 @@ google_accounts:
             managed = proc_root / "101"
             external.mkdir(parents=True)
             managed.mkdir()
-            external.joinpath("environ").write_bytes(f"CODEX_HOME={home}\0".encode("utf-8"))
+            external.joinpath("environ").write_bytes(
+                f"CODEX_HOME={home}\0CODEX_MASTER_MCP=1\0".encode("utf-8")
+            )
             external.joinpath("status").write_text("Name:\tcodex\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8")
             managed.joinpath("environ").write_bytes(f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0".encode("utf-8"))
             managed.joinpath("status").write_text("Name:\tcodex\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8")
@@ -23456,16 +23482,16 @@ google_accounts:
             process = proc_root / str(pid)
             process.mkdir(parents=True)
             process.joinpath("environ").write_bytes(
-                f"CODEX_HOME={home}\0CODEX_MASTER_MCP=1\0CODEX_AGENT_MCP=1\0".encode("utf-8")
+                f"CODEX_HOME={home}\0THE_HIVE_MCP=1\0CODEX_AGENT_MCP=1\0".encode("utf-8")
             )
             process.joinpath("status").write_text(
                 "Name:\t3\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8"
             )
             process.joinpath("cmdline").write_bytes(b"/proc/3130095/fd/3\0--model\0gpt-5.6-terra\0")
             process.joinpath("exe").symlink_to(pinned_native)
-            scope_unit = "codex-master-resource-" + "d" * 32 + ".scope"
+            scope_unit = "the-hive-resource-" + "d" * 32 + ".scope"
             process.joinpath("cgroup").write_text(
-                f"0::/user.slice/user-1000.slice/user@1000.service/app.slice/codex-master.slice/{scope_unit}\n",
+                f"0::/user.slice/user-1000.slice/user@1000.service/app.slice/the-hive.slice/{scope_unit}\n",
                 encoding="ascii",
             )
             meta = {
@@ -23514,13 +23540,13 @@ google_accounts:
                 proc_root = root / "proc"
                 pane_pid = 3130101
                 child_pid = 3214107
-                scope_unit = "codex-master-resource-" + "d" * 32 + ".scope"
+                scope_unit = "the-hive-resource-" + "d" * 32 + ".scope"
                 pane = proc_root / str(pane_pid)
                 child = proc_root / str(child_pid)
                 pane.mkdir(parents=True)
                 child.mkdir()
                 pane.joinpath("environ").write_bytes(
-                    f"CODEX_HOME={home}\0CODEX_MASTER_MCP=1\0CODEX_AGENT_MCP=1\0".encode("utf-8")
+                    f"CODEX_HOME={home}\0THE_HIVE_MCP=1\0CODEX_AGENT_MCP=1\0".encode("utf-8")
                 )
                 pane.joinpath("status").write_text(
                     "Name:\t3\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8"
@@ -23530,16 +23556,16 @@ google_accounts:
                 )
                 pane.joinpath("exe").symlink_to(native)
                 pane.joinpath("cgroup").write_text(
-                    f"0::/user.slice/codex-master.slice/{scope_unit}\n", encoding="ascii"
+                    f"0::/user.slice/the-hive.slice/{scope_unit}\n", encoding="ascii"
                 )
                 child.joinpath("environ").write_bytes(f"CODEX_HOME={home}\0".encode("utf-8"))
                 child.joinpath("status").write_text(
                     f"Name:\tMainThread\nState:\tS (sleeping)\nPPid:\t{pane_pid}\n",
                     encoding="utf-8",
                 )
-                child_scope = scope_unit if child_scope_matches else "codex-master-resource-" + "e" * 32 + ".scope"
+                child_scope = scope_unit if child_scope_matches else "the-hive-resource-" + "e" * 32 + ".scope"
                 child.joinpath("cgroup").write_text(
-                    f"0::/user.slice/codex-master.slice/{child_scope}\n", encoding="ascii"
+                    f"0::/user.slice/the-hive.slice/{child_scope}\n", encoding="ascii"
                 )
                 meta = {
                     "agent": "a",
@@ -23587,16 +23613,16 @@ google_accounts:
             process = proc_root / str(pid)
             process.mkdir(parents=True)
             process.joinpath("environ").write_bytes(
-                f"CODEX_HOME={home}\0CODEX_MASTER_MCP=1\0CODEX_AGENT_MCP=1\0".encode("utf-8")
+                f"CODEX_HOME={home}\0THE_HIVE_MCP=1\0CODEX_AGENT_MCP=1\0".encode("utf-8")
             )
             process.joinpath("status").write_text(
                 "Name:\t3\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8"
             )
             process.joinpath("cmdline").write_bytes(b"/proc/3130095/fd/3\0--model\0gpt-5.6-terra\0")
             process.joinpath("exe").symlink_to(spoofed_native)
-            scope_unit = "codex-master-resource-" + "d" * 32 + ".scope"
+            scope_unit = "the-hive-resource-" + "d" * 32 + ".scope"
             process.joinpath("cgroup").write_text(
-                f"0::/user.slice/user-1000.slice/user@1000.service/app.slice/codex-master.slice/{scope_unit}\n",
+                f"0::/user.slice/user-1000.slice/user@1000.service/app.slice/the-hive.slice/{scope_unit}\n",
                 encoding="ascii",
             )
             meta = {
@@ -23633,7 +23659,7 @@ google_accounts:
             pid_dir.mkdir(parents=True)
             pid_dir.joinpath("exe").symlink_to(native)
             pid_dir.joinpath("cgroup").write_bytes(b"0::/" + b"x" * 4092)
-            scope_unit = "codex-master-resource-" + "d" * 32 + ".scope"
+            scope_unit = "the-hive-resource-" + "d" * 32 + ".scope"
 
             with patch.object(Path, "read_bytes", side_effect=AssertionError("unbounded cgroup read")):
                 matched = server_module._proc_matches_g5_native_pane(
@@ -23742,7 +23768,7 @@ google_accounts:
                 process = proc_root / pid
                 process.mkdir()
                 process.joinpath("environ").write_bytes(
-                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0CODEX_MASTER_MCP=1\0".encode("utf-8")
+                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0THE_HIVE_MCP=1\0".encode("utf-8")
                 )
                 process.joinpath("status").write_text(
                     f"Name:\t{Path(executable).name}\nState:\tS (sleeping)\nPPid:\t1\n",
@@ -23833,7 +23859,7 @@ google_accounts:
                 process = proc_root / pid
                 process.mkdir()
                 process.joinpath("environ").write_bytes(
-                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0CODEX_MASTER_MCP=1\0".encode("utf-8")
+                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0THE_HIVE_MCP=1\0".encode("utf-8")
                 )
                 process.joinpath("status").write_text(
                     f"Name:\t{Path(executable).name}\nState:\tS (sleeping)\nPPid:\t200\n",
@@ -23931,7 +23957,7 @@ google_accounts:
                 process.joinpath("environ").write_bytes(
                     (
                         f"CODEX_HOME={home}\0"
-                        + ("CODEX_AGENT_MCP=1\0CODEX_MASTER_MCP=1\0" if strong_markers else "")
+                        + ("CODEX_AGENT_MCP=1\0THE_HIVE_MCP=1\0" if strong_markers else "")
                     ).encode("utf-8")
                 )
                 process.joinpath("status").write_text(
@@ -23971,7 +23997,7 @@ google_accounts:
                 process = proc_root / "100"
                 process.mkdir(parents=True)
                 process.joinpath("environ").write_bytes(
-                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0CODEX_MASTER_MCP=1\0".encode("utf-8")
+                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0THE_HIVE_MCP=1\0".encode("utf-8")
                 )
                 process.joinpath("status").write_text(
                     "Name:\tdbus-daemon\nState:\tS (sleeping)\nPPid:\t1\n",
@@ -24003,7 +24029,7 @@ google_accounts:
     def test_agent_home_process_summary_requires_both_markers_for_direct_helpers(self) -> None:
         environments = (
             "CODEX_AGENT_MCP=1\0",
-            "CODEX_MASTER_MCP=1\0",
+            "THE_HIVE_MCP=1\0",
             "",
         )
         for markers in environments:
@@ -24066,7 +24092,7 @@ google_accounts:
                 helper = proc_root / "201"
                 helper.mkdir(parents=True)
                 helper.joinpath("environ").write_bytes(
-                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0CODEX_MASTER_MCP=1\0".encode("utf-8")
+                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0THE_HIVE_MCP=1\0".encode("utf-8")
                 )
                 helper.joinpath("status").write_text(
                     "Name:\tdbus-daemon\nState:\tS (sleeping)\nPPid:\t200\n",
@@ -32361,6 +32387,7 @@ google_accounts:
         self.assertEqual(second["status"], "sent")
         self.assertEqual(len(load_names), 2)
         self.assertEqual(len(set(load_names)), 2)
+        self.assertTrue(all(name.startswith("the-hive-mcp-a1-") for name in load_names))
         self.assertCountEqual(pasted, ["first", "second"])
 
     def test_send_agent_fails_when_tui_input_is_not_ready(self) -> None:
@@ -33831,7 +33858,7 @@ class CliLifecycleTest(unittest.TestCase):
         adapter.assert_not_called()
 
     def test_watchdog_systemd_service_keeps_hardening_directives(self) -> None:
-        service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "codex-master-watchdog.service"
+        service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "the-hive-watchdog.service"
         text = service.read_text(encoding="utf-8")
 
         self.assertIn("CapabilityBoundingSet=", text)
@@ -38911,8 +38938,8 @@ def test_usage_loader_exception_becomes_canonical_unavailable_and_render_success
 
 
 class ResourceMonitorLifecycleTest(unittest.TestCase):
-    service_name = "codex-master-resource-monitor.service"
-    slice_name = "codex-master.slice"
+    service_name = "the-hive-resource-monitor.service"
+    slice_name = "the-hive.slice"
     _test_release_commit = "e" * 40
 
     def setUp(self) -> None:
@@ -39037,7 +39064,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
 
     def _published_release(self, root: Path, generation: str) -> RuntimeLayout:
         installer = runpy.run_path(
-            str(self._release_source_root / "scripts" / "codex-master-hive-hourly-probe-install")
+            str(self._release_source_root / "scripts" / "the-hive-hive-hourly-probe-install")
         )
         stage = root / f".stage-{generation}"
         stage.mkdir(mode=0o700)
@@ -39057,7 +39084,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
                 release_root
                 / "generations"
                 / generation
-                / ".codex-master-runtime-manifest.json"
+                / ".the-hive-runtime-manifest.json"
             ).read_bytes()
         ).hexdigest()
         return RuntimeLayout.from_current_release(release_root, generation, digest)
@@ -39170,7 +39197,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             layout = self._published_release(root, "h4-current")
             dirty_checkout = root / "dirty-checkout"
             dirty_checkout.mkdir()
-            (dirty_checkout / "codex-master-resource-monitor.service").write_text(
+            (dirty_checkout / "the-hive-resource-monitor.service").write_text(
                 "ExecStart=/dirty-checkout/monitor\n", encoding="utf-8"
             )
             target = root / "systemd-user"
@@ -39190,7 +39217,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             self.assertTrue(result["ok"])
             expected = server_module._resource_monitor_render_service_template(
                 layout.read_attested_file(
-                    "systemd/user/codex-master-resource-monitor.service"
+                    "systemd/user/the-hive-resource-monitor.service"
                 ),
                 generation="h4-current",
                 manifest_digest=layout.manifest_digest,
@@ -39202,7 +39229,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             self.assertNotIn(b"dirty-checkout", installed)
             self.assertEqual(
                 (target / self.slice_name).read_bytes(),
-                layout.read_attested_file("systemd/user/codex-master.slice"),
+                layout.read_attested_file("systemd/user/the-hive.slice"),
             )
 
     def test_install_resource_monitor_release_drift_aborts_before_target_or_systemctl(self) -> None:
@@ -39212,7 +39239,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
                 layout = self._published_release(root, f"h4-{drift}")
                 release_root = layout.root.parent.parent
                 if drift == "manifest":
-                    manifest = layout.root / ".codex-master-runtime-manifest.json"
+                    manifest = layout.root / ".the-hive-runtime-manifest.json"
                     manifest.write_bytes(manifest.read_bytes() + b" ")
                     server_layout: Any = layout
                 elif drift == "digest":
@@ -39362,13 +39389,13 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             expected_previous = {
                 self.service_name: server_module._resource_monitor_render_service_template(
                     previous.read_attested_file(
-                        "systemd/user/codex-master-resource-monitor.service"
+                        "systemd/user/the-hive-resource-monitor.service"
                     ),
                     generation="h4-previous",
                     manifest_digest=previous.manifest_digest,
                 ),
                 self.slice_name: previous.read_attested_file(
-                    "systemd/user/codex-master.slice"
+                    "systemd/user/the-hive.slice"
                 ),
             }
             for name, content in expected_previous.items():
@@ -39883,7 +39910,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             states[self.service_name].update(
                 {
                     "FragmentPath": str(target / self.service_name),
-                    "ControlGroup": "/user.slice/codex-master.slice/codex-master-resource-monitor.service",
+                    "ControlGroup": "/user.slice/the-hive.slice/the-hive-resource-monitor.service",
                     "MainPID": "42",
                 }
             )
@@ -39892,7 +39919,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
                     "ActiveState": "active",
                     "SubState": "active",
                     "FragmentPath": str(target / self.slice_name),
-                    "ControlGroup": "/user.slice/codex-master.slice",
+                    "ControlGroup": "/user.slice/the-hive.slice",
                     "TasksCurrent": "1",
                 }
             )

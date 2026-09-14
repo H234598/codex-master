@@ -12,23 +12,23 @@ except ImportError:
 
 
 REPO_ROOT = Path(__file__).parents[1]
-MODULE = REPO_ROOT / "src/codex_master/fleet_home_broker_install.py"
-CONFIG = REPO_ROOT / "systemd/config/codex-master-home-broker.conf"
-MANIFEST_SOURCE = "systemd/manifest/codex-master-home-broker-manifest-v1.json"
-MANIFEST_TARGET = "/usr/lib/codex-master-home-broker/manifest-v1.json"
-PAYLOAD_ROOT = "/usr/lib/codex-master-home-broker/0.10.5"
+MODULE = REPO_ROOT / "src/the_hive/fleet_home_broker_install.py"
+CONFIG = REPO_ROOT / "systemd/config/the-hive-home-broker.conf"
+MANIFEST_SOURCE = "systemd/manifest/the-hive-home-broker-manifest-v1.json"
+MANIFEST_TARGET = "/usr/lib/the-hive-home-broker/manifest-v1.json"
+PAYLOAD_ROOT = "/usr/lib/the-hive-home-broker/0.10.5"
 EXPECTED_DIRECTORIES = (
-    ("/usr/lib/codex-master-home-broker", 0, 0, 0o555),
-    ("/usr/lib/codex-master-home-broker/0.10.5", 0, 0, 0o555),
-    ("/usr/lib/codex-master-home-broker/0.10.5/bin", 0, 0, 0o555),
-    ("/usr/lib/codex-master-home-broker/0.10.5/python", 0, 0, 0o555),
+    ("/usr/lib/the-hive-home-broker", 0, 0, 0o555),
+    ("/usr/lib/the-hive-home-broker/0.10.5", 0, 0, 0o555),
+    ("/usr/lib/the-hive-home-broker/0.10.5/bin", 0, 0, 0o555),
+    ("/usr/lib/the-hive-home-broker/0.10.5/python", 0, 0, 0o555),
     (
-        "/usr/lib/codex-master-home-broker/0.10.5/python/codex_master",
+        "/usr/lib/the-hive-home-broker/0.10.5/python/the_hive",
         0,
         0,
         0o555,
     ),
-    ("/etc/codex-master", 0, 0, 0o755),
+    ("/etc/the-hive", 0, 0, 0o755),
 )
 
 
@@ -40,127 +40,127 @@ def _api():
 def _expected_files() -> tuple[tuple[str, str, int, int, int], ...]:
     return (
         (
-            "systemd/config/codex-master-home-broker.conf",
-            "/etc/codex-master/home-broker.conf",
+            "systemd/config/the-hive-home-broker.conf",
+            "/etc/the-hive/home-broker.conf",
             0,
             0,
             0o400,
         ),
         (
-            "bin/codex-master-home-broker",
-            f"{PAYLOAD_ROOT}/bin/codex-master-home-broker",
+            "bin/the-hive-home-broker",
+            f"{PAYLOAD_ROOT}/bin/the-hive-home-broker",
             0,
             0,
             0o755,
         ),
         (
-            "src/codex_master/__init__.py",
-            f"{PAYLOAD_ROOT}/python/codex_master/__init__.py",
+            "src/the_hive/__init__.py",
+            f"{PAYLOAD_ROOT}/python/the_hive/__init__.py",
             0,
             0,
             0o644,
         ),
         (
-            "src/codex_master/fleet_agent_launcher.py",
-            f"{PAYLOAD_ROOT}/python/codex_master/fleet_agent_launcher.py",
+            "src/the_hive/fleet_agent_launcher.py",
+            f"{PAYLOAD_ROOT}/python/the_hive/fleet_agent_launcher.py",
             0,
             0,
             0o644,
         ),
         (
-            "src/codex_master/fleet_home_broker.py",
-            f"{PAYLOAD_ROOT}/python/codex_master/fleet_home_broker.py",
+            "src/the_hive/fleet_home_broker.py",
+            f"{PAYLOAD_ROOT}/python/the_hive/fleet_home_broker.py",
             0,
             0,
             0o644,
         ),
         (
-            "src/codex_master/fleet_home_broker_client.py",
-            f"{PAYLOAD_ROOT}/python/codex_master/fleet_home_broker_client.py",
+            "src/the_hive/fleet_home_broker_client.py",
+            f"{PAYLOAD_ROOT}/python/the_hive/fleet_home_broker_client.py",
             0,
             0,
             0o644,
         ),
         (
-            "src/codex_master/fleet_home_broker_identity.py",
-            f"{PAYLOAD_ROOT}/python/codex_master/fleet_home_broker_identity.py",
+            "src/the_hive/fleet_home_broker_identity.py",
+            f"{PAYLOAD_ROOT}/python/the_hive/fleet_home_broker_identity.py",
             0,
             0,
             0o644,
         ),
         (
-            "src/codex_master/fleet_home_broker_linux.py",
-            f"{PAYLOAD_ROOT}/python/codex_master/fleet_home_broker_linux.py",
+            "src/the_hive/fleet_home_broker_linux.py",
+            f"{PAYLOAD_ROOT}/python/the_hive/fleet_home_broker_linux.py",
             0,
             0,
             0o644,
         ),
         (
-            "src/codex_master/fleet_home_broker_package.py",
-            f"{PAYLOAD_ROOT}/python/codex_master/fleet_home_broker_package.py",
+            "src/the_hive/fleet_home_broker_package.py",
+            f"{PAYLOAD_ROOT}/python/the_hive/fleet_home_broker_package.py",
             0,
             0,
             0o644,
         ),
         (
-            "src/codex_master/fleet_home_broker_protocol.py",
-            f"{PAYLOAD_ROOT}/python/codex_master/fleet_home_broker_protocol.py",
+            "src/the_hive/fleet_home_broker_protocol.py",
+            f"{PAYLOAD_ROOT}/python/the_hive/fleet_home_broker_protocol.py",
             0,
             0,
             0o644,
         ),
         (
-            "src/codex_master/fleet_home_broker_wal.py",
-            f"{PAYLOAD_ROOT}/python/codex_master/fleet_home_broker_wal.py",
+            "src/the_hive/fleet_home_broker_wal.py",
+            f"{PAYLOAD_ROOT}/python/the_hive/fleet_home_broker_wal.py",
             0,
             0,
             0o644,
         ),
         (
-            "systemd/manifest/codex-master-home-broker-manifest-v1.json",
+            "systemd/manifest/the-hive-home-broker-manifest-v1.json",
             MANIFEST_TARGET,
             0,
             0,
             0o644,
         ),
         (
-            "systemd/system/codex-master-agent@.service",
-            "/usr/lib/systemd/system/codex-master-agent@.service",
+            "systemd/system/the-hive-agent@.service",
+            "/usr/lib/systemd/system/the-hive-agent@.service",
             0,
             0,
             0o644,
         ),
         (
-            "systemd/system/codex-master-home-broker.service",
-            "/usr/lib/systemd/system/codex-master-home-broker.service",
+            "systemd/system/the-hive-home-broker.service",
+            "/usr/lib/systemd/system/the-hive-home-broker.service",
             0,
             0,
             0o644,
         ),
         (
-            "systemd/libexec/codex-master-agent-launcher",
-            "/usr/libexec/codex-master-agent-launcher",
+            "systemd/libexec/the-hive-agent-launcher",
+            "/usr/libexec/the-hive-agent-launcher",
             0,
             0,
             0o555,
         ),
         (
-            "systemd/libexec/codex-master-broker-verify",
-            "/usr/libexec/codex-master-broker-verify",
+            "systemd/libexec/the-hive-broker-verify",
+            "/usr/libexec/the-hive-broker-verify",
             0,
             0,
             0o555,
         ),
         (
-            "systemd/libexec/codex-master-home-broker",
-            "/usr/libexec/codex-master-home-broker",
+            "systemd/libexec/the-hive-home-broker",
+            "/usr/libexec/the-hive-home-broker",
             0,
             0,
             0o555,
         ),
         (
-            "systemd/libexec/codex_master_bootstrap.py",
-            "/usr/libexec/codex_master_bootstrap.py",
+            "systemd/libexec/the_hive_bootstrap.py",
+            "/usr/libexec/the_hive_bootstrap.py",
             0,
             0,
             0o555,
@@ -276,7 +276,7 @@ def test_config_source_is_comment_only_and_has_exact_install_mapping() -> None:
     )
     assert any(
         entry.source_path == str(CONFIG.relative_to(CONFIG.parents[2]))
-        and entry.target_path == "/etc/codex-master/home-broker.conf"
+        and entry.target_path == "/etc/the-hive/home-broker.conf"
         and (entry.uid, entry.gid, entry.mode) == (0, 0, 0o400)
         for entry in module.build_home_broker_install_plan().files
     )
@@ -349,9 +349,22 @@ def test_plan_module_has_no_host_io_digest_or_activation_surface() -> None:
 
 def test_units_have_no_activation_section() -> None:
     for path in (
-        REPO_ROOT / "systemd/system/codex-master-home-broker.service",
-        REPO_ROOT / "systemd/system/codex-master-agent@.service",
+        REPO_ROOT / "systemd/system/the-hive-home-broker.service",
+        REPO_ROOT / "systemd/system/the-hive-agent@.service",
     ):
         source = path.read_text(encoding="utf-8")
         assert "[Install]" not in source
         assert "WantedBy=" not in source
+
+
+def test_home_broker_install_plan_uses_only_canonical_product_targets() -> None:
+    """Rename break: an offline install plan must not emit an old product path."""
+
+    plan = _api().build_home_broker_install_plan()
+    legacy_tokens = ("codex-master", "codex_master", "CODEX_MASTER")
+    values = [
+        *(entry.target_path for entry in plan.files),
+        *(entry.source_path for entry in plan.files),
+        *(entry.path for entry in plan.directories),
+    ]
+    assert all(token not in value for value in values for token in legacy_tokens)

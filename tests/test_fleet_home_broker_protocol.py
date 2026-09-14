@@ -212,10 +212,10 @@ def release():
             ReleasePayloadDigestV2("systemd_units", "d" * 64),
         ),
         "CHPB/2",
-        "org.codex_master.HomeBrokerControl2",
+        "org.the_hive.HomeBrokerControl2",
         "StartDynamicTeamlead",
-        "codex-master-agent@.service",
-        "/usr/libexec/codex-master-agent-launcher",
+        "the-hive-agent@.service",
+        "/usr/libexec/the-hive-agent-launcher",
     )
 
 
@@ -255,9 +255,9 @@ def agent_start_envelope(**changes):
         13,
         principal_value,
         expected_value,
-        "codex-master-agent@c0\\x2cc1.service",
+        "the-hive-agent@c0\\x2cc1.service",
         identity,
-        AgentStartExecutablePin("/usr/libexec/codex-master-agent-launcher", "e" * 64),
+        AgentStartExecutablePin("/usr/libexec/the-hive-agent-launcher", "e" * 64),
         AgentStartEnvironmentProjection(
             (
                 ("CODEX_HOME", CANONICAL_AGENT_HOME),
@@ -280,6 +280,13 @@ def test_binding_doc_projects_operation_and_nested_bindings():
         "store_uuid": U,
         "transaction_id": T,
     }
+
+
+def test_agent_home_and_mcs_unit_use_the_canonical_r3_systemd_binding():
+    assert CANONICAL_AGENT_HOME == "/run/the-hive-agent/home"
+    assert protocol.agent_unit_name_for_mcs("c0,c1") == (
+        "the-hive-agent@c0\\x2cc1.service"
+    )
 
 
 def test_digest_requires_lowercase_hex_of_requested_size():

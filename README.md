@@ -812,7 +812,7 @@ session is available.
 
 ## Cinnamon Applet: Flottenmanagement
 
-`codex-master@H234598` is the P3/P3a read-only status applet. Its visible panel
+`the-hive@H234598` is the P3/P3a read-only status applet. Its visible panel
 title is always `Flottenmanagement`. It explicitly requests applet status
 schema v4; schemas v1 through v3 remain unchanged for older callers.
 
@@ -927,7 +927,7 @@ Useful diagnostics:
 ./bin/codex-master-mcp applet-status --schema-version 4
 gdbus call --session --dest org.Cinnamon --object-path /org/Cinnamon \
   --method org.Cinnamon.GetRunningXletUUIDs applet
-journalctl --user -b | grep -F codex-master@H234598
+journalctl --user -b | grep -F the-hive@H234598
 ```
 
 An `unavailable` or stale applet state means the bounded read-only refresh

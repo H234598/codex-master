@@ -1882,11 +1882,11 @@ def _systemd_unit_sections(text: str) -> dict[str, dict[str, str]]:
 
 def test_h2_slice_is_documentation_only_without_parent_resource_policy() -> None:
     root = Path(__file__).resolve().parents[1]
-    slice_unit = root / "systemd" / "user" / "codex-master.slice"
+    slice_unit = root / "systemd" / "user" / "the-hive.slice"
 
     assert _systemd_unit_sections(slice_unit.read_text(encoding="utf-8")) == {
         "Unit": {
-            "Description": "Codex Master Resource Slice",
+            "Description": "The Hive Resource Slice",
             "Documentation": "man:systemd.slice(5)",
         }
     }
@@ -1894,7 +1894,7 @@ def test_h2_slice_is_documentation_only_without_parent_resource_policy() -> None
 
 def test_h2_system_user_manager_template_delegates_exact_controller_set_only() -> None:
     root = Path(__file__).resolve().parents[1]
-    template = root / "systemd" / "system" / "user@.service.d" / "50-codex-master-delegation.conf"
+    template = root / "systemd" / "system" / "user@.service.d" / "50-the-hive-delegation.conf"
 
     assert _systemd_unit_sections(template.read_text(encoding="utf-8")) == {
         "Service": {"Delegate": "cpu cpuset memory pids io"}
@@ -1902,15 +1902,15 @@ def test_h2_system_user_manager_template_delegates_exact_controller_set_only() -
 
 
 def test_h2_resource_monitor_is_slice_anchor_with_exact_delegation() -> None:
-    service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "codex-master-resource-monitor.service"
+    service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "the-hive-resource-monitor.service"
     sections = _systemd_unit_sections(service.read_text(encoding="utf-8"))
 
-    assert sections["Service"]["Slice"] == "codex-master.slice"
+    assert sections["Service"]["Slice"] == "the-hive.slice"
     assert sections["Service"]["Delegate"] == "cpu cpuset memory pids io"
 
 
 def test_resource_monitor_unit_has_exact_hardening_allowlist_including_keyring_clock_hostname_personality_and_mdwx() -> None:
-    service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "codex-master-resource-monitor.service"
+    service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "the-hive-resource-monitor.service"
     assert service.is_file()
     directives = _resource_monitor_unit_directives(service.read_text(encoding="utf-8"))
     expected = {
@@ -1945,7 +1945,7 @@ def test_resource_monitor_unit_has_exact_hardening_allowlist_including_keyring_c
 
 
 def test_resource_monitor_unit_checks_readonly_and_readwrite_paths_separately() -> None:
-    service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "codex-master-resource-monitor.service"
+    service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "the-hive-resource-monitor.service"
     assert service.is_file()
     directives = _resource_monitor_unit_directives(service.read_text(encoding="utf-8"))
     assert directives["ReadOnlyPaths"].split() == [
@@ -1961,13 +1961,13 @@ def test_resource_monitor_unit_checks_readonly_and_readwrite_paths_separately() 
     ]
     assert all(not path.startswith("/sys") for path in directives["ReadOnlyPaths"].split())
     assert directives["BindReadOnlyPaths"].split() == [
-        "%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@/bin/codex-master-resource-monitor:%h/.local/bin/codex-master-resource-monitor:norbind",
-        "%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@/src:%h/.local/src:norbind",
-        "%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@/codex-agent-classes.json:%h/.local/codex-agent-classes.json:norbind",
-        "%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@/codex-hive.json:%h/.local/codex-hive.json:norbind",
+        "%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@/bin/the-hive-resource-monitor:%h/.local/bin/the-hive-resource-monitor:norbind",
+        "%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@/src:%h/.local/src:norbind",
+        "%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@/codex-agent-classes.json:%h/.local/codex-agent-classes.json:norbind",
+        "%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@/codex-hive.json:%h/.local/codex-hive.json:norbind",
         "%h/.local/state/codex-master-mcp/hive:%h/.local/state/codex-master-mcp/hive:norbind",
     ]
-    assert "%h/codex-master" not in service.read_text(encoding="utf-8")
+    assert "%h/the-hive" not in service.read_text(encoding="utf-8")
     assert "plugin-cache" not in service.read_text(encoding="utf-8")
     assert directives["ReadWritePaths"].split() == [
         "%h/.local/state/codex-master-mcp/hive/resources",
@@ -1977,15 +1977,15 @@ def test_resource_monitor_unit_checks_readonly_and_readwrite_paths_separately() 
 
 def test_resource_monitor_unit_uses_absolute_exec_and_declares_default_target_install() -> None:
     root = Path(__file__).resolve().parents[1]
-    service = root / "systemd" / "user" / "codex-master-resource-monitor.service"
+    service = root / "systemd" / "user" / "the-hive-resource-monitor.service"
     entrypoint = root / "bin" / "the-hive-resource-monitor"
     assert service.is_file()
     assert entrypoint.is_file()
     text = service.read_text(encoding="utf-8")
     directives = _resource_monitor_unit_directives(text)
     assert directives["ExecStart"] == (
-        "%h/.local/bin/codex-master-resource-monitor "
-        "%h/.local/lib/codex-master-runtime "
+        "%h/.local/bin/the-hive-resource-monitor "
+        "%h/.local/lib/the-hive-runtime "
         "@MASTERJET_GENERATION@ @MASTERJET_MANIFEST_DIGEST@"
     )
     assert directives["ExecStart"].startswith("%h/")
@@ -2021,7 +2021,7 @@ def test_resource_monitor_entrypoint_rejects_all_legacy_noarg_paths(
 
 def test_documentation_marks_unit_delivered_but_not_installed_or_active() -> None:
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-    assert "codex-master-resource-monitor.service is delivered but not installed or active" in readme
+    assert "the-hive-resource-monitor.service is delivered but not installed or active" in readme
     assert "No installer, MCP tool, or standard test enables or starts this unit" in readme
     assert "ProtectHome=tmpfs and PrivatePIDs=yes hide unrelated Home and process data" in readme
     assert "BindReadOnlyPaths exposes only the installed monitor layout" in readme

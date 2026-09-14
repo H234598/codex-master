@@ -53,15 +53,15 @@ def release_spec(**changes):
         "provider_abi": "provider-v1",
         "unit_digest": "f" * 64,
         "selinux_digest": "0" * 64,
-        "socket_unit": "codex-master-home-broker.socket",
-        "service_unit": "codex-master-home-broker.service",
-        "system_bus_name": "org.codex_master.HomeBrokerControl",
-        "system_bus_path": "/org/codex_master/HomeBrokerControl",
-        "system_bus_interface": "org.codex_master.HomeBrokerControl1",
-        "broker_domain": "codex_master_home_broker_t",
-        "gateway_domain": "codex_master_control_t",
-        "socket_type": "codex_master_home_broker_runtime_t",
-        "agent_domain": "codex_master_agent_t",
+        "socket_unit": "the-hive-home-broker.socket",
+        "service_unit": "the-hive-home-broker.service",
+        "system_bus_name": "org.the_hive.HomeBrokerControl",
+        "system_bus_path": "/org/the_hive/HomeBrokerControl",
+        "system_bus_interface": "org.the_hive.HomeBrokerControl1",
+        "broker_domain": "the_hive_home_broker_t",
+        "gateway_domain": "the_hive_control_t",
+        "socket_type": "the_hive_home_broker_runtime_t",
+        "agent_domain": "the_hive_agent_t",
     }
     values.update(changes)
     return BrokerReleaseSpec(**values)
@@ -419,7 +419,7 @@ def test_attestation_has_one_explicit_trusted_release_input_and_no_payload_input
         ("broker_domain", "untrusted_broker_t"),
         ("gateway_domain", "untrusted_control_t"),
         ("socket_type", "untrusted_runtime_t"),
-        ("agent_domain", "codex_master_agent_exec_t"),
+        ("agent_domain", "the_hive_agent_exec_t"),
         ("agent_domain", "unconfined_t"),
         ("agent_domain", ""),
     ],
@@ -435,8 +435,8 @@ def test_release_drift_is_rejected_before_projection(field, value):
 
 def test_release_requires_exact_agent_selinux_domain() -> None:
     provider = FakeProvider()
-    assert release_spec().agent_domain == "codex_master_agent_t"
-    for value in ("", "codex_master_agent_exec_t", "unconfined_t", None):
+    assert release_spec().agent_domain == "the_hive_agent_t"
+    for value in ("", "the_hive_agent_exec_t", "unconfined_t", None):
         with pytest.raises(RuntimeBoundaryError, match="broker release is invalid"):
             _attest(release=release_spec(agent_domain=value), provider=provider)
     assert provider.calls == []
@@ -1129,7 +1129,7 @@ def test_trusted_operations_are_called_without_getattr_preprobes():
 def test_runtime_module_imports_only_offline_contracts():
     source = (
         Path(__file__).resolve().parents[1]
-        / "src/codex_master/fleet_home_broker_runtime.py"
+        / "src/the_hive/fleet_home_broker_runtime.py"
     ).read_text()
     tree = ast.parse(source)
     imported = set()

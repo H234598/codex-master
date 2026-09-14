@@ -1,0 +1,54 @@
+policy_module(the_hive_home_broker, 1.0)
+
+require {
+    type init_t;
+    class process transition;
+    class file { append create entrypoint execute getattr map open read setattr unlink write };
+    class dir { add_name getattr open read remove_name search setattr write };
+    class sock_file { create getattr open read setattr unlink write };
+}
+
+type the_hive_home_broker_t;
+typeattribute the_hive_home_broker_t domain;
+type the_hive_home_broker_exec_t;
+typeattribute the_hive_home_broker_exec_t exec_type;
+typeattribute the_hive_home_broker_exec_t file_type;
+type the_hive_home_broker_package_t;
+typeattribute the_hive_home_broker_package_t file_type;
+type the_hive_home_broker_config_t;
+typeattribute the_hive_home_broker_config_t file_type;
+type the_hive_home_broker_state_t;
+typeattribute the_hive_home_broker_state_t file_type;
+
+type the_hive_agent_t;
+typeattribute the_hive_agent_t domain;
+type the_hive_agent_exec_t;
+typeattribute the_hive_agent_exec_t exec_type;
+typeattribute the_hive_agent_exec_t file_type;
+type the_hive_agent_home_t;
+typeattribute the_hive_agent_home_t file_type;
+type the_hive_agent_endpoint_t;
+typeattribute the_hive_agent_endpoint_t file_type;
+
+type_transition init_t the_hive_home_broker_exec_t:process the_hive_home_broker_t;
+allow init_t the_hive_home_broker_exec_t:file { execute getattr map open read };
+allow init_t the_hive_home_broker_t:process transition;
+
+type_transition init_t the_hive_agent_exec_t:process the_hive_agent_t;
+allow init_t the_hive_agent_exec_t:file { execute getattr map open read };
+allow init_t the_hive_agent_t:process transition;
+
+allow the_hive_home_broker_t the_hive_home_broker_exec_t:file entrypoint;
+allow the_hive_agent_t the_hive_agent_exec_t:file entrypoint;
+
+allow the_hive_home_broker_t the_hive_home_broker_package_t:dir { getattr open read search };
+allow the_hive_home_broker_t the_hive_home_broker_package_t:file { getattr map open read };
+allow the_hive_home_broker_t the_hive_home_broker_config_t:dir { getattr open read search };
+allow the_hive_home_broker_t the_hive_home_broker_config_t:file { getattr open read };
+allow the_hive_home_broker_t the_hive_home_broker_state_t:dir { add_name getattr open read remove_name search setattr write };
+allow the_hive_home_broker_t the_hive_home_broker_state_t:file { append create getattr open read setattr unlink write };
+
+allow the_hive_agent_t the_hive_agent_home_t:dir { add_name getattr open read remove_name search setattr write };
+allow the_hive_agent_t the_hive_agent_home_t:file { append create getattr open read setattr unlink write };
+allow the_hive_agent_t the_hive_agent_endpoint_t:dir { add_name getattr open read remove_name search setattr write };
+allow the_hive_agent_t the_hive_agent_endpoint_t:sock_file { create getattr open read setattr unlink write };

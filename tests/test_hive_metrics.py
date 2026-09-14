@@ -163,7 +163,7 @@ def test_overview_adapter_requires_common_native_generation_binding() -> None:
         observed_at=CAPTURED,
     )
 
-    assert values["codex_master_bees_total"] == 1
+    assert values["the_hive_bees_total"] == 1
     with pytest.raises(HiveMetricsError, match="invalid_metric_input"):
         fleet_metric_values(
             snapshot,
@@ -254,7 +254,7 @@ def test_overview_adapter_accepts_native_input_at_telemetry_bound(native_active:
         observed_at=CAPTURED,
     )
 
-    assert values["codex_master_bees_total"] == native_active
+    assert values["the_hive_bees_total"] == native_active
 
 
 def test_overview_adapter_rejects_native_input_above_telemetry_bound() -> None:
@@ -268,12 +268,12 @@ def test_overview_adapter_rejects_native_input_above_telemetry_bound() -> None:
 
 
 def test_openmetrics_uses_label_free_openmetrics_eof_contract() -> None:
-    rendered = render_openmetrics({"codex_master_bees_total": 4})
+    rendered = render_openmetrics({"the_hive_bees_total": 4})
 
-    assert rendered == "codex_master_bees_total 4\n# EOF\n"
-    assert re.fullmatch(r"codex_master_bees_total 4\n# EOF\n", rendered)
+    assert rendered == "the_hive_bees_total 4\n# EOF\n"
+    assert re.fullmatch(r"the_hive_bees_total 4\n# EOF\n", rendered)
     with pytest.raises(HiveMetricsError, match="invalid_metric_values"):
-        render_openmetrics({'codex_master_bees{provider="gemini"}': 1})
+        render_openmetrics({'the_hive_bees{provider="gemini"}': 1})
 
 
 def test_projection_separates_active_inventory_and_visible_unknowns() -> None:
@@ -406,30 +406,30 @@ def test_legacy_overview_adapter_uses_one_active_counting_semantics() -> None:
         observed_at=CAPTURED,
     )
 
-    assert values["codex_master_bees_total"] == 4
-    assert values["codex_master_homes_registered"] == 5
-    assert values["codex_master_bees_codex"] == 1
-    assert values["codex_master_bees_native"] == 2
-    assert values["codex_master_bees_unknown"] == 1
-    assert values["codex_master_roles_team_lead"] == 1
-    assert values["codex_master_roles_unknown"] == 3
+    assert values["the_hive_bees_total"] == 4
+    assert values["the_hive_homes_registered"] == 5
+    assert values["the_hive_bees_codex"] == 1
+    assert values["the_hive_bees_native"] == 2
+    assert values["the_hive_bees_unknown"] == 1
+    assert values["the_hive_roles_team_lead"] == 1
+    assert values["the_hive_roles_unknown"] == 3
 
 
 def test_openmetrics_renderer_is_deterministic_and_rejects_nonfinite_values() -> None:
     rendered = render_openmetrics(
         {
-            "codex_master_bees_total": 4,
-            "codex_master_hive_metrics_age_seconds": 0.5,
+            "the_hive_bees_total": 4,
+            "the_hive_hive_metrics_age_seconds": 0.5,
         }
     )
 
     assert rendered == (
-        "codex_master_bees_total 4\n"
-        "codex_master_hive_metrics_age_seconds 0.5\n"
+        "the_hive_bees_total 4\n"
+        "the_hive_hive_metrics_age_seconds 0.5\n"
         "# EOF\n"
     )
     with pytest.raises(HiveMetricsError, match="invalid_metric_values"):
-        render_openmetrics({"codex_master_bees_total": float("nan")})
+        render_openmetrics({"the_hive_bees_total": float("nan")})
 
 
 def test_projection_consumes_one_typed_snapshot_without_runtime_or_callback_inputs() -> None:
@@ -467,9 +467,9 @@ def test_metric_values_accepts_typed_snapshot_without_separate_native_count() ->
 
     values = fleet_metric_values(snapshot, observed_at=CAPTURED)
 
-    assert values["codex_master_bees_total"] == 1
-    assert values["codex_master_homes_registered"] == 3
-    assert values["codex_master_bees_native"] == 1
+    assert values["the_hive_bees_total"] == 1
+    assert values["the_hive_homes_registered"] == 3
+    assert values["the_hive_bees_native"] == 1
 
 
 def test_snapshot_projection_preserves_all_provider_and_role_buckets() -> None:
@@ -563,15 +563,15 @@ def test_pcp_htop_meter_config_has_exactly_two_complete_canonical_blocks() -> No
 
     assert blocks == (
         "[textmeter provider_runtime]\n"
-        "metrics = codex_master_bees_native,codex_master_bees_codex,"
-        "codex_master_bees_gemini,codex_master_bees_claude,"
-        "codex_master_bees_hf,codex_master_bees_ollama,"
-        "codex_master_bees_deepseek,codex_master_bees_unknown\n"
+        "metrics = the_hive_bees_native,the_hive_bees_codex,"
+        "the_hive_bees_gemini,the_hive_bees_claude,"
+        "the_hive_bees_hf,the_hive_bees_ollama,"
+        "the_hive_bees_deepseek,the_hive_bees_unknown\n"
         "labels = Native,Codex/OpenAI,Gemini,Claude,HF,Ollama,DeepSeek,unknown\n",
         "[textmeter hierarchy]\n"
-        "metrics = codex_master_roles_godbee,codex_master_roles_queen,"
-        "codex_master_roles_team_lead,codex_master_roles_worker,"
-        "codex_master_roles_rogue,codex_master_roles_unknown\n"
+        "metrics = the_hive_roles_godbee,the_hive_roles_queen,"
+        "the_hive_roles_team_lead,the_hive_roles_worker,"
+        "the_hive_roles_rogue,the_hive_roles_unknown\n"
         "labels = Gottbiene,Königin,TL,Arbeiterin,Rogue,unknown\n",
     )
     assert "OpenAI/Codex" not in "\n".join(blocks)
@@ -654,7 +654,7 @@ def test_explicit_stale_snapshot_sets_freshness_and_stale_metric_consistently() 
 
     assert projection.state == "stale"
     assert projection.health_state == "STALE"
-    assert values["codex_master_hive_metrics_stale"] == 1
+    assert values["the_hive_hive_metrics_stale"] == 1
 
 
 def test_age_stale_snapshot_sets_freshness_health_and_stale_metric_consistently() -> None:
@@ -673,7 +673,7 @@ def test_age_stale_snapshot_sets_freshness_health_and_stale_metric_consistently(
 
     assert projection.state == "stale"
     assert projection.health_state == "STALE"
-    assert values["codex_master_hive_metrics_stale"] == 1
+    assert values["the_hive_hive_metrics_stale"] == 1
 
 
 def test_snapshot_projection_bounds_and_redacts_untrusted_detail_values() -> None:

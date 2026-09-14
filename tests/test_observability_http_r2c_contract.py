@@ -89,8 +89,8 @@ def test_metrics_http_server_suppresses_request_error_output(capsys: pytest.Capt
 
 def test_metrics_passthroughs_stale_openmetrics_body_byte_for_byte() -> None:
     payload = (
-        "codex_master_snapshot_state{state=\"stale\"} 1\n"
-        "codex_master_snapshot_age_seconds 61\n"
+        "the_hive_snapshot_state{state=\"stale\"} 1\n"
+        "the_hive_snapshot_age_seconds 61\n"
         "# EOF\n"
     )
     server = MetricsHttpServer(("127.0.0.1", 0), lambda: payload)
@@ -308,8 +308,8 @@ def test_http_error_response_redacts_internal_details() -> None:
 
 def test_http_passthroughs_valid_stale_openmetrics_without_fresh_header() -> None:
     payload = (
-        "codex_master_snapshot_state{state=\"stale\"} 1\n"
-        "codex_master_snapshot_age_seconds 61\n"
+        "the_hive_snapshot_state{state=\"stale\"} 1\n"
+        "the_hive_snapshot_age_seconds 61\n"
         "# EOF\n"
     )
     server = MetricsHttpServer(("127.0.0.1", 0), lambda: payload)

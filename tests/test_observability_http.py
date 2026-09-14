@@ -123,9 +123,9 @@ def test_metrics_accepts_one_mib_payload() -> None:
 
 def test_metrics_preserves_stale_openmetrics_text_verbatim() -> None:
     stale = (
-        "# HELP codex_master_bees_native Native bees\n"
-        "# TYPE codex_master_bees_native gauge\n"
-        "codex_master_bees_native 3 1\n"
+        "# HELP the_hive_bees_native Native bees\n"
+        "# TYPE the_hive_bees_native gauge\n"
+        "the_hive_bees_native 3 1\n"
         "# EOF\n"
     )
     with _running_server("127.0.0.1", lambda: stale) as server:

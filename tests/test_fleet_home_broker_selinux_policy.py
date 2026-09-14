@@ -3,18 +3,18 @@ import re
 
 
 REPO_ROOT = Path(__file__).parents[1]
-POLICY = REPO_ROOT / "systemd/selinux/codex_master_home_broker.te"
-FILECONTEXTS = REPO_ROOT / "systemd/selinux/codex_master_home_broker.fc"
+POLICY = REPO_ROOT / "systemd/selinux/the_hive_home_broker.te"
+FILECONTEXTS = REPO_ROOT / "systemd/selinux/the_hive_home_broker.fc"
 
-BROKER_DOMAIN = "codex_master_home_broker_t"
-BROKER_EXEC = "codex_master_home_broker_exec_t"
-BROKER_PACKAGE = "codex_master_home_broker_package_t"
-BROKER_CONFIG = "codex_master_home_broker_config_t"
-BROKER_STATE = "codex_master_home_broker_state_t"
-AGENT_DOMAIN = "codex_master_agent_t"
-AGENT_EXEC = "codex_master_agent_exec_t"
-AGENT_HOME = "codex_master_agent_home_t"
-AGENT_ENDPOINT = "codex_master_agent_endpoint_t"
+BROKER_DOMAIN = "the_hive_home_broker_t"
+BROKER_EXEC = "the_hive_home_broker_exec_t"
+BROKER_PACKAGE = "the_hive_home_broker_package_t"
+BROKER_CONFIG = "the_hive_home_broker_config_t"
+BROKER_STATE = "the_hive_home_broker_state_t"
+AGENT_DOMAIN = "the_hive_agent_t"
+AGENT_EXEC = "the_hive_agent_exec_t"
+AGENT_HOME = "the_hive_agent_home_t"
+AGENT_ENDPOINT = "the_hive_agent_endpoint_t"
 
 TYPE_NAMES = {
     BROKER_DOMAIN,
@@ -283,14 +283,14 @@ def _parse_filecontexts(filecontexts: str) -> list[tuple[str, str | None, str]]:
 def test_filecontexts_use_exact_paths_and_distinct_file_type_selectors() -> None:
     filecontexts = _read(FILECONTEXTS)
     expected = [
-        ("/usr/lib/codex-master-home-broker(/.*)?", None, BROKER_PACKAGE),
-        ("/usr/libexec/codex-master-home-broker", "--", BROKER_EXEC),
-        ("/usr/libexec/codex-master-broker-verify", "--", BROKER_EXEC),
+        ("/usr/lib/the-hive-home-broker(/.*)?", None, BROKER_PACKAGE),
+        ("/usr/libexec/the-hive-home-broker", "--", BROKER_EXEC),
+        ("/usr/libexec/the-hive-broker-verify", "--", BROKER_EXEC),
         ("/var/lib/codex-master-home-broker(/.*)?", None, BROKER_STATE),
-        ("/etc/codex-master/home-broker.conf", "--", BROKER_CONFIG),
-        ("/usr/libexec/codex-master-agent-launcher", "--", AGENT_EXEC),
-        ("/run/codex-master-agent", "-d", AGENT_ENDPOINT),
-        ("/run/codex-master-agent/home(/.*)?", None, AGENT_HOME),
+        ("/etc/the-hive/home-broker.conf", "--", BROKER_CONFIG),
+        ("/usr/libexec/the-hive-agent-launcher", "--", AGENT_EXEC),
+        ("/run/the-hive-agent", "-d", AGENT_ENDPOINT),
+        ("/run/the-hive-agent/home(/.*)?", None, AGENT_HOME),
     ]
 
     assert _parse_filecontexts(filecontexts) == expected

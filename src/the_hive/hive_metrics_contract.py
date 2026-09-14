@@ -83,29 +83,29 @@ def fleet_metric_values(
         _invalid()
     registered_homes = _registered_homes(overview)
     values: dict[str, int | float] = {
-        "codex_master_bees_native": native_active,
-        "codex_master_bees_total": len(overview.agents) + native_active,
-        "codex_master_homes_registered": registered_homes,
-        "codex_master_fleet_generation": overview.generation,
-        "codex_master_snapshot_age_seconds": age,
-        "codex_master_snapshot_observed_at_seconds": measured_at,
-        "codex_master_snapshot_stale": int(age > _STALE_AFTER_SECONDS),
+        "the_hive_bees_native": native_active,
+        "the_hive_bees_total": len(overview.agents) + native_active,
+        "the_hive_homes_registered": registered_homes,
+        "the_hive_fleet_generation": overview.generation,
+        "the_hive_snapshot_age_seconds": age,
+        "the_hive_snapshot_observed_at_seconds": measured_at,
+        "the_hive_snapshot_stale": int(age > _STALE_AFTER_SECONDS),
     }
-    values.update({f"codex_master_bees_{key}": 0 for key in _PROVIDER_KEYS})
-    values.update({f"codex_master_bees_{key}": 0 for key in _ROLE_KEYS})
-    values["codex_master_bees_provider_unknown"] = 0
-    values["codex_master_bees_role_unknown"] = 0
+    values.update({f"the_hive_bees_{key}": 0 for key in _PROVIDER_KEYS})
+    values.update({f"the_hive_bees_{key}": 0 for key in _ROLE_KEYS})
+    values["the_hive_bees_provider_unknown"] = 0
+    values["the_hive_bees_role_unknown"] = 0
     for row in overview.agents:
         provider_key = _PROVIDER_METRIC.get(row.provider.lower())
         if provider_key is not None:
-            values[f"codex_master_bees_{provider_key}"] += 1
+            values[f"the_hive_bees_{provider_key}"] += 1
         else:
-            values["codex_master_bees_provider_unknown"] += 1
+            values["the_hive_bees_provider_unknown"] += 1
         role_key = _ROLE_METRIC.get(row.principal_role.lower()) if row.principal_role is not None else None
         if role_key is not None:
-            values[f"codex_master_bees_{role_key}"] += 1
+            values[f"the_hive_bees_{role_key}"] += 1
         else:
-            values["codex_master_bees_role_unknown"] += 1
+            values["the_hive_bees_role_unknown"] += 1
     return values
 
 
@@ -116,7 +116,7 @@ def render_openmetrics(values: Mapping[str, int | float]) -> str:
     for name in sorted(values):
         value = values[name]
         if (
-            not isinstance(name, str) or not name.startswith("codex_master_")
+            not isinstance(name, str) or not name.startswith("the_hive_")
             or not name.replace("_", "").isalnum() or isinstance(value, bool)
             or not isinstance(value, (int, float)) or not math.isfinite(value)
         ):
@@ -127,53 +127,53 @@ def render_openmetrics(values: Mapping[str, int | float]) -> str:
 
 
 def pcp_htop_meter_config() -> str:
-    return """[codex_master_provider_bees]
+    return """[the_hive_provider_bees]
 caption = Bienen Provider
 type = text
-native.metric = openmetrics.codexmaster.codex_master_bees_native
+native.metric = openmetrics.thehive.the_hive_bees_native
 native.label = Native Bienen
 native.color = green
-codex.metric = openmetrics.codexmaster.codex_master_bees_codex
+codex.metric = openmetrics.thehive.the_hive_bees_codex
 codex.label = Codex Bienen
 codex.color = green
-gemini.metric = openmetrics.codexmaster.codex_master_bees_gemini
+gemini.metric = openmetrics.thehive.the_hive_bees_gemini
 gemini.label = Gemini Bienen
 gemini.color = green
-claude.metric = openmetrics.codexmaster.codex_master_bees_claude
+claude.metric = openmetrics.thehive.the_hive_bees_claude
 claude.label = Claude Bienen
 claude.color = green
-huggingface.metric = openmetrics.codexmaster.codex_master_bees_huggingface
+huggingface.metric = openmetrics.thehive.the_hive_bees_huggingface
 huggingface.label = HF Bienen
 huggingface.color = green
-ollama.metric = openmetrics.codexmaster.codex_master_bees_ollama
+ollama.metric = openmetrics.thehive.the_hive_bees_ollama
 ollama.label = Ollama Bienen
 ollama.color = green
-deepseek.metric = openmetrics.codexmaster.codex_master_bees_deepseek
+deepseek.metric = openmetrics.thehive.the_hive_bees_deepseek
 deepseek.label = DeepSeek Bienen
 deepseek.color = green
-unknown.metric = openmetrics.codexmaster.codex_master_bees_provider_unknown
+unknown.metric = openmetrics.thehive.the_hive_bees_provider_unknown
 unknown.label = Unbekannte Provider
 unknown.color = red
 
-[codex_master_role_bees]
+[the_hive_role_bees]
 caption = Bienen Klassen
 type = text
-goddess.metric = openmetrics.codexmaster.codex_master_bees_goddess
+goddess.metric = openmetrics.thehive.the_hive_bees_goddess
 goddess.label = Gottbienen
 goddess.color = green
-queen.metric = openmetrics.codexmaster.codex_master_bees_queen
+queen.metric = openmetrics.thehive.the_hive_bees_queen
 queen.label = Königinnen
 queen.color = green
-teamleader.metric = openmetrics.codexmaster.codex_master_bees_teamleader
+teamleader.metric = openmetrics.thehive.the_hive_bees_teamleader
 teamleader.label = Teamleiterinnen
 teamleader.color = green
-worker.metric = openmetrics.codexmaster.codex_master_bees_worker
+worker.metric = openmetrics.thehive.the_hive_bees_worker
 worker.label = Arbeiterinnen
 worker.color = green
-rogue.metric = openmetrics.codexmaster.codex_master_bees_rogue
+rogue.metric = openmetrics.thehive.the_hive_bees_rogue
 rogue.label = Rogue
 rogue.color = red
-unknown.metric = openmetrics.codexmaster.codex_master_bees_role_unknown
+unknown.metric = openmetrics.thehive.the_hive_bees_role_unknown
 unknown.label = Unbekannte Rollen
 unknown.color = red
 """

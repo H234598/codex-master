@@ -37,7 +37,7 @@ class FleetSnapshotTests(unittest.TestCase):
         )
         env = [f"CODEX_HOME={home}"]
         if managed:
-            env.extend(("CODEX_AGENT_MCP=1", "CODEX_MASTER_MCP=1"))
+            env.extend(("CODEX_AGENT_MCP=1", "THE_HIVE_MCP=1"))
         (process / "environ").write_bytes("\0".join(env).encode() + b"\0")
         (process / "cmdline").write_bytes(b"codex\0")
 
@@ -86,6 +86,32 @@ class FleetSnapshotTests(unittest.TestCase):
                 snapshot.created_at = datetime.now(timezone.utc)
             with self.assertRaises(TypeError):
                 snapshot.tmux_sessions["a1-session"] = snapshot.tmux_sessions["a2-session"]
+
+    def test_snapshot_recognizes_the_hive_mcp_without_codex_agent_marker(self) -> None:
+        """A The-Hive-managed process needs no independent Codex-Agent marker."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            proc_root = root / "proc"
+            proc_root.mkdir()
+            home = root / "a1-home"
+            home.mkdir()
+            self._write_process(proc_root, 101, home=home, name="codex", managed=False)
+            (proc_root / "101" / "environ").write_bytes(
+                f"CODEX_HOME={home}\0THE_HIVE_MCP=1\0".encode()
+            )
+
+            snapshot = create_fleet_snapshot(
+                agent_homes={"a1": home},
+                agent_sessions={},
+                proc_root=proc_root,
+                tmux_runner=lambda args, *, check=False: subprocess.CompletedProcess(
+                    args, 0, "", ""
+                ),
+            )
+
+            summary = summarize_agent_processes(snapshot, "a1")
+            self.assertEqual(summary["managed_process_count"], 1)
+            self.assertEqual(summary["external_process_count"], 0)
 
     def test_nested_snapshot_collections_are_immutable(self) -> None:
         process = ProcessSnapshot(101, 1, "codex", "S (sleeping)", "/home/a1", True)

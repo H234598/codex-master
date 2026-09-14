@@ -29,7 +29,7 @@ from the_hive.resource_cgroup import (
 SYSTEMD_RUN_PATH = "/usr/bin/systemd-run"
 SYSTEMCTL_PATH = "/usr/bin/systemctl"
 CGROUP_ROOT = Path("/sys/fs/cgroup")
-OLLAMA_SLICE = "codex-master.slice"
+OLLAMA_SLICE = "the-hive.slice"
 PROBE_TIMEOUT_SECONDS = 2.0
 MAX_TAG_RESPONSE_BYTES = 64 * 1024
 _MAX_CGROUP_BYTES = 4096

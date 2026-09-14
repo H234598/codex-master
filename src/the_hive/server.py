@@ -373,7 +373,7 @@ HEADLESS_META_KEY = "headless_job"
 G5_TMUX_SOCKET_META_KEY = "tmux_socket"
 G5_TMUX_SOCKET_RE = re.compile(r"g5-[0-9a-f]{20}")
 G5_NATIVE_RUNNER_META_KEY = "g5_native_runner"
-G5_SCOPE_UNIT_RE = re.compile(r"codex-master-resource-[a-f0-9]{32}\.scope")
+G5_SCOPE_UNIT_RE = re.compile(r"the-hive-resource-[a-f0-9]{32}\.scope")
 DEFAULT_HEADLESS_TIMEOUT_SECONDS = 600
 HEADLESS_ROLLBACK_DIR_NAME = "headless-write-scope-rollback"
 HEADLESS_ROLLBACK_SCHEMA_VERSION = 1
@@ -727,7 +727,7 @@ SERIES_DISABLE_TIMEOUT_SECONDS = 30.0
 DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS = 10
 MAX_MCP_PROBE_OUTPUT_BYTES = 256 * 1024
 RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
-FLEET_DESKTOP_ENTRY_NAME = "de.teladi.CodexMaster.ControlCenter.desktop"
+FLEET_DESKTOP_ENTRY_NAME = "de.teladi.TheHive.ControlCenter.desktop"
 MAX_FLEET_DESKTOP_ENTRY_BYTES = 16 * 1024
 FLEET_DESKTOP_COMMAND_RE = re.compile(r"^/[-A-Za-z0-9._+@/ ]+$")
 AGENT_POOL_ROOT = Path(
@@ -902,10 +902,10 @@ DEFAULT_AGENTIN_BASE_NAMES = (
 )
 DEFAULT_AGENTIN_NAMES = {"a1": "Mila", "b1": "Nora"}
 Q_WEEKLY_THRESHOLD_PERCENT = 10.0
-WATCHDOG_SERVICE_NAME = "codex-master-watchdog.service"
-WATCHDOG_TIMER_NAME = "codex-master-watchdog.timer"
-RESOURCE_MONITOR_SERVICE_NAME = "codex-master-resource-monitor.service"
-RESOURCE_MONITOR_SLICE_NAME = "codex-master.slice"
+WATCHDOG_SERVICE_NAME = "the-hive-watchdog.service"
+WATCHDOG_TIMER_NAME = "the-hive-watchdog.timer"
+RESOURCE_MONITOR_SERVICE_NAME = "the-hive-resource-monitor.service"
+RESOURCE_MONITOR_SLICE_NAME = "the-hive.slice"
 RESOURCE_MONITOR_UNIT_NAMES = (
     RESOURCE_MONITOR_SERVICE_NAME,
     RESOURCE_MONITOR_SLICE_NAME,
@@ -952,7 +952,7 @@ RAW_LOG_TRUNCATION_MARKER = (
     b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 )
 MCP_SERVER_TABLE_HEADER = f"[mcp_servers.{MCP_SERVER_NAME}]"
-APP_BRIDGE_NAME = "codex-master"
+APP_BRIDGE_NAME = "the-hive"
 
 
 def default_server_instance_id() -> str:
@@ -4500,7 +4500,7 @@ def mcp_initialize_probe_payload() -> str:
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
                     "clientInfo": {
-                        "name": "codex-master-install-probe",
+                        "name": "the-hive-install-probe",
                         "version": "0",
                     },
                 },
@@ -4520,7 +4520,7 @@ def mcp_tools_list_probe_payload() -> str:
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "codex-master-tools-probe", "version": "0"},
+                "clientInfo": {"name": "the-hive-tools-probe", "version": "0"},
             },
         },
         {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
@@ -11593,7 +11593,7 @@ def _proc_has_exact_g5_home_evidence(
     raw = _read_bounded_proc_evidence(pid_dir, "environ", max_bytes=16 * 1024)
     if raw is None:
         return False
-    expected = {b"CODEX_HOME", b"CODEX_MASTER_MCP", b"CODEX_AGENT_MCP"}
+    expected = {b"CODEX_HOME", b"THE_HIVE_MCP", b"CODEX_AGENT_MCP"}
     values: dict[bytes, bytes] = {}
     for item in raw.split(b"\0"):
         if not item or b"=" not in item:
@@ -11610,7 +11610,7 @@ def _proc_has_exact_g5_home_evidence(
     if not same_path_text(codex_home, home):
         return False
     return not require_markers or (
-        values.get(b"CODEX_MASTER_MCP") == b"1"
+        values.get(b"THE_HIVE_MCP") == b"1"
         and values.get(b"CODEX_AGENT_MCP") == b"1"
     )
 
@@ -11788,7 +11788,7 @@ def agent_home_processes(
                     except (OSError, RuntimeError):
                         matches_home = False
             managed = (
-                env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
+                env.get("CODEX_AGENT_MCP") == "1" or env.get("THE_HIVE_MCP") == "1"
             ) and proc_is_codex_like(status, read_proc_cmdline(pid_dir))
             if native_g5_evidence is not None:
                 pane_process_id, device, inode, scope_unit = native_g5_evidence
@@ -11823,7 +11823,7 @@ def agent_home_processes(
             and env is not None
             and bool(env.get("CODEX_HOME"))
             and env.get("CODEX_AGENT_MCP") == "1"
-            and env.get("CODEX_MASTER_MCP") == "1"
+            and env.get("THE_HIVE_MCP") == "1"
             and _proc_is_exact_inherited_home_session_helper(
                 pid_dir,
                 status,
@@ -11937,7 +11937,7 @@ def pool_home_processes(
                 except (OSError, RuntimeError, ValueError):
                     matches_home = False
             managed = (
-                env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
+                env.get("CODEX_AGENT_MCP") == "1" or env.get("THE_HIVE_MCP") == "1"
             ) and proc_is_codex_like(status, read_proc_cmdline(pid_dir))
         if not matches_home:
             if current_dir is None:
@@ -12144,7 +12144,7 @@ def codex_related_process_summary(proc_root: Path = Path("/proc")) -> dict[str, 
         status = read_proc_status(pid_dir)
         argv = read_proc_cmdline(pid_dir)
         joined = "\0".join(argv).lower()
-        if "the_hive.server" in joined or "codex-master-mcp" in joined:
+        if "the_hive.server" in joined or "the-hive-mcp" in joined:
             mcp_server_count += 1
             continue
 
@@ -12726,10 +12726,10 @@ def _start_agent_unlocked(
             command = (
                 "env -u CODEX_ACCESS_TOKEN -u OPENAI_API_KEY "
                 f"CODEX_HOME={shlex.quote(str(managed_home))} "
-                'CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 "${CODEX_MASTER_RUNNER_EXEC_PATH:?}"'
+                'THE_HIVE_MCP=1 CODEX_AGENT_MCP=1 "${THE_HIVE_RUNNER_EXEC_PATH:?}"'
             )
         else:
-            command = 'env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 "${CODEX_MASTER_RUNNER_EXEC_PATH:?}"'
+            command = 'env THE_HIVE_MCP=1 CODEX_AGENT_MCP=1 "${THE_HIVE_RUNNER_EXEC_PATH:?}"'
         if argv:
             command += " " + shlex.join(argv)
         try:
@@ -21063,7 +21063,7 @@ def master_app_bridge_status() -> dict[str, Any]:
         return result
     app_entry = apps.get(APP_BRIDGE_NAME)
     if not isinstance(app_entry, dict):
-        result["reason"] = "codex_master_app_missing"
+        result["reason"] = "the_hive_app_missing"
         return result
     connector_id = app_entry.get("id")
     if not isinstance(connector_id, str) or not connector_id.strip():
@@ -21126,7 +21126,7 @@ def master_plugin_status() -> dict[str, Any]:
     root = repo_root()
     manifest = root / ".codex-plugin" / "plugin.json"
     app_manifest = root / ".app.json"
-    skill = root / "skills" / "codex-master-fleet" / "SKILL.md"
+    skill = root / "skills" / "the-hive-fleet" / "SKILL.md"
     mcp_manifest_declaration = plugin_declares_mcp_manifest(root)
     mcp_manifest_status = plugin_mcp_manifest_status(root)
     app_bridge = master_app_bridge_status()
@@ -21558,14 +21558,12 @@ _RESOURCE_MONITOR_RELEASE_ROOT_NAME = "codex-master-runtime"
 _RESOURCE_MONITOR_RELEASE_GENERATIONS_NAME = "generations"
 _RESOURCE_MONITOR_RELEASE_POINTERS_NAME = ".codex-master-release-pointers.json"
 _RESOURCE_MONITOR_RELEASE_PUBLISH_LOCK_NAME = ".codex-master-release-publish.lock"
-_RESOURCE_MONITOR_SERVICE_TEMPLATE = (
-    "systemd/user/codex-master-resource-monitor.service"
-)
-_RESOURCE_MONITOR_SLICE_TEMPLATE = "systemd/user/codex-master.slice"
+_RESOURCE_MONITOR_SERVICE_TEMPLATE = "systemd/user/the-hive-resource-monitor.service"
+_RESOURCE_MONITOR_SLICE_TEMPLATE = "systemd/user/the-hive.slice"
 _RESOURCE_MONITOR_RELEASE_ATTESTED_PATHS = (
     _RESOURCE_MONITOR_SERVICE_TEMPLATE,
     _RESOURCE_MONITOR_SLICE_TEMPLATE,
-    "bin/codex-master-resource-monitor",
+    "bin/the-hive-resource-monitor",
     "codex-agent-classes.json",
     "codex-hive.json",
 )
@@ -21763,7 +21761,7 @@ def _resource_monitor_render_service_template(
     if (
         text.count(_RESOURCE_MONITOR_GENERATION_TOKEN) != 5
         or text.count(_RESOURCE_MONITOR_MANIFEST_TOKEN) != 1
-        or "%h/codex-master/" in text
+        or "%h/the-hive/" in text
         or "PYTHONPATH" in text
     ):
         raise AgentError("resource_monitor_release_template_invalid")
@@ -21772,24 +21770,22 @@ def _resource_monitor_render_service_template(
     )
     if re.search(r"@[A-Z0-9_]+@", rendered):
         raise AgentError("resource_monitor_release_template_invalid")
-    release_path = (
-        f"%h/.local/lib/{_RESOURCE_MONITOR_RELEASE_ROOT_NAME}/generations/{generation}"
-    )
+    release_path = f"%h/.local/lib/the-hive-runtime/generations/{generation}"
     required_binds = (
-        f"{release_path}/bin/codex-master-resource-monitor:%h/.local/bin/codex-master-resource-monitor:norbind",
+        f"{release_path}/bin/the-hive-resource-monitor:%h/.local/bin/the-hive-resource-monitor:norbind",
         f"{release_path}/src:%h/.local/src:norbind",
         f"{release_path}/codex-agent-classes.json:%h/.local/codex-agent-classes.json:norbind",
         f"{release_path}/codex-hive.json:%h/.local/codex-hive.json:norbind",
     )
     expected_exec = (
-        f"ExecStart=%h/.local/bin/codex-master-resource-monitor "
-        f"%h/.local/lib/{_RESOURCE_MONITOR_RELEASE_ROOT_NAME} {generation} "
+        f"ExecStart=%h/.local/bin/the-hive-resource-monitor "
+        f"%h/.local/lib/the-hive-runtime {generation} "
         f"{manifest_digest}"
     )
     if (
         any(bind not in rendered for bind in required_binds)
         or expected_exec not in rendered
-        or "codex-master-resource-monitor %h/.local/lib/" not in rendered
+        or "the-hive-resource-monitor %h/.local/lib/" not in rendered
     ):
         raise AgentError("resource_monitor_release_template_invalid")
     return rendered.encode("utf-8")
@@ -24920,7 +24916,7 @@ def send_agent(
             if paste_mode == "bracketed_paste"
             else text
         )
-        buffer_name = f"codex-master-mcp-{agent}-{uuid.uuid4().hex}"
+        buffer_name = f"the-hive-mcp-{agent}-{uuid.uuid4().hex}"
         cp = run_tmux(
             _tmux_args_for_session(session, ["load-buffer", "-b", buffer_name, "-"]),
             input_text=payload,
@@ -36335,7 +36331,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "master_app_bridge_status",
-        "description": "Return codex-master App Bridge manifest and connector-ID status without local paths.",
+        "description": "Return The Hive App Bridge manifest and connector-ID status without local paths.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -36344,7 +36340,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "master_plugin_status",
-        "description": "Return plugin packaging, App Bridge, and MCP registration status for codex-master.",
+        "description": "Return plugin packaging, App Bridge, and MCP registration status for The Hive.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -36353,7 +36349,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "master_namespace_status",
-        "description": "Diagnose whether codex-master-mcp is registered, starts, and exposes its MCP tools to new clients. Does not return raw output.",
+        "description": "Diagnose whether the-hive-mcp is registered, starts, and exposes its MCP tools to new clients. Does not return raw output.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -37757,15 +37753,15 @@ def _hive_metrics_local_admin(
         )
         values.update(
             {
-                "codex_master_agent_observation_errors": observation_errors,
-                "codex_master_native_bridge_ready": int(
+                "the_hive_agent_observation_errors": observation_errors,
+                "the_hive_native_bridge_ready": int(
                     native.get("bridge_state") == "ready"
                 ),
-                "codex_master_bees_native_unconfirmed": native_unconfirmed,
-                "codex_master_process_scan_available": int(
+                "the_hive_bees_native_unconfirmed": native_unconfirmed,
+                "the_hive_process_scan_available": int(
                     observation.process_scan_available
                 ),
-                "codex_master_tmux_scan_available": int(
+                "the_hive_tmux_scan_available": int(
                     observation.tmux_scan_available
                 ),
             }
@@ -37776,7 +37772,7 @@ def _hive_metrics_local_admin(
 
 
 def _observability_serve_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="codex-master-mcp observability-serve")
+    parser = argparse.ArgumentParser(prog="the-hive-mcp observability-serve")
     parser.add_argument("--host", choices=("127.0.0.1", "::1"), default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9798)
     parser.add_argument("--cache-seconds", type=float, default=5.0)
@@ -37798,7 +37794,7 @@ def _observability_serve_cli(argv: list[str]) -> int:
 
 
 def _fleet_overview_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="codex-master-mcp fleet overview")
+    parser = argparse.ArgumentParser(prog="the-hive-mcp fleet overview")
     parser.add_argument(
         "--format", choices=("compact", "json", "markdown"), default="compact"
     )
@@ -37854,7 +37850,7 @@ def _render_resource_operator_status(
 
 
 def _resource_status_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="codex-master-mcp resource-status")
+    parser = argparse.ArgumentParser(prog="the-hive-mcp resource-status")
     parser.add_argument(
         "--format", choices=("compact", "json", "markdown"), default="compact"
     )
@@ -37876,7 +37872,7 @@ def _resource_status_cli(argv: list[str]) -> int:
 
 
 def _resource_monitor_install_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="codex-master-mcp install-resource-monitor")
+    parser = argparse.ArgumentParser(prog="the-hive-mcp install-resource-monitor")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -37890,7 +37886,7 @@ def _resource_monitor_install_cli(argv: list[str]) -> int:
 
 def _resource_scope_gate_install_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog="codex-master-mcp install-resource-scope-gate"
+        prog="the-hive-mcp install-resource-scope-gate"
     )
     parser.parse_args(argv)
     try:
@@ -37903,7 +37899,7 @@ def _resource_scope_gate_install_cli(argv: list[str]) -> int:
 
 
 def _resource_monitor_status_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="codex-master-mcp resource-monitor-status")
+    parser = argparse.ArgumentParser(prog="the-hive-mcp resource-monitor-status")
     parser.parse_args(argv)
     try:
         return print_json(resource_monitor_status())

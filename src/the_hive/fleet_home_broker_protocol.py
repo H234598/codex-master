@@ -27,7 +27,7 @@ MAX_CHPB_GENERATION = 2**63 - 1
 MAX_CHPB_DEVICE = 2**63 - 1
 MAX_CHPB_INODE = 2**63 - 1
 MAX_CHPB_MCS_CATEGORY = 1023
-CANONICAL_AGENT_HOME = "/run/codex-master-agent/home"
+CANONICAL_AGENT_HOME = "/run/the-hive-agent/home"
 
 
 class ChpbValidationCode(str, Enum):
@@ -382,7 +382,7 @@ def agent_unit_name_for_mcs(mcs_pair: object) -> str:
     instance = f"c{low}\\x2cc{high}"
     if _MCS_INSTANCE.fullmatch(instance) is None:
         _fail(ChpbValidationCode.INVALID_BINDING)
-    return f"codex-master-agent@{instance}.service"
+    return f"the-hive-agent@{instance}.service"
 
 
 def _fail(code: ChpbValidationCode):

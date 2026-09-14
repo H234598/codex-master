@@ -29,28 +29,28 @@ def _named_release_layout(tmp_path: Path, runtime_image) -> object:
     """Copy the complete fixture under an explicitly current named release."""
 
     tmp_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    root = tmp_path / "codex-master-runtime"
+    root = tmp_path / "the-hive-runtime"
     root.mkdir(mode=0o700)
     generations = root / "generations"
     generations.mkdir(mode=0o700)
     stage = tmp_path / "stage"
     shutil.copytree(runtime_image.root, stage)
     manifest = json.loads(
-        (stage / ".codex-master-runtime-manifest.json").read_text(encoding="utf-8")
+        (stage / ".the-hive-runtime-manifest.json").read_text(encoding="utf-8")
     )
     generation = manifest["generation"]
     assert isinstance(generation, str)
     target = generations / generation
     os.replace(stage, target)
     digest = "sha256:" + hashlib.sha256(
-        (target / ".codex-master-runtime-manifest.json").read_bytes()
+        (target / ".the-hive-runtime-manifest.json").read_bytes()
     ).hexdigest()
     pointers = {
         "schema_version": 1,
         "current": {"generation": generation, "manifest_digest": digest},
         "previous": None,
     }
-    pointer = root / ".codex-master-release-pointers.json"
+    pointer = root / ".the-hive-release-pointers.json"
     pointer.write_text(json.dumps(pointers), encoding="utf-8")
     pointer.chmod(0o644)
     return runtime_image.__class__.from_current_release(root, generation, digest)
@@ -68,7 +68,7 @@ def _healthy_mcp_result() -> SimpleNamespace:
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
-                        "serverInfo": {"name": "codex-master-mcp", "version": "1"},
+                        "serverInfo": {"name": "the-hive-mcp", "version": "1"},
                     },
                 },
                 {
@@ -230,7 +230,7 @@ def test_runtime_status_rejects_mcp_start_and_incomplete_tools_surface(
                         "result": {
                             "protocolVersion": "2024-11-05",
                             "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
-                            "serverInfo": {"name": "codex-master-mcp", "version": "1"},
+                            "serverInfo": {"name": "the-hive-mcp", "version": "1"},
                         },
                     }
                 ),
@@ -369,7 +369,7 @@ def test_runtime_status_fails_closed_on_current_pointer_or_digest_drift(
     assert modules is not None
     _layout_module, status_module = modules
     layout = _named_release_layout(tmp_path, runtime_image)
-    pointer = layout.root.parent.parent / ".codex-master-release-pointers.json"
+    pointer = layout.root.parent.parent / ".the-hive-release-pointers.json"
     original = json.loads(pointer.read_text(encoding="utf-8"))
     attempted = 0
 
@@ -439,7 +439,7 @@ def test_runtime_status_rejects_any_noncanonical_runtime_status_tool_surface() -
         "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
-            "serverInfo": {"name": "codex-master-mcp", "version": "1"},
+            "serverInfo": {"name": "the-hive-mcp", "version": "1"},
         },
     }
     canonical_tool = {
@@ -500,7 +500,7 @@ def test_runtime_status_rejects_out_of_order_and_duplicate_key_responses() -> No
     initialize_result = {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
-        "serverInfo": {"name": "codex-master-mcp", "version": "1"},
+        "serverInfo": {"name": "the-hive-mcp", "version": "1"},
     }
     tools_result = {
         "tools": [

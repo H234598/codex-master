@@ -8,10 +8,10 @@ import json
 
 _SCHEMA_VERSION = 2
 _BROKER_PROTOCOL = "CHPB/2"
-_SYSTEM_BUS_INTERFACE = "org.codex_master.HomeBrokerControl2"
+_SYSTEM_BUS_INTERFACE = "org.the_hive.HomeBrokerControl2"
 _SYSTEM_BUS_METHOD = "StartDynamicTeamlead"
-_AGENT_UNIT_TEMPLATE = "codex-master-agent@.service"
-_LAUNCHER_PATH = "/usr/libexec/codex-master-agent-launcher"
+_AGENT_UNIT_TEMPLATE = "the-hive-agent@.service"
+_LAUNCHER_PATH = "/usr/libexec/the-hive-agent-launcher"
 _PAYLOAD_ROLES = (
     "python_runtime",
     "root_helpers",

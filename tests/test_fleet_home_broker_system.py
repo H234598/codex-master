@@ -60,15 +60,15 @@ RELEASE = BrokerReleaseSpec(
     "provider-v1",
     "f" * 64,
     "0" * 64,
-    "codex-master-home-broker.socket",
-    "codex-master-home-broker.service",
-    "org.codex_master.HomeBrokerControl",
-    "/org/codex_master/HomeBrokerControl",
-    "org.codex_master.HomeBrokerControl1",
-    "codex_master_home_broker_t",
-    "codex_master_control_t",
-    "codex_master_home_broker_runtime_t",
-    "codex_master_agent_t",
+    "the-hive-home-broker.socket",
+    "the-hive-home-broker.service",
+    "org.the_hive.HomeBrokerControl",
+    "/org/the_hive/HomeBrokerControl",
+    "org.the_hive.HomeBrokerControl1",
+    "the_hive_home_broker_t",
+    "the_hive_control_t",
+    "the_hive_home_broker_runtime_t",
+    "the_hive_agent_t",
 )
 
 
@@ -198,17 +198,17 @@ def test_builder_derives_only_fixed_topology_and_issued_release_binding() -> Non
     plan = build_broker_system_plan(_issued_grant())
 
     assert plan.directory == BrokerDirectoryExpectation(
-        "/run/codex-master-home-broker",
+        "/run/the-hive-home-broker",
         BrokerNodeType.DIRECTORY,
         "root",
-        "codex-master-broker",
+        "the-hive-broker",
         0o750,
     )
     assert plan.socket == BrokerSocketExpectation(
-        "/run/codex-master-home-broker/broker.sock",
+        "/run/the-hive-home-broker/broker.sock",
         BrokerNodeType.SOCKET,
         "root",
-        "codex-master-broker",
+        "the-hive-broker",
         0o660,
         socket.AF_UNIX,
         socket.SOCK_SEQPACKET,
@@ -241,10 +241,10 @@ def test_builder_derives_only_fixed_topology_and_issued_release_binding() -> Non
     [
         (
             lambda: BrokerDirectoryEvidence(
-                "/run/codex-master-home-broker",
+                "/run/the-hive-home-broker",
                 BrokerNodeType.DIRECTORY,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o750,
                 17,
                 29,
@@ -254,10 +254,10 @@ def test_builder_derives_only_fixed_topology_and_issued_release_binding() -> Non
         ),
         (
             lambda: BrokerSocketEvidence(
-                "/run/codex-master-home-broker/broker.sock",
+                "/run/the-hive-home-broker/broker.sock",
                 BrokerNodeType.SOCKET,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o660,
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET,
@@ -277,19 +277,19 @@ def test_node_evidence_rejects_typed_boundary_drift(factory, field, value) -> No
 def test_all_public_evidence_is_frozen_and_slotted() -> None:
     values = (
         BrokerDirectoryEvidence(
-            "/run/codex-master-home-broker",
+            "/run/the-hive-home-broker",
             BrokerNodeType.DIRECTORY,
             "root",
-            "codex-master-broker",
+            "the-hive-broker",
             0o750,
             17,
             29,
         ),
         BrokerSocketEvidence(
-            "/run/codex-master-home-broker/broker.sock",
+            "/run/the-hive-home-broker/broker.sock",
             BrokerNodeType.SOCKET,
             "root",
-            "codex-master-broker",
+            "the-hive-broker",
             0o660,
             socket.AF_UNIX,
             socket.SOCK_SEQPACKET,
@@ -310,19 +310,19 @@ def test_all_public_evidence_is_frozen_and_slotted() -> None:
 def _system_evidence(**changes: object) -> BrokerSystemEvidence:
     values = {
         "directory": BrokerDirectoryEvidence(
-            "/run/codex-master-home-broker",
+            "/run/the-hive-home-broker",
             BrokerNodeType.DIRECTORY,
             "root",
-            "codex-master-broker",
+            "the-hive-broker",
             0o750,
             17,
             29,
         ),
         "socket": BrokerSocketEvidence(
-            "/run/codex-master-home-broker/broker.sock",
+            "/run/the-hive-home-broker/broker.sock",
             BrokerNodeType.SOCKET,
             "root",
-            "codex-master-broker",
+            "the-hive-broker",
             0o660,
             socket.AF_UNIX,
             socket.SOCK_SEQPACKET,
@@ -501,7 +501,7 @@ def test_missing_fedora_enforcing_fails_before_claim_without_start_or_close() ->
         (
             "system_bus",
             lambda evidence: dataclasses.replace(
-                evidence.system_bus, interface="org.codex_master.Wrong"
+                evidence.system_bus, interface="org.the_hive.Wrong"
             ),
         ),
         (
@@ -673,10 +673,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
     [
         (
             lambda: BrokerDirectoryEvidence(
-                "/run/codex-master-home-broker",
+                "/run/the-hive-home-broker",
                 BrokerNodeType.DIRECTORY,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o750,
                 17,
                 29,
@@ -686,10 +686,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerDirectoryEvidence(
-                "/run/codex-master-home-broker",
+                "/run/the-hive-home-broker",
                 BrokerNodeType.DIRECTORY,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o750,
                 17,
                 29,
@@ -699,10 +699,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerDirectoryEvidence(
-                "/run/codex-master-home-broker",
+                "/run/the-hive-home-broker",
                 BrokerNodeType.DIRECTORY,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o750,
                 17,
                 29,
@@ -712,10 +712,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerDirectoryEvidence(
-                "/run/codex-master-home-broker",
+                "/run/the-hive-home-broker",
                 BrokerNodeType.DIRECTORY,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o750,
                 17,
                 29,
@@ -725,10 +725,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerDirectoryEvidence(
-                "/run/codex-master-home-broker",
+                "/run/the-hive-home-broker",
                 BrokerNodeType.DIRECTORY,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o750,
                 17,
                 29,
@@ -738,10 +738,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerDirectoryEvidence(
-                "/run/codex-master-home-broker",
+                "/run/the-hive-home-broker",
                 BrokerNodeType.DIRECTORY,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o750,
                 17,
                 29,
@@ -751,10 +751,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerDirectoryEvidence(
-                "/run/codex-master-home-broker",
+                "/run/the-hive-home-broker",
                 BrokerNodeType.DIRECTORY,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o750,
                 17,
                 29,
@@ -764,10 +764,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerSocketEvidence(
-                "/run/codex-master-home-broker/broker.sock",
+                "/run/the-hive-home-broker/broker.sock",
                 BrokerNodeType.SOCKET,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o660,
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET,
@@ -779,10 +779,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerSocketEvidence(
-                "/run/codex-master-home-broker/broker.sock",
+                "/run/the-hive-home-broker/broker.sock",
                 BrokerNodeType.SOCKET,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o660,
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET,
@@ -794,10 +794,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerSocketEvidence(
-                "/run/codex-master-home-broker/broker.sock",
+                "/run/the-hive-home-broker/broker.sock",
                 BrokerNodeType.SOCKET,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o660,
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET,
@@ -809,10 +809,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerSocketEvidence(
-                "/run/codex-master-home-broker/broker.sock",
+                "/run/the-hive-home-broker/broker.sock",
                 BrokerNodeType.SOCKET,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o660,
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET,
@@ -824,10 +824,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerSocketEvidence(
-                "/run/codex-master-home-broker/broker.sock",
+                "/run/the-hive-home-broker/broker.sock",
                 BrokerNodeType.SOCKET,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o660,
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET,
@@ -839,10 +839,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerSocketEvidence(
-                "/run/codex-master-home-broker/broker.sock",
+                "/run/the-hive-home-broker/broker.sock",
                 BrokerNodeType.SOCKET,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o660,
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET,
@@ -854,10 +854,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerSocketEvidence(
-                "/run/codex-master-home-broker/broker.sock",
+                "/run/the-hive-home-broker/broker.sock",
                 BrokerNodeType.SOCKET,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o660,
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET,
@@ -869,10 +869,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerSocketEvidence(
-                "/run/codex-master-home-broker/broker.sock",
+                "/run/the-hive-home-broker/broker.sock",
                 BrokerNodeType.SOCKET,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o660,
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET,
@@ -884,10 +884,10 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
         ),
         (
             lambda: BrokerSocketEvidence(
-                "/run/codex-master-home-broker/broker.sock",
+                "/run/the-hive-home-broker/broker.sock",
                 BrokerNodeType.SOCKET,
                 "root",
-                "codex-master-broker",
+                "the-hive-broker",
                 0o660,
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET,

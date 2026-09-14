@@ -83,10 +83,10 @@ class FakeCgroupAdapter:
         if self.fail_at == "start":
             raise CgroupPreflightError("cgroup_preflight_failed")
         return PreparedAgentScope(
-            unit_name="codex-master-test.scope",
+            unit_name="the-hive-test.scope",
             socket_name=socket_name,
             session_name=session_name,
-            control_group="user.slice/codex-master-test.scope",
+            control_group="user.slice/the-hive-test.scope",
             gate_pid=4241,
             challenge="a" * 64,
         )
@@ -121,7 +121,7 @@ class FakeCgroupAdapter:
         try:
             return resource_cgroup._parse_cgroup_pressure(
                 self.read_bounded_cgroup_bytes(
-                    Path("/sys/fs/cgroup/user.slice/codex-master.slice/io.pressure"),
+                    Path("/sys/fs/cgroup/user.slice/the-hive.slice/io.pressure"),
                     max_bytes=4096,
                 )
             )
@@ -189,7 +189,7 @@ def _approved_provider_runner(
     cpu_root = tmp_path / "cpu"
     _write_topology_documents(cpu_root, _topology_documents(present=present))
     cgroup_root = tmp_path / "cgroup"
-    slice_root = cgroup_root / "user.slice" / "codex-master.slice"
+    slice_root = cgroup_root / "user.slice" / "the-hive.slice"
     slice_root.mkdir(parents=True)
     (slice_root / "cgroup.controllers").write_bytes(controllers)
     (slice_root / "cgroup.subtree_control").write_bytes(subtree_controllers)
@@ -384,7 +384,7 @@ def test_approved_monitor_runtime_binds_exact_self_service_parent_without_user_b
     cgroup = proc_root / str(os.getpid()) / "cgroup"
     cgroup.parent.mkdir(parents=True)
     cgroup.write_bytes(
-        b"0::/user.slice/codex-master.slice/codex-master-resource-monitor.service\n"
+        b"0::/user.slice/the-hive.slice/the-hive-resource-monitor.service\n"
     )
     monkeypatch.setattr(resource_cgroup, "PROC_ROOT", proc_root)
 
@@ -394,17 +394,17 @@ def test_approved_monitor_runtime_binds_exact_self_service_parent_without_user_b
         monitor_self_cgroup=True,
     )
 
-    assert result.adapter._target_slice_control_group_path == "user.slice/codex-master.slice"
+    assert result.adapter._target_slice_control_group_path == "user.slice/the-hive.slice"
     assert runner.calls == []
 
 
 @pytest.mark.parametrize(
     "payload",
     (
-        b"0::/user.slice/codex-master.slice/foreign.service\n",
-        b"0::/user.slice/other.slice/codex-master-resource-monitor.service\n",
-        b"0::/user.slice/codex-master.slice/codex-master-resource-monitor.service\n1::/\n",
-        b"1:cpu:/user.slice/codex-master.slice/codex-master-resource-monitor.service\n",
+        b"0::/user.slice/the-hive.slice/foreign.service\n",
+        b"0::/user.slice/other.slice/the-hive-resource-monitor.service\n",
+        b"0::/user.slice/the-hive.slice/the-hive-resource-monitor.service\n1::/\n",
+        b"1:cpu:/user.slice/the-hive.slice/the-hive-resource-monitor.service\n",
     ),
 )
 def test_approved_monitor_runtime_rejects_nonexact_self_cgroup_evidence_without_runner(
@@ -601,7 +601,7 @@ def test_topology_rejects_malformed_oversize_and_inconsistent_cpu_records() -> N
 def test_read_hive_io_pressure_reads_valid_pressure_payload() -> None:
     adapter = FakeCgroupAdapter(
         documents={
-            Path("/sys/fs/cgroup/user.slice/codex-master.slice/io.pressure"): (
+            Path("/sys/fs/cgroup/user.slice/the-hive.slice/io.pressure"): (
                 b"some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
                 b"full avg10=1.23 avg60=2.34 avg300=3.45 total=4\n"
             )
@@ -623,13 +623,13 @@ def test_read_hive_io_pressure_rejects_malformed_pressure_payload() -> None:
     )
     for payload in payloads:
         adapter = FakeCgroupAdapter(
-            documents={Path("/sys/fs/cgroup/user.slice/codex-master.slice/io.pressure"): payload}
+            documents={Path("/sys/fs/cgroup/user.slice/the-hive.slice/io.pressure"): payload}
         )
         assert read_hive_io_pressure(adapter=adapter) is None
 
 
 def test_read_hive_io_pressure_uses_control_group_from_target_slice_systemd_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    target_control_group = "/user.slice/user-1000.slice/user@1000.service/codex.slice/codex-master.slice"
+    target_control_group = "/user.slice/user-1000.slice/user@1000.service/codex.slice/the-hive.slice"
     payload = (
         b"some avg10=12.34 avg60=11.11 avg300=10.00 total=7\n"
         b"full avg10=34.56 avg60=7.89 avg300=6.78 total=8\n"
@@ -755,7 +755,7 @@ def test_scope_runner_uses_held_scope_before_tmux_and_readbacks_every_required_p
         session_name="scope-session.1",
     )
 
-    assert scope.unit_name == "codex-master-test.scope"
+    assert scope.unit_name == "the-hive-test.scope"
     assert adapter.events == ["inspect", "start", "verify_scope", "release", "confirm", "verify_tmux"]
     assert adapter.cleaned == []
 
@@ -773,7 +773,7 @@ def test_scope_runner_dispatches_command_between_gate_ready_and_elf_attestation(
         ),
     )
 
-    assert scope.unit_name == "codex-master-test.scope"
+    assert scope.unit_name == "the-hive-test.scope"
     assert adapter.events == [
         "inspect",
         "start",
@@ -830,7 +830,7 @@ def test_scope_failure_before_publication_cleans_only_new_scope_and_never_touche
             session_name="scope-session.1",
         )
     assert adapter.events == ["inspect", "start", "verify_scope", "cleanup"]
-    assert [scope.unit_name for scope in adapter.cleaned] == ["codex-master-test.scope"]
+    assert [scope.unit_name for scope in adapter.cleaned] == ["the-hive-test.scope"]
 
 
 def test_scope_runner_checks_tmux_pid_cgroup_and_child_inheritance_before_success() -> None:
@@ -859,7 +859,7 @@ def test_io_weight_is_not_reported_as_proven_physical_isolation_without_evidence
 
 
 def test_scope_gate_rejects_general_launcher_token_and_extra_argv_before_exec() -> None:
-    control = "codex-master-resource-" + "a" * 32
+    control = "the-hive-resource-" + "a" * 32
     rejected = (
         ("invalid", "socket", "session"),
         (control, "socket", "session", "unexpected"),
@@ -915,7 +915,7 @@ def test_scope_gate_generates_internal_challenge_and_executes_only_fixed_tmux_ar
     tmp_path: Path,
 ) -> None:
     challenge = "c" * 64
-    control = "codex-master-resource-" + "d" * 32
+    control = "the-hive-resource-" + "d" * 32
     called: dict[str, object] = {}
     control_socket = _GateControlSocket(f"{challenge}\n".encode())
 
@@ -957,7 +957,7 @@ def test_scope_gate_generates_internal_challenge_and_executes_only_fixed_tmux_ar
         with pytest.raises(_GateExecveCalled):
             runpy.run_path(str(GATE), run_name="__main__")
 
-        runner_path = called["env"]["CODEX_MASTER_RUNNER_EXEC_PATH"]
+        runner_path = called["env"]["THE_HIVE_RUNNER_EXEC_PATH"]
         assert runner_path.startswith(f"/proc/{os.getpid()}/fd/")
         gate_fd = int(runner_path.rsplit("/", 1)[1])
         assert gate_fd != runner_fd
@@ -984,13 +984,13 @@ def test_scope_gate_generates_internal_challenge_and_executes_only_fixed_tmux_ar
             "LANG": "C",
             "LC_ALL": "C",
             "PATH": "/usr/bin:/bin",
-            "CODEX_MASTER_RUNNER_EXEC_PATH": runner_path,
+            "THE_HIVE_RUNNER_EXEC_PATH": runner_path,
         },
     }
 
 
 def test_scope_gate_rejects_wrong_or_replayed_challenge_without_exec(tmp_path: Path) -> None:
-    control = "codex-master-resource-" + "e" * 32
+    control = "the-hive-resource-" + "e" * 32
     runner = tmp_path / "runner"
     runner.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
     runner.chmod(0o700)
@@ -1041,7 +1041,7 @@ def test_scope_gate_retains_verified_runner_fd_for_tmux_pane_after_source_replac
     runner.chmod(0o700)
     expected = runner.stat()
     runner_fd = os.open(runner, getattr(os, "O_PATH", os.O_RDONLY))
-    control_name = f"codex-master-resource-{os.urandom(16).hex()}"
+    control_name = f"the-hive-resource-{os.urandom(16).hex()}"
     socket_name = f"gatefd{os.urandom(8).hex()}"
     session_name = "gatefd"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1106,7 +1106,7 @@ def test_scope_gate_retains_verified_runner_fd_for_tmux_pane_after_source_replac
                 "send-keys",
                 "-t",
                 session_name,
-                'exec "$CODEX_MASTER_RUNNER_EXEC_PATH" -c \'import time; print("RUNNER_FD_ORIGINAL", flush=True); time.sleep(10)\'',
+                'exec "$THE_HIVE_RUNNER_EXEC_PATH" -c \'import time; print("RUNNER_FD_ORIGINAL", flush=True); time.sleep(10)\'',
                 "Enter",
             ],
             stdin=subprocess.DEVNULL,
@@ -1158,7 +1158,7 @@ def test_scope_gate_cleans_new_session_when_pane_exec_evidence_fails(mode: str, 
     runner.chmod(0o700)
     expected = runner.stat()
     runner_fd = os.open(runner, getattr(os, "O_PATH", os.O_RDONLY))
-    control_name = f"codex-master-resource-{os.urandom(16).hex()}"
+    control_name = f"the-hive-resource-{os.urandom(16).hex()}"
     socket_name = f"gatefd{os.urandom(8).hex()}"
     session_name = "gatefd"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1267,7 +1267,7 @@ def test_scope_gate_rejects_missing_or_replaced_runner_fd(source_state: str, tmp
             [
                 sys.executable,
                 str(GATE),
-                f"codex-master-resource-{os.urandom(16).hex()}",
+                f"the-hive-resource-{os.urandom(16).hex()}",
                 f"gatefd{os.urandom(8).hex()}",
                 "gatefd",
                 str(os.getpid()),
@@ -1353,7 +1353,7 @@ def _scope_control_releases() -> list[bytes]:
 
 
 def _scope_control_name() -> str:
-    return f"codex-master-resource-{os.getpid():032x}"
+    return f"the-hive-resource-{os.getpid():032x}"
 
 
 def test_scope_control_rejects_wrong_peer_pid_and_closes_without_release() -> None:
@@ -1411,7 +1411,7 @@ class _FakeSystemdRunner:
         *,
         collision: bool = False,
         control_group: str | None = None,
-        target_slice_control_group: str = "/user.slice/codex-master.slice",
+        target_slice_control_group: str = "/user.slice/the-hive.slice",
         target_slice_missing: bool = False,
         target_slice_stdout: bytes | None = None,
         timeout: bool = False,
@@ -1461,7 +1461,7 @@ class _FakeSystemdRunner:
                 stdout=self.show_stdout
                 or (b"LoadState=loaded\n" if self.collision else b"LoadState=not-found\n"),
             )
-        if argv[0] == "/usr/bin/systemctl" and argv[3] == "show" and argv[4] == "codex-master.slice":
+        if argv[0] == "/usr/bin/systemctl" and argv[3] == "show" and argv[4] == "the-hive.slice":
             if self.target_slice_missing:
                 return self._result(returncode=4)
             if self.target_slice_stdout is not None:
@@ -1528,7 +1528,7 @@ class _Systemd259MissingScopeRunner(_FakeSystemdRunner):
         if (
             argv[0] == "/usr/bin/systemctl"
             and argv[3] == "show"
-            and argv[4].startswith("codex-master-resource-")
+            and argv[4].startswith("the-hive-resource-")
             and argv[4].endswith(".scope")
             and ("--property=Id" in argv or "--property=LoadState" in argv)
         ):
@@ -1550,7 +1550,7 @@ def _write_cgroup_documents(
     slice_controllers: bytes = b"cpu cpuset memory pids io\n",
     slice_subtree: bytes = b"cpu cpuset memory pids io\n",
 ) -> None:
-    target = root / "user.slice" / "codex-master.slice" / unit_name
+    target = root / "user.slice" / "the-hive.slice" / unit_name
     target.mkdir(parents=True)
     parent = target.parent
     for directory in (root,):
@@ -1582,7 +1582,7 @@ def _systemd_adapter(
     slice_controllers: bytes = b"cpu cpuset memory pids io\n",
     slice_subtree: bytes = b"cpu cpuset memory pids io\n",
 ) -> object:
-    unit_name = "codex-master-resource-" + "d" * 32 + ".scope"
+    unit_name = "the-hive-resource-" + "d" * 32 + ".scope"
     root = tmp_path / "cgroup"
     _write_cgroup_documents(
         root,
@@ -1612,7 +1612,7 @@ def test_systemd_v259_scope_uses_pid_bound_control_without_pipe_and_one_gate_rel
         session_name="scope-session.1",
     )
 
-    assert scope.unit_name == "codex-master-resource-" + "d" * 32 + ".scope"
+    assert scope.unit_name == "the-hive-resource-" + "d" * 32 + ".scope"
     assert scope.challenge == "c" * 64
     assert runner.started == [
         (
@@ -1622,7 +1622,7 @@ def test_systemd_v259_scope_uses_pid_bound_control_without_pipe_and_one_gate_rel
             "--quiet",
             "--collect",
             f"--unit={scope.unit_name}",
-            "--slice=codex-master.slice",
+            "--slice=the-hive.slice",
             "--property=Delegate=cpu cpuset memory pids io",
             "--property=AllowedCPUs=4-11",
             "--property=CPUQuota=750%",
@@ -1632,7 +1632,7 @@ def test_systemd_v259_scope_uses_pid_bound_control_without_pipe_and_one_gate_rel
             f"--property=MemorySwapMax={8 * GIB}",
             "--property=IOWeight=50",
             "/usr/libexec/the-hive-resource-scope-gate",
-            "codex-master-resource-" + "d" * 32,
+            "the-hive-resource-" + "d" * 32,
             "scope_socket-1",
             "scope-session.1",
         )
@@ -1678,7 +1678,7 @@ def test_systemd_adapter_allows_empty_tmux_children_after_membership_verificatio
         session_name="scope-session.1",
     )
 
-    assert scope.unit_name == "codex-master-resource-" + "d" * 32 + ".scope"
+    assert scope.unit_name == "the-hive-resource-" + "d" * 32 + ".scope"
 
 
 def test_systemd_adapter_accepts_kernel_tmux_children_space_format(
@@ -1695,7 +1695,7 @@ def test_systemd_adapter_accepts_kernel_tmux_children_space_format(
         session_name="scope-session.1",
     )
 
-    assert scope.unit_name == "codex-master-resource-" + "d" * 32 + ".scope"
+    assert scope.unit_name == "the-hive-resource-" + "d" * 32 + ".scope"
 
 
 @pytest.mark.parametrize("children_payload", (None, b"4243\n4244\n", b"malformed\n"))
@@ -1742,8 +1742,8 @@ def test_systemd_v259_scope_accepts_cgroup_v2_default_io_weight_format(
     runner = _FakeSystemdRunner()
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
     monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
-    scope_name = "codex-master-resource-" + "d" * 32 + ".scope"
-    (tmp_path / "cgroup" / "user.slice" / "codex-master.slice" / scope_name / "io.weight").write_bytes(
+    scope_name = "the-hive-resource-" + "d" * 32 + ".scope"
+    (tmp_path / "cgroup" / "user.slice" / "the-hive.slice" / scope_name / "io.weight").write_bytes(
         b"default 50\n"
     )
 
@@ -1769,7 +1769,7 @@ def test_systemd_v259_missing_scope_is_identified_by_load_state_not_synthetic_id
         session_name="scope-session.1",
     )
 
-    assert scope.unit_name == "codex-master-resource-" + "d" * 32 + ".scope"
+    assert scope.unit_name == "the-hive-resource-" + "d" * 32 + ".scope"
     assert (
         "/usr/bin/systemctl",
         "--user",
@@ -1780,7 +1780,7 @@ def test_systemd_v259_missing_scope_is_identified_by_load_state_not_synthetic_id
     ) in runner.calls
 
 
-def test_systemd_adapter_binds_preflight_and_new_scope_to_codex_master_slice(
+def test_systemd_adapter_binds_preflight_and_new_scope_to_the_hive_slice(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     runner = _FakeSystemdRunner()
@@ -1794,13 +1794,13 @@ def test_systemd_adapter_binds_preflight_and_new_scope_to_codex_master_slice(
         session_name="scope-session.1",
     )
 
-    assert "--slice=codex-master.slice" in runner.started[0]
+    assert "--slice=the-hive.slice" in runner.started[0]
     assert (
         "/usr/bin/systemctl",
         "--user",
         "--no-pager",
         "show",
-        "codex-master.slice",
+        "the-hive.slice",
         "--property=ControlGroup",
     ) in runner.calls
 
@@ -1825,7 +1825,7 @@ def test_systemd_adapter_denies_missing_wrong_or_non_delegated_target_slice_befo
 ) -> None:
     cases = (
         (_FakeSystemdRunner(target_slice_missing=True), b"cpu cpuset memory pids io\n"),
-        (_FakeSystemdRunner(control_group="/user.slice/other.slice/codex-master-resource-" + "d" * 32 + ".scope"), b"cpu cpuset memory pids io\n"),
+        (_FakeSystemdRunner(control_group="/user.slice/other.slice/the-hive-resource-" + "d" * 32 + ".scope"), b"cpu cpuset memory pids io\n"),
         (_FakeSystemdRunner(), b"cpu cpuset memory pids\n"),
     )
     for number, (runner, controllers) in enumerate(cases):
@@ -1844,7 +1844,7 @@ def test_systemd_adapter_denies_missing_wrong_or_non_delegated_target_slice_befo
             )
         assert _scope_control_releases() == []
         if number == 1:
-            assert runner.stopped == ["codex-master-resource-" + "d" * 32 + ".scope"]
+            assert runner.stopped == ["the-hive-resource-" + "d" * 32 + ".scope"]
         else:
             assert runner.started == []
 
@@ -1867,7 +1867,7 @@ def test_systemd_adapter_rejects_scope_delegate_controller_superset_before_relea
 
     assert len(runner.started) == 1
     assert _scope_control_releases() == []
-    assert runner.stopped == ["codex-master-resource-" + "d" * 32 + ".scope"]
+    assert runner.stopped == ["the-hive-resource-" + "d" * 32 + ".scope"]
 
 
 def test_systemd_adapter_allows_parent_controller_supersets(
@@ -1890,7 +1890,7 @@ def test_systemd_adapter_allows_parent_controller_supersets(
         session_name="scope-session.1",
     )
 
-    assert scope.unit_name == "codex-master-resource-" + "d" * 32 + ".scope"
+    assert scope.unit_name == "the-hive-resource-" + "d" * 32 + ".scope"
 
 
 @pytest.mark.parametrize(
@@ -1969,7 +1969,7 @@ def test_empty_target_slice_control_group_is_missing_only_for_integration_classi
     (
         b"ControlGroup\n",
         b"Other=\n",
-        b"ControlGroup=/user.slice/codex-master.slice\nUnexpected=value\n",
+        b"ControlGroup=/user.slice/the-hive.slice\nUnexpected=value\n",
     ),
 )
 def test_integration_precondition_rejects_malformed_target_slice_output(
@@ -2007,7 +2007,7 @@ def test_systemd_adapter_denies_collision_timeout_overflow_and_path_traversal_be
             assert runner.started == []
         else:
             assert len(runner.started) == 1
-            assert runner.stopped == ["codex-master-resource-" + "d" * 32 + ".scope"]
+            assert runner.stopped == ["the-hive-resource-" + "d" * 32 + ".scope"]
 
 
 def test_systemd_adapter_never_releases_on_readback_failure_and_cleans_only_own_unit(
@@ -2025,7 +2025,7 @@ def test_systemd_adapter_never_releases_on_readback_failure_and_cleans_only_own_
         )
 
     assert _scope_control_releases() == []
-    assert runner.stopped == ["codex-master-resource-" + "d" * 32 + ".scope"]
+    assert runner.stopped == ["the-hive-resource-" + "d" * 32 + ".scope"]
 
 
 @pytest.mark.parametrize("replacement", ("symlink", "hardlink"))
@@ -2069,9 +2069,9 @@ def test_systemd_adapter_rejects_cgroup_root_generation_replacement(
 
 
 def test_systemd_user_cgroup_integration_contract_requires_double_opt_in() -> None:
-    if os.environ.get("CODEX_MASTER_CGROUP_IT") != "1":
+    if os.environ.get("THE_HIVE_CGROUP_IT") != "1":
         pytest.skip("cgroup_it_disabled")
-    if os.environ.get("CODEX_MASTER_SYSTEMD_USER_IT") != "1":
+    if os.environ.get("THE_HIVE_SYSTEMD_USER_IT") != "1":
         pytest.skip("systemd_user_it_disabled")
     if sys.platform != "linux":
         pytest.skip("requires_linux")
@@ -2084,7 +2084,7 @@ def test_systemd_user_cgroup_integration_contract_requires_double_opt_in() -> No
         pytest.fail(f"cgroup_v2_readback_failed:{type(exc).__name__}")
     if not stat.S_ISREG(metadata.st_mode):
         pytest.fail("cgroup_v2_readback_failed:not_regular")
-    approved_text = os.environ.get("CODEX_MASTER_CGROUP_IT_CPUSET")
+    approved_text = os.environ.get("THE_HIVE_CGROUP_IT_CPUSET")
     if not isinstance(approved_text, str):
         pytest.skip("requires_approved_cpuset")
 

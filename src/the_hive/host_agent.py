@@ -761,7 +761,7 @@ def run_poll_loop(
 
 def main(argv: list[str] | None = None) -> int:
     """Run the packaged outbound agent using only fixed systemd credentials."""
-    parser = argparse.ArgumentParser(prog="codex-master-host-agent")
+    parser = argparse.ArgumentParser(prog="the-hive-host-agent")
     parser.parse_args(argv)
     stop_event = threading.Event()
 

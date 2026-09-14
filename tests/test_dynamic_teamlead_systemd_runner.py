@@ -18,7 +18,7 @@ from test_fleet_control_release_v2 import SPEC as V2_RELEASE
 from test_fleet_root_system_bus import runner_plan, trusted_context
 
 
-UNIT = "codex-master-agent@c1\\x2cc2.service"
+UNIT = "the-hive-agent@c1\\x2cc2.service"
 
 
 def runner_module():
@@ -124,12 +124,12 @@ def test_boundary_mcs_pairs_map_to_unique_reversible_instances(
     operation.execute(candidate, permit=permit())
     assert manager.calls[0] == (
         "start_unit",
-        f"codex-master-agent@{expected_instance}.service",
+        f"the-hive-agent@{expected_instance}.service",
         "fail",
     )
     assert manager.calls[1] == (
         "unit_is_active",
-        f"codex-master-agent@{expected_instance}.service",
+        f"the-hive-agent@{expected_instance}.service",
     )
 
 

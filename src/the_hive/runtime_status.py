@@ -17,7 +17,7 @@ from the_hive.runtime_process import (
 )
 
 
-_MCP_SERVER_NAME = "codex-master-mcp"
+_MCP_SERVER_NAME = "the-hive-mcp"
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 _MAX_MCP_OUTPUT_BYTES = 256 * 1024
 RUNTIME_STATUS_MCP_TIMEOUT_SECONDS = 10.0
@@ -34,7 +34,7 @@ def _probe_payload() -> bytes:
             "params": {
                 "protocolVersion": _MCP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "codex-master-runtime-status", "version": "1"},
+                "clientInfo": {"name": "the-hive-runtime-status", "version": "1"},
             },
         },
         {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},

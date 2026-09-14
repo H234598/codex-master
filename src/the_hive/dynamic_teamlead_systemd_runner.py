@@ -95,7 +95,7 @@ def _unit_for_mcs(mcs_pair: object) -> str:
     instance = f"c{low}\\x2cc{high}"
     if _MCS_INSTANCE.fullmatch(instance) is None:
         _invalid()
-    return f"codex-master-agent@{instance}.service"
+    return f"the-hive-agent@{instance}.service"
 
 
 def _validate_plan(plan: object) -> str:

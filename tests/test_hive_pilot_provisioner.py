@@ -334,7 +334,8 @@ def test_apply_rejects_an_existing_nonprivate_state_root_without_repair(tmp_path
 def test_tracked_admin_cli_requires_confirmation_and_has_no_hidden_path(tmp_path: Path) -> None:
     repository = make_repository(tmp_path)
     state_root = tmp_path / "private-state"
-    command = ROOT / "scripts" / "codex-master-hive-pilot-provisioner"
+    command = ROOT / "scripts" / "the-hive-hive-pilot-provisioner"
+    assert not (ROOT / "scripts" / "codex-master-hive-pilot-provisioner").exists()
 
     planned = subprocess.run(
         [str(command), "plan", "--repository-root", str(repository), "--state-root", str(state_root)],
@@ -351,6 +352,18 @@ def test_tracked_admin_cli_requires_confirmation_and_has_no_hidden_path(tmp_path
     )
     assert missing_confirmation.returncode == 2
     assert not state_root.exists()
+
+
+def test_tracked_admin_cli_help_uses_the_canonical_program_name(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as outcome:
+        pilot_provisioner.main(["--help"])
+
+    assert outcome.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "the-hive-hive-pilot-provisioner" in help_text
+    assert "codex-master-hive-pilot-provisioner" not in help_text
 
 
 def _set_nonmain_head(repository: Path, kind: str) -> None:

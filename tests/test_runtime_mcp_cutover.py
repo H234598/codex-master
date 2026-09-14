@@ -33,14 +33,14 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     _write(root, "bin/the-hive-mcp-stable", "#!/bin/sh\nexit 0\n", 0o755)
     _write(root, "bin/the-hive-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
     _write(root, "bin/the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
-    _write(root, "systemd/user/codex-master-resource-monitor.service", "[Service]\n")
-    _write(root, "systemd/user/codex-master.slice", "[Slice]\n")
+    _write(root, "systemd/user/the-hive-resource-monitor.service", "[Service]\n")
+    _write(root, "systemd/user/the-hive.slice", "[Slice]\n")
     _write(
         root,
         ".codex-plugin/plugin.json",
         json.dumps(
             {
-                "name": "codex-master",
+                "name": "the-hive",
                 "version": "0",
                 "skills": "./skills/",
                 "mcpServers": "./.mcp.json",
@@ -65,9 +65,9 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
             }
         ),
     )
-    _write(root, ".app.json", json.dumps({"apps": {"codex-master": {}}}))
+    _write(root, ".app.json", json.dumps({"apps": {"the-hive": {}}}))
     _write(root, "hooks/hooks.json", json.dumps({"hooks": {}}))
-    _write(root, "skills/codex-master-fleet/SKILL.md", "# Fleet\n")
+    _write(root, "skills/the-hive-fleet/SKILL.md", "# Fleet\n")
     _write(root, "codex-hive.json", "{}")
     _write(root, "codex-agent-classes.json", "{}")
     for path in root.rglob("*"):

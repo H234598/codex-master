@@ -1,4 +1,4 @@
-"""Contract gate for the canonical codex-master-fleet skill router."""
+"""Contract gate for the canonical the-hive-fleet skill router."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "skills" / "codex-master-fleet"
+DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "skills" / "the-hive-fleet"
 EXPECTED_REFERENCES = {
     "references/common-invariants.md",
     "references/queen-operations.md",
@@ -99,12 +99,15 @@ def _has_symlink_ancestor(path: Path, root: Path) -> bool:
     return root.is_symlink()
 
 
-def test_codex_master_fleet_router_contract() -> None:
+def test_the_hive_fleet_router_contract() -> None:
     """Catch a second policy book, unsafe routing, or legacy fleet policy."""
     root = _skill_root()
     repository = root.parents[1]
     router = root / "SKILL.md"
     violations: list[str] = []
+
+    if (repository / "skills" / "codex-master-fleet").exists():
+        violations.append("legacy skill tree remains discoverable")
 
     if not router.is_file() or router.is_symlink():
         violations.append("router must be a regular SKILL.md")
@@ -114,9 +117,9 @@ def test_codex_master_fleet_router_contract() -> None:
 
     frontmatter = re.match(r"\A---\n(.*?)\n---\n", router_text, re.DOTALL)
     if frontmatter is None or not re.search(
-        r"^name: codex-master-fleet$", frontmatter.group(1), re.MULTILINE
+        r"^name: the-hive-fleet$", frontmatter.group(1), re.MULTILINE
     ):
-        violations.append("router frontmatter must expose exactly codex-master-fleet")
+        violations.append("router frontmatter must expose exactly the-hive-fleet")
 
     skill_files = list(root.rglob("SKILL.md")) if root.is_dir() else []
     if skill_files != [router]:

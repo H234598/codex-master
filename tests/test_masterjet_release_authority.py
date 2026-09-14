@@ -70,8 +70,8 @@ def test_d89_successor_witness_binds_only_the_final_the_hive_anchor_and_git_line
         "bin/the-hive-resource-monitor",
     } == set(manifest["release"]["stable_launchers"])
     assert manifest["release"]["h4_units"] == [
-        "systemd/user/codex-master-resource-monitor.service",
-        "systemd/user/codex-master.slice",
+        "systemd/user/the-hive-resource-monitor.service",
+        "systemd/user/the-hive.slice",
     ]
     invalid_stage = tmp_path / "invalid-commit"
     invalid_stage.mkdir(mode=0o700)
@@ -380,18 +380,18 @@ def test_retention_keeps_attested_unit_bound_generations_and_prunes_expired_ones
         )
     one_manifest = release_root / "generations" / "one" / ".the-hive-runtime-manifest.json"
     one_digest = "sha256:" + hashlib.sha256(one_manifest.read_bytes()).hexdigest()
-    (units / "codex-master-resource-monitor.service").write_text(
+    (units / "the-hive-resource-monitor.service").write_text(
         "\n".join(
                 (
                     "[Service]",
-                    "BindReadOnlyPaths=%h/.local/lib/codex-master-runtime/generations/one/bin/codex-master-resource-monitor:%h/.local/bin/codex-master-resource-monitor:norbind %h/.local/lib/codex-master-runtime/generations/one/src:%h/.local/src:norbind %h/.local/lib/codex-master-runtime/generations/one/codex-agent-classes.json:%h/.local/codex-agent-classes.json:norbind %h/.local/lib/codex-master-runtime/generations/one/codex-hive.json:%h/.local/codex-hive.json:norbind",
-                "ExecStart=%h/.local/bin/codex-master-resource-monitor %h/.local/lib/codex-master-runtime one " + one_digest,
+                    "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime/generations/one/bin/the-hive-resource-monitor:%h/.local/bin/the-hive-resource-monitor:norbind %h/.local/lib/the-hive-runtime/generations/one/src:%h/.local/src:norbind %h/.local/lib/the-hive-runtime/generations/one/codex-agent-classes.json:%h/.local/codex-agent-classes.json:norbind %h/.local/lib/the-hive-runtime/generations/one/codex-hive.json:%h/.local/codex-hive.json:norbind",
+                "ExecStart=%h/.local/bin/the-hive-resource-monitor %h/.local/lib/the-hive-runtime one " + one_digest,
             )
         )
         + "\n",
         encoding="utf-8",
     )
-    (units / "codex-master-resource-monitor.service").chmod(0o644)
+    (units / "the-hive-resource-monitor.service").chmod(0o644)
     installer["_publish_runtime_generation"](  # type: ignore[operator]
         stage=_stage(installer, tmp_path, "three"),
         release_root=release_root,

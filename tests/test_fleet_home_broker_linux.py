@@ -55,7 +55,7 @@ EXPECTED_STAT = FdStat(17, 29, 0o40700, 0, 0)
 VALID_CGROUP_STAT = FdStat(17, 29, 0o40755, 1000, 1000)
 EXPECTED_PID_IDENTITY = PidfdIdentity(PEER_PID, PID_START_TIME)
 EXPECTED_SELINUX_CONTEXT = (
-    "system_u:system_r:codex_master_agent_t:s0:c0,c1"
+    "system_u:system_r:the_hive_agent_t:s0:c0,c1"
 )
 
 
@@ -99,7 +99,7 @@ def agent_start_envelope():
     )
     attestation = HomeAttestation(
         transaction_binding,
-        "/run/codex-master-agent/home",
+        "/run/the-hive-agent/home",
         DirectoryIdentity(0, 1, 0o40700),
         "a" * 64,
         expected_principal.mcs_pair,
@@ -114,10 +114,10 @@ def agent_start_envelope():
             ReleasePayloadDigestV2("systemd_units", "4" * 64),
         ),
         CHPB_PROTOCOL,
-        "org.codex_master.HomeBrokerControl2",
+        "org.the_hive.HomeBrokerControl2",
         "StartDynamicTeamlead",
-        "codex-master-agent@.service",
-        "/usr/libexec/codex-master-agent-launcher",
+        "the-hive-agent@.service",
+        "/usr/libexec/the-hive-agent-launcher",
     )
     return AgentStartEnvelope(
         CHPB_PROTOCOL,
@@ -128,7 +128,7 @@ def agent_start_envelope():
         13,
         expected_principal,
         BindingExpectation("bee_1", 3, 9, 7, "a" * 64, 4),
-        "codex-master-agent@c0\\x2cc1.service",
+        "the-hive-agent@c0\\x2cc1.service",
         BrokerIdentity(
             "bee_1",
             3,
@@ -140,13 +140,13 @@ def agent_start_envelope():
             4,
         ),
         AgentStartExecutablePin(
-            "/usr/libexec/codex-master-agent-launcher", "b" * 64
+            "/usr/libexec/the-hive-agent-launcher", "b" * 64
         ),
         AgentStartEnvironmentProjection(
             (
-                ("CODEX_HOME", "/run/codex-master-agent/home"),
-                ("GEMINI_CLI_HOME", "/run/codex-master-agent/home"),
-                ("HOME", "/run/codex-master-agent/home"),
+                ("CODEX_HOME", "/run/the-hive-agent/home"),
+                ("GEMINI_CLI_HOME", "/run/the-hive-agent/home"),
+                ("HOME", "/run/the-hive-agent/home"),
             )
         ),
         attestation,
@@ -828,7 +828,7 @@ def test_linux_operations_has_no_aggregate_peer_snapshot_operation():
 def test_linux_module_import_scope_excludes_real_system_and_lifecycle_apis():
     source = (
         Path(__file__).resolve().parents[1]
-        / "src/codex_master/fleet_home_broker_linux.py"
+        / "src/the_hive/fleet_home_broker_linux.py"
     ).read_text()
     tree = ast.parse(source)
     imported = set()
@@ -842,7 +842,7 @@ def test_linux_module_import_scope_excludes_real_system_and_lifecycle_apis():
 
 
 def test_agent_start_peer_observation_binds_peer_credentials_and_unit_instance():
-    unit_name = "codex-master-agent@c0\\x2cc1.service"
+    unit_name = "the-hive-agent@c0\\x2cc1.service"
     control_group = f"/user.slice/user-1000.slice/{unit_name}"
     operations = FakeOperations(
         proc_control_group=control_group,
@@ -1018,7 +1018,7 @@ def test_agent_start_reader_failure_closes_three_unique_owned_fds_once_in_lifo_o
         ({"pid1_unit_generation": 10}, (PEER_PID, 1000, 1001)),
         ({"pid1_invocation_id": "2" * 32}, (PEER_PID, 1000, 1001)),
         ({"peer_mcs_pair": "c0,c2"}, (PEER_PID, 1000, 1001)),
-        ({"pid1_unit_name": "codex-master-agent@c0-c1.service"}, (PEER_PID, 1000, 1001)),
+        ({"pid1_unit_name": "the-hive-agent@c0-c1.service"}, (PEER_PID, 1000, 1001)),
         ({}, (PEER_PID + 1, 1000, 1001)),
         ({}, (PEER_PID, True, 1001)),
         ({}, (PEER_PID, 1000, True)),
@@ -1052,10 +1052,10 @@ def test_agent_start_peer_observation_rejects_pid_uid_gid_and_unit_drift(
 @pytest.mark.parametrize(
     "selinux_context",
     (
-        "other_u:system_r:codex_master_agent_t:s0:c0,c1",
-        "system_u:other_r:codex_master_agent_t:s0:c0,c1",
+        "other_u:system_r:the_hive_agent_t:s0:c0,c1",
+        "system_u:other_r:the_hive_agent_t:s0:c0,c1",
         "system_u:system_r:wrong_t:s0:c0,c1",
-        "system_u:system_r:codex_master_agent_t:s0:c0,c2",
+        "system_u:system_r:the_hive_agent_t:s0:c0,c2",
     ),
 )
 def test_direct_agent_start_observation_rejects_full_selinux_context_drift(
@@ -1105,7 +1105,7 @@ def test_agent_start_observation_keeps_v1_peer_snapshot_shape_untouched():
         PID_START_TIME,
         17,
         29,
-        "codex-master-agent@c0\\x2cc1.service",
+        "the-hive-agent@c0\\x2cc1.service",
         "1" * 32,
         9,
         "c0,c1",

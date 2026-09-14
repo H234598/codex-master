@@ -587,7 +587,7 @@ def _validate_agent_start_peer_observation(
         or value.service_generation != expected.principal.unit_generation
         or value.mcs_pair != expected.principal.mcs_pair
         or value.selinux_context
-        != f"system_u:system_r:codex_master_agent_t:s0:{expected.principal.mcs_pair}"
+        != f"system_u:system_r:the_hive_agent_t:s0:{expected.principal.mcs_pair}"
     ):
         raise LinuxBoundaryError("agent start peer observation drifted")
     return value
@@ -612,7 +612,7 @@ def _observe_agent_start_peer_with_identity(
     if (
         type(selinux_context) is not str
         or selinux_context
-        != f"system_u:system_r:codex_master_agent_t:s0:{expected.principal.mcs_pair}"
+        != f"system_u:system_r:the_hive_agent_t:s0:{expected.principal.mcs_pair}"
     ):
         raise LinuxBoundaryError("agent start SELinux context is invalid")
     _positive_integer(peer_pid, "peer pid")

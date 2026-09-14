@@ -70,14 +70,14 @@ _HISTORICAL_LINEAGE = {
 _RUNTIME_SPAWN_HELPER_SOURCE = "src/the_hive/runtime_spawn_helper.c"
 _RUNTIME_SPAWN_HELPER_LIBRARY = "src/the_hive/_runtime_spawn_helper.so"
 _UNIT_NAMES = (
-    "codex-master-hive-hourly-probe.service",
-    "codex-master-hive-hourly-probe.timer",
+    "the-hive-hive-hourly-probe.service",
+    "the-hive-hive-hourly-probe.timer",
 )
 _BOUND_RELEASE_UNIT_NAMES = (
-    "codex-master-resource-monitor.service",
-    "codex-master-hive-hourly-probe.service",
+    "the-hive-resource-monitor.service",
+    "the-hive-hive-hourly-probe.service",
 )
-_RELEASE_GENERATION_MARKER = "%h/.local/lib/codex-master-runtime/generations/"
+_RELEASE_GENERATION_MARKER = "%h/.local/lib/the-hive-runtime/generations/"
 # This is the sole product Runtime Image definition. Recursive entries carry
 # complete product trees; no Probe-specific mirror is maintained.
 _RUNTIME_IMAGE_FILES = (
@@ -92,14 +92,14 @@ _RUNTIME_IMAGE_FILES = (
     ("codex-agent-classes.json", "codex-agent-classes.json", 0o644),
     ("codex-agent-pool.json", "codex-agent-pool.json", 0o644),
     ("codex-model-policy.json", "codex-model-policy.json", 0o644),
-    ("systemd/user/codex-master-resource-monitor.service", "systemd/user/codex-master-resource-monitor.service", 0o644),
-    ("systemd/user/codex-master.slice", "systemd/user/codex-master.slice", 0o644),
-    ("systemd/user/codex-master-hive-hourly-probe.service", "systemd/user/codex-master-hive-hourly-probe.service", 0o644),
-    ("systemd/user/codex-master-hive-hourly-probe.timer", "systemd/user/codex-master-hive-hourly-probe.timer", 0o644),
+    ("systemd/user/the-hive-resource-monitor.service", "systemd/user/the-hive-resource-monitor.service", 0o644),
+    ("systemd/user/the-hive.slice", "systemd/user/the-hive.slice", 0o644),
+    ("systemd/user/the-hive-hive-hourly-probe.service", "systemd/user/the-hive-hive-hourly-probe.service", 0o644),
+    ("systemd/user/the-hive-hive-hourly-probe.timer", "systemd/user/the-hive-hive-hourly-probe.timer", 0o644),
 )
 _RUNTIME_IMAGE_TREES = (
     ("src/the_hive", "src/the_hive"),
-    ("skills/codex-master-fleet", "skills/codex-master-fleet"),
+    ("skills/the-hive-fleet", "skills/the-hive-fleet"),
     ("hooks", "hooks"),
     ("schemas", "schemas"),
 )
@@ -562,8 +562,8 @@ def _release_metadata(*, generation: str, commit: str) -> dict[str, object]:
             "python_tree": "src/the_hive",
             "monitor_entrypoint": "bin/the-hive-resource-monitor",
             "h4_units": [
-                "systemd/user/codex-master-resource-monitor.service",
-                "systemd/user/codex-master.slice",
+                "systemd/user/the-hive-resource-monitor.service",
+                "systemd/user/the-hive.slice",
             ],
             "bind_sources": [
                 "bin/the-hive-resource-monitor",
@@ -863,9 +863,9 @@ def _render_hourly_probe_service(
     if "@MASTERJET_" in rendered:
         raise InstallError("install_release_template_invalid")
     expected = (
-        "ExecStart=%h/.local/lib/codex-master-runtime/generations/"
-        f"{generation}/bin/codex-master-hive-hourly-probe "
-        "%h/.local/lib/codex-master-runtime "
+        "ExecStart=%h/.local/lib/the-hive-runtime/generations/"
+        f"{generation}/bin/the-hive-hive-hourly-probe "
+        "%h/.local/lib/the-hive-runtime "
         f"{generation} {manifest_digest} --json"
     )
     if expected not in rendered:
@@ -880,10 +880,10 @@ def _materialize_hourly_probe_units(
 
     try:
         service_template = layout.read_attested_file(
-            "systemd/user/codex-master-hive-hourly-probe.service"
+            "systemd/user/the-hive-hive-hourly-probe.service"
         )
         timer = layout.read_attested_file(
-            "systemd/user/codex-master-hive-hourly-probe.timer"
+            "systemd/user/the-hive-hive-hourly-probe.timer"
         )
     except ValueError as exc:
         raise InstallError("install_release_invalid") from exc
@@ -891,10 +891,10 @@ def _materialize_hourly_probe_units(
         service_template, generation=generation, manifest_digest=layout.manifest_digest
     )
     _install_attested_bytes(
-        units / "codex-master-hive-hourly-probe.service", service, mode=0o644
+        units / "the-hive-hive-hourly-probe.service", service, mode=0o644
     )
     _install_attested_bytes(
-        units / "codex-master-hive-hourly-probe.timer", timer, mode=0o644
+        units / "the-hive-hive-hourly-probe.timer", timer, mode=0o644
     )
 
 
@@ -985,9 +985,9 @@ def _unit_bound_generation(*, release_root: Path, source: Path) -> str | None:
         raise InstallError("install_release_retention_failed") from exc
     if layout.manifest_digest != digest_matches[0]:
         raise InstallError("install_release_retention_failed")
-    if source.name == "codex-master-resource-monitor.service":
+    if source.name == "the-hive-resource-monitor.service":
         required_sources = (
-            "bin/codex-master-resource-monitor",
+            "bin/the-hive-resource-monitor",
             "src",
             "codex-agent-classes.json",
             "codex-hive.json",
@@ -996,18 +996,18 @@ def _unit_bound_generation(*, release_root: Path, source: Path) -> str | None:
             f"{_RELEASE_GENERATION_MARKER}{generation}/{relative}" not in text
             for relative in required_sources
         ) or (
-            "ExecStart=%h/.local/bin/codex-master-resource-monitor "
-            f"%h/.local/lib/codex-master-runtime {generation} {layout.manifest_digest}"
+            "ExecStart=%h/.local/bin/the-hive-resource-monitor "
+            f"%h/.local/lib/the-hive-runtime {generation} {layout.manifest_digest}"
         ) not in text:
             raise InstallError("install_release_retention_failed")
-    elif source.name == "codex-master-hive-hourly-probe.service":
+    elif source.name == "the-hive-hive-hourly-probe.service":
         if (
             f"BindReadOnlyPaths={_RELEASE_GENERATION_MARKER}{generation}:"
             f"{_RELEASE_GENERATION_MARKER}{generation}:norbind"
         ) not in text or (
             "ExecStart="
-            f"{_RELEASE_GENERATION_MARKER}{generation}/bin/codex-master-hive-hourly-probe "
-            f"%h/.local/lib/codex-master-runtime {generation} {layout.manifest_digest} --json"
+            f"{_RELEASE_GENERATION_MARKER}{generation}/bin/the-hive-hive-hourly-probe "
+            f"%h/.local/lib/the-hive-runtime {generation} {layout.manifest_digest} --json"
         ) not in text:
             raise InstallError("install_release_retention_failed")
     else:

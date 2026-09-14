@@ -75,9 +75,9 @@ from the_hive.fleet_root_runtime_host import (
 from the_hive.fleet_runners import DynamicTeamleadRunnerPlan
 
 
-BUS_NAME = "org.codex_master.HomeBrokerControl"
-BUS_PATH = "/org/codex_master/HomeBrokerControl"
-BUS_INTERFACE = "org.codex_master.HomeBrokerControl1"
+BUS_NAME = "org.the_hive.HomeBrokerControl"
+BUS_PATH = "/org/the_hive/HomeBrokerControl"
+BUS_INTERFACE = "org.the_hive.HomeBrokerControl1"
 BUS_METHOD = "StartDynamicTeamlead"
 
 _DBUS_NAME = "org.freedesktop.DBus"

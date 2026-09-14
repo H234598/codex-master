@@ -210,7 +210,7 @@ def _process_snapshot(
     pid = int(pid_text)
     ppid = int(ppid_parts[0]) if ppid_parts and ppid_parts[0].isdigit() else None
     managed = bool(env) and (
-        env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
+        env.get("CODEX_AGENT_MCP") == "1" or env.get("THE_HIVE_MCP") == "1"
     ) and codex_like
     return (
         ProcessSnapshot(

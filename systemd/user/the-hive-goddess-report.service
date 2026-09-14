@@ -1,0 +1,30 @@
+[Unit]
+Description=The Hive Göttinnenbericht
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=oneshot
+Environment=CODEX_MASTER_MCP_INSTANCE_ID=the-hive-goddess-report
+CapabilityBoundingSet=
+KeyringMode=private
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.local/state/codex-master-mcp %h/Dokumente/Obsidian_Vaults/Teladi_Programming
+IPAddressDeny=any
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+UMask=0077
+ExecStart=%h/.local/lib/the-hive-runtime/bin/the-hive-mcp goddess report run

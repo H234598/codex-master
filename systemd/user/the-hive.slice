@@ -1,0 +1,3 @@
+[Unit]
+Description=The Hive Resource Slice
+Documentation=man:systemd.slice(5)

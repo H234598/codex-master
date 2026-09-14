@@ -30,8 +30,8 @@ SYSTEMD_RUN_PATH = "/usr/bin/systemd-run"
 SYSTEMCTL_PATH = "/usr/bin/systemctl"
 TMUX_PATH = "/usr/bin/tmux"
 RESOURCE_SCOPE_GATE_PATH = "/usr/libexec/the-hive-resource-scope-gate"
-CODEX_MASTER_SLICE = "codex-master.slice"
-_RESOURCE_MONITOR_SERVICE = "codex-master-resource-monitor.service"
+THE_HIVE_SLICE = "the-hive.slice"
+_RESOURCE_MONITOR_SERVICE = "the-hive-resource-monitor.service"
 MAX_COMMAND_STDOUT_BYTES = 1024
 MAX_COMMAND_STDERR_BYTES = 1024
 COMMAND_TIMEOUT_SECONDS = 5.0
@@ -43,7 +43,7 @@ _CPU_SET_PART = re.compile(r"(?:0|[1-9][0-9]*)(?:-(?:[1-9][0-9]*))?")
 _UNIT_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{0,127}$")
 _CHALLENGE = re.compile(r"^[a-f0-9]{64}$")
 _TMUX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-_CONTROL_SOCKET_NAME = re.compile(r"^codex-master-resource-[a-f0-9]{32}$")
+_CONTROL_SOCKET_NAME = re.compile(r"^the-hive-resource-[a-f0-9]{32}$")
 _CGROUP_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$")
 _PSI_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 
@@ -959,7 +959,7 @@ class SystemdUserCgroupAdapter:
                 "--user",
                 "--no-pager",
                 "show",
-                CODEX_MASTER_SLICE,
+                THE_HIVE_SLICE,
                 "--property=ControlGroup",
             )
         )
@@ -1026,7 +1026,7 @@ class SystemdUserCgroupAdapter:
         if (
             len(components) < 2
             or components[-1] != _RESOURCE_MONITOR_SERVICE
-            or components[-2] != CODEX_MASTER_SLICE
+            or components[-2] != THE_HIVE_SLICE
         ):
             _fail()
         parent = "/".join(components[:-1])
@@ -1138,7 +1138,7 @@ class SystemdUserCgroupAdapter:
         if slice_evidence is None:
             _fail()
         slice_control_group, _controllers, _subtree_controllers, _parent_effective_cpuset = slice_evidence
-        unit_name = f"codex-master-resource-{secrets.token_hex(16)}.scope"
+        unit_name = f"the-hive-resource-{secrets.token_hex(16)}.scope"
         if not _UNIT_NAME.fullmatch(unit_name) or unit_name in self._owned:
             _fail()
         collision = self._run(
@@ -1153,7 +1153,7 @@ class SystemdUserCgroupAdapter:
             )
         ):
             _fail()
-        control_name = f"codex-master-resource-{secrets.token_hex(16)}"
+        control_name = f"the-hive-resource-{secrets.token_hex(16)}"
         if not _CONTROL_SOCKET_NAME.fullmatch(control_name):
             _fail()
         runner_arguments: tuple[str, ...] = ()
@@ -1184,7 +1184,7 @@ class SystemdUserCgroupAdapter:
             "--quiet",
             "--collect",
             f"--unit={unit_name}",
-            f"--slice={CODEX_MASTER_SLICE}",
+            f"--slice={THE_HIVE_SLICE}",
             "--property=Delegate=cpu cpuset memory pids io",
             f"--property=AllowedCPUs={profile.cpuset_expression}",
             f"--property=CPUQuota={profile.cpu_quota_percent}%",

@@ -163,15 +163,15 @@ def release() -> BrokerReleaseSpec:
         provider_abi="provider-v1",
         unit_digest="3" * 64,
         selinux_digest="4" * 64,
-        socket_unit="codex-master-home-broker.socket",
-        service_unit="codex-master-home-broker.service",
-        system_bus_name="org.codex_master.HomeBrokerControl",
-        system_bus_path="/org/codex_master/HomeBrokerControl",
-        system_bus_interface="org.codex_master.HomeBrokerControl1",
-        broker_domain="codex_master_home_broker_t",
-        gateway_domain="codex_master_control_t",
-        socket_type="codex_master_home_broker_runtime_t",
-        agent_domain="codex_master_agent_t",
+        socket_unit="the-hive-home-broker.socket",
+        service_unit="the-hive-home-broker.service",
+        system_bus_name="org.the_hive.HomeBrokerControl",
+        system_bus_path="/org/the_hive/HomeBrokerControl",
+        system_bus_interface="org.the_hive.HomeBrokerControl1",
+        broker_domain="the_hive_home_broker_t",
+        gateway_domain="the_hive_control_t",
+        socket_type="the_hive_home_broker_runtime_t",
+        agent_domain="the_hive_agent_t",
     )
 
 
@@ -858,7 +858,7 @@ def test_executor_failure_propagates_without_legacy_fallback(
 
 def test_provider_has_no_live_authority_or_state_imports() -> None:
     path = Path(__file__).parents[1] / (
-        "src/codex_master/dynamic_teamlead_a3_runtime_provider.py"
+        "src/the_hive/dynamic_teamlead_a3_runtime_provider.py"
     )
     tree = ast.parse(path.read_text(encoding="utf-8"))
     forbidden = {
