@@ -76,6 +76,17 @@ def _write_target_ready_tree(root: Path) -> None:
             else:
                 content = marker
             path.write_text(content, encoding="utf-8")
+    cinnamon = matrix.cinnamon_surface
+    cinnamon_prefix = root / matrix.render_template(cinnamon.target_path_prefix_template + "/placeholder").parent
+    cinnamon_prefix.mkdir(parents=True, exist_ok=True)
+    (cinnamon_prefix / cinnamon.metadata_name).write_text(
+        json.dumps({"uuid": matrix.render_value(cinnamon.target_metadata_value_template)}), encoding="utf-8"
+    )
+    (cinnamon_prefix / cinnamon.applet_name).write_text(
+        matrix.render_value(cinnamon.target_applet_value_template), encoding="utf-8"
+    )
+    for index in range(cinnamon.member_count - 2):
+        (cinnamon_prefix / f"asset-{index:02d}.txt").write_text("target Cinnamon asset\n", encoding="utf-8")
     structured = {
         "pyproject.toml": (
             "[project]\n"
@@ -167,6 +178,7 @@ def test_matrix_binds_the_d74_d76_target_forms() -> None:
     assert matrix.canonical["github_repository"] == "H234598/the-hive"
     assert matrix.canonical["checkout"] == "/home/teladi/the-hive"
     assert matrix.canonical["vault_project"] == "Projekte/The Hive"
+    assert matrix.canonical["cinnamon_uuid"] == "the-hive@H234598"
 
 
 def test_matrix_tampering_fails_closed() -> None:
@@ -211,8 +223,9 @@ def test_matrix_records_current_and_target_semantic_edges() -> None:
         assert edge.target_value_templates
         assert matrix.render_template(edge.path_template)
         assert matrix.render_template(edge.target_path_template)
-    assert matrix.unresolved_surfaces[0].identifier == "cinnamon_uuid"
-    assert matrix.unresolved_surfaces[0].member_count == 28
+    assert matrix.cinnamon_surface.identifier == "cinnamon_uuid"
+    assert matrix.cinnamon_surface.member_count == 28
+    assert matrix.render_template(matrix.cinnamon_surface.target_path_prefix_template + "/placeholder").parent.as_posix() == "cinnamon/applets/the-hive@H234598"
     assert matrix.retirement_artifacts[0].identifier == "hive_test_index"
     assert matrix.retirement_artifacts[0].disposition == "remove_from_product_tree_only"
     assert {family.identifier for family in matrix.bounded_families} == {
@@ -395,11 +408,11 @@ def test_release_gate_rejects_all_legacy_forms_in_paths_and_raw_blobs(tmp_path: 
 
     assert {finding.location for finding in report.legacy_findings} == {"content", "path"}
     assert {finding.form_identifier for finding in report.legacy_findings} == set(matrix.legacy_forms)
-    assert report.missing_target_identifiers == ("unresolved:cinnamon_uuid",)
+    assert report.missing_target_identifiers == ()
     assert not report.ready
 
 
-def test_release_gate_preserves_protected_terms_but_keeps_an_unresolved_surface_blocked(tmp_path: Path) -> None:
+def test_release_gate_preserves_protected_terms_when_the_cinnamon_target_is_complete(tmp_path: Path) -> None:
     matrix = load_rename_matrix()
     _write_target_ready_tree(tmp_path)
     protected = tmp_path / "protected.txt"
@@ -409,8 +422,35 @@ def test_release_gate_preserves_protected_terms_but_keeps_an_unresolved_surface_
     report = RenameReleaseValidator(matrix).validate_tree(tmp_path)
 
     assert report.legacy_findings == ()
-    assert report.missing_target_identifiers == ("unresolved:cinnamon_uuid",)
-    assert not report.ready
+    assert report.missing_target_identifiers == ()
+    assert report.ready
+
+
+@pytest.mark.parametrize(("member", "content"), (("metadata.json", json.dumps({"uuid": "wrong"})), ("applet.js", 'const UUID = "wrong";')))
+def test_release_gate_rejects_a_cinnamon_uuid_target_drift(tmp_path: Path, member: str, content: str) -> None:
+    _write_target_ready_tree(tmp_path)
+    matrix = load_rename_matrix()
+    cinnamon_prefix = tmp_path / matrix.render_template(matrix.cinnamon_surface.target_path_prefix_template + "/placeholder").parent
+    (cinnamon_prefix / member).write_text(content, encoding="utf-8")
+    _commit_tree(tmp_path)
+
+    report = RenameReleaseValidator(matrix).validate_tree(tmp_path)
+
+    assert "cinnamon_uuid" in report.missing_target_identifiers
+
+
+def test_release_gate_rejects_a_cinnamon_target_member_count_drift(tmp_path: Path) -> None:
+    _write_target_ready_tree(tmp_path)
+    matrix = load_rename_matrix()
+    cinnamon_prefix = tmp_path / matrix.render_template(
+        matrix.cinnamon_surface.target_path_prefix_template + "/placeholder"
+    ).parent
+    (cinnamon_prefix / "asset-00.txt").unlink()
+    _commit_tree(tmp_path)
+
+    report = RenameReleaseValidator(matrix).validate_tree(tmp_path)
+
+    assert "cinnamon_uuid" in report.missing_target_identifiers
 
 
 def test_release_gate_requires_a_git_top_level_and_local_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

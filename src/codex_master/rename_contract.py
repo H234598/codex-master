@@ -15,7 +15,7 @@ import tomllib
 from typing import Any, Mapping, Sequence
 
 
-_CONTRACT_SHA256 = "b943f9b51282ebc68529e7f1ea23e1280116356692adfd946b7b14fc94c4a42f"
+_CONTRACT_SHA256 = "8bd4894672b3db2a494c4b23ec84cbc48eebcd11fe27ac3dd771f602964c396f"
 _CONTRACT_FILE_NAME = "rename_contract.v1.json"
 _TOP_LEVEL_KEYS = frozenset(
     {
@@ -23,7 +23,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "canonical",
         "legacy_forms",
         "protected_terms",
-        "unresolved_surfaces",
+        "cinnamon_surface",
         "bounded_families",
         "retirement_artifacts",
         "proven_product_aliases",
@@ -57,6 +57,7 @@ _CANONICAL_KEYS = frozenset(
         "github_repository",
         "checkout",
         "vault_project",
+        "cinnamon_uuid",
     }
 )
 _LEGACY_FORM_IDENTIFIERS = frozenset({"display", "slug", "python", "environment", "compact"})
@@ -188,11 +189,18 @@ class BoundedFamily:
 
 
 @dataclass(frozen=True)
-class UnresolvedSurface:
+class CinnamonSurface:
     identifier: str
-    current_path_prefix_template: str
+    legacy_path_prefix_template: str
+    target_path_prefix_template: str
     member_count: int
-    reason: str
+    metadata_name: str
+    metadata_field: tuple[str, ...]
+    legacy_metadata_value_template: str
+    target_metadata_value_template: str
+    applet_name: str
+    legacy_applet_value_template: str
+    target_applet_value_template: str
 
 
 @dataclass(frozen=True)
@@ -222,7 +230,7 @@ class RenameMatrix:
     canonical: Mapping[str, str]
     legacy_forms: Mapping[str, LegacyForm]
     protected_terms: tuple[str, ...]
-    unresolved_surfaces: tuple[UnresolvedSurface, ...]
+    cinnamon_surface: CinnamonSurface
     bounded_families: tuple[BoundedFamily, ...]
     retirement_artifacts: tuple[RetirementArtifact, ...]
     proven_product_aliases: tuple[ProvenProductAlias, ...]
@@ -411,27 +419,61 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
     if {entry.identifier for entry in parsed_characterization} != _CHARACTERIZATION_IDENTIFIERS:
         raise RenameContractError("rename contract characterization is incomplete")
 
-    unresolved = raw.get("unresolved_surfaces")
+    cinnamon = raw.get("cinnamon_surface")
     if (
-        not isinstance(unresolved, list)
-        or len(unresolved) != 1
-        or not isinstance(unresolved[0], dict)
-        or set(unresolved[0]) != {"id", "current_path_prefix", "member_count", "reason"}
-        or unresolved[0].get("id") != "cinnamon_uuid"
-        or not isinstance(unresolved[0].get("current_path_prefix"), str)
-        or not isinstance(unresolved[0].get("member_count"), int)
-        or unresolved[0].get("member_count") <= 0
-        or not isinstance(unresolved[0].get("reason"), str)
+        not isinstance(cinnamon, dict)
+        or set(cinnamon) != {
+            "id",
+            "legacy_path_prefix",
+            "target_path_prefix",
+            "member_count",
+            "metadata_name",
+            "metadata_field",
+            "legacy_metadata_value",
+            "target_metadata_value",
+            "applet_name",
+            "legacy_applet_value",
+            "target_applet_value",
+        }
+        or cinnamon.get("id") != "cinnamon_uuid"
+        or not isinstance(cinnamon.get("legacy_path_prefix"), str)
+        or not isinstance(cinnamon.get("target_path_prefix"), str)
+        or not isinstance(cinnamon.get("member_count"), int)
+        or cinnamon.get("member_count") != 28
+        or not isinstance(cinnamon.get("metadata_name"), str)
+        or not isinstance(cinnamon.get("metadata_field"), list)
+        or not cinnamon["metadata_field"]
+        or not all(isinstance(part, str) and part for part in cinnamon["metadata_field"])
+        or not isinstance(cinnamon.get("legacy_metadata_value"), str)
+        or not isinstance(cinnamon.get("target_metadata_value"), str)
+        or not isinstance(cinnamon.get("applet_name"), str)
+        or not isinstance(cinnamon.get("legacy_applet_value"), str)
+        or not isinstance(cinnamon.get("target_applet_value"), str)
     ):
-        raise RenameContractError("rename contract unresolved surfaces are malformed")
-    parsed_unresolved = tuple(
-        UnresolvedSurface(
-            unresolved[0]["id"],
-            unresolved[0]["current_path_prefix"],
-            unresolved[0]["member_count"],
-            unresolved[0]["reason"],
-        )
-        for _ in (None,)
+        raise RenameContractError("rename contract Cinnamon surface is malformed")
+    metadata_name = PurePosixPath(cinnamon["metadata_name"])
+    applet_name = PurePosixPath(cinnamon["applet_name"])
+    if (
+        metadata_name.is_absolute()
+        or applet_name.is_absolute()
+        or len(metadata_name.parts) != 1
+        or len(applet_name.parts) != 1
+        or metadata_name.name != cinnamon["metadata_name"]
+        or applet_name.name != cinnamon["applet_name"]
+    ):
+        raise RenameContractError("rename contract Cinnamon member path is malformed")
+    parsed_cinnamon = CinnamonSurface(
+        cinnamon["id"],
+        cinnamon["legacy_path_prefix"],
+        cinnamon["target_path_prefix"],
+        cinnamon["member_count"],
+        cinnamon["metadata_name"],
+        tuple(cinnamon["metadata_field"]),
+        cinnamon["legacy_metadata_value"],
+        cinnamon["target_metadata_value"],
+        cinnamon["applet_name"],
+        cinnamon["legacy_applet_value"],
+        cinnamon["target_applet_value"],
     )
 
     parsed_families: list[BoundedFamily] = []
@@ -588,7 +630,7 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
         canonical=dict(canonical),
         legacy_forms=parsed_forms,
         protected_terms=tuple(protected_terms),
-        unresolved_surfaces=parsed_unresolved,
+        cinnamon_surface=parsed_cinnamon,
         bounded_families=tuple(parsed_families),
         retirement_artifacts=tuple(parsed_retirements),
         proven_product_aliases=tuple(parsed_aliases),
@@ -615,8 +657,16 @@ def parse_rename_matrix(raw: object) -> RenameMatrix:
         matrix.render_template(artifact.target_caller_path_template)
     for alias in matrix.proven_product_aliases:
         matrix.render_template(alias.path_template)
-    for surface in matrix.unresolved_surfaces:
-        matrix.render_template(surface.current_path_prefix_template + "/placeholder")
+    cinnamon = matrix.cinnamon_surface
+    matrix.render_template(cinnamon.legacy_path_prefix_template + "/placeholder")
+    matrix.render_template(cinnamon.target_path_prefix_template + "/placeholder")
+    for template in (
+        cinnamon.legacy_metadata_value_template,
+        cinnamon.target_metadata_value_template,
+        cinnamon.legacy_applet_value_template,
+        cinnamon.target_applet_value_template,
+    ):
+        matrix.render_value(template)
     for readiness_entry in matrix.target_readiness:
         matrix.render_template(readiness_entry.path_template)
     return matrix
@@ -702,11 +752,20 @@ class RenameReleaseValidator:
             value = self._json_field(paths_to_blobs.get(path), alias.field)
             if not self._alias_phrase_is_present(value, alias.legacy_phrase):
                 failures.append(CharacterizationFailure(alias.identifier, "missing_alias_provenance"))
-        for surface in matrix.unresolved_surfaces:
-            prefix = matrix.render_template(surface.current_path_prefix_template + "/placeholder").parent.as_posix()
-            count = sum(path.startswith(prefix + "/") for path in paths_to_blobs)
-            if count != surface.member_count:
-                failures.append(CharacterizationFailure(surface.identifier, "unresolved_member_count_drift"))
+        cinnamon = matrix.cinnamon_surface
+        legacy_prefix = matrix.render_template(cinnamon.legacy_path_prefix_template + "/placeholder").parent.as_posix()
+        legacy_metadata = f"{legacy_prefix}/{cinnamon.metadata_name}"
+        legacy_applet = f"{legacy_prefix}/{cinnamon.applet_name}"
+        if sum(path.startswith(legacy_prefix + "/") for path in paths_to_blobs) != cinnamon.member_count:
+            failures.append(CharacterizationFailure(cinnamon.identifier, "legacy_member_count_drift"))
+        elif self._json_field(paths_to_blobs.get(legacy_metadata), cinnamon.metadata_field) != matrix.render_value(
+            cinnamon.legacy_metadata_value_template
+        ):
+            failures.append(CharacterizationFailure(cinnamon.identifier, "legacy_metadata_uuid_drift"))
+        elif matrix.render_value(cinnamon.legacy_applet_value_template).encode("utf-8") not in paths_to_blobs.get(
+            legacy_applet, b""
+        ):
+            failures.append(CharacterizationFailure(cinnamon.identifier, "legacy_applet_uuid_drift"))
         return tuple(failures)
 
     def validate_tree(self, repository_root: Path, treeish: str = "HEAD") -> RenameGateReport:
@@ -747,8 +806,18 @@ class RenameReleaseValidator:
             path = matrix.render_template(alias.path_template).as_posix()
             if self._alias_phrase_is_present(self._json_field(paths_to_blobs.get(path), alias.field), alias.legacy_phrase):
                 missing_targets.append(f"alias:{alias.identifier}")
-        for surface in matrix.unresolved_surfaces:
-            missing_targets.append(f"unresolved:{surface.identifier}")
+        cinnamon = matrix.cinnamon_surface
+        target_prefix = matrix.render_template(cinnamon.target_path_prefix_template + "/placeholder").parent.as_posix()
+        target_metadata = f"{target_prefix}/{cinnamon.metadata_name}"
+        target_applet = f"{target_prefix}/{cinnamon.applet_name}"
+        if (
+            sum(path.startswith(target_prefix + "/") for path in paths_to_blobs) != cinnamon.member_count
+            or self._json_field(paths_to_blobs.get(target_metadata), cinnamon.metadata_field)
+            != matrix.render_value(cinnamon.target_metadata_value_template)
+            or matrix.render_value(cinnamon.target_applet_value_template).encode("utf-8")
+            not in paths_to_blobs.get(target_applet, b"")
+        ):
+            missing_targets.append(cinnamon.identifier)
         for expectation in matrix.legacy_characterization:
             target_path = matrix.render_template(expectation.target_path_template).as_posix()
             content = paths_to_blobs.get(target_path)

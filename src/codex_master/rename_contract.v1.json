@@ -24,7 +24,8 @@
     "state_root": "the-hive-mcp",
     "github_repository": "H234598/the-hive",
     "checkout": "/home/teladi/the-hive",
-    "vault_project": "Projekte/The Hive"
+    "vault_project": "Projekte/The Hive",
+    "cinnamon_uuid": "the-hive@H234598"
   },
   "legacy_forms": [
     {
@@ -60,14 +61,19 @@
     "Hive",
     "Codex"
   ],
-  "unresolved_surfaces": [
-    {
-      "id": "cinnamon_uuid",
-      "current_path_prefix": "cinnamon/applets/{legacy_slug}@H234598",
-      "member_count": 28,
-      "reason": "D74_D76_do_not_bind_a_cinnamon_uuid"
-    }
-  ],
+  "cinnamon_surface": {
+    "id": "cinnamon_uuid",
+    "legacy_path_prefix": "cinnamon/applets/{legacy_slug}@H234598",
+    "target_path_prefix": "cinnamon/applets/{target_cinnamon_uuid}",
+    "member_count": 28,
+    "metadata_name": "metadata.json",
+    "metadata_field": ["uuid"],
+    "legacy_metadata_value": "{legacy_slug}@H234598",
+    "target_metadata_value": "{target_cinnamon_uuid}",
+    "applet_name": "applet.js",
+    "legacy_applet_value": "const UUID = \"{legacy_slug}@H234598\";",
+    "target_applet_value": "const UUID = \"{target_cinnamon_uuid}\";"
+  },
   "bounded_families": [
     {
       "id": "cli_entry_points",
