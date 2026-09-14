@@ -16780,7 +16780,7 @@ google_accounts:
             result = master_namespace_status()
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["server_name"], "codex-master-mcp")
+        self.assertEqual(result["server_name"], "the-hive-mcp")
         self.assertTrue(result["expected_tools"]["master_app_bridge_status"])
         self.assertTrue(result["expected_tools"]["master_namespace_status"])
         self.assertTrue(result["expected_tools"]["master_release_status"])

@@ -10,6 +10,9 @@ from io import BytesIO
 
 import pytest
 
+import the_hive
+import the_hive.server as server
+
 from the_hive.rename_contract import (
     RenameContractError,
     RenameReleaseValidator,
@@ -20,6 +23,16 @@ from the_hive.rename_contract import (
 
 ROOT = Path(__file__).resolve().parents[1]
 D73_BASE = "f6f9348a4348d1a18bb3c4b591a93c393dfda838"
+
+
+def test_current_package_description_uses_the_hive_display_name() -> None:
+    assert the_hive.__doc__ == "The Hive package."
+    assert "codex-master" not in the_hive.__doc__
+
+
+def test_active_mcp_server_name_uses_the_hive_slug() -> None:
+    assert server.MCP_SERVER_NAME == "the-hive-mcp"
+    assert server.MCP_SERVER_NAME != "codex-master-mcp"
 
 
 def _commit_tree(root: Path) -> None:

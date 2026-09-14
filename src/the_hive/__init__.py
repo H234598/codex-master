@@ -1,4 +1,4 @@
-"""codex-master package."""
+"""The Hive package."""
 
 __all__ = ["__version__"]
 
