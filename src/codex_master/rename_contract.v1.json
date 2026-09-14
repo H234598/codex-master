@@ -1,0 +1,570 @@
+{
+  "schema_version": 1,
+  "canonical": {
+    "display": "The Hive",
+    "slug": "the-hive",
+    "python": "the_hive",
+    "environment": "THE_HIVE",
+    "desktop": "de.teladi.TheHive.ControlCenter",
+    "dbus_name": "org.the_hive",
+    "dbus_path": "/org/the_hive",
+    "c_abi_prefix": "the_hive_",
+    "openmetrics_namespace": "the_hive",
+    "compact_metrics": "thehive",
+    "repository": "the-hive",
+    "principal": "queen-the-hive",
+    "mcp_name": "the-hive-mcp",
+    "runtime_root": "the-hive-runtime",
+    "runtime_manifest": ".the-hive-runtime-manifest.json",
+    "release_pointers": ".the-hive-release-pointers.json",
+    "release_publish_lock": ".the-hive-release-publish.lock",
+    "plugin": "the-hive",
+    "skill": "the-hive-fleet",
+    "manpage": "the-hive-mcp.1",
+    "state_root": "the-hive-mcp",
+    "github_repository": "H234598/the-hive",
+    "checkout": "/home/teladi/the-hive",
+    "vault_project": "Projekte/The Hive"
+  },
+  "legacy_forms": [
+    {
+      "id": "display",
+      "parts": ["Codex", "Master"],
+      "separator": " "
+    },
+    {
+      "id": "slug",
+      "parts": ["codex", "master"],
+      "separator": "-"
+    },
+    {
+      "id": "python",
+      "parts": ["codex", "master"],
+      "separator": "_"
+    },
+    {
+      "id": "environment",
+      "parts": ["CODEX", "MASTER"],
+      "separator": "_"
+    },
+    {
+      "id": "compact",
+      "parts": ["codex", "master"],
+      "separator": ""
+    }
+  ],
+  "protected_terms": [
+    "Masterjet",
+    "master_*",
+    "codex-agent",
+    "Hive",
+    "Codex"
+  ],
+  "unresolved_surfaces": [
+    {
+      "id": "cinnamon_uuid",
+      "current_path_prefix": "cinnamon/applets/{legacy_slug}@H234598",
+      "member_count": 28,
+      "reason": "D74_D76_do_not_bind_a_cinnamon_uuid"
+    }
+  ],
+  "bounded_families": [
+    {
+      "id": "cli_entry_points",
+      "kind": "tracked_cli_path_set",
+      "legacy_paths": [
+        "bin/{legacy_slug}-hive-hourly-probe",
+        "bin/{legacy_slug}-home-broker",
+        "bin/{legacy_slug}-limit-tracker",
+        "bin/{legacy_slug}-mcp",
+        "bin/{legacy_slug}-mcp-stable",
+        "bin/{legacy_slug}-openai-pricing-inventory",
+        "bin/{legacy_slug}-publish-plan-path",
+        "bin/{legacy_slug}-resource-monitor",
+        "bin/{legacy_slug}-resource-scope-gate"
+      ],
+      "target_paths": [
+        "bin/{target_slug}-hive-hourly-probe",
+        "bin/{target_slug}-home-broker",
+        "bin/{target_slug}-limit-tracker",
+        "bin/{target_slug}-mcp",
+        "bin/{target_slug}-mcp-stable",
+        "bin/{target_slug}-openai-pricing-inventory",
+        "bin/{target_slug}-publish-plan-path",
+        "bin/{target_slug}-resource-monitor",
+        "bin/{target_slug}-resource-scope-gate"
+      ],
+      "caller_path": "pyproject.toml",
+      "caller_symbol": "[project.scripts]",
+      "target_content_forms": ["slug", "python"]
+    },
+    {
+      "id": "systemd_artifacts",
+      "kind": "tracked_systemd_unit_config_path_set",
+      "legacy_paths": [
+        "systemd/{legacy_slug}-admin.service",
+        "systemd/{legacy_slug}-agent-api.service",
+        "systemd/{legacy_slug}-host-agent.service",
+        "systemd/config/{legacy_slug}-home-broker.conf",
+        "systemd/libexec/{legacy_slug}-agent-launcher",
+        "systemd/libexec/{legacy_slug}-broker-verify",
+        "systemd/libexec/{legacy_slug}-home-broker",
+        "systemd/libexec/{legacy_python}_bootstrap.py",
+        "systemd/manifest/{legacy_slug}-home-broker-manifest-v1.json",
+        "systemd/selinux/{legacy_python}_home_broker.fc",
+        "systemd/selinux/{legacy_python}_home_broker.te",
+        "systemd/system/{legacy_slug}-agent@.service",
+        "systemd/system/{legacy_slug}-home-broker.service",
+        "systemd/system/user@.service.d/50-{legacy_slug}-delegation.conf",
+        "systemd/sysusers.d/{legacy_slug}-agent-api.conf",
+        "systemd/sysusers.d/{legacy_slug}-host-agent.conf",
+        "systemd/tmpfiles.d/{legacy_slug}-agent-api.conf",
+        "systemd/tmpfiles.d/{legacy_slug}-host-agent.conf",
+        "systemd/user/{legacy_slug}-goddess-report.service",
+        "systemd/user/{legacy_slug}-goddess-report.timer",
+        "systemd/user/{legacy_slug}-hive-hourly-probe.service",
+        "systemd/user/{legacy_slug}-hive-hourly-probe.timer",
+        "systemd/user/{legacy_slug}-limit-tracker-emergency.service",
+        "systemd/user/{legacy_slug}-limit-tracker-emergency.timer",
+        "systemd/user/{legacy_slug}-limit-tracker.service",
+        "systemd/user/{legacy_slug}-limit-tracker.timer",
+        "systemd/user/{legacy_slug}-openai-pricing.service",
+        "systemd/user/{legacy_slug}-openai-pricing.timer",
+        "systemd/user/{legacy_slug}-resource-monitor.service",
+        "systemd/user/{legacy_slug}-watchdog.service",
+        "systemd/user/{legacy_slug}-watchdog.timer",
+        "systemd/user/{legacy_slug}.slice"
+      ],
+      "target_paths": [
+        "systemd/{target_slug}-admin.service",
+        "systemd/{target_slug}-agent-api.service",
+        "systemd/{target_slug}-host-agent.service",
+        "systemd/config/{target_slug}-home-broker.conf",
+        "systemd/libexec/{target_slug}-agent-launcher",
+        "systemd/libexec/{target_slug}-broker-verify",
+        "systemd/libexec/{target_slug}-home-broker",
+        "systemd/libexec/{target_python}_bootstrap.py",
+        "systemd/manifest/{target_slug}-home-broker-manifest-v1.json",
+        "systemd/selinux/{target_python}_home_broker.fc",
+        "systemd/selinux/{target_python}_home_broker.te",
+        "systemd/system/{target_slug}-agent@.service",
+        "systemd/system/{target_slug}-home-broker.service",
+        "systemd/system/user@.service.d/50-{target_slug}-delegation.conf",
+        "systemd/sysusers.d/{target_slug}-agent-api.conf",
+        "systemd/sysusers.d/{target_slug}-host-agent.conf",
+        "systemd/tmpfiles.d/{target_slug}-agent-api.conf",
+        "systemd/tmpfiles.d/{target_slug}-host-agent.conf",
+        "systemd/user/{target_slug}-goddess-report.service",
+        "systemd/user/{target_slug}-goddess-report.timer",
+        "systemd/user/{target_slug}-hive-hourly-probe.service",
+        "systemd/user/{target_slug}-hive-hourly-probe.timer",
+        "systemd/user/{target_slug}-limit-tracker-emergency.service",
+        "systemd/user/{target_slug}-limit-tracker-emergency.timer",
+        "systemd/user/{target_slug}-limit-tracker.service",
+        "systemd/user/{target_slug}-limit-tracker.timer",
+        "systemd/user/{target_slug}-openai-pricing.service",
+        "systemd/user/{target_slug}-openai-pricing.timer",
+        "systemd/user/{target_slug}-resource-monitor.service",
+        "systemd/user/{target_slug}-watchdog.service",
+        "systemd/user/{target_slug}-watchdog.timer",
+        "systemd/user/{target_slug}.slice"
+      ],
+      "caller_path": "external:systemd.unit_loader",
+      "caller_symbol": "unit_search_path",
+      "target_content_forms": ["slug", "python"]
+    },
+    {
+      "id": "hook_artifacts",
+      "kind": "tracked_plugin_hook_path_set",
+      "legacy_paths": ["hooks/hooks.json", "hooks/native_bee_event.py", "hooks/native_spawn_admission.py"],
+      "target_paths": ["hooks/hooks.json", "hooks/native_bee_event.py", "hooks/native_spawn_admission.py"],
+      "caller_path": ".codex-plugin/plugin.json",
+      "caller_symbol": "hooks",
+      "target_content_forms": []
+    }
+  ],
+  "retirement_artifacts": [
+    {
+      "id": "hive_test_index",
+      "path": ".hive/test-index.v1.json",
+      "caller_path": "src/{legacy_python}/hive/evidence_service.py",
+      "caller_symbol": "test-index.v1.json",
+      "target_caller_path": "src/{target_python}/hive/evidence_service.py",
+      "target_forbidden_symbol": "test-index.v1.json",
+      "disposition": "remove_from_product_tree_only",
+      "generator_status": "no_production_generator_attested"
+    }
+  ],
+  "proven_product_aliases": [
+    {
+      "id": "plugin_description_masterjet_alias",
+      "path": ".codex-plugin/plugin.json",
+      "field": ["description"],
+      "legacy_phrase": "Masterjet remain compatibility aliases",
+      "caller_symbol": "description"
+    },
+    {
+      "id": "plugin_long_description_masterjet_alias",
+      "path": ".codex-plugin/plugin.json",
+      "field": ["interface", "longDescription"],
+      "legacy_phrase": "Masterjet remains a compatible colloquial alias",
+      "caller_symbol": "longDescription"
+    }
+  ],
+  "legacy_characterization": [
+    {
+      "id": "distribution",
+      "kind": "packaging_entry_points",
+      "path": "pyproject.toml",
+      "forms": ["slug", "python"],
+      "legacy_values": [
+        "name = \"{legacy_slug}\"",
+        "{legacy_slug}-mcp = \"{legacy_python}.server:main\"",
+        "{legacy_slug}-admin = \"{legacy_python}.admin_daemon:main\"",
+        "{legacy_slug}-agent-api = \"{legacy_python}.agent_daemon:main\"",
+        "{legacy_slug}-host-agent = \"{legacy_python}.host_agent:main\"",
+        "google-account-manager = \"{legacy_python}.google_account_manager_cli:main\""
+      ],
+      "target_path": "pyproject.toml",
+      "target_values": [
+        "name = \"{target_slug}\"",
+        "{target_slug}-mcp = \"{target_python}.server:main\"",
+        "{target_slug}-admin = \"{target_python}.admin_daemon:main\"",
+        "{target_slug}-agent-api = \"{target_python}.agent_daemon:main\"",
+        "{target_slug}-host-agent = \"{target_python}.host_agent:main\"",
+        "google-account-manager = \"{target_python}.google_account_manager_cli:main\""
+      ],
+      "callers": [{"path": "external:setuptools", "symbol": "project.scripts", "kind": "packaging"}]
+    },
+    {
+      "id": "python_package",
+      "kind": "python_package_and_import_root",
+      "path": "src/{legacy_python}/__init__.py",
+      "forms": ["python"],
+      "legacy_values": ["\"\"\"{legacy_slug} package.\"\"\""],
+      "target_path": "src/{target_python}/__init__.py",
+      "target_values": ["\"\"\"The Hive package.\"\"\""],
+      "callers": [{"path": "src/{legacy_python}/server.py", "symbol": "from {legacy_python}", "kind": "python_import"}]
+    },
+    {
+      "id": "cli_mcp",
+      "kind": "runtime_cli_entry_point",
+      "path": "bin/{legacy_slug}-mcp",
+      "forms": ["slug", "python"],
+      "legacy_values": [
+        "from {legacy_python}.runtime_layout import RuntimeLayout",
+        "runpy.run_module(\"{legacy_python}.server\", run_name=\"__main__\", alter_sys=True)",
+        "\"{legacy_slug}-mcp\""
+      ],
+      "target_path": "bin/{target_slug}-mcp",
+      "target_values": [
+        "from {target_python}.runtime_layout import RuntimeLayout",
+        "runpy.run_module(\"{target_python}.server\", run_name=\"__main__\", alter_sys=True)",
+        "\"{target_slug}-mcp\""
+      ],
+      "callers": [{"path": "external:runtime_launcher", "symbol": "exec", "kind": "process_entry_point"}]
+    },
+    {
+      "id": "mcp_manifest",
+      "kind": "mcp_manifest",
+      "path": ".mcp.json",
+      "forms": ["slug"],
+      "legacy_values": [
+        "\"{legacy_slug}-mcp\"",
+        "/home/teladi/.local/lib/{legacy_slug}-runtime/{legacy_slug}-mcp"
+      ],
+      "target_path": ".mcp.json",
+      "target_values": [
+        "\"{target_mcp_name}\"",
+        "/home/teladi/.local/lib/{target_runtime_root}/{target_mcp_name}"
+      ],
+      "callers": [{"path": "external:mcp_client", "symbol": "mcpServers", "kind": "manifest_consumer"}]
+    },
+    {
+      "id": "app_bridge",
+      "kind": "app_bridge_manifest",
+      "path": ".app.json",
+      "forms": ["slug"],
+      "legacy_values": ["\"{legacy_slug}\""],
+      "target_path": ".app.json",
+      "target_values": ["\"{target_slug}\""],
+      "callers": [{"path": "external:app_bridge", "symbol": "apps", "kind": "manifest_consumer"}]
+    },
+    {
+      "id": "runtime_layout",
+      "kind": "runtime_release_layout",
+      "path": "src/{legacy_python}/runtime_layout.py",
+      "forms": ["slug", "python", "environment"],
+      "legacy_values": [
+        "\".{legacy_slug}-runtime-manifest.json\"",
+        "\".{legacy_slug}-release-pointers.json\"",
+        "\"bin/{legacy_slug}-mcp-stable\"",
+        "\"/home/teladi/.local/lib/{legacy_slug}-runtime/{legacy_slug}-mcp\"",
+        "\"src/{legacy_python}/_runtime_spawn_helper.so\""
+      ],
+      "target_path": "src/{target_python}/runtime_layout.py",
+      "target_values": [
+        "\"{target_runtime_manifest}\"",
+        "\"{target_release_pointers}\"",
+        "\"bin/{target_slug}-mcp-stable\"",
+        "\"/home/teladi/.local/lib/{target_runtime_root}/{target_mcp_name}\"",
+        "\"src/{target_python}/_runtime_spawn_helper.so\""
+      ],
+      "callers": [{"path": "src/{legacy_python}/server.py", "symbol": "_runtime_layout", "kind": "python_call"}]
+    },
+    {
+      "id": "state_interface",
+      "kind": "state_configuration_interface",
+      "path": "src/{legacy_python}/server.py",
+      "forms": ["slug", "environment"],
+      "legacy_values": [
+        "\"{legacy_environment}_MCP_STATE\"",
+        "~/.local/state/{legacy_slug}-mcp",
+        "MCP_SERVER_NAME = \"{legacy_slug}-mcp\""
+      ],
+      "target_path": "src/{target_python}/server.py",
+      "target_values": [
+        "\"{target_environment}_MCP_STATE\"",
+        "~/.local/state/{target_state_root}",
+        "MCP_SERVER_NAME = \"{target_mcp_name}\""
+      ],
+      "callers": [{"path": "src/{legacy_python}/server.py", "symbol": "STATE_ROOT", "kind": "state_interface"}]
+    },
+    {
+      "id": "c_abi",
+      "kind": "c_abi_symbol",
+      "path": "src/{legacy_python}/runtime_spawn_helper.c",
+      "forms": ["python"],
+      "legacy_values": ["{legacy_python}_pidfd_spawnp"],
+      "target_path": "src/{target_python}/runtime_spawn_helper.c",
+      "target_values": ["{target_c_abi_prefix}pidfd_spawnp"],
+      "callers": [{"path": "src/{legacy_python}/runtime_process.py", "symbol": "spawn", "kind": "native_loader"}]
+    },
+    {
+      "id": "metrics",
+      "kind": "openmetrics_namespace",
+      "path": "src/{legacy_python}/hive_metrics_contract.py",
+      "forms": ["python", "compact"],
+      "legacy_values": ["{legacy_python}_bees_native", "{legacy_python}_bees_total"],
+      "target_path": "src/{target_python}/hive_metrics_contract.py",
+      "target_values": ["{target_openmetrics_namespace}_bees_native", "{target_openmetrics_namespace}_bees_total"],
+      "callers": [{"path": "src/{legacy_python}/server.py", "symbol": "render_openmetrics", "kind": "python_call"}]
+    },
+    {
+      "id": "desktop",
+      "kind": "desktop_application_id",
+      "path": "src/{legacy_python}/control_center.py",
+      "forms": ["compact"],
+      "legacy_values": ["de.teladi.{legacy_compact}.ControlCenter"],
+      "target_path": "src/{target_python}/control_center.py",
+      "target_values": ["{target_desktop}"],
+      "callers": [{"path": "external:gtk", "symbol": "Gtk.Application", "kind": "desktop_launcher"}]
+    },
+    {
+      "id": "dbus_api",
+      "kind": "dbus_python_constants",
+      "path": "src/{legacy_python}/fleet_root_system_bus.py",
+      "forms": ["python"],
+      "legacy_values": [
+        "BUS_NAME = \"org.{legacy_python}.HomeBrokerControl\"",
+        "BUS_PATH = \"/org/{legacy_python}/HomeBrokerControl\"",
+        "BUS_INTERFACE = \"org.{legacy_python}.HomeBrokerControl1\""
+      ],
+      "target_path": "src/{target_python}/fleet_root_system_bus.py",
+      "target_values": [
+        "BUS_NAME = \"{target_dbus_name}.HomeBrokerControl\"",
+        "BUS_PATH = \"{target_dbus_path}/HomeBrokerControl\"",
+        "BUS_INTERFACE = \"{target_dbus_name}.HomeBrokerControl1\""
+      ],
+      "callers": [{"path": "external:system_dbus", "symbol": "HomeBrokerControl", "kind": "dbus_client"}]
+    },
+    {
+      "id": "unit",
+      "kind": "systemd_user_unit_and_timer",
+      "path": "systemd/user/{legacy_slug}-goddess-report.service",
+      "forms": ["slug", "environment"],
+      "legacy_values": [
+        "Environment={legacy_environment}_MCP_INSTANCE_ID={legacy_slug}-goddess-report",
+        "%h/.local/state/{legacy_slug}-mcp",
+        "%h/.local/lib/{legacy_slug}-runtime/bin/{legacy_slug}-mcp"
+      ],
+      "target_path": "systemd/user/{target_slug}-goddess-report.service",
+      "target_values": [
+        "Environment={target_environment}_MCP_INSTANCE_ID={target_slug}-goddess-report",
+        "%h/.local/state/{target_state_root}",
+        "%h/.local/lib/{target_runtime_root}/bin/{target_mcp_name}"
+      ],
+      "callers": [{"path": "external:systemd_user_manager", "symbol": "Unit", "kind": "unit_loader"}]
+    },
+    {
+      "id": "plugin",
+      "kind": "plugin_manifest",
+      "path": ".codex-plugin/plugin.json",
+      "forms": ["slug"],
+      "legacy_values": [
+        "\"name\": \"{legacy_slug}\"",
+        "https://github.com/H234598/{legacy_slug}",
+        "{legacy_slug}-mcp"
+      ],
+      "target_path": ".codex-plugin/plugin.json",
+      "target_values": [
+        "\"name\": \"{target_plugin}\"",
+        "https://github.com/{target_github_repository}",
+        "{target_mcp_name}"
+      ],
+      "callers": [{"path": "external:plugin_loader", "symbol": "name", "kind": "plugin_manifest"}]
+    },
+    {
+      "id": "skill",
+      "kind": "skill_router",
+      "path": "skills/{legacy_slug}-fleet/SKILL.md",
+      "forms": ["slug"],
+      "legacy_values": ["name: {legacy_slug}-fleet", "# {legacy_display} Fleet"],
+      "target_path": "skills/{target_skill}/SKILL.md",
+      "target_values": ["name: {target_skill}", "# The Hive Fleet"],
+      "callers": [{"path": "external:skill_router", "symbol": "name", "kind": "skill_manifest"}]
+    },
+    {
+      "id": "hook",
+      "kind": "plugin_hook_import",
+      "path": "hooks/native_spawn_admission.py",
+      "forms": ["environment"],
+      "legacy_values": ["from {legacy_python}.server import reserve_native_agent_spawn"],
+      "target_path": "hooks/native_spawn_admission.py",
+      "target_values": ["from {target_python}.server import reserve_native_agent_spawn"],
+      "callers": [{"path": "hooks/hooks.json", "symbol": "PreToolUse", "kind": "hook_manifest"}]
+    },
+    {
+      "id": "manpage",
+      "kind": "cli_manpage",
+      "path": "man/man1/{legacy_slug}-mcp.1",
+      "forms": ["slug", "python"],
+      "legacy_values": ["{legacy_slug}-mcp", "python3 -m {legacy_python}.server"],
+      "target_path": "man/man1/{target_manpage}",
+      "target_values": ["{target_mcp_name}", "python3 -m {target_python}.server"],
+      "callers": [{"path": "external:man_db", "symbol": "man1", "kind": "manpage_loader"}]
+    },
+    {
+      "id": "error_surface",
+      "kind": "daemon_error_prefix",
+      "path": "src/{legacy_python}/admin_daemon.py",
+      "forms": ["slug"],
+      "legacy_values": ["{legacy_slug}-admin: control.admin"],
+      "target_path": "src/{target_python}/admin_daemon.py",
+      "target_values": ["{target_slug}-admin: control.admin"],
+      "callers": [{"path": "external:admin_cli", "symbol": "stderr", "kind": "error_consumer"}]
+    }
+  ],
+  "target_readiness": [
+    {
+      "id": "display",
+      "path": ".codex-plugin/plugin.json",
+      "target": "display"
+    },
+    {
+      "id": "slug",
+      "path": "pyproject.toml",
+      "target": "slug"
+    },
+    {
+      "id": "mcp_name",
+      "path": ".mcp.json",
+      "target": "mcp_name"
+    },
+    {
+      "id": "python",
+      "path": "src/{target_python}/__init__.py",
+      "target": "python"
+    },
+    {
+      "id": "environment",
+      "path": "src/{target_python}/server.py",
+      "target": "environment"
+    },
+    {
+      "id": "desktop",
+      "path": "src/{target_python}/control_center.py",
+      "target": "desktop"
+    },
+    {
+      "id": "dbus_name",
+      "path": "src/{target_python}/fleet_root_system_bus.py",
+      "target": "dbus_name"
+    },
+    {
+      "id": "dbus_path",
+      "path": "src/{target_python}/fleet_root_system_bus.py",
+      "target": "dbus_path"
+    },
+    {
+      "id": "c_abi_prefix",
+      "path": "src/{target_python}/runtime_spawn_helper.c",
+      "target": "c_abi_prefix"
+    },
+    {
+      "id": "openmetrics_namespace",
+      "path": "src/{target_python}/hive_metrics_contract.py",
+      "target": "openmetrics_namespace"
+    },
+    {
+      "id": "compact_metrics",
+      "path": "src/{target_python}/hive_metrics_contract.py",
+      "target": "compact_metrics"
+    },
+    {
+      "id": "repository",
+      "path": "src/{target_python}/server.py",
+      "target": "repository"
+    },
+    {
+      "id": "principal",
+      "path": "src/{target_python}/server.py",
+      "target": "principal"
+    },
+    {
+      "id": "github_repository",
+      "path": ".codex-plugin/plugin.json",
+      "target": "github_repository"
+    },
+    {
+      "id": "plugin",
+      "path": ".codex-plugin/plugin.json",
+      "target": "plugin"
+    },
+    {
+      "id": "skill",
+      "path": "skills/{target_skill}/SKILL.md",
+      "target": "skill"
+    },
+    {
+      "id": "manpage",
+      "path": "man/man1/{target_manpage}",
+      "target": "manpage"
+    },
+    {
+      "id": "runtime_root",
+      "path": "src/{target_python}/runtime_layout.py",
+      "target": "runtime_root"
+    },
+    {
+      "id": "runtime_manifest",
+      "path": "src/{target_python}/runtime_layout.py",
+      "target": "runtime_manifest"
+    },
+    {
+      "id": "release_pointers",
+      "path": "src/{target_python}/runtime_layout.py",
+      "target": "release_pointers"
+    },
+    {
+      "id": "release_publish_lock",
+      "path": "src/{target_python}/runtime_layout.py",
+      "target": "release_publish_lock"
+    },
+    {
+      "id": "state_root",
+      "path": "src/{target_python}/server.py",
+      "target": "state_root"
+    }
+  ]
+}

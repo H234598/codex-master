@@ -36,7 +36,7 @@ google-account-manager = "codex_master.google_account_manager_cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-codex_master = ["markdown/*.md", "markdown/classes/*.md"]
+codex_master = ["markdown/*.md", "markdown/classes/*.md", "rename_contract.v1.json"]
 
 [tool.setuptools.data-files]
 "lib/codex-master/systemd" = [
