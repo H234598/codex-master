@@ -46,17 +46,53 @@ def _probe_payload() -> bytes:
     )
 
 
+def _current_release_binding(layout: RuntimeLayout) -> tuple[RuntimeLayout, Path, str]:
+    """Return only a still-current named release binding for the MCP launcher."""
+
+    release_root = layout.root.parent.parent
+    generation = layout.root.name
+    if (
+        not layout.root.is_absolute()
+        or layout.root.parent.name != "generations"
+        or not generation
+        or generation in {".", ".."}
+        or release_root / "generations" / generation != layout.root
+    ):
+        raise RuntimeError("mcp_release_binding_invalid")
+    try:
+        current_layout = RuntimeLayout.from_current_release(
+            release_root, generation, layout.manifest_digest
+        )
+    except (LayoutError, TypeError, ValueError) as exc:
+        raise RuntimeError("mcp_release_binding_invalid") from exc
+    if (
+        current_layout.root != layout.root
+        or current_layout.root_device != layout.root_device
+        or current_layout.root_inode != layout.root_inode
+        or current_layout.manifest_digest != layout.manifest_digest
+    ):
+        raise RuntimeError("mcp_release_binding_invalid")
+    return current_layout, release_root, generation
+
+
 def _run_direct_mcp(*, layout: RuntimeLayout, home: Path) -> tuple[int, str]:
+    current_layout, release_root, generation = _current_release_binding(layout)
     try:
         result = run_bounded(
-            [str(layout.mcp_entrypoint), AUTONOMOUS_RUNTIME_STATUS_MCP_ARGUMENT],
-            cwd=layout.root,
+            [
+                str(current_layout.mcp_entrypoint),
+                str(release_root),
+                generation,
+                current_layout.manifest_digest,
+                AUTONOMOUS_RUNTIME_STATUS_MCP_ARGUMENT,
+            ],
+            cwd=current_layout.root,
             home=home,
             timeout_seconds=RUNTIME_STATUS_MCP_TIMEOUT_SECONDS,
             stdout_limit=_MAX_MCP_OUTPUT_BYTES,
             stderr_limit=DEFAULT_STDERR_LIMIT,
             input_data=_probe_payload(),
-            runtime_layout=layout,
+            runtime_layout=current_layout,
         )
     except BoundedProcessError as exc:
         if exc.code == "command_timeout":

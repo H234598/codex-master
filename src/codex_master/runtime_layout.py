@@ -19,9 +19,50 @@ _MAX_IMAGE_FILE_BYTES = 2 * 1024 * 1024
 _MAX_METADATA_BYTES = 256 * 1024
 _ROOT_MODE = 0o700
 _MANIFEST_NAME = ".codex-master-runtime-manifest.json"
+_RELEASE_POINTERS_NAME = ".codex-master-release-pointers.json"
+_RELEASE_GENERATIONS_NAME = "generations"
 _RUNTIME_SPAWN_HELPER = "src/codex_master/_runtime_spawn_helper.so"
+_F25_COMMIT = "f25f60f6010d7b74b82a57f6471618e16df3e1a6"
+_C4_COMMIT = "c4b72abcfe0e8b208b05f90cc4f8275def851581"
+_D69_RUNTIME_PATHS = (
+    "src/codex_master/admission.py", "src/codex_master/admission_runtime.py",
+    "src/codex_master/dynamic_pool.py", "src/codex_master/hive/__init__.py",
+    "src/codex_master/hive/admission.py", "src/codex_master/hive/dispatch.py",
+    "src/codex_master/hive/principals.py", "src/codex_master/selection.py",
+    "src/codex_master/selection_service.py", "src/codex_master/server.py",
+)
+_D69_ANCHOR_PATH = "src/codex_master/dynamic_pool.py"
+_D69_ANCHOR_SHA256 = "1c3e2e8ff7c0c14294af2dee044b6dfd3a072caad0d117b49dfc8d360d8efef4"
+_STABLE_MCP_LAUNCHER_SOURCE = "bin/codex-master-mcp-stable"
+_STABLE_MCP_COMMAND = "/home/teladi/.local/lib/codex-master-runtime/codex-master-mcp"
+_STABLE_MCP_NOTE = (
+    "Local data-sparse Codex Masterjet MCP server. Controls the sleeping "
+    "Agentinnen pool through tmux and does not return raw terminal output by default."
+)
+_F25_D69_SOURCE_SHA256 = {
+    "src/codex_master/admission.py": "ad2609dc0022b4bcc8937ee2c2ce17ef553c602eb02849103840d7279f773bd4",
+    "src/codex_master/admission_runtime.py": "0babae1ca3fda111a623c56cb0f230f901981585dda7bec9dbf33b87b0a88e6f",
+    "src/codex_master/dynamic_pool.py": _D69_ANCHOR_SHA256,
+    "src/codex_master/hive/__init__.py": "28b14addc149512d68782b416c26b5191c823095fade0318bc3d7338dee1c4a8",
+    "src/codex_master/hive/admission.py": "4d97e5f73005068833d2181d1751c59f7861f0bcf24fdc6ad04b1aa882cf34ca",
+    "src/codex_master/hive/dispatch.py": "d164865c2285eaae6d2aa9a3f50555c0bb8f3ab2d7529308431438273cba8ba6",
+    "src/codex_master/hive/principals.py": "4b9912390c2f7c198338245c0912f8c195fb027e4c14f5184d3ec5dfae62fcee",
+    "src/codex_master/selection.py": "c575dc16bb553fc3a34e566f23486e71b324f7de640762b459868c275b8d1c8e",
+    "src/codex_master/selection_service.py": "486dce3f357f40377042b28791da48db67ece5a7d6dd86c6e6c0cec3f5744f4f",
+    "src/codex_master/server.py": "3e22e18b67f8407e895816b40452ba8c32db7f5817e9af47ff57c88c60818942",
+}
+_F25_C4_SUBSET_SHA256 = {
+    "bin/codex-master-mcp": "7374a1e82c7308a8836f973646658e368a3996b41461d8a7722c100d27f0ccbe",
+    "bin/codex-master-resource-monitor": "b630d3f7e01288c1b8509062d98e3c6a900228bd07972d5f0ec7c76281183ab3",
+    "systemd/user/codex-master.slice": "4771a0a12b219b3053b0f88dc32caf071244ddf8c4a2efbec26892c79078f290",
+    "systemd/user/codex-master-resource-monitor.service": "73f44183861aa5d950de525ad1517bbf928fe59b4b40cc9c471a5f59e7d2242f",
+    "src/codex_master/resource_cgroup.py": "c49ce367a96a4f3e422989a3d6e51ab372864206f1d820124e4fe72866287024",
+    "src/codex_master/resource_monitor.py": "7d2f4c7efad196166dd2c0e924d3dda8645ee853ff8ce11449755e4aa2d3bce4",
+}
 _REQUIRED_FILES: tuple[tuple[str, int], ...] = (
     ("bin/codex-master-mcp", 0o755),
+    (_STABLE_MCP_LAUNCHER_SOURCE, 0o755),
+    ("bin/codex-master-resource-monitor", 0o755),
     ("bin/codex-master-hive-hourly-probe", 0o755),
     (".codex-plugin/plugin.json", 0o644),
     (".mcp.json", 0o644),
@@ -30,6 +71,8 @@ _REQUIRED_FILES: tuple[tuple[str, int], ...] = (
     ("skills/codex-master-fleet/SKILL.md", 0o644),
     ("codex-hive.json", 0o644),
     ("codex-agent-classes.json", 0o644),
+    ("systemd/user/codex-master-resource-monitor.service", 0o644),
+    ("systemd/user/codex-master.slice", 0o644),
     (_RUNTIME_SPAWN_HELPER, 0o755),
     (_MANIFEST_NAME, 0o644),
 )
@@ -198,16 +241,22 @@ def _validate_metadata(root: Path) -> None:
     _exact_relative_reference(plugin.get("hooks"), "./hooks/hooks.json")
 
     mcp = _read_json_object(root, ".mcp.json")
+    if set(mcp) != {"mcpServers"}:
+        raise _invalid()
     servers = mcp.get("mcpServers")
-    if not isinstance(servers, dict):
+    if not isinstance(servers, dict) or set(servers) != {"codex-master-mcp"}:
         raise _invalid()
     server = servers.get("codex-master-mcp")
-    if not isinstance(server, dict):
+    if not isinstance(server, dict) or set(server) != {
+        "command", "args", "startup_timeout_sec", "note"
+    }:
         raise _invalid()
-    _exact_relative_reference(server.get("command"), "./bin/codex-master-mcp")
-    if server.get("args") != []:
-        raise _invalid()
-    if "cwd" in server and server["cwd"] != ".":
+    if (
+        server.get("command") != _STABLE_MCP_COMMAND
+        or server.get("args") != []
+        or server.get("startup_timeout_sec") != 120
+        or server.get("note") != _STABLE_MCP_NOTE
+    ):
         raise _invalid()
 
     apps = _read_json_object(root, ".app.json").get("apps")
@@ -222,7 +271,61 @@ def _validate_metadata(root: Path) -> None:
         raise _invalid()
 
 
-def _runtime_manifest_payload(root: Path) -> dict[str, object]:
+def _release_metadata(manifest: dict[str, object]) -> dict[str, object]:
+    expected_release = {
+        "stable_launchers": [
+            _STABLE_MCP_LAUNCHER_SOURCE,
+            "bin/codex-master-mcp",
+            "bin/codex-master-resource-monitor",
+        ],
+        "python_tree": "src/codex_master",
+        "monitor_entrypoint": "bin/codex-master-resource-monitor",
+        "h4_units": [
+            "systemd/user/codex-master-resource-monitor.service",
+            "systemd/user/codex-master.slice",
+        ],
+        "bind_sources": [
+            "bin/codex-master-resource-monitor", "src/codex_master",
+            "codex-agent-classes.json", "codex-hive.json",
+            "%h/.local/state/codex-master-mcp/hive",
+        ],
+    }
+    commit = manifest.get("commit")
+    generation = manifest.get("generation")
+    if (
+        not isinstance(commit, str)
+        or len(commit) != 40
+        or any(character not in "0123456789abcdef" for character in commit)
+        or not isinstance(generation, str)
+        or not generation
+        or "/" in generation
+        or generation in {".", ".."}
+        or manifest.get("f25_base_commit") != _F25_COMMIT
+        or manifest.get("d69") != {"commit": _F25_COMMIT, "parent": _C4_COMMIT}
+        or manifest.get("d69_paths") != list(_D69_RUNTIME_PATHS)
+        or manifest.get("d69_anchor") != {
+            "path": _D69_ANCHOR_PATH,
+            "sha256": _D69_ANCHOR_SHA256,
+        }
+        or manifest.get("f25_d69_source_sha256") != _F25_D69_SOURCE_SHA256
+        or manifest.get("f25_c4_subset_sha256") != _F25_C4_SUBSET_SHA256
+        or manifest.get("release") != expected_release
+    ):
+        raise _invalid()
+    return {
+        "commit": commit,
+        "f25_base_commit": _F25_COMMIT,
+        "generation": generation,
+        "d69": {"commit": _F25_COMMIT, "parent": _C4_COMMIT},
+        "d69_paths": list(_D69_RUNTIME_PATHS),
+        "d69_anchor": {"path": _D69_ANCHOR_PATH, "sha256": _D69_ANCHOR_SHA256},
+        "f25_d69_source_sha256": _F25_D69_SOURCE_SHA256,
+        "f25_c4_subset_sha256": _F25_C4_SUBSET_SHA256,
+        "release": expected_release,
+    }
+
+
+def _runtime_manifest_payload(root: Path, metadata: dict[str, object]) -> dict[str, object]:
     directories: dict[str, dict[str, int]] = {}
     files: dict[str, dict[str, object]] = {}
     for directory, child_directories, file_names in os.walk(root):
@@ -267,7 +370,7 @@ def _runtime_manifest_payload(root: Path) -> dict[str, object]:
                 "size": len(raw),
                 "sha256": hashlib.sha256(raw).hexdigest(),
             }
-    return {"schema_version": 1, "directories": directories, "files": files}
+    return {"schema_version": 2, **metadata, "directories": directories, "files": files}
 
 
 def _validated_manifest(root: Path, *, expected_digest: str | None = None) -> tuple[dict[str, object], str]:
@@ -279,7 +382,23 @@ def _validated_manifest(root: Path, *, expected_digest: str | None = None) -> tu
         manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
     except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise _invalid() from exc
-    if not isinstance(manifest, dict) or manifest != _runtime_manifest_payload(root):
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
+        raise _invalid()
+    metadata = _release_metadata(manifest)
+    expected = _runtime_manifest_payload(root, metadata)
+    if manifest != expected:
+        raise _invalid()
+    files = manifest.get("files")
+    expected_d69 = (
+        _F25_D69_SOURCE_SHA256
+        if metadata["commit"] == _F25_COMMIT
+        else {_D69_ANCHOR_PATH: _D69_ANCHOR_SHA256}
+    )
+    if not isinstance(files, dict) or any(
+        not isinstance(files.get(path), dict)
+        or files[path].get("sha256") != digest
+        for path, digest in expected_d69.items()
+    ):
         raise _invalid()
     return manifest, digest
 
@@ -392,6 +511,89 @@ class RuntimeLayout:
             root_inode=root_stat.st_ino,
             manifest_digest=manifest_digest,
         )
+
+    @classmethod
+    def from_current_release(
+        cls, release_root: Path, generation: str, manifest_digest: str
+    ) -> RuntimeLayout:
+        """Attest an explicit generation against the one atomic pointer pair."""
+
+        return cls._from_release_pointer(
+            release_root, generation, manifest_digest, pointer_name="current"
+        )
+
+    @classmethod
+    def from_previous_release(
+        cls, release_root: Path, generation: str, manifest_digest: str
+    ) -> RuntimeLayout:
+        """Attest an explicit rollback target against the same pointer pair."""
+
+        return cls._from_release_pointer(
+            release_root, generation, manifest_digest, pointer_name="previous"
+        )
+
+    @classmethod
+    def _from_release_pointer(
+        cls,
+        release_root: Path,
+        generation: str,
+        manifest_digest: str,
+        *,
+        pointer_name: str,
+    ) -> RuntimeLayout:
+
+        if (
+            not isinstance(release_root, Path)
+            or not isinstance(generation, str)
+            or not generation
+            or "/" in generation
+            or generation in {".", ".."}
+            or not isinstance(manifest_digest, str)
+        ):
+            raise _invalid()
+        _validate_root(release_root)
+        try:
+            raw = _read_regular_bytes(
+                release_root, _RELEASE_POINTERS_NAME, max_bytes=_MAX_METADATA_BYTES
+            )
+            pointers = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise _invalid() from exc
+        if (
+            not isinstance(pointers, dict)
+            or set(pointers) != {"schema_version", "current", "previous"}
+            or pointers.get("schema_version") != 1
+        ):
+            raise _invalid()
+        def attest(value: object) -> dict[str, object] | None:
+            if value is None:
+                return None
+            if not isinstance(value, dict) or set(value) != {"generation", "manifest_digest"}:
+                raise _invalid()
+            listed_generation = value.get("generation")
+            listed_digest = value.get("manifest_digest")
+            if (
+                not isinstance(listed_generation, str)
+                or not listed_generation
+                or "/" in listed_generation
+                or listed_generation in {".", ".."}
+                or not isinstance(listed_digest, str)
+            ):
+                raise _invalid()
+            layout = cls.from_runtime_root(
+                release_root / _RELEASE_GENERATIONS_NAME / listed_generation
+            )
+            if layout.manifest_digest != listed_digest:
+                raise _invalid()
+            return {"generation": listed_generation, "manifest_digest": listed_digest}
+        current = attest(pointers["current"])
+        previous = attest(pointers["previous"])
+        if pointer_name not in {"current", "previous"}:
+            raise _invalid()
+        selected = current if pointer_name == "current" else previous
+        if selected != {"generation": generation, "manifest_digest": manifest_digest}:
+            raise _invalid()
+        return cls.from_runtime_root(release_root / _RELEASE_GENERATIONS_NAME / generation)
 
     @classmethod
     def from_module_path(cls, module_path: Path) -> RuntimeLayout:

@@ -21554,6 +21554,386 @@ def _resource_monitor_read_sources(root: Path) -> dict[str, dict[str, Any]]:
     return sources
 
 
+_RESOURCE_MONITOR_RELEASE_ROOT_NAME = "codex-master-runtime"
+_RESOURCE_MONITOR_RELEASE_GENERATIONS_NAME = "generations"
+_RESOURCE_MONITOR_RELEASE_POINTERS_NAME = ".codex-master-release-pointers.json"
+_RESOURCE_MONITOR_RELEASE_PUBLISH_LOCK_NAME = ".codex-master-release-publish.lock"
+_RESOURCE_MONITOR_SERVICE_TEMPLATE = (
+    "systemd/user/codex-master-resource-monitor.service"
+)
+_RESOURCE_MONITOR_SLICE_TEMPLATE = "systemd/user/codex-master.slice"
+_RESOURCE_MONITOR_RELEASE_ATTESTED_PATHS = (
+    _RESOURCE_MONITOR_SERVICE_TEMPLATE,
+    _RESOURCE_MONITOR_SLICE_TEMPLATE,
+    "bin/codex-master-resource-monitor",
+    "codex-agent-classes.json",
+    "codex-hive.json",
+)
+_RESOURCE_MONITOR_RELEASE_UNIT_MODES = {
+    _RESOURCE_MONITOR_SERVICE_TEMPLATE: 0o644,
+    _RESOURCE_MONITOR_SLICE_TEMPLATE: 0o644,
+}
+_RESOURCE_MONITOR_GENERATION_TOKEN = "@MASTERJET_GENERATION@"
+_RESOURCE_MONITOR_MANIFEST_TOKEN = "@MASTERJET_MANIFEST_DIGEST@"
+
+
+@contextlib.contextmanager
+def _resource_monitor_release_read_lease() -> Iterator[None]:
+    """Hold the authority's existing publish lock without becoming a writer."""
+
+    descriptor = -1
+    try:
+        layout = _runtime_layout()
+        root = layout.root
+        generation = root.name
+        release_root = root.parent.parent
+        if (
+            not isinstance(root, Path)
+            or not root.is_absolute()
+            or root.parent.name != _RESOURCE_MONITOR_RELEASE_GENERATIONS_NAME
+            or release_root.name != _RESOURCE_MONITOR_RELEASE_ROOT_NAME
+            or not generation
+            or generation in {".", ".."}
+            or "/" in generation
+            or release_root / _RESOURCE_MONITOR_RELEASE_GENERATIONS_NAME / generation
+            != root
+        ):
+            raise ValueError("not a named Masterjet release")
+        lock = release_root / _RESOURCE_MONITOR_RELEASE_PUBLISH_LOCK_NAME
+        before = lock.lstat()
+        if (
+            not stat_module.S_ISREG(before.st_mode)
+            or stat_module.S_ISLNK(before.st_mode)
+            or getattr(before, "st_nlink", 1) != 1
+            or before.st_uid != os.geteuid()
+            or stat_module.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise ValueError("release publish lock invalid")
+        descriptor = os.open(
+            lock,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if not _resource_monitor_stat_matches_identity(
+            opened, _resource_monitor_stat_identity(before)
+        ):
+            raise ValueError("release publish lock changed")
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        after = lock.lstat()
+        held = os.fstat(descriptor)
+        if not _resource_monitor_stat_matches_identity(
+            held, _resource_monitor_stat_identity(before)
+        ) or not _resource_monitor_stat_matches_identity(
+            after, _resource_monitor_stat_identity(before)
+        ):
+            raise ValueError("release publish lock changed")
+    except (AgentError, AttributeError, OSError, TypeError, ValueError) as exc:
+        raise AgentError("resource_monitor_release_lease_invalid") from exc
+    try:
+        yield
+    finally:
+        if descriptor >= 0:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def _resource_monitor_current_release_layout() -> tuple[Any, Path, str]:
+    """Return only the server's still-current immutable release generation."""
+
+    from codex_master.runtime_layout import LayoutError, RuntimeLayout
+
+    try:
+        layout = _runtime_layout()
+        root = layout.root
+        generation = root.name
+        release_root = root.parent.parent
+        if (
+            not isinstance(root, Path)
+            or not root.is_absolute()
+            or root.parent.name != _RESOURCE_MONITOR_RELEASE_GENERATIONS_NAME
+            or release_root.name != _RESOURCE_MONITOR_RELEASE_ROOT_NAME
+            or not generation
+            or generation in {".", ".."}
+            or "/" in generation
+            or release_root / _RESOURCE_MONITOR_RELEASE_GENERATIONS_NAME / generation
+            != root
+        ):
+            raise ValueError("not a named Masterjet release")
+        current = RuntimeLayout.from_current_release(
+            release_root, generation, layout.manifest_digest
+        )
+        if (
+            current.root != root
+            or current.root_device != layout.root_device
+            or current.root_inode != layout.root_inode
+            or current.manifest_digest != layout.manifest_digest
+        ):
+            raise ValueError("release binding changed")
+        return current, release_root, generation
+    except (AgentError, AttributeError, LayoutError, TypeError, ValueError) as exc:
+        raise AgentError("resource_monitor_release_binding_invalid") from exc
+
+
+def _resource_monitor_previous_release_layout(
+    generation: str, manifest_digest: str
+) -> tuple[Any, Path]:
+    """Return a caller-named rollback target only when Previous attests it."""
+
+    from codex_master.runtime_layout import LayoutError, RuntimeLayout
+
+    _current, release_root, _current_generation = _resource_monitor_current_release_layout()
+    try:
+        previous = RuntimeLayout.from_previous_release(
+            release_root, generation, manifest_digest
+        )
+        if (
+            previous.root
+            != release_root / _RESOURCE_MONITOR_RELEASE_GENERATIONS_NAME / generation
+            or previous.manifest_digest != manifest_digest
+        ):
+            raise ValueError("previous release binding changed")
+        return previous, release_root
+    except (LayoutError, TypeError, ValueError) as exc:
+        raise AgentError("resource_monitor_previous_release_invalid") from exc
+
+
+def _resource_monitor_previous_release_binding() -> tuple[str, str] | None:
+    """Read the one pointer pair only to select a separately attested Previous."""
+
+    _current, release_root, _generation = _resource_monitor_current_release_layout()
+    pointer = release_root / _RESOURCE_MONITOR_RELEASE_POINTERS_NAME
+    try:
+        parent_stat = release_root.lstat()
+        pointer_stat = pointer.lstat()
+        if (
+            not stat_module.S_ISREG(pointer_stat.st_mode)
+            or getattr(pointer_stat, "st_nlink", 1) != 1
+            or pointer_stat.st_uid != os.geteuid()
+            or stat_module.S_IMODE(pointer_stat.st_mode) != 0o644
+        ):
+            raise ValueError("release pointer metadata invalid")
+        raw = read_private_regular_text(
+            pointer,
+            MAX_SYSTEMD_UNIT_BYTES,
+            "resource_monitor_previous_release_invalid",
+            expected_parent_stat=parent_stat,
+            expected_target_stat=pointer_stat,
+        )
+        value = json.loads(raw)
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"schema_version", "current", "previous"}
+            or value.get("schema_version") != 1
+        ):
+            raise ValueError("release pointer invalid")
+        previous = value["previous"]
+        if previous is None:
+            return None
+        if not isinstance(previous, dict) or set(previous) != {
+            "generation",
+            "manifest_digest",
+        }:
+            raise ValueError("previous release pointer invalid")
+        generation = previous["generation"]
+        digest = previous["manifest_digest"]
+        if (
+            not isinstance(generation, str)
+            or not generation
+            or generation in {".", ".."}
+            or "/" in generation
+            or not isinstance(digest, str)
+        ):
+            raise ValueError("previous release pointer invalid")
+        return generation, digest
+    except (AgentError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AgentError("resource_monitor_previous_release_invalid") from exc
+
+
+def _resource_monitor_render_service_template(
+    template: bytes, *, generation: str, manifest_digest: str
+) -> bytes:
+    """Render the one immutable release binding allowed in the monitor unit."""
+
+    try:
+        text = template.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AgentError("resource_monitor_release_template_invalid") from exc
+    if (
+        text.count(_RESOURCE_MONITOR_GENERATION_TOKEN) != 5
+        or text.count(_RESOURCE_MONITOR_MANIFEST_TOKEN) != 1
+        or "%h/codex-master/" in text
+        or "PYTHONPATH" in text
+    ):
+        raise AgentError("resource_monitor_release_template_invalid")
+    rendered = text.replace(_RESOURCE_MONITOR_GENERATION_TOKEN, generation).replace(
+        _RESOURCE_MONITOR_MANIFEST_TOKEN, manifest_digest
+    )
+    if re.search(r"@[A-Z0-9_]+@", rendered):
+        raise AgentError("resource_monitor_release_template_invalid")
+    release_path = (
+        f"%h/.local/lib/{_RESOURCE_MONITOR_RELEASE_ROOT_NAME}/generations/{generation}"
+    )
+    required_binds = (
+        f"{release_path}/bin/codex-master-resource-monitor:%h/.local/bin/codex-master-resource-monitor:norbind",
+        f"{release_path}/src:%h/.local/src:norbind",
+        f"{release_path}/codex-agent-classes.json:%h/.local/codex-agent-classes.json:norbind",
+        f"{release_path}/codex-hive.json:%h/.local/codex-hive.json:norbind",
+    )
+    expected_exec = (
+        f"ExecStart=%h/.local/bin/codex-master-resource-monitor "
+        f"%h/.local/lib/{_RESOURCE_MONITOR_RELEASE_ROOT_NAME} {generation} "
+        f"{manifest_digest}"
+    )
+    if (
+        any(bind not in rendered for bind in required_binds)
+        or expected_exec not in rendered
+        or "codex-master-resource-monitor %h/.local/lib/" not in rendered
+    ):
+        raise AgentError("resource_monitor_release_template_invalid")
+    return rendered.encode("utf-8")
+
+
+def _resource_monitor_read_release_sources() -> dict[str, dict[str, Any]]:
+    """Attest all H4 inputs before the unit transaction can open its target."""
+
+    from codex_master.runtime_layout import LayoutError, validate_runtime_metadata
+
+    layout, release_root, generation = _resource_monitor_current_release_layout()
+    try:
+        validate_runtime_metadata(layout)
+        payload = {
+            path: layout.read_attested_file(path)
+            for path in _RESOURCE_MONITOR_RELEASE_ATTESTED_PATHS
+        }
+    except (LayoutError, TypeError, ValueError) as exc:
+        raise AgentError("resource_monitor_release_source_invalid") from exc
+    service = _resource_monitor_render_service_template(
+        payload[_RESOURCE_MONITOR_SERVICE_TEMPLATE],
+        generation=generation,
+        manifest_digest=layout.manifest_digest,
+    )
+    refreshed, refreshed_root, refreshed_generation = _resource_monitor_current_release_layout()
+    if (
+        refreshed.root != layout.root
+        or refreshed.root_device != layout.root_device
+        or refreshed.root_inode != layout.root_inode
+        or refreshed.manifest_digest != layout.manifest_digest
+        or refreshed_root != release_root
+        or refreshed_generation != generation
+    ):
+        raise AgentError("resource_monitor_release_binding_invalid")
+    return {
+        RESOURCE_MONITOR_SERVICE_NAME: {
+            "bytes": service,
+            "mode": _RESOURCE_MONITOR_RELEASE_UNIT_MODES[
+                _RESOURCE_MONITOR_SERVICE_TEMPLATE
+            ],
+        },
+        RESOURCE_MONITOR_SLICE_NAME: {
+            "bytes": payload[_RESOURCE_MONITOR_SLICE_TEMPLATE],
+            "mode": _RESOURCE_MONITOR_RELEASE_UNIT_MODES[
+                _RESOURCE_MONITOR_SLICE_TEMPLATE
+            ],
+        },
+    }
+
+
+def _resource_monitor_read_previous_release_sources() -> dict[str, dict[str, Any]] | None:
+    """Attest rollback bytes from Previous; no unit snapshot is an authority."""
+
+    from codex_master.runtime_layout import LayoutError, validate_runtime_metadata
+
+    binding = _resource_monitor_previous_release_binding()
+    if binding is None:
+        return None
+    generation, manifest_digest = binding
+    previous, release_root = _resource_monitor_previous_release_layout(
+        generation, manifest_digest
+    )
+    try:
+        validate_runtime_metadata(previous)
+        payload = {
+            path: previous.read_attested_file(path)
+            for path in _RESOURCE_MONITOR_RELEASE_ATTESTED_PATHS
+        }
+    except (LayoutError, TypeError, ValueError) as exc:
+        raise AgentError("resource_monitor_previous_release_invalid") from exc
+    service = _resource_monitor_render_service_template(
+        payload[_RESOURCE_MONITOR_SERVICE_TEMPLATE],
+        generation=generation,
+        manifest_digest=manifest_digest,
+    )
+    refreshed, refreshed_root = _resource_monitor_previous_release_layout(
+        generation, manifest_digest
+    )
+    if (
+        refreshed.root != previous.root
+        or refreshed.root_device != previous.root_device
+        or refreshed.root_inode != previous.root_inode
+        or refreshed.manifest_digest != previous.manifest_digest
+        or refreshed_root != release_root
+    ):
+        raise AgentError("resource_monitor_previous_release_invalid")
+    return {
+        RESOURCE_MONITOR_SERVICE_NAME: {
+            "bytes": service,
+            "mode": _RESOURCE_MONITOR_RELEASE_UNIT_MODES[
+                _RESOURCE_MONITOR_SERVICE_TEMPLATE
+            ],
+        },
+        RESOURCE_MONITOR_SLICE_NAME: {
+            "bytes": payload[_RESOURCE_MONITOR_SLICE_TEMPLATE],
+            "mode": _RESOURCE_MONITOR_RELEASE_UNIT_MODES[
+                _RESOURCE_MONITOR_SLICE_TEMPLATE
+            ],
+        },
+    }
+
+
+def _resource_monitor_rollback_pair_kind(
+    directory_fd: int,
+    snapshots: Mapping[str, os.stat_result | None],
+    current_sources: Mapping[str, Mapping[str, Any]],
+    previous_sources: Mapping[str, Mapping[str, Any]] | None,
+) -> str:
+    """Accept only an absent, Current, or fully attested Previous unit pair."""
+
+    present = {name: snapshots.get(name) is not None for name in RESOURCE_MONITOR_UNIT_NAMES}
+    if not any(present.values()):
+        return "absent"
+    if not all(present.values()):
+        raise AgentError("resource_monitor_rollback_generation_required")
+
+    def matches(sources: Mapping[str, Mapping[str, Any]]) -> bool:
+        for name in RESOURCE_MONITOR_UNIT_NAMES:
+            expected = sources.get(name)
+            snapshot = snapshots.get(name)
+            if not isinstance(expected, Mapping):
+                return False
+            raw, current = _resource_monitor_read_regular_at_fd(
+                directory_fd, name, missing_ok=False
+            )
+            if (
+                raw != expected.get("bytes")
+                or current is None
+                or snapshot is None
+                or not _resource_monitor_stat_matches_identity(
+                    current, _resource_monitor_stat_identity(snapshot)
+                )
+                or stat_module.S_IMODE(current.st_mode) != expected.get("mode")
+            ):
+                return False
+        return True
+
+    if matches(current_sources):
+        return "current"
+    if previous_sources is not None and matches(previous_sources):
+        return "previous"
+    raise AgentError("resource_monitor_rollback_generation_required")
+
+
 def _resource_monitor_temp_bytes(
     directory_fd: int,
     name: str,
@@ -22333,14 +22713,13 @@ def _resource_monitor_rollback_result(
 
 def install_resource_monitor(
     *,
-    root: Path | None = None,
     systemd_user_dir: Path | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    root = root or repo_root()
     target_dir = systemd_user_dir or (Path.home() / ".config" / "systemd" / "user")
-    with install_lock() as lock_handle:
-        sources = _resource_monitor_read_sources(root)
+    with install_lock() as lock_handle, _resource_monitor_release_read_lease():
+        sources = _resource_monitor_read_release_sources()
+        previous_sources = _resource_monitor_read_previous_release_sources()
         directory_fd = -1
         snapshots: dict[str, os.stat_result | None] = {}
         journals: list[dict[str, Any]] = []
@@ -22356,20 +22735,12 @@ def install_resource_monitor(
             opened_target = os.fstat(directory_fd)
             target_identity = (opened_target.st_dev, opened_target.st_ino)
             snapshots = _resource_monitor_snapshot_targets(directory_fd)
+            rollback_pair = _resource_monitor_rollback_pair_kind(
+                directory_fd, snapshots, sources, previous_sources
+            )
             if not force:
-                for name, source in sources.items():
-                    if snapshots[name] is None:
-                        continue
-                    target_bytes, target_stat = _resource_monitor_read_regular_at_fd(
-                        directory_fd,
-                        name,
-                        missing_ok=False,
-                    )
-                    if (
-                        target_bytes != source["bytes"]
-                        or stat_module.S_IMODE(target_stat.st_mode) != source["mode"]
-                    ):
-                        raise AgentError("resource_monitor_target_stale_use_force")
+                if rollback_pair == "previous":
+                    raise AgentError("resource_monitor_target_stale_use_force")
             service_show = _resource_monitor_systemctl_show(
                 RESOURCE_MONITOR_SERVICE_NAME
             )
@@ -22378,24 +22749,25 @@ def install_resource_monitor(
                 if not show["ok"] and show["returncode"] not in {1}:
                     raise AgentError("resource_monitor_systemctl_unavailable")
             previous_service_state = _resource_monitor_previous_state(service_show)
-            for name, source in sources.items():
-                staged_name, staged_stat = _resource_monitor_temp_bytes(
-                    directory_fd,
-                    name,
-                    source["bytes"],
-                    source["mode"],
-                )
-                journals.append(
-                    _resource_monitor_new_journal(
-                        name, snapshots[name], staged_name, staged_stat
+            if rollback_pair != "current":
+                for name, source in sources.items():
+                    staged_name, staged_stat = _resource_monitor_temp_bytes(
+                        directory_fd,
+                        name,
+                        source["bytes"],
+                        source["mode"],
                     )
-                )
-            _resource_monitor_fsync_directory(directory_fd)
-            for journal in journals:
-                _resource_monitor_journal_mark(journal, "staged_durable")
-            for journal in journals:
-                mutation_started = True
-                _resource_monitor_mutate_unit(directory_fd, journal)
+                    journals.append(
+                        _resource_monitor_new_journal(
+                            name, snapshots[name], staged_name, staged_stat
+                        )
+                    )
+                _resource_monitor_fsync_directory(directory_fd)
+                for journal in journals:
+                    _resource_monitor_journal_mark(journal, "staged_durable")
+                for journal in journals:
+                    mutation_started = True
+                    _resource_monitor_mutate_unit(directory_fd, journal)
 
             try:
                 _resource_monitor_canonical_surface_check(

@@ -1,30 +1,46 @@
-#!/usr/bin/python3
-"""Run the centrally composed resource monitor without accepting roots."""
+#!/usr/bin/bash
+set -euo pipefail
 
-from __future__ import annotations
-
+(( $# == 3 )) || exit 64
+release_root="$1"
+generation="$2"
+manifest_digest="$3"
+for variable in "${!CODEX_@}"; do unset "${variable}"; done
+unset PYTHONHOME PYTHONPATH
+export PATH=/usr/bin:/bin
+exec /usr/bin/python3 -I -B -c '
 import sys
 from pathlib import Path
 
-
-def _load_run_resource_monitor():
-    repository_source = Path(__file__).resolve().parents[1] / "src"
-    if repository_source.is_dir():
-        sys.path.insert(0, str(repository_source))
+release_root = Path(sys.argv[1])
+generation = sys.argv[2]
+manifest_digest = sys.argv[3]
+if (
+    not release_root.is_absolute()
+    or not generation
+    or "/" in generation
+    or generation in {".", ".."}
+    or not manifest_digest.startswith("sha256:")
+    or len(manifest_digest) != 71
+    or any(character not in "0123456789abcdef" for character in manifest_digest[7:])
+):
+    raise SystemExit(64)
+candidate = release_root / "generations" / generation / "src"
+try:
+    # The bootstrap is used only to load the attester.  Application imports do
+    # not start until the returned layout has revalidated the current pointer.
+    sys.path.insert(0, str(candidate))
+    from codex_master.runtime_layout import RuntimeLayout
+    layout = RuntimeLayout.from_current_release(
+        release_root, generation, manifest_digest
+    )
+    if layout.root / "src" != candidate:
+        raise ValueError("release source mismatch")
+except Exception:
+    raise SystemExit(64)
+try:
     from codex_master.server import run_resource_monitor
-
-    return run_resource_monitor
-
-
-def main() -> int:
-    if len(sys.argv) != 1:
-        return 64
-    try:
-        _load_run_resource_monitor()()
-    except Exception:
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    run_resource_monitor()
+except Exception:
+    raise SystemExit(1)
+' "$release_root" "$generation" "$manifest_digest"

@@ -1,8 +1,10 @@
 #!/usr/bin/bash
 set -euo pipefail
 
-runtime_root="${BASH_SOURCE[0]%/bin/codex-master-hive-hourly-probe}"
-[[ "${runtime_root}" != "${BASH_SOURCE[0]}" && "${runtime_root}" == /* ]] || exit 64
+(( $# >= 3 )) || exit 64
+release_root="$1"
+generation="$2"
+manifest_digest="$3"
 for variable in "${!CODEX_@}"; do unset "${variable}"; done
 unset PYTHONHOME PYTHONPATH
 export PATH=/usr/bin:/bin
@@ -11,7 +13,27 @@ import runpy
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
-sys.path.insert(0, str(root / "src"))
-sys.argv = [str(root / "bin" / "codex-master-hive-hourly-probe"), *sys.argv[2:]]
+generation = sys.argv[2]
+manifest_digest = sys.argv[3]
+if (
+    not root.is_absolute()
+    or not generation
+    or "/" in generation
+    or generation in {".", ".."}
+    or not manifest_digest.startswith("sha256:")
+    or len(manifest_digest) != 71
+    or any(character not in "0123456789abcdef" for character in manifest_digest[7:])
+):
+    raise SystemExit(64)
+candidate = root / "generations" / generation / "src"
+try:
+    sys.path.insert(0, str(candidate))
+    from codex_master.runtime_layout import RuntimeLayout
+    layout = RuntimeLayout.from_current_release(root, generation, manifest_digest)
+except Exception:
+    raise SystemExit(64)
+if layout.root / "src" != candidate:
+    raise SystemExit(64)
+sys.argv = [str(layout.root / "bin" / "codex-master-hive-hourly-probe"), *sys.argv[4:]]
 runpy.run_module("codex_master.hive.hourly_probe", run_name="__main__", alter_sys=True)
-' "${runtime_root}" "$@"
+' "$release_root" "$generation" "$manifest_digest" "${@:4}"

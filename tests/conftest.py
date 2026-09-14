@@ -8,9 +8,10 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_TEST_MANIFEST_COMMIT = "a" * 40
 
 
-def seal_runtime_image(root: Path) -> None:
+def seal_runtime_image(root: Path, *, commit: str = _TEST_MANIFEST_COMMIT) -> None:
     """Add the real helper and canonical manifest to a private test image."""
 
     helper = root / "src" / "codex_master" / "_runtime_spawn_helper.so"
@@ -42,7 +43,7 @@ def seal_runtime_image(root: Path) -> None:
     installer = runpy.run_path(
         str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
     )
-    installer["_write_runtime_image_manifest"](root=root)
+    installer["_write_runtime_image_manifest"](root=root, commit=commit)
 
 
 @pytest.fixture(scope="session")
@@ -56,7 +57,9 @@ def runtime_image(tmp_path_factory: pytest.TempPathFactory):
     installer = runpy.run_path(
         str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
     )
-    installer["_build_runtime_image"](repository=ROOT, stage=stage)
+    installer["_build_runtime_image"](
+        repository=ROOT, stage=stage, commit=_TEST_MANIFEST_COMMIT
+    )
     return RuntimeLayout.from_runtime_root(stage)
 
 

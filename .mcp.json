@@ -1,8 +1,7 @@
 {
   "mcpServers": {
     "codex-master-mcp": {
-      "cwd": ".",
-      "command": "./bin/codex-master-mcp",
+      "command": "/home/teladi/.local/lib/codex-master-runtime/codex-master-mcp",
       "args": [],
       "startup_timeout_sec": 120,
       "note": "Local data-sparse Codex Masterjet MCP server. Controls the sleeping Agentinnen pool through tmux and does not return raw terminal output by default."

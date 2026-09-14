@@ -29,6 +29,7 @@ from codex_master.runtime_process import BoundedProcessError, BoundedProcessResu
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TEST_NON_F25_COMMIT = "a" * 40
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 
 
@@ -122,7 +123,11 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
         path.chmod(mode)
 
     write("bin/codex-master-mcp", "#!/bin/sh\nexit 0\n", 0o755)
+    write("bin/codex-master-mcp-stable", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/codex-master-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
+    write("bin/codex-master-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
+    write("systemd/user/codex-master-resource-monitor.service", "[Service]\n")
+    write("systemd/user/codex-master.slice", "[Slice]\n")
     write(
         ".codex-plugin/plugin.json",
         json.dumps(
@@ -142,8 +147,10 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
             {
                 "mcpServers": {
                     "codex-master-mcp": {
-                        "command": "./bin/codex-master-mcp",
+                        "command": "/home/teladi/.local/lib/codex-master-runtime/codex-master-mcp",
                         "args": [],
+                        "startup_timeout_sec": 120,
+                        "note": "Local data-sparse Codex Masterjet MCP server. Controls the sleeping Agentinnen pool through tmux and does not return raw terminal output by default.",
                     }
                 }
             }
@@ -154,10 +161,26 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     write("skills/codex-master-fleet/SKILL.md", "---\nname: codex-master-fleet\n---\n")
     write("codex-hive.json", "{}")
     write("codex-agent-classes.json", "{}")
+    for relative in (
+        "admission.py", "admission_runtime.py", "dynamic_pool.py", "hive/__init__.py",
+        "hive/admission.py", "hive/dispatch.py", "hive/principals.py", "selection.py",
+        "selection_service.py", "server.py",
+    ):
+        write(
+            f"src/codex_master/{relative}",
+            (ROOT / "src" / "codex_master" / relative).read_text(encoding="utf-8"),
+        )
     for path in root.rglob("*"):
         if path.is_dir():
             path.chmod(0o700)
     seal_runtime_image(root)
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
+    )
+    (root / ".codex-master-runtime-manifest.json").unlink()
+    installer["_write_runtime_image_manifest"](
+        root=root, commit=TEST_NON_F25_COMMIT
+    )
     return RuntimeLayout.from_runtime_root(root)
 
 
@@ -372,7 +395,28 @@ def test_run_probe_persists_only_one_schema_v2_health_record(
 def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    layout = runtime_layout(tmp_path)
+    stage = runtime_layout(tmp_path)
+    release_root = tmp_path / "release-root"
+    generations = release_root / "generations"
+    release_root.mkdir(mode=0o700)
+    generations.mkdir(mode=0o700)
+    generation = json.loads(
+        (stage.root / ".codex-master-runtime-manifest.json").read_text(encoding="utf-8")
+    )["generation"]
+    assert isinstance(generation, str)
+    target = generations / generation
+    os.replace(stage.root, target)
+    pointers = {
+        "schema_version": 1,
+        "current": {"generation": generation, "manifest_digest": stage.manifest_digest},
+        "previous": None,
+    }
+    pointer = release_root / ".codex-master-release-pointers.json"
+    pointer.write_text(json.dumps(pointers), encoding="utf-8")
+    pointer.chmod(0o644)
+    layout = RuntimeLayout.from_current_release(
+        release_root, generation, stage.manifest_digest
+    )
     status_layouts: list[RuntimeLayout] = []
     bounded_commands: list[tuple[tuple[str, ...], str]] = []
 
@@ -384,9 +428,10 @@ def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics
         _layout: RuntimeLayout, _command: Path, *arguments: str, phase: str
     ) -> tuple[dict[str, object], bool]:
         bounded_commands.append((arguments, phase))
-        if arguments == ("hive", "status"):
+        binding = (str(release_root), generation, layout.manifest_digest)
+        if arguments == (*binding, "hive", "status"):
             return green_hive_runtime(), True
-        assert arguments == ("hive", "doctor")
+        assert arguments == (*binding, "hive", "doctor")
         return (
             {
                 "healthy": True,
@@ -410,8 +455,8 @@ def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics
 
     assert status_layouts == [layout]
     assert bounded_commands == [
-        (("hive", "status"), "hive_status"),
-        (("hive", "doctor"), "hive_doctor"),
+        ((str(release_root), generation, layout.manifest_digest, "hive", "status"), "hive_status"),
+        ((str(release_root), generation, layout.manifest_digest, "hive", "doctor"), "hive_doctor"),
     ]
     assert result["commands"]["runtime_status"] is True
 
@@ -492,8 +537,9 @@ def test_hourly_probe_unit_runs_only_the_runtime_image_entrypoint() -> None:
     assert "%h/codex-master/bin/codex-master-mcp" not in service_text
     assert "%h/codex-master/codex-agent-classes.json" not in service_text
     assert "%h/codex-master/codex-hive.json" not in service_text
+    assert "%h/.local/lib/codex-master-runtime:%h/.local/lib/codex-master-runtime:norbind" not in service_text
     assert (
-        "%h/.local/lib/codex-master-runtime:%h/.local/lib/codex-master-runtime:norbind"
+        "%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@:%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@:norbind"
         in service_text
     )
     assert (
@@ -501,7 +547,7 @@ def test_hourly_probe_unit_runs_only_the_runtime_image_entrypoint() -> None:
         in service_text
     )
     assert (
-        "ExecStart=%h/.local/lib/codex-master-runtime/bin/codex-master-hive-hourly-probe --json"
+        "ExecStart=%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@/bin/codex-master-hive-hourly-probe %h/.local/lib/codex-master-runtime @MASTERJET_GENERATION@ @MASTERJET_MANIFEST_DIGEST@ --json"
         in service_text
     )
     assert "libexec" not in service_text
@@ -534,14 +580,20 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
 ) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
-    installed = subprocess.run(
-        [ROOT / "scripts" / "codex-master-hive-hourly-probe-install", "--home", home],
-        check=False,
-        capture_output=True,
-        text=True,
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
     )
-    assert installed.returncode == 0, installed.stderr
-    runtime_root = home / ".local" / "lib" / "codex-master-runtime"
+    installer["install"].__globals__["_verified_release_commit"] = lambda _repository: (  # type: ignore[index]
+        "a" * 40
+    )
+    installed = installer["install"](home=home)  # type: ignore[operator]
+    assert installed["status"] == "installed"
+    release_root = home / ".local" / "lib" / "codex-master-runtime"
+    pointers = json.loads(
+        (release_root / ".codex-master-release-pointers.json").read_text(encoding="utf-8")
+    )
+    generation = pointers["current"]["generation"]
+    runtime_root = release_root / "generations" / generation
     entrypoint = runtime_root / "bin" / "codex-master-hive-hourly-probe"
     entrypoint_stat = entrypoint.lstat()
     assert stat.S_ISREG(entrypoint_stat.st_mode)
@@ -572,6 +624,14 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         f"TimeoutStartSec={math.ceil(hourly_probe_module.RUNTIME_IMAGE_PROBE_TOTAL_TIMEOUT_SECONDS)}s"
         in installed_service.read_text(encoding="utf-8")
     )
+    installed_service_text = installed_service.read_text(encoding="utf-8")
+    assert "@MASTERJET_" not in installed_service_text
+    assert (
+        "ExecStart=%h/.local/lib/codex-master-runtime/generations/"
+        f"{generation}/bin/codex-master-hive-hourly-probe "
+        "%h/.local/lib/codex-master-runtime "
+        f"{generation} {installed['manifest_digest']} --json"
+    ) in installed_service_text
     installed_cli = runtime_root / "bin" / "codex-master-mcp"
     installed_source = (
         runtime_root / "src" / "codex_master" / "hive" / "hourly_probe.py"
@@ -600,6 +660,7 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         assert not path.is_symlink()
         assert stat.S_IMODE(item.st_mode) == mode
     assert not any(path.is_symlink() for path in runtime_root.rglob("*"))
+    assert stat.S_IMODE(release_root.lstat().st_mode) == 0o700
     assert stat.S_IMODE(runtime_root.lstat().st_mode) == 0o700
     for path in runtime_root.rglob("*"):
         item = path.lstat()
@@ -622,7 +683,7 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         "CODEX_MASTER_MCP_STATE": str(tmp_path / "attacker-state"),
     }
     completed = subprocess.run(
-        [entrypoint, "--json"],
+        [entrypoint, release_root, generation, installed["manifest_digest"], "--json"],
         check=False,
         capture_output=True,
         text=True,
@@ -632,7 +693,14 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     assert completed.returncode in {0, 1}, completed.stderr
     assert set(json.loads(completed.stdout)) == {"checks"}
     runtime_status = subprocess.run(
-        [installed_cli, "hive", "runtime-status"],
+        [
+            installed_cli,
+            release_root,
+            generation,
+            installed["manifest_digest"],
+            "hive",
+            "runtime-status",
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -642,7 +710,7 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     assert runtime_status.returncode == 0, runtime_status.stderr
     assert json.loads(runtime_status.stdout)["ok"] is True
     direct_mcp = subprocess.run(
-        [installed_cli],
+        [installed_cli, release_root, generation, installed["manifest_digest"]],
         check=False,
         capture_output=True,
         input=(
@@ -685,8 +753,8 @@ def test_stage_validation_uses_the_shared_hive_diagnostic_budget(
     monkeypatch.setattr(
         installer["hourly_probe"], "HIVE_DIAGNOSTIC_TIMEOUT_SECONDS", 7.25
     )
-    installer["_validate_runtime_image_stage"].__globals__["runtime_status"] = (
-        lambda *, layout, home: {"ok": True}
+    installer["_validate_runtime_image_stage"].__globals__["_mcp_surface"] = (
+        lambda *_args: {"ok": True}
     )
 
     def bounded(*_args: object, timeout_seconds: float, **_kwargs: object) -> object:
@@ -697,7 +765,7 @@ def test_stage_validation_uses_the_shared_hive_diagnostic_budget(
 
     installer["_validate_runtime_image_stage"](stage=layout.root, home=home)
 
-    assert observed_timeouts == [7.25, 7.25]
+    assert observed_timeouts == [7.25, 7.25, 7.25]
 
 
 def test_hourly_probe_from_a_complete_image_checks_runtime_status_without_recursion(
@@ -712,10 +780,39 @@ def test_hourly_probe_from_a_complete_image_checks_runtime_status_without_recurs
         "LANG": "C.UTF-8",
         "PATH": "/usr/bin:/bin",
     }
+    release_root = tmp_path / "codex-master-runtime"
+    generations = release_root / "generations"
+    release_root.mkdir(mode=0o700)
+    generations.mkdir(mode=0o700)
+    generation = json.loads(
+        (runtime_image.root / ".codex-master-runtime-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )["generation"]
+    assert isinstance(generation, str)
+    target = generations / generation
+    os.replace(runtime_image.root, target)
+    pointers = {
+        "schema_version": 1,
+        "current": {
+            "generation": generation,
+            "manifest_digest": runtime_image.manifest_digest,
+        },
+        "previous": None,
+    }
+    pointer = release_root / ".codex-master-release-pointers.json"
+    pointer.write_text(json.dumps(pointers), encoding="utf-8")
+    pointer.chmod(0o644)
 
     try:
         completed = subprocess.run(
-            [runtime_image.root / "bin" / "codex-master-hive-hourly-probe", "--json"],
+            [
+                target / "bin" / "codex-master-hive-hourly-probe",
+                release_root,
+                generation,
+                runtime_image.manifest_digest,
+                "--json",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -807,7 +904,10 @@ def test_manifest_failure_never_unlinks_a_swapped_foreign_manifest_tempfile(
     install_error = installer["InstallError"]
     root = tmp_path / "runtime-image"
     root.mkdir(mode=0o700)
-    (root / "payload").write_text("runtime payload\n", encoding="utf-8")
+    installer["_build_runtime_image"](
+        repository=ROOT, stage=root, commit=TEST_NON_F25_COMMIT
+    )
+    (root / ".codex-master-runtime-manifest.json").unlink()
     displaced_private_temp = tmp_path / "displaced-private-manifest-temp"
     foreign_sentinel = b"foreign manifest sentinel\n"
     swapped: list[Path] = []
@@ -823,7 +923,9 @@ def test_manifest_failure_never_unlinks_a_swapped_foreign_manifest_tempfile(
     monkeypatch.setattr(installer["os"], "replace", swap_then_fail)
 
     with pytest.raises(install_error, match="install_target_untrusted"):
-        installer["_write_runtime_image_manifest"](root=root)
+        installer["_write_runtime_image_manifest"](
+            root=root, commit=TEST_NON_F25_COMMIT
+        )
 
     assert len(swapped) == 1
     assert swapped[0].read_bytes() == foreign_sentinel
@@ -853,17 +955,6 @@ def test_runtime_spawn_helper_build_fails_closed_before_image_publication(
     assert not (stage / "src" / "codex_master" / "_runtime_spawn_helper.so").exists()
 
 
-def _sealed_publish_image(
-    installer: dict[str, object], root: Path, marker: str
-) -> Path:
-    root.mkdir(mode=0o700)
-    payload = root / marker
-    payload.write_text(marker + "\n", encoding="utf-8")
-    payload.chmod(0o644)
-    installer["_write_runtime_image_manifest"](root=root)  # type: ignore[operator]
-    return root
-
-
 def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen_home(
     tmp_path: Path,
 ) -> None:
@@ -875,9 +966,6 @@ def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen
     _write_authorized_queen_registry(home)
     library = home / ".local" / "lib"
     library.mkdir(mode=0o700, parents=True)
-    old_image = library / "codex-master-runtime"
-    old_image.mkdir(mode=0o700)
-    (old_image / "old-generation").write_text("old\n", encoding="utf-8")
     legacy_root = library / "codex-master-hive-probe"
     legacy_root.mkdir(mode=0o700)
     legacy_marker = legacy_root / "foreign-marker"
@@ -891,14 +979,20 @@ def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen
     legacy_bin.parent.mkdir(mode=0o700, parents=True)
     legacy_bin.symlink_to(foreign_bin_target)
 
+    installer["install"].__globals__["_verified_release_commit"] = lambda _repository: (  # type: ignore[index]
+        "a" * 40
+    )
     result = installer["install"](home=home)
 
     runtime_root = library / "codex-master-runtime"
-    displaced = list(library.glob(".codex-master-runtime.stage.*"))
-    assert result == {"status": "installed", "raw_output": "not_returned"}
-    assert (runtime_root / "bin" / "codex-master-mcp").is_file()
-    assert len(displaced) == 1
-    assert (displaced[0] / "old-generation").read_text(encoding="utf-8") == "old\n"
+    generation = result["generation"]
+    assert result["status"] == "installed"
+    assert result["raw_output"] == "not_returned"
+    assert isinstance(generation, str)
+    assert (runtime_root / "generations" / generation / "bin" / "codex-master-mcp").is_file()
+    assert RuntimeLayout.from_current_release(
+        runtime_root, generation, result["manifest_digest"]
+    ).root == runtime_root / "generations" / generation
     assert legacy_marker.read_text(encoding="utf-8") == "legacy root\n"
     assert legacy_libexec.read_text(encoding="utf-8") == "legacy libexec\n"
     assert legacy_bin.is_symlink()
@@ -985,9 +1079,10 @@ def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
     )
     stage = tmp_path / "stage"
     stage.mkdir(mode=0o700)
-    installer["_build_runtime_image"](repository=ROOT, stage=stage)
+    installer["_build_runtime_image"](
+        repository=ROOT, stage=stage, commit=TEST_NON_F25_COMMIT
+    )
     observed: list[tuple[str, ...]] = []
-    status_calls: list[tuple[RuntimeLayout, Path]] = []
 
     class Completed:
         def __init__(self, returncode: int, stdout: str) -> None:
@@ -998,65 +1093,65 @@ def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
         observed.append(tuple(command))
         return Completed(0, json.dumps({"status": "ready"}))
 
-    def status(*, layout: RuntimeLayout, home: Path) -> dict[str, object]:
-        status_calls.append((layout, home))
-        return {"ok": True}
-
     monkeypatch.setitem(
         installer["_validate_runtime_image_stage"].__globals__, "run_bounded", run
     )
     monkeypatch.setitem(
-        installer["_validate_runtime_image_stage"].__globals__, "runtime_status", status
+        installer["_validate_runtime_image_stage"].__globals__, "_mcp_surface", lambda *_args: {"ok": True}
     )
     installer["_validate_runtime_image_stage"](stage=stage, home=tmp_path / "home")
 
-    entrypoint = str(stage / "bin" / "codex-master-mcp")
+    stage_server = (
+        "import runpy, sys\n"
+        "from pathlib import Path\n"
+        "root = Path(sys.argv[1])\n"
+        "sys.path.insert(0, str(root / 'src'))\n"
+        "sys.argv = [str(root / 'src' / 'codex_master' / 'server.py'), *sys.argv[2:]]\n"
+        "runpy.run_module('codex_master.server', run_name='__main__', alter_sys=True)\n"
+    )
     assert observed == [
-        (entrypoint, "hive", "status"),
-        (entrypoint, "hive", "doctor"),
+        ("/usr/bin/python3", "-I", "-B", "-c", stage_server, str(stage), "--runtime-status-mcp"),
+        ("/usr/bin/python3", "-I", "-B", "-c", stage_server, str(stage), "hive", "status"),
+        ("/usr/bin/python3", "-I", "-B", "-c", stage_server, str(stage), "hive", "doctor"),
     ]
-    assert status_calls == [(RuntimeLayout.from_runtime_root(stage), tmp_path / "home")]
 
 
-def test_runtime_image_publish_failure_leaves_the_previous_complete_image_untouched(
+def test_named_runtime_generation_publish_failure_keeps_the_attested_current_pointer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     installer = runpy.run_path(
         str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
     )
-    install_error = installer["InstallError"]
-    library = tmp_path / "lib"
-    library.mkdir(mode=0o700)
-    target = _sealed_publish_image(
-        installer, library / "codex-master-runtime", "old-complete-image"
+    release_root = tmp_path / "codex-master-runtime"
+    first = tmp_path / ".codex-master-runtime.stage.first"
+    first.mkdir(mode=0o700)
+    installer["_build_runtime_image"](
+        repository=ROOT, stage=first, generation="first", commit=TEST_NON_F25_COMMIT
     )
-    stage = _sealed_publish_image(
-        installer, library / ".codex-master-runtime.stage.test", "new-complete-image"
+    installer["_publish_runtime_generation"](stage=first, release_root=release_root)
+    old_pointers = (release_root / ".codex-master-release-pointers.json").read_bytes()
+    second = tmp_path / ".codex-master-runtime.stage.second"
+    second.mkdir(mode=0o700)
+    installer["_build_runtime_image"](
+        repository=ROOT, stage=second, generation="second", commit=TEST_NON_F25_COMMIT
     )
 
-    def renameat2(*_args: object) -> int:
-        return -1
+    def fail_pointer(*_args: object, **_kwargs: object) -> None:
+        raise installer["InstallError"]("install_release_pointer_write_failed")
 
-    class FailedExchange:
-        pass
-
-    failed_exchange = FailedExchange()
-    failed_exchange.renameat2 = renameat2  # type: ignore[attr-defined]
-    monkeypatch.setattr(
-        installer["ctypes"], "CDLL", lambda *_args, **_kwargs: failed_exchange
+    monkeypatch.setitem(
+        installer["_publish_runtime_generation"].__globals__,
+        "_write_release_pointers",
+        fail_pointer,
     )
-    monkeypatch.setattr(installer["ctypes"], "get_errno", lambda: errno.EIO)
+    with pytest.raises(installer["InstallError"], match="install_release_pointer_write_failed"):
+        installer["_publish_runtime_generation"](stage=second, release_root=release_root)
 
-    with pytest.raises(install_error, match="install_swap_failed"):
-        installer["_publish_runtime_image"](stage=stage, target=target)
-
-    assert (target / "old-complete-image").read_text(
-        encoding="utf-8"
-    ) == "old-complete-image\n"
-    assert not (target / "new-complete-image").exists()
-    assert (stage / "new-complete-image").read_text(
-        encoding="utf-8"
-    ) == "new-complete-image\n"
+    assert (release_root / ".codex-master-release-pointers.json").read_bytes() == old_pointers
+    current = json.loads(old_pointers)["current"]
+    assert RuntimeLayout.from_current_release(
+        release_root, current["generation"], current["manifest_digest"]
+    ).root == release_root / "generations" / "first"
 
 
 def test_runtime_image_build_failure_never_publishes_a_partial_stage(
@@ -1081,7 +1176,9 @@ def test_runtime_image_build_failure_never_publishes_a_partial_stage(
         installer["_build_runtime_image"].__globals__, "_install_regular", fail_copy
     )
     with pytest.raises(install_error, match="install_source_untrusted"):
-        installer["_build_runtime_image"](repository=ROOT, stage=stage)
+        installer["_build_runtime_image"](
+            repository=ROOT, stage=stage, commit=TEST_NON_F25_COMMIT
+        )
 
     assert (target / "old-complete-image").read_text(encoding="utf-8") == "old\n"
     assert not (target / "new-complete-image").exists()

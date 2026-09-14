@@ -537,6 +537,37 @@ def _runtime_status_json(layout: RuntimeLayout) -> tuple[dict[str, Any], bool]:
     return (value, value.get("ok") is True)
 
 
+def _current_release_binding(layout: RuntimeLayout) -> tuple[RuntimeLayout, Path, str]:
+    """Return one still-Current immutable generation for productive probes."""
+
+    root = layout.root
+    generation = root.name
+    release_root = root.parent.parent
+    if (
+        not root.is_absolute()
+        or root.parent.name != "generations"
+        or not generation
+        or generation in {".", ".."}
+        or "/" in generation
+        or release_root / "generations" / generation != root
+    ):
+        raise ValueError("probe_runtime_release_unavailable")
+    try:
+        current = RuntimeLayout.from_current_release(
+            release_root, generation, layout.manifest_digest
+        )
+    except (LayoutError, TypeError, ValueError) as exc:
+        raise ValueError("probe_runtime_release_unavailable") from exc
+    if (
+        current.root != root
+        or current.root_device != layout.root_device
+        or current.root_inode != layout.root_inode
+        or current.manifest_digest != layout.manifest_digest
+    ):
+        raise ValueError("probe_runtime_release_unavailable")
+    return current, release_root, generation
+
+
 def run_probe(
     *,
     layout: RuntimeLayout | None = None,
@@ -555,25 +586,30 @@ def run_probe(
     if not isinstance(active_layout, RuntimeLayout):
         raise ValueError("probe_runtime_layout_unavailable")
     state_directory = _state_directory(state_directory or _probe_state_root())
-    runtime, runtime_command = _runtime_status_json(active_layout)
-    if runner is None:
+    if runner is not None:
+        runtime, runtime_command = _runtime_status_json(active_layout)
+        hive, hive_command = runner(active_layout.mcp_entrypoint, "hive", "status")
+        doctor, doctor_command = runner(active_layout.mcp_entrypoint, "hive", "doctor")
+    else:
+        current_layout, release_root, generation = _current_release_binding(active_layout)
+        runtime, runtime_command = _runtime_status_json(current_layout)
+        binding = (str(release_root), generation, current_layout.manifest_digest)
         hive, hive_command = _run_json(
-            active_layout,
-            active_layout.mcp_entrypoint,
+            current_layout,
+            current_layout.mcp_entrypoint,
+            *binding,
             "hive",
             "status",
             phase="hive_status",
         )
         doctor, doctor_command = _run_json(
-            active_layout,
-            active_layout.mcp_entrypoint,
+            current_layout,
+            current_layout.mcp_entrypoint,
+            *binding,
             "hive",
             "doctor",
             phase="hive_doctor",
         )
-    else:
-        hive, hive_command = runner(active_layout.mcp_entrypoint, "hive", "status")
-        doctor, doctor_command = runner(active_layout.mcp_entrypoint, "hive", "doctor")
     result = evaluate(runtime, hive, doctor)
     moment = (now or (lambda: datetime.now(UTC)))()
     if (

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-import hashlib
 import importlib
 import json
-import os
 from pathlib import Path
-import stat
+import runpy
 
 import pytest
 
@@ -29,11 +27,15 @@ def materialize_runtime_image(tmp_path: Path) -> Path:
     root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     root.mkdir(mode=0o700)
     _write_file(root / "bin" / "codex-master-mcp", "#!/bin/sh\nexit 0\n", 0o755)
+    _write_file(root / "bin" / "codex-master-mcp-stable", "#!/bin/sh\nexit 0\n", 0o755)
     _write_file(
         root / "bin" / "codex-master-hive-hourly-probe",
         "#!/bin/sh\nexit 0\n",
         0o755,
     )
+    _write_file(root / "bin" / "codex-master-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
+    _write_file(root / "systemd" / "user" / "codex-master-resource-monitor.service", "[Service]\n")
+    _write_file(root / "systemd" / "user" / "codex-master.slice", "[Slice]\n")
     _write_file(
         root / ".codex-plugin" / "plugin.json",
         json.dumps(
@@ -53,8 +55,10 @@ def materialize_runtime_image(tmp_path: Path) -> Path:
             {
                 "mcpServers": {
                     "codex-master-mcp": {
-                        "command": "./bin/codex-master-mcp",
+                        "command": "/home/teladi/.local/lib/codex-master-runtime/codex-master-mcp",
                         "args": [],
+                        "startup_timeout_sec": 120,
+                        "note": "Local data-sparse Codex Masterjet MCP server. Controls the sleeping Agentinnen pool through tmux and does not return raw terminal output by default.",
                     }
                 }
             }
@@ -67,30 +71,22 @@ def materialize_runtime_image(tmp_path: Path) -> Path:
     _write_file(root / "codex-agent-classes.json", json.dumps({"schema_version": 1, "classes": []}))
     _write_file(root / "src" / "codex_master" / "_runtime_spawn_helper.so", "test helper", 0o755)
     _write_file(root / "src" / "codex_master" / "hive" / "cli.py", "# image module\n")
+    for relative in (
+        "admission.py", "admission_runtime.py", "dynamic_pool.py", "hive/__init__.py",
+        "hive/admission.py", "hive/dispatch.py", "hive/principals.py", "selection.py",
+        "selection_service.py", "server.py",
+    ):
+        _write_file(
+            root / "src" / "codex_master" / relative,
+            (Path(__file__).resolve().parents[1] / "src" / "codex_master" / relative).read_text(encoding="utf-8"),
+        )
     for path in root.rglob("*"):
         if path.is_dir():
             path.chmod(0o700)
-    directories: dict[str, dict[str, int]] = {}
-    files: dict[str, dict[str, object]] = {}
-    for directory, _child_directories, file_names in os.walk(root):
-        current = Path(directory)
-        relative = current.relative_to(root).as_posix() if current != root else "."
-        info = current.lstat()
-        directories[relative] = {"mode": stat.S_IMODE(info.st_mode), "nlink": info.st_nlink}
-        for name in file_names:
-            path = current / name
-            raw = path.read_bytes()
-            item = path.lstat()
-            files[path.relative_to(root).as_posix()] = {
-                "mode": stat.S_IMODE(item.st_mode),
-                "nlink": item.st_nlink,
-                "size": len(raw),
-                "sha256": hashlib.sha256(raw).hexdigest(),
-            }
-    _write_file(
-        root / ".codex-master-runtime-manifest.json",
-        json.dumps({"schema_version": 1, "directories": directories, "files": files}),
+    installer = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "scripts" / "codex-master-hive-hourly-probe-install")
     )
+    installer["_write_runtime_image_manifest"](root=root, commit="a" * 40)
     return root
 
 
@@ -315,6 +311,26 @@ def test_runtime_layout_rejects_legacy_python_mcp_manifest_commands(tmp_path: Pa
         ),
         encoding="utf-8",
     )
+
+    with pytest.raises(module.LayoutError):
+        module.RuntimeLayout.from_runtime_root(root)
+
+
+def test_runtime_layout_requires_the_external_stable_mcp_launcher_shape(
+    tmp_path: Path,
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    mcp_path = root / ".mcp.json"
+    payload = json.loads(mcp_path.read_text(encoding="utf-8"))
+    payload["mcpServers"]["codex-master-mcp"]["cwd"] = "/tmp/attacker"
+    mcp_path.write_text(json.dumps(payload), encoding="utf-8")
+    installer = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "scripts" / "codex-master-hive-hourly-probe-install")
+    )
+    (root / ".codex-master-runtime-manifest.json").unlink()
+    installer["_write_runtime_image_manifest"](root=root, commit="a" * 40)
 
     with pytest.raises(module.LayoutError):
         module.RuntimeLayout.from_runtime_root(root)

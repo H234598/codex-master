@@ -393,12 +393,14 @@ def test_resource_monitor_unit_checks_readonly_and_readwrite_paths_separately() 
     ]
     assert all(not path.startswith("/sys") for path in directives["ReadOnlyPaths"].split())
     assert directives["BindReadOnlyPaths"].split() == [
-        "%h/codex-master/bin/codex-master-resource-monitor:%h/.local/bin/codex-master-resource-monitor:norbind",
-        "%h/codex-master/src:%h/.local/src:norbind",
-        "%h/codex-master/codex-agent-classes.json:%h/.local/codex-agent-classes.json:norbind",
-        "%h/codex-master/codex-hive.json:%h/.local/codex-hive.json:norbind",
+        "%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@/bin/codex-master-resource-monitor:%h/.local/bin/codex-master-resource-monitor:norbind",
+        "%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@/src:%h/.local/src:norbind",
+        "%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@/codex-agent-classes.json:%h/.local/codex-agent-classes.json:norbind",
+        "%h/.local/lib/codex-master-runtime/generations/@MASTERJET_GENERATION@/codex-hive.json:%h/.local/codex-hive.json:norbind",
         "%h/.local/state/codex-master-mcp/hive:%h/.local/state/codex-master-mcp/hive:norbind",
     ]
+    assert "%h/codex-master" not in service.read_text(encoding="utf-8")
+    assert "plugin-cache" not in service.read_text(encoding="utf-8")
     assert directives["ReadWritePaths"].split() == [
         "%h/.local/state/codex-master-mcp/hive/resources",
         "%h/.local/state/codex-master-mcp/hive/.hive-state.lock",
@@ -413,49 +415,33 @@ def test_resource_monitor_unit_uses_absolute_exec_and_declares_default_target_in
     assert entrypoint.is_file()
     text = service.read_text(encoding="utf-8")
     directives = _resource_monitor_unit_directives(text)
-    assert directives["ExecStart"] == "%h/.local/bin/codex-master-resource-monitor"
+    assert directives["ExecStart"] == (
+        "%h/.local/bin/codex-master-resource-monitor "
+        "%h/.local/lib/codex-master-runtime "
+        "@MASTERJET_GENERATION@ @MASTERJET_MANIFEST_DIGEST@"
+    )
     assert directives["ExecStart"].startswith("%h/")
-    assert " " not in directives["ExecStart"]
     assert "[Install]" in text
     assert directives["WantedBy"] == "default.target"
     assert "systemctl" not in text
     assert "Environment=" not in text
     assert entrypoint.stat().st_mode & 0o111
     entrypoint_text = entrypoint.read_text(encoding="utf-8")
-    assert entrypoint_text.startswith("#!/usr/bin/python3\n")
+    assert entrypoint_text.startswith("#!/usr/bin/bash\n")
+    assert "RuntimeLayout.from_current_release" in entrypoint_text
     assert "run_resource_monitor" in entrypoint_text
-    assert "state-root" not in entrypoint_text
-    assert "runtime-root" not in entrypoint_text
+    assert "__file__" not in entrypoint_text
+    assert "PYTHONPATH" in entrypoint_text
 
 
-def test_resource_monitor_entrypoint_loads_real_server_from_foreign_cwd_in_isolated_mode_without_starting_monitor(
+def test_resource_monitor_entrypoint_rejects_all_legacy_noarg_paths(
     tmp_path: Path,
 ) -> None:
     entrypoint = Path(__file__).resolve().parents[1] / "bin" / "codex-master-resource-monitor"
-    probe = (
-        "import runpy, sys\n"
-        f"namespace = runpy.run_path({str(entrypoint)!r}, run_name='resource_monitor_import_probe')\n"
-        "target = namespace['_load_run_resource_monitor']()\n"
-        "assert target.__module__ == 'codex_master.server'\n"
-        "assert sys.modules['codex_master.server'].run_resource_monitor is target\n"
-    )
-    imported = subprocess.run(
-        ["/usr/bin/python3", "-I", "-c", probe],
-        cwd=tmp_path,
-        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert imported.returncode == 0
-    assert imported.stdout == ""
-    assert imported.stderr == ""
-
     completed = subprocess.run(
-        ["/usr/bin/python3", "-I", str(entrypoint), "unexpected-argument"],
+        [entrypoint],
         cwd=tmp_path,
-        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin", "PYTHONPATH": str(tmp_path)},
         check=False,
         capture_output=True,
         text=True,
