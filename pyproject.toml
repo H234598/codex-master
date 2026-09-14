@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "codex-master"
+name = "the-hive"
 version = "0.10.5"
 description = "Local MCP wrapper for controlling a sleeping Codex Agentinnen pool via tmux"
 requires-python = ">=3.11"
@@ -26,17 +26,17 @@ test-index = [
 ]
 
 [project.scripts]
-codex-master-mcp = "codex_master.server:main"
-codex-master-admin = "codex_master.admin_daemon:main"
-codex-master-agent-api = "codex_master.agent_daemon:main"
-codex-master-host-agent = "codex_master.host_agent:main"
-google-account-manager = "codex_master.google_account_manager_cli:main"
+the-hive-mcp = "the_hive.server:main"
+the-hive-admin = "the_hive.admin_daemon:main"
+the-hive-agent-api = "the_hive.agent_daemon:main"
+the-hive-host-agent = "the_hive.host_agent:main"
+google-account-manager = "the_hive.google_account_manager_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-codex_master = ["markdown/*.md", "markdown/classes/*.md", "rename_contract.v1.json"]
+the_hive = ["markdown/*.md", "markdown/classes/*.md", "rename_contract.v1.json"]
 
 [tool.setuptools.data-files]
 "lib/codex-master/systemd" = [

@@ -34,7 +34,7 @@ def test_unit_exposes_the_admin_cli_entrypoint() -> None:
 
     document = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert document["project"]["scripts"]["codex-master-admin"] == (
+    assert document["project"]["scripts"]["the-hive-admin"] == (
         "the_hive.admin_daemon:main"
     )
     assert _directives("Service")["ExecStart"] == [
@@ -148,7 +148,7 @@ def test_agent_api_unit_uses_private_tls_entrypoint_and_credentials() -> None:
     document = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     service = _directives("Service", AGENT_API_UNIT)
 
-    assert document["project"]["scripts"]["codex-master-agent-api"] == (
+    assert document["project"]["scripts"]["the-hive-agent-api"] == (
         "the_hive.agent_daemon:main"
     )
     assert service["Type"] == ["exec"]
@@ -194,7 +194,7 @@ def test_host_agent_unit_has_exact_hardening_credentials_and_write_scope() -> No
     document = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     service = _directives("Service", HOST_AGENT_UNIT)
 
-    assert document["project"]["scripts"]["codex-master-host-agent"] == (
+    assert document["project"]["scripts"]["the-hive-host-agent"] == (
         "the_hive.host_agent:main"
     )
     assert service["Type"] == ["exec"]
