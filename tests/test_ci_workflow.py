@@ -1,6 +1,8 @@
+import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 from the_hive.runtime_layout import RuntimeLayout
@@ -74,9 +76,32 @@ def test_agent_pool_installer_gate_materializes_a_valid_image_for_a_fresh_home(
     runner_temp.mkdir(mode=0o700)
     home = tmp_path / "fresh-home"
     home.mkdir(mode=0o700)
+    checkout = tmp_path / "clean-checkout"
+    subprocess.run(
+        ["git", "clone", "--no-hardlinks", "--quiet", str(ROOT), str(checkout)],
+        check=True,
+    )
+    shutil.copytree(
+        ROOT,
+        checkout,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns(".git", ".local", ".pytest_cache", "__pycache__"),
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "add", "--all"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(checkout), "-c", "user.name=CI workflow test",
+            "-c", "user.email=ci-workflow-test@example.invalid", "commit",
+            "--no-gpg-sign", "--quiet", "-m", "test fixture",
+        ],
+        check=True,
+    )
     completed = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", workflow_step_run("Check agent pool installer")],
-        cwd=ROOT,
+        cwd=checkout,
         env={
             **os.environ,
             "HOME": str(home),
@@ -90,7 +115,21 @@ def test_agent_pool_installer_gate_materializes_a_valid_image_for_a_fresh_home(
 
     assert completed.returncode == 0, completed.stderr
     ci_home = runner_temp / "codex-agent-pool-ci-home"
-    RuntimeLayout.from_runtime_root(
-        ci_home / ".local" / "lib" / "codex-master-runtime"
+    release_root = ci_home / ".local" / "lib" / "the-hive-runtime"
+    current = json.loads(
+        (release_root / ".the-hive-release-pointers.json").read_text(encoding="utf-8")
+    )["current"]
+    RuntimeLayout.from_current_release(
+        release_root, current["generation"], current["manifest_digest"]
     )
     assert not (ci_home / ".codex-agents-ci").exists()
+
+
+def test_agent_pool_ci_smoke_derives_all_three_direct_wrapper_bindings_from_current() -> None:
+    step = workflow_step_run("Check agent pool installer")
+
+    assert "./scripts/the-hive-hive-hourly-probe-install --home \"${home}\"" in step
+    assert 'pointer="${release_root}/.the-hive-release-pointers.json"' in step
+    assert 'mcp="${release_root}/generations/${generation}/bin/the-hive-mcp"' in step
+    assert '"${mcp}" "${release_root}" "${generation}" "${manifest_digest}"' in step
+    assert "codex-master-hive-hourly-probe-install" not in step

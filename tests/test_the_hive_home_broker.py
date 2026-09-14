@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).parents[1] / "bin" / "codex-master-home-broker"
+SCRIPT = Path(__file__).parents[1] / "bin" / "the-hive-home-broker"
 
 
 def _adapter() -> dict[str, object]:

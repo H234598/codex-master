@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import stat as stat_module
 import subprocess
 import sys
@@ -25,10 +27,14 @@ def _write(root: Path, relative: str, content: str, mode: int = 0o644) -> None:
 
 
 def runtime_layout(tmp_path: Path) -> RuntimeLayout:
-    root = tmp_path / "codex-master-runtime"
+    root = tmp_path / "the-hive-runtime"
     root.mkdir(mode=0o700)
-    _write(root, "bin/codex-master-mcp", "#!/bin/sh\nexit 0\n", 0o755)
-    _write(root, "bin/codex-master-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
+    _write(root, "bin/the-hive-mcp", "#!/bin/sh\nexit 0\n", 0o755)
+    _write(root, "bin/the-hive-mcp-stable", "#!/bin/sh\nexit 0\n", 0o755)
+    _write(root, "bin/the-hive-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
+    _write(root, "bin/the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
+    _write(root, "systemd/user/codex-master-resource-monitor.service", "[Service]\n")
+    _write(root, "systemd/user/codex-master.slice", "[Slice]\n")
     _write(
         root,
         ".codex-plugin/plugin.json",
@@ -49,9 +55,11 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
         json.dumps(
             {
                 "mcpServers": {
-                    "codex-master-mcp": {
-                        "command": "./bin/codex-master-mcp",
+                    "the-hive-mcp": {
+                        "command": "/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp",
                         "args": [],
+                        "startup_timeout_sec": 120,
+                        "note": "Local data-sparse Codex Masterjet MCP server. Controls the sleeping Agentinnen pool through tmux and does not return raw terminal output by default.",
                     }
                 }
             }
@@ -1289,12 +1297,77 @@ def test_agent_pool_installer_uses_only_the_runtime_image_entrypoint() -> None:
     script = Path(__file__).resolve().parents[1] / "scripts" / "install-agent-pool"
     source = script.read_text(encoding="utf-8")
 
-    assert (
-        '"${HOME}/.local/lib/codex-master-runtime/bin/codex-master-mcp" pool install'
-        in source
-    )
+    assert 'release_root="${HOME}/.local/lib/the-hive-runtime"' in source
+    assert 'pointer="${release_root}/.the-hive-release-pointers.json"' in source
+    assert 'mcp="${release_root}/generations/${generation}/bin/the-hive-mcp"' in source
+    assert 'exec "${mcp}" "${release_root}" "${generation}" "${manifest_digest}" pool install "$@"' in source
+    assert "codex-master-runtime" not in source
+    assert "codex-master-mcp" not in source
     assert "repo_root" not in source
     assert "/.local/bin/codex-master-mcp" not in source
+
+
+def test_agent_pool_installer_derives_the_current_pointer_triple_before_exec(
+    tmp_path: Path,
+) -> None:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "install-agent-pool"
+    home = tmp_path / "home"
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    generation = "current"
+    manifest_digest = "sha256:" + "a" * 64
+    pointer = release_root / ".the-hive-release-pointers.json"
+    pointer.parent.mkdir(mode=0o700, parents=True)
+    pointer.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "current": {
+                    "generation": generation,
+                    "manifest_digest": manifest_digest,
+                },
+                "previous": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    pointer.chmod(0o644)
+    wrapper = release_root / "generations" / generation / "bin" / "the-hive-mcp"
+    wrapper.parent.mkdir(mode=0o700, parents=True)
+    wrapper.write_text('#!/usr/bin/bash\nprintf "%s\\n" "$@" > "${CAPTURE}"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+    capture = tmp_path / "wrapper-arguments"
+
+    completed = subprocess.run(
+        [script, "--spec", "pool.json"],
+        env={**os.environ, "HOME": str(home), "CAPTURE": str(capture)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        str(release_root),
+        generation,
+        manifest_digest,
+        "pool",
+        "install",
+        "--spec",
+        "pool.json",
+    ]
+
+    pointer.write_text('{"schema_version": 1, "current": null, "previous": null}', encoding="utf-8")
+    pointer.chmod(0o644)
+    capture.unlink()
+    rejected = subprocess.run(
+        [script],
+        env={**os.environ, "HOME": str(home), "CAPTURE": str(capture)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert not capture.exists()
 
 
 def test_unauthorized_runtime_surface_stays_sterile_until_a_principal_is_verified(
@@ -1385,6 +1458,26 @@ def test_unauthorized_stdio_runtime_status_creates_no_private_state(
 ) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    installer = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    generation = "stdio"
+    stage = tmp_path / ".the-hive-runtime.stage.stdio"
+    stage.mkdir(mode=0o700)
+    installer["_build_runtime_image"](  # type: ignore[operator]
+        repository=Path(__file__).resolve().parents[1],
+        stage=stage,
+        generation=generation,
+        commit="a" * 40,
+    )
+    release_root = tmp_path / "the-hive-runtime"
+    installer["_publish_runtime_generation"](  # type: ignore[operator]
+        stage=stage, release_root=release_root
+    )
+    manifest_digest = "sha256:" + hashlib.sha256(
+        (release_root / "generations" / generation / ".the-hive-runtime-manifest.json").read_bytes()
+    ).hexdigest()
+    entrypoint = release_root / "generations" / generation / "bin" / "the-hive-mcp"
     requests = (
         {
             "jsonrpc": "2.0",
@@ -1411,8 +1504,21 @@ def test_unauthorized_stdio_runtime_status_creates_no_private_state(
             "params": {"name": "agent_start", "arguments": {"agent": "a1"}},
         },
     )
+    base_command = [entrypoint, release_root, generation, manifest_digest]
+    for invalid in (base_command[:1], base_command[:-1], [*base_command[:-1], "sha256:" + "0" * 64]):
+        rejected = subprocess.run(
+            invalid,
+            capture_output=True,
+            check=False,
+            cwd=tmp_path,
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+        )
+        assert rejected.returncode == 64
+        assert rejected.stdout == b""
+        assert rejected.stderr == b""
+
     completed = subprocess.run(
-        [Path(__file__).resolve().parents[1] / "bin" / "codex-master-mcp"],
+        base_command,
         input="".join(
             json.dumps(request, separators=(",", ":")) + "\n" for request in requests
         ),

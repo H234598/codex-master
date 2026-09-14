@@ -4,7 +4,7 @@
 import json
 import sys
 
-from codex_master.server import reconcile_usage_fast_modes
+from the_hive.server import reconcile_usage_fast_modes
 
 
 result = reconcile_usage_fast_modes(emergency_only="--emergency" in sys.argv)

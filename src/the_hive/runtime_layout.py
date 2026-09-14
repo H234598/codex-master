@@ -1,4 +1,4 @@
-"""Immutable, fail-closed paths for the single codex-master runtime image."""
+"""Immutable, fail-closed paths for the single The Hive runtime image."""
 
 from __future__ import annotations
 
@@ -18,52 +18,44 @@ class LayoutError(ValueError):
 _MAX_IMAGE_FILE_BYTES = 2 * 1024 * 1024
 _MAX_METADATA_BYTES = 256 * 1024
 _ROOT_MODE = 0o700
-_MANIFEST_NAME = ".codex-master-runtime-manifest.json"
-_RELEASE_POINTERS_NAME = ".codex-master-release-pointers.json"
+_MANIFEST_NAME = ".the-hive-runtime-manifest.json"
+_RELEASE_POINTERS_NAME = ".the-hive-release-pointers.json"
 _RELEASE_GENERATIONS_NAME = "generations"
 _RUNTIME_SPAWN_HELPER = "src/the_hive/_runtime_spawn_helper.so"
-_F25_COMMIT = "f25f60f6010d7b74b82a57f6471618e16df3e1a6"
+_R2_BASE_COMMIT = "5defcac83030e91b39188c8b055adb97d5f51e98"
+_R2_BASE_TREE = "6c872289709de2a0bfe69d8392ce91b49f3855f3"
+_D73_COMMIT = "f6f9348a4348d1a18bb3c4b591a93c393dfda838"
+_D73_TREE = "d4f9620d25b0053763a6d20d0dfacbb8bd9a40ff"
+_F25_D69_COMMIT = "f25f60f6010d7b74b82a57f6471618e16df3e1a6"
+_F25_D69_TREE = "0f459eea9d8e13bd54e74e699272c53cddaecb1d"
 _C4_COMMIT = "c4b72abcfe0e8b208b05f90cc4f8275def851581"
-_D69_RUNTIME_PATHS = (
-    "src/the_hive/admission.py", "src/the_hive/admission_runtime.py",
-    "src/the_hive/dynamic_pool.py", "src/the_hive/hive/__init__.py",
-    "src/the_hive/hive/admission.py", "src/the_hive/hive/dispatch.py",
-    "src/the_hive/hive/principals.py", "src/the_hive/selection.py",
-    "src/the_hive/selection_service.py", "src/the_hive/server.py",
-)
-_D69_ANCHOR_PATH = "src/the_hive/dynamic_pool.py"
-_D69_ANCHOR_SHA256 = "1c3e2e8ff7c0c14294af2dee044b6dfd3a072caad0d117b49dfc8d360d8efef4"
-_STABLE_MCP_LAUNCHER_SOURCE = "bin/codex-master-mcp-stable"
-_STABLE_MCP_COMMAND = "/home/teladi/.local/lib/codex-master-runtime/codex-master-mcp"
+_D69_DYNAMIC_POOL_BLOB = "36c1e4a2716f808dc2ac89fe0d604249b1639ddd"
+_SUCCESSOR_WITNESS_PATH = "src/the_hive/dynamic_pool.py"
+_SUCCESSOR_WITNESS_SHA256 = "3519e0acc0c90316477f9cb7ce253a05d3626fe729793709a3bf11da88ebc5a1"
+_HISTORICAL_LINEAGE = {
+    "d69": {
+        "commit": _F25_D69_COMMIT,
+        "tree": _F25_D69_TREE,
+        "parent": _C4_COMMIT,
+        "dynamic_pool_blob": _D69_DYNAMIC_POOL_BLOB,
+    },
+    "d73": {
+        "commit": _D73_COMMIT,
+        "tree": _D73_TREE,
+        "parent": _F25_D69_COMMIT,
+    },
+}
+_STABLE_MCP_LAUNCHER_SOURCE = "bin/the-hive-mcp-stable"
+_STABLE_MCP_COMMAND = "/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp"
 _STABLE_MCP_NOTE = (
     "Local data-sparse Codex Masterjet MCP server. Controls the sleeping "
     "Agentinnen pool through tmux and does not return raw terminal output by default."
 )
-_F25_D69_SOURCE_SHA256 = {
-    "src/the_hive/admission.py": "ad2609dc0022b4bcc8937ee2c2ce17ef553c602eb02849103840d7279f773bd4",
-    "src/the_hive/admission_runtime.py": "0babae1ca3fda111a623c56cb0f230f901981585dda7bec9dbf33b87b0a88e6f",
-    "src/the_hive/dynamic_pool.py": _D69_ANCHOR_SHA256,
-    "src/the_hive/hive/__init__.py": "28b14addc149512d68782b416c26b5191c823095fade0318bc3d7338dee1c4a8",
-    "src/the_hive/hive/admission.py": "4d97e5f73005068833d2181d1751c59f7861f0bcf24fdc6ad04b1aa882cf34ca",
-    "src/the_hive/hive/dispatch.py": "d164865c2285eaae6d2aa9a3f50555c0bb8f3ab2d7529308431438273cba8ba6",
-    "src/the_hive/hive/principals.py": "4b9912390c2f7c198338245c0912f8c195fb027e4c14f5184d3ec5dfae62fcee",
-    "src/the_hive/selection.py": "c575dc16bb553fc3a34e566f23486e71b324f7de640762b459868c275b8d1c8e",
-    "src/the_hive/selection_service.py": "486dce3f357f40377042b28791da48db67ece5a7d6dd86c6e6c0cec3f5744f4f",
-    "src/the_hive/server.py": "3e22e18b67f8407e895816b40452ba8c32db7f5817e9af47ff57c88c60818942",
-}
-_F25_C4_SUBSET_SHA256 = {
-    "bin/codex-master-mcp": "7374a1e82c7308a8836f973646658e368a3996b41461d8a7722c100d27f0ccbe",
-    "bin/codex-master-resource-monitor": "b630d3f7e01288c1b8509062d98e3c6a900228bd07972d5f0ec7c76281183ab3",
-    "systemd/user/codex-master.slice": "4771a0a12b219b3053b0f88dc32caf071244ddf8c4a2efbec26892c79078f290",
-    "systemd/user/codex-master-resource-monitor.service": "73f44183861aa5d950de525ad1517bbf928fe59b4b40cc9c471a5f59e7d2242f",
-    "src/the_hive/resource_cgroup.py": "c49ce367a96a4f3e422989a3d6e51ab372864206f1d820124e4fe72866287024",
-    "src/the_hive/resource_monitor.py": "7d2f4c7efad196166dd2c0e924d3dda8645ee853ff8ce11449755e4aa2d3bce4",
-}
 _REQUIRED_FILES: tuple[tuple[str, int], ...] = (
-    ("bin/codex-master-mcp", 0o755),
+    ("bin/the-hive-mcp", 0o755),
     (_STABLE_MCP_LAUNCHER_SOURCE, 0o755),
-    ("bin/codex-master-resource-monitor", 0o755),
-    ("bin/codex-master-hive-hourly-probe", 0o755),
+    ("bin/the-hive-resource-monitor", 0o755),
+    ("bin/the-hive-hive-hourly-probe", 0o755),
     (".codex-plugin/plugin.json", 0o644),
     (".mcp.json", 0o644),
     (".app.json", 0o644),
@@ -244,9 +236,9 @@ def _validate_metadata(root: Path) -> None:
     if set(mcp) != {"mcpServers"}:
         raise _invalid()
     servers = mcp.get("mcpServers")
-    if not isinstance(servers, dict) or set(servers) != {"codex-master-mcp"}:
+    if not isinstance(servers, dict) or set(servers) != {"the-hive-mcp"}:
         raise _invalid()
-    server = servers.get("codex-master-mcp")
+    server = servers.get("the-hive-mcp")
     if not isinstance(server, dict) or set(server) != {
         "command", "args", "startup_timeout_sec", "note"
     }:
@@ -275,17 +267,17 @@ def _release_metadata(manifest: dict[str, object]) -> dict[str, object]:
     expected_release = {
         "stable_launchers": [
             _STABLE_MCP_LAUNCHER_SOURCE,
-            "bin/codex-master-mcp",
-            "bin/codex-master-resource-monitor",
+            "bin/the-hive-mcp",
+            "bin/the-hive-resource-monitor",
         ],
         "python_tree": "src/the_hive",
-        "monitor_entrypoint": "bin/codex-master-resource-monitor",
+        "monitor_entrypoint": "bin/the-hive-resource-monitor",
         "h4_units": [
             "systemd/user/codex-master-resource-monitor.service",
             "systemd/user/codex-master.slice",
         ],
         "bind_sources": [
-            "bin/codex-master-resource-monitor", "src/the_hive",
+            "bin/the-hive-resource-monitor", "src/the_hive",
             "codex-agent-classes.json", "codex-hive.json",
             "%h/.local/state/codex-master-mcp/hive",
         ],
@@ -300,27 +292,24 @@ def _release_metadata(manifest: dict[str, object]) -> dict[str, object]:
         or not generation
         or "/" in generation
         or generation in {".", ".."}
-        or manifest.get("f25_base_commit") != _F25_COMMIT
-        or manifest.get("d69") != {"commit": _F25_COMMIT, "parent": _C4_COMMIT}
-        or manifest.get("d69_paths") != list(_D69_RUNTIME_PATHS)
-        or manifest.get("d69_anchor") != {
-            "path": _D69_ANCHOR_PATH,
-            "sha256": _D69_ANCHOR_SHA256,
+        or manifest.get("r2_base") != {"commit": _R2_BASE_COMMIT, "tree": _R2_BASE_TREE}
+        or manifest.get("historical_lineage") != _HISTORICAL_LINEAGE
+        or manifest.get("successor_witness") != {
+            "path": _SUCCESSOR_WITNESS_PATH,
+            "sha256": _SUCCESSOR_WITNESS_SHA256,
         }
-        or manifest.get("f25_d69_source_sha256") != _F25_D69_SOURCE_SHA256
-        or manifest.get("f25_c4_subset_sha256") != _F25_C4_SUBSET_SHA256
         or manifest.get("release") != expected_release
     ):
         raise _invalid()
     return {
         "commit": commit,
-        "f25_base_commit": _F25_COMMIT,
         "generation": generation,
-        "d69": {"commit": _F25_COMMIT, "parent": _C4_COMMIT},
-        "d69_paths": list(_D69_RUNTIME_PATHS),
-        "d69_anchor": {"path": _D69_ANCHOR_PATH, "sha256": _D69_ANCHOR_SHA256},
-        "f25_d69_source_sha256": _F25_D69_SOURCE_SHA256,
-        "f25_c4_subset_sha256": _F25_C4_SUBSET_SHA256,
+        "r2_base": {"commit": _R2_BASE_COMMIT, "tree": _R2_BASE_TREE},
+        "historical_lineage": _HISTORICAL_LINEAGE,
+        "successor_witness": {
+            "path": _SUCCESSOR_WITNESS_PATH,
+            "sha256": _SUCCESSOR_WITNESS_SHA256,
+        },
         "release": expected_release,
     }
 
@@ -389,15 +378,10 @@ def _validated_manifest(root: Path, *, expected_digest: str | None = None) -> tu
     if manifest != expected:
         raise _invalid()
     files = manifest.get("files")
-    expected_d69 = (
-        _F25_D69_SOURCE_SHA256
-        if metadata["commit"] == _F25_COMMIT
-        else {_D69_ANCHOR_PATH: _D69_ANCHOR_SHA256}
-    )
-    if not isinstance(files, dict) or any(
-        not isinstance(files.get(path), dict)
-        or files[path].get("sha256") != digest
-        for path, digest in expected_d69.items()
+    witness = files.get(_SUCCESSOR_WITNESS_PATH) if isinstance(files, dict) else None
+    if (
+        not isinstance(witness, dict)
+        or witness.get("sha256") != _SUCCESSOR_WITNESS_SHA256
     ):
         raise _invalid()
     return manifest, digest
@@ -447,8 +431,8 @@ def _validate_layout_values(
         not isinstance(mcp_entrypoint, Path)
         or not isinstance(probe_entrypoint, Path)
         or not isinstance(metadata_root, Path)
-        or mcp_entrypoint != root / "bin" / "codex-master-mcp"
-        or probe_entrypoint != root / "bin" / "codex-master-hive-hourly-probe"
+        or mcp_entrypoint != root / "bin" / "the-hive-mcp"
+        or probe_entrypoint != root / "bin" / "the-hive-hive-hourly-probe"
         or metadata_root != root
         or spawn_helper != root / _RUNTIME_SPAWN_HELPER
     ):
@@ -502,8 +486,8 @@ class RuntimeLayout:
         manifest, manifest_digest = _validated_manifest(root)
         return cls(
             root=root,
-            mcp_entrypoint=root / "bin" / "codex-master-mcp",
-            probe_entrypoint=root / "bin" / "codex-master-hive-hourly-probe",
+            mcp_entrypoint=root / "bin" / "the-hive-mcp",
+            probe_entrypoint=root / "bin" / "the-hive-hive-hourly-probe",
             metadata_root=root,
             spawn_helper=root / _RUNTIME_SPAWN_HELPER,
             spawn_helper_digest=_spawn_helper_digest(manifest),

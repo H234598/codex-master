@@ -2,8 +2,8 @@
 set -euo pipefail
 
 stable_path="${BASH_SOURCE[0]}"
-release_root="${stable_path%/codex-master-mcp}"
-[[ "${release_root}" != "${stable_path}" && "${release_root}" == /* && "${release_root}/codex-master-mcp" == "${stable_path}" ]] || exit 64
+release_root="${stable_path%/the-hive-mcp}"
+[[ "${release_root}" != "${stable_path}" && "${release_root}" == /* && "${release_root}/the-hive-mcp" == "${stable_path}" ]] || exit 64
 for variable in "${!CODEX_@}"; do unset "${variable}"; done
 unset PYTHONHOME PYTHONPATH
 export PATH=/usr/bin:/bin
@@ -17,9 +17,9 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 stable_path = Path(sys.argv[2])
-pointer = root / ".codex-master-release-pointers.json"
+pointer = root / ".the-hive-release-pointers.json"
 try:
-    if stable_path != root / "codex-master-mcp":
+    if stable_path != root / "the-hive-mcp":
         raise ValueError("invalid stable path")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(pointer, flags)
@@ -68,7 +68,7 @@ try:
         or any(character not in "0123456789abcdef" for character in digest[7:])
     ):
         raise ValueError("invalid release binding")
-    manifest_path = root / "generations" / generation / ".codex-master-runtime-manifest.json"
+    manifest_path = root / "generations" / generation / ".the-hive-runtime-manifest.json"
     descriptor = os.open(manifest_path, flags)
     try:
         manifest_stat = os.fstat(descriptor)
@@ -90,7 +90,7 @@ try:
         raise ValueError("manifest digest mismatch")
     manifest = json.loads(manifest_raw.decode("utf-8"), object_pairs_hook=unique_object)
     files = manifest.get("files") if isinstance(manifest, dict) else None
-    expected = files.get("bin/codex-master-mcp-stable") if isinstance(files, dict) else None
+    expected = files.get("bin/the-hive-mcp-stable") if isinstance(files, dict) else None
     if (
         not isinstance(expected, dict)
         or set(expected) != {"mode", "nlink", "size", "sha256"}
@@ -120,7 +120,7 @@ try:
         os.close(descriptor)
     if hashlib.sha256(stable_raw).hexdigest() != expected["sha256"]:
         raise ValueError("stable launcher drift")
-    entrypoint = root / "generations" / generation / "bin" / "codex-master-mcp"
+    entrypoint = root / "generations" / generation / "bin" / "the-hive-mcp"
     entry = entrypoint.lstat()
     if (
         not stat.S_ISREG(entry.st_mode)

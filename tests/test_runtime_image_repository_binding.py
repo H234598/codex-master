@@ -126,7 +126,7 @@ def _p2_runtime_image(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
     state_root.parent.mkdir(mode=0o700, parents=True)
     apply_pilot_provisioning(repository_root=checkout, state_root=state_root)
 
-    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
+    installer = runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
     stage = tmp_path / "runtime-image"
     stage.mkdir(mode=0o700)
     installer["_build_runtime_image"](
@@ -137,7 +137,7 @@ def _p2_runtime_image(tmp_path: Path) -> tuple[Path, Path, dict[str, object]]:
     )
     (stage / "codex-hive.json").write_bytes((checkout / "codex-hive.json").read_bytes())
     (stage / "codex-hive.json").chmod(0o644)
-    (stage / ".codex-master-runtime-manifest.json").unlink()
+    (stage / ".the-hive-runtime-manifest.json").unlink()
     installer["_write_runtime_image_manifest"](
         root=stage,
         generation=TEST_STRUCTURAL_COMMIT,
@@ -152,8 +152,8 @@ def _published_launcher_release(
 ) -> tuple[Path, str, str, dict[str, object]]:
     """Build a harmless attested generation for the stable launchers alone."""
 
-    installer = runpy.run_path(str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install"))
-    stage = tmp_path / ".codex-master-runtime.stage.launcher-test"
+    installer = runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
+    stage = tmp_path / ".the-hive-runtime.stage.launcher-test"
     stage.mkdir(mode=0o700)
     generation = "launcher-test"
     installer["_build_runtime_image"](  # type: ignore[operator]
@@ -172,20 +172,20 @@ def _published_launcher_release(
         encoding="utf-8",
     )
     (stage / "src" / "the_hive" / "server.py").chmod(0o644)
-    (stage / ".codex-master-runtime-manifest.json").unlink()
+    (stage / ".the-hive-runtime-manifest.json").unlink()
     installer["_write_runtime_image_manifest"](  # type: ignore[operator]
         root=stage,
         generation=generation,
         commit=TEST_STRUCTURAL_COMMIT,
     )
-    release_root = tmp_path / "codex-master-runtime"
+    release_root = tmp_path / "the-hive-runtime"
     installer["_publish_runtime_generation"](stage=stage, release_root=release_root)  # type: ignore[operator]
     manifest_digest = "sha256:" + hashlib.sha256(
         (
             release_root
             / "generations"
             / generation
-            / ".codex-master-runtime-manifest.json"
+            / ".the-hive-runtime-manifest.json"
         ).read_bytes()
     ).hexdigest()
     assert RuntimeLayout.from_current_release(
@@ -218,8 +218,8 @@ def test_stable_launchers_require_one_attested_current_generation_without_checko
         "CODEX_MASTER_DIRTY_ROOT": str(dirty_checkout),
     }
     launchers = (
-        ROOT / "bin" / "codex-master-mcp",
-        ROOT / "bin" / "codex-master-resource-monitor",
+        ROOT / "bin" / "the-hive-mcp",
+        ROOT / "bin" / "the-hive-resource-monitor",
     )
 
     for launcher in launchers:
@@ -238,7 +238,7 @@ def test_stable_launchers_require_one_attested_current_generation_without_checko
         assert successful.returncode == 0, successful.stderr
         assert successful.stdout == ""
         assert successful.stderr == ""
-        if launcher.name == "codex-master-mcp":
+        if launcher.name == "the-hive-mcp":
             forwarded = subprocess.run(
                 [launcher, release_root, generation, manifest_digest, "--runtime-status-mcp"],
                 cwd=dirty_checkout, env=env, check=False, capture_output=True,
@@ -270,7 +270,7 @@ def test_stable_launchers_require_one_attested_current_generation_without_checko
             assert result.stdout == ""
             assert result.stderr == ""
 
-    pointers = release_root / ".codex-master-release-pointers.json"
+    pointers = release_root / ".the-hive-release-pointers.json"
     drifted = json.loads(pointers.read_text(encoding="utf-8"))
     drifted["current"]["manifest_digest"] = "sha256:" + "f" * 64
     pointers.write_text(json.dumps(drifted), encoding="utf-8")
@@ -291,29 +291,29 @@ def test_plugin_mcp_config_uses_only_the_authority_materialized_stable_launcher(
 ) -> None:
     release_root, generation, manifest_digest, _installer = _published_launcher_release(tmp_path)
     config = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
-    server = config["mcpServers"]["codex-master-mcp"]
+    server = config["mcpServers"]["the-hive-mcp"]
     assert server == {
-        "command": "/home/teladi/.local/lib/codex-master-runtime/codex-master-mcp",
+        "command": "/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp",
         "args": [],
         "startup_timeout_sec": 120,
         "note": "Local data-sparse Codex Masterjet MCP server. Controls the sleeping Agentinnen pool through tmux and does not return raw terminal output by default.",
     }
-    stable = release_root / "codex-master-mcp"
+    stable = release_root / "the-hive-mcp"
     item = stable.lstat()
     assert stat.S_ISREG(item.st_mode)
     assert not stable.is_symlink()
     assert stat.S_IMODE(item.st_mode) == 0o755
-    immutable = release_root / "generations" / generation / "bin" / "codex-master-mcp-stable"
+    immutable = release_root / "generations" / generation / "bin" / "the-hive-mcp-stable"
     manifest = json.loads(
         (
             release_root
             / "generations"
             / generation
-            / ".codex-master-runtime-manifest.json"
+            / ".the-hive-runtime-manifest.json"
         ).read_text(encoding="utf-8")
     )
     assert stable.read_bytes() == immutable.read_bytes()
-    assert manifest["files"]["bin/codex-master-mcp-stable"] == {
+    assert manifest["files"]["bin/the-hive-mcp-stable"] == {
         "mode": 0o755,
         "nlink": 1,
         "size": len(stable.read_bytes()),
@@ -356,7 +356,7 @@ def test_plugin_mcp_config_uses_only_the_authority_materialized_stable_launcher(
     assert drifted_stable.stderr == ""
     stable.write_bytes(immutable.read_bytes())
     stable.chmod(0o755)
-    pointers = release_root / ".codex-master-release-pointers.json"
+    pointers = release_root / ".the-hive-release-pointers.json"
     drifted = json.loads(pointers.read_text(encoding="utf-8"))
     drifted["current"]["manifest_digest"] = "sha256:" + "0" * 64
     pointers.write_text(json.dumps(drifted), encoding="utf-8")
@@ -383,7 +383,7 @@ def test_complete_p2_runtime_image_binds_its_attested_root_without_a_checkout(
     installer["_validate_runtime_image_stage"](stage=stage, home=tmp_path / "home")
 
     legacy_launcher = subprocess.run(
-        [stage / "bin" / "codex-master-mcp", "hive", "status"],
+        [stage / "bin" / "the-hive-mcp", "hive", "status"],
         check=False,
         capture_output=True,
         text=True,
@@ -529,7 +529,7 @@ def test_image_diagnostics_reject_conflicting_authority_profile_capabilities(
             item["authority_profile"] = "specialist"
     (stage / "codex-agent-classes.json").write_text(json.dumps(catalog), encoding="utf-8")
     (stage / "codex-agent-classes.json").chmod(0o644)
-    (stage / ".codex-master-runtime-manifest.json").unlink()
+    (stage / ".the-hive-runtime-manifest.json").unlink()
     installer["_write_runtime_image_manifest"](
         root=stage,
         generation=TEST_STRUCTURAL_COMMIT,

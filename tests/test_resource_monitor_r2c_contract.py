@@ -410,7 +410,7 @@ def test_resource_monitor_unit_checks_readonly_and_readwrite_paths_separately() 
 def test_resource_monitor_unit_uses_absolute_exec_and_declares_default_target_install() -> None:
     root = Path(__file__).resolve().parents[1]
     service = root / "systemd" / "user" / "codex-master-resource-monitor.service"
-    entrypoint = root / "bin" / "codex-master-resource-monitor"
+    entrypoint = root / "bin" / "the-hive-resource-monitor"
     assert service.is_file()
     assert entrypoint.is_file()
     text = service.read_text(encoding="utf-8")
@@ -437,7 +437,7 @@ def test_resource_monitor_unit_uses_absolute_exec_and_declares_default_target_in
 def test_resource_monitor_entrypoint_rejects_all_legacy_noarg_paths(
     tmp_path: Path,
 ) -> None:
-    entrypoint = Path(__file__).resolve().parents[1] / "bin" / "codex-master-resource-monitor"
+    entrypoint = Path(__file__).resolve().parents[1] / "bin" / "the-hive-resource-monitor"
     completed = subprocess.run(
         [entrypoint],
         cwd=tmp_path,

@@ -14,6 +14,11 @@ _TEST_MANIFEST_COMMIT = "a" * 40
 def seal_runtime_image(root: Path, *, commit: str = _TEST_MANIFEST_COMMIT) -> None:
     """Add the real helper and canonical manifest to a private test image."""
 
+    witness = root / "src" / "the_hive" / "dynamic_pool.py"
+    if not witness.exists():
+        witness.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        witness.write_bytes((ROOT / "src" / "the_hive" / "dynamic_pool.py").read_bytes())
+        witness.chmod(0o644)
     helper = root / "src" / "the_hive" / "_runtime_spawn_helper.so"
     helper.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     completed = subprocess.run(
@@ -41,7 +46,7 @@ def seal_runtime_image(root: Path, *, commit: str = _TEST_MANIFEST_COMMIT) -> No
         current.chmod(0o700)
         current = current.parent
     installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
     installer["_write_runtime_image_manifest"](root=root, commit=commit)
 
@@ -52,10 +57,10 @@ def runtime_image(tmp_path_factory: pytest.TempPathFactory):
 
     from the_hive.runtime_layout import RuntimeLayout
 
-    stage = tmp_path_factory.mktemp("runtime-image") / "codex-master-runtime"
+    stage = tmp_path_factory.mktemp("runtime-image") / "the-hive-runtime"
     stage.mkdir(mode=0o700)
     installer = runpy.run_path(
-        str(ROOT / "scripts" / "codex-master-hive-hourly-probe-install")
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
     installer["_build_runtime_image"](
         repository=ROOT, stage=stage, commit=_TEST_MANIFEST_COMMIT

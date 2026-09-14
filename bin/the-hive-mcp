@@ -12,11 +12,12 @@ exec /usr/bin/python3 -I -B -c '
 import runpy
 import sys
 from pathlib import Path
-root = Path(sys.argv[1])
+
+release_root = Path(sys.argv[1])
 generation = sys.argv[2]
 manifest_digest = sys.argv[3]
 if (
-    not root.is_absolute()
+    not release_root.is_absolute()
     or not generation
     or "/" in generation
     or generation in {".", ".."}
@@ -25,15 +26,19 @@ if (
     or any(character not in "0123456789abcdef" for character in manifest_digest[7:])
 ):
     raise SystemExit(64)
-candidate = root / "generations" / generation / "src"
+candidate = release_root / "generations" / generation / "src"
 try:
+    # The bootstrap is used only to load the attester.  Application imports do
+    # not start until the returned layout has revalidated the current pointer.
     sys.path.insert(0, str(candidate))
-    from codex_master.runtime_layout import RuntimeLayout
-    layout = RuntimeLayout.from_current_release(root, generation, manifest_digest)
+    from the_hive.runtime_layout import RuntimeLayout
+    layout = RuntimeLayout.from_current_release(
+        release_root, generation, manifest_digest
+    )
 except Exception:
     raise SystemExit(64)
 if layout.root / "src" != candidate:
     raise SystemExit(64)
-sys.argv = [str(layout.root / "bin" / "codex-master-hive-hourly-probe"), *sys.argv[4:]]
-runpy.run_module("codex_master.hive.hourly_probe", run_name="__main__", alter_sys=True)
+sys.argv = [str(layout.root / "bin" / "the-hive-mcp"), *sys.argv[4:]]
+runpy.run_module("the_hive.server", run_name="__main__", alter_sys=True)
 ' "$release_root" "$generation" "$manifest_digest" "${@:4}"

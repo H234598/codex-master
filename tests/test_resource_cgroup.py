@@ -32,7 +32,7 @@ from the_hive.resource_cgroup import (
 
 
 GIB = 1024**3
-GATE = Path(__file__).parents[1] / "bin" / "codex-master-resource-scope-gate"
+GATE = Path(__file__).parents[1] / "bin" / "the-hive-resource-scope-gate"
 REQUIRED_CONTROLLERS = frozenset({"cpu", "cpuset", "memory", "pids", "io"})
 
 
@@ -1631,7 +1631,7 @@ def test_systemd_v259_scope_uses_pid_bound_control_without_pipe_and_one_gate_rel
             f"--property=MemoryMax={12 * GIB}",
             f"--property=MemorySwapMax={8 * GIB}",
             "--property=IOWeight=50",
-            "/usr/libexec/codex-master-resource-scope-gate",
+            "/usr/libexec/the-hive-resource-scope-gate",
             "codex-master-resource-" + "d" * 32,
             "scope_socket-1",
             "scope-session.1",

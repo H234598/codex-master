@@ -23,71 +23,52 @@ _RUNTIME_PROCESS_SOURCE = Path(__file__).resolve().parents[1] / "src"
 if not _RUNTIME_PROCESS_SOURCE.is_dir():
     raise SystemExit("runtime_process_source_missing")
 sys.path.insert(0, os.fspath(_RUNTIME_PROCESS_SOURCE))
-from codex_master.runtime_process import (  # noqa: E402
+from the_hive.runtime_process import (  # noqa: E402
     DEFAULT_STDERR_LIMIT,
     BoundedProcessError,
     run_bounded,
 )
-from codex_master.hive import hourly_probe  # noqa: E402
-from codex_master.runtime_layout import RuntimeLayout  # noqa: E402
-from codex_master.runtime_status import _mcp_surface, _probe_payload  # noqa: E402
+from the_hive.hive import hourly_probe  # noqa: E402
+from the_hive.runtime_layout import RuntimeLayout  # noqa: E402
+from the_hive.runtime_status import _mcp_surface, _probe_payload  # noqa: E402
 
 
-_RUNTIME_ROOT_NAME = "codex-master-runtime"
+_RUNTIME_ROOT_NAME = "the-hive-runtime"
 _MAX_SOURCE_BYTES = 2 * 1024 * 1024
 _MAX_STAGE_DIAGNOSTIC_BYTES = 256 * 1024
 _MAX_MANIFEST_BYTES = 512 * 1024
-_MANIFEST_NAME = ".codex-master-runtime-manifest.json"
+_MANIFEST_NAME = ".the-hive-runtime-manifest.json"
 _MANIFEST_SCHEMA_VERSION = 2
-_RELEASE_POINTERS_NAME = ".codex-master-release-pointers.json"
+_RELEASE_POINTERS_NAME = ".the-hive-release-pointers.json"
 _RELEASE_GENERATIONS_NAME = "generations"
-_PUBLISH_LOCK_NAME = ".codex-master-release-publish.lock"
-_STABLE_MCP_LAUNCHER_SOURCE = "bin/codex-master-mcp-stable"
-_STABLE_MCP_LAUNCHER_NAME = "codex-master-mcp"
-_F25_COMMIT = "f25f60f6010d7b74b82a57f6471618e16df3e1a6"
+_PUBLISH_LOCK_NAME = ".the-hive-release-publish.lock"
+_STABLE_MCP_LAUNCHER_SOURCE = "bin/the-hive-mcp-stable"
+_STABLE_MCP_LAUNCHER_NAME = "the-hive-mcp"
+_R2_BASE_COMMIT = "5defcac83030e91b39188c8b055adb97d5f51e98"
+_R2_BASE_TREE = "6c872289709de2a0bfe69d8392ce91b49f3855f3"
+_D73_COMMIT = "f6f9348a4348d1a18bb3c4b591a93c393dfda838"
+_D73_TREE = "d4f9620d25b0053763a6d20d0dfacbb8bd9a40ff"
+_F25_D69_COMMIT = "f25f60f6010d7b74b82a57f6471618e16df3e1a6"
+_F25_D69_TREE = "0f459eea9d8e13bd54e74e699272c53cddaecb1d"
 _C4_COMMIT = "c4b72abcfe0e8b208b05f90cc4f8275def851581"
-_D69_RUNTIME_PATHS = (
-    "src/codex_master/admission.py",
-    "src/codex_master/admission_runtime.py",
-    "src/codex_master/dynamic_pool.py",
-    "src/codex_master/hive/__init__.py",
-    "src/codex_master/hive/admission.py",
-    "src/codex_master/hive/dispatch.py",
-    "src/codex_master/hive/principals.py",
-    "src/codex_master/selection.py",
-    "src/codex_master/selection_service.py",
-    "src/codex_master/server.py",
-)
-_D69_ANCHOR_PATH = "src/codex_master/dynamic_pool.py"
-_D69_ANCHOR_SHA256 = "1c3e2e8ff7c0c14294af2dee044b6dfd3a072caad0d117b49dfc8d360d8efef4"
-_F25_D69_SOURCE_SHA256 = {
-    "src/codex_master/admission.py": "ad2609dc0022b4bcc8937ee2c2ce17ef553c602eb02849103840d7279f773bd4",
-    "src/codex_master/admission_runtime.py": "0babae1ca3fda111a623c56cb0f230f901981585dda7bec9dbf33b87b0a88e6f",
-    "src/codex_master/dynamic_pool.py": _D69_ANCHOR_SHA256,
-    "src/codex_master/hive/__init__.py": "28b14addc149512d68782b416c26b5191c823095fade0318bc3d7338dee1c4a8",
-    "src/codex_master/hive/admission.py": "4d97e5f73005068833d2181d1751c59f7861f0bcf24fdc6ad04b1aa882cf34ca",
-    "src/codex_master/hive/dispatch.py": "d164865c2285eaae6d2aa9a3f50555c0bb8f3ab2d7529308431438273cba8ba6",
-    "src/codex_master/hive/principals.py": "4b9912390c2f7c198338245c0912f8c195fb027e4c14f5184d3ec5dfae62fcee",
-    "src/codex_master/selection.py": "c575dc16bb553fc3a34e566f23486e71b324f7de640762b459868c275b8d1c8e",
-    "src/codex_master/selection_service.py": "486dce3f357f40377042b28791da48db67ece5a7d6dd86c6e6c0cec3f5744f4f",
-    "src/codex_master/server.py": "3e22e18b67f8407e895816b40452ba8c32db7f5817e9af47ff57c88c60818942",
+_D69_DYNAMIC_POOL_BLOB = "36c1e4a2716f808dc2ac89fe0d604249b1639ddd"
+_SUCCESSOR_WITNESS_PATH = "src/the_hive/dynamic_pool.py"
+_SUCCESSOR_WITNESS_SHA256 = "3519e0acc0c90316477f9cb7ce253a05d3626fe729793709a3bf11da88ebc5a1"
+_HISTORICAL_LINEAGE = {
+    "d69": {
+        "commit": _F25_D69_COMMIT,
+        "tree": _F25_D69_TREE,
+        "parent": _C4_COMMIT,
+        "dynamic_pool_blob": _D69_DYNAMIC_POOL_BLOB,
+    },
+    "d73": {
+        "commit": _D73_COMMIT,
+        "tree": _D73_TREE,
+        "parent": _F25_D69_COMMIT,
+    },
 }
-_F25_C4_SUBSET_SHA256 = {
-    "bin/codex-master-mcp": "7374a1e82c7308a8836f973646658e368a3996b41461d8a7722c100d27f0ccbe",
-    "bin/codex-master-resource-monitor": "b630d3f7e01288c1b8509062d98e3c6a900228bd07972d5f0ec7c76281183ab3",
-    "systemd/user/codex-master.slice": "4771a0a12b219b3053b0f88dc32caf071244ddf8c4a2efbec26892c79078f290",
-    "systemd/user/codex-master-resource-monitor.service": "73f44183861aa5d950de525ad1517bbf928fe59b4b40cc9c471a5f59e7d2242f",
-    "src/codex_master/resource_cgroup.py": "c49ce367a96a4f3e422989a3d6e51ab372864206f1d820124e4fe72866287024",
-    "src/codex_master/resource_monitor.py": "7d2f4c7efad196166dd2c0e924d3dda8645ee853ff8ce11449755e4aa2d3bce4",
-}
-_RUNTIME_SPAWN_HELPER_SOURCE = "src/codex_master/runtime_spawn_helper.c"
-_RUNTIME_SPAWN_HELPER_LIBRARY = "src/codex_master/_runtime_spawn_helper.so"
-# Provenance: canonical 23510da legacy probe payload. The focused regression
-# test reconstructs this former contract from that revision; legacy paths are
-# inert and the runtime installer never invokes Git, a checkout, or a purge.
-_LEGACY_PROBE_MANIFEST_DIGEST = (
-    "723416595c8c8eec8c68d3021964d01014652abb8300a39a511d32e6976f7802"
-)
+_RUNTIME_SPAWN_HELPER_SOURCE = "src/the_hive/runtime_spawn_helper.c"
+_RUNTIME_SPAWN_HELPER_LIBRARY = "src/the_hive/_runtime_spawn_helper.so"
 _UNIT_NAMES = (
     "codex-master-hive-hourly-probe.service",
     "codex-master-hive-hourly-probe.timer",
@@ -96,16 +77,14 @@ _BOUND_RELEASE_UNIT_NAMES = (
     "codex-master-resource-monitor.service",
     "codex-master-hive-hourly-probe.service",
 )
-_RELEASE_GENERATION_MARKER = (
-    "%h/.local/lib/codex-master-runtime/generations/"
-)
+_RELEASE_GENERATION_MARKER = "%h/.local/lib/codex-master-runtime/generations/"
 # This is the sole product Runtime Image definition. Recursive entries carry
 # complete product trees; no Probe-specific mirror is maintained.
 _RUNTIME_IMAGE_FILES = (
-    ("bin/codex-master-mcp", "bin/codex-master-mcp", 0o755),
+    ("bin/the-hive-mcp", "bin/the-hive-mcp", 0o755),
     (_STABLE_MCP_LAUNCHER_SOURCE, _STABLE_MCP_LAUNCHER_SOURCE, 0o755),
-    ("bin/codex-master-resource-monitor", "bin/codex-master-resource-monitor", 0o755),
-    ("bin/codex-master-hive-hourly-probe", "bin/codex-master-hive-hourly-probe", 0o755),
+    ("bin/the-hive-resource-monitor", "bin/the-hive-resource-monitor", 0o755),
+    ("bin/the-hive-hive-hourly-probe", "bin/the-hive-hive-hourly-probe", 0o755),
     (".codex-plugin/plugin.json", ".codex-plugin/plugin.json", 0o644),
     (".mcp.json", ".mcp.json", 0o644),
     (".app.json", ".app.json", 0o644),
@@ -119,7 +98,7 @@ _RUNTIME_IMAGE_FILES = (
     ("systemd/user/codex-master-hive-hourly-probe.timer", "systemd/user/codex-master-hive-hourly-probe.timer", 0o644),
 )
 _RUNTIME_IMAGE_TREES = (
-    ("src/codex_master", "src/codex_master"),
+    ("src/the_hive", "src/the_hive"),
     ("skills/codex-master-fleet", "skills/codex-master-fleet"),
     ("hooks", "hooks"),
     ("schemas", "schemas"),
@@ -416,7 +395,7 @@ def _compile_runtime_spawn_helper(*, stage: Path) -> None:
 
 
 def _build_runtime_image(
-    *, repository: Path, stage: Path, generation: str = _F25_COMMIT, commit: str = _F25_COMMIT
+    *, repository: Path, stage: Path, generation: str = _R2_BASE_COMMIT, commit: str = _R2_BASE_COMMIT
 ) -> None:
     _directory(stage, mode=0o700, create=False)
     for source_name, target_name, mode in _RUNTIME_IMAGE_FILES:
@@ -435,7 +414,7 @@ def _build_runtime_image(
 
 
 def _verified_release_commit(repository: Path) -> str:
-    """Read only a clean F25-descended checkout identity for a real publish."""
+    """Read only a clean R2-base-descended checkout identity for a real publish."""
 
     command_env = {"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}
     try:
@@ -453,14 +432,14 @@ def _verified_release_commit(repository: Path) -> str:
             raise InstallError("install_release_checkout_dirty")
         commit = head.stdout.decode("ascii").strip()
         ancestor = subprocess.run(
-            ["git", "-C", os.fspath(repository), "merge-base", "--is-ancestor", _F25_COMMIT, commit],
+            ["git", "-C", os.fspath(repository), "merge-base", "--is-ancestor", _R2_BASE_COMMIT, commit],
             check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=command_env,
         )
     except (OSError, UnicodeError) as exc:
         raise InstallError("install_release_checkout_dirty") from exc
     if ancestor.returncode != 0:
-        raise InstallError("install_release_checkout_not_f25_descended")
+        raise InstallError("install_release_checkout_not_r2_base_descended")
     _release_metadata(generation=commit, commit=commit)
     return commit
 
@@ -470,7 +449,7 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
 
     try:
         layout = RuntimeLayout.from_runtime_root(stage)
-        layout.read_attested_file("src/codex_master/server.py")
+        layout.read_attested_file("src/the_hive/server.py")
     except ValueError as exc:
         raise InstallError("install_stage_validation_failed") from exc
     stage_server = (
@@ -478,8 +457,8 @@ def _validate_runtime_image_stage(*, stage: Path, home: Path) -> None:
         "from pathlib import Path\n"
         "root = Path(sys.argv[1])\n"
         "sys.path.insert(0, str(root / 'src'))\n"
-        "sys.argv = [str(root / 'src' / 'codex_master' / 'server.py'), *sys.argv[2:]]\n"
-        "runpy.run_module('codex_master.server', run_name='__main__', alter_sys=True)\n"
+        "sys.argv = [str(root / 'src' / 'the_hive' / 'server.py'), *sys.argv[2:]]\n"
+        "runpy.run_module('the_hive.server', run_name='__main__', alter_sys=True)\n"
     )
     try:
         mcp = run_bounded(
@@ -567,28 +546,28 @@ def _release_metadata(*, generation: str, commit: str) -> dict[str, object]:
         raise InstallError("install_release_identity_invalid")
     return {
         "commit": commit,
-        "f25_base_commit": _F25_COMMIT,
         "generation": generation,
-        "d69": {"commit": _F25_COMMIT, "parent": _C4_COMMIT},
-        "d69_paths": list(_D69_RUNTIME_PATHS),
-        "d69_anchor": {"path": _D69_ANCHOR_PATH, "sha256": _D69_ANCHOR_SHA256},
-        "f25_d69_source_sha256": _F25_D69_SOURCE_SHA256,
-        "f25_c4_subset_sha256": _F25_C4_SUBSET_SHA256,
+        "r2_base": {"commit": _R2_BASE_COMMIT, "tree": _R2_BASE_TREE},
+        "historical_lineage": _HISTORICAL_LINEAGE,
+        "successor_witness": {
+            "path": _SUCCESSOR_WITNESS_PATH,
+            "sha256": _SUCCESSOR_WITNESS_SHA256,
+        },
         "release": {
             "stable_launchers": [
                 _STABLE_MCP_LAUNCHER_SOURCE,
-                "bin/codex-master-mcp",
-                "bin/codex-master-resource-monitor",
+                "bin/the-hive-mcp",
+                "bin/the-hive-resource-monitor",
             ],
-            "python_tree": "src/codex_master",
-            "monitor_entrypoint": "bin/codex-master-resource-monitor",
+            "python_tree": "src/the_hive",
+            "monitor_entrypoint": "bin/the-hive-resource-monitor",
             "h4_units": [
                 "systemd/user/codex-master-resource-monitor.service",
                 "systemd/user/codex-master.slice",
             ],
             "bind_sources": [
-                "bin/codex-master-resource-monitor",
-                "src/codex_master",
+                "bin/the-hive-resource-monitor",
+                "src/the_hive",
                 "codex-agent-classes.json",
                 "codex-hive.json",
                 "%h/.local/state/codex-master-mcp/hive",
@@ -598,7 +577,7 @@ def _release_metadata(*, generation: str, commit: str) -> dict[str, object]:
 
 
 def _runtime_manifest_payload(
-    root: Path, *, generation: str = _F25_COMMIT, commit: str = _F25_COMMIT
+    root: Path, *, generation: str = _R2_BASE_COMMIT, commit: str = _R2_BASE_COMMIT
 ) -> dict[str, object]:
     _directory(root, mode=0o700, create=False)
     directories: dict[str, dict[str, int]] = {}
@@ -626,15 +605,10 @@ def _runtime_manifest_payload(
                 "size": len(raw),
                 "sha256": hashlib.sha256(raw).hexdigest(),
             }
-    expected_d69 = (
-        _F25_D69_SOURCE_SHA256
-        if commit == _F25_COMMIT
-        else {_D69_ANCHOR_PATH: _D69_ANCHOR_SHA256}
-    )
-    if any(
-        not isinstance(files.get(path), dict)
-        or files[path].get("sha256") != digest
-        for path, digest in expected_d69.items()
+    witness = files.get(_SUCCESSOR_WITNESS_PATH)
+    if (
+        not isinstance(witness, dict)
+        or witness.get("sha256") != _SUCCESSOR_WITNESS_SHA256
     ):
         raise InstallError("install_release_binding_drift")
     return {
@@ -646,7 +620,7 @@ def _runtime_manifest_payload(
 
 
 def _write_runtime_image_manifest(
-    *, root: Path, generation: str = _F25_COMMIT, commit: str = _F25_COMMIT
+    *, root: Path, generation: str = _R2_BASE_COMMIT, commit: str = _R2_BASE_COMMIT
 ) -> None:
     encoded = _canonical_json(_runtime_manifest_payload(root, generation=generation, commit=commit))
     if len(encoded) > _MAX_MANIFEST_BYTES:
@@ -1216,7 +1190,7 @@ def install(*, home: Path) -> dict[str, object]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="codex-master-hive-hourly-probe-install")
+    parser = argparse.ArgumentParser(prog="the-hive-hive-hourly-probe-install")
     parser.add_argument("--home", type=Path, default=Path.home())
     arguments = parser.parse_args()
     try:

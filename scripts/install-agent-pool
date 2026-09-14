@@ -2,4 +2,32 @@
 set -euo pipefail
 
 [[ "${HOME:-}" == /* ]] || exit 64
-exec "${HOME}/.local/lib/codex-master-runtime/bin/codex-master-mcp" pool install "$@"
+release_root="${HOME}/.local/lib/the-hive-runtime"
+pointer="${release_root}/.the-hive-release-pointers.json"
+binding="$(
+  /usr/bin/python3 -I -B - "${pointer}" <<'PY'
+import json
+import sys
+
+pointers = json.loads(open(sys.argv[1], encoding="utf-8").read())
+current = pointers.get("current") if isinstance(pointers, dict) else None
+if (
+    not isinstance(current, dict)
+    or set(pointers) != {"schema_version", "current", "previous"}
+    or pointers.get("schema_version") != 1
+    or set(current) != {"generation", "manifest_digest"}
+    or not isinstance(current.get("generation"), str)
+    or not current["generation"]
+    or "/" in current["generation"]
+    or current["generation"] in {".", ".."}
+    or not isinstance(current.get("manifest_digest"), str)
+    or not current["manifest_digest"].startswith("sha256:")
+    or len(current["manifest_digest"]) != 71
+):
+    raise SystemExit("invalid release binding")
+print(current["generation"], current["manifest_digest"])
+PY
+)"
+read -r generation manifest_digest <<< "${binding}"
+mcp="${release_root}/generations/${generation}/bin/the-hive-mcp"
+exec "${mcp}" "${release_root}" "${generation}" "${manifest_digest}" pool install "$@"

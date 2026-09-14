@@ -30,7 +30,7 @@ try:
     # The bootstrap is used only to load the attester.  Application imports do
     # not start until the returned layout has revalidated the current pointer.
     sys.path.insert(0, str(candidate))
-    from codex_master.runtime_layout import RuntimeLayout
+    from the_hive.runtime_layout import RuntimeLayout
     layout = RuntimeLayout.from_current_release(
         release_root, generation, manifest_digest
     )
@@ -39,7 +39,7 @@ try:
 except Exception:
     raise SystemExit(64)
 try:
-    from codex_master.server import run_resource_monitor
+    from the_hive.server import run_resource_monitor
     run_resource_monitor()
 except Exception:
     raise SystemExit(1)

@@ -11,7 +11,7 @@ from the_hive import server
 
 def test_install_resource_scope_gate_requires_root_and_is_idempotent(tmp_path: Path) -> None:
     source_root = Path(__file__).resolve().parents[1]
-    target = tmp_path / "libexec" / "codex-master-resource-scope-gate"
+    target = tmp_path / "libexec" / "the-hive-resource-scope-gate"
     target.parent.mkdir()
 
     with pytest.raises(server.AgentError, match="^resource_scope_gate_install_requires_root$"):
@@ -21,7 +21,7 @@ def test_install_resource_scope_gate_requires_root_and_is_idempotent(tmp_path: P
         first = server.install_resource_scope_gate(root=source_root, target=target)
         second = server.install_resource_scope_gate(root=source_root, target=target)
 
-    expected = (source_root / "bin" / "codex-master-resource-scope-gate").read_bytes()
+    expected = (source_root / "bin" / "the-hive-resource-scope-gate").read_bytes()
     assert first == {"ok": True, "status": "installed", "raw_output": "not_returned"}
     assert second == {"ok": True, "status": "already_installed", "raw_output": "not_returned"}
     assert target.read_bytes() == expected
@@ -30,7 +30,7 @@ def test_install_resource_scope_gate_requires_root_and_is_idempotent(tmp_path: P
 
 def test_install_resource_scope_gate_refuses_existing_symlink(tmp_path: Path) -> None:
     source_root = Path(__file__).resolve().parents[1]
-    target = tmp_path / "libexec" / "codex-master-resource-scope-gate"
+    target = tmp_path / "libexec" / "the-hive-resource-scope-gate"
     target.parent.mkdir()
     target.symlink_to(tmp_path / "outside")
 

@@ -58,10 +58,10 @@ jobs:
           app_entry = app["apps"]["codex-master"]
           assert app_entry["id"].startswith(("connector_", "asdk_app_"))
 
-          server = mcp["mcpServers"]["codex-master-mcp"]
-          assert server["command"] == "python3"
-          assert "codex_master.server" in " ".join(server["args"])
-          assert server["startup_timeout_sec"] >= 120
+          server = mcp["mcpServers"]["the-hive-mcp"]
+          assert server["command"] == "/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp"
+          assert server["args"] == []
+          assert server["startup_timeout_sec"] == 120
           PY
 
       - name: Lint Python sources
@@ -114,16 +114,43 @@ jobs:
       - name: Run unit tests
         run: PYTHONPATH=src python -m pytest -q
 
-      - name: Check CLI wrapper
-        run: ./bin/codex-master-mcp tools
+      - name: Check CLI wrapper syntax
+        run: bash -n ./bin/the-hive-mcp ./bin/the-hive-mcp-stable
 
       - name: Check agent pool installer
         run: |
           set -eu
           home="${RUNNER_TEMP}/codex-agent-pool-ci-home"
           mkdir -m 700 "${home}"
-          ./scripts/codex-master-hive-hourly-probe-install --home "${home}"
-          mcp="${home}/.local/lib/codex-master-runtime/bin/codex-master-mcp"
+          ./scripts/the-hive-hive-hourly-probe-install --home "${home}"
+          release_root="${home}/.local/lib/the-hive-runtime"
+          pointer="${release_root}/.the-hive-release-pointers.json"
+          binding="$(
+            python3 - "${pointer}" <<'PY'
+          import json
+          import sys
+
+          pointers = json.loads(open(sys.argv[1], encoding="utf-8").read())
+          current = pointers.get("current") if isinstance(pointers, dict) else None
+          if (
+              not isinstance(current, dict)
+              or set(pointers) != {"schema_version", "current", "previous"}
+              or pointers.get("schema_version") != 1
+              or set(current) != {"generation", "manifest_digest"}
+              or not isinstance(current.get("generation"), str)
+              or not current["generation"]
+              or "/" in current["generation"]
+              or current["generation"] in {".", ".."}
+              or not isinstance(current.get("manifest_digest"), str)
+              or not current["manifest_digest"].startswith("sha256:")
+              or len(current["manifest_digest"]) != 71
+          ):
+              raise SystemExit("invalid release binding")
+          print(current["generation"], current["manifest_digest"])
+          PY
+          )"
+          read -r generation manifest_digest <<< "${binding}"
+          mcp="${release_root}/generations/${generation}/bin/the-hive-mcp"
           spec="${RUNNER_TEMP}/codex-agent-pool-ci.json"
           target="${RUNNER_TEMP}/codex-agents-ci"
           cat > "${spec}" <<'JSON'
@@ -152,7 +179,7 @@ jobs:
             }
           }
           JSON
-          HOME="${home}" "${mcp}" pool validate --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
+          HOME="${home}" "${mcp}" "${release_root}" "${generation}" "${manifest_digest}" pool validate --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
           HOME="${home}" ./scripts/install-agent-pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
-          HOME="${home}" "${mcp}" pool status --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
-          HOME="${home}" "${mcp}" pool destroy_pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo --yes --force --remove-root
+          HOME="${home}" "${mcp}" "${release_root}" "${generation}" "${manifest_digest}" pool status --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
+          HOME="${home}" "${mcp}" "${release_root}" "${generation}" "${manifest_digest}" pool destroy_pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo --yes --force --remove-root
