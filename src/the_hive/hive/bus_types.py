@@ -1298,4 +1298,3 @@ __all__ = [
     "validate_event_type_producer_partition",
     "validate_topic_partition",
 ]
-

@@ -1450,4 +1450,3 @@ def test_bus_source_has_no_legacy_test_index_reference() -> None:
         / "bus_types.py"
     ).read_text(encoding="utf-8")
     assert ".hive/test-index.v1.json" not in source
-
