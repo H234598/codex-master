@@ -40,7 +40,7 @@ from the_hive.hive.types import Clock, HiveValidationError, validate_identifier
 _DATABASE_NAME: Final = "bus_store.sqlite3"
 _OWNER_NAME: Final = "bus_store.owner.lock"
 _SCHEMA_NAME: Final = "hive_bus_store"
-_GENERATION: Final = 1
+_GENERATION: Final = 2
 _MAX_HEADER_BYTES: Final = 4096
 _EVENT_ID_RE: Final = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 _LEASE_TOKEN_RE: Final = re.compile(r"lease-v1-[A-Za-z0-9_-]{43}\Z", re.ASCII)
@@ -69,7 +69,8 @@ class EffectBeginResultV1:
     state: Literal["apply", "committed", "dead_lettered"]
     attempt_count: int
 
-_TABLE_DDL: Final = (
+
+_GEN1_TABLE_DDL: Final = (
     "CREATE TABLE bus_store_meta (schema_name TEXT PRIMARY KEY CHECK(schema_name='hive_bus_store'),generation INTEGER NOT NULL CHECK(generation>=1),schema_digest TEXT NOT NULL UNIQUE,created_at_utc TEXT NOT NULL)",
     "CREATE TABLE partitions (partition TEXT PRIMARY KEY,next_seq INTEGER NOT NULL CHECK(next_seq>=1),first_retained_seq INTEGER NOT NULL CHECK(first_retained_seq>=1 AND first_retained_seq<=next_seq),state TEXT NOT NULL CHECK(state IN ('active','blocked')),blocked_code TEXT,created_at_utc TEXT NOT NULL,updated_at_utc TEXT NOT NULL)",
     "CREATE TABLE payloads (kind TEXT NOT NULL CHECK(kind IN ('inline','blob','artifact')),digest TEXT NOT NULL,ref TEXT NOT NULL,size_bytes INTEGER NOT NULL CHECK(size_bytes BETWEEN 0 AND 1048576),body BLOB,body_state TEXT NOT NULL CHECK(body_state IN ('present','expired','quarantined','reference')),artifact_id TEXT,quarantine_code TEXT,created_at_utc TEXT NOT NULL,PRIMARY KEY(kind,digest,ref),CHECK((kind IN ('inline','blob') AND body_state='present' AND body IS NOT NULL AND length(body)=size_bytes AND artifact_id IS NULL AND quarantine_code IS NULL) OR (kind='artifact' AND body IS NULL AND body_state='reference' AND artifact_id IS NOT NULL AND quarantine_code IS NULL) OR (body_state IN ('expired','quarantined') AND body IS NULL)))",
@@ -85,10 +86,41 @@ _TABLE_DDL: Final = (
     "CREATE TABLE archive_manifests (archive_manifest_id TEXT PRIMARY KEY,partition TEXT NOT NULL REFERENCES partitions(partition),snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id),accepted_event_id TEXT NOT NULL,decision_digest TEXT NOT NULL,manifest_digest TEXT NOT NULL UNIQUE,manifest_bytes BLOB NOT NULL CHECK(length(manifest_bytes)<=1048576),manifest_size_bytes INTEGER NOT NULL CHECK(manifest_size_bytes=length(manifest_bytes)),state TEXT NOT NULL CHECK(state='prepared'),created_at_utc TEXT NOT NULL,UNIQUE(partition,snapshot_id,manifest_digest))",
     "CREATE TABLE outbox (outbox_id TEXT PRIMARY KEY,event_id TEXT NOT NULL UNIQUE,effect_digest TEXT NOT NULL,idempotency_key TEXT NOT NULL,hash_basis_digest TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','leased','acked','blocked')),lease_token TEXT,lease_expires_at_utc TEXT,attempt_count INTEGER NOT NULL CHECK(attempt_count>=0),created_at_utc TEXT NOT NULL,updated_at_utc TEXT NOT NULL)",
 )
-_INDEX_DDL: Final = (
+_GEN1_INDEX_DDL: Final = (
     "CREATE INDEX events_partition_retention_seq_idx ON events(partition,retention_class,partition_seq)",
     "CREATE INDEX events_payload_ref_idx ON events(payload_kind,payload_digest,payload_ref)",
     "CREATE INDEX producer_epochs_principal_epoch_idx ON producer_epochs(producer_principal_id,producer_epoch DESC)",
+    "CREATE INDEX delivery_leases_expiry_idx ON delivery_leases(expires_at_utc)",
+    "CREATE INDEX consumer_effects_partition_seq_idx ON consumer_effects(consumer_group_id,partition,partition_seq)",
+    "CREATE INDEX consumer_effects_retry_idx ON consumer_effects(retry_not_before_utc)",
+    "CREATE INDEX dead_letters_partition_seq_idx ON dead_letters(partition,partition_seq)",
+    "CREATE INDEX snapshots_partition_through_idx ON snapshots(partition,through_seq DESC)",
+    "CREATE INDEX outbox_state_expiry_idx ON outbox(state,lease_expires_at_utc)",
+)
+_TABLE_DDL: Final = (
+    "CREATE TABLE bus_store_meta (schema_name TEXT PRIMARY KEY CHECK(schema_name='hive_bus_store'),generation INTEGER NOT NULL CHECK(generation>=1),schema_digest TEXT NOT NULL UNIQUE,created_at_utc TEXT NOT NULL)",
+    "CREATE TABLE partitions (partition TEXT PRIMARY KEY,next_seq INTEGER NOT NULL CHECK(next_seq>=1),first_retained_seq INTEGER NOT NULL CHECK(first_retained_seq>=1 AND first_retained_seq<=next_seq),state TEXT NOT NULL CHECK(state IN ('active','blocked')),blocked_code TEXT,created_at_utc TEXT NOT NULL,updated_at_utc TEXT NOT NULL)",
+    "CREATE TABLE payloads (kind TEXT NOT NULL CHECK(kind IN ('inline','blob','artifact')),digest TEXT NOT NULL,ref TEXT NOT NULL,size_bytes INTEGER NOT NULL CHECK((kind='artifact' AND size_bytes BETWEEN 0 AND 9223372036854775807) OR (kind IN ('inline','blob') AND size_bytes BETWEEN 0 AND 1048576)),body BLOB,body_state TEXT NOT NULL CHECK(body_state IN ('present','expired','quarantined','reference')),artifact_id TEXT,quarantine_code TEXT,created_at_utc TEXT NOT NULL,PRIMARY KEY(kind,digest,ref),CHECK((kind IN ('inline','blob') AND body_state='present' AND body IS NOT NULL AND length(body)=size_bytes AND artifact_id IS NULL AND quarantine_code IS NULL) OR (kind='artifact' AND body IS NULL AND body_state='reference' AND artifact_id IS NOT NULL AND quarantine_code IS NULL) OR (body_state IN ('expired','quarantined') AND body IS NULL)))",
+    "CREATE TABLE events (event_id TEXT PRIMARY KEY,partition TEXT NOT NULL REFERENCES partitions(partition),partition_seq INTEGER NOT NULL CHECK(partition_seq>=1),schema_version INTEGER NOT NULL,event_type TEXT NOT NULL,idempotency_key TEXT NOT NULL,producer_principal_id TEXT NOT NULL,producer_session_id TEXT NOT NULL,producer_epoch INTEGER NOT NULL,producer_seq INTEGER NOT NULL,repo_id TEXT,topic_id TEXT,workpackage_id TEXT,correlation_id TEXT NOT NULL,causation_ids_bytes BLOB NOT NULL,authority_grant_id TEXT NOT NULL,authority_scope_digest TEXT NOT NULL,authority_principal_version INTEGER NOT NULL,classification TEXT NOT NULL,retention_class TEXT NOT NULL,created_at_utc TEXT NOT NULL,accepted_at_utc TEXT NOT NULL,payload_kind TEXT NOT NULL,payload_digest TEXT NOT NULL,payload_ref TEXT NOT NULL,payload_size_bytes INTEGER NOT NULL CHECK((payload_kind='artifact' AND payload_size_bytes BETWEEN 0 AND 9223372036854775807) OR (payload_kind IN ('inline','blob') AND payload_size_bytes BETWEEN 0 AND 1048576)),header_bytes BLOB NOT NULL CHECK(length(header_bytes)<=4096),header_digest TEXT NOT NULL,UNIQUE(partition,partition_seq),UNIQUE(producer_principal_id,producer_epoch,producer_seq),UNIQUE(producer_principal_id,producer_epoch,idempotency_key),FOREIGN KEY(payload_kind,payload_digest,payload_ref) REFERENCES payloads(kind,digest,ref))",
+    "CREATE TABLE producer_epochs (producer_principal_id TEXT NOT NULL,producer_epoch INTEGER NOT NULL,producer_session_id TEXT NOT NULL,last_seq INTEGER NOT NULL CHECK(last_seq>=0),last_event_id TEXT,updated_at_utc TEXT NOT NULL,PRIMARY KEY(producer_principal_id,producer_epoch))",
+    "CREATE TABLE idempotency (producer_principal_id TEXT NOT NULL,producer_epoch INTEGER NOT NULL,idempotency_key TEXT NOT NULL,event_id TEXT NOT NULL UNIQUE,canonical_request_digest TEXT NOT NULL,partition_seq INTEGER NOT NULL CHECK(partition_seq>=1),accepted_at_utc TEXT NOT NULL,created_at_utc TEXT NOT NULL,PRIMARY KEY(producer_principal_id,producer_epoch,idempotency_key))",
+    "CREATE TABLE subscription_manifests (consumer_group_id TEXT NOT NULL,generation TEXT NOT NULL,manifest_bytes BLOB NOT NULL,manifest_size_bytes INTEGER NOT NULL CHECK(manifest_size_bytes BETWEEN 1 AND 65536 AND length(manifest_bytes)=manifest_size_bytes),created_at_utc TEXT NOT NULL,PRIMARY KEY(consumer_group_id,generation))",
+    "CREATE TABLE cursors (consumer_group_id TEXT NOT NULL,partition TEXT NOT NULL,generation TEXT NOT NULL,acked_seq INTEGER NOT NULL CHECK(acked_seq>=0),gap_snapshot_id TEXT,gap_from_seq INTEGER,gap_through_seq INTEGER,updated_at_utc TEXT NOT NULL,PRIMARY KEY(consumer_group_id,partition),FOREIGN KEY(partition) REFERENCES partitions(partition),FOREIGN KEY(consumer_group_id,generation) REFERENCES subscription_manifests(consumer_group_id,generation),CHECK((gap_snapshot_id IS NULL AND gap_from_seq IS NULL AND gap_through_seq IS NULL) OR (gap_snapshot_id IS NOT NULL AND gap_from_seq>=1 AND gap_from_seq<=gap_through_seq)))",
+    "CREATE TABLE delivery_leases (consumer_group_id TEXT NOT NULL,partition TEXT NOT NULL,generation TEXT NOT NULL,delivery_token TEXT NOT NULL UNIQUE,from_seq INTEGER NOT NULL,scan_through_seq INTEGER NOT NULL CHECK(from_seq>=1 AND from_seq<=scan_through_seq),leased_at_utc TEXT NOT NULL,expires_at_utc TEXT NOT NULL,created_monotonic REAL NOT NULL,PRIMARY KEY(consumer_group_id,partition),FOREIGN KEY(consumer_group_id,partition) REFERENCES cursors(consumer_group_id,partition),FOREIGN KEY(consumer_group_id,generation) REFERENCES subscription_manifests(consumer_group_id,generation))",
+    "CREATE TABLE consumer_effects (consumer_group_id TEXT NOT NULL,event_id TEXT NOT NULL,partition TEXT NOT NULL,partition_seq INTEGER NOT NULL,generation TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','committed','dead_lettered')),effect_digest TEXT,attempt_count INTEGER NOT NULL CHECK(attempt_count BETWEEN 0 AND 5),retry_not_before_utc TEXT,lease_token TEXT,lease_expires_at_utc TEXT,last_error_code TEXT,updated_at_utc TEXT NOT NULL,PRIMARY KEY(consumer_group_id,event_id),FOREIGN KEY(consumer_group_id,partition) REFERENCES cursors(consumer_group_id,partition),FOREIGN KEY(consumer_group_id,generation) REFERENCES subscription_manifests(consumer_group_id,generation))",
+    "CREATE TABLE dead_letters (consumer_group_id TEXT NOT NULL,event_id TEXT NOT NULL,partition TEXT NOT NULL,partition_seq INTEGER NOT NULL,generation TEXT NOT NULL,attempt_count INTEGER NOT NULL CHECK(attempt_count=5),error_code TEXT NOT NULL,error_fingerprint TEXT NOT NULL,created_at_utc TEXT NOT NULL,PRIMARY KEY(consumer_group_id,event_id),FOREIGN KEY(consumer_group_id,event_id) REFERENCES consumer_effects(consumer_group_id,event_id))",
+    "CREATE TABLE snapshots (snapshot_id TEXT PRIMARY KEY,partition TEXT NOT NULL REFERENCES partitions(partition),through_seq INTEGER NOT NULL CHECK(through_seq>=1),snapshot_digest TEXT NOT NULL UNIQUE,snapshot_bytes BLOB NOT NULL CHECK(length(snapshot_bytes)<=1048576),snapshot_size_bytes INTEGER NOT NULL CHECK(snapshot_size_bytes=length(snapshot_bytes)),created_at_utc TEXT NOT NULL,UNIQUE(partition,through_seq))",
+    "CREATE TABLE archive_manifests (archive_manifest_id TEXT PRIMARY KEY,partition TEXT NOT NULL REFERENCES partitions(partition),snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id),accepted_event_id TEXT NOT NULL,decision_digest TEXT NOT NULL,manifest_digest TEXT NOT NULL UNIQUE,manifest_bytes BLOB NOT NULL CHECK(length(manifest_bytes)<=1048576),manifest_size_bytes INTEGER NOT NULL CHECK(manifest_size_bytes=length(manifest_bytes)),state TEXT NOT NULL CHECK(state='prepared'),created_at_utc TEXT NOT NULL,UNIQUE(partition,snapshot_id,manifest_digest))",
+    "CREATE TABLE outbox (outbox_id TEXT PRIMARY KEY,event_id TEXT NOT NULL UNIQUE,effect_digest TEXT NOT NULL,idempotency_key TEXT NOT NULL,hash_basis_digest TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','leased','acked','blocked')),lease_token TEXT,lease_expires_at_utc TEXT,attempt_count INTEGER NOT NULL CHECK(attempt_count>=0),created_at_utc TEXT NOT NULL,updated_at_utc TEXT NOT NULL)",
+    "CREATE TABLE digest_anchors (partition TEXT NOT NULL REFERENCES partitions(partition),from_seq INTEGER NOT NULL CHECK(from_seq>=1),through_seq INTEGER NOT NULL CHECK(through_seq>=from_seq),event_count INTEGER NOT NULL CHECK(event_count BETWEEN 1 AND 32),header_bytes INTEGER NOT NULL CHECK(header_bytes BETWEEN 1 AND 69632),digest TEXT NOT NULL UNIQUE,digest_bytes BLOB NOT NULL CHECK(length(digest_bytes)<=65536),digest_size_bytes INTEGER NOT NULL CHECK(digest_size_bytes=length(digest_bytes)),created_at_utc TEXT NOT NULL,PRIMARY KEY(partition,through_seq),UNIQUE(partition,from_seq))",
+    "CREATE TABLE retention_policies (retention_generation INTEGER PRIMARY KEY CHECK(retention_generation>=1),policy_digest TEXT NOT NULL UNIQUE,policy_bytes BLOB NOT NULL CHECK(length(policy_bytes)<=4096),created_at_utc TEXT NOT NULL)",
+    "CREATE TABLE retention_checkpoints (partition TEXT NOT NULL REFERENCES partitions(partition),run_id TEXT NOT NULL,request_digest TEXT NOT NULL,retention_generation INTEGER NOT NULL REFERENCES retention_policies(retention_generation),basis_digest TEXT NOT NULL,snapshot_id TEXT REFERENCES snapshots(snapshot_id),compacted_through_seq INTEGER NOT NULL CHECK(compacted_through_seq>=0),first_retained_seq INTEGER NOT NULL CHECK(first_retained_seq>=1),expired_payload_count INTEGER NOT NULL CHECK(expired_payload_count>=0),compacted_event_count INTEGER NOT NULL CHECK(compacted_event_count>=0),completed_at_utc TEXT NOT NULL,PRIMARY KEY(partition,run_id),UNIQUE(partition,request_digest))",
+)
+_INDEX_DDL: Final = (
+    "CREATE INDEX events_partition_retention_accepted_seq_idx ON events(partition,retention_class,accepted_at_utc,partition_seq)",
+    "CREATE INDEX events_payload_ref_idx ON events(payload_kind,payload_digest,payload_ref)",
+    "CREATE INDEX producer_epochs_principal_epoch_idx ON producer_epochs(producer_principal_id,producer_epoch DESC)",
+    "CREATE INDEX cursors_partition_acked_seq_idx ON cursors(partition,acked_seq)",
     "CREATE INDEX delivery_leases_expiry_idx ON delivery_leases(expires_at_utc)",
     "CREATE INDEX consumer_effects_partition_seq_idx ON consumer_effects(consumer_group_id,partition,partition_seq)",
     "CREATE INDEX consumer_effects_retry_idx ON consumer_effects(retry_not_before_utc)",
@@ -109,7 +141,38 @@ _SCHEMA_MANIFEST: Final = {
         "wal_autocheckpoint": 1000,
     },
 }
-_SCHEMA_DIGEST: Final = "sha256:577d018653c16b9bf92590c1e68931f2ec972ad84a7e35c6f644f4f08aa508ba"
+_SCHEMA_DIGEST: Final = (
+    "sha256:1554a2ab9908b11262b238fb2906ec2c43b81f7fdf99f120546d415e4b462e11"
+)
+_GEN1_SCHEMA_DIGEST: Final = (
+    "sha256:577d018653c16b9bf92590c1e68931f2ec972ad84a7e35c6f644f4f08aa508ba"
+)
+_GEN1_RETENTION_POLICY: Final = {
+    "schema_version": 1,
+    "retention_generation": 1,
+    "classes": {
+        "transient": {
+            "header_retention_seconds": 86400,
+            "payload_retention_seconds": 21600,
+        },
+        "work": {
+            "header_retention_seconds": 2592000,
+            "payload_retention_seconds": 604800,
+        },
+        "audit": {
+            "header_retention_seconds": 31536000,
+            "payload_retention_seconds": 2592000,
+        },
+        "manifest": {
+            "header_retention_seconds": None,
+            "payload_retention_seconds": None,
+        },
+    },
+}
+_GEN1_RETENTION_POLICY_DIGEST: Final = (
+    "sha256:33dc6401f637e0dd7552a606266771f6cdfe5393f9d87d59353957a711324e8f"
+)
+_GEN1_PERSISTED_PRAGMAS: Final = (("journal_mode", ("wal",)),)
 _NFS_SUPER_MAGIC: Final = 0x6969
 _SMB_SUPER_MAGIC: Final = 0x517B
 _CIFS_SUPER_MAGIC: Final = 0xFF534D42
@@ -165,6 +228,14 @@ def _stored_utc(value: object) -> datetime:
     if parsed.tzinfo is None or _format_utc(parsed.astimezone(timezone.utc)) != value:
         raise ValueError
     return parsed.astimezone(timezone.utc)
+
+
+def _migration_checkpoint(_stage: str) -> None:
+    """Private fault-injection seam; production execution has no side effect."""
+
+
+def _append_checkpoint(_stage: str) -> None:
+    """Private fault-injection seam; production execution has no side effect."""
 
 
 def _identity(info: os.stat_result) -> tuple[int, int]:
@@ -230,17 +301,19 @@ def _ancestors_are_trusted(parent: Path) -> bool:
 
 
 class HiveBusStore:
-    """The sole public BUS-S1/A store, with one locally-owned SQLite connection."""
+    """The sole public BUS-S1 store, with one locally-owned SQLite connection."""
 
     @classmethod
-    def initialize(cls, state_root: Path, *, clock: Clock) -> HiveBusStore | DiagnosticV2:
-        """Create only a missing final private root and initialize or verify Gen-1."""
+    def initialize(
+        cls, state_root: Path, *, clock: Clock
+    ) -> HiveBusStore | DiagnosticV2:
+        """Create only a missing final private root and initialize or verify Gen-2."""
 
         return cls._open_store(state_root, clock=clock, create=True)
 
     @classmethod
     def open(cls, state_root: Path, *, clock: Clock) -> HiveBusStore | DiagnosticV2:
-        """Open an existing complete Gen-1 store without creating any filesystem node."""
+        """Open an existing complete Gen-2 store without creating any filesystem node."""
 
         return cls._open_store(state_root, clock=clock, create=False)
 
@@ -380,7 +453,6 @@ class HiveBusStore:
                     action="operator_intervention",
                     causes=(),
                 )
-            cls._configure(connection)
             schema_result = cls._initialize_or_validate_schema(
                 connection,
                 create_schema=create and existed is None,
@@ -484,7 +556,9 @@ class HiveBusStore:
     def _open_root(state_root: Path, *, create: bool) -> int:
         if not _ancestors_are_trusted(state_root.parent):
             raise ValueError
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
             parent_fd = os.open(state_root.parent, flags)
         except OSError as exc:
@@ -507,9 +581,8 @@ class HiveBusStore:
             try:
                 if created:
                     os.fchmod(root_fd, 0o700)
-                if (
-                    not _is_local_filesystem(root_fd)
-                    or not _is_trusted_directory(os.fstat(root_fd))
+                if not _is_local_filesystem(root_fd) or not _is_trusted_directory(
+                    os.fstat(root_fd)
                 ):
                     raise ValueError
                 return root_fd
@@ -533,7 +606,9 @@ class HiveBusStore:
             if not create:
                 raise ValueError
             try:
-                fd = os.open(_OWNER_NAME, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd)
+                fd = os.open(
+                    _OWNER_NAME, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd
+                )
                 created = True
             except FileExistsError:
                 existing = os.stat(_OWNER_NAME, dir_fd=root_fd, follow_symlinks=False)
@@ -570,6 +645,7 @@ class HiveBusStore:
             raise sqlite3.DatabaseError
         if connection.execute("PRAGMA wal_autocheckpoint=1000").fetchone() != (1000,):
             raise sqlite3.DatabaseError
+
     @staticmethod
     def _validate_auxiliary_files(
         root: Path, *, new_suffixes: frozenset[str] = frozenset()
@@ -611,6 +687,7 @@ class HiveBusStore:
                     action="operator_intervention",
                     causes=(),
                 )
+            HiveBusStore._configure(connection)
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 for statement in _TABLE_DDL:
@@ -625,7 +702,233 @@ class HiveBusStore:
             except Exception:
                 HiveBusStore._rollback(connection)
                 raise
-        return HiveBusStore._validate_schema(connection)
+            return HiveBusStore._validate_schema(connection)
+        if HiveBusStore._schema_surface_matches(connection, _TABLE_DDL, _INDEX_DDL):
+            HiveBusStore._configure(connection)
+            return HiveBusStore._validate_schema(connection)
+        if HiveBusStore._schema_surface_matches(
+            connection, _GEN1_TABLE_DDL, _GEN1_INDEX_DDL
+        ):
+            # SQLite does not persist foreign_keys across connections.  Enable it
+            # only as the operational enforcement required for source checks;
+            # all other manifest values remain observable before Gen-2 setup.
+            connection.execute("PRAGMA foreign_keys=ON")
+            if connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
+                return diagnostic_for(
+                    "BUS_E_STORE_SCHEMA_UNKNOWN",
+                    severity=DiagnosticSeverityV2.CRITICAL,
+                    retryable=False,
+                    retry_after_seconds=None,
+                    fallback_applied=False,
+                    requested_choice=None,
+                    effective_choice=None,
+                    action="operator_intervention",
+                    causes=(),
+                )
+            source_error = HiveBusStore._validate_gen1_source(connection)
+            if source_error is not None:
+                return source_error
+            HiveBusStore._configure(connection)
+            HiveBusStore._migrate_gen1(connection, clock=clock)
+            HiveBusStore._configure(connection)
+            return HiveBusStore._validate_schema(connection)
+        generation = HiveBusStore._declared_generation(connection)
+        if generation is not None and generation > _GENERATION:
+            return diagnostic_for(
+                "BUS_E_STORE_SCHEMA_TOO_NEW",
+                severity=DiagnosticSeverityV2.CRITICAL,
+                retryable=False,
+                retry_after_seconds=None,
+                fallback_applied=False,
+                requested_choice=None,
+                effective_choice=None,
+                action="operator_intervention",
+                causes=(),
+            )
+        return diagnostic_for(
+            "BUS_E_STORE_SCHEMA_UNKNOWN",
+            severity=DiagnosticSeverityV2.CRITICAL,
+            retryable=False,
+            retry_after_seconds=None,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="operator_intervention",
+            causes=(),
+        )
+
+    @staticmethod
+    def _schema_surface_matches(
+        connection: sqlite3.Connection,
+        tables: tuple[str, ...],
+        indexes: tuple[str, ...],
+    ) -> bool:
+        expected_tables = {statement.split()[2]: statement for statement in tables}
+        expected_indexes = {statement.split()[2]: statement for statement in indexes}
+        entries = connection.execute(
+            "SELECT type,name,sql FROM sqlite_schema"
+        ).fetchall()
+        explicit_entries = [
+            (kind, name, sql)
+            for kind, name, sql in entries
+            if not name.startswith("sqlite_")
+        ]
+        actual_tables = {
+            name: sql for kind, name, sql in explicit_entries if kind == "table"
+        }
+        actual_indexes = {
+            name: sql for kind, name, sql in explicit_entries if kind == "index"
+        }
+        return (
+            set(actual_tables) == set(expected_tables)
+            and set(actual_indexes) == set(expected_indexes)
+            and all(
+                actual_tables[name] == statement
+                for name, statement in expected_tables.items()
+            )
+            and all(
+                actual_indexes[name] == statement
+                for name, statement in expected_indexes.items()
+            )
+            and all(
+                kind in {"table", "index"} for kind, _name, _sql in explicit_entries
+            )
+        )
+
+    @staticmethod
+    def _declared_generation(connection: sqlite3.Connection) -> int | None:
+        try:
+            rows = connection.execute(
+                "SELECT generation FROM bus_store_meta"
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return None
+        if len(rows) != 1 or type(rows[0][0]) is not int:
+            return None
+        return rows[0][0]
+
+    @staticmethod
+    def _validate_gen1_source(connection: sqlite3.Connection) -> DiagnosticV2 | None:
+        rows = connection.execute(
+            "SELECT schema_name,generation,schema_digest FROM bus_store_meta"
+        ).fetchall()
+        if rows != [(_SCHEMA_NAME, 1, _GEN1_SCHEMA_DIGEST)]:
+            return diagnostic_for(
+                "BUS_E_STORE_SCHEMA_UNKNOWN",
+                severity=DiagnosticSeverityV2.CRITICAL,
+                retryable=False,
+                retry_after_seconds=None,
+                fallback_applied=False,
+                requested_choice=None,
+                effective_choice=None,
+                action="operator_intervention",
+                causes=(),
+            )
+        for pragma, expected in _GEN1_PERSISTED_PRAGMAS:
+            if connection.execute(f"PRAGMA {pragma}").fetchone() != expected:
+                return diagnostic_for(
+                    "BUS_E_STORE_SCHEMA_UNKNOWN",
+                    severity=DiagnosticSeverityV2.CRITICAL,
+                    retryable=False,
+                    retry_after_seconds=None,
+                    fallback_applied=False,
+                    requested_choice=None,
+                    effective_choice=None,
+                    action="operator_intervention",
+                    causes=(),
+                )
+        if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            return HiveBusStore._store_integrity()
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            return HiveBusStore._store_integrity()
+        return None
+
+    @staticmethod
+    def _migrate_gen1(connection: sqlite3.Connection, *, clock: Clock) -> None:
+        """Replace only an exact Gen-1 source in one immediate transaction."""
+
+        policy_bytes = canonical_json_bytes(_GEN1_RETENTION_POLICY)
+        if (
+            len(policy_bytes) != 377
+            or _digest(policy_bytes) != _GEN1_RETENTION_POLICY_DIGEST
+        ):
+            raise sqlite3.DatabaseError
+        connection.execute("PRAGMA foreign_keys=OFF")
+        if connection.execute("PRAGMA foreign_keys").fetchone() != (0,):
+            raise sqlite3.DatabaseError
+        connection.execute("BEGIN IMMEDIATE")
+        _migration_checkpoint("before_rename")
+        try:
+            source_names = tuple(statement.split()[2] for statement in _GEN1_TABLE_DDL)
+            for name in source_names:
+                connection.execute(f"ALTER TABLE {name} RENAME TO legacy_g1_{name}")
+            for statement in _GEN1_INDEX_DDL:
+                connection.execute(f"DROP INDEX {statement.split()[2]}")
+            _migration_checkpoint("after_rename_indexdrop")
+            for statement in _TABLE_DDL:
+                connection.execute(statement)
+            for statement in _INDEX_DDL:
+                connection.execute(statement)
+            for name in source_names:
+                if name not in {"bus_store_meta", "idempotency"}:
+                    connection.execute(
+                        f"INSERT INTO {name} SELECT * FROM legacy_g1_{name}"
+                    )
+            connection.execute(
+                "INSERT INTO idempotency(producer_principal_id,producer_epoch,idempotency_key,event_id,canonical_request_digest,partition_seq,accepted_at_utc,created_at_utc) SELECT events.producer_principal_id,events.producer_epoch,legacy.idempotency_key,legacy.event_id,legacy.canonical_request_digest,events.partition_seq,events.accepted_at_utc,legacy.created_at_utc FROM legacy_g1_idempotency AS legacy JOIN legacy_g1_events AS events ON events.event_id=legacy.event_id"
+            )
+            connection.execute(
+                "INSERT INTO retention_policies(retention_generation,policy_digest,policy_bytes,created_at_utc) VALUES(?,?,?,?)",
+                (1, _GEN1_RETENTION_POLICY_DIGEST, policy_bytes, _utc_now(clock)),
+            )
+            HiveBusStore._validate_migration_copy(connection, source_names)
+            _migration_checkpoint("after_copy")
+            for name in reversed(source_names):
+                connection.execute(f"DROP TABLE legacy_g1_{name}")
+            connection.execute(
+                "INSERT INTO bus_store_meta(schema_name,generation,schema_digest,created_at_utc) VALUES(?,?,?,?)",
+                (_SCHEMA_NAME, _GENERATION, _SCHEMA_DIGEST, _utc_now(clock)),
+            )
+            if HiveBusStore._validate_schema(connection) is not None:
+                raise sqlite3.DatabaseError
+            _migration_checkpoint("after_final_validation_before_commit")
+            connection.execute("COMMIT")
+        except Exception:
+            HiveBusStore._rollback(connection)
+            raise
+        _migration_checkpoint("after_commit")
+
+    @staticmethod
+    def _validate_migration_copy(
+        connection: sqlite3.Connection, source_names: tuple[str, ...]
+    ) -> None:
+        for name in source_names:
+            if name in {"bus_store_meta", "idempotency"}:
+                continue
+            source_count = connection.execute(
+                f"SELECT COUNT(*) FROM legacy_g1_{name}"
+            ).fetchone()
+            target_count = connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()
+            if source_count != target_count:
+                raise sqlite3.DatabaseError
+        source_count = connection.execute(
+            "SELECT COUNT(*) FROM legacy_g1_idempotency"
+        ).fetchone()
+        joined_count = connection.execute(
+            "SELECT COUNT(*) FROM legacy_g1_idempotency AS legacy JOIN legacy_g1_events AS events ON events.event_id=legacy.event_id"
+        ).fetchone()
+        target_count = connection.execute("SELECT COUNT(*) FROM idempotency").fetchone()
+        if source_count != joined_count or source_count != target_count:
+            raise sqlite3.DatabaseError
+        verified_count = connection.execute(
+            "SELECT COUNT(*) FROM idempotency AS target JOIN legacy_g1_idempotency AS legacy ON legacy.event_id=target.event_id JOIN legacy_g1_events AS events ON events.event_id=legacy.event_id WHERE target.producer_principal_id=events.producer_principal_id AND target.producer_epoch=events.producer_epoch AND target.idempotency_key=legacy.idempotency_key AND target.canonical_request_digest=legacy.canonical_request_digest AND target.partition_seq=events.partition_seq AND target.accepted_at_utc=events.accepted_at_utc AND target.created_at_utc=legacy.created_at_utc"
+        ).fetchone()
+        if verified_count != source_count:
+            raise sqlite3.DatabaseError
+        if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise sqlite3.DatabaseError
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise sqlite3.DatabaseError
 
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> DiagnosticV2 | None:
@@ -653,9 +956,17 @@ class HiveBusStore:
         if (
             set(actual_tables) != set(expected_tables)
             or set(actual_indexes) != set(expected_indexes)
-            or any(actual_tables[name] != statement for name, statement in expected_tables.items())
-            or any(actual_indexes[name] != statement for name, statement in expected_indexes.items())
-            or any(kind not in {"table", "index"} for kind, _name, _sql in explicit_entries)
+            or any(
+                actual_tables[name] != statement
+                for name, statement in expected_tables.items()
+            )
+            or any(
+                actual_indexes[name] != statement
+                for name, statement in expected_indexes.items()
+            )
+            or any(
+                kind not in {"table", "index"} for kind, _name, _sql in explicit_entries
+            )
             or any(
                 kind != "index"
                 or not name.startswith("sqlite_autoindex_")
@@ -704,7 +1015,7 @@ class HiveBusStore:
             )
         if generation < _GENERATION:
             return diagnostic_for(
-                "BUS_E_STORE_SCHEMA_TOO_OLD",
+                "BUS_E_STORE_SCHEMA_UNKNOWN",
                 severity=DiagnosticSeverityV2.CRITICAL,
                 retryable=False,
                 retry_after_seconds=None,
@@ -758,7 +1069,7 @@ class HiveBusStore:
                 retry_after_seconds=None,
                 fallback_applied=False,
                 requested_choice=None,
-               effective_choice=None,
+                effective_choice=None,
                 action="operator_intervention",
                 causes=(),
             )
@@ -785,7 +1096,11 @@ class HiveBusStore:
                 causes=(),
             )
         try:
-            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
             descriptor = os.open(self._root, flags)
             try:
                 if (
@@ -821,7 +1136,9 @@ class HiveBusStore:
                 return None
             incomplete = False
             try:
-                result = self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                result = self._connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
                 incomplete = (
                     not isinstance(result, tuple)
                     or len(result) != 3
@@ -1143,11 +1460,17 @@ class HiveBusStore:
             (group, partition, token_digest),
         ).fetchall()
         for event_id, attempt_count in pending:
-            if type(event_id) is not str or type(attempt_count) is not int or not 0 <= attempt_count < 5:
+            if (
+                type(event_id) is not str
+                or type(attempt_count) is not int
+                or not 0 <= attempt_count < 5
+            ):
                 raise ValueError
             next_attempt = attempt_count + 1
             if next_attempt < 5:
-                retry_at = _format_utc(now + timedelta(seconds=_BACKOFF_SECONDS[next_attempt - 1]))
+                retry_at = _format_utc(
+                    now + timedelta(seconds=_BACKOFF_SECONDS[next_attempt - 1])
+                )
                 changed = self._connection.execute(
                     "UPDATE consumer_effects SET attempt_count=?,retry_not_before_utc=?,"
                     "lease_token=NULL,lease_expires_at_utc=NULL,last_error_code=?,updated_at_utc=? "
@@ -1233,18 +1556,88 @@ class HiveBusStore:
                 )
             except HiveBusContractError as exc:
                 if exc.code == "BUS_E_CANONICALIZATION":
-                    return diagnostic_for("BUS_E_CANONICALIZATION", severity=DiagnosticSeverityV2.ERROR, retryable=False, retry_after_seconds=None, fallback_applied=False, requested_choice=None, effective_choice=None, action="reject_publish", causes=())
+                    return diagnostic_for(
+                        "BUS_E_CANONICALIZATION",
+                        severity=DiagnosticSeverityV2.ERROR,
+                        retryable=False,
+                        retry_after_seconds=None,
+                        fallback_applied=False,
+                        requested_choice=None,
+                        effective_choice=None,
+                        action="reject_publish",
+                        causes=(),
+                    )
                 if exc.code == "BUS_E_TOPIC_INVALID":
-                    return diagnostic_for("BUS_E_TOPIC_INVALID", severity=DiagnosticSeverityV2.ERROR, retryable=False, retry_after_seconds=None, fallback_applied=False, requested_choice=None, effective_choice=None, action="reject_publish", causes=())
+                    return diagnostic_for(
+                        "BUS_E_TOPIC_INVALID",
+                        severity=DiagnosticSeverityV2.ERROR,
+                        retryable=False,
+                        retry_after_seconds=None,
+                        fallback_applied=False,
+                        requested_choice=None,
+                        effective_choice=None,
+                        action="reject_publish",
+                        causes=(),
+                    )
                 if exc.code == "BUS_E_EVENT_TOO_LARGE":
-                    return diagnostic_for("BUS_E_EVENT_TOO_LARGE", severity=DiagnosticSeverityV2.ERROR, retryable=False, retry_after_seconds=None, fallback_applied=False, requested_choice=None, effective_choice=None, action="reject_publish", causes=())
+                    return diagnostic_for(
+                        "BUS_E_EVENT_TOO_LARGE",
+                        severity=DiagnosticSeverityV2.ERROR,
+                        retryable=False,
+                        retry_after_seconds=None,
+                        fallback_applied=False,
+                        requested_choice=None,
+                        effective_choice=None,
+                        action="reject_publish",
+                        causes=(),
+                    )
                 if exc.code == "BUS_E_SECRET_CLASSIFICATION":
-                    return diagnostic_for("BUS_E_SECRET_CLASSIFICATION", severity=DiagnosticSeverityV2.ERROR, retryable=False, retry_after_seconds=None, fallback_applied=False, requested_choice=None, effective_choice=None, action="reject_publish", causes=())
+                    return diagnostic_for(
+                        "BUS_E_SECRET_CLASSIFICATION",
+                        severity=DiagnosticSeverityV2.ERROR,
+                        retryable=False,
+                        retry_after_seconds=None,
+                        fallback_applied=False,
+                        requested_choice=None,
+                        effective_choice=None,
+                        action="reject_publish",
+                        causes=(),
+                    )
                 if exc.code == "BUS_E_ACL_DENIED":
-                    return diagnostic_for("BUS_E_ACL_DENIED", severity=DiagnosticSeverityV2.ERROR, retryable=False, retry_after_seconds=None, fallback_applied=False, requested_choice=None, effective_choice=None, action="reject_publish", causes=())
+                    return diagnostic_for(
+                        "BUS_E_ACL_DENIED",
+                        severity=DiagnosticSeverityV2.ERROR,
+                        retryable=False,
+                        retry_after_seconds=None,
+                        fallback_applied=False,
+                        requested_choice=None,
+                        effective_choice=None,
+                        action="reject_publish",
+                        causes=(),
+                    )
                 if exc.code == "BUS_E_REPO_SCOPE":
-                    return diagnostic_for("BUS_E_REPO_SCOPE", severity=DiagnosticSeverityV2.ERROR, retryable=False, retry_after_seconds=None, fallback_applied=False, requested_choice=None, effective_choice=None, action="reject_publish", causes=())
-                return diagnostic_for("BUS_E_SCHEMA", severity=DiagnosticSeverityV2.ERROR, retryable=False, retry_after_seconds=None, fallback_applied=False, requested_choice=None, effective_choice=None, action="reject_publish", causes=())
+                    return diagnostic_for(
+                        "BUS_E_REPO_SCOPE",
+                        severity=DiagnosticSeverityV2.ERROR,
+                        retryable=False,
+                        retry_after_seconds=None,
+                        fallback_applied=False,
+                        requested_choice=None,
+                        effective_choice=None,
+                        action="reject_publish",
+                        causes=(),
+                    )
+                return diagnostic_for(
+                    "BUS_E_SCHEMA",
+                    severity=DiagnosticSeverityV2.ERROR,
+                    retryable=False,
+                    retry_after_seconds=None,
+                    fallback_applied=False,
+                    requested_choice=None,
+                    effective_choice=None,
+                    action="reject_publish",
+                    causes=(),
+                )
             except ValueError:
                 return diagnostic_for(
                     "BUS_E_SCHEMA",
@@ -1271,18 +1664,6 @@ class HiveBusStore:
                         action="reject_publish",
                         causes=(),
                     )
-                if payload.size_bytes > MAX_PAYLOAD_BYTES:
-                    return diagnostic_for(
-                        "BUS_E_EVENT_TOO_LARGE",
-                        severity=DiagnosticSeverityV2.ERROR,
-                        retryable=False,
-                        retry_after_seconds=None,
-                        fallback_applied=False,
-                        requested_choice=None,
-                        effective_choice=None,
-                        action="reject_publish",
-                        causes=(),
-                    )
                 body: bytes | None = None
                 artifact_id = payload.ref[len("artifact:") :].split("@", 1)[0]
             else:
@@ -1298,7 +1679,10 @@ class HiveBusStore:
                         action="reject_publish",
                         causes=(),
                     )
-                if len(payload_bytes) != payload.size_bytes or len(payload_bytes) > MAX_PAYLOAD_BYTES:
+                if (
+                    len(payload_bytes) != payload.size_bytes
+                    or len(payload_bytes) > MAX_PAYLOAD_BYTES
+                ):
                     return diagnostic_for(
                         "BUS_E_PAYLOAD_DIGEST",
                         severity=DiagnosticSeverityV2.ERROR,
@@ -1328,8 +1712,12 @@ class HiveBusStore:
                 request_digest = _digest(canonical_json_bytes(request))
                 self._connection.execute("BEGIN IMMEDIATE")
                 retry = self._connection.execute(
-                    "SELECT event_id,canonical_request_digest FROM idempotency WHERE idempotency_key=?",
-                    (probe.idempotency_key,),
+                    "SELECT event_id,canonical_request_digest FROM idempotency WHERE producer_principal_id=? AND producer_epoch=? AND idempotency_key=?",
+                    (
+                        probe.producer_principal_id,
+                        probe.producer_epoch,
+                        probe.idempotency_key,
+                    ),
                 ).fetchone()
                 if retry is not None:
                     self._connection.execute("ROLLBACK")
@@ -1348,7 +1736,8 @@ class HiveBusStore:
                     return self._stored_event(request, retry[0])
                 now = _utc_now(self._clock)
                 partition_row = self._connection.execute(
-                    "SELECT next_seq,state FROM partitions WHERE partition=?", (probe.partition,)
+                    "SELECT next_seq,state FROM partitions WHERE partition=?",
+                    (probe.partition,),
                 ).fetchone()
                 if partition_row is None:
                     partition_seq = 1
@@ -1521,10 +1910,21 @@ class HiveBusStore:
                         ),
                     )
                 self._connection.execute(
-                    "INSERT INTO idempotency(idempotency_key,event_id,canonical_request_digest,created_at_utc) VALUES(?,?,?,?)",
-                    (event.idempotency_key, event.event_id, request_digest, now),
+                    "INSERT INTO idempotency(producer_principal_id,producer_epoch,idempotency_key,event_id,canonical_request_digest,partition_seq,accepted_at_utc,created_at_utc) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        event.producer_principal_id,
+                        event.producer_epoch,
+                        event.idempotency_key,
+                        event.event_id,
+                        request_digest,
+                        event.partition_seq,
+                        event.accepted_at_utc,
+                        now,
+                    ),
                 )
+                _append_checkpoint("before_commit")
                 self._connection.execute("COMMIT")
+                _append_checkpoint("after_commit")
                 return event
             except sqlite3.OperationalError as exc:
                 self._rollback(self._connection)
@@ -1589,8 +1989,13 @@ class HiveBusStore:
             if unusable is not None:
                 return unusable
             try:
-                group = validate_identifier(consumer_group_id, field="consumer_group_id")
-                if type(manifest_bytes) is not bytes or not 1 <= len(manifest_bytes) <= 65536:
+                group = validate_identifier(
+                    consumer_group_id, field="consumer_group_id"
+                )
+                if (
+                    type(manifest_bytes) is not bytes
+                    or not 1 <= len(manifest_bytes) <= 65536
+                ):
                     raise ValueError
                 generation = _digest(manifest_bytes)
             except (HiveValidationError, ValueError):
@@ -1615,7 +2020,11 @@ class HiveBusStore:
                 return generation
             except sqlite3.OperationalError as exc:
                 self._rollback(self._connection)
-                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+                return (
+                    self._store_busy()
+                    if _sqlite_is_busy(exc)
+                    else self._store_integrity()
+                )
             except (ValueError, sqlite3.DatabaseError):
                 self._rollback(self._connection)
                 return self._store_integrity()
@@ -1630,8 +2039,10 @@ class HiveBusStore:
             if unusable is not None:
                 return unusable
             try:
-                group, checked_partition, checked_generation = self._validate_group_partition_generation(
-                    consumer_group_id, partition, generation
+                group, checked_partition, checked_generation = (
+                    self._validate_group_partition_generation(
+                        consumer_group_id, partition, generation
+                    )
                 )
             except (HiveBusContractError, HiveValidationError, ValueError):
                 return self._schema_error()
@@ -1655,7 +2066,11 @@ class HiveBusStore:
                     (group, checked_partition),
                 ).fetchone()
                 if cursor is not None:
-                    if cursor[0] != checked_generation or type(cursor[1]) is not int or cursor[1] < 0:
+                    if (
+                        cursor[0] != checked_generation
+                        or type(cursor[1]) is not int
+                        or cursor[1] < 0
+                    ):
                         self._connection.execute("ROLLBACK")
                         return self._subscription_stale()
                     self._connection.execute("ROLLBACK")
@@ -1664,13 +2079,26 @@ class HiveBusStore:
                 self._connection.execute(
                     "INSERT INTO cursors(consumer_group_id,partition,generation,acked_seq,gap_snapshot_id,"
                     "gap_from_seq,gap_through_seq,updated_at_utc) VALUES(?,?,?,?,?,?,?,?)",
-                    (group, checked_partition, checked_generation, 0, None, None, None, now),
+                    (
+                        group,
+                        checked_partition,
+                        checked_generation,
+                        0,
+                        None,
+                        None,
+                        None,
+                        now,
+                    ),
                 )
                 self._connection.execute("COMMIT")
                 return 0
             except sqlite3.OperationalError as exc:
                 self._rollback(self._connection)
-                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+                return (
+                    self._store_busy()
+                    if _sqlite_is_busy(exc)
+                    else self._store_integrity()
+                )
             except (ValueError, sqlite3.DatabaseError):
                 self._rollback(self._connection)
                 return self._store_integrity()
@@ -1685,8 +2113,10 @@ class HiveBusStore:
             if unusable is not None:
                 return unusable
             try:
-                group, checked_partition, checked_generation = self._validate_group_partition_generation(
-                    consumer_group_id, partition, generation
+                group, checked_partition, checked_generation = (
+                    self._validate_group_partition_generation(
+                        consumer_group_id, partition, generation
+                    )
                 )
             except (HiveBusContractError, HiveValidationError, ValueError):
                 return self._schema_error()
@@ -1694,7 +2124,9 @@ class HiveBusStore:
                 now = _utc_datetime(self._clock)
                 now_text = _format_utc(now)
                 self._connection.execute("BEGIN IMMEDIATE")
-                cursor = self._cursor_generation_matches(group, checked_partition, checked_generation)
+                cursor = self._cursor_generation_matches(
+                    group, checked_partition, checked_generation
+                )
                 if cursor is None:
                     self._connection.execute("ROLLBACK")
                     return self._subscription_stale()
@@ -1711,7 +2143,9 @@ class HiveBusStore:
                     if now < expires_at:
                         self._connection.execute("ROLLBACK")
                         return self._delivery_active(
-                            self._remaining_seconds(expires_at, now, maximum=_LEASE_SECONDS)
+                            self._remaining_seconds(
+                                expires_at, now, maximum=_LEASE_SECONDS
+                            )
                         )
                     terminal_expiry = self._materialize_expired_lease(
                         group, checked_partition, active[0], now
@@ -1759,7 +2193,9 @@ class HiveBusStore:
                                 if headers:
                                     break
                                 self._connection.execute(
-                                    "COMMIT" if expired_lease_materialized else "ROLLBACK"
+                                    "COMMIT"
+                                    if expired_lease_materialized
+                                    else "ROLLBACK"
                                 )
                                 return self._delivery_backoff(
                                     self._remaining_seconds(
@@ -1806,7 +2242,11 @@ class HiveBusStore:
                 )
             except sqlite3.OperationalError as exc:
                 self._rollback(self._connection)
-                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+                return (
+                    self._store_busy()
+                    if _sqlite_is_busy(exc)
+                    else self._store_integrity()
+                )
             except (OSError, ValueError, sqlite3.DatabaseError):
                 self._rollback(self._connection)
                 return self._store_integrity()
@@ -1828,8 +2268,10 @@ class HiveBusStore:
             if unusable is not None:
                 return unusable
             try:
-                group, checked_partition, checked_generation = self._validate_group_partition_generation(
-                    consumer_group_id, partition, generation
+                group, checked_partition, checked_generation = (
+                    self._validate_group_partition_generation(
+                        consumer_group_id, partition, generation
+                    )
                 )
                 raw_token = self._validate_delivery_token(delivery_token)
                 checked_event_id = self._validate_digest(event_id)
@@ -1841,7 +2283,12 @@ class HiveBusStore:
                 now_text = _format_utc(now)
                 token_digest = _digest(raw_token.encode("ascii"))
                 self._connection.execute("BEGIN IMMEDIATE")
-                if self._cursor_generation_matches(group, checked_partition, checked_generation) is None:
+                if (
+                    self._cursor_generation_matches(
+                        group, checked_partition, checked_generation
+                    )
+                    is None
+                ):
                     self._connection.execute("ROLLBACK")
                     return self._subscription_stale()
                 lease = self._valid_current_lease(
@@ -1925,7 +2372,9 @@ class HiveBusStore:
                     if now < retry_at:
                         self._connection.execute("ROLLBACK")
                         return self._delivery_backoff(
-                            self._remaining_seconds(retry_at, now, maximum=_BACKOFF_SECONDS[-1])
+                            self._remaining_seconds(
+                                retry_at, now, maximum=_BACKOFF_SECONDS[-1]
+                            )
                         )
                 changed = self._connection.execute(
                     "UPDATE consumer_effects SET retry_not_before_utc=NULL,lease_token=?,"
@@ -1947,7 +2396,11 @@ class HiveBusStore:
                 return EffectBeginResultV1("apply", persisted[3])
             except sqlite3.OperationalError as exc:
                 self._rollback(self._connection)
-                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+                return (
+                    self._store_busy()
+                    if _sqlite_is_busy(exc)
+                    else self._store_integrity()
+                )
             except (ValueError, sqlite3.DatabaseError):
                 self._rollback(self._connection)
                 return self._store_integrity()
@@ -1969,8 +2422,10 @@ class HiveBusStore:
             if unusable is not None:
                 return unusable
             try:
-                group, checked_partition, checked_generation = self._validate_group_partition_generation(
-                    consumer_group_id, partition, generation
+                group, checked_partition, checked_generation = (
+                    self._validate_group_partition_generation(
+                        consumer_group_id, partition, generation
+                    )
                 )
                 raw_token = self._validate_delivery_token(delivery_token)
                 checked_event_id = self._validate_digest(event_id)
@@ -1982,7 +2437,12 @@ class HiveBusStore:
                 now_text = _format_utc(now)
                 token_digest = _digest(raw_token.encode("ascii"))
                 self._connection.execute("BEGIN IMMEDIATE")
-                if self._cursor_generation_matches(group, checked_partition, checked_generation) is None:
+                if (
+                    self._cursor_generation_matches(
+                        group, checked_partition, checked_generation
+                    )
+                    is None
+                ):
                     self._connection.execute("ROLLBACK")
                     return self._subscription_stale()
                 lease = self._valid_current_lease(
@@ -1991,9 +2451,12 @@ class HiveBusStore:
                 if lease is None:
                     self._connection.execute("ROLLBACK")
                     return self._delivery_stale()
-                if self._event_in_lease(
-                    group, checked_partition, checked_event_id, lease[0], lease[1]
-                ) is None:
+                if (
+                    self._event_in_lease(
+                        group, checked_partition, checked_event_id, lease[0], lease[1]
+                    )
+                    is None
+                ):
                     self._connection.execute("ROLLBACK")
                     return self._cursor_conflict()
                 effect = self._connection.execute(
@@ -2004,7 +2467,11 @@ class HiveBusStore:
                 if effect is None:
                     self._connection.execute("ROLLBACK")
                     return self._cursor_conflict()
-                if effect[0] != checked_generation or type(effect[1]) is not str or type(effect[2]) is not str:
+                if (
+                    effect[0] != checked_generation
+                    or type(effect[1]) is not str
+                    or type(effect[2]) is not str
+                ):
                     raise ValueError
                 if effect[2] != checked_effect_digest:
                     self._connection.execute("ROLLBACK")
@@ -2019,7 +2486,13 @@ class HiveBusStore:
                     "UPDATE consumer_effects SET state='committed',retry_not_before_utc=NULL,"
                     "updated_at_utc=? WHERE consumer_group_id=? AND event_id=? AND state='pending' "
                     "AND effect_digest=? AND lease_token=?",
-                    (now_text, group, checked_event_id, checked_effect_digest, token_digest),
+                    (
+                        now_text,
+                        group,
+                        checked_event_id,
+                        checked_effect_digest,
+                        token_digest,
+                    ),
                 ).rowcount
                 if changed != 1:
                     raise sqlite3.DatabaseError
@@ -2027,7 +2500,11 @@ class HiveBusStore:
                 return None
             except sqlite3.OperationalError as exc:
                 self._rollback(self._connection)
-                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+                return (
+                    self._store_busy()
+                    if _sqlite_is_busy(exc)
+                    else self._store_integrity()
+                )
             except (ValueError, sqlite3.DatabaseError):
                 self._rollback(self._connection)
                 return self._store_integrity()
@@ -2051,8 +2528,10 @@ class HiveBusStore:
             if unusable is not None:
                 return unusable
             try:
-                group, checked_partition, checked_generation = self._validate_group_partition_generation(
-                    consumer_group_id, partition, generation
+                group, checked_partition, checked_generation = (
+                    self._validate_group_partition_generation(
+                        consumer_group_id, partition, generation
+                    )
                 )
                 raw_token = self._validate_delivery_token(delivery_token)
                 checked_event_id = self._validate_digest(event_id)
@@ -2066,7 +2545,12 @@ class HiveBusStore:
                 now_text = _format_utc(now)
                 token_digest = _digest(raw_token.encode("ascii"))
                 self._connection.execute("BEGIN IMMEDIATE")
-                if self._cursor_generation_matches(group, checked_partition, checked_generation) is None:
+                if (
+                    self._cursor_generation_matches(
+                        group, checked_partition, checked_generation
+                    )
+                    is None
+                ):
                     self._connection.execute("ROLLBACK")
                     return self._subscription_stale()
                 lease = self._valid_current_lease(
@@ -2075,9 +2559,12 @@ class HiveBusStore:
                 if lease is None:
                     self._connection.execute("ROLLBACK")
                     return self._delivery_stale()
-                if self._event_in_lease(
-                    group, checked_partition, checked_event_id, lease[0], lease[1]
-                ) is None:
+                if (
+                    self._event_in_lease(
+                        group, checked_partition, checked_event_id, lease[0], lease[1]
+                    )
+                    is None
+                ):
                     self._connection.execute("ROLLBACK")
                     return self._cursor_conflict()
                 effect = self._connection.execute(
@@ -2107,7 +2594,9 @@ class HiveBusStore:
                     return self._cursor_conflict()
                 next_attempt = effect[3] + 1
                 if next_attempt < 5:
-                    retry_at = now + timedelta(seconds=_BACKOFF_SECONDS[next_attempt - 1])
+                    retry_at = now + timedelta(
+                        seconds=_BACKOFF_SECONDS[next_attempt - 1]
+                    )
                     changed = self._connection.execute(
                         "UPDATE consumer_effects SET attempt_count=?,retry_not_before_utc=?,"
                         "lease_token=NULL,lease_expires_at_utc=NULL,last_error_code=?,updated_at_utc=? "
@@ -2136,7 +2625,9 @@ class HiveBusStore:
                         raise sqlite3.DatabaseError
                     self._connection.execute("COMMIT")
                     return self._delivery_backoff(
-                        self._remaining_seconds(retry_at, now, maximum=_BACKOFF_SECONDS[-1])
+                        self._remaining_seconds(
+                            retry_at, now, maximum=_BACKOFF_SECONDS[-1]
+                        )
                     )
                 changed = self._connection.execute(
                     "UPDATE consumer_effects SET state='dead_lettered',attempt_count=5,"
@@ -2163,7 +2654,11 @@ class HiveBusStore:
                         checked_event_id,
                         checked_partition,
                         self._event_in_lease(
-                            group, checked_partition, checked_event_id, lease[0], lease[1]
+                            group,
+                            checked_partition,
+                            checked_event_id,
+                            lease[0],
+                            lease[1],
                         )[0],
                         checked_generation,
                         5,
@@ -2176,7 +2671,11 @@ class HiveBusStore:
                 return self._poison()
             except sqlite3.OperationalError as exc:
                 self._rollback(self._connection)
-                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+                return (
+                    self._store_busy()
+                    if _sqlite_is_busy(exc)
+                    else self._store_integrity()
+                )
             except (ValueError, sqlite3.DatabaseError):
                 self._rollback(self._connection)
                 return self._store_integrity()
@@ -2196,8 +2695,10 @@ class HiveBusStore:
             if unusable is not None:
                 return unusable
             try:
-                group, checked_partition, checked_generation = self._validate_group_partition_generation(
-                    consumer_group_id, partition, generation
+                group, checked_partition, checked_generation = (
+                    self._validate_group_partition_generation(
+                        consumer_group_id, partition, generation
+                    )
                 )
                 raw_token = self._validate_delivery_token(delivery_token)
                 if (
@@ -2213,7 +2714,9 @@ class HiveBusStore:
                 now_text = _format_utc(now)
                 token_digest = _digest(raw_token.encode("ascii"))
                 self._connection.execute("BEGIN IMMEDIATE")
-                cursor = self._cursor_generation_matches(group, checked_partition, checked_generation)
+                cursor = self._cursor_generation_matches(
+                    group, checked_partition, checked_generation
+                )
                 if cursor is None:
                     self._connection.execute("ROLLBACK")
                     return self._subscription_stale()
@@ -2268,7 +2771,10 @@ class HiveBusStore:
                     ).fetchone()
                     if dead_letter != (5, checked_generation):
                         raise ValueError
-                    if EVENT_TYPE_MATRIX[event_type].urgent or event_type == "artifact.archived":
+                    if (
+                        EVENT_TYPE_MATRIX[event_type].urgent
+                        or event_type == "artifact.archived"
+                    ):
                         self._connection.execute("ROLLBACK")
                         return self._poison()
                 changed = self._connection.execute(
@@ -2296,7 +2802,11 @@ class HiveBusStore:
                 return scan_through_seq
             except sqlite3.OperationalError as exc:
                 self._rollback(self._connection)
-                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+                return (
+                    self._store_busy()
+                    if _sqlite_is_busy(exc)
+                    else self._store_integrity()
+                )
             except (ValueError, sqlite3.DatabaseError):
                 self._rollback(self._connection)
                 return self._store_integrity()
@@ -2312,9 +2822,12 @@ class HiveBusStore:
         except sqlite3.DatabaseError:
             self._rollback(self._connection)
 
-    def _stored_event(self, request: object, event_id: object) -> HiveBusEventV1 | DiagnosticV2:
+    def _stored_event(
+        self, request: object, event_id: object
+    ) -> HiveBusEventV1 | DiagnosticV2:
         row = self._connection.execute(
-            "SELECT partition_seq,accepted_at_utc FROM events WHERE event_id=?", (event_id,)
+            "SELECT partition_seq,accepted_at_utc FROM events WHERE event_id=?",
+            (event_id,),
         ).fetchone()
         if row is None:
             return diagnostic_for(
@@ -2369,7 +2882,8 @@ class HiveBusStore:
                 )
             try:
                 row = self._connection.execute(
-                    "SELECT header_bytes,header_digest FROM events WHERE event_id=?", (event_id,)
+                    "SELECT header_bytes,header_digest FROM events WHERE event_id=?",
+                    (event_id,),
                 ).fetchone()
             except sqlite3.OperationalError as exc:
                 if not _sqlite_is_busy(exc):
