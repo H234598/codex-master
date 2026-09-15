@@ -1306,6 +1306,186 @@ def test_b_lease_expiry_counts_only_pending_and_poison_blocks_static_ack(
         assert store.close() is None
 
 
+def test_b_manifest_exact_65536_bytes_persists_with_full_digest(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "bus-state", FakeClock())
+    try:
+        manifest_bytes = b"m" * 65536
+
+        generation = store.record_manifest_bytes(_GROUP, manifest_bytes=manifest_bytes)
+
+        assert generation == _digest(manifest_bytes)
+        assert store._connection.execute(  # noqa: SLF001 - exact manifest boundary persistence.
+            "SELECT manifest_bytes,manifest_size_bytes FROM subscription_manifests "
+            "WHERE consumer_group_id=? AND generation=?",
+            (_GROUP, generation),
+        ).fetchone() == (manifest_bytes, 65536)
+    finally:
+        assert store.close() is None
+
+
+def test_b_poll_empty_cursor_returns_none_without_creating_a_lease(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        event = _append_events(store, 1)[0]
+        generation, delivery = _prepared_delivery(store)
+        assert hasattr(delivery, "delivery_token")
+        effect_digest = _digest(b"empty-poll-effect")
+        assert store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            event.event_id,
+            effect_digest=effect_digest,
+        ).state == "apply"
+        assert store.commit_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            event.event_id,
+            effect_digest=effect_digest,
+        ) is None
+        assert store.ack(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            delivery.scan_through_seq,
+        ) == 1
+        assert store._connection.execute("SELECT COUNT(*) FROM delivery_leases").fetchone() == (0,)  # noqa: SLF001
+
+        empty = store.poll_headers(_GROUP, _PARTITION, generation)
+
+        assert empty is None
+        assert store._connection.execute("SELECT COUNT(*) FROM delivery_leases").fetchone() == (0,)  # noqa: SLF001
+    finally:
+        assert store.close() is None
+
+
+def test_b_poll_stops_before_65536_cumulative_header_bytes(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        repo_id = "r" * 64
+        workpackage_id = "w" * 64
+        partition = f"repo/{repo_id}/task/{workpackage_id}"
+        causation_ids = [f"sha256:{value:064x}" for value in range(1, 17)]
+        for sequence in range(1, 33):
+            request = _request(
+                idempotency_suffix=f"{sequence:032x}", producer_seq=sequence
+            ) | {
+                "partition": partition,
+                "repo_id": repo_id,
+                "workpackage_id": workpackage_id,
+                "causation_ids": causation_ids,
+            }
+            assert not isinstance(store.append(request, payload_bytes=b"payload"), DiagnosticV2)
+        generation = store.record_manifest_bytes(_GROUP, manifest_bytes=b"bounded-headers")
+        assert isinstance(generation, str)
+        assert store.open_cursor_once(_GROUP, partition, generation) == 0
+        all_headers = store._connection.execute(  # noqa: SLF001 - real stored canonical headers.
+            "SELECT partition_seq,header_bytes FROM events WHERE partition=? ORDER BY partition_seq",
+            (partition,),
+        ).fetchall()
+        assert len(all_headers) == 32
+
+        delivery = store.poll_headers(_GROUP, partition, generation)
+
+        assert hasattr(delivery, "delivery_token")
+        assert len(delivery.headers) < 32
+        prefix_length = len(delivery.headers)
+        assert delivery.headers == tuple(header for _, header in all_headers[:prefix_length])
+        assert sum(map(len, delivery.headers)) <= 65536
+        next_header = all_headers[prefix_length][1]
+        assert sum(map(len, delivery.headers)) + len(next_header) > 65536
+        assert delivery.scan_through_seq == all_headers[prefix_length - 1][0]
+        assert next_header not in delivery.headers
+    finally:
+        assert store.close() is None
+
+
+def test_b_partial_ack_of_committed_multi_header_lease_preserves_state(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        first_event, second_event = _append_events(store, 2)
+        generation, delivery = _prepared_delivery(store)
+        assert hasattr(delivery, "delivery_token")
+        assert delivery.scan_through_seq == 2
+        for event, effect_digest in (
+            (first_event, _digest(b"partial-ack-first")),
+            (second_event, _digest(b"partial-ack-second")),
+        ):
+            assert store.begin_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                event.event_id,
+                effect_digest=effect_digest,
+            ).state == "apply"
+            assert store.commit_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                event.event_id,
+                effect_digest=effect_digest,
+            ) is None
+        cursor_before = store._connection.execute(  # noqa: SLF001 - rejected partial ACK is read-only.
+            "SELECT consumer_group_id,partition,generation,acked_seq,gap_snapshot_id,gap_from_seq,"
+            "gap_through_seq,updated_at_utc FROM cursors"
+        ).fetchall()
+        lease_before = store._connection.execute(  # noqa: SLF001 - rejected partial ACK retains lease.
+            "SELECT consumer_group_id,partition,generation,delivery_token,from_seq,scan_through_seq,"
+            "leased_at_utc,expires_at_utc,created_monotonic FROM delivery_leases"
+        ).fetchall()
+        effects_before = store._connection.execute(  # noqa: SLF001 - all effects are ACKable and unchanged.
+            "SELECT event_id,state,effect_digest,attempt_count,retry_not_before_utc,lease_token,"
+            "lease_expires_at_utc,last_error_code,updated_at_utc FROM consumer_effects ORDER BY partition_seq"
+        ).fetchall()
+
+        partial = store.ack(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            delivery.scan_through_seq - 1,
+        )
+
+        _delivery_diagnostic(
+            partial,
+            "BUS_E_CURSOR_CONFLICT",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="repoll_headers",
+        )
+        assert store._connection.execute(  # noqa: SLF001 - rejected partial ACK is read-only.
+            "SELECT consumer_group_id,partition,generation,acked_seq,gap_snapshot_id,gap_from_seq,"
+            "gap_through_seq,updated_at_utc FROM cursors"
+        ).fetchall() == cursor_before
+        assert store._connection.execute(  # noqa: SLF001 - rejected partial ACK retains lease.
+            "SELECT consumer_group_id,partition,generation,delivery_token,from_seq,scan_through_seq,"
+            "leased_at_utc,expires_at_utc,created_monotonic FROM delivery_leases"
+        ).fetchall() == lease_before
+        assert store._connection.execute(  # noqa: SLF001 - rejected partial ACK retains effect state.
+            "SELECT event_id,state,effect_digest,attempt_count,retry_not_before_utc,lease_token,"
+            "lease_expires_at_utc,last_error_code,updated_at_utc FROM consumer_effects ORDER BY partition_seq"
+        ).fetchall() == effects_before
+    finally:
+        assert store.close() is None
+
+
 def test_every_store_diagnostic_call_is_direct_and_uses_d135_literals() -> None:
     source = Path("src/the_hive/hive/bus_store.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
