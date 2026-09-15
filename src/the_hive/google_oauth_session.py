@@ -8,13 +8,16 @@ from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
 import shutil
+import socket
 import stat
 import subprocess
+import threading
 import time
 from typing import Final, Protocol, cast
 import urllib.parse
@@ -336,9 +339,13 @@ def load_access_token(store, *, account_ref: str, client_file: Path) -> str:
 MAX_OAUTH_TRANSACTION_SECONDS: Final[int] = 10 * 60
 MAX_OAUTH_CLIENT_IMPORT_SECONDS: Final[int] = 5 * 60
 _CONTROL_DOCUMENT: Final[PurePosixPath] = PurePosixPath("google-oauth-control.json")
+_INVENTORY_AUTHORIZATION_DOCUMENT: Final[PurePosixPath] = PurePosixPath(
+    "google-oauth-inventory-readonly.json"
+)
 _MAX_CONTROL_BYTES: Final[int] = 2 * 1024 * 1024
 _MAX_CONTROL_RECORDS: Final[int] = 4096
 _CONTROL_SCHEMA_VERSION: Final[int] = 3
+_INVENTORY_AUTHORIZATION_SCHEMA_VERSION: Final[int] = 1
 _REF: Final[re.Pattern[str]] = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII
 )
@@ -519,6 +526,436 @@ class GoogleOAuthTransactionV1:
         return "GoogleOAuthTransactionV1(<redacted>)"
 
 
+class _InventoryReadonlyCodeExchangeV1:
+    """Private, mutable provider result; no token value may escape its owner."""
+
+    __slots__ = ("refresh_token", "access_token", "id_token")
+
+    def __init__(
+        self,
+        *,
+        refresh_token: bytearray,
+        access_token: bytearray,
+        id_token: bytearray,
+    ) -> None:
+        if not all(
+            type(value) is bytearray and value
+            for value in (refresh_token, access_token, id_token)
+        ):
+            raise GoogleOAuthSessionError("oauth.exchange_failed")
+        self.refresh_token = refresh_token
+        self.access_token = access_token
+        self.id_token = id_token
+
+    def __repr__(self) -> str:
+        return "_InventoryReadonlyCodeExchangeV1(<redacted>)"
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("private OAuth exchange result is not serializable")
+
+    def clear(self) -> None:
+        _zero_bytes(self.refresh_token)
+        _zero_bytes(self.access_token)
+        _zero_bytes(self.id_token)
+        self.refresh_token = bytearray()
+        self.access_token = bytearray()
+        self.id_token = bytearray()
+
+
+class _InventoryReadonlyVerifiedIdTokenV1:
+    """Private verifier output, carrying only the signed subject and nonce claim."""
+
+    __slots__ = ("subject_id", "nonce")
+
+    def __init__(self, *, subject_id: str, nonce: bytearray) -> None:
+        if (
+            type(subject_id) is not str
+            or not subject_id
+            or type(nonce) is not bytearray
+            or not nonce
+        ):
+            raise GoogleOAuthSessionError("oauth.id_token_invalid")
+        self.subject_id = subject_id
+        self.nonce = nonce
+
+    def __repr__(self) -> str:
+        return "_InventoryReadonlyVerifiedIdTokenV1(<redacted>)"
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("private verified ID token is not serializable")
+
+    def clear(self) -> None:
+        _zero_bytes(self.nonce)
+        self.nonce = bytearray()
+        self.subject_id = ""
+
+
+class _InventoryReadonlyAuthorizationTransactionV1:
+    """Private transaction projection with no nonce, token, or identity material."""
+
+    __slots__ = ("id", "authorization_url", "expires_at", "inventory_generation")
+
+    def __init__(
+        self,
+        transaction_id: str,
+        authorization_url: str,
+        expires_at: float,
+        inventory_generation: int,
+    ) -> None:
+        self.id = transaction_id
+        self.authorization_url = authorization_url
+        self.expires_at = expires_at
+        self.inventory_generation = inventory_generation
+
+    def __repr__(self) -> str:
+        return "_InventoryReadonlyAuthorizationTransactionV1(<redacted>)"
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError(
+            "private inventory authorization transaction is not serializable"
+        )
+
+
+class _InventoryReadonlyAuthorizationEffectV1:
+    """One-shot, redacted in-memory authorization effect for the Authority only."""
+
+    __slots__ = (
+        "_account_ref",
+        "_subject_id",
+        "_inventory_generation",
+        "_oauth_client_fingerprint",
+        "_scope_fingerprint",
+        "_refresh_token",
+    )
+
+    def __init__(
+        self,
+        *,
+        account_ref: str,
+        subject_id: str,
+        inventory_generation: int,
+        oauth_client_fingerprint: str,
+        scope_fingerprint: str,
+        refresh_token: bytearray,
+    ) -> None:
+        self._account_ref = account_ref
+        self._subject_id = subject_id
+        self._inventory_generation = inventory_generation
+        self._oauth_client_fingerprint = oauth_client_fingerprint
+        self._scope_fingerprint = scope_fingerprint
+        self._refresh_token = refresh_token
+
+    def __repr__(self) -> str:
+        return "_InventoryReadonlyAuthorizationEffectV1(<redacted>)"
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("private inventory authorization effect is not serializable")
+
+    def clear(self) -> None:
+        _zero_bytes(self._refresh_token)
+        self._refresh_token = bytearray()
+        self._account_ref = ""
+        self._subject_id = ""
+        self._inventory_generation = 0
+        self._oauth_client_fingerprint = ""
+        self._scope_fingerprint = ""
+
+    def _consume_for_authority(
+        self,
+    ) -> tuple[str, str, int, str, str, bytearray]:
+        if not self._refresh_token:
+            raise GoogleOAuthSessionError("oauth.inventory_effect_consumed")
+        result = (
+            self._account_ref,
+            self._subject_id,
+            self._inventory_generation,
+            self._oauth_client_fingerprint,
+            self._scope_fingerprint,
+            self._refresh_token,
+        )
+        self._refresh_token = bytearray()
+        self._account_ref = ""
+        self._subject_id = ""
+        self._inventory_generation = 0
+        self._oauth_client_fingerprint = ""
+        self._scope_fingerprint = ""
+        return result
+
+
+class _InventoryReadonlyIdTokenVerifierPort(Protocol):
+    """Private fixed-policy verifier for signed Google ID tokens.
+
+    The concrete port verifies the fixed Google issuer and algorithm, the bound
+    client audience/authorized-party, expiration and time bounds, verified
+    login email, and subject. It returns only signed subject and nonce claims;
+    this owner compares the nonce against its pending transaction digest.
+    """
+
+    def verify_inventory_readonly_id_token(
+        self,
+        id_token: bytearray,
+        *,
+        expected_nonce: bytearray,
+        client_id: str,
+        login_email: str,
+        now: float,
+    ) -> _InventoryReadonlyVerifiedIdTokenV1: ...
+
+
+class _GoogleInventoryReadonlyIdTokenVerifierV1:
+    """Fixed Google RS256 verifier; its only result is a redacted identity claim."""
+
+    _ISSUERS: Final[frozenset[str]] = frozenset(
+        {"accounts.google.com", "https://accounts.google.com"}
+    )
+    _ALGORITHM: Final[str] = "RS256"
+    _CLOCK_SKEW_SECONDS: Final[int] = 60
+    _MAX_ID_TOKEN_SECONDS: Final[int] = 3_660
+
+    def __repr__(self) -> str:
+        return "_GoogleInventoryReadonlyIdTokenVerifierV1(<redacted>)"
+
+    __str__ = __repr__
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("private Google ID token verifier is not serializable")
+
+    @classmethod
+    def _fixed_rs256_header(cls, token: str) -> None:
+        try:
+            parts = token.split(".")
+            if len(parts) != 3 or not all(parts):
+                raise ValueError
+            encoded_header = parts[0]
+            padded_header = encoded_header + "=" * (-len(encoded_header) % 4)
+            header = json.loads(
+                base64.urlsafe_b64decode(padded_header.encode("ascii")).decode("utf-8")
+            )
+            if (
+                type(header) is not dict
+                or header.get("alg") != cls._ALGORITHM
+                or type(header.get("kid")) is not str
+                or not header["kid"]
+            ):
+                raise ValueError
+        except (UnicodeError, ValueError, json.JSONDecodeError):
+            raise GoogleOAuthSessionError("oauth.id_token_invalid") from None
+
+    def verify_inventory_readonly_id_token(
+        self,
+        id_token: bytearray,
+        *,
+        expected_nonce: bytearray,
+        client_id: str,
+        login_email: str,
+        now: float,
+    ) -> _InventoryReadonlyVerifiedIdTokenV1:
+        """Verify signature and every fixed Inventory Readonly identity binding."""
+
+        token = ""
+        nonce = ""
+        claims: Mapping[str, object] | object = {}
+        try:
+            if (
+                type(id_token) is not bytearray
+                or not id_token
+                or type(expected_nonce) is not bytearray
+                or not expected_nonce
+                or type(client_id) is not str
+                or not client_id
+                or type(login_email) is not str
+                or not login_email
+                or type(now) not in (int, float)
+                or isinstance(now, bool)
+                or not math.isfinite(float(now))
+            ):
+                raise ValueError
+            token = id_token.decode("ascii")
+            nonce = expected_nonce.decode("ascii")
+            if (
+                _URLSAFE.fullmatch(nonce) is None
+                or len(token) > 64 * 1024
+                or len(nonce) > 512
+            ):
+                raise ValueError
+            self._fixed_rs256_header(token)
+            from google.auth.transport.requests import Request
+            from google.oauth2 import id_token as google_id_token
+
+            claims = google_id_token.verify_oauth2_token(
+                token,
+                Request(),
+                client_id,
+                clock_skew_in_seconds=self._CLOCK_SKEW_SECONDS,
+            )
+            if type(claims) is not dict:
+                raise ValueError
+            issuer = claims.get("iss")
+            audience = claims.get("aud")
+            authorized_party = claims.get("azp")
+            issued_at = claims.get("iat")
+            expires_at = claims.get("exp")
+            claimed_nonce = claims.get("nonce")
+            email_verified = claims.get("email_verified")
+            email = claims.get("email")
+            subject_id = claims.get("sub")
+            if (
+                issuer not in self._ISSUERS
+                or audience != client_id
+                or authorized_party != client_id
+                or type(issued_at) is not int
+                or isinstance(issued_at, bool)
+                or type(expires_at) is not int
+                or isinstance(expires_at, bool)
+                or issued_at > now + self._CLOCK_SKEW_SECONDS
+                or expires_at <= now - self._CLOCK_SKEW_SECONDS
+                or expires_at < issued_at
+                or expires_at - issued_at > self._MAX_ID_TOKEN_SECONDS
+                or type(claimed_nonce) is not str
+                or _URLSAFE.fullmatch(claimed_nonce) is None
+                or not secrets.compare_digest(claimed_nonce, nonce)
+                or email_verified is not True
+                or type(email) is not str
+                or not secrets.compare_digest(email, login_email)
+                or type(subject_id) is not str
+                or not 1 <= len(subject_id.encode("utf-8")) <= 1024
+                or "\x00" in subject_id
+            ):
+                raise ValueError
+            return _InventoryReadonlyVerifiedIdTokenV1(
+                subject_id=subject_id,
+                nonce=bytearray(claimed_nonce.encode("ascii")),
+            )
+        except (GoogleOAuthSessionError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise GoogleOAuthSessionError("oauth.id_token_invalid") from None
+        finally:
+            token = ""
+            nonce = ""
+            if type(claims) is dict:
+                claims.clear()
+            claims = {}
+
+
+class _InventoryReadonlyNoRedirectHandlerV1(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        raise GoogleOAuthSessionError("oauth.exchange_failed")
+
+
+class _GoogleInventoryReadonlyCodeExchangeV1:
+    """Fixed Google token endpoint for the Inventory Readonly callback only."""
+
+    _TOKEN_URI: Final[str] = "https://oauth2.googleapis.com/token"
+
+    def __repr__(self) -> str:
+        return "_GoogleInventoryReadonlyCodeExchangeV1(<redacted>)"
+
+    __str__ = __repr__
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("private inventory code exchange is not serializable")
+
+    def exchange_inventory_readonly(
+        self,
+        client: dict[str, object],
+        *,
+        code: str,
+        redirect_uri: str,
+        pkce_verifier: str,
+    ) -> _InventoryReadonlyCodeExchangeV1:
+        payload: bytearray | None = None
+        raw = b""
+        value: object = {}
+        access_token = ""
+        id_token = ""
+        refresh_token = ""
+        try:
+            if (
+                type(client) is not dict
+                or client.get("token_uri") != self._TOKEN_URI
+                or "client_secret" in client
+                or any(
+                    type(value) is not str or not value
+                    for value in (
+                        client.get("client_id"),
+                        code,
+                        redirect_uri,
+                        pkce_verifier,
+                    )
+                )
+            ):
+                raise ValueError
+            payload = bytearray(
+                urllib.parse.urlencode(
+                    {
+                        "code": code,
+                        "client_id": client["client_id"],
+                        "redirect_uri": redirect_uri,
+                        "grant_type": "authorization_code",
+                        "code_verifier": pkce_verifier,
+                    }
+                ).encode("ascii")
+            )
+            request = urllib.request.Request(
+                self._TOKEN_URI,
+                data=payload,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                method="POST",
+            )
+            opener = urllib.request.build_opener(
+                _InventoryReadonlyNoRedirectHandlerV1()
+            )
+            with opener.open(request, timeout=10) as response:
+                if response.status != 200 or response.geturl() != self._TOKEN_URI:
+                    raise ValueError
+                raw = response.read(64 * 1024 + 1)
+            if len(raw) > 64 * 1024:
+                raise ValueError
+            value = json.loads(raw)
+            if type(value) is not dict:
+                raise ValueError
+            access_token = value.get("access_token", "")
+            id_token = value.get("id_token", "")
+            refresh_token = value.get("refresh_token", "")
+            if any(
+                type(token) is not str
+                or not token
+                or len(token.encode("utf-8")) > 16 * 1024
+                for token in (access_token, id_token, refresh_token)
+            ):
+                raise ValueError
+            return _InventoryReadonlyCodeExchangeV1(
+                refresh_token=bytearray(refresh_token.encode("utf-8")),
+                access_token=bytearray(access_token.encode("utf-8")),
+                id_token=bytearray(id_token.encode("utf-8")),
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise GoogleOAuthSessionError("oauth.exchange_failed") from None
+        finally:
+            _zero_bytes(payload) if payload is not None else None
+            payload = None
+            raw = b""
+            if type(value) is dict:
+                value.clear()
+            value = {}
+            access_token = ""
+            id_token = ""
+            refresh_token = ""
+
+
 def _zero_bytes(value: bytearray) -> None:
     for index in range(len(value)):
         value[index] = 0
@@ -532,6 +969,481 @@ def _required_callable(owner: object, name: str) -> bool:
     except BaseException:
         failed = True
     return not failed and callable(value)
+
+
+class _InventoryReadonlyAuthorizationCallbackDriverV1:
+    """Fixed, private callback inputs for one Inventory Readonly interaction.
+
+    This type is deliberately reachable only through the module-private test
+    factory below.  Production has no callback material until its source-owned
+    private client and loopback callback owners exist.
+    """
+
+    __slots__ = (
+        "_account_ref",
+        "_code",
+        "_expected_generation",
+        "_idempotency_key",
+        "_oauth_client_ref",
+        "_principal",
+        "_redirect_uri",
+        "_state",
+    )
+
+    def __init__(
+        self,
+        *,
+        account_ref: str,
+        oauth_client_ref: str,
+        redirect_uri: str,
+        expected_generation: int,
+        idempotency_key: str,
+        principal: str,
+        code: str,
+        state: str,
+    ) -> None:
+        try:
+            self._account_ref = GoogleOAuthControlService._ref(account_ref)
+            self._oauth_client_ref = GoogleOAuthControlService._ref(oauth_client_ref)
+            self._redirect_uri = GoogleOAuthControlService._redirect_uri(redirect_uri)
+            self._expected_generation = GoogleOAuthControlService._generation(
+                expected_generation
+            )
+            self._idempotency_key = GoogleOAuthControlService._ref(idempotency_key)
+            self._principal = GoogleOAuthControlService._ref(principal)
+            if (
+                type(code) is not str
+                or not 1 <= len(code) <= 8192
+                or type(state) is not str
+                or not 1 <= len(state) <= 512
+            ):
+                raise ValueError
+            self._code = code
+            self._state = state
+        except (GoogleOAuthSessionError, ValueError, TypeError):
+            raise GoogleOAuthSessionError("oauth.inventory_unavailable") from None
+
+    def __repr__(self) -> str:
+        return "_InventoryReadonlyAuthorizationCallbackDriverV1(<redacted>)"
+
+    __str__ = __repr__
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("private inventory callback driver is not serializable")
+
+    def _begin_arguments(self) -> tuple[str, dict[str, object]]:
+        return self._account_ref, {
+            "oauth_client_ref": self._oauth_client_ref,
+            "redirect_uri": self._redirect_uri,
+            "expected_generation": self._expected_generation,
+            "idempotency_key": self._idempotency_key,
+            "principal": self._principal,
+        }
+
+    def _complete_arguments(self, transaction_id: str) -> tuple[str, dict[str, object]]:
+        return transaction_id, {
+            "code": self._code,
+            "account_ref": self._account_ref,
+            "redirect_uri": self._redirect_uri,
+            "expected_generation": self._expected_generation,
+            "state": self._state,
+        }
+
+
+class _InventoryReadonlyAuthorizationPreflightForTestV1:
+    """Statically bounded no-I/O preflight seam for direct OAuth leaf tests."""
+
+    __slots__ = ("calls",)
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __repr__(self) -> str:
+        return "_InventoryReadonlyAuthorizationPreflightForTestV1(<redacted>)"
+
+    __str__ = __repr__
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("private inventory preflight is not serializable")
+
+    def _preflight_for_inventory_authorize(self) -> None:
+        self.calls += 1
+
+
+class _InventoryReadonlyAuthorizationHandleV1:
+    """One nonserializable RAM transaction owned only by the OAuth service."""
+
+    __slots__ = (
+        "registry_generation",
+        "registry_fingerprint",
+        "record",
+        "account",
+        "inventory_generation",
+        "redirect_uri",
+        "expires_at",
+        "state",
+        "verifier",
+        "nonce",
+        "code",
+        "callback_state",
+        "authorization_url",
+    )
+
+    def __init__(
+        self,
+        *,
+        registry_generation,
+        registry_fingerprint,
+        record,
+        account,
+        inventory_generation,
+        redirect_uri,
+        expires_at,
+    ):
+        self.registry_generation = registry_generation
+        self.registry_fingerprint = registry_fingerprint
+        self.record = record
+        self.account = account
+        self.inventory_generation = inventory_generation
+        self.redirect_uri = redirect_uri
+        self.expires_at = expires_at
+        self.state = bytearray()
+        self.verifier = bytearray()
+        self.nonce = bytearray()
+        self.code = bytearray()
+        self.callback_state = bytearray()
+        self.authorization_url = bytearray()
+
+    def __repr__(self) -> str:
+        return "_InventoryReadonlyAuthorizationHandleV1(<redacted>)"
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("private inventory transaction is not serializable")
+
+    def clear(self) -> None:
+        for value in (
+            self.state,
+            self.verifier,
+            self.nonce,
+            self.code,
+            self.callback_state,
+            self.authorization_url,
+        ):
+            _zero_bytes(value)
+        self.record = None
+        self.account = None
+        self.registry_generation = 0
+        self.registry_fingerprint = ""
+        self.inventory_generation = 0
+        self.redirect_uri = ""
+        self.expires_at = 0.0
+
+
+class _InventoryReadonlyLoopbackDriverV1:
+    """Fixed IPv4 loopback and desktop browser driver for one callback GET."""
+
+    __slots__ = ("_listener", "_redirect_uri")
+
+    def __init__(self) -> None:
+        self._listener = None
+        self._redirect_uri = ""
+
+    def __repr__(self) -> str:
+        return "_InventoryReadonlyLoopbackDriverV1(<redacted>)"
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("private loopback driver is not serializable")
+
+    def clear(self) -> None:
+        listener, self._listener = self._listener, None
+        self._redirect_uri = ""
+        if listener is not None:
+            listener.close()
+
+    def _open(self) -> str:
+        display = os.environ.get("DISPLAY", "")
+        wayland = os.environ.get("WAYLAND_DISPLAY", "")
+        if (
+            any(
+                os.environ.get(name)
+                for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
+            )
+            or not (display or wayland)
+            or (display and re.fullmatch(r":[0-9]+(?:\.[0-9]+)?", display) is None)
+            or (wayland and re.fullmatch(r"wayland-[0-9]+", wayland) is None)
+            or self._listener is not None
+        ):
+            raise GoogleOAuthSessionError("oauth.interactive_authorization_required")
+        try:
+            self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._listener.bind(("127.0.0.1", 0))
+            self._listener.listen(1)
+            host, port = self._listener.getsockname()
+            if host != "127.0.0.1" or type(port) is not int or not 1 <= port <= 65535:
+                raise ValueError
+            self._redirect_uri = f"http://127.0.0.1:{port}/callback"
+            return self._redirect_uri
+        except (KeyboardInterrupt, SystemExit):
+            self.clear()
+            raise
+        except Exception:
+            self.clear()
+            raise GoogleOAuthSessionError(
+                "oauth.interactive_authorization_required"
+            ) from None
+
+    def _receive(self, handle: _InventoryReadonlyAuthorizationHandleV1) -> None:
+        connection = None
+        raw = bytearray()
+        try:
+            if (
+                type(handle) is not _InventoryReadonlyAuthorizationHandleV1
+                or self._listener is None
+                or handle.redirect_uri != self._redirect_uri
+                or not handle.authorization_url.startswith(
+                    b"https://accounts.google.com/o/oauth2/auth?"
+                )
+            ):
+                raise ValueError
+            self._listener.settimeout(MAX_OAUTH_TRANSACTION_SECONDS)
+            subprocess.run(
+                ["/usr/bin/xdg-open", handle.authorization_url.decode("ascii")],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+                timeout=10,
+            )
+            connection, peer = self._listener.accept()
+            self.clear()
+            if peer[0] != "127.0.0.1":
+                raise ValueError
+            connection.settimeout(10)
+            while b"\r\n\r\n" not in raw:
+                chunk = connection.recv(min(4096, 16 * 1024 + 1 - len(raw)))
+                if not chunk:
+                    raise ValueError
+                raw.extend(chunk)
+                if len(raw) > 16 * 1024:
+                    raise ValueError
+            head, body = raw.split(b"\r\n\r\n", 1)
+            lines = head.decode("ascii").split("\r\n")
+            method, target, version = lines[0].split(" ")
+            if method != "GET" or version not in ("HTTP/1.0", "HTTP/1.1") or body:
+                raise ValueError
+            headers = {}
+            for line in lines[1:]:
+                key, value = line.split(":", 1)
+                key = key.lower()
+                if key in headers or key.strip() != key:
+                    raise ValueError
+                headers[key] = value.strip()
+            if (
+                headers.get("host") != urllib.parse.urlsplit(handle.redirect_uri).netloc
+                or "transfer-encoding" in headers
+                or headers.get("content-length", "0") != "0"
+            ):
+                raise ValueError
+            parsed = urllib.parse.urlsplit(target)
+            if (
+                parsed.scheme
+                or parsed.netloc
+                or parsed.fragment
+                or parsed.path != "/callback"
+            ):
+                raise ValueError
+            values = urllib.parse.parse_qs(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+                max_num_fields=8,
+            )
+            if (
+                set(values) - {"code", "state", "scope", "authuser", "prompt", "hd"}
+                or "code" not in values
+                or "state" not in values
+                or any(len(value) != 1 for value in values.values())
+                or not 1 <= len(values["code"][0]) <= 8192
+                or not 1 <= len(values["state"][0]) <= 512
+            ):
+                raise ValueError
+            handle.code.extend(values["code"][0].encode("ascii"))
+            handle.callback_state.extend(values["state"][0].encode("ascii"))
+            connection.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                b"Cache-Control: no-store\r\nConnection: close\r\nContent-Length: 32\r\n\r\n"
+                b"Authorization callback received."
+            )
+        except (KeyboardInterrupt, SystemExit):
+            if type(handle) is _InventoryReadonlyAuthorizationHandleV1:
+                handle.clear()
+            raise
+        except Exception:
+            if type(handle) is _InventoryReadonlyAuthorizationHandleV1:
+                handle.clear()
+            raise GoogleOAuthSessionError(
+                "oauth.interactive_authorization_required"
+            ) from None
+        finally:
+            _zero_bytes(raw)
+            if connection is not None:
+                connection.close()
+            self.clear()
+
+
+class _TheHiveInventoryReadonlyAuthorizationPort:
+    """Authority-only adapter over the existing narrow Inventory OAuth owner."""
+
+    __slots__ = ("_callback_driver", "_control_service", "_manager", "_preflight")
+
+    def __init__(
+        self,
+        *,
+        preflight: object,
+        manager: GoogleAccountInventoryManager | None,
+        control_service: GoogleOAuthControlService | None = None,
+        callback_driver: _InventoryReadonlyAuthorizationCallbackDriverV1
+        | _InventoryReadonlyLoopbackDriverV1
+        | None = None,
+    ) -> None:
+        self._preflight = preflight
+        self._manager = manager
+        self._control_service = control_service
+        self._callback_driver = callback_driver
+
+    def __repr__(self) -> str:
+        return "_TheHiveInventoryReadonlyAuthorizationPort(<redacted>)"
+
+    __str__ = __repr__
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("private inventory authorization port is not serializable")
+
+    def authorize(self) -> object:
+        """Run the fixed registry-bound OAuth transaction with no caller choices."""
+
+        try:
+            preflight = getattr(self._preflight, "_preflight_for_inventory_authorize")
+            if not callable(preflight):
+                raise TypeError
+            preflight()
+            if self._manager is None:
+                raise TypeError
+            if self._control_service is None or self._callback_driver is None:
+                raise GoogleOAuthSessionError("oauth.inventory_unavailable")
+            if type(self._callback_driver) is _InventoryReadonlyLoopbackDriverV1:
+                handle = None
+                try:
+                    # Resolve before opening any socket or launching the desktop.
+                    self._control_service._inventory_bound_selection()
+                    redirect_uri = self._callback_driver._open()
+                    handle = (
+                        self._control_service._begin_inventory_readonly_authorization(
+                            redirect_uri=redirect_uri,
+                        )
+                    )
+                    self._callback_driver._receive(handle)
+                    return self._control_service._complete_inventory_readonly_authorization(
+                        handle
+                    )
+                finally:
+                    if handle is not None:
+                        with self._control_service._inventory_transaction_lock:
+                            if (
+                                self._control_service._inventory_pending_handle
+                                is handle
+                            ):
+                                self._control_service._inventory_pending_handle = None
+                        handle.clear()
+                    self._callback_driver.clear()
+            if (
+                type(self._preflight)
+                is not _InventoryReadonlyAuthorizationPreflightForTestV1
+            ):
+                raise GoogleOAuthSessionError("oauth.inventory_unavailable")
+            account_ref, begin_arguments = self._callback_driver._begin_arguments()
+            transaction = self._control_service._for_test_legacy_begin_inventory_readonly_authorization(
+                account_ref, **begin_arguments
+            )
+            if type(transaction) is not _InventoryReadonlyAuthorizationTransactionV1:
+                raise TypeError
+            transaction_id, complete_arguments = (
+                self._callback_driver._complete_arguments(transaction.id)
+            )
+            return self._control_service._for_test_legacy_complete_inventory_readonly_authorization(
+                transaction_id, **complete_arguments
+            )
+        except GoogleOAuthSessionError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise GoogleOAuthSessionError("oauth.inventory_unavailable") from None
+
+
+def _new_the_hive_inventory_readonly_authorization_port(
+    *, vault_components: object, manager: object
+) -> _TheHiveInventoryReadonlyAuthorizationPort:
+    """Build the production OAuth leaf from only fixed private owner resources."""
+
+    try:
+        from .google_inventory_token_vault import (
+            _TheHiveInventoryVaultProductionComponents,
+        )
+        from .google_inventory_desktop_client_registry import (
+            _InventoryDesktopClientRegistryStoreV1,
+        )
+
+        if (
+            type(vault_components) is not _TheHiveInventoryVaultProductionComponents
+            or type(manager) is not GoogleAccountInventoryManager
+        ):
+            raise TypeError
+        return _TheHiveInventoryReadonlyAuthorizationPort(
+            preflight=vault_components,
+            manager=manager,
+            control_service=GoogleOAuthControlService._from_inventory_registry(
+                registry=_InventoryDesktopClientRegistryStoreV1(
+                    vault_components._layout
+                ),
+                manager=manager,
+            ),
+            callback_driver=_InventoryReadonlyLoopbackDriverV1(),
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        raise GoogleOAuthSessionError("oauth.inventory_unavailable") from None
+
+
+def _for_test_the_hive_inventory_readonly_authorization_port(
+    *,
+    control_service: GoogleOAuthControlService | None,
+    callback_driver: _InventoryReadonlyAuthorizationCallbackDriverV1 | None,
+    preflight: _InventoryReadonlyAuthorizationPreflightForTestV1,
+) -> _TheHiveInventoryReadonlyAuthorizationPort:
+    """Construct the only statically bounded direct-test OAuth leaf seam."""
+
+    if type(preflight) is not _InventoryReadonlyAuthorizationPreflightForTestV1:
+        raise GoogleOAuthSessionError("oauth.inventory_unavailable")
+    populated = (
+        type(control_service) is GoogleOAuthControlService
+        and type(callback_driver) is _InventoryReadonlyAuthorizationCallbackDriverV1
+    )
+    absent = control_service is None and callback_driver is None
+    if not (populated or absent):
+        raise GoogleOAuthSessionError("oauth.inventory_unavailable")
+    return _TheHiveInventoryReadonlyAuthorizationPort(
+        preflight=preflight,
+        manager=GoogleAccountInventoryManager.__new__(GoogleAccountInventoryManager),
+        control_service=control_service,
+        callback_driver=callback_driver,
+    )
 
 
 class GoogleOAuthControlService:
@@ -567,6 +1479,15 @@ class GoogleOAuthControlService:
         self._token_writer = token_writer
         self._secret_ingress = secret_ingress
         self._code_exchange = code_exchange
+        self._inventory_code_exchange = (
+            code_exchange
+            if _required_callable(code_exchange, "exchange_inventory_readonly")
+            else _GoogleInventoryReadonlyCodeExchangeV1()
+        )
+        self._inventory_id_token_verifier: _InventoryReadonlyIdTokenVerifierPort = (
+            _GoogleInventoryReadonlyIdTokenVerifierV1()
+        )
+        self._inventory_pending_nonces: dict[str, bytearray] = {}
         self._clock = clock or time.time
         try:
             self._state = HiveStateStore(state_root)
@@ -577,6 +1498,14 @@ class GoogleOAuthControlService:
                     self._write_locked(self._empty_document())
                 else:
                     self._read_locked()
+                try:
+                    os.lstat(state_root / _INVENTORY_AUTHORIZATION_DOCUMENT.name)
+                except FileNotFoundError:
+                    self._write_inventory_authorization_locked(
+                        self._empty_inventory_authorization_document()
+                    )
+                else:
+                    self._read_inventory_authorization_locked()
         except (GoogleOAuthSessionError, HiveStateError, OSError):
             raise GoogleOAuthSessionError("oauth.control_unavailable") from None
 
@@ -594,9 +1523,7 @@ class GoogleOAuthControlService:
             raise GoogleOAuthSessionError("oauth.account_mismatch") from None
         return cast(int, snapshot.generation)
 
-    def account_oauth_state(
-        self, account_ref: str, *, expected_generation: int
-    ) -> str:
+    def account_oauth_state(self, account_ref: str, *, expected_generation: int) -> str:
         """Project current non-secret OAuth authority state for one account."""
 
         account_ref = self._ref(account_ref)
@@ -646,6 +1573,130 @@ class GoogleOAuthControlService:
             "clients": [],
             "transactions": [],
         }
+
+    @staticmethod
+    def _empty_inventory_authorization_document() -> dict[str, object]:
+        return {
+            "schema_version": _INVENTORY_AUTHORIZATION_SCHEMA_VERSION,
+            "transactions": [],
+        }
+
+    @classmethod
+    def _validate_inventory_authorization_document(
+        cls, value: Mapping[str, object]
+    ) -> None:
+        if (
+            set(value) != {"schema_version", "transactions"}
+            or value.get("schema_version") != _INVENTORY_AUTHORIZATION_SCHEMA_VERSION
+            or type(value.get("transactions")) is not list
+            or len(cast(list[object], value["transactions"])) > _MAX_CONTROL_RECORDS
+        ):
+            raise HiveStateError("invalid_google_oauth_inventory_authorization_state")
+        transaction_ids: set[str] = set()
+        for item in cast(list[object], value["transactions"]):
+            record = cls._record(
+                item,
+                {
+                    "id",
+                    "account_ref",
+                    "oauth_client_ref",
+                    "client_digest",
+                    "client_vault_generation",
+                    "pkce_verifier",
+                    "redirect_uri",
+                    "scope_fingerprint",
+                    "state_token",
+                    "state_digest",
+                    "nonce_digest",
+                    "inventory_generation",
+                    "expires_at",
+                    "state",
+                    "authorization_code_digest",
+                    "effect_subject_digest",
+                    "terminal_at",
+                },
+            )
+            base = (
+                cls._stored_ref(record["id"])
+                and cls._stored_ref(record["account_ref"])
+                and cls._stored_ref(record["oauth_client_ref"])
+                and cls._stored_digest(record["client_digest"])
+                and cls._stored_generation(record["client_vault_generation"])
+                and type(record["redirect_uri"]) is str
+                and _REDIRECT.fullmatch(cast(str, record["redirect_uri"])) is not None
+                and cls._stored_digest(record["scope_fingerprint"])
+                and record["scope_fingerprint"]
+                == resolve_google_oauth_profile_v1(
+                    GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+                    GoogleOAuthOperationV1.PROJECTS_SEARCH,
+                ).scope_fingerprint
+                and cls._stored_digest(record["state_digest"])
+                and cls._stored_digest(record["nonce_digest"])
+                and cls._stored_generation(record["inventory_generation"])
+                and cls._stored_time(record["expires_at"])
+            )
+            pending = record["state"] == "pending" and (
+                cls._stored_urlsafe(record["pkce_verifier"])
+                and cls._stored_urlsafe(record["state_token"])
+                and record["state_digest"]
+                == cls._digest("google.oauth-state", record["state_token"])
+                and record["authorization_code_digest"] is None
+                and record["effect_subject_digest"] is None
+                and record["terminal_at"] is None
+            )
+            exchanging = record["state"] == "exchanging" and (
+                record["pkce_verifier"] is None
+                and record["state_token"] is None
+                and cls._stored_digest(record["authorization_code_digest"])
+                and record["effect_subject_digest"] is None
+                and record["terminal_at"] is None
+            )
+            verified = record["state"] == "verified" and (
+                record["pkce_verifier"] is None
+                and record["state_token"] is None
+                and cls._stored_digest(record["authorization_code_digest"])
+                and cls._stored_digest(record["effect_subject_digest"])
+                and record["terminal_at"] is None
+            )
+            terminal = record["state"] in {"failed", "expired"} and (
+                record["pkce_verifier"] is None
+                and record["state_token"] is None
+                and record["authorization_code_digest"] is None
+                and record["effect_subject_digest"] is None
+                and cls._stored_time(record["terminal_at"])
+            )
+            if not base or not (pending or exchanging or verified or terminal):
+                raise HiveStateError(
+                    "invalid_google_oauth_inventory_authorization_state"
+                )
+            transaction_id = cast(str, record["id"])
+            if transaction_id in transaction_ids:
+                raise HiveStateError(
+                    "invalid_google_oauth_inventory_authorization_state"
+                )
+            transaction_ids.add(transaction_id)
+
+    def _read_inventory_authorization_locked(self) -> dict[str, object]:
+        try:
+            value = dict(
+                self._state.read_json_locked(
+                    _INVENTORY_AUTHORIZATION_DOCUMENT,
+                    max_bytes=_MAX_CONTROL_BYTES,
+                )
+            )
+            self._validate_inventory_authorization_document(value)
+        except (HiveStateError, OSError, GoogleOAuthAuthorizationError):
+            raise GoogleOAuthSessionError("oauth.inventory_unavailable") from None
+        return value
+
+    def _write_inventory_authorization_locked(
+        self, document: Mapping[str, object]
+    ) -> None:
+        try:
+            self._validate_inventory_authorization_document(document)
+            self._state.replace_json_locked(_INVENTORY_AUTHORIZATION_DOCUMENT, document)
+        except (HiveStateError, OSError, GoogleOAuthAuthorizationError):
+            raise GoogleOAuthSessionError("oauth.inventory_unavailable") from None
 
     def _read_locked(self) -> dict[str, object]:
         try:
@@ -2351,6 +3402,605 @@ class GoogleOAuthControlService:
                 }
             )
         )
+
+    @staticmethod
+    def _inventory_authorization_url(
+        client: Mapping[str, object],
+        *,
+        redirect_uri: str,
+        state: str,
+        verifier: str,
+        nonce: str,
+    ) -> str:
+        challenge = (
+            base64.urlsafe_b64encode(sha256(verifier.encode("ascii")).digest())
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+        return (
+            str(client["auth_uri"])
+            + "?"
+            + urllib.parse.urlencode(
+                {
+                    "access_type": "offline",
+                    "client_id": str(client["client_id"]),
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                    "nonce": nonce,
+                    "prompt": "consent",
+                    "redirect_uri": redirect_uri,
+                    "response_type": "code",
+                    "scope": " ".join(
+                        google_oauth_scope_values_v1(
+                            GoogleOAuthProfileIdV1.INVENTORY_READONLY
+                        )
+                    ),
+                    "state": state,
+                }
+            )
+        )
+
+    def _inventory_account_login(
+        self, account_ref: str, expected_generation: int
+    ) -> str:
+        try:
+            snapshot = self._manager._snapshot_for_internal_use()
+            if snapshot.generation != expected_generation:
+                raise GoogleOAuthSessionError("oauth.generation_mismatch")
+            account = snapshot.by_account_ref[account_ref]
+            login_email = account.login_email
+            subject_id = account.subject_id
+        except GoogleOAuthSessionError:
+            raise
+        except (GoogleAccountInventoryError, KeyError, AttributeError):
+            raise GoogleOAuthSessionError("oauth.account_mismatch") from None
+        if (
+            type(login_email) is not str
+            or not login_email
+            or (
+                subject_id is not None
+                and (type(subject_id) is not str or not subject_id)
+            )
+        ):
+            raise GoogleOAuthSessionError("oauth.account_mismatch")
+        return login_email
+
+    def _inventory_active_client(
+        self,
+        document: Mapping[str, object],
+        *,
+        account_ref: str,
+        oauth_client_ref: str,
+        expected_generation: int,
+    ) -> tuple[dict[str, object], dict[str, object], str]:
+        matches = [
+            cast(dict[str, object], item)
+            for item in cast(list[object], document["clients"])
+            if cast(dict[str, object], item)["id"] == oauth_client_ref
+            and cast(dict[str, object], item)["account_ref"] == account_ref
+            and cast(dict[str, object], item)["state"] == "active"
+            and cast(dict[str, object], item)["inventory_generation"]
+            == expected_generation
+        ]
+        if len(matches) != 1:
+            raise GoogleOAuthSessionError("oauth.client_expired")
+        client_record = matches[0]
+        client, fingerprint = self._load_client(account_ref, client_record)
+        if fingerprint != client_record["client_digest"]:
+            client.clear()
+            raise GoogleOAuthSessionError("oauth.client_expired")
+        return client_record, client, fingerprint
+
+    def _inventory_authorization_capable(self) -> _InventoryReadonlyIdTokenVerifierPort:
+        verifier = self._inventory_id_token_verifier
+        if (
+            verifier is None
+            or not _required_callable(verifier, "verify_inventory_readonly_id_token")
+            or not _required_callable(
+                self._inventory_code_exchange, "exchange_inventory_readonly"
+            )
+        ):
+            raise GoogleOAuthSessionError("oauth.inventory_unavailable")
+        return verifier
+
+    @classmethod
+    def _from_inventory_registry(
+        cls, *, registry, manager
+    ) -> GoogleOAuthControlService:
+        """Private construction of the OAuth owner without generic/admin storage."""
+
+        from .google_inventory_desktop_client_registry import (
+            _InventoryDesktopClientRegistryStoreV1,
+        )
+
+        if (
+            type(registry) is not _InventoryDesktopClientRegistryStoreV1
+            or type(manager) is not GoogleAccountInventoryManager
+        ):
+            raise GoogleOAuthSessionError("oauth.inventory_unavailable")
+        service = cls.__new__(cls)
+        service._manager = manager
+        service._inventory_registry = registry
+        service._inventory_pending_handle = None
+        service._inventory_transaction_lock = threading.RLock()
+        service._inventory_code_exchange = _GoogleInventoryReadonlyCodeExchangeV1()
+        service._inventory_id_token_verifier = (
+            _GoogleInventoryReadonlyIdTokenVerifierV1()
+        )
+        service._clock = time.time
+        return service
+
+    def _inventory_bound_selection(self):
+        """Resolve exactly one registry-bound canonical account, never a caller choice."""
+
+        try:
+            registry = self._inventory_registry.load()
+            snapshot = self._manager._snapshot_for_internal_use()
+            if registry is None:
+                raise ValueError
+            eligible = [
+                (record, snapshot.by_account_ref[record.account_ref])
+                for record in registry.records
+                if record.account_ref in snapshot.by_account_ref
+            ]
+            if len(eligible) != 1:
+                raise ValueError
+            record, account = eligible[0]
+            return (
+                registry.registry_generation,
+                registry.fingerprint,
+                record,
+                account,
+                snapshot.generation,
+            )
+        except Exception:
+            raise GoogleOAuthSessionError("oauth.inventory_unavailable") from None
+
+    def _begin_inventory_readonly_authorization(
+        self, *, redirect_uri: str
+    ) -> _InventoryReadonlyAuthorizationHandleV1:
+        """Create State, PKCE-S256 and OIDC nonce only in a private RAM handle."""
+
+        handle = None
+        try:
+            with self._inventory_transaction_lock:
+                if self._inventory_pending_handle is not None:
+                    raise GoogleOAuthSessionError(
+                        "oauth.inventory_reauthorization_required"
+                    )
+                self._inventory_authorization_capable()
+                redirect_uri = self._redirect_uri(redirect_uri)
+                generation, fingerprint, record, account, inventory_generation = (
+                    self._inventory_bound_selection()
+                )
+                handle = _InventoryReadonlyAuthorizationHandleV1(
+                    registry_generation=generation,
+                    registry_fingerprint=fingerprint,
+                    record=record,
+                    account=account,
+                    inventory_generation=inventory_generation,
+                    redirect_uri=redirect_uri,
+                    expires_at=self._now() + MAX_OAUTH_TRANSACTION_SECONDS,
+                )
+                handle.state.extend(secrets.token_urlsafe(32).encode("ascii"))
+                handle.verifier.extend(secrets.token_urlsafe(32).encode("ascii"))
+                handle.nonce.extend(secrets.token_urlsafe(32).encode("ascii"))
+                handle.authorization_url.extend(
+                    self._inventory_authorization_url(
+                        {"client_id": record.client_id, "auth_uri": record.auth_uri},
+                        redirect_uri=redirect_uri,
+                        state=handle.state.decode("ascii"),
+                        verifier=handle.verifier.decode("ascii"),
+                        nonce=handle.nonce.decode("ascii"),
+                    ).encode("ascii")
+                )
+                self._inventory_pending_handle = handle
+                return handle
+        except BaseException:
+            if handle is not None:
+                handle.clear()
+            raise
+
+    def _complete_inventory_readonly_authorization(
+        self, handle
+    ) -> _InventoryReadonlyAuthorizationEffectV1:
+        """Consume the private callback once and reattest both registry bindings."""
+
+        result = None
+        verified = None
+        refresh = None
+        try:
+            with self._inventory_transaction_lock:
+                if (
+                    type(handle) is not _InventoryReadonlyAuthorizationHandleV1
+                    or self._inventory_pending_handle is not handle
+                ):
+                    raise GoogleOAuthSessionError(
+                        "oauth.inventory_reauthorization_required"
+                    )
+                self._inventory_pending_handle = None
+            if (
+                self._now() >= handle.expires_at
+                or not 1 <= len(handle.code) <= 8192
+                or not secrets.compare_digest(handle.state, handle.callback_state)
+            ):
+                raise GoogleOAuthSessionError(
+                    "oauth.inventory_reauthorization_required"
+                )
+            generation, fingerprint, record, account, inventory_generation = (
+                self._inventory_bound_selection()
+            )
+            if (
+                generation != handle.registry_generation
+                or record != handle.record
+                or fingerprint != handle.registry_fingerprint
+                or inventory_generation != handle.inventory_generation
+                or account != handle.account
+            ):
+                raise GoogleOAuthSessionError("oauth.client_expired")
+            verifier = self._inventory_authorization_capable()
+            result = self._inventory_code_exchange.exchange_inventory_readonly(
+                {"client_id": record.client_id, "token_uri": record.token_uri},
+                code=handle.code.decode("ascii"),
+                redirect_uri=handle.redirect_uri,
+                pkce_verifier=handle.verifier.decode("ascii"),
+            )
+            if type(result) is not _InventoryReadonlyCodeExchangeV1:
+                raise GoogleOAuthSessionError("oauth.exchange_failed")
+            verified = verifier.verify_inventory_readonly_id_token(
+                result.id_token,
+                expected_nonce=handle.nonce,
+                client_id=record.client_id,
+                login_email=account.login_email,
+                now=self._now(),
+            )
+            if type(
+                verified
+            ) is not _InventoryReadonlyVerifiedIdTokenV1 or not secrets.compare_digest(
+                verified.nonce, handle.nonce
+            ):
+                raise GoogleOAuthSessionError("oauth.id_token_invalid")
+            if account.subject_id is not None and not secrets.compare_digest(
+                account.subject_id, verified.subject_id
+            ):
+                raise GoogleOAuthSessionError("oauth.subject_mismatch")
+            if self._inventory_bound_selection() != (
+                generation,
+                fingerprint,
+                record,
+                account,
+                inventory_generation,
+            ):
+                raise GoogleOAuthSessionError("oauth.client_expired")
+            refresh = result.refresh_token
+            result.refresh_token = bytearray()
+            effect = _InventoryReadonlyAuthorizationEffectV1(
+                account_ref=record.account_ref,
+                subject_id=verified.subject_id,
+                inventory_generation=inventory_generation,
+                oauth_client_fingerprint=record.fingerprint,
+                scope_fingerprint=resolve_google_oauth_profile_v1(
+                    GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+                    GoogleOAuthOperationV1.PROJECTS_SEARCH,
+                ).scope_fingerprint,
+                refresh_token=refresh,
+            )
+            refresh = None
+            return effect
+        except (GoogleOAuthSessionError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise GoogleOAuthSessionError("oauth.inventory_unavailable") from None
+        finally:
+            if refresh is not None:
+                _zero_bytes(refresh)
+            if type(verified) is _InventoryReadonlyVerifiedIdTokenV1:
+                verified.clear()
+            if type(result) is _InventoryReadonlyCodeExchangeV1:
+                result.clear()
+            if type(handle) is _InventoryReadonlyAuthorizationHandleV1:
+                handle.clear()
+
+    def _for_test_legacy_begin_inventory_readonly_authorization(
+        self,
+        account_ref: str,
+        *,
+        oauth_client_ref: str,
+        redirect_uri: str,
+        expected_generation: int,
+        idempotency_key: str,
+        principal: str,
+        ttl_seconds: int = MAX_OAUTH_TRANSACTION_SECONDS,
+    ) -> _InventoryReadonlyAuthorizationTransactionV1:
+        """Begin the only fixed-profile Inventory Readonly OAuth flow.
+
+        The raw OIDC nonce stays only in this process as a scrubbable capability.
+        A process crash therefore loses a pending browser interaction safely and
+        requires re-authorization; durable state contains only its digest.
+        """
+
+        account_ref = self._ref(account_ref)
+        oauth_client_ref = self._ref(oauth_client_ref)
+        redirect_uri = self._redirect_uri(redirect_uri)
+        expected_generation = self._generation(expected_generation)
+        idempotency_key = self._ref(idempotency_key)
+        principal = self._ref(principal)
+        ttl_seconds = self._ttl(ttl_seconds, MAX_OAUTH_TRANSACTION_SECONDS)
+        self._inventory_authorization_capable()
+        self._inventory_account_login(account_ref, expected_generation)
+        nonce_bytes = bytearray(secrets.token_bytes(32))
+        nonce = ""
+        client: dict[str, object] = {}
+        try:
+            nonce = base64.urlsafe_b64encode(nonce_bytes).rstrip(b"=").decode("ascii")
+            _zero_bytes(nonce_bytes)
+            nonce_bytes = bytearray(nonce.encode("ascii"))
+            transaction_prefix = (
+                "inventory-oauth-"
+                + sha256(
+                    ("google.inventory-oauth\0" + idempotency_key).encode("utf-8")
+                ).hexdigest()[:32]
+                + "-"
+            )
+            transaction_id = (
+                transaction_prefix
+                + sha256(
+                    ("google.inventory-oauth-principal\0" + principal).encode("utf-8")
+                ).hexdigest()[:32]
+            )
+            state = secrets.token_urlsafe(32)
+            verifier = (
+                base64.urlsafe_b64encode(secrets.token_bytes(32))
+                .rstrip(b"=")
+                .decode("ascii")
+            )
+            now = self._now()
+            expires_at = now + ttl_seconds
+            with self._state.locked():
+                control = self._read_locked()
+                inventory = self._read_inventory_authorization_locked()
+                prior = [
+                    cast(dict[str, object], item)
+                    for item in cast(list[object], inventory["transactions"])
+                    if cast(str, cast(dict[str, object], item)["id"]).startswith(
+                        transaction_prefix
+                    )
+                ]
+                if prior:
+                    raise GoogleOAuthSessionError(
+                        "oauth.inventory_reauthorization_required"
+                    )
+                client_record, client, client_digest = self._inventory_active_client(
+                    control,
+                    account_ref=account_ref,
+                    oauth_client_ref=oauth_client_ref,
+                    expected_generation=expected_generation,
+                )
+                if len(self._inventory_pending_nonces) >= _MAX_CONTROL_RECORDS:
+                    raise GoogleOAuthSessionError("oauth.inventory_unavailable")
+                authorization_url = self._inventory_authorization_url(
+                    client,
+                    redirect_uri=redirect_uri,
+                    state=state,
+                    verifier=verifier,
+                    nonce=nonce,
+                )
+                transactions = cast(list[object], inventory["transactions"])
+                self._make_room(transactions, {"pending", "exchanging", "verified"})
+                transactions.append(
+                    {
+                        "id": transaction_id,
+                        "account_ref": account_ref,
+                        "oauth_client_ref": oauth_client_ref,
+                        "client_digest": client_digest,
+                        "client_vault_generation": client_record["vault_generation"],
+                        "pkce_verifier": verifier,
+                        "redirect_uri": redirect_uri,
+                        "scope_fingerprint": resolve_google_oauth_profile_v1(
+                            GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+                            GoogleOAuthOperationV1.PROJECTS_SEARCH,
+                        ).scope_fingerprint,
+                        "state_token": state,
+                        "state_digest": self._digest("google.oauth-state", state),
+                        "nonce_digest": self._digest("google.oidc-nonce", nonce),
+                        "inventory_generation": expected_generation,
+                        "expires_at": expires_at,
+                        "state": "pending",
+                        "authorization_code_digest": None,
+                        "effect_subject_digest": None,
+                        "terminal_at": None,
+                    }
+                )
+                self._write_inventory_authorization_locked(inventory)
+                self._inventory_pending_nonces[transaction_id] = nonce_bytes
+                nonce_bytes = bytearray()
+            return _InventoryReadonlyAuthorizationTransactionV1(
+                transaction_id,
+                authorization_url,
+                expires_at,
+                expected_generation,
+            )
+        finally:
+            _zero_bytes(nonce_bytes)
+            client.clear()
+            nonce = ""
+
+    def _for_test_legacy_complete_inventory_readonly_authorization(
+        self,
+        transaction_id: str,
+        *,
+        code: str,
+        account_ref: str,
+        redirect_uri: str,
+        expected_generation: int,
+        state: str,
+    ) -> _InventoryReadonlyAuthorizationEffectV1:
+        """Verify one fixed-profile callback and return a one-shot RAM-only effect."""
+
+        transaction_id = self._ref(transaction_id)
+        account_ref = self._ref(account_ref)
+        redirect_uri = self._redirect_uri(redirect_uri)
+        expected_generation = self._generation(expected_generation)
+        if (
+            type(code) is not str
+            or not 1 <= len(code) <= 8192
+            or type(state) is not str
+            or not 1 <= len(state) <= 512
+        ):
+            raise GoogleOAuthSessionError("oauth.request_invalid")
+        verifier_port = self._inventory_authorization_capable()
+        client: dict[str, object] = {}
+        result: _InventoryReadonlyCodeExchangeV1 | None = None
+        verified: _InventoryReadonlyVerifiedIdTokenV1 | None = None
+        nonce_bytes: bytearray | None = None
+        refresh_token: bytearray | None = None
+        try:
+            with self._state.locked():
+                control = self._read_locked()
+                inventory = self._read_inventory_authorization_locked()
+                record = self._find(
+                    cast(list[object], inventory["transactions"]), "id", transaction_id
+                )
+                if record is None or record["state"] != "pending":
+                    raise GoogleOAuthSessionError(
+                        "oauth.inventory_reauthorization_required"
+                    )
+                mismatch = (
+                    record["account_ref"] != account_ref
+                    or record["redirect_uri"] != redirect_uri
+                    or record["inventory_generation"] != expected_generation
+                    or self._now() >= cast(float, record["expires_at"])
+                    or not secrets.compare_digest(
+                        cast(str, record["state_digest"]),
+                        self._digest("google.oauth-state", state),
+                    )
+                )
+                nonce_bytes = self._inventory_pending_nonces.pop(transaction_id, None)
+                if mismatch or nonce_bytes is None:
+                    record.update(
+                        {
+                            "pkce_verifier": None,
+                            "state_token": None,
+                            "state": "expired" if mismatch else "failed",
+                            "terminal_at": self._now(),
+                        }
+                    )
+                    self._write_inventory_authorization_locked(inventory)
+                    raise GoogleOAuthSessionError(
+                        "oauth.inventory_reauthorization_required"
+                    )
+                client_record, client, client_digest = self._inventory_active_client(
+                    control,
+                    account_ref=account_ref,
+                    oauth_client_ref=cast(str, record["oauth_client_ref"]),
+                    expected_generation=expected_generation,
+                )
+                if (
+                    client_digest != record["client_digest"]
+                    or client_record["vault_generation"]
+                    != record["client_vault_generation"]
+                ):
+                    raise GoogleOAuthSessionError("oauth.client_expired")
+                pkce_verifier = cast(str, record["pkce_verifier"])
+                record.update(
+                    {
+                        "pkce_verifier": None,
+                        "state_token": None,
+                        "state": "exchanging",
+                        "authorization_code_digest": self._digest(
+                            "google.oauth-code", code
+                        ),
+                    }
+                )
+                self._write_inventory_authorization_locked(inventory)
+            try:
+                result = self._inventory_code_exchange.exchange_inventory_readonly(
+                    client,
+                    code=code,
+                    redirect_uri=redirect_uri,
+                    pkce_verifier=pkce_verifier,
+                )
+            except GoogleOAuthSessionError:
+                raise
+            except Exception:
+                raise GoogleOAuthSessionError("oauth.exchange_failed") from None
+            if type(result) is not _InventoryReadonlyCodeExchangeV1:
+                raise GoogleOAuthSessionError("oauth.exchange_failed")
+            login_email = self._inventory_account_login(
+                account_ref, expected_generation
+            )
+            try:
+                verified = verifier_port.verify_inventory_readonly_id_token(
+                    result.id_token,
+                    expected_nonce=nonce_bytes,
+                    client_id=cast(str, client["client_id"]),
+                    login_email=login_email,
+                    now=self._now(),
+                )
+            except GoogleOAuthSessionError:
+                raise
+            except Exception:
+                raise GoogleOAuthSessionError("oauth.id_token_invalid") from None
+            if type(verified) is not _InventoryReadonlyVerifiedIdTokenV1:
+                raise GoogleOAuthSessionError("oauth.id_token_invalid")
+            nonce_text = ""
+            try:
+                nonce_text = verified.nonce.decode("ascii")
+            except UnicodeError:
+                raise GoogleOAuthSessionError("oauth.id_token_invalid") from None
+            if _URLSAFE.fullmatch(nonce_text) is None or not secrets.compare_digest(
+                cast(str, record["nonce_digest"]),
+                self._digest("google.oidc-nonce", nonce_text),
+            ):
+                raise GoogleOAuthSessionError("oauth.id_token_invalid")
+            expected_subject = self._account_subject(account_ref, expected_generation)
+            if expected_subject is not None and not secrets.compare_digest(
+                expected_subject, verified.subject_id
+            ):
+                raise GoogleOAuthSessionError("oauth.subject_mismatch")
+            with self._state.locked():
+                inventory = self._read_inventory_authorization_locked()
+                record = self._find(
+                    cast(list[object], inventory["transactions"]), "id", transaction_id
+                )
+                if record is None or record["state"] != "exchanging":
+                    raise GoogleOAuthSessionError(
+                        "oauth.inventory_reauthorization_required"
+                    )
+                record.update(
+                    {
+                        "state": "verified",
+                        "effect_subject_digest": self._digest(
+                            "google.oauth-subject", verified.subject_id
+                        ),
+                    }
+                )
+                self._write_inventory_authorization_locked(inventory)
+            refresh_token = result.refresh_token
+            result.refresh_token = bytearray()
+            return _InventoryReadonlyAuthorizationEffectV1(
+                account_ref=account_ref,
+                subject_id=verified.subject_id,
+                inventory_generation=expected_generation,
+                oauth_client_fingerprint=cast(str, record["client_digest"]),
+                scope_fingerprint=cast(str, record["scope_fingerprint"]),
+                refresh_token=refresh_token,
+            )
+        except BaseException:
+            if refresh_token is not None:
+                _zero_bytes(refresh_token)
+            refresh_token = None
+            raise
+        finally:
+            _zero_bytes(nonce_bytes)
+            nonce_bytes = None
+            if verified is not None:
+                verified.clear()
+            if result is not None:
+                result.clear()
+            client.clear()
+            code = ""
+            state = ""
 
     def complete_oauth_transaction(
         self,

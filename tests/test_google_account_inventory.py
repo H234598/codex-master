@@ -29,20 +29,26 @@ def test_public_loader_uses_only_canonical_inventory_path() -> None:
 
 
 def test_frozen_index_iteration_returns_stable_keys() -> None:
-    index = inventory._FrozenIndex({"account-one": 1, "account-two": 2})
-    assert tuple(iter(index)) == ("account-one", "account-two")
+    index = inventory._FrozenIndex(
+        {"synthetic-account-one": 1, "synthetic-account-two": 2}
+    )
+    assert tuple(iter(index)) == ("synthetic-account-one", "synthetic-account-two")
 
 
 def test_frozen_index_length_matches_copied_mapping() -> None:
-    source = {"account-one": 1}
+    source = {"synthetic-account-one": 1}
     index = inventory._FrozenIndex(source)
-    source["account-two"] = 2
+    source["synthetic-account-two"] = 2
     assert len(index) == 1
 
 
 def test_private_secret_source_rejects_serializing() -> None:
-    source = inventory._GoogleAccountInventorySecretSource({"project-one": "synthetic-secret"})
-    with pytest.raises(TypeError, match="private inventory secret source is not serializable"):
+    source = inventory._GoogleAccountInventorySecretSource(
+        {"synthetic-project-one": "synthetic-secret"}
+    )
+    with pytest.raises(
+        TypeError, match="private inventory secret source is not serializable"
+    ):
         pickle.dumps(source)
 
 
@@ -57,17 +63,18 @@ def _write_private_inventory(root: Path, content: str) -> Path:
 
 def _inventory_document(*, secret: object = _SYNTHETIC_SECRET) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 3,
+        "authority_generation": 1,
         "google_accounts": [
             {
-                "ref": "google-account-01",
+                "ref": "synthetic-account-01",
                 "login_email": "account@example.test",
                 "recovery_email": None,
                 "label": "Test account",
                 "subject_id": "000123",
                 "billing_accounts": [
                     {
-                        "ref": "billing-01",
+                        "ref": "synthetic-billing-01",
                         "billing_account_id": "000456",
                         "label": "Trial",
                     }
@@ -75,13 +82,16 @@ def _inventory_document(*, secret: object = _SYNTHETIC_SECRET) -> dict[str, obje
                 "projects": [
                     {
                         "ref": "the-hive-1",
-                        "billing_account_ref": "billing-01",
+                        "billing_account_ref": "synthetic-billing-01",
                         "status": "active",
                         "project_id": "000789",
                         "project_number": "000987",
                         "key_id": "000654",
                         "key_uid": "000321",
                         "secret": secret,
+                        "purpose": "hive",
+                        "project_name": "Synthetic Project",
+                        "key_name": "Synthetic Project Key",
                     }
                 ],
             }
@@ -185,35 +195,39 @@ def test_load_builds_private_immutable_document_and_indices(tmp_path: Path) -> N
     path = _write_private_inventory(
         tmp_path / "inventory",
         f"""\
-schema_version: 1
+schema_version: 3
+authority_generation: 1
 google_accounts:
-  - ref: google-account-01
+  - ref: synthetic-account-01
     login_email: account@example.test
     recovery_email: null
     label: Test account
     subject_id: "000123"
     billing_accounts:
-      - ref: billing-01
+      - ref: synthetic-billing-01
         billing_account_id: "000456"
         label: Trial
     projects:
       - ref: the-hive-1
-        billing_account_ref: billing-01
+        billing_account_ref: synthetic-billing-01
         status: active
         project_id: "000789"
         project_number: "000987"
         key_id: "000654"
         key_uid: "000321"
+        purpose: hive
+        project_name: Synthetic Project
+        key_name: Synthetic Project Key
         secret: {_SYNTHETIC_SECRET}
 """,
     )
 
     document = _load_test_document(path)
 
-    assert document.schema_version == 1
-    assert [account.ref for account in document.accounts] == ["google-account-01"]
-    assert document.by_subject_id["000123"].ref == "google-account-01"
-    assert document.by_billing_account_id["000456"].ref == "billing-01"
+    assert document.schema_version == 3
+    assert [account.ref for account in document.accounts] == ["synthetic-account-01"]
+    assert document.by_subject_id["000123"].ref == "synthetic-account-01"
+    assert document.by_billing_account_id["000456"].ref == "synthetic-billing-01"
     assert document.by_project_id["000789"].project_number == "000987"
     assert document.by_key_id["000654"].key_uid == "000321"
     assert document.by_hive_slot[1].ref == "the-hive-1"
@@ -368,8 +382,8 @@ def test_schema_enforces_four_billing_accounts_without_ten_project_ceiling(
     for number in range(2, 5):
         billing_accounts.append(  # type: ignore[union-attr]
             {
-                "ref": f"billing-{number:02d}",
-                "billing_account_id": f"billing-id-{number}",
+                "ref": f"synthetic-billing-{number:02d}",
+                "billing_account_id": f"synthetic-billing-synthetic-id-{number}",
                 "label": None,
             }
         )
@@ -379,11 +393,14 @@ def test_schema_enforces_four_billing_accounts_without_ten_project_ceiling(
                 "ref": f"the-hive-{number}",
                 "billing_account_ref": None,
                 "status": "blocked",
-                "project_id": f"project-{number}",
+                "project_id": f"synthetic-project-{number}",
                 "project_number": f"number-{number}",
-                "key_id": f"key-{number}",
-                "key_uid": f"key-uid-{number}",
+                "key_id": f"synthetic-key-{number}",
+                "key_uid": f"synthetic-key-identifier-{number}",
                 "secret": None,
+                "purpose": "hive",
+                "project_name": "Synthetic Project",
+                "key_name": "Synthetic Project Key",
             }
         )
 
@@ -395,7 +412,11 @@ def test_schema_enforces_four_billing_accounts_without_ten_project_ceiling(
 
     over_billing = copy.deepcopy(within_limit)
     over_billing["google_accounts"][0]["billing_accounts"].append(  # type: ignore[index]
-        {"ref": "billing-05", "billing_account_id": "billing-id-5", "label": None}
+        {
+            "ref": "synthetic-billing-05",
+            "billing_account_id": "synthetic-billing-synthetic-id-5",
+            "label": None,
+        }
     )
     assert (
         _assert_inventory_error(
@@ -410,11 +431,14 @@ def test_schema_enforces_four_billing_accounts_without_ten_project_ceiling(
             "ref": "the-hive-11",
             "billing_account_ref": None,
             "status": "blocked",
-            "project_id": "project-11",
+            "project_id": "synthetic-project-11",
             "project_number": "number-11",
-            "key_id": "key-11",
-            "key_uid": "key-uid-11",
+            "key_id": "synthetic-key-11",
+            "key_uid": "synthetic-key-identifier-11",
             "secret": None,
+            "purpose": "hive",
+            "project_name": "Synthetic Project",
+            "key_name": "Synthetic Project Key",
         }
     )
     document = _load_test_document(
@@ -441,23 +465,25 @@ def test_duplicate_global_identity_has_specific_code(
 ) -> None:
     document = _inventory_document()
     duplicated = _inventory_document()
-    duplicated["google_accounts"][0]["ref"] = "google-account-02"  # type: ignore[index]
+    duplicated["google_accounts"][0]["ref"] = "synthetic-account-02"  # type: ignore[index]
     duplicated["google_accounts"][0]["login_email"] = "second@example.test"  # type: ignore[index]
     duplicated["google_accounts"][0]["subject_id"] = "000124"  # type: ignore[index]
-    duplicated["google_accounts"][0]["billing_accounts"][0]["ref"] = "billing-02"  # type: ignore[index]
+    duplicated["google_accounts"][0]["billing_accounts"][0]["ref"] = (
+        "synthetic-billing-02"  # type: ignore[index]
+    )
     duplicated["google_accounts"][0]["billing_accounts"][0]["billing_account_id"] = (
         "000457"  # type: ignore[index]
     )
     duplicated["google_accounts"][0]["projects"][0]["ref"] = "the-hive-2"  # type: ignore[index]
     duplicated["google_accounts"][0]["projects"][0]["billing_account_ref"] = (
-        "billing-02"  # type: ignore[index]
+        "synthetic-billing-02"  # type: ignore[index]
     )
     duplicated["google_accounts"][0]["projects"][0]["project_id"] = "000790"  # type: ignore[index]
     duplicated["google_accounts"][0]["projects"][0]["project_number"] = "000988"  # type: ignore[index]
     duplicated["google_accounts"][0]["projects"][0]["key_id"] = "000655"  # type: ignore[index]
     duplicated["google_accounts"][0]["projects"][0]["key_uid"] = "000322"  # type: ignore[index]
     if field == "ref":
-        duplicated["google_accounts"][0]["ref"] = "google-account-01"  # type: ignore[index]
+        duplicated["google_accounts"][0]["ref"] = "synthetic-account-01"  # type: ignore[index]
     elif field == "login_email":
         duplicated["google_accounts"][0]["login_email"] = "account@example.test"  # type: ignore[index]
     elif field == "subject_id":
@@ -490,7 +516,7 @@ def test_duplicate_hive_slot_is_rejected_even_when_ref_spelling_differs(
     other["project_id"] = "other-project"
     other["project_number"] = "other-number"
     other["key_id"] = "other-key"
-    other["key_uid"] = "other-key-uid"
+    other["key_uid"] = "synthetic-key-identifier"
     document["google_accounts"][0]["projects"].append(other)  # type: ignore[index]
 
     error = _assert_inventory_error(_write_document(tmp_path / "inventory", document))
@@ -551,7 +577,7 @@ def test_owner_readonly_direct_parent_matches_production_0755(tmp_path: Path) ->
     path = _write_document(tmp_path / "inventory", _inventory_document())
     path.parent.chmod(0o755)
 
-    assert _load_test_document(path).schema_version == 1
+    assert _load_test_document(path).schema_version == 3
 
     path.parent.chmod(0o775)
     assert _assert_inventory_error(path).code == "credential.inventory_permissions"
@@ -564,14 +590,16 @@ def test_rejects_oversize_invalid_utf8_and_nul_before_yaml_load(
     monkeypatch.setattr(inventory, "MAX_INVENTORY_BYTES", 8)
     assert _assert_inventory_error(oversize).code == "credential.inventory_unavailable"
 
-    invalid_utf8 = _write_private_inventory(tmp_path / "invalid-utf8", "placeholder")
+    invalid_utf8 = _write_private_inventory(
+        tmp_path / "synthetic-malformed-utf8", "placeholder"
+    )
     invalid_utf8.write_bytes(b"\xff")
     assert (
         _assert_inventory_error(invalid_utf8).code == "credential.inventory_unavailable"
     )
 
     nul = _write_private_inventory(tmp_path / "nul", "placeholder")
-    nul.write_bytes(b"schema_version: 1\x00")
+    nul.write_bytes(b"schema_version: 3\x00")
     assert _assert_inventory_error(nul).code == "credential.inventory_unavailable"
 
 
@@ -605,7 +633,7 @@ def test_redacted_fingerprint_and_order_ignore_yaml_order_and_secret_value(
     first["google_accounts"].append(  # type: ignore[index]
         {
             **first["google_accounts"][0],  # type: ignore[index]
-            "ref": "google-account-02",
+            "ref": "synthetic-account-02",
             "login_email": "second@example.test",
             "subject_id": "000124",
             "billing_accounts": [],
@@ -620,8 +648,8 @@ def test_redacted_fingerprint_and_order_ignore_yaml_order_and_secret_value(
     second_document = _load_test_document(_write_document(tmp_path / "second", second))
 
     assert [account.ref for account in second_document.accounts] == [
-        "google-account-01",
-        "google-account-02",
+        "synthetic-account-01",
+        "synthetic-account-02",
     ]
     assert second_document.content_fingerprint == first_document.content_fingerprint
     assert "synthetic-first-secret" not in repr(second_document)
@@ -644,7 +672,7 @@ def test_private_test_factory_never_uses_environment_network_or_provider(
 
     document = _load_test_document(path)
 
-    assert document.accounts[0].ref == "google-account-01"
+    assert document.accounts[0].ref == "synthetic-account-01"
     assert calls == 0
 
 
@@ -682,22 +710,26 @@ def test_document_is_not_runtime_snapshot_and_omits_secret_from_value_protocols(
 
 def test_private_document_secret_source_is_bound_and_one_shot(tmp_path: Path) -> None:
     first_document = _load_test_document(
-        _write_document(tmp_path / "first", _inventory_document(secret="secret-one"))
+        _write_document(
+            tmp_path / "first", _inventory_document(secret="synthetic-secret-one")
+        )
     )
     second_document = _load_test_document(
-        _write_document(tmp_path / "second", _inventory_document(secret="secret-two"))
+        _write_document(
+            tmp_path / "second", _inventory_document(secret="synthetic-secret-two")
+        )
     )
 
     first_source = inventory._consume_document_secret_source(first_document)
     second_source = inventory._consume_document_secret_source(second_document)
 
-    assert first_source._secret_for_project("the-hive-1") == "secret-one"
-    assert second_source._secret_for_project("the-hive-1") == "secret-two"
+    assert first_source._secret_for_project("the-hive-1") == "synthetic-secret-one"
+    assert second_source._secret_for_project("the-hive-1") == "synthetic-secret-two"
     with pytest.raises(GoogleAccountInventoryError) as raised:
         inventory._consume_document_secret_source(first_document)
     assert raised.value.code == "credential.inventory_secret_source_unavailable"
-    assert "secret-one" not in repr(first_source)
-    assert "secret-two" not in repr(second_source)
+    assert "synthetic-secret-one" not in repr(first_source)
+    assert "synthetic-secret-two" not in repr(second_source)
     assert not hasattr(first_document, "secret_source")
 
 
@@ -706,18 +738,19 @@ def test_public_projection_is_small_redacted_aggregate(tmp_path: Path) -> None:
     account = document["google_accounts"][0]  # type: ignore[index]
     account["login_email"] = "login-marker@example.test"  # type: ignore[index]
     account["recovery_email"] = "recovery-marker@example.test"  # type: ignore[index]
-    account["subject_id"] = "subject-marker"  # type: ignore[index]
-    account["billing_accounts"][0]["billing_account_id"] = "billing-marker"  # type: ignore[index]
+    account["subject_id"] = "synthetic-subject-marker"  # type: ignore[index]
+    account["billing_accounts"][0]["billing_account_id"] = "synthetic-billing-marker"  # type: ignore[index]
     project = account["projects"][0]  # type: ignore[index]
-    project["project_id"] = "project-marker"
-    project["key_id"] = "key-marker"
+    project["project_id"] = "synthetic-project-marker"
+    project["key_id"] = "synthetic-key-marker"
 
     projection = _load_test_document(
         _write_document(tmp_path / "inventory", document)
     ).public_projection()
 
     assert projection == {
-        "schema_version": 1,
+        "schema_version": 3,
+        "authority_generation": 1,
         "account_count": 1,
         "billing_account_count": 1,
         "project_count": 1,
@@ -727,10 +760,10 @@ def test_public_projection_is_small_redacted_aggregate(tmp_path: Path) -> None:
     for marker in (
         "login-marker",
         "recovery-marker",
-        "subject-marker",
-        "billing-marker",
-        "project-marker",
-        "key-marker",
+        "synthetic-subject-marker",
+        "synthetic-billing-marker",
+        "synthetic-project-marker",
+        "synthetic-key-marker",
         "projection-synthetic-secret",
         str(tmp_path),
     ):
@@ -740,9 +773,9 @@ def test_public_projection_is_small_redacted_aggregate(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "content",
     [
-        "schema_version: 1\\nschema_version: 1\\ngoogle_accounts: []\\n",
-        "schema_version: 1\\ngoogle_accounts: &accounts []\\n",
-        "schema_version: 1\\ngoogle_accounts: &accounts []\\ngoogle_accounts: *accounts\\n",
+        "schema_version: 3\\nschema_version: 3\\ngoogle_accounts: []\\n",
+        "schema_version: 3\\ngoogle_accounts: &accounts []\\n",
+        "schema_version: 3\\ngoogle_accounts: &accounts []\\ngoogle_accounts: *accounts\\n",
     ],
 )
 def test_yaml_boundary_rejects_duplicate_anchor_and_alias(
@@ -757,9 +790,10 @@ def test_yaml_boundary_rejects_duplicate_anchor_and_alias(
 
 def test_yaml_boundary_rejects_merge_keys(tmp_path: Path) -> None:
     content = """\\
-schema_version: 1
+schema_version: 3
+authority_generation: 1
 google_accounts:
-  - ref: google-account-01
+  - ref: synthetic-account-01
     login_email: account@example.test
     billing_accounts: []
     projects:
@@ -767,17 +801,20 @@ google_accounts:
         ref: the-hive-1
         billing_account_ref: null
         status: blocked
-        project_id: project-1
+        project_id: synthetic-project-1
         project_number: number-1
-        key_id: key-1
-        key_uid: key-uid-1
+        key_id: synthetic-key-1
+        key_uid: synthetic-key-identifier-1
+        purpose: hive
+        project_name: Synthetic Project
+        key_name: Synthetic Project Key
         secret: null
       - <<: *project
         ref: the-hive-2
-        project_id: project-2
+        project_id: synthetic-project-2
         project_number: number-2
-        key_id: key-2
-        key_uid: key-uid-2
+        key_id: synthetic-key-2
+        key_uid: synthetic-key-identifier-2
 """
 
     error = _assert_inventory_error(
@@ -793,7 +830,7 @@ def test_yaml_boundary_rejects_merge_key_without_anchor_or_alias(
     error = _assert_inventory_error(
         _write_private_inventory(
             tmp_path / "inventory",
-            "schema_version: 1\\ngoogle_accounts: []\\n<<: {}\\n",
+            "schema_version: 3\\ngoogle_accounts: []\\n<<: {}\\n",
         )
     )
 
@@ -804,16 +841,16 @@ def test_yaml_boundary_rejects_excessive_depth_nodes_and_scalar_size(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixtures = (
-        ("MAX_YAML_DEPTH", 4, "schema_version: 1\\ngoogle_accounts: [[[[[]]]]]\\n"),
+        ("MAX_YAML_DEPTH", 4, "schema_version: 3\\ngoogle_accounts: [[[[[]]]]]\\n"),
         (
             "MAX_YAML_NODES",
             12,
-            "schema_version: 1\\ngoogle_accounts: [[], [], [], [], [], [], []]\\n",
+            "schema_version: 3\\ngoogle_accounts: [[], [], [], [], [], [], []]\\n",
         ),
         (
             "MAX_YAML_SCALAR_BYTES",
             16,
-            "schema_version: 1\\ngoogle_accounts: []\\nlabel: 12345678901234567\\n",
+            "schema_version: 3\\ngoogle_accounts: []\\nlabel: 12345678901234567\\n",
         ),
     )
 
@@ -821,7 +858,9 @@ def test_yaml_boundary_rejects_excessive_depth_nodes_and_scalar_size(
         with monkeypatch.context() as patch:
             patch.setattr(inventory, bound, value)
             error = _assert_inventory_error(
-                _write_private_inventory(tmp_path / f"inventory-{position}", content)
+                _write_private_inventory(
+                    tmp_path / f"synthetic-inventory-{position}", content
+                )
             )
         assert error.code == "credential.inventory_schema_invalid"
 
@@ -906,9 +945,10 @@ def test_account_integer_label_is_rejected_without_integer_construction(
     path = _write_private_inventory(
         tmp_path / "inventory",
         """\
-schema_version: 1
+schema_version: 3
+authority_generation: 1
 google_accounts:
-  - ref: google-account-01
+  - ref: synthetic-account-01
     login_email: account@example.test
     label: !!int 1
     billing_accounts: []
@@ -931,7 +971,7 @@ def test_integer_mapping_key_is_rejected_without_integer_construction(
 ) -> None:
     path = _write_private_inventory(
         tmp_path / "inventory",
-        "schema_version: 1\ngoogle_accounts: []\n1: value\n",
+        "schema_version: 3\ngoogle_accounts: []\n1: value\n",
     )
 
     completed = _run_with_large_integer_constructor_guard(
@@ -950,19 +990,23 @@ def test_nested_canonical_integer_tag_is_rejected_without_integer_construction(
     path = _write_private_inventory(
         tmp_path / "inventory",
         """\
-schema_version: 1
+schema_version: 3
+authority_generation: 1
 google_accounts:
-  - ref: google-account-01
+  - ref: synthetic-account-01
     login_email: account@example.test
     billing_accounts: []
     projects:
       - ref: the-hive-1
         billing_account_ref: null
         status: blocked
-        project_id: project-1
-        project_number: project-number-1
+        project_id: synthetic-project-1
+        project_number: synthetic-project-number-1
         key_id: !<tag:yaml.org,2002:int> 1
-        key_uid: key-uid-1
+        key_uid: synthetic-key-identifier-1
+        purpose: hive
+        project_name: Synthetic Project
+        key_name: Synthetic Project Key
         secret: null
 """,
     )
@@ -979,27 +1023,28 @@ google_accounts:
 
 @pytest.mark.parametrize(
     "schema_version",
-    ["schema_version: 1", "schema_version: !!int 1"],
+    ["schema_version: 3", "schema_version: !!int 3"],
 )
 def test_only_top_level_canonical_schema_version_integer_is_valid(
     tmp_path: Path, schema_version: str
 ) -> None:
     document = _load_test_document(
         _write_private_inventory(
-            tmp_path / "inventory", schema_version + "\ngoogle_accounts: []\n"
+            tmp_path / "inventory",
+            schema_version + "\nauthority_generation: 1\ngoogle_accounts: []\n",
         )
     )
 
-    assert document.schema_version == 1
+    assert document.schema_version == 3
 
 
 def test_login_identity_uses_casefold_but_keeps_raw_spelling(tmp_path: Path) -> None:
     document = _inventory_document()
     duplicate = _inventory_document()
     account = duplicate["google_accounts"][0]  # type: ignore[index]
-    account["ref"] = "google-account-02"
+    account["ref"] = "synthetic-account-02"
     account["login_email"] = "ACCOUNT@example.test"
-    account["subject_id"] = "subject-two"
+    account["subject_id"] = "synthetic-subject-two"
     account["billing_accounts"] = []
     account["projects"] = []
     document["google_accounts"].append(account)  # type: ignore[index]

@@ -49,7 +49,7 @@ class _SecretLeaseStateV1(str, Enum):
 DEFAULT_SECRET_LEASE_TTL_SECONDS = 30.0
 MAX_SECRET_LEASE_TTL_SECONDS = 60.0
 MAX_OUTSTANDING_SECRET_LEASES = 128
-MAX_INVENTORY_GENERATION = 2**63 - 1
+MAX_INVENTORY_GENERATION = _inventory.MAX_AUTHORITY_GENERATION
 
 
 class _SecretLeaseV1:
@@ -406,6 +406,22 @@ def _build_snapshot(
 
 
 class GoogleAccountInventoryManager:
+    @classmethod
+    def _from_authority_bytes(cls, raw: bytes) -> GoogleAccountInventoryManager:
+        """Private transaction handoff; never performs a second source read."""
+
+        manager = cls.__new__(cls)
+        manager._initialize(
+            lambda: _inventory._document_from_bytes(raw),
+            monotonic_clock=time.monotonic,
+            operator_timestamp_utc=lambda: time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            ),
+            source_type=InventorySourceTypeV1.CANONICAL_YAML,
+        )
+        manager.reload()
+        return manager
+
     def __init__(self) -> None:
         self._initialize(
             GoogleAccountInventoryLoader().load,
@@ -487,6 +503,12 @@ class GoogleAccountInventoryManager:
         source: object | None = None
         try:
             document = self._document_loader()
+            if (
+                document.schema_version != 3
+                or not _valid_generation(document.authority_generation)
+                or document.authority_generation < self._generation
+            ):
+                raise GoogleAccountInventoryError("credential.inventory_reload_failed")
             _claim_document_ownership(document, self._owner_token)
             source = _inventory._consume_document_secret_source(document)
             loaded_at_utc = self._operator_timestamp_utc()
@@ -496,7 +518,7 @@ class GoogleAccountInventoryManager:
                 )
             snapshot = _build_snapshot(
                 document,
-                generation=self._generation + 1,
+                generation=document.authority_generation,
                 loaded_at_utc=loaded_at_utc,
                 source_type=self._source_type,
             )
@@ -544,13 +566,6 @@ class GoogleAccountInventoryManager:
                 or expected_generation != self._generation
             ):
                 raise GoogleAccountInventoryError("credential.generation_conflict")
-            if self._generation >= MAX_INVENTORY_GENERATION:
-                self._block_after_reload_failure(
-                    "credential.inventory_generation_exhausted"
-                )
-                raise GoogleAccountInventoryError(
-                    "credential.inventory_generation_exhausted"
-                )
             result = self._prepare_and_publish_reload_locked()
             if isinstance(result, _ReloadFailureV1):
                 code = result.code

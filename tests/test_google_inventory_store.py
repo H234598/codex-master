@@ -15,7 +15,7 @@ from the_hive.google_inventory_store import (
 )
 
 
-SECRET = "AIza-private-project-secret"
+SECRET = "synthetic-secret-placeholder"
 
 
 def test_public_store_uses_only_canonical_inventory_path() -> None:
@@ -23,12 +23,13 @@ def test_public_store_uses_only_canonical_inventory_path() -> None:
     assert store._path == google_account_inventory.DEFAULT_GOOGLE_ACCOUNT_INVENTORY_PATH
 
 
-def _legacy_document() -> dict[str, object]:
+def _canonical_document() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 3,
+        "authority_generation": 1,
         "google_accounts": [
             {
-                "ref": "google-account-01",
+                "ref": "synthetic-account-01",
                 "login_email": "account@example.test",
                 "recovery_email": None,
                 "subject_id": "123456",
@@ -43,6 +44,9 @@ def _legacy_document() -> dict[str, object]:
                         "key_id": None,
                         "key_uid": None,
                         "secret": SECRET,
+                        "project_name": None,
+                        "purpose": "hive",
+                        "key_name": None,
                     }
                 ],
             }
@@ -55,7 +59,7 @@ def _store(tmp_path: Path) -> tuple[GoogleInventoryStore, Path]:
     private.mkdir(mode=0o700)
     path = private / "api-token.yaml"
     path.write_text(
-        yaml.safe_dump(_legacy_document(), sort_keys=False), encoding="utf-8"
+        yaml.safe_dump(_canonical_document(), sort_keys=False), encoding="utf-8"
     )
     path.chmod(0o600)
     return GoogleInventoryStore._for_test_path(path), path
@@ -84,19 +88,21 @@ def _observed_update(path: str, started, entered) -> None:
     store.atomic_update(update)
 
 
-def test_migrate_v2_preserves_secret_and_adds_project_fields(tmp_path: Path) -> None:
+def test_canonical_update_preserves_secret_and_project_fields(tmp_path: Path) -> None:
     store, path = _store(tmp_path)
 
-    receipt = store.migrate_to_v2()
+    receipt = store.atomic_update(lambda document: None)
 
     private = yaml.safe_load(path.read_text(encoding="utf-8"))
     project = private["google_accounts"][0]["projects"][0]
-    assert private["schema_version"] == 2
+    assert private["schema_version"] == 3
+    assert private["authority_generation"] == 2
     assert project["project_name"] is None
     assert project["purpose"] == "hive"
     assert project["key_name"] is None
     assert project["secret"] == SECRET
-    assert receipt.schema_version == 2
+    assert receipt.schema_version == 3
+    assert receipt.authority_generation == 2
     assert SECRET not in repr(receipt)
     GoogleAccountInventoryLoader._for_test_path(path).load()
 
@@ -105,7 +111,7 @@ def test_atomic_update_writes_0600_backup_and_replacement(tmp_path: Path) -> Non
     store, path = _store(tmp_path)
     original = path.read_bytes()
 
-    store.migrate_to_v2()
+    store.atomic_update(lambda document: None)
 
     backups = list(path.parent.glob("api-token.yaml.backup-*"))
     assert len(backups) == 1
@@ -176,14 +182,14 @@ def test_store_rejects_nonprivate_file_mode(tmp_path: Path, mode: int) -> None:
     path.chmod(mode)
 
     with pytest.raises(GoogleInventoryStoreError, match="inventory.store_permissions"):
-        store.migrate_to_v2()
+        store.atomic_update(lambda document: None)
 
 
 def test_store_rejects_symlink_without_touching_target(tmp_path: Path) -> None:
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
     target = private / "target.yaml"
-    target.write_text(yaml.safe_dump(_legacy_document()), encoding="utf-8")
+    target.write_text(yaml.safe_dump(_canonical_document()), encoding="utf-8")
     target.chmod(0o600)
     link = private / "api-token.yaml"
     link.symlink_to(target.name)
@@ -191,7 +197,7 @@ def test_store_rejects_symlink_without_touching_target(tmp_path: Path) -> None:
     original = target.read_bytes()
 
     with pytest.raises(GoogleInventoryStoreError, match="inventory.store_permissions"):
-        store.migrate_to_v2()
+        store.atomic_update(lambda document: None)
 
     assert target.read_bytes() == original
 
@@ -201,7 +207,7 @@ def test_redacted_summary_contains_counts_not_credentials(tmp_path: Path) -> Non
 
     summary = store.redacted_summary()
 
-    assert summary == {"schema_version": 1, "account_count": 1, "project_count": 1}
+    assert summary == {"schema_version": 3, "account_count": 1, "project_count": 1}
     assert SECRET not in repr(summary)
 
 

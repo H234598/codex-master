@@ -31,12 +31,14 @@ EXPECTED_SCOPES = (
     "openid",
 )
 EXPECTED_OPERATIONS = (
+    "billingAccounts.list",
     "keys.get",
     "keys.list",
     "keys.lookupKey",
     "projects.get",
     "projects.getBillingInfo",
     "projects.search",
+    "services.list",
 )
 EXPECTED_SCOPE_FINGERPRINT = (
     "sha256:9b2a7ff6966db417c590bbaae896036309e4391f414c7c93cf727873ed7d7e7f"
@@ -129,7 +131,7 @@ def _assert_failure_graph_is_redacted(error: Exception, marker: str) -> None:
 def test_i1_invalid_type_inputs_leave_no_marker_in_production_traceback(
     argument: str,
 ) -> None:
-    marker = f"i1-invalid-{argument}-access-token"
+    marker = f"i1-invalsynthetic-id-{argument}-synthetic-access-token"
     if argument == "profile_id":
         error = _capture_failure(
             lambda: resolve_google_oauth_profile_v1(
@@ -149,7 +151,7 @@ def test_i1_invalid_type_inputs_leave_no_marker_in_production_traceback(
 
 
 def test_i1_unknown_profile_leaves_no_marker_in_production_traceback() -> None:
-    marker = "i1-unknown-profile-refresh-token"
+    marker = "i1-unknown-profile-synthetic-refresh-token"
     error = _capture_failure(
         lambda: resolve_google_oauth_profile_v1(
             marker, GoogleOAuthOperationV1.PROJECTS_SEARCH
@@ -162,7 +164,7 @@ def test_i1_unknown_profile_leaves_no_marker_in_production_traceback() -> None:
 
 
 def test_i1_forbidden_operation_leaves_no_marker_in_production_traceback() -> None:
-    marker = "i1-forbidden-operation-client-secret"
+    marker = "i1-forbidden-operation-synthetic-client-secret"
     error = _capture_failure(
         lambda: resolve_google_oauth_profile_v1(READONLY_PROFILE, marker)
     )
@@ -173,7 +175,7 @@ def test_i1_forbidden_operation_leaves_no_marker_in_production_traceback() -> No
 
 
 def test_i1_direct_invalid_error_code_leaves_no_marker_in_traceback() -> None:
-    marker = "i1-invalid-error-code-refresh-token"
+    marker = "i1-invalsynthetic-id-error-code-synthetic-refresh-token"
     error = _capture_failure(lambda: GoogleOAuthAuthorizationError(marker))
 
     assert type(error) is TypeError
@@ -194,6 +196,8 @@ def test_inventory_readonly_policy_exposes_exact_scopes_and_operations() -> None
         "keys.get",
         "keys.list",
         "projects.getBillingInfo",
+        "billingAccounts.list",
+        "services.list",
         "projects.create",
         "projects.patch",
         "services.enable",
@@ -222,6 +226,8 @@ def test_inventory_readonly_policy_exposes_exact_scopes_and_operations() -> None
         GoogleOAuthOperationV1.KEYS_GET,
         GoogleOAuthOperationV1.KEYS_LIST,
         GoogleOAuthOperationV1.PROJECTS_GET_BILLING_INFO,
+        GoogleOAuthOperationV1.BILLING_ACCOUNTS_LIST,
+        GoogleOAuthOperationV1.SERVICES_LIST,
     ),
 )
 def test_each_inventory_read_operation_resolves(
@@ -336,7 +342,7 @@ def test_readonly_profile_still_rejects_provisioner_mutations() -> None:
 
 
 def test_unknown_profile_is_rejected_without_identifier_in_error() -> None:
-    marker = "account-project-billing-key-token-secret"
+    marker = "synthetic-account-synthetic-project-synthetic-billing-synthetic-key-synthetic-token-secret"
 
     with pytest.raises(
         GoogleOAuthAuthorizationError,
@@ -498,7 +504,10 @@ def test_build_inventory_readonly_profile_reconstructs_the_closed_read_policy() 
 
     assert profile.profile_id is GoogleOAuthProfileIdV1.INVENTORY_READONLY
     assert profile.minimal_scopes == EXPECTED_SCOPES
-    assert tuple(operation.value for operation in profile.allowed_operations) == EXPECTED_OPERATIONS
+    assert (
+        tuple(operation.value for operation in profile.allowed_operations)
+        == EXPECTED_OPERATIONS
+    )
 
 
 def test_build_provisioner_profile_has_the_mutation_policy_and_fingerprint() -> None:

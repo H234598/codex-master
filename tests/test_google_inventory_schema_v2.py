@@ -21,15 +21,15 @@ def _write(root: Path, document: object) -> Path:
 
 def _account(projects: list[dict[str, object]]) -> dict[str, object]:
     return {
-        "ref": "google-account-01",
+        "ref": "synthetic-account-01",
         "login_email": "account@example.test",
         "recovery_email": None,
         "label": None,
         "subject_id": "123456789",
         "auth": {
-            "access_token": "private-access-token",
-            "refresh_token": "private-refresh-token",
-            "cookies": [{"name": "SID", "value": "private-cookie"}],
+            "access_token": "synthetic-access-placeholder",
+            "refresh_token": "synthetic-refresh-placeholder",
+            "cookies": [{"name": "SID", "value": "synthetic-cookie-placeholder"}],
         },
         "billing_accounts": [],
         "projects": projects,
@@ -45,10 +45,10 @@ def _project(slot: int) -> dict[str, object]:
         "status": "active",
         "project_id": f"quiet-aurora-{slot:06d}",
         "project_number": str(100_000 + slot),
-        "key_id": f"key-{slot}",
-        "key_uid": f"uid-{slot}",
+        "key_id": f"synthetic-key-{slot}",
+        "key_uid": f"usynthetic-id-{slot}",
         "key_name": f"Quiet Aurora {chr(64 + slot)} Key",
-        "secret": f"secret-{slot}",
+        "secret": f"synthetic-secret-{slot}",
     }
 
 
@@ -56,23 +56,27 @@ def _load(path: Path):
     return GoogleAccountInventoryLoader._for_test_path(path).load()
 
 
-def test_v2_loads_more_than_ten_projects_and_keeps_auth_private(tmp_path: Path) -> None:
+def test_schema3_retains_v2_account_shape_and_private_auth(tmp_path: Path) -> None:
     path = _write(
         tmp_path / "private",
-        {"schema_version": 2, "google_accounts": [_account([_project(i) for i in range(1, 26)])]},
+        {
+            "schema_version": 3,
+            "authority_generation": 1,
+            "google_accounts": [_account([_project(i) for i in range(1, 26)])],
+        },
     )
 
     document = _load(path)
 
-    assert document.schema_version == 2
+    assert document.schema_version == 3
     assert len(document.accounts[0].projects) == 25
     project_25 = document.by_hive_slot[25]
     assert project_25.project_name == "Quiet Aurora Y"
     assert project_25.purpose == "hive"
     rendered = repr(document) + repr(document.public_projection())
-    assert "private-access-token" not in rendered
-    assert "private-refresh-token" not in rendered
-    assert "private-cookie" not in rendered
+    assert "synthetic-access-placeholder" not in rendered
+    assert "synthetic-refresh-placeholder" not in rendered
+    assert "synthetic-cookie-placeholder" not in rendered
 
 
 @pytest.mark.parametrize(
@@ -92,7 +96,11 @@ def test_v2_requires_valid_project_name_and_closed_purpose(
     change(project)
     path = _write(
         tmp_path / "private",
-        {"schema_version": 2, "google_accounts": [_account([project])]},
+        {
+            "schema_version": 3,
+            "authority_generation": 1,
+            "google_accounts": [_account([project])],
+        },
     )
 
     with pytest.raises(
@@ -116,7 +124,11 @@ def test_v2_requires_name_only_when_google_project_exists(tmp_path: Path) -> Non
     )
     path = _write(
         tmp_path / "private",
-        {"schema_version": 2, "google_accounts": [_account([blocked])]},
+        {
+            "schema_version": 3,
+            "authority_generation": 1,
+            "google_accounts": [_account([blocked])],
+        },
     )
 
     document = _load(path)
@@ -124,7 +136,7 @@ def test_v2_requires_name_only_when_google_project_exists(tmp_path: Path) -> Non
     assert document.accounts[0].projects[0].project_name is None
 
 
-def test_v1_remains_loadable_during_explicit_migration(tmp_path: Path) -> None:
+def test_v1_is_not_loadable_by_runtime_after_schema3_cutover(tmp_path: Path) -> None:
     legacy = _project(1)
     legacy.pop("project_name")
     legacy.pop("purpose")
@@ -135,11 +147,8 @@ def test_v1_remains_loadable_during_explicit_migration(tmp_path: Path) -> None:
         tmp_path / "private", {"schema_version": 1, "google_accounts": [account]}
     )
 
-    document = _load(path)
-
-    project = document.accounts[0].projects[0]
-    assert project.project_name is None
-    assert project.purpose == "hive"
+    with pytest.raises(GoogleAccountInventoryError, match="schema_invalid"):
+        _load(path)
 
 
 def test_active_oauth_control_project_requires_no_gemini_key(tmp_path: Path) -> None:
@@ -155,7 +164,11 @@ def test_active_oauth_control_project_requires_no_gemini_key(tmp_path: Path) -> 
     )
     path = _write(
         tmp_path / "private",
-        {"schema_version": 2, "google_accounts": [_account([control])]},
+        {
+            "schema_version": 3,
+            "authority_generation": 1,
+            "google_accounts": [_account([control])],
+        },
     )
 
     document = _load(path)
