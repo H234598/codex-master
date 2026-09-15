@@ -6,14 +6,19 @@
 `b5def7d6156d7862606a0edcbd7226652cf4833f`
 
 **Current-product comparison:** Current-Main snapshot
-`4eef3d90db78f72efb96d1888d15af8c024cd5a0`. Relative to the historical
+`e7b3286ab0752b3f110f1fa02d0f366aa6f710cb` (tree
+`184da8c6e517b6021079a6d2a9d8c55338c125e3`). Relative to the historical
 parity/consolidation base, commit `a65fe3972f7859e808ec6f09a39808fa240d4f49`
 source-integrates the local, fail-closed BUS-S1 Slice-A Store-Foundation
-(`HiveBusStore`) and its focused test. Current-Main additionally contains only
-the `DiagnosticV2` code registrations `BUS_E_CURSOR_CONFLICT`,
-`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`. This is source/test evidence only,
-not evidence of a running bus, broker, service, or deployment. For current
-product status, see [ROADMAP.md](../../ROADMAP.md).
+(`HiveBusStore`) and its focused test. The preceding
+`4eef3d90db78f72efb96d1888d15af8c024cd5a0` additionally contains only the
+`DiagnosticV2` code registrations `BUS_E_CURSOR_CONFLICT`,
+`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`; then
+`9e0ce708a803ce6f6b961ea678e367cc31e2888c` source-integrates
+Delivery-/Effectsicherheitslogik. Current-Main adds four additive
+Testmatrixnachweise in `tests/test_hive_bus_store.py`. This is source/test
+evidence only, not evidence of a running bus, broker, service, or deployment.
+For current product status, see [ROADMAP.md](../../ROADMAP.md).
 
 This is the preservation-and-disposition record for the active documentation
 that was shortened during the The-Hive documentation migration. It is separate

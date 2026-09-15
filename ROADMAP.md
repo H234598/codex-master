@@ -2,18 +2,22 @@
 
 Status is intentionally separated into source-integrated work, prepared work,
 blockers, and later work. It is based on repository snapshot
-`4eef3d90db78f72efb96d1888d15af8c024cd5a0`; it makes no live-runtime,
+`e7b3286ab0752b3f110f1fa02d0f366aa6f710cb` (tree
+`184da8c6e517b6021079a6d2a9d8c55338c125e3`); it makes no live-runtime,
 provider, approval, deployment, or CI-success claim. The historical
 documentation parity and consolidation basis is
 `b5def7d6156d7862606a0edcbd7226652cf4833f`.
 
 In the product-source comparison, `a65fe3972f7859e808ec6f09a39808fa240d4f49`
 source-integrates the local, fail-closed BUS-S1 Slice-A Store-Foundation
-(`HiveBusStore`) and its focused test. Current-Main
+(`HiveBusStore`) and its focused test. The preceding
 `4eef3d90db78f72efb96d1888d15af8c024cd5a0` additionally contains only the
 `DiagnosticV2` code registrations `BUS_E_CURSOR_CONFLICT`,
-`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`. This is source/test evidence only,
-not evidence of a running bus, broker, service, or deployment.
+`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`. Commit
+`9e0ce708a803ce6f6b961ea678e367cc31e2888c` source-integrates
+Delivery-/Effectsicherheitslogik. Current-Main adds four additive
+Testmatrixnachweise in `tests/test_hive_bus_store.py`. This is source/test
+evidence only, not evidence of a running bus, broker, service, or deployment.
 
 ## Now — integrated in the repository
 
@@ -43,11 +47,18 @@ not evidence of a running bus, broker, service, or deployment.
   `src/the_hive/hive/bus_store.py` and `tests/test_hive_bus_store.py`. This is a
   source/test foundation, not evidence of a running bus, broker, service, or
   deployment.
-- **Additional DiagnosticV2 code registrations.** Current-Main
+- **Additional DiagnosticV2 code registrations.** Commit
   `4eef3d90db78f72efb96d1888d15af8c024cd5a0` additionally registers only
   `BUS_E_CURSOR_CONFLICT`, `BUS_E_DELIVERY_STALE`, and `BUS_E_POISON` in
   `DiagnosticV2`. These registrations alone do not establish a running bus,
   broker, service, or deployment.
+- **BUS-S1/B source/test additions.** Commit
+  `9e0ce708a803ce6f6b961ea678e367cc31e2888c` source-integrates
+  Delivery-/Effectsicherheitslogik. Current-Main
+  `e7b3286ab0752b3f110f1fa02d0f366aa6f710cb` (tree
+  `184da8c6e517b6021079a6d2a9d8c55338c125e3`) adds four additive
+  Testmatrixnachweise in `tests/test_hive_bus_store.py`. These are source/test
+  evidence only, not evidence of a running bus, broker, service, or deployment.
 
 ## Next — prepared, but not active by this repository alone
 

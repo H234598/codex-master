@@ -148,11 +148,17 @@ installed unit nor permission to activate, reload, or inspect a local service.
 The current product-source snapshot includes a canonical, redacted
 `DiagnosticV2` contract, a bounded BUS-S0 event-type contract, and the local,
 fail-closed BUS-S1 Slice-A Store-Foundation (`HiveBusStore`) with its focused
-test. Current-Main snapshot `4eef3d90db78f72efb96d1888d15af8c024cd5a0`
-additionally contains only the `DiagnosticV2` code registrations
-`BUS_E_CURSOR_CONFLICT`, `BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`. This
-establishes source/test artifacts and code registrations; it does not establish
-a deployed diagnostics or bus service.
+test. Current-Main snapshot `e7b3286ab0752b3f110f1fa02d0f366aa6f710cb` (tree
+`184da8c6e517b6021079a6d2a9d8c55338c125e3`) carries the following bounded
+source/test evidence: `a65fe3972f7859e808ec6f09a39808fa240d4f49`
+source-integrates that Store-Foundation; the preceding
+`4eef3d90db78f72efb96d1888d15af8c024cd5a0` registers only
+`BUS_E_CURSOR_CONFLICT`, `BUS_E_DELIVERY_STALE`, and `BUS_E_POISON` in
+`DiagnosticV2`; `9e0ce708a803ce6f6b961ea678e367cc31e2888c` source-integrates
+Delivery-/Effectsicherheitslogik; and current Main adds four additive
+Testmatrixnachweise in `tests/test_hive_bus_store.py`. This establishes only
+source/test artifacts, code registrations, and test evidence; it does not
+establish a deployed diagnostics or bus service.
 
 Several operational conditions remain external or explicitly unavailable:
 
@@ -182,7 +188,8 @@ historical plans, templates, and handoffs.
 The historical documentation parity and consolidation basis is
 `b5def7d6156d7862606a0edcbd7226652cf4833f`. Current product-source status is
 verified against Current-Main snapshot
-`4eef3d90db78f72efb96d1888d15af8c024cd5a0`: [pyproject.toml](pyproject.toml),
+`e7b3286ab0752b3f110f1fa02d0f366aa6f710cb` (tree
+`184da8c6e517b6021079a6d2a9d8c55338c125e3`): [pyproject.toml](pyproject.toml),
 [`.mcp.json`](.mcp.json), [`bin/the-hive-mcp`](bin/the-hive-mcp),
 [`bin/the-hive-mcp-stable`](bin/the-hive-mcp-stable),
 [src/the_hive/admission_runtime.py](src/the_hive/admission_runtime.py),
@@ -194,8 +201,13 @@ verified against Current-Main snapshot
 
 In that product-source comparison,
 `a65fe3972f7859e808ec6f09a39808fa240d4f49` adds the local, fail-closed BUS-S1
-Slice-A Store-Foundation (`HiveBusStore`) and its focused test. Current-Main
+Slice-A Store-Foundation (`HiveBusStore`) and its focused test. The preceding
 `4eef3d90db78f72efb96d1888d15af8c024cd5a0` adds only the three additional
 `DiagnosticV2` code registrations `BUS_E_CURSOR_CONFLICT`,
-`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`. This is source/test evidence only,
-not evidence of a running bus, broker, service, or deployment.
+`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`; then
+`9e0ce708a803ce6f6b961ea678e367cc31e2888c` source-integrates
+Delivery-/Effectsicherheitslogik. Current-Main
+`e7b3286ab0752b3f110f1fa02d0f366aa6f710cb` (tree
+`184da8c6e517b6021079a6d2a9d8c55338c125e3`) adds four additive
+Testmatrixnachweise in `tests/test_hive_bus_store.py`. This is source/test
+evidence only, not evidence of a running bus, broker, service, or deployment.

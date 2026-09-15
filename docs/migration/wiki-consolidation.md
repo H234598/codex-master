@@ -6,7 +6,18 @@
 
 For current product status, use [ROADMAP.md](../../ROADMAP.md), which is
 verified against Current-Main snapshot
-`4eef3d90db78f72efb96d1888d15af8c024cd5a0`.
+`e7b3286ab0752b3f110f1fa02d0f366aa6f710cb` (tree
+`184da8c6e517b6021079a6d2a9d8c55338c125e3`). Relative to the historical
+parity/consolidation base, `a65fe3972f7859e808ec6f09a39808fa240d4f49`
+source-integrates the local, fail-closed BUS-S1 Slice-A Store-Foundation
+(`HiveBusStore`) and its focused test; the preceding
+`4eef3d90db78f72efb96d1888d15af8c024cd5a0` contains only the three
+`DiagnosticV2` code registrations `BUS_E_CURSOR_CONFLICT`,
+`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`; and
+`9e0ce708a803ce6f6b961ea678e367cc31e2888c` source-integrates
+Delivery-/Effectsicherheitslogik. Current-Main adds four additive
+Testmatrixnachweise in `tests/test_hive_bus_store.py`. This is source/test
+evidence only, not evidence of a running bus, broker, service, or deployment.
 
 This record closes the former `docs/wiki/` publishing layout. The normal,
 versioned repository documentation under [`docs/`](../README.md) is the only
