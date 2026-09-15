@@ -1,7 +1,12 @@
 # Wiki Consolidation Record
 
 **Migration date:** 2026-09-15
-**Verified source HEAD:** `b5def7d6156d7862606a0edcbd7226652cf4833f`
+**Verified source snapshot for this parity mapping:**
+`b5def7d6156d7862606a0edcbd7226652cf4833f`
+
+For current product status, use [ROADMAP.md](../../ROADMAP.md), which is
+verified against Current-Main snapshot
+`4eef3d90db78f72efb96d1888d15af8c024cd5a0`.
 
 This record closes the former `docs/wiki/` publishing layout. The normal,
 versioned repository documentation under [`docs/`](../README.md) is the only

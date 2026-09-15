@@ -17,8 +17,7 @@ Dokumentation nicht abgefragt und bleibt daher unbekannt.
 `bin/the-hive-mcp` ist ein Release-Einstiegspunkt, kein direkt nutzbarer
 Entwicklungs-Wrapper: Er verlangt Release-Root, Generation und
 Manifest-Digest. Die eingecheckte MCP-Konfiguration referenziert stattdessen
-den stabilen lokalen Launcher
-`/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp`. Ob dieses installierte
+den deployment-konfigurierten stabilen lokalen Launcher. Ob dieses installierte
 Release vorhanden oder gültig ist, ist hier nicht nachgewiesen.
 
 Der Parser des The-Hive-Servers führt die Pool-Unterbefehle `validate`,

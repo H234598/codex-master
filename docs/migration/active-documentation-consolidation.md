@@ -2,16 +2,18 @@
 
 **Migration date:** 2026-09-15
 
-**Base examined:** `b5def7d6156d7862606a0edcbd7226652cf4833f`
+**Historical parity and consolidation base examined:**
+`b5def7d6156d7862606a0edcbd7226652cf4833f`
 
-**Current-product comparison:** `git diff --name-only`
-`b5def7d6156d7862606a0edcbd7226652cf4833f..origin/main` showed the unassessed
-BUS-S1 files `src/the_hive/hive/bus_store.py` and
-`tests/test_hive_bus_store.py`. They are outside this record's scope. A
-separate path-limited comparison found no change in the concrete documentation
-evidence cited here: `bin/`, `scripts/`, `systemd/`, `.github/`, project and
-MCP/plugin manifests, checked-in configuration/catalog files, or the man-page
-source. This is not a claim about every other source or test surface.
+**Current-product comparison:** Current-Main snapshot
+`4eef3d90db78f72efb96d1888d15af8c024cd5a0`. Relative to the historical
+parity/consolidation base, commit `a65fe3972f7859e808ec6f09a39808fa240d4f49`
+source-integrates the local, fail-closed BUS-S1 Slice-A Store-Foundation
+(`HiveBusStore`) and its focused test. Current-Main additionally contains only
+the `DiagnosticV2` code registrations `BUS_E_CURSOR_CONFLICT`,
+`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`. This is source/test evidence only,
+not evidence of a running bus, broker, service, or deployment. For current
+product status, see [ROADMAP.md](../../ROADMAP.md).
 
 This is the preservation-and-disposition record for the active documentation
 that was shortened during the The-Hive documentation migration. It is separate

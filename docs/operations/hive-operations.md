@@ -13,9 +13,8 @@ Reset-Anker-Vorschau.
 Diese Namen beschreiben Parseroberflächen im Quellstand. Der eingecheckte
 `bin/the-hive-mcp`-Einstiegspunkt verlangt Release-Root, Generation und
 Manifest-Digest und ist nicht als direkter Aufruf dokumentiert. Die
-`.mcp.json` verweist auf den stabilen, installierten Launcher
-`/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp`; dessen Existenz und
-aktueller Laufzeitzustand wurden nicht geprüft.
+`.mcp.json` verweist auf den deployment-konfigurierten stabilen, installierten
+Launcher; dessen Existenz und aktueller Laufzeitzustand wurden nicht geprüft.
 
 ## Aktuelle Fail-closed-Grenzen
 

@@ -2,14 +2,18 @@
 
 Status is intentionally separated into source-integrated work, prepared work,
 blockers, and later work. It is based on repository snapshot
-`b5def7d6156d7862606a0edcbd7226652cf4833f`; it makes no live-runtime,
-provider, approval, deployment, or CI-success claim.
+`4eef3d90db78f72efb96d1888d15af8c024cd5a0`; it makes no live-runtime,
+provider, approval, deployment, or CI-success claim. The historical
+documentation parity and consolidation basis is
+`b5def7d6156d7862606a0edcbd7226652cf4833f`.
 
-This documentation candidate remains on b5. At the check time, `origin/main`
-is one commit ahead at `a65fe3972f7859e808ec6f09a39808fa240d4f49`
-(`feat(hive): add BUS-S1 slice A store foundation`), which adds a BUS-S1 store
-module and its focused test. BUS-S1 is therefore not claimed as integrated in
-this candidate; its product and status impact has not been assessed here.
+In the product-source comparison, `a65fe3972f7859e808ec6f09a39808fa240d4f49`
+source-integrates the local, fail-closed BUS-S1 Slice-A Store-Foundation
+(`HiveBusStore`) and its focused test. Current-Main
+`4eef3d90db78f72efb96d1888d15af8c024cd5a0` additionally contains only the
+`DiagnosticV2` code registrations `BUS_E_CURSOR_CONFLICT`,
+`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`. This is source/test evidence only,
+not evidence of a running bus, broker, service, or deployment.
 
 ## Now — integrated in the repository
 
@@ -23,8 +27,7 @@ this candidate; its product and status impact has not been assessed here.
   bindings, grants, work packages, admission, queues, and event records are
   implemented as source contracts. Evidence: [src/the_hive/hive/](src/the_hive/hive/)
   and the associated `tests/test_hive_*.py` files.
-- **DiagnosticV2 P0.** Commit
-  `b5def7d6156d7862606a0edcbd7226652cf4833f` adds the canonical, redacted
+- **DiagnosticV2 P0.** The source contains the canonical, redacted
   `DiagnosticV2` value and wire contract with focused tests. Evidence:
   [src/the_hive/diagnostics.py](src/the_hive/diagnostics.py) and
   [tests/test_diagnostics.py](tests/test_diagnostics.py). No deployment or
@@ -34,6 +37,17 @@ this candidate; its product and status impact has not been assessed here.
   [src/the_hive/hive/bus_types.py](src/the_hive/hive/bus_types.py) and
   [tests/test_hive_bus_types.py](tests/test_hive_bus_types.py). This is a
   static contract, not evidence of a running bus broker or transport.
+- **BUS-S1 Slice-A Store-Foundation.** Commit
+  `a65fe3972f7859e808ec6f09a39808fa240d4f49` source-integrates the local,
+  fail-closed `HiveBusStore` and its focused test. Evidence:
+  `src/the_hive/hive/bus_store.py` and `tests/test_hive_bus_store.py`. This is a
+  source/test foundation, not evidence of a running bus, broker, service, or
+  deployment.
+- **Additional DiagnosticV2 code registrations.** Current-Main
+  `4eef3d90db78f72efb96d1888d15af8c024cd5a0` additionally registers only
+  `BUS_E_CURSOR_CONFLICT`, `BUS_E_DELIVERY_STALE`, and `BUS_E_POISON` in
+  `DiagnosticV2`. These registrations alone do not establish a running bus,
+  broker, service, or deployment.
 
 ## Next — prepared, but not active by this repository alone
 

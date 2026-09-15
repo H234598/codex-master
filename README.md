@@ -14,8 +14,8 @@ provider, service unit, pilot, or CI run is live on any machine.
   `the-hive-admin`, `the-hive-agent-api`, and `the-hive-host-agent` entry
   points.
 - The repository ships the The Hive MCP configuration in
-  [`.mcp.json`](.mcp.json). Its `the-hive-mcp` entry uses the stable launcher
-  at `/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp` with no arguments.
+  [`.mcp.json`](.mcp.json). Its `the-hive-mcp` entry uses the
+  deployment-configured stable local launcher with no arguments.
 - The source includes a typed Hive control plane for principals, repository
   bindings, grants, work packages, admission, queues, and bounded reports.
 - The source also contains a versioned runtime-image and launcher contract,
@@ -145,10 +145,14 @@ installed unit nor permission to activate, reload, or inspect a local service.
 
 ## Status and limitations
 
-The current source includes a canonical, redacted `DiagnosticV2` contract and
-a bounded BUS-S0 event-type contract. That establishes source artifacts and
-their focused tests; it does not establish a deployed diagnostics or bus
-service.
+The current product-source snapshot includes a canonical, redacted
+`DiagnosticV2` contract, a bounded BUS-S0 event-type contract, and the local,
+fail-closed BUS-S1 Slice-A Store-Foundation (`HiveBusStore`) with its focused
+test. Current-Main snapshot `4eef3d90db78f72efb96d1888d15af8c024cd5a0`
+additionally contains only the `DiagnosticV2` code registrations
+`BUS_E_CURSOR_CONFLICT`, `BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`. This
+establishes source/test artifacts and code registrations; it does not establish
+a deployed diagnostics or bus service.
 
 Several operational conditions remain external or explicitly unavailable:
 
@@ -175,19 +179,23 @@ historical plans, templates, and handoffs.
 
 ## Evidence scope
 
-This README is grounded in repository snapshot
-`b5def7d6156d7862606a0edcbd7226652cf4833f`: [pyproject.toml](pyproject.toml),
+The historical documentation parity and consolidation basis is
+`b5def7d6156d7862606a0edcbd7226652cf4833f`. Current product-source status is
+verified against Current-Main snapshot
+`4eef3d90db78f72efb96d1888d15af8c024cd5a0`: [pyproject.toml](pyproject.toml),
 [`.mcp.json`](.mcp.json), [`bin/the-hive-mcp`](bin/the-hive-mcp),
 [`bin/the-hive-mcp-stable`](bin/the-hive-mcp-stable),
 [src/the_hive/admission_runtime.py](src/the_hive/admission_runtime.py),
 [src/the_hive/agent_daemon.py](src/the_hive/agent_daemon.py),
 [src/the_hive/host_agent.py](src/the_hive/host_agent.py),
-[src/the_hive/diagnostics.py](src/the_hive/diagnostics.py), and
-[src/the_hive/hive/bus_types.py](src/the_hive/hive/bus_types.py).
+[src/the_hive/diagnostics.py](src/the_hive/diagnostics.py),
+[src/the_hive/hive/bus_types.py](src/the_hive/hive/bus_types.py),
+`src/the_hive/hive/bus_store.py`, and `tests/test_hive_bus_store.py`.
 
-At this documentation check, `origin/main` is one commit ahead at
-`a65fe3972f7859e808ec6f09a39808fa240d4f49` (`feat(hive): add BUS-S1 slice A
-store foundation`), adding `src/the_hive/hive/bus_store.py` and its focused
-test. This candidate remains intentionally based on b5 and does not claim
-BUS-S1 as integrated; the newer change's product and status effect requires a
-separate review.
+In that product-source comparison,
+`a65fe3972f7859e808ec6f09a39808fa240d4f49` adds the local, fail-closed BUS-S1
+Slice-A Store-Foundation (`HiveBusStore`) and its focused test. Current-Main
+`4eef3d90db78f72efb96d1888d15af8c024cd5a0` adds only the three additional
+`DiagnosticV2` code registrations `BUS_E_CURSOR_CONFLICT`,
+`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`. This is source/test evidence only,
+not evidence of a running bus, broker, service, or deployment.

@@ -6,11 +6,10 @@ not by itself an installed, enabled, or healthy runtime.
 
 ## Supported repository evidence
 
-The checked-in MCP connection describes a stable local launcher at
-`/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp`. That is a
-deployment-specific absolute path, not a portable path to copy into another
-environment. Its presence in the repository does not prove that a release is
-present or valid on a machine.
+The checked-in MCP connection describes a deployment-configured stable local
+launcher. The repository does not publish a portable launcher path to copy into
+another environment. Its presence in the repository does not prove that a
+release is present or valid on a machine.
 
 [`bin/the-hive-mcp`](../bin/the-hive-mcp) is an attested release wrapper. It
 requires a release root, generation, and manifest digest before any command
