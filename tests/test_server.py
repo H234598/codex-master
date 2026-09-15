@@ -38831,6 +38831,49 @@ def test_native_agent_observation_fails_closed_for_incomplete_or_stale_evidence(
             assert result["agents"] == []
 
 
+@pytest.mark.parametrize(
+    "action_key",
+    (
+        pytest.param(None, id="missing"),
+        pytest.param(b"k" * (server_module.APPLET_ACTION_KEY_BYTES - 1), id="invalid"),
+    ),
+)
+def test_native_agent_observation_fails_closed_for_missing_or_invalid_action_key(
+    action_key: bytes | None,
+) -> None:
+    raw_native_id = "native-private-agent-019fc541-a1e2-7a63-a4bf-b307fcb78457"
+    capture = _native_observation_capture()
+    with (
+        patch.object(
+            server_module,
+            "read_applet_action_key",
+            return_value=action_key,
+        ) as read_key,
+        patch.object(
+            server_module,
+            "_read_native_agent_registry_read_only",
+            side_effect=AssertionError("action-key failure must not read the registry"),
+        ) as read_registry,
+        patch.object(
+            server_module,
+            "native_agent_status",
+            side_effect=AssertionError("action-key failure must not use a count fallback"),
+        ) as legacy_count,
+    ):
+        result = server_module.native_agent_observation(capture)
+
+    read_key.assert_called_once_with()
+    read_registry.assert_not_called()
+    legacy_count.assert_not_called()
+    assert result["state"] == "unavailable"
+    assert result["agents"] == []
+    rendered_agents = json.dumps(result["agents"])
+    assert raw_native_id not in rendered_agents
+    assert raw_native_id[:8] not in rendered_agents
+    assert "count" not in result
+    assert "native_count" not in result
+
+
 def test_hive_metrics_uses_the_capture_bound_native_observation_without_legacy_recount() -> None:
     capture = _native_observation_capture()
     registry_snapshot = object()
