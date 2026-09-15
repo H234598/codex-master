@@ -92,7 +92,12 @@ from the_hive.fleet_overview import (
     enrich_fleet_overview_usage,
     render_fleet_overview,
 )
-from the_hive.hive_metrics import fleet_metric_values, render_openmetrics
+from the_hive.hive_metrics import (
+    FleetMetricObservation,
+    FleetMetricSnapshot,
+    fleet_metric_values,
+    render_openmetrics,
+)
 from the_hive.observability_http import MetricsHttpServer, TimedMetricsReader
 from the_hive.goddess_reporting import (
     ReporterStateStore,
@@ -6487,6 +6492,159 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
                     record["updated_at"] = timestamp
             _write_native_agent_registry(registry)
             return
+
+
+def _read_native_agent_registry_read_only() -> tuple[dict[str, Any], str]:
+    """Read one native registry document without legacy migration or repair."""
+
+    payload = _native_agent_registry_payload()
+    try:
+        raw = read_private_regular_text(
+            NATIVE_AGENT_REGISTRY_FILE,
+            MAX_NATIVE_AGENT_REGISTRY_BYTES,
+            "native agent registry state must be a regular file within the size limit",
+        )
+        loaded = json.loads(raw)
+    except (AgentError, TypeError, UnicodeError, json.JSONDecodeError):
+        return payload, "degraded"
+    if not isinstance(loaded, dict):
+        return payload, "degraded"
+    normalized = _native_agent_normalize_registry(loaded)
+    if normalized != loaded:
+        return payload, "degraded"
+    return normalized, "ready"
+
+
+def native_agent_observation(capture: FleetWatchdogSnapshot) -> dict[str, Any]:
+    """Return native observations bound to one already-captured fleet snapshot.
+
+    This source neither captures processes nor reuses the display/count view.
+    A missing key, incomplete parent coverage, stale registry data, or any
+    malformed read makes the complete observation unavailable.
+    """
+
+    captured_at_utc: str | None = None
+    expected_parent_sessions = 0
+    observed_parent_sessions = 0
+
+    def unavailable() -> dict[str, Any]:
+        return {
+            "capture": capture,
+            "captured_at_utc": captured_at_utc,
+            "state": "unavailable",
+            "coverage": {
+                "managed_parent_session_coverage": "unavailable",
+                "registry_coverage": "unavailable",
+                "tmux_coverage": "unavailable",
+                "expected_managed_parent_sessions": expected_parent_sessions,
+                "observed_managed_parent_sessions": observed_parent_sessions,
+                "complete": False,
+            },
+            "agents": [],
+        }
+
+    if type(capture) is not FleetWatchdogSnapshot:
+        return unavailable()
+    created_at = capture.created_at
+    if (
+        not isinstance(created_at, _dt.datetime)
+        or created_at.tzinfo is None
+        or created_at.utcoffset() is None
+    ):
+        return unavailable()
+    capture_timestamp = _normalize_native_agent_timestamp(created_at.timestamp())
+    if capture_timestamp is None or capture.tmux_scan_available is not True:
+        return unavailable()
+    captured_at_utc = created_at.astimezone(_dt.timezone.utc).isoformat()
+
+    expected_ids: set[str] = set()
+    try:
+        for session_id, session in capture.tmux_sessions.items():
+            if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE):
+                return unavailable()
+            alive = getattr(session, "alive", None)
+            if type(alive) is not bool:
+                return unavailable()
+            if alive:
+                expected_ids.add(session_id)
+    except (AttributeError, TypeError, ValueError):
+        return unavailable()
+    expected_parent_sessions = len(expected_ids)
+
+    try:
+        opaque_key = read_applet_action_key()
+        if type(opaque_key) is not bytes or len(opaque_key) != APPLET_ACTION_KEY_BYTES:
+            return unavailable()
+        with native_agent_registry_lock():
+            registry, registry_state = _read_native_agent_registry_read_only()
+        if registry_state != "ready":
+            return unavailable()
+
+        def fresh_at_capture(record: Mapping[str, Any]) -> bool:
+            updated_at = _normalize_native_agent_timestamp(record.get("updated_at"))
+            return (
+                updated_at is not None
+                and 0 <= capture_timestamp - updated_at <= NATIVE_AGENT_ACTIVE_SECONDS
+            )
+
+        covered_parent_by_thread: dict[str, str] = {}
+        for record in registry["sessions"]:
+            if record["activity_state"] != "active" or not fresh_at_capture(record):
+                continue
+            managed_session = record.get("managed_session")
+            if managed_session in expected_ids:
+                covered_parent_by_thread[record["session_id"]] = managed_session
+        observed_parent_sessions = len(set(covered_parent_by_thread.values()))
+        if set(covered_parent_by_thread.values()) != expected_ids:
+            return unavailable()
+
+        observations: list[dict[str, Any]] = []
+        observed_agent_ids: set[str] = set()
+        for record in registry["agents"]:
+            if record["activity_state"] == "completed":
+                continue
+            if record["session_id"] not in covered_parent_by_thread:
+                continue
+            if not fresh_at_capture(record):
+                return unavailable()
+            agent_id = record["agent_id"]
+            if agent_id in observed_agent_ids:
+                return unavailable()
+            observed_agent_ids.add(agent_id)
+            opaque_identifier = hmac.new(
+                opaque_key,
+                f"the-hive-native-observation-v1\\0{agent_id}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()[:32]
+            observations.append(
+                {
+                    "native_observation_id": f"native-{opaque_identifier}",
+                    "active": record["activity_state"] == "active",
+                    # "unconfirmed" is an inactive native bee, not invalid
+                    # evidence: freshness, parent coverage, schema and capture
+                    # binding have already been verified above.
+                    "valid": True,
+                    "captured_at_utc": captured_at_utc,
+                }
+            )
+    except Exception:
+        return unavailable()
+
+    observations.sort(key=lambda item: item["native_observation_id"])
+    return {
+        "capture": capture,
+        "captured_at_utc": captured_at_utc,
+        "state": "ready",
+        "coverage": {
+            "managed_parent_session_coverage": "complete",
+            "registry_coverage": "complete",
+            "tmux_coverage": "complete",
+            "expected_managed_parent_sessions": expected_parent_sessions,
+            "observed_managed_parent_sessions": observed_parent_sessions,
+            "complete": True,
+        },
+        "agents": observations,
+    }
 
 
 def native_agent_status(
@@ -37738,25 +37896,85 @@ def _hive_metrics_local_admin(
             contexts=contexts,
             created_at=observation.created_at,
         )
-        native = native_agent_status()
-        native_counts = (
-            native.get("counts") if isinstance(native.get("counts"), dict) else {}
+        native = native_agent_observation(observation)
+        native_agents = native.get("agents")
+        native_coverage = native.get("coverage")
+        if (
+            native.get("capture") is not observation
+            or native.get("state") != "ready"
+            or not isinstance(native_coverage, dict)
+            or native_coverage.get("complete") is not True
+            or not isinstance(native_agents, list)
+            or len(native_agents) > MAX_NATIVE_AGENT_RECORDS
+        ):
+            raise AgentError("native_observation_unavailable")
+        metric_observations: list[FleetMetricObservation] = []
+        registered_homes = 0
+        for series in overview.series:
+            if type(series.total_count) is not int or series.total_count < 0:
+                raise AgentError("native_observation_unavailable")
+            registered_homes += series.total_count
+        for row in overview.agents:
+            if row.state != "running":
+                continue
+            metric_observations.append(
+                FleetMetricObservation(
+                    True,
+                    True,
+                    row.provider,
+                    row.principal_role or "unknown",
+                )
+            )
+        native_valid = 0
+        native_unconfirmed = 0
+        for item in native_agents:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {
+                    "native_observation_id",
+                    "active",
+                    "valid",
+                    "captured_at_utc",
+                }
+                or not isinstance(item["native_observation_id"], str)
+                or re.fullmatch(r"native-[0-9a-f]{32}", item["native_observation_id"])
+                is None
+                or type(item["active"]) is not bool
+                or type(item["valid"]) is not bool
+                or item["captured_at_utc"] != observation.created_at.astimezone(
+                    _dt.timezone.utc
+                ).isoformat()
+            ):
+                raise AgentError("native_observation_unavailable")
+            if not item["valid"]:
+                raise AgentError("native_observation_unavailable")
+            native_valid += 1
+            native_unconfirmed += int(not item["active"])
+            metric_observations.append(
+                FleetMetricObservation(
+                    item["active"],
+                    item["valid"],
+                    "native",
+                    "unknown",
+                    observation_key="sha256:"
+                    + hashlib.sha256(
+                        item["native_observation_id"].encode("ascii")
+                    ).hexdigest(),
+                )
+            )
+        metric_snapshot = FleetMetricSnapshot(
+            tuple(metric_observations),
+            registered_homes,
+            observation.created_at,
         )
-        native_active = native_counts.get("active")
-        native_unconfirmed = native_counts.get("unconfirmed")
-        if type(native_active) is not int or native_active < 0:
-            native_active = 0
-        if type(native_unconfirmed) is not int or native_unconfirmed < 0:
-            native_unconfirmed = 0
         values = fleet_metric_values(
-            overview, native_active=native_active, observed_at=selected_clock()
+            metric_snapshot, observed_at=selected_clock()
         )
         values.update(
             {
                 "the_hive_agent_observation_errors": observation_errors,
-                "the_hive_native_bridge_ready": int(
-                    native.get("bridge_state") == "ready"
-                ),
+                "the_hive_native_bridge_ready": 1,
+                "the_hive_bees_native_valid": native_valid,
                 "the_hive_bees_native_unconfirmed": native_unconfirmed,
                 "the_hive_process_scan_available": int(
                     observation.process_scan_available

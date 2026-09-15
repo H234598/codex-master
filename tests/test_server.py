@@ -37,6 +37,11 @@ from the_hive.hive.state import HiveStateStore
 from the_hive.masterjet_runtime import MasterjetRuntime
 from the_hive.runtime_layout import RuntimeLayout
 from the_hive.fleet_home_recovery import make_fleet_identity_journal_plan
+from the_hive.fleet_overview import (
+    FleetOverviewAgentRow,
+    FleetOverviewSeriesRow,
+    FleetOverviewSnapshot,
+)
 from the_hive.resource_cgroup import (
     CgroupPreflightError,
     CgroupProfileV1,
@@ -38630,6 +38635,457 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 "the_hive.server.NATIVE_AGENT_REGISTRY_FILE", record_path
             ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch("the_hive.server.time.time", return_value=1_031.0):
                 self.assertEqual(server_module._fresh_native_reservation_count(now=1_031.0, managed_ids=frozenset()), 0)
+
+
+def _native_observation_capture(
+    *,
+    capture_at: float = 1_001.0,
+    sessions: dict[str, bool] | None = None,
+    tmux_scan_available: bool = True,
+) -> object:
+    session_states = sessions if sessions is not None else {"managed-q1": True}
+    return server_module.FleetWatchdogSnapshot(
+        created_at=datetime.fromtimestamp(capture_at, timezone.utc),
+        processes=(),
+        processes_by_codex_home={},
+        tmux_sessions={
+            session: SimpleNamespace(alive=alive, pane_pid=None)
+            for session, alive in session_states.items()
+        },
+        agent_process_map={},
+        process_scan_available=False,
+        tmux_scan_available=tmux_scan_available,
+    )
+
+
+def test_native_agent_observation_binds_one_capture_and_hides_native_identifier() -> None:
+    raw_agent_id = "native-private-agent-019fc541-a1e2-7a63-a4bf-b307fcb78457"
+    capture = _native_observation_capture()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "state"
+        with (
+            patch.object(server_module, "STATE_ROOT", root),
+            patch.object(server_module, "LOCK_DIR", root / "locks"),
+            patch.object(
+                server_module, "NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
+            ),
+            patch.object(
+                server_module,
+                "NATIVE_AGENT_REGISTRY_LOCK_FILE",
+                root / "locks" / "native-agents.lock",
+            ),
+            patch.object(server_module, "read_applet_action_key", return_value=b"k" * 32),
+        ):
+            server_module._write_native_agent_registry(
+                {
+                    "schema_version": 2,
+                    "agents": [
+                        {
+                            "session_id": "native-thread-q1",
+                            "agent_id": raw_agent_id,
+                            "agent_type": "worker",
+                            "activity_state": "active",
+                            "updated_at": 1_000.0,
+                        }
+                    ],
+                    "sessions": [
+                        {
+                            "session_id": "native-thread-q1",
+                            "managed_session": "managed-q1",
+                            "activity_state": "active",
+                            "updated_at": 1_000.0,
+                        }
+                    ],
+                    "reservations": [],
+                }
+            )
+            first = server_module.native_agent_observation(capture)
+            second = server_module.native_agent_observation(capture)
+
+    assert first["capture"] is capture
+    assert first["captured_at_utc"] == "1970-01-01T00:16:41+00:00"
+    assert first["coverage"] == {
+        "managed_parent_session_coverage": "complete",
+        "registry_coverage": "complete",
+        "tmux_coverage": "complete",
+        "expected_managed_parent_sessions": 1,
+        "observed_managed_parent_sessions": 1,
+        "complete": True,
+    }
+    assert first["state"] == "ready"
+    assert first["agents"] == [
+        {
+            "native_observation_id": first["agents"][0]["native_observation_id"],
+            "active": True,
+            "valid": True,
+            "captured_at_utc": "1970-01-01T00:16:41+00:00",
+        }
+    ]
+    assert re.fullmatch(r"native-[0-9a-f]{32}", first["agents"][0]["native_observation_id"])
+    assert first["agents"][0]["native_observation_id"] == second["agents"][0]["native_observation_id"]
+    assert raw_agent_id not in json.dumps(first, default=str)
+    assert raw_agent_id[:8] not in json.dumps(first, default=str)
+
+
+def test_native_agent_observation_fails_closed_for_incomplete_or_stale_evidence() -> None:
+    capture = _native_observation_capture()
+    cases = (
+        (
+            "coverage",
+            {
+                "schema_version": 2,
+                "agents": [],
+                "sessions": [],
+                "reservations": [],
+            },
+        ),
+        (
+            "stale",
+            {
+                "schema_version": 2,
+                "agents": [
+                    {
+                        "session_id": "native-thread-q1",
+                        "agent_id": "native-worker-q1",
+                        "agent_type": "worker",
+                        "activity_state": "active",
+                        "updated_at": 1_001.0 - server_module.NATIVE_AGENT_ACTIVE_SECONDS - 1,
+                    }
+                ],
+                "sessions": [
+                    {
+                        "session_id": "native-thread-q1",
+                        "managed_session": "managed-q1",
+                        "activity_state": "active",
+                        "updated_at": 1_000.0,
+                    }
+                ],
+                "reservations": [],
+            },
+        ),
+        (
+            "schema",
+            {
+                "schema_version": 99,
+                "agents": [
+                    {
+                        "session_id": "native-thread-q1",
+                        "agent_id": "native-worker-q1",
+                        "agent_type": "worker",
+                        "activity_state": "active",
+                        "updated_at": 1_000.0,
+                    }
+                ],
+                "sessions": [
+                    {
+                        "session_id": "native-thread-q1",
+                        "managed_session": "managed-q1",
+                        "activity_state": "active",
+                        "updated_at": 1_000.0,
+                    }
+                ],
+                "reservations": [
+                    {
+                        "reservation_id": "native-reservation-q1",
+                        "kind": "headless_inflight",
+                        "created_at": 1_000.0,
+                        "agent": "native-worker-q1",
+                        "assignment_id": "native-assignment-q1",
+                    }
+                ],
+            },
+        ),
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "state"
+        registry = root / "native-agents.json"
+        with (
+            patch.object(server_module, "STATE_ROOT", root),
+            patch.object(server_module, "LOCK_DIR", root / "locks"),
+            patch.object(server_module, "NATIVE_AGENT_REGISTRY_FILE", registry),
+            patch.object(
+                server_module,
+                "NATIVE_AGENT_REGISTRY_LOCK_FILE",
+                root / "locks" / "native-agents.lock",
+            ),
+            patch.object(server_module, "read_applet_action_key", return_value=b"k" * 32),
+        ):
+            for name, payload in cases:
+                if name == "schema":
+                    root.mkdir(parents=True, exist_ok=True)
+                    registry.write_text(json.dumps(payload), encoding="utf-8")
+                else:
+                    server_module._write_native_agent_registry(payload)
+                result = server_module.native_agent_observation(capture)
+                assert result["state"] == "unavailable"
+                assert result["agents"] == []
+                assert result["coverage"]["complete"] is False
+
+            with patch.object(
+                server_module,
+                "_read_native_agent_registry_read_only",
+                side_effect=AgentError("registry read failed"),
+            ):
+                result = server_module.native_agent_observation(capture)
+            assert result["state"] == "unavailable"
+            assert result["agents"] == []
+
+
+def test_hive_metrics_uses_the_capture_bound_native_observation_without_legacy_recount() -> None:
+    capture = _native_observation_capture()
+    registry_snapshot = object()
+    inventory = SimpleNamespace(
+        agent_ids=("q1",),
+        agents={"q1": SimpleNamespace(home=Path("/managed/q1"), session="managed-q1")},
+    )
+    overview = FleetOverviewSnapshot(
+        generation=7,
+        created_at=capture.created_at,
+        integration_freshness="fresh",
+        series=(
+            FleetOverviewSeriesRow(
+                "q",
+                "Queen",
+                "codex",
+                "codex_cli",
+                "gpt-test",
+                1,
+                1,
+                ("q1",),
+            ),
+        ),
+        agents=(
+            FleetOverviewAgentRow(
+                "q1",
+                "Queen",
+                "codex",
+                "codex_cli",
+                "gpt-test",
+                None,
+                None,
+                "running",
+                "queen",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "unavailable",
+            ),
+        ),
+        account_limits=(),
+        warnings=(),
+    )
+    native = {
+        "capture": capture,
+        "captured_at_utc": "1970-01-01T00:16:41+00:00",
+        "state": "ready",
+        "coverage": {"complete": True},
+        "agents": [
+            {
+                "native_observation_id": "native-" + "a" * 32,
+                "active": True,
+                "valid": True,
+                "captured_at_utc": "1970-01-01T00:16:41+00:00",
+            }
+        ],
+    }
+    paths = SimpleNamespace(lock=Path("/unused/fleet.lock"))
+    with (
+        patch.object(server_module.FleetPaths, "from_state_root", return_value=paths),
+        patch.object(server_module, "_fleet_registry_read_lock", contextlib.nullcontext),
+        patch.object(
+            server_module,
+            "_readonly_fleet_service",
+            return_value=SimpleNamespace(registry_snapshot=lambda: registry_snapshot),
+        ),
+        patch.object(server_module, "build_inventory", return_value=inventory),
+        patch.object(server_module, "create_fleet_snapshot", return_value=capture) as create_capture,
+        patch.object(
+            server_module,
+            "status_agent",
+            return_value={"running": True, "last_assignment": {}},
+        ) as status,
+        patch.object(server_module, "read_meta", return_value={}),
+        patch.object(server_module, "build_fleet_overview", return_value=overview),
+        patch.object(server_module, "native_agent_observation", return_value=native) as observe,
+        patch.object(
+            server_module,
+            "native_agent_status",
+            side_effect=AssertionError("legacy recount must not be used by metrics"),
+        ),
+        patch.object(
+            server_module,
+            "fleet_metric_values",
+            wraps=server_module.fleet_metric_values,
+        ) as values,
+        patch.object(server_module, "render_openmetrics", return_value="rendered") as render,
+    ):
+        result = server_module._hive_metrics_local_admin(
+            clock=lambda: datetime(1970, 1, 1, 0, 16, 41, tzinfo=timezone.utc)
+        )
+
+    assert result == "rendered"
+    create_capture.assert_called_once()
+    status.assert_called_once_with("q1", initialize_state=False, snapshot=capture)
+    observe.assert_called_once_with(capture)
+    values.assert_called_once()
+    metric_snapshot = values.call_args.args[0]
+    assert type(metric_snapshot) is server_module.FleetMetricSnapshot
+    assert values.call_args.kwargs == {"observed_at": capture.created_at}
+    rendered_metrics = render.call_args.args[0]
+    assert rendered_metrics["the_hive_bees_native"] == 1
+    assert rendered_metrics["the_hive_bees_total"] == 2
+
+
+def test_hive_metrics_keeps_fresh_unconfirmed_native_evidence_valid_and_counted() -> None:
+    capture = _native_observation_capture()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "state"
+        with (
+            patch.object(server_module, "STATE_ROOT", root),
+            patch.object(server_module, "LOCK_DIR", root / "locks"),
+            patch.object(
+                server_module, "NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
+            ),
+            patch.object(
+                server_module,
+                "NATIVE_AGENT_REGISTRY_LOCK_FILE",
+                root / "locks" / "native-agents.lock",
+            ),
+            patch.object(server_module, "read_applet_action_key", return_value=b"k" * 32),
+        ):
+            server_module._write_native_agent_registry(
+                {
+                    "schema_version": 2,
+                    "agents": [
+                        {
+                            "session_id": "native-thread-q1",
+                            "agent_id": "native-unconfirmed-q1",
+                            "agent_type": "worker",
+                            "activity_state": "unconfirmed",
+                            "updated_at": 1_000.0,
+                        }
+                    ],
+                    "sessions": [
+                        {
+                            "session_id": "native-thread-q1",
+                            "managed_session": "managed-q1",
+                            "activity_state": "active",
+                            "updated_at": 1_000.0,
+                        }
+                    ],
+                    "reservations": [],
+                }
+            )
+            native = server_module.native_agent_observation(capture)
+
+    assert native["state"] == "ready"
+    assert native["coverage"]["complete"] is True
+    assert native["agents"] == [
+        {
+            "native_observation_id": native["agents"][0]["native_observation_id"],
+            "active": False,
+            "valid": True,
+            "captured_at_utc": "1970-01-01T00:16:41+00:00",
+        }
+    ]
+
+    registry_snapshot = object()
+    inventory = SimpleNamespace(
+        agent_ids=("q1",),
+        agents={"q1": SimpleNamespace(home=Path("/managed/q1"), session="managed-q1")},
+    )
+    overview = FleetOverviewSnapshot(
+        generation=7,
+        created_at=capture.created_at,
+        integration_freshness="fresh",
+        series=(
+            FleetOverviewSeriesRow(
+                "q",
+                "Queen",
+                "codex",
+                "codex_cli",
+                "gpt-test",
+                1,
+                1,
+                ("q1",),
+            ),
+        ),
+        agents=(
+            FleetOverviewAgentRow(
+                "q1",
+                "Queen",
+                "codex",
+                "codex_cli",
+                "gpt-test",
+                None,
+                None,
+                "running",
+                "queen",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "unavailable",
+            ),
+        ),
+        account_limits=(),
+        warnings=(),
+    )
+    paths = SimpleNamespace(lock=Path("/unused/fleet.lock"))
+    with (
+        patch.object(server_module.FleetPaths, "from_state_root", return_value=paths),
+        patch.object(server_module, "_fleet_registry_read_lock", contextlib.nullcontext),
+        patch.object(
+            server_module,
+            "_readonly_fleet_service",
+            return_value=SimpleNamespace(registry_snapshot=lambda: registry_snapshot),
+        ),
+        patch.object(server_module, "build_inventory", return_value=inventory),
+        patch.object(server_module, "create_fleet_snapshot", return_value=capture),
+        patch.object(
+            server_module,
+            "status_agent",
+            return_value={"running": True, "last_assignment": {}},
+        ),
+        patch.object(server_module, "read_meta", return_value={}),
+        patch.object(server_module, "build_fleet_overview", return_value=overview),
+        patch.object(server_module, "native_agent_observation", return_value=native),
+        patch.object(
+            server_module,
+            "native_agent_status",
+            side_effect=AssertionError("legacy recount must not be used by metrics"),
+        ),
+        patch.object(
+            server_module,
+            "fleet_metric_values",
+            wraps=server_module.fleet_metric_values,
+        ) as values,
+        patch.object(server_module, "render_openmetrics", return_value="rendered") as render,
+    ):
+        result = server_module._hive_metrics_local_admin(
+            clock=lambda: datetime(1970, 1, 1, 0, 16, 41, tzinfo=timezone.utc)
+        )
+
+    assert result == "rendered"
+    values.assert_called_once()
+    metric_snapshot = values.call_args.args[0]
+    native_metric_observations = [
+        item for item in metric_snapshot.observations if item.provider == "native"
+    ]
+    assert len(native_metric_observations) == 1
+    assert native_metric_observations[0].active is False
+    assert native_metric_observations[0].valid is True
+    assert values.call_args.kwargs == {"observed_at": capture.created_at}
+    rendered_metrics = render.call_args.args[0]
+    assert rendered_metrics["the_hive_bees_total"] == 1
+    assert rendered_metrics["the_hive_bees_native"] == 0
+    assert rendered_metrics["the_hive_bees_native_valid"] == 1
+    assert rendered_metrics["the_hive_bees_native_unconfirmed"] == 1
 
 
 @contextlib.contextmanager
