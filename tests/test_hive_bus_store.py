@@ -15,12 +15,16 @@ import threading
 import pytest
 
 from the_hive.diagnostics import DiagnosticSeverityV2, DiagnosticV2
-from the_hive.hive.bus_types import canonical_json_bytes, serialize_hive_bus_event_v1
+from the_hive.hive.bus_types import (
+    canonical_json_bytes,
+    create_hive_bus_event_v1,
+    serialize_hive_bus_event_v1,
+)
 from the_hive.hive.bus_store import HiveBusStore
 from the_hive.hive import bus_store
 
 
-EXPECTED_TABLE_DDL = (
+GEN1_TABLE_DDL = (
     "CREATE TABLE bus_store_meta (schema_name TEXT PRIMARY KEY CHECK(schema_name='hive_bus_store'),generation INTEGER NOT NULL CHECK(generation>=1),schema_digest TEXT NOT NULL UNIQUE,created_at_utc TEXT NOT NULL)",
     "CREATE TABLE partitions (partition TEXT PRIMARY KEY,next_seq INTEGER NOT NULL CHECK(next_seq>=1),first_retained_seq INTEGER NOT NULL CHECK(first_retained_seq>=1 AND first_retained_seq<=next_seq),state TEXT NOT NULL CHECK(state IN ('active','blocked')),blocked_code TEXT,created_at_utc TEXT NOT NULL,updated_at_utc TEXT NOT NULL)",
     "CREATE TABLE payloads (kind TEXT NOT NULL CHECK(kind IN ('inline','blob','artifact')),digest TEXT NOT NULL,ref TEXT NOT NULL,size_bytes INTEGER NOT NULL CHECK(size_bytes BETWEEN 0 AND 1048576),body BLOB,body_state TEXT NOT NULL CHECK(body_state IN ('present','expired','quarantined','reference')),artifact_id TEXT,quarantine_code TEXT,created_at_utc TEXT NOT NULL,PRIMARY KEY(kind,digest,ref),CHECK((kind IN ('inline','blob') AND body_state='present' AND body IS NOT NULL AND length(body)=size_bytes AND artifact_id IS NULL AND quarantine_code IS NULL) OR (kind='artifact' AND body IS NULL AND body_state='reference' AND artifact_id IS NOT NULL AND quarantine_code IS NULL) OR (body_state IN ('expired','quarantined') AND body IS NULL)))",
@@ -36,7 +40,7 @@ EXPECTED_TABLE_DDL = (
     "CREATE TABLE archive_manifests (archive_manifest_id TEXT PRIMARY KEY,partition TEXT NOT NULL REFERENCES partitions(partition),snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id),accepted_event_id TEXT NOT NULL,decision_digest TEXT NOT NULL,manifest_digest TEXT NOT NULL UNIQUE,manifest_bytes BLOB NOT NULL CHECK(length(manifest_bytes)<=1048576),manifest_size_bytes INTEGER NOT NULL CHECK(manifest_size_bytes=length(manifest_bytes)),state TEXT NOT NULL CHECK(state='prepared'),created_at_utc TEXT NOT NULL,UNIQUE(partition,snapshot_id,manifest_digest))",
     "CREATE TABLE outbox (outbox_id TEXT PRIMARY KEY,event_id TEXT NOT NULL UNIQUE,effect_digest TEXT NOT NULL,idempotency_key TEXT NOT NULL,hash_basis_digest TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','leased','acked','blocked')),lease_token TEXT,lease_expires_at_utc TEXT,attempt_count INTEGER NOT NULL CHECK(attempt_count>=0),created_at_utc TEXT NOT NULL,updated_at_utc TEXT NOT NULL)",
 )
-EXPECTED_INDEX_DDL = (
+GEN1_INDEX_DDL = (
     "CREATE INDEX events_partition_retention_seq_idx ON events(partition,retention_class,partition_seq)",
     "CREATE INDEX events_payload_ref_idx ON events(payload_kind,payload_digest,payload_ref)",
     "CREATE INDEX producer_epochs_principal_epoch_idx ON producer_epochs(producer_principal_id,producer_epoch DESC)",
@@ -47,11 +51,11 @@ EXPECTED_INDEX_DDL = (
     "CREATE INDEX snapshots_partition_through_idx ON snapshots(partition,through_seq DESC)",
     "CREATE INDEX outbox_state_expiry_idx ON outbox(state,lease_expires_at_utc)",
 )
-EXPECTED_MANIFEST = {
+GEN1_MANIFEST = {
     "schema_name": "hive_bus_store",
     "generation": 1,
-    "tables": list(EXPECTED_TABLE_DDL),
-    "indexes": list(EXPECTED_INDEX_DDL),
+    "tables": list(GEN1_TABLE_DDL),
+    "indexes": list(GEN1_INDEX_DDL),
     "pragmas": {
         "foreign_keys": 1,
         "journal_mode": "wal",
@@ -60,7 +64,76 @@ EXPECTED_MANIFEST = {
         "wal_autocheckpoint": 1000,
     },
 }
-EXPECTED_SCHEMA_DIGEST = "sha256:577d018653c16b9bf92590c1e68931f2ec972ad84a7e35c6f644f4f08aa508ba"
+GEN1_SCHEMA_DIGEST = (
+    "sha256:577d018653c16b9bf92590c1e68931f2ec972ad84a7e35c6f644f4f08aa508ba"
+)
+
+EXPECTED_TABLE_DDL = (
+    "CREATE TABLE bus_store_meta (schema_name TEXT PRIMARY KEY CHECK(schema_name='hive_bus_store'),generation INTEGER NOT NULL CHECK(generation>=1),schema_digest TEXT NOT NULL UNIQUE,created_at_utc TEXT NOT NULL)",
+    "CREATE TABLE partitions (partition TEXT PRIMARY KEY,next_seq INTEGER NOT NULL CHECK(next_seq>=1),first_retained_seq INTEGER NOT NULL CHECK(first_retained_seq>=1 AND first_retained_seq<=next_seq),state TEXT NOT NULL CHECK(state IN ('active','blocked')),blocked_code TEXT,created_at_utc TEXT NOT NULL,updated_at_utc TEXT NOT NULL)",
+    "CREATE TABLE payloads (kind TEXT NOT NULL CHECK(kind IN ('inline','blob','artifact')),digest TEXT NOT NULL,ref TEXT NOT NULL,size_bytes INTEGER NOT NULL CHECK((kind='artifact' AND size_bytes BETWEEN 0 AND 9223372036854775807) OR (kind IN ('inline','blob') AND size_bytes BETWEEN 0 AND 1048576)),body BLOB,body_state TEXT NOT NULL CHECK(body_state IN ('present','expired','quarantined','reference')),artifact_id TEXT,quarantine_code TEXT,created_at_utc TEXT NOT NULL,PRIMARY KEY(kind,digest,ref),CHECK((kind IN ('inline','blob') AND body_state='present' AND body IS NOT NULL AND length(body)=size_bytes AND artifact_id IS NULL AND quarantine_code IS NULL) OR (kind='artifact' AND body IS NULL AND body_state='reference' AND artifact_id IS NOT NULL AND quarantine_code IS NULL) OR (body_state IN ('expired','quarantined') AND body IS NULL)))",
+    "CREATE TABLE events (event_id TEXT PRIMARY KEY,partition TEXT NOT NULL REFERENCES partitions(partition),partition_seq INTEGER NOT NULL CHECK(partition_seq>=1),schema_version INTEGER NOT NULL,event_type TEXT NOT NULL,idempotency_key TEXT NOT NULL,producer_principal_id TEXT NOT NULL,producer_session_id TEXT NOT NULL,producer_epoch INTEGER NOT NULL,producer_seq INTEGER NOT NULL,repo_id TEXT,topic_id TEXT,workpackage_id TEXT,correlation_id TEXT NOT NULL,causation_ids_bytes BLOB NOT NULL,authority_grant_id TEXT NOT NULL,authority_scope_digest TEXT NOT NULL,authority_principal_version INTEGER NOT NULL,classification TEXT NOT NULL,retention_class TEXT NOT NULL,created_at_utc TEXT NOT NULL,accepted_at_utc TEXT NOT NULL,payload_kind TEXT NOT NULL,payload_digest TEXT NOT NULL,payload_ref TEXT NOT NULL,payload_size_bytes INTEGER NOT NULL CHECK((payload_kind='artifact' AND payload_size_bytes BETWEEN 0 AND 9223372036854775807) OR (payload_kind IN ('inline','blob') AND payload_size_bytes BETWEEN 0 AND 1048576)),header_bytes BLOB NOT NULL CHECK(length(header_bytes)<=4096),header_digest TEXT NOT NULL,UNIQUE(partition,partition_seq),UNIQUE(producer_principal_id,producer_epoch,producer_seq),UNIQUE(producer_principal_id,producer_epoch,idempotency_key),FOREIGN KEY(payload_kind,payload_digest,payload_ref) REFERENCES payloads(kind,digest,ref))",
+    "CREATE TABLE producer_epochs (producer_principal_id TEXT NOT NULL,producer_epoch INTEGER NOT NULL,producer_session_id TEXT NOT NULL,last_seq INTEGER NOT NULL CHECK(last_seq>=0),last_event_id TEXT,updated_at_utc TEXT NOT NULL,PRIMARY KEY(producer_principal_id,producer_epoch))",
+    "CREATE TABLE idempotency (producer_principal_id TEXT NOT NULL,producer_epoch INTEGER NOT NULL,idempotency_key TEXT NOT NULL,event_id TEXT NOT NULL UNIQUE,canonical_request_digest TEXT NOT NULL,partition_seq INTEGER NOT NULL CHECK(partition_seq>=1),accepted_at_utc TEXT NOT NULL,created_at_utc TEXT NOT NULL,PRIMARY KEY(producer_principal_id,producer_epoch,idempotency_key))",
+    "CREATE TABLE subscription_manifests (consumer_group_id TEXT NOT NULL,generation TEXT NOT NULL,manifest_bytes BLOB NOT NULL,manifest_size_bytes INTEGER NOT NULL CHECK(manifest_size_bytes BETWEEN 1 AND 65536 AND length(manifest_bytes)=manifest_size_bytes),created_at_utc TEXT NOT NULL,PRIMARY KEY(consumer_group_id,generation))",
+    "CREATE TABLE cursors (consumer_group_id TEXT NOT NULL,partition TEXT NOT NULL,generation TEXT NOT NULL,acked_seq INTEGER NOT NULL CHECK(acked_seq>=0),gap_snapshot_id TEXT,gap_from_seq INTEGER,gap_through_seq INTEGER,updated_at_utc TEXT NOT NULL,PRIMARY KEY(consumer_group_id,partition),FOREIGN KEY(partition) REFERENCES partitions(partition),FOREIGN KEY(consumer_group_id,generation) REFERENCES subscription_manifests(consumer_group_id,generation),CHECK((gap_snapshot_id IS NULL AND gap_from_seq IS NULL AND gap_through_seq IS NULL) OR (gap_snapshot_id IS NOT NULL AND gap_from_seq>=1 AND gap_from_seq<=gap_through_seq)))",
+    "CREATE TABLE delivery_leases (consumer_group_id TEXT NOT NULL,partition TEXT NOT NULL,generation TEXT NOT NULL,delivery_token TEXT NOT NULL UNIQUE,from_seq INTEGER NOT NULL,scan_through_seq INTEGER NOT NULL CHECK(from_seq>=1 AND from_seq<=scan_through_seq),leased_at_utc TEXT NOT NULL,expires_at_utc TEXT NOT NULL,created_monotonic REAL NOT NULL,PRIMARY KEY(consumer_group_id,partition),FOREIGN KEY(consumer_group_id,partition) REFERENCES cursors(consumer_group_id,partition),FOREIGN KEY(consumer_group_id,generation) REFERENCES subscription_manifests(consumer_group_id,generation))",
+    "CREATE TABLE consumer_effects (consumer_group_id TEXT NOT NULL,event_id TEXT NOT NULL,partition TEXT NOT NULL,partition_seq INTEGER NOT NULL,generation TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','committed','dead_lettered')),effect_digest TEXT,attempt_count INTEGER NOT NULL CHECK(attempt_count BETWEEN 0 AND 5),retry_not_before_utc TEXT,lease_token TEXT,lease_expires_at_utc TEXT,last_error_code TEXT,updated_at_utc TEXT NOT NULL,PRIMARY KEY(consumer_group_id,event_id),FOREIGN KEY(consumer_group_id,partition) REFERENCES cursors(consumer_group_id,partition),FOREIGN KEY(consumer_group_id,generation) REFERENCES subscription_manifests(consumer_group_id,generation))",
+    "CREATE TABLE dead_letters (consumer_group_id TEXT NOT NULL,event_id TEXT NOT NULL,partition TEXT NOT NULL,partition_seq INTEGER NOT NULL,generation TEXT NOT NULL,attempt_count INTEGER NOT NULL CHECK(attempt_count=5),error_code TEXT NOT NULL,error_fingerprint TEXT NOT NULL,created_at_utc TEXT NOT NULL,PRIMARY KEY(consumer_group_id,event_id),FOREIGN KEY(consumer_group_id,event_id) REFERENCES consumer_effects(consumer_group_id,event_id))",
+    "CREATE TABLE snapshots (snapshot_id TEXT PRIMARY KEY,partition TEXT NOT NULL REFERENCES partitions(partition),through_seq INTEGER NOT NULL CHECK(through_seq>=1),snapshot_digest TEXT NOT NULL UNIQUE,snapshot_bytes BLOB NOT NULL CHECK(length(snapshot_bytes)<=1048576),snapshot_size_bytes INTEGER NOT NULL CHECK(snapshot_size_bytes=length(snapshot_bytes)),created_at_utc TEXT NOT NULL,UNIQUE(partition,through_seq))",
+    "CREATE TABLE archive_manifests (archive_manifest_id TEXT PRIMARY KEY,partition TEXT NOT NULL REFERENCES partitions(partition),snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id),accepted_event_id TEXT NOT NULL,decision_digest TEXT NOT NULL,manifest_digest TEXT NOT NULL UNIQUE,manifest_bytes BLOB NOT NULL CHECK(length(manifest_bytes)<=1048576),manifest_size_bytes INTEGER NOT NULL CHECK(manifest_size_bytes=length(manifest_bytes)),state TEXT NOT NULL CHECK(state='prepared'),created_at_utc TEXT NOT NULL,UNIQUE(partition,snapshot_id,manifest_digest))",
+    "CREATE TABLE outbox (outbox_id TEXT PRIMARY KEY,event_id TEXT NOT NULL UNIQUE,effect_digest TEXT NOT NULL,idempotency_key TEXT NOT NULL,hash_basis_digest TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','leased','acked','blocked')),lease_token TEXT,lease_expires_at_utc TEXT,attempt_count INTEGER NOT NULL CHECK(attempt_count>=0),created_at_utc TEXT NOT NULL,updated_at_utc TEXT NOT NULL)",
+    "CREATE TABLE digest_anchors (partition TEXT NOT NULL REFERENCES partitions(partition),from_seq INTEGER NOT NULL CHECK(from_seq>=1),through_seq INTEGER NOT NULL CHECK(through_seq>=from_seq),event_count INTEGER NOT NULL CHECK(event_count BETWEEN 1 AND 32),header_bytes INTEGER NOT NULL CHECK(header_bytes BETWEEN 1 AND 69632),digest TEXT NOT NULL UNIQUE,digest_bytes BLOB NOT NULL CHECK(length(digest_bytes)<=65536),digest_size_bytes INTEGER NOT NULL CHECK(digest_size_bytes=length(digest_bytes)),created_at_utc TEXT NOT NULL,PRIMARY KEY(partition,through_seq),UNIQUE(partition,from_seq))",
+    "CREATE TABLE retention_policies (retention_generation INTEGER PRIMARY KEY CHECK(retention_generation>=1),policy_digest TEXT NOT NULL UNIQUE,policy_bytes BLOB NOT NULL CHECK(length(policy_bytes)<=4096),created_at_utc TEXT NOT NULL)",
+    "CREATE TABLE retention_checkpoints (partition TEXT NOT NULL REFERENCES partitions(partition),run_id TEXT NOT NULL,request_digest TEXT NOT NULL,retention_generation INTEGER NOT NULL REFERENCES retention_policies(retention_generation),basis_digest TEXT NOT NULL,snapshot_id TEXT REFERENCES snapshots(snapshot_id),compacted_through_seq INTEGER NOT NULL CHECK(compacted_through_seq>=0),first_retained_seq INTEGER NOT NULL CHECK(first_retained_seq>=1),expired_payload_count INTEGER NOT NULL CHECK(expired_payload_count>=0),compacted_event_count INTEGER NOT NULL CHECK(compacted_event_count>=0),completed_at_utc TEXT NOT NULL,PRIMARY KEY(partition,run_id),UNIQUE(partition,request_digest))",
+)
+EXPECTED_INDEX_DDL = (
+    "CREATE INDEX events_partition_retention_accepted_seq_idx ON events(partition,retention_class,accepted_at_utc,partition_seq)",
+    "CREATE INDEX events_payload_ref_idx ON events(payload_kind,payload_digest,payload_ref)",
+    "CREATE INDEX producer_epochs_principal_epoch_idx ON producer_epochs(producer_principal_id,producer_epoch DESC)",
+    "CREATE INDEX cursors_partition_acked_seq_idx ON cursors(partition,acked_seq)",
+    "CREATE INDEX delivery_leases_expiry_idx ON delivery_leases(expires_at_utc)",
+    "CREATE INDEX consumer_effects_partition_seq_idx ON consumer_effects(consumer_group_id,partition,partition_seq)",
+    "CREATE INDEX consumer_effects_retry_idx ON consumer_effects(retry_not_before_utc)",
+    "CREATE INDEX dead_letters_partition_seq_idx ON dead_letters(partition,partition_seq)",
+    "CREATE INDEX snapshots_partition_through_idx ON snapshots(partition,through_seq DESC)",
+    "CREATE INDEX outbox_state_expiry_idx ON outbox(state,lease_expires_at_utc)",
+)
+EXPECTED_MANIFEST = {
+    "schema_name": "hive_bus_store",
+    "generation": 2,
+    "tables": list(EXPECTED_TABLE_DDL),
+    "indexes": list(EXPECTED_INDEX_DDL),
+    "pragmas": GEN1_MANIFEST["pragmas"],
+}
+EXPECTED_SCHEMA_DIGEST = (
+    "sha256:1554a2ab9908b11262b238fb2906ec2c43b81f7fdf99f120546d415e4b462e11"
+)
+GEN1_RETENTION_POLICY = {
+    "schema_version": 1,
+    "retention_generation": 1,
+    "classes": {
+        "transient": {
+            "header_retention_seconds": 86400,
+            "payload_retention_seconds": 21600,
+        },
+        "work": {
+            "header_retention_seconds": 2592000,
+            "payload_retention_seconds": 604800,
+        },
+        "audit": {
+            "header_retention_seconds": 31536000,
+            "payload_retention_seconds": 2592000,
+        },
+        "manifest": {
+            "header_retention_seconds": None,
+            "payload_retention_seconds": None,
+        },
+    },
+}
+GEN1_RETENTION_POLICY_DIGEST = (
+    "sha256:33dc6401f637e0dd7552a606266771f6cdfe5393f9d87d59353957a711324e8f"
+)
 
 
 class FakeClock:
@@ -82,13 +155,19 @@ def _request(
     *,
     idempotency_suffix: str = "0",
     producer_seq: int = 1,
+    producer_principal_hex: str = "0123456789abcdef0123456789abcdef",
+    producer_epoch: int = 1,
     payload_kind: str = "inline",
     payload_bytes: bytes = b"payload",
 ) -> dict[str, object]:
     idempotency_hex = (
         idempotency_suffix * 32 if len(idempotency_suffix) == 1 else idempotency_suffix
     )
-    event_type = "result.proposed" if payload_kind in {"blob", "artifact"} else "assignment.created"
+    event_type = (
+        "result.proposed"
+        if payload_kind in {"blob", "artifact"}
+        else "assignment.created"
+    )
     payload_digest = _digest(payload_bytes)
     reference = f"{payload_kind}:{payload_digest}"
     if payload_kind == "artifact":
@@ -98,9 +177,9 @@ def _request(
         "event_type": event_type,
         "partition": "repo/repo-1/task/task-1",
         "idempotency_key": "idempotency-v1-" + idempotency_hex,
-        "producer_principal_id": "producer-principal-v1-0123456789abcdef0123456789abcdef",
+        "producer_principal_id": "producer-principal-v1-" + producer_principal_hex,
         "producer_session_id": "producer-session-v1-0123456789abcdef0123456789abcdef",
-        "producer_epoch": 1,
+        "producer_epoch": producer_epoch,
         "producer_seq": producer_seq,
         "repo_id": "repo-1",
         "topic_id": None,
@@ -188,22 +267,265 @@ def _prepared_delivery(
     return generation, store.poll_headers(_GROUP, _PARTITION, generation)
 
 
+def _seed_exact_gen1(root: Path, clock: FakeClock) -> None:
+    """Create a fully-populated, byte-exact legacy source for migration tests."""
+
+    root.mkdir(mode=0o700)
+    database = root / "bus_store.sqlite3"
+    connection = sqlite3.connect(database)
+    accepted_at_utc = "2026-09-15T10:11:12.345Z"
+    created_at_utc = "2026-09-15T10:00:00Z"
+    request = _request()
+    event = create_hive_bus_event_v1(
+        request, partition_seq=1, accepted_at_utc=accepted_at_utc
+    )
+    header = canonical_json_bytes(serialize_hive_bus_event_v1(event))
+    artifact_digest = _digest(b"legacy-artifact")
+    artifact_ref = f"artifact:artifact-1@{artifact_digest}"
+    manifest_generation = _digest(b"legacy-manifest")
+    snapshot_id = _digest(b"legacy-snapshot-id")
+    snapshot_digest = _digest(b"legacy-snapshot")
+    try:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        for statement in GEN1_TABLE_DDL:
+            connection.execute(statement)
+        for statement in GEN1_INDEX_DDL:
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO bus_store_meta(schema_name,generation,schema_digest,created_at_utc) VALUES(?,?,?,?)",
+            ("hive_bus_store", 1, GEN1_SCHEMA_DIGEST, accepted_at_utc),
+        )
+        connection.execute(
+            "INSERT INTO partitions(partition,next_seq,first_retained_seq,state,blocked_code,created_at_utc,updated_at_utc) VALUES(?,?,?,?,?,?,?)",
+            (_PARTITION, 2, 1, "active", None, accepted_at_utc, accepted_at_utc),
+        )
+        connection.execute(
+            "INSERT INTO payloads(kind,digest,ref,size_bytes,body,body_state,artifact_id,quarantine_code,created_at_utc) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                "inline",
+                _digest(b"payload"),
+                f"inline:{_digest(b'payload')}",
+                7,
+                b"payload",
+                "present",
+                None,
+                None,
+                accepted_at_utc,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO payloads(kind,digest,ref,size_bytes,body,body_state,artifact_id,quarantine_code,created_at_utc) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                "artifact",
+                artifact_digest,
+                artifact_ref,
+                0,
+                None,
+                "reference",
+                "artifact-1",
+                None,
+                accepted_at_utc,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO events(event_id,partition,partition_seq,schema_version,event_type,idempotency_key,producer_principal_id,producer_session_id,producer_epoch,producer_seq,repo_id,topic_id,workpackage_id,correlation_id,causation_ids_bytes,authority_grant_id,authority_scope_digest,authority_principal_version,classification,retention_class,created_at_utc,accepted_at_utc,payload_kind,payload_digest,payload_ref,payload_size_bytes,header_bytes,header_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                event.event_id,
+                event.partition,
+                event.partition_seq,
+                event.schema_version,
+                event.event_type,
+                event.idempotency_key,
+                event.producer_principal_id,
+                event.producer_session_id,
+                event.producer_epoch,
+                event.producer_seq,
+                event.repo_id,
+                event.topic_id,
+                event.workpackage_id,
+                event.correlation_id,
+                canonical_json_bytes(list(event.causation_ids)),
+                event.authority.grant_id,
+                event.authority.scope_digest,
+                event.authority.principal_version,
+                event.classification,
+                event.retention_class,
+                event.created_at_utc,
+                event.accepted_at_utc,
+                event.payload.kind,
+                event.payload.digest,
+                event.payload.ref,
+                event.payload.size_bytes,
+                header,
+                _digest(header),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO producer_epochs(producer_principal_id,producer_epoch,producer_session_id,last_seq,last_event_id,updated_at_utc) VALUES(?,?,?,?,?,?)",
+            (
+                event.producer_principal_id,
+                event.producer_epoch,
+                event.producer_session_id,
+                1,
+                event.event_id,
+                accepted_at_utc,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO idempotency(idempotency_key,event_id,canonical_request_digest,created_at_utc) VALUES(?,?,?,?)",
+            (
+                event.idempotency_key,
+                event.event_id,
+                _digest(canonical_json_bytes(request)),
+                created_at_utc,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO subscription_manifests(consumer_group_id,generation,manifest_bytes,manifest_size_bytes,created_at_utc) VALUES(?,?,?,?,?)",
+            (_GROUP, manifest_generation, b"legacy-manifest", 15, accepted_at_utc),
+        )
+        connection.execute(
+            "INSERT INTO cursors(consumer_group_id,partition,generation,acked_seq,gap_snapshot_id,gap_from_seq,gap_through_seq,updated_at_utc) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                _GROUP,
+                _PARTITION,
+                manifest_generation,
+                0,
+                None,
+                None,
+                None,
+                accepted_at_utc,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO delivery_leases(consumer_group_id,partition,generation,delivery_token,from_seq,scan_through_seq,leased_at_utc,expires_at_utc,created_monotonic) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                _GROUP,
+                _PARTITION,
+                manifest_generation,
+                _digest(b"legacy-lease"),
+                1,
+                1,
+                accepted_at_utc,
+                "2026-09-15T10:12:12.345Z",
+                123.5,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO consumer_effects(consumer_group_id,event_id,partition,partition_seq,generation,state,effect_digest,attempt_count,retry_not_before_utc,lease_token,lease_expires_at_utc,last_error_code,updated_at_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                _GROUP,
+                event.event_id,
+                _PARTITION,
+                1,
+                manifest_generation,
+                "dead_lettered",
+                None,
+                5,
+                None,
+                None,
+                None,
+                "BUS_E_SCHEMA",
+                accepted_at_utc,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO dead_letters(consumer_group_id,event_id,partition,partition_seq,generation,attempt_count,error_code,error_fingerprint,created_at_utc) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                _GROUP,
+                event.event_id,
+                _PARTITION,
+                1,
+                manifest_generation,
+                5,
+                "BUS_E_SCHEMA",
+                _digest(b"legacy-error"),
+                accepted_at_utc,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO snapshots(snapshot_id,partition,through_seq,snapshot_digest,snapshot_bytes,snapshot_size_bytes,created_at_utc) VALUES(?,?,?,?,?,?,?)",
+            (
+                snapshot_id,
+                _PARTITION,
+                1,
+                snapshot_digest,
+                b"legacy-snapshot",
+                15,
+                accepted_at_utc,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO archive_manifests(archive_manifest_id,partition,snapshot_id,accepted_event_id,decision_digest,manifest_digest,manifest_bytes,manifest_size_bytes,state,created_at_utc) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                _digest(b"legacy-archive-id"),
+                _PARTITION,
+                snapshot_id,
+                event.event_id,
+                _digest(b"legacy-decision"),
+                _digest(b"legacy-manifest-bytes"),
+                b"legacy-manifest",
+                15,
+                "prepared",
+                accepted_at_utc,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO outbox(outbox_id,event_id,effect_digest,idempotency_key,hash_basis_digest,state,lease_token,lease_expires_at_utc,attempt_count,created_at_utc,updated_at_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                _digest(b"legacy-outbox"),
+                event.event_id,
+                _digest(b"legacy-effect"),
+                event.idempotency_key,
+                _digest(b"legacy-basis"),
+                "pending",
+                None,
+                None,
+                0,
+                accepted_at_utc,
+                accepted_at_utc,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    database.chmod(0o600)
+    owner = root / "bus_store.owner.lock"
+    owner.write_bytes(b"")
+    owner.chmod(0o600)
+
+
+def _persisted_schema(root: Path) -> dict[str, str]:
+    connection = sqlite3.connect(root / "bus_store.sqlite3")
+    try:
+        return dict(
+            connection.execute(
+                "SELECT name,sql FROM sqlite_schema WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'"
+            )
+        )
+    finally:
+        connection.close()
+
+
 @pytest.fixture
 def secure_tmp_path() -> Path:
     with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
         yield Path(temporary)
 
 
-def test_foundation_initializes_exact_manifest_and_pragmas(secure_tmp_path: Path) -> None:
+def test_foundation_initializes_exact_manifest_and_pragmas(
+    secure_tmp_path: Path,
+) -> None:
     root = secure_tmp_path / "bus-state"
     store = _store(root, FakeClock())
     try:
-        expected_digest = "sha256:" + hashlib.sha256(
-            canonical_json_bytes(EXPECTED_MANIFEST)
-        ).hexdigest()
+        expected_digest = (
+            "sha256:"
+            + hashlib.sha256(canonical_json_bytes(EXPECTED_MANIFEST)).hexdigest()
+        )
         assert expected_digest == EXPECTED_SCHEMA_DIGEST
-        assert len(EXPECTED_TABLE_DDL) == 14
-        assert len(EXPECTED_INDEX_DDL) == 9
+        assert len(EXPECTED_TABLE_DDL) == 17
+        assert len(EXPECTED_INDEX_DDL) == 10
         assert all(
             statement.isascii()
             and statement == statement.strip()
@@ -231,19 +553,28 @@ def test_foundation_initializes_exact_manifest_and_pragmas(secure_tmp_path: Path
                 "WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'"
             )
         )
-        assert {name for name in schema if name in {sql.split()[2] for sql in EXPECTED_TABLE_DDL}} == {
-            sql.split()[2] for sql in EXPECTED_TABLE_DDL
-        }
+        assert {
+            name
+            for name in schema
+            if name in {sql.split()[2] for sql in EXPECTED_TABLE_DDL}
+        } == {sql.split()[2] for sql in EXPECTED_TABLE_DDL}
         for statement in (*EXPECTED_TABLE_DDL, *EXPECTED_INDEX_DDL):
-            assert schema[statement.split()[2 if statement.startswith("CREATE TABLE") else 2]] == statement
+            assert (
+                schema[
+                    statement.split()[2 if statement.startswith("CREATE TABLE") else 2]
+                ]
+                == statement
+            )
         assert store._connection.execute(  # noqa: SLF001 - verifies independent manifest gold.
             "SELECT schema_name,generation,schema_digest FROM bus_store_meta"
-        ).fetchall() == [("hive_bus_store", 1, EXPECTED_SCHEMA_DIGEST)]
+        ).fetchall() == [("hive_bus_store", 2, EXPECTED_SCHEMA_DIGEST)]
         assert store._connection.execute("PRAGMA foreign_keys").fetchone() == (1,)  # noqa: SLF001
         assert store._connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)  # noqa: SLF001
         assert store._connection.execute("PRAGMA synchronous").fetchone() == (2,)  # noqa: SLF001
         assert store._connection.execute("PRAGMA busy_timeout").fetchone() == (5000,)  # noqa: SLF001
-        assert store._connection.execute("PRAGMA wal_autocheckpoint").fetchone() == (1000,)  # noqa: SLF001
+        assert store._connection.execute("PRAGMA wal_autocheckpoint").fetchone() == (
+            1000,
+        )  # noqa: SLF001
     finally:
         assert store.close() is None
 
@@ -260,12 +591,298 @@ def test_open_never_creates_and_schema_is_fail_closed(secure_tmp_path: Path) -> 
     assert store.close() is None
     connection = sqlite3.connect(root / "bus_store.sqlite3")
     try:
-        connection.execute("UPDATE bus_store_meta SET generation = 2")
+        connection.execute("UPDATE bus_store_meta SET generation = 3")
         connection.commit()
     finally:
         connection.close()
     result = HiveBusStore.initialize(root, clock=clock)
     _diagnostic(result, "BUS_E_STORE_SCHEMA_TOO_NEW", DiagnosticSeverityV2.CRITICAL)
+
+
+def test_exact_fully_populated_gen1_migrates_once_to_the_gen2_gold_schema(
+    secure_tmp_path: Path,
+) -> None:
+    root = secure_tmp_path / "bus-state"
+    clock = FakeClock()
+    _seed_exact_gen1(root, clock)
+
+    store = HiveBusStore.initialize(root, clock=clock)
+
+    assert isinstance(store, HiveBusStore)
+    try:
+        policy_bytes = canonical_json_bytes(GEN1_RETENTION_POLICY)
+        assert len(policy_bytes) == 377
+        assert _digest(policy_bytes) == GEN1_RETENTION_POLICY_DIGEST
+        assert store._connection.execute(  # noqa: SLF001 - exact migration destination.
+            "SELECT schema_name,generation,schema_digest FROM bus_store_meta"
+        ).fetchall() == [("hive_bus_store", 2, EXPECTED_SCHEMA_DIGEST)]
+        assert store._connection.execute(  # noqa: SLF001 - legacy values are preserved.
+            "SELECT COUNT(*) FROM payloads"
+        ).fetchone() == (2,)
+        for table in (
+            "partitions",
+            "events",
+            "producer_epochs",
+            "subscription_manifests",
+            "cursors",
+            "delivery_leases",
+            "consumer_effects",
+            "dead_letters",
+            "snapshots",
+            "archive_manifests",
+            "outbox",
+        ):
+            assert store._connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone() == (1,)  # noqa: S608, SLF001 - closed test literals.
+        source_idempotency = store._connection.execute(  # noqa: SLF001 - joined columns are migration contract.
+            "SELECT producer_principal_id,producer_epoch,idempotency_key,event_id,partition_seq,accepted_at_utc,created_at_utc FROM idempotency"
+        ).fetchall()
+        assert source_idempotency == [
+            (
+                "producer-principal-v1-0123456789abcdef0123456789abcdef",
+                1,
+                "idempotency-v1-00000000000000000000000000000000",
+                store._connection.execute("SELECT event_id FROM events").fetchone()[0],  # noqa: SLF001
+                1,
+                "2026-09-15T10:11:12.345Z",
+                "2026-09-15T10:00:00Z",
+            )
+        ]
+        assert store._connection.execute(  # noqa: SLF001 - exact one-time policy seed.
+            "SELECT retention_generation,policy_digest,policy_bytes FROM retention_policies"
+        ).fetchall() == [(1, GEN1_RETENTION_POLICY_DIGEST, policy_bytes)]
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM digest_anchors"
+        ).fetchone() == (0,)  # noqa: SLF001
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM retention_checkpoints"
+        ).fetchone() == (0,)  # noqa: SLF001
+    finally:
+        assert store.close() is None
+    reopened = HiveBusStore.initialize(root, clock=clock)
+    assert isinstance(reopened, HiveBusStore)
+    assert reopened.close() is None
+    schema = _persisted_schema(root)
+    assert set(EXPECTED_TABLE_DDL) <= set(schema.values())
+    assert set(EXPECTED_INDEX_DDL) <= set(schema.values())
+    assert not any(name.startswith("legacy_g1_") for name in schema)
+
+
+def test_gen1_persisted_journal_mode_is_attested_before_gen2_configuration(
+    secure_tmp_path: Path,
+) -> None:
+    root = secure_tmp_path / "journal-mode-drift"
+    _seed_exact_gen1(root, FakeClock())
+    connection = sqlite3.connect(root / "bus_store.sqlite3")
+    try:
+        # A reopen supplies these connection-local defaults, not historical
+        # Gen-1 evidence.  Only journal_mode remains persisted in the file.
+        # foreign_keys is enabled narrowly later for foreign_key_check.
+        assert connection.execute("PRAGMA foreign_keys").fetchone() == (0,)
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert connection.execute("PRAGMA synchronous").fetchone() == (2,)
+        assert connection.execute("PRAGMA busy_timeout").fetchone() == (5000,)
+        assert connection.execute("PRAGMA wal_autocheckpoint").fetchone() == (1000,)
+        assert connection.execute("PRAGMA journal_mode=DELETE").fetchone() == (
+            "delete",
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    connection = sqlite3.connect(root / "bus_store.sqlite3")
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    finally:
+        connection.close()
+
+    result = HiveBusStore.initialize(root, clock=FakeClock())
+    if isinstance(result, HiveBusStore):
+        assert result.close() is None
+
+    _diagnostic(result, "BUS_E_STORE_SCHEMA_UNKNOWN", DiagnosticSeverityV2.CRITICAL)
+    schema = _persisted_schema(root)
+    assert set(GEN1_TABLE_DDL) <= set(schema.values())
+    assert set(GEN1_INDEX_DDL) <= set(schema.values())
+    assert not any(name.startswith("legacy_g1_") for name in schema)
+    connection = sqlite3.connect(root / "bus_store.sqlite3")
+    try:
+        assert connection.execute(
+            "SELECT generation FROM bus_store_meta"
+        ).fetchone() == (1,)
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    finally:
+        connection.close()
+
+
+def test_gen1_source_attests_only_persisted_journal_before_operational_configuration(
+    secure_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = secure_tmp_path / "connection-local-pragmas"
+    _seed_exact_gen1(root, FakeClock())
+    database = root / "bus_store.sqlite3"
+    original_connect = sqlite3.connect
+
+    def open_with_connection_local_drift(
+        path: str | Path, *args: object, **kwargs: object
+    ) -> sqlite3.Connection:
+        connection = original_connect(path, *args, **kwargs)
+        if Path(path) == database:
+            assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("PRAGMA busy_timeout=17")
+            connection.execute("PRAGMA wal_autocheckpoint=23")
+        return connection
+
+    monkeypatch.setattr(bus_store.sqlite3, "connect", open_with_connection_local_drift)
+    result = HiveBusStore.initialize(root, clock=FakeClock())
+
+    assert isinstance(result, HiveBusStore)
+    try:
+        assert result._connection.execute(  # noqa: SLF001 - operational post-migration setup.
+            "SELECT generation FROM bus_store_meta"
+        ).fetchone() == (2,)
+        assert result._connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)  # noqa: SLF001
+        assert result._connection.execute("PRAGMA foreign_keys").fetchone() == (1,)  # noqa: SLF001
+        assert result._connection.execute("PRAGMA synchronous").fetchone() == (2,)  # noqa: SLF001
+        assert result._connection.execute("PRAGMA busy_timeout").fetchone() == (5000,)  # noqa: SLF001
+        assert result._connection.execute("PRAGMA wal_autocheckpoint").fetchone() == (
+            1000,
+        )  # noqa: SLF001
+    finally:
+        assert result.close() is None
+
+
+def test_gen1_migration_sets_full_synchronous_before_rename(
+    secure_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = secure_tmp_path / "migration-synchronous"
+    _seed_exact_gen1(root, FakeClock())
+    database = root / "bus_store.sqlite3"
+    original_connect = sqlite3.connect
+    connections: list[sqlite3.Connection] = []
+
+    def open_with_synchronous_off(
+        path: str | Path, *args: object, **kwargs: object
+    ) -> sqlite3.Connection:
+        connection = original_connect(path, *args, **kwargs)
+        if Path(path) == database:
+            connection.execute("PRAGMA synchronous=OFF")
+            connections.append(connection)
+        return connection
+
+    def attest_migration_configuration(stage: str) -> None:
+        if stage == "before_rename":
+            assert len(connections) == 1
+            assert connections[0].in_transaction
+            assert connections[0].execute("PRAGMA synchronous").fetchone() == (2,)
+            assert connections[0].execute("PRAGMA foreign_keys").fetchone() == (0,)
+
+    monkeypatch.setattr(bus_store.sqlite3, "connect", open_with_synchronous_off)
+    monkeypatch.setattr(
+        bus_store, "_migration_checkpoint", attest_migration_configuration
+    )
+    result = HiveBusStore.initialize(root, clock=FakeClock())
+
+    assert isinstance(result, HiveBusStore)
+    assert result.close() is None
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "generation"),
+    (
+        ("before_rename", 1),
+        ("after_rename_indexdrop", 1),
+        ("after_copy", 1),
+        ("after_final_validation_before_commit", 1),
+        ("after_commit", 2),
+    ),
+)
+def test_gen1_migration_crash_boundaries_are_all_or_nothing(
+    secure_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+    generation: int,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    root = secure_tmp_path / checkpoint
+    clock = FakeClock()
+    _seed_exact_gen1(root, clock)
+
+    def fault(point: str) -> None:
+        if point == checkpoint:
+            raise SimulatedCrash
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(bus_store, "_migration_checkpoint", fault)
+        with pytest.raises(SimulatedCrash):
+            HiveBusStore.initialize(root, clock=clock)
+
+    schema = _persisted_schema(root)
+    assert not any(name.startswith("legacy_g1_") for name in schema)
+    connection = sqlite3.connect(root / "bus_store.sqlite3")
+    try:
+        assert connection.execute(
+            "SELECT generation FROM bus_store_meta"
+        ).fetchone() == (generation,)
+    finally:
+        connection.close()
+    if generation == 1:
+        assert set(GEN1_TABLE_DDL) <= set(schema.values())
+        assert set(GEN1_INDEX_DDL) <= set(schema.values())
+    else:
+        assert set(EXPECTED_TABLE_DDL) <= set(schema.values())
+        assert set(EXPECTED_INDEX_DDL) <= set(schema.values())
+
+    resumed = HiveBusStore.initialize(root, clock=clock)
+    assert isinstance(resumed, HiveBusStore)
+    assert resumed.close() is None
+
+
+def test_gen1_schema_mix_fails_closed_and_owner_stays_active_during_migration(
+    secure_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mixed_root = secure_tmp_path / "mixed"
+    _seed_exact_gen1(mixed_root, FakeClock())
+    connection = sqlite3.connect(mixed_root / "bus_store.sqlite3")
+    try:
+        connection.execute("CREATE TABLE unrecognized_mix (value TEXT)")
+        connection.commit()
+    finally:
+        connection.close()
+    mixed = HiveBusStore.initialize(mixed_root, clock=FakeClock())
+    _diagnostic(mixed, "BUS_E_STORE_SCHEMA_UNKNOWN", DiagnosticSeverityV2.CRITICAL)
+
+    root = secure_tmp_path / "owner-active"
+    clock = FakeClock()
+    _seed_exact_gen1(root, clock)
+    entered = threading.Event()
+    release = threading.Event()
+    results: list[object] = []
+
+    def pause_after_rename(point: str) -> None:
+        if point == "after_rename_indexdrop":
+            entered.set()
+            assert release.wait(timeout=5)
+
+    def migrate() -> None:
+        results.append(HiveBusStore.initialize(root, clock=clock))
+
+    monkeypatch.setattr(bus_store, "_migration_checkpoint", pause_after_rename)
+    worker = threading.Thread(target=migrate)
+    worker.start()
+    assert entered.wait(timeout=5)
+    parallel = HiveBusStore.open(root, clock=clock)
+    _diagnostic(parallel, "BUS_E_STORE_OWNER_ACTIVE", DiagnosticSeverityV2.WARNING)
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert len(results) == 1 and isinstance(results[0], HiveBusStore)
+    assert results[0].close() is None
 
 
 def test_initialize_rejects_an_existing_empty_database_without_reinitializing(
@@ -285,9 +902,12 @@ def test_initialize_rejects_an_existing_empty_database_without_reinitializing(
     _diagnostic(result, "BUS_E_STORE_SCHEMA_UNKNOWN", DiagnosticSeverityV2.CRITICAL)
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute(
-            "SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
-        ).fetchall() == []
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            == []
+        )
     finally:
         connection.close()
 
@@ -322,7 +942,9 @@ def test_network_filesystems_are_rejected_without_mounting(
         lambda _descriptor: filesystem_magic,
     )
 
-    result = HiveBusStore.initialize(secure_tmp_path / "network-state", clock=FakeClock())
+    result = HiveBusStore.initialize(
+        secure_tmp_path / "network-state", clock=FakeClock()
+    )
 
     _diagnostic(result, "BUS_E_STORE_ROOT_UNTRUSTED", DiagnosticSeverityV2.CRITICAL)
     assert not (secure_tmp_path / "network-state").exists()
@@ -341,7 +963,9 @@ def test_linux_fstatfs_probe_masks_the_linux_filesystem_magic(
     assert bus_store._filesystem_type(7) is None
 
 
-def test_filesystem_owner_and_closed_lifecycle_are_fail_closed(secure_tmp_path: Path) -> None:
+def test_filesystem_owner_and_closed_lifecycle_are_fail_closed(
+    secure_tmp_path: Path,
+) -> None:
     clock = FakeClock()
     relative = HiveBusStore.initialize(Path("relative"), clock=clock)
     _diagnostic(relative, "BUS_E_STORE_ROOT_UNTRUSTED", DiagnosticSeverityV2.CRITICAL)
@@ -376,7 +1000,9 @@ def test_filesystem_owner_and_closed_lifecycle_are_fail_closed(secure_tmp_path: 
     _diagnostic(closed, "BUS_E_STORE_INTEGRITY", DiagnosticSeverityV2.CRITICAL)
 
 
-def test_append_is_atomic_idempotent_and_uses_canonical_header(secure_tmp_path: Path) -> None:
+def test_append_is_atomic_idempotent_and_uses_canonical_header(
+    secure_tmp_path: Path,
+) -> None:
     store = _store(secure_tmp_path / "bus-state", FakeClock())
     request = _request()
     try:
@@ -389,13 +1015,19 @@ def test_append_is_atomic_idempotent_and_uses_canonical_header(secure_tmp_path: 
 
         retried = store.append(request, payload_bytes=b"payload")
         assert retried == first
-        assert store._connection.execute("SELECT COUNT(*) FROM events").fetchone() == (1,)  # noqa: SLF001
-        assert store._connection.execute("SELECT next_seq FROM partitions").fetchone() == (2,)  # noqa: SLF001
+        assert store._connection.execute("SELECT COUNT(*) FROM events").fetchone() == (
+            1,
+        )  # noqa: SLF001
+        assert store._connection.execute(
+            "SELECT next_seq FROM partitions"
+        ).fetchone() == (2,)  # noqa: SLF001
     finally:
         assert store.close() is None
 
 
-def test_append_rejects_payload_and_sequence_conflicts_without_writing(secure_tmp_path: Path) -> None:
+def test_append_rejects_payload_and_sequence_conflicts_without_writing(
+    secure_tmp_path: Path,
+) -> None:
     store = _store(secure_tmp_path / "bus-state", FakeClock())
     try:
         mismatch = store.append(_request(), payload_bytes=b"different")
@@ -405,11 +1037,11 @@ def test_append_rejects_payload_and_sequence_conflicts_without_writing(secure_tm
         )
         _diagnostic(artifact_with_bytes, "BUS_E_SCHEMA", DiagnosticSeverityV2.ERROR)
 
-        assert not isinstance(store.append(_request(), payload_bytes=b"payload"), DiagnosticV2)
+        assert not isinstance(
+            store.append(_request(), payload_bytes=b"payload"), DiagnosticV2
+        )
         artifact = store.append(
-            _request(
-                idempotency_suffix="3", producer_seq=2, payload_kind="artifact"
-            ),
+            _request(idempotency_suffix="3", producer_seq=2, payload_kind="artifact"),
             payload_bytes=None,
         )
         assert not isinstance(artifact, DiagnosticV2)
@@ -419,7 +1051,9 @@ def test_append_rejects_payload_and_sequence_conflicts_without_writing(secure_tm
         conflict = store.append(
             _request(idempotency_suffix="1", producer_seq=1), payload_bytes=b"payload"
         )
-        _diagnostic(conflict, "BUS_E_PRODUCER_SEQ_REGRESSION", DiagnosticSeverityV2.ERROR)
+        _diagnostic(
+            conflict, "BUS_E_PRODUCER_SEQ_REGRESSION", DiagnosticSeverityV2.ERROR
+        )
         gap = store.append(
             _request(idempotency_suffix="2", producer_seq=4), payload_bytes=b"payload"
         )
@@ -428,30 +1062,238 @@ def test_append_rejects_payload_and_sequence_conflicts_without_writing(secure_tm
             _request() | {"created_at_utc": "2026-09-15T10:00:01Z"},
             payload_bytes=b"payload",
         )
-        _diagnostic(incompatible, "BUS_E_IDEMPOTENCY_CONFLICT", DiagnosticSeverityV2.ERROR)
+        _diagnostic(
+            incompatible, "BUS_E_IDEMPOTENCY_CONFLICT", DiagnosticSeverityV2.ERROR
+        )
     finally:
         assert store.close() is None
 
 
-def test_large_artifact_is_rejected_before_partition_mutation(secure_tmp_path: Path) -> None:
+def test_artifact_uses_external_signed64_size_without_body_or_inline_blob_regression(
+    secure_tmp_path: Path,
+) -> None:
     store = _store(secure_tmp_path / "bus-state", FakeClock())
-    request = _request(payload_kind="artifact")
-    payload = request["payload"]
-    assert isinstance(payload, dict)
-    request["payload"] = payload | {"size_bytes": 1048577}
     try:
-        result = store.append(request, payload_bytes=None)
+        first_request = _request(payload_kind="artifact")
+        first_payload = first_request["payload"]
+        assert isinstance(first_payload, dict)
+        first_request["payload"] = first_payload | {"size_bytes": 1_048_577}
+        first = store.append(first_request, payload_bytes=None)
+        assert not isinstance(first, DiagnosticV2)
 
-        _diagnostic(result, "BUS_E_EVENT_TOO_LARGE", DiagnosticSeverityV2.ERROR)
-        assert isinstance(result, DiagnosticV2)
-        assert result.retryable is False
-        assert result.action == "reject_publish"
-        assert store._connection.execute("SELECT COUNT(*) FROM partitions").fetchone() == (0,)  # noqa: SLF001
+        maximum_request = _request(
+            idempotency_suffix="2",
+            producer_seq=2,
+            payload_kind="artifact",
+            payload_bytes=b"maximum-artifact",
+        )
+        maximum_payload = maximum_request["payload"]
+        assert isinstance(maximum_payload, dict)
+        maximum_request["payload"] = maximum_payload | {"size_bytes": (2**63) - 1}
+        maximum = store.append(maximum_request, payload_bytes=None)
+        assert not isinstance(maximum, DiagnosticV2)
+        assert store._connection.execute(  # noqa: SLF001 - artifact bytes are never persisted.
+            "SELECT size_bytes,body,body_state FROM payloads WHERE kind='artifact' ORDER BY size_bytes"
+        ).fetchall() == [
+            (1_048_577, None, "reference"),
+            ((2**63) - 1, None, "reference"),
+        ]
+
+        before = store._connection.execute(  # noqa: SLF001 - reject is pre-mutation.
+            "SELECT COUNT(*) FROM events"
+        ).fetchone()
+        rejected_request = _request(
+            idempotency_suffix="3", producer_seq=3, payload_kind="artifact"
+        )
+        rejected_payload = rejected_request["payload"]
+        assert isinstance(rejected_payload, dict)
+        rejected_request["payload"] = rejected_payload | {"size_bytes": 2**63}
+        rejected = store.append(rejected_request, payload_bytes=None)
+        _diagnostic(rejected, "BUS_E_EVENT_TOO_LARGE", DiagnosticSeverityV2.ERROR)
+        assert (
+            store._connection.execute("SELECT COUNT(*) FROM events").fetchone()
+            == before
+        )  # noqa: SLF001
+
+        inline_ok = _request(
+            idempotency_suffix="4", producer_seq=3, payload_bytes=b"i" * 2048
+        )
+        assert not isinstance(
+            store.append(inline_ok, payload_bytes=b"i" * 2048), DiagnosticV2
+        )
+        inline_too_large = _request(
+            idempotency_suffix="5", producer_seq=4, payload_bytes=b"i" * 2049
+        )
+        _diagnostic(
+            store.append(inline_too_large, payload_bytes=b"i" * 2049),
+            "BUS_E_EVENT_TOO_LARGE",
+            DiagnosticSeverityV2.ERROR,
+        )
+        blob_ok = _request(
+            idempotency_suffix="6",
+            producer_seq=4,
+            payload_kind="blob",
+            payload_bytes=b"b" * (256 * 1024),
+        )
+        assert not isinstance(
+            store.append(blob_ok, payload_bytes=b"b" * (256 * 1024)), DiagnosticV2
+        )
     finally:
         assert store.close() is None
 
 
-def test_open_recovery_and_header_read_fail_closed_on_drift(secure_tmp_path: Path) -> None:
+def test_idempotency_is_scoped_to_producer_principal_epoch_and_conflicts_do_not_mutate(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "bus-state", FakeClock())
+    first_request = _request()
+    try:
+        first = store.append(first_request, payload_bytes=b"payload")
+        assert not isinstance(first, DiagnosticV2)
+        different_principal = store.append(
+            _request(
+                producer_principal_hex="fedcba9876543210fedcba9876543210",
+                producer_seq=1,
+            ),
+            payload_bytes=b"payload",
+        )
+        assert not isinstance(different_principal, DiagnosticV2)
+        different_epoch = store.append(
+            _request(producer_epoch=2, producer_seq=1), payload_bytes=b"payload"
+        )
+        assert not isinstance(different_epoch, DiagnosticV2)
+        assert {
+            first.partition_seq,
+            different_principal.partition_seq,
+            different_epoch.partition_seq,
+        } == {
+            1,
+            2,
+            3,
+        }
+        assert store.append(first_request, payload_bytes=b"payload") == first
+        before = store._connection.execute(  # noqa: SLF001 - conflict writes nothing.
+            "SELECT COUNT(*),MAX(partition_seq) FROM events"
+        ).fetchone()
+        conflict = store.append(
+            first_request | {"created_at_utc": "2026-09-15T10:00:01Z"},
+            payload_bytes=b"payload",
+        )
+        _diagnostic(conflict, "BUS_E_IDEMPOTENCY_CONFLICT", DiagnosticSeverityV2.ERROR)
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*),MAX(partition_seq) FROM events"
+            ).fetchone()
+            == before
+        )  # noqa: SLF001
+        assert store._connection.execute(  # noqa: SLF001 - no global key constraint remains.
+            "SELECT COUNT(*) FROM idempotency WHERE idempotency_key=?",
+            (first_request["idempotency_key"],),
+        ).fetchone() == (3,)
+    finally:
+        assert store.close() is None
+
+
+def test_append_crashes_rollback_or_commit_all_state_and_parallel_publishes_are_gapless(
+    secure_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    root = secure_tmp_path / "append-crash"
+    clock = FakeClock()
+    store = _store(root, clock)
+
+    def before_commit(point: str) -> None:
+        if point == "before_commit":
+            raise SimulatedCrash
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(bus_store, "_append_checkpoint", before_commit)
+        with pytest.raises(SimulatedCrash):
+            store.append(_request(), payload_bytes=b"payload")
+    assert store.close() is not None
+    reopened = _store(root, clock)
+    try:
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM events"
+        ).fetchone() == (0,)  # noqa: SLF001
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM payloads"
+        ).fetchone() == (0,)  # noqa: SLF001
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM idempotency"
+        ).fetchone() == (0,)  # noqa: SLF001
+    finally:
+        assert reopened.close() is None
+
+    store = _store(root, clock)
+
+    def after_commit(point: str) -> None:
+        if point == "after_commit":
+            raise SimulatedCrash
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(bus_store, "_append_checkpoint", after_commit)
+        with pytest.raises(SimulatedCrash):
+            store.append(_request(), payload_bytes=b"payload")
+    assert store.close() is None
+    reopened = _store(root, clock)
+    try:
+        retried = reopened.append(_request(), payload_bytes=b"payload")
+        assert not isinstance(retried, DiagnosticV2)
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM events"
+        ).fetchone() == (1,)  # noqa: SLF001
+    finally:
+        assert reopened.close() is None
+
+    parallel_root = secure_tmp_path / "append-race"
+    parallel = _store(parallel_root, clock)
+    gate = threading.Barrier(8)
+    results: list[object] = []
+
+    def publish(value: int) -> None:
+        gate.wait()
+        results.append(
+            parallel.append(
+                _request(
+                    idempotency_suffix=f"{value:032x}",
+                    producer_principal_hex=f"{value:032x}",
+                    producer_seq=1,
+                ),
+                payload_bytes=b"payload",
+            )
+        )
+
+    workers = [threading.Thread(target=publish, args=(value,)) for value in range(1, 9)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+    try:
+        assert len(results) == 8
+        assert all(not isinstance(result, DiagnosticV2) for result in results)
+        assert parallel._connection.execute(  # noqa: SLF001 - no gap, duplication, or partial state.
+            "SELECT partition_seq FROM events ORDER BY partition_seq"
+        ).fetchall() == [(value,) for value in range(1, 9)]
+        assert parallel._connection.execute(
+            "SELECT COUNT(*) FROM idempotency"
+        ).fetchone() == (8,)  # noqa: SLF001
+        assert parallel._connection.execute(
+            "SELECT COUNT(*) FROM payloads"
+        ).fetchone() == (1,)  # noqa: SLF001
+        assert parallel._connection.execute(
+            "SELECT next_seq FROM partitions"
+        ).fetchone() == (9,)  # noqa: SLF001
+    finally:
+        assert parallel.close() is None
+
+
+def test_open_recovery_and_header_read_fail_closed_on_drift(
+    secure_tmp_path: Path,
+) -> None:
     root = secure_tmp_path / "bus-state"
     clock = FakeClock()
     store = _store(root, clock)
@@ -538,7 +1380,9 @@ def test_b_manifest_cursor_and_public_bounds_are_opaque_and_fail_closed(
         )
         generation = store.record_manifest_bytes(_GROUP, manifest_bytes=b"opaque")
         assert generation == _digest(b"opaque")
-        assert store.record_manifest_bytes(_GROUP, manifest_bytes=b"opaque") == generation
+        assert (
+            store.record_manifest_bytes(_GROUP, manifest_bytes=b"opaque") == generation
+        )
         assert store._connection.execute(  # noqa: SLF001 - opaque byte persistence.
             "SELECT manifest_bytes,manifest_size_bytes FROM subscription_manifests"
         ).fetchall() == [(b"opaque", 6)]
@@ -551,7 +1395,9 @@ def test_b_manifest_cursor_and_public_bounds_are_opaque_and_fail_closed(
             action="refresh_subscription",
         )
         assert store.open_cursor_once(_GROUP, _PARTITION, generation) is None
-        assert store._connection.execute("SELECT COUNT(*) FROM cursors").fetchone() == (0,)  # noqa: SLF001
+        assert store._connection.execute("SELECT COUNT(*) FROM cursors").fetchone() == (
+            0,
+        )  # noqa: SLF001
         _append_events(store, 1)
         assert store.open_cursor_once(_GROUP, _PARTITION, generation) == 0
         alternate = store.record_manifest_bytes(_GROUP, manifest_bytes=b"alternate")
@@ -602,7 +1448,9 @@ def test_b_poll_is_header_bounded_and_parallel_lease_persists_only_digest(
         assert batch.from_seq == 1
         assert batch.scan_through_seq == 32
         assert len(batch.headers) == 32
-        assert all(type(header) is bytes and len(header) <= 4096 for header in batch.headers)
+        assert all(
+            type(header) is bytes and len(header) <= 4096 for header in batch.headers
+        )
         assert sum(map(len, batch.headers)) <= 65536
         assert batch.delivery_token.startswith("lease-v1-")
         persisted = store._connection.execute(  # noqa: SLF001 - bearer never reaches SQLite.
@@ -637,7 +1485,11 @@ def test_b_cursor_cas_effect_idempotence_and_crash_boundary(
         token = delivery.delivery_token
         effect_digest = _digest(b"effect-one")
         stale_generation = store.ack(
-            _GROUP, _PARTITION, _digest(b"other-generation"), token, delivery.scan_through_seq
+            _GROUP,
+            _PARTITION,
+            _digest(b"other-generation"),
+            token,
+            delivery.scan_through_seq,
         )
         _delivery_diagnostic(
             stale_generation,
@@ -659,7 +1511,9 @@ def test_b_cursor_cas_effect_idempotence_and_crash_boundary(
             retryable=True,
             action="repoll_headers",
         )
-        missing = store.ack(_GROUP, _PARTITION, generation, token, delivery.scan_through_seq)
+        missing = store.ack(
+            _GROUP, _PARTITION, generation, token, delivery.scan_through_seq
+        )
         _delivery_diagnostic(
             missing,
             "BUS_E_CURSOR_CONFLICT",
@@ -700,14 +1554,17 @@ def test_b_cursor_cas_effect_idempotence_and_crash_boundary(
             retryable=False,
             action="operator_intervention",
         )
-        assert store.commit_effect(
-            _GROUP,
-            _PARTITION,
-            generation,
-            token,
-            event.event_id,
-            effect_digest=effect_digest,
-        ) is None
+        assert (
+            store.commit_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                token,
+                event.event_id,
+                effect_digest=effect_digest,
+            )
+            is None
+        )
         assert store.close() is None
         reopened = HiveBusStore.initialize(root, clock=clock)
         assert isinstance(reopened, HiveBusStore)
@@ -722,9 +1579,12 @@ def test_b_cursor_cas_effect_idempotence_and_crash_boundary(
             )
             assert replay.state == "committed"
             assert replay.attempt_count == 0
-            assert reopened.ack(
-                _GROUP, _PARTITION, generation, token, delivery.scan_through_seq
-            ) == 1
+            assert (
+                reopened.ack(
+                    _GROUP, _PARTITION, generation, token, delivery.scan_through_seq
+                )
+                == 1
+            )
             stale = reopened.ack(
                 _GROUP, _PARTITION, generation, token, delivery.scan_through_seq
             )
@@ -828,9 +1688,16 @@ def test_b_backoff_expiry_counting_fifth_dlq_and_nonurgent_ack(
         assert store._connection.execute(  # noqa: SLF001 - fifth failure is atomic evidence.
             "SELECT attempt_count,error_code FROM dead_letters"
         ).fetchall() == [(5, "BUS_E_SCHEMA")]
-        assert store.ack(
-            _GROUP, _PARTITION, generation, delivery.delivery_token, delivery.scan_through_seq
-        ) == 1
+        assert (
+            store.ack(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                delivery.scan_through_seq,
+            )
+            == 1
+        )
     finally:
         assert store.close() is None
 
@@ -846,14 +1713,17 @@ def test_b_fifth_pending_lease_expiry_persists_dlq_and_returns_poison(
         assert hasattr(delivery, "delivery_token")
         effect_digest = _digest(b"fifth-expiry-effect")
         for count, delay in enumerate((5, 15, 60, 300), start=1):
-            assert store.begin_effect(
-                _GROUP,
-                _PARTITION,
-                generation,
-                delivery.delivery_token,
-                event.event_id,
-                effect_digest=effect_digest,
-            ).state == "apply"
+            assert (
+                store.begin_effect(
+                    _GROUP,
+                    _PARTITION,
+                    generation,
+                    delivery.delivery_token,
+                    event.event_id,
+                    effect_digest=effect_digest,
+                ).state
+                == "apply"
+            )
             _delivery_diagnostic(
                 store.fail_effect(
                     _GROUP,
@@ -874,14 +1744,17 @@ def test_b_fifth_pending_lease_expiry_persists_dlq_and_returns_poison(
             clock.now += timedelta(seconds=delay)
             delivery = store.poll_headers(_GROUP, _PARTITION, generation)
             assert hasattr(delivery, "delivery_token")
-        assert store.begin_effect(
-            _GROUP,
-            _PARTITION,
-            generation,
-            delivery.delivery_token,
-            event.event_id,
-            effect_digest=effect_digest,
-        ).attempt_count == 4
+        assert (
+            store.begin_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                event.event_id,
+                effect_digest=effect_digest,
+            ).attempt_count
+            == 4
+        )
         clock.now += timedelta(seconds=60)
 
         terminal = store.poll_headers(_GROUP, _PARTITION, generation)
@@ -903,7 +1776,9 @@ def test_b_fifth_pending_lease_expiry_persists_dlq_and_returns_poison(
             "BUS_E_DELIVERY_STALE",
             _digest(b"delivery_lease_expired_v1"),
         )
-        assert store._connection.execute("SELECT COUNT(*) FROM delivery_leases").fetchone() == (0,)  # noqa: SLF001
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM delivery_leases"
+        ).fetchone() == (0,)  # noqa: SLF001
     finally:
         assert store.close() is None
 
@@ -920,30 +1795,39 @@ def test_b_poll_leases_committed_prefix_before_later_effect_backoff(
         assert initial.scan_through_seq == 2
         first_digest = _digest(b"prefix-first")
         second_digest = _digest(b"prefix-second")
-        assert store.begin_effect(
-            _GROUP,
-            _PARTITION,
-            generation,
-            initial.delivery_token,
-            first_event.event_id,
-            effect_digest=first_digest,
-        ).state == "apply"
-        assert store.commit_effect(
-            _GROUP,
-            _PARTITION,
-            generation,
-            initial.delivery_token,
-            first_event.event_id,
-            effect_digest=first_digest,
-        ) is None
-        assert store.begin_effect(
-            _GROUP,
-            _PARTITION,
-            generation,
-            initial.delivery_token,
-            second_event.event_id,
-            effect_digest=second_digest,
-        ).state == "apply"
+        assert (
+            store.begin_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                initial.delivery_token,
+                first_event.event_id,
+                effect_digest=first_digest,
+            ).state
+            == "apply"
+        )
+        assert (
+            store.commit_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                initial.delivery_token,
+                first_event.event_id,
+                effect_digest=first_digest,
+            )
+            is None
+        )
+        assert (
+            store.begin_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                initial.delivery_token,
+                second_event.event_id,
+                effect_digest=second_digest,
+            ).state
+            == "apply"
+        )
         _delivery_diagnostic(
             store.fail_effect(
                 _GROUP,
@@ -965,10 +1849,21 @@ def test_b_poll_leases_committed_prefix_before_later_effect_backoff(
         prefix = store.poll_headers(_GROUP, _PARTITION, generation)
 
         assert hasattr(prefix, "delivery_token")
-        assert (prefix.from_seq, prefix.scan_through_seq, len(prefix.headers)) == (1, 1, 1)
-        assert store.ack(
-            _GROUP, _PARTITION, generation, prefix.delivery_token, prefix.scan_through_seq
-        ) == 1
+        assert (prefix.from_seq, prefix.scan_through_seq, len(prefix.headers)) == (
+            1,
+            1,
+            1,
+        )
+        assert (
+            store.ack(
+                _GROUP,
+                _PARTITION,
+                generation,
+                prefix.delivery_token,
+                prefix.scan_through_seq,
+            )
+            == 1
+        )
         blocked = store.poll_headers(_GROUP, _PARTITION, generation)
         _delivery_diagnostic(
             blocked,
@@ -978,7 +1873,9 @@ def test_b_poll_leases_committed_prefix_before_later_effect_backoff(
             action="retry_delivery",
             retry_after_seconds=5,
         )
-        assert store._connection.execute("SELECT COUNT(*) FROM delivery_leases").fetchone() == (0,)  # noqa: SLF001
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM delivery_leases"
+        ).fetchone() == (0,)  # noqa: SLF001
     finally:
         assert store.close() is None
 
@@ -994,14 +1891,17 @@ def test_b_begin_effect_serializes_pending_attempts_within_a_lease(
         assert hasattr(initial, "delivery_token")
         first_digest = _digest(b"serialized-first")
         second_digest = _digest(b"serialized-second")
-        assert store.begin_effect(
-            _GROUP,
-            _PARTITION,
-            generation,
-            initial.delivery_token,
-            first_event.event_id,
-            effect_digest=first_digest,
-        ).state == "apply"
+        assert (
+            store.begin_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                initial.delivery_token,
+                first_event.event_id,
+                effect_digest=first_digest,
+            ).state
+            == "apply"
+        )
         blocked_peer = store.begin_effect(
             _GROUP,
             _PARTITION,
@@ -1058,7 +1958,8 @@ def test_b_begin_effect_serializes_pending_attempts_within_a_lease(
         )
         assert (replay.state, replay.attempt_count) == ("apply", 1)
         assert store._connection.execute(  # noqa: SLF001 - peer never became uncounted pending.
-            "SELECT COUNT(*) FROM consumer_effects WHERE event_id=?", (second_event.event_id,)
+            "SELECT COUNT(*) FROM consumer_effects WHERE event_id=?",
+            (second_event.event_id,),
         ).fetchone() == (0,)
     finally:
         assert store.close() is None
@@ -1103,9 +2004,12 @@ def test_b_begin_effect_rejects_duplicate_live_bearer_without_reauthorizing(
             retryable=False,
             action="repoll_headers",
         )
-        assert store._connection.execute(  # noqa: SLF001 - duplicate begin must not mutate.
-            "SELECT state,attempt_count,lease_token FROM consumer_effects"
-        ).fetchone() == before
+        assert (
+            store._connection.execute(  # noqa: SLF001 - duplicate begin must not mutate.
+                "SELECT state,attempt_count,lease_token FROM consumer_effects"
+            ).fetchone()
+            == before
+        )
         _delivery_diagnostic(
             store.fail_effect(
                 _GROUP,
@@ -1149,14 +2053,17 @@ def test_b_expired_pending_effect_counts_once_and_old_bearer_cannot_ack(
         event = events[0]
         generation, delivery = _prepared_delivery(store)
         assert hasattr(delivery, "delivery_token")
-        assert store.begin_effect(
-            _GROUP,
-            _PARTITION,
-            generation,
-            delivery.delivery_token,
-            event.event_id,
-            effect_digest=_digest(b"pending-expiry"),
-        ).state == "apply"
+        assert (
+            store.begin_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                event.event_id,
+                effect_digest=_digest(b"pending-expiry"),
+            ).state
+            == "apply"
+        )
         clock.now += timedelta(seconds=60)
         materialized = store.poll_headers(_GROUP, _PARTITION, generation)
         _delivery_diagnostic(
@@ -1184,7 +2091,9 @@ def test_b_expired_pending_effect_counts_once_and_old_bearer_cannot_ack(
         assert store._connection.execute(  # noqa: SLF001 - one expiry creates one failure.
             "SELECT state,attempt_count,retry_not_before_utc FROM consumer_effects"
         ).fetchone() == ("pending", 1, "2026-09-15T10:12:17.345Z")
-        assert store._connection.execute("SELECT acked_seq FROM cursors").fetchone() == (0,)  # noqa: SLF001
+        assert store._connection.execute(
+            "SELECT acked_seq FROM cursors"
+        ).fetchone() == (0,)  # noqa: SLF001
         clock.now += timedelta(seconds=5)
         retry = store.poll_headers(_GROUP, _PARTITION, generation)
         assert hasattr(retry, "delivery_token")
@@ -1222,7 +2131,9 @@ def test_b_lease_expiry_counts_only_pending_and_poison_blocks_static_ack(
             event = store.append(request, payload_bytes=b"payload")
         assert not isinstance(event, DiagnosticV2)
         partition = event.partition
-        generation = store.record_manifest_bytes(_GROUP, manifest_bytes=b"opaque-manifest")
+        generation = store.record_manifest_bytes(
+            _GROUP, manifest_bytes=b"opaque-manifest"
+        )
         assert isinstance(generation, str)
         assert store.open_cursor_once(_GROUP, partition, generation) == 0
         untouched = store.poll_headers(_GROUP, partition, generation)
@@ -1301,7 +2212,9 @@ def test_b_lease_expiry_counts_only_pending_and_poison_blocks_static_ack(
             retryable=False,
             action="inspect_dead_letter",
         )
-        assert store._connection.execute("SELECT acked_seq FROM cursors").fetchone() == (0,)  # noqa: SLF001
+        assert store._connection.execute(
+            "SELECT acked_seq FROM cursors"
+        ).fetchone() == (0,)  # noqa: SLF001
     finally:
         assert store.close() is None
 
@@ -1335,35 +2248,48 @@ def test_b_poll_empty_cursor_returns_none_without_creating_a_lease(
         generation, delivery = _prepared_delivery(store)
         assert hasattr(delivery, "delivery_token")
         effect_digest = _digest(b"empty-poll-effect")
-        assert store.begin_effect(
-            _GROUP,
-            _PARTITION,
-            generation,
-            delivery.delivery_token,
-            event.event_id,
-            effect_digest=effect_digest,
-        ).state == "apply"
-        assert store.commit_effect(
-            _GROUP,
-            _PARTITION,
-            generation,
-            delivery.delivery_token,
-            event.event_id,
-            effect_digest=effect_digest,
-        ) is None
-        assert store.ack(
-            _GROUP,
-            _PARTITION,
-            generation,
-            delivery.delivery_token,
-            delivery.scan_through_seq,
-        ) == 1
-        assert store._connection.execute("SELECT COUNT(*) FROM delivery_leases").fetchone() == (0,)  # noqa: SLF001
+        assert (
+            store.begin_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                event.event_id,
+                effect_digest=effect_digest,
+            ).state
+            == "apply"
+        )
+        assert (
+            store.commit_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                event.event_id,
+                effect_digest=effect_digest,
+            )
+            is None
+        )
+        assert (
+            store.ack(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                delivery.scan_through_seq,
+            )
+            == 1
+        )
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM delivery_leases"
+        ).fetchone() == (0,)  # noqa: SLF001
 
         empty = store.poll_headers(_GROUP, _PARTITION, generation)
 
         assert empty is None
-        assert store._connection.execute("SELECT COUNT(*) FROM delivery_leases").fetchone() == (0,)  # noqa: SLF001
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM delivery_leases"
+        ).fetchone() == (0,)  # noqa: SLF001
     finally:
         assert store.close() is None
 
@@ -1387,8 +2313,12 @@ def test_b_poll_stops_before_65536_cumulative_header_bytes(
                 "workpackage_id": workpackage_id,
                 "causation_ids": causation_ids,
             }
-            assert not isinstance(store.append(request, payload_bytes=b"payload"), DiagnosticV2)
-        generation = store.record_manifest_bytes(_GROUP, manifest_bytes=b"bounded-headers")
+            assert not isinstance(
+                store.append(request, payload_bytes=b"payload"), DiagnosticV2
+            )
+        generation = store.record_manifest_bytes(
+            _GROUP, manifest_bytes=b"bounded-headers"
+        )
         assert isinstance(generation, str)
         assert store.open_cursor_once(_GROUP, partition, generation) == 0
         all_headers = store._connection.execute(  # noqa: SLF001 - real stored canonical headers.
@@ -1402,7 +2332,9 @@ def test_b_poll_stops_before_65536_cumulative_header_bytes(
         assert hasattr(delivery, "delivery_token")
         assert len(delivery.headers) < 32
         prefix_length = len(delivery.headers)
-        assert delivery.headers == tuple(header for _, header in all_headers[:prefix_length])
+        assert delivery.headers == tuple(
+            header for _, header in all_headers[:prefix_length]
+        )
         assert sum(map(len, delivery.headers)) <= 65536
         next_header = all_headers[prefix_length][1]
         assert sum(map(len, delivery.headers)) + len(next_header) > 65536
@@ -1426,22 +2358,28 @@ def test_b_partial_ack_of_committed_multi_header_lease_preserves_state(
             (first_event, _digest(b"partial-ack-first")),
             (second_event, _digest(b"partial-ack-second")),
         ):
-            assert store.begin_effect(
-                _GROUP,
-                _PARTITION,
-                generation,
-                delivery.delivery_token,
-                event.event_id,
-                effect_digest=effect_digest,
-            ).state == "apply"
-            assert store.commit_effect(
-                _GROUP,
-                _PARTITION,
-                generation,
-                delivery.delivery_token,
-                event.event_id,
-                effect_digest=effect_digest,
-            ) is None
+            assert (
+                store.begin_effect(
+                    _GROUP,
+                    _PARTITION,
+                    generation,
+                    delivery.delivery_token,
+                    event.event_id,
+                    effect_digest=effect_digest,
+                ).state
+                == "apply"
+            )
+            assert (
+                store.commit_effect(
+                    _GROUP,
+                    _PARTITION,
+                    generation,
+                    delivery.delivery_token,
+                    event.event_id,
+                    effect_digest=effect_digest,
+                )
+                is None
+            )
         cursor_before = store._connection.execute(  # noqa: SLF001 - rejected partial ACK is read-only.
             "SELECT consumer_group_id,partition,generation,acked_seq,gap_snapshot_id,gap_from_seq,"
             "gap_through_seq,updated_at_utc FROM cursors"
@@ -1470,18 +2408,27 @@ def test_b_partial_ack_of_committed_multi_header_lease_preserves_state(
             retryable=False,
             action="repoll_headers",
         )
-        assert store._connection.execute(  # noqa: SLF001 - rejected partial ACK is read-only.
-            "SELECT consumer_group_id,partition,generation,acked_seq,gap_snapshot_id,gap_from_seq,"
-            "gap_through_seq,updated_at_utc FROM cursors"
-        ).fetchall() == cursor_before
-        assert store._connection.execute(  # noqa: SLF001 - rejected partial ACK retains lease.
-            "SELECT consumer_group_id,partition,generation,delivery_token,from_seq,scan_through_seq,"
-            "leased_at_utc,expires_at_utc,created_monotonic FROM delivery_leases"
-        ).fetchall() == lease_before
-        assert store._connection.execute(  # noqa: SLF001 - rejected partial ACK retains effect state.
-            "SELECT event_id,state,effect_digest,attempt_count,retry_not_before_utc,lease_token,"
-            "lease_expires_at_utc,last_error_code,updated_at_utc FROM consumer_effects ORDER BY partition_seq"
-        ).fetchall() == effects_before
+        assert (
+            store._connection.execute(  # noqa: SLF001 - rejected partial ACK is read-only.
+                "SELECT consumer_group_id,partition,generation,acked_seq,gap_snapshot_id,gap_from_seq,"
+                "gap_through_seq,updated_at_utc FROM cursors"
+            ).fetchall()
+            == cursor_before
+        )
+        assert (
+            store._connection.execute(  # noqa: SLF001 - rejected partial ACK retains lease.
+                "SELECT consumer_group_id,partition,generation,delivery_token,from_seq,scan_through_seq,"
+                "leased_at_utc,expires_at_utc,created_monotonic FROM delivery_leases"
+            ).fetchall()
+            == lease_before
+        )
+        assert (
+            store._connection.execute(  # noqa: SLF001 - rejected partial ACK retains effect state.
+                "SELECT event_id,state,effect_digest,attempt_count,retry_not_before_utc,lease_token,"
+                "lease_expires_at_utc,last_error_code,updated_at_utc FROM consumer_effects ORDER BY partition_seq"
+            ).fetchall()
+            == effects_before
+        )
     finally:
         assert store.close() is None
 
