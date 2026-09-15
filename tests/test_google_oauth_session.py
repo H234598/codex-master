@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import copy
 from contextlib import contextmanager
 from dataclasses import asdict
 import json
 from pathlib import Path
+import pickle
 import sys
 import threading
 from types import ModuleType
@@ -44,23 +46,23 @@ class MemoryStore:
         return b"", copy.deepcopy(self.document)
 
 
-def _document(subject="subject-one"):
+def _document(subject="synthetic-subject-one"):
     return {
         "schema_version": 2,
         "google_accounts": [
             {
-                "ref": "google-account-01",
-                "login_email": "one@example.test",
+                "ref": "google-synthetic-account-01",
+                "login_email": "synthetic-one@example.test",
                 "recovery_email": None,
                 "subject_id": subject,
                 "billing_accounts": [],
                 "projects": [],
             },
             {
-                "ref": "google-account-02",
-                "login_email": "two@example.test",
+                "ref": "google-synthetic-account-02",
+                "login_email": "synthetic-two@example.test",
                 "recovery_email": None,
-                "subject_id": "subject-two",
+                "subject_id": "synthetic-subject-two",
                 "billing_accounts": [],
                 "projects": [],
             },
@@ -73,18 +75,18 @@ def test_authorization_is_bound_to_one_account_and_never_cross_written() -> None
 
     _persist_authorization(
         store,
-        account_ref="google-account-01",
-        observed_subject_id="subject-one",
-        access_token="private-access",
-        refresh_token="private-refresh",
+        account_ref="google-synthetic-account-01",
+        observed_subject_id="synthetic-subject-one",
+        access_token="synthetic-private-access",
+        refresh_token="synthetic-private-refresh",
         client_fingerprint="sha256:" + "a" * 64,
     )
 
     first, second = store.document["google_accounts"]
-    assert first["auth"]["access_token"] == "private-access"
+    assert first["auth"]["access_token"] == "synthetic-private-access"
     assert "auth" not in second
     assert store.writes == 1
-    assert "private-access" not in repr(_persist_authorization)
+    assert "synthetic-private-access" not in repr(_persist_authorization)
 
 
 def test_module_level_oauth_helpers_delegate_exact_arguments() -> None:
@@ -110,10 +112,22 @@ def test_module_level_oauth_helpers_delegate_exact_arguments() -> None:
 
     service = Service()
 
-    assert oauth_session.plan_oauth_client_import(service, "account", generation=1) == "plan"
-    assert oauth_session.apply_oauth_client_import(service, "plan", ingress="cap") == "apply"
-    assert oauth_session.begin_oauth_transaction(service, "account", profile="inventory") == "begin"
-    assert oauth_session.complete_oauth_transaction(service, "txn", code="code") == "complete"
+    assert (
+        oauth_session.plan_oauth_client_import(service, "account", generation=1)
+        == "plan"
+    )
+    assert (
+        oauth_session.apply_oauth_client_import(service, "plan", ingress="cap")
+        == "apply"
+    )
+    assert (
+        oauth_session.begin_oauth_transaction(service, "account", profile="inventory")
+        == "begin"
+    )
+    assert (
+        oauth_session.complete_oauth_transaction(service, "txn", code="code")
+        == "complete"
+    )
     assert service.calls == [
         ("plan", ("account",), {"generation": 1}),
         ("apply", ("plan",), {"ingress": "cap"}),
@@ -123,7 +137,9 @@ def test_module_level_oauth_helpers_delegate_exact_arguments() -> None:
 
 
 def test_v2_migration_rejects_noncanonical_shape() -> None:
-    with pytest.raises(oauth_session.HiveStateError, match="invalid_google_oauth_control_state"):
+    with pytest.raises(
+        oauth_session.HiveStateError, match="invalid_google_oauth_control_state"
+    ):
         oauth_session.GoogleOAuthControlService._migrate_v2(
             {"schema_version": 2, "imports": [], "clients": []}
         )
@@ -135,10 +151,10 @@ def test_subject_mismatch_stops_without_auth_write() -> None:
     with pytest.raises(GoogleOAuthSessionError, match="oauth.session_subject_mismatch"):
         _persist_authorization(
             store,
-            account_ref="google-account-01",
+            account_ref="google-synthetic-account-01",
             observed_subject_id="wrong",
-            access_token="private-access",
-            refresh_token="private-refresh",
+            access_token="synthetic-private-access",
+            refresh_token="synthetic-private-refresh",
             client_fingerprint="sha256:" + "a" * 64,
         )
 
@@ -149,12 +165,12 @@ def test_subject_mismatch_stops_without_auth_write() -> None:
 def test_client_project_number_is_strictly_derived_from_client_id() -> None:
     assert (
         _client_project_number(
-            {"client_id": "577074103233-clientpart.apps.googleusercontent.com"}
+            {"client_id": "000000000000-syntheticclient.apps.googleusercontent.com"}
         )
-        == "577074103233"
+        == "000000000000"
     )
 
-    for invalid in ({}, {"client_id": "clientpart.apps.googleusercontent.com"}):
+    for invalid in ({}, {"client_id": "synthetic-invalid.apps.googleusercontent.com"}):
         with pytest.raises(
             GoogleOAuthSessionError, match="oauth.session_client_invalid"
         ):
@@ -164,11 +180,11 @@ def test_client_project_number_is_strictly_derived_from_client_id() -> None:
 def test_client_rejects_non_google_oauth_endpoints(tmp_path: Path) -> None:
     client_file = tmp_path / "client.json"
     installed = {
-        "client_id": "577074103233-clientpart.apps.googleusercontent.com",
-        "project_id": "private-project",
+        "client_id": "000000000000-syntheticclient.apps.googleusercontent.com",
+        "project_id": "synthetic-private-project",
         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
-        "client_secret": "private-secret",
+        "client_secret": "synthetic-private-secret",
         "redirect_uris": ["http://localhost"],
     }
     client_file.write_text(json.dumps({"installed": installed}))
@@ -229,8 +245,8 @@ def test_authorize_google_account_runs_the_local_flow_and_persists_subject_bound
     stored: dict[str, object] = {}
 
     class Credentials:
-        token = "access-test"
-        refresh_token = "refresh-test"
+        token = "synthetic-access-test"
+        refresh_token = "synthetic-refresh-test"
 
     class Flow:
         @classmethod
@@ -245,13 +261,13 @@ def test_authorize_google_account_runs_the_local_flow_and_persists_subject_bound
 
     class Api:
         def __init__(self, token):
-            assert token == "access-test"
+            assert token == "synthetic-access-test"
 
         def subject_id(self):
-            return "subject-one"
+            return "synthetic-subject-one"
 
         def enable_control_services(self, project_number):
-            assert project_number == "123"
+            assert project_number == "000000000000"
 
     package = ModuleType("google_auth_oauthlib")
     flow_module = ModuleType("google_auth_oauthlib.flow")
@@ -262,7 +278,7 @@ def test_authorize_google_account_runs_the_local_flow_and_persists_subject_bound
         oauth_session,
         "_client",
         lambda path: (
-            {"client_id": "123-test.apps.googleusercontent.com"},
+            {"client_id": "000000000000-syntheticclient.apps.googleusercontent.com"},
             "sha256:test",
         ),
     )
@@ -288,27 +304,27 @@ def test_authorize_google_account_runs_the_local_flow_and_persists_subject_bound
     assert receipt.account_ref == "one"
     assert receipt.subject_bound is True
     assert receipt.refresh_token_stored is True
-    assert stored["observed_subject_id"] == "subject-one"
+    assert stored["observed_subject_id"] == "synthetic-subject-one"
 
 
-def test_load_access_token_returns_unrefreshable_bound_access_token(monkeypatch) -> None:
+def test_load_access_token_returns_unrefreshable_bound_access_token(
+    monkeypatch,
+) -> None:
     store = MemoryStore(_document())
     store.document["google_accounts"][0]["auth"] = {
         "client_fingerprint": "sha256:test",
-        "access_token": "access-test",
+        "access_token": "synthetic-access-test",
         "refresh_token": None,
     }
-    monkeypatch.setattr(
-        oauth_session, "_client", lambda path: ({}, "sha256:test")
-    )
+    monkeypatch.setattr(oauth_session, "_client", lambda path: ({}, "sha256:test"))
 
     assert (
         oauth_session.load_access_token(
             store,
-            account_ref="google-account-01",
+            account_ref="google-synthetic-account-01",
             client_file=Path("/private/client.json"),
         )
-        == "access-test"
+        == "synthetic-access-test"
     )
 
 
@@ -427,7 +443,7 @@ class _TokenWriter:
         )
         if existing is not None:
             return existing
-        assert refresh_token == bytearray(b"private-refresh-token")
+        assert refresh_token == bytearray(b"synthetic-private-synthetic-refresh-token")
         self.writes.append((account_ref, scope_profile.value, scope_fingerprint))
         receipt = oauth_session.GoogleOAuthTokenWriteReceiptV1(
             operation_id=operation_id,
@@ -442,7 +458,7 @@ class _TokenWriter:
 
 
 class _Exchange:
-    def __init__(self, subject_id: str = "subject-one") -> None:
+    def __init__(self, subject_id: str = "synthetic-subject-one") -> None:
         self.subject_id = subject_id
         self.calls: list[tuple[str, str, str]] = []
 
@@ -455,27 +471,28 @@ class _Exchange:
         pkce_verifier: str,
     ):
         assert client["client_id"] == (
-            "577074103233-clientpart.apps.googleusercontent.com"
+            "000000000000-syntheticclient.apps.googleusercontent.com"
         )
         self.calls.append((code, redirect_uri, pkce_verifier))
         return oauth_session.GoogleOAuthCodeExchangeV1(
             subject_id=self.subject_id,
-            refresh_token=bytearray(b"private-refresh-token"),
+            refresh_token=bytearray(b"synthetic-private-synthetic-refresh-token"),
         )
 
 
 def _manager(
-    tmp_path: Path, *, subject_one: str | None = "subject-one"
+    tmp_path: Path, *, subject_one: str | None = "synthetic-subject-one"
 ) -> GoogleAccountInventoryManager:
     inventory = tmp_path / "inventory.yaml"
     inventory.write_text(
         yaml.safe_dump(
             {
-                "schema_version": 1,
+                "schema_version": 3,
+                "authority_generation": 1,
                 "google_accounts": [
                     {
-                        "ref": "google-account-01",
-                        "login_email": "one@example.test",
+                        "ref": "google-synthetic-account-01",
+                        "login_email": "synthetic-one@example.test",
                         "recovery_email": None,
                         "label": None,
                         "subject_id": subject_one,
@@ -483,11 +500,11 @@ def _manager(
                         "projects": [],
                     },
                     {
-                        "ref": "google-account-02",
-                        "login_email": "two@example.test",
+                        "ref": "google-synthetic-account-02",
+                        "login_email": "synthetic-two@example.test",
                         "recovery_email": None,
                         "label": None,
-                        "subject_id": "subject-two",
+                        "subject_id": "synthetic-subject-two",
                         "billing_accounts": [],
                         "projects": [],
                     },
@@ -508,12 +525,14 @@ def _manager(
     return manager
 
 
-def _client_json(marker: str = "private-client-secret") -> bytes:
+def _client_json(marker: str = "synthetic-private-synthetic-client-secret") -> bytes:
     return json.dumps(
         {
             "installed": {
-                "client_id": ("577074103233-clientpart.apps.googleusercontent.com"),
-                "project_id": "private-project",
+                "client_id": (
+                    "000000000000-syntheticclient.apps.googleusercontent.com"
+                ),
+                "project_id": "synthetic-private-project",
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
                 "client_secret": marker,
@@ -521,6 +540,13 @@ def _client_json(marker: str = "private-client-secret") -> bytes:
             }
         }
     ).encode()
+
+
+def _advance_inventory_generation(tmp_path: Path) -> None:
+    inventory = tmp_path / "inventory.yaml"
+    document = yaml.safe_load(inventory.read_text(encoding="utf-8"))
+    document["authority_generation"] += 1
+    inventory.write_text(yaml.safe_dump(document), encoding="utf-8")
 
 
 def _service(
@@ -541,7 +567,7 @@ def _service(
         tmp_path / "oauth-state",
         manager=manager,
         client_vault=CredentialVault.for_test(
-            tmp_path / "client-vault", key=b"k" * 32, clock=clock
+            tmp_path / "synthetic-client-vault", key=b"k" * 32, clock=clock
         ),
         token_writer=token_writer,
         secret_ingress=ingress,
@@ -556,13 +582,13 @@ def test_exchange_token_receipt_and_control_service_repr_are_redacted(
 ) -> None:
     service, _ingress, _exchange, _manager = _service(tmp_path)
     exchange = oauth_session.GoogleOAuthCodeExchangeV1(
-        "private-subject",
-        bytearray(b"private-refresh-token"),
+        "synthetic-private-subject",
+        bytearray(b"synthetic-private-synthetic-refresh-token"),
     )
     receipt = oauth_session.GoogleOAuthTokenWriteReceiptV1(
         operation_id="operation-one",
-        account_ref="google-account-01",
-        subject_id="private-subject",
+        account_ref="google-synthetic-account-01",
+        subject_id="synthetic-private-subject",
         oauth_client_fingerprint="sha256:" + "a" * 64,
         scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
         scope_fingerprint="sha256:" + "b" * 64,
@@ -575,7 +601,7 @@ def test_exchange_token_receipt_and_control_service_repr_are_redacted(
 
 def _import_client(service, ingress: _SecretIngress, *, key: str = "import-one"):
     plan = service.plan_oauth_client_import(
-        "google-account-01",
+        "google-synthetic-account-01",
         expected_generation=1,
         idempotency_key=key,
     )
@@ -588,13 +614,15 @@ def test_resolve_oauth_client_import_plan_from_durable_digest_after_restart(
 ) -> None:
     service, _ingress, _exchange, _manager = _service(tmp_path)
     plan = service.plan_oauth_client_import(
-        "google-account-01", expected_generation=1, idempotency_key="resolve-one"
+        "google-synthetic-account-01",
+        expected_generation=1,
+        idempotency_key="resolve-one",
     )
     restarted, _ingress, _exchange, _manager = _service(tmp_path)
 
     assert (
         restarted.resolve_oauth_client_import_plan(
-            "google-account-01",
+            "google-synthetic-account-01",
             expected_generation=1,
             plan_digest=plan.plan_digest,
         )
@@ -631,13 +659,13 @@ def _begin(
     idempotency_key: str = "oauth-begin-default",
 ):
     return service.begin_oauth_transaction(
-        "google-account-01",
+        "google-synthetic-account-01",
         oauth_client_ref=client_ref,
         redirect_uri="http://127.0.0.1:8765/callback",
         scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
         expected_generation=1,
         idempotency_key=idempotency_key,
-        principal="operator-one",
+        principal="synthetic-operator-one",
         ttl_seconds=ttl_seconds,
     )
 
@@ -651,13 +679,546 @@ def _state(transaction) -> str:
 def _complete(service, transaction, **overrides):
     arguments = {
         "code": "first-code",
-        "account_ref": "google-account-01",
+        "account_ref": "google-synthetic-account-01",
         "redirect_uri": "http://127.0.0.1:8765/callback",
         "expected_generation": 1,
         "state": _state(transaction),
     }
     arguments.update(overrides)
     return service.complete_oauth_transaction(transaction.id, **arguments)
+
+
+class _InventoryReadonlyExchange(_Exchange):
+    def __init__(self, subject_id: str = "synthetic-subject-one") -> None:
+        super().__init__(subject_id)
+        self.inventory_calls: list[tuple[str, str, str]] = []
+        self.id_token = bytearray(b"synthetic-private-synthetic-id-token")
+        self.access_token = bytearray(b"synthetic-private-synthetic-access-token")
+
+    def exchange_inventory_readonly(
+        self,
+        client: dict[str, object],
+        *,
+        code: str,
+        redirect_uri: str,
+        pkce_verifier: str,
+    ):
+        assert client["client_id"] == (
+            "000000000000-syntheticclient.apps.googleusercontent.com"
+        )
+        self.inventory_calls.append((code, redirect_uri, pkce_verifier))
+        return oauth_session._InventoryReadonlyCodeExchangeV1(
+            refresh_token=bytearray(
+                b"synthetic-private-synthetic-inventory-synthetic-refresh-token"
+            ),
+            access_token=self.access_token,
+            id_token=self.id_token,
+        )
+
+
+class _InventoryReadonlyVerifier:
+    def __init__(self, subject_id: str = "synthetic-subject-one") -> None:
+        self.subject_id = subject_id
+        self.calls: list[tuple[bytes, bytes, str, str, float]] = []
+
+    def verify_inventory_readonly_id_token(
+        self,
+        id_token: bytearray,
+        *,
+        expected_nonce: bytearray,
+        client_id: str,
+        login_email: str,
+        now: float,
+    ) -> oauth_session._InventoryReadonlyVerifiedIdTokenV1:
+        self.calls.append(
+            (bytes(id_token), bytes(expected_nonce), client_id, login_email, now)
+        )
+        return oauth_session._InventoryReadonlyVerifiedIdTokenV1(
+            subject_id=self.subject_id,
+            nonce=bytearray(expected_nonce),
+        )
+
+
+class _WrongInventoryReadonlyNonceVerifier:
+    def verify_inventory_readonly_id_token(
+        self,
+        id_token: bytearray,
+        *,
+        expected_nonce: bytearray,
+        client_id: str,
+        login_email: str,
+        now: float,
+    ) -> oauth_session._InventoryReadonlyVerifiedIdTokenV1:
+        del id_token, expected_nonce, client_id, login_email, now
+        return oauth_session._InventoryReadonlyVerifiedIdTokenV1(
+            subject_id="synthetic-subject-one",
+            nonce=bytearray(b"wrong-synthetic-inventory-nonce"),
+        )
+
+
+def test_fixed_inventory_id_token_verifier_enforces_rs256_and_bound_google_claims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: an unbound or non-RS256 ID token must never become an effect."""
+
+    calls: list[tuple[str, object, str, int]] = []
+
+    class Request:
+        pass
+
+    def verify_oauth2_token(
+        token: str, request: object, audience: str, *, clock_skew_in_seconds: int
+    ):
+        calls.append((token, request, audience, clock_skew_in_seconds))
+        return {
+            "iss": "https://accounts.google.com",
+            "aud": audience,
+            "azp": audience,
+            "exp": 1_060,
+            "iat": 980,
+            "nonce": "nonce-bound-to-transaction",
+            "email_verified": True,
+            "email": "synthetic-one@example.test",
+            "sub": "synthetic-subject-one",
+        }
+
+    google = ModuleType("google")
+    auth = ModuleType("google.auth")
+    transport = ModuleType("google.auth.transport")
+    requests = ModuleType("google.auth.transport.requests")
+    oauth2 = ModuleType("google.oauth2")
+    id_token = ModuleType("google.oauth2.id_token")
+    requests.Request = Request
+    id_token.verify_oauth2_token = verify_oauth2_token
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.auth", auth)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", transport)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", requests)
+    monkeypatch.setitem(sys.modules, "google.oauth2", oauth2)
+    monkeypatch.setitem(sys.modules, "google.oauth2.id_token", id_token)
+
+    def token_with_header(header: bytes) -> bytearray:
+        encoded = base64.urlsafe_b64encode(header).rstrip(b"=")
+        return bytearray(encoded + b".claims.signature")
+
+    verifier = oauth_session._GoogleInventoryReadonlyIdTokenVerifierV1()
+    verified = verifier.verify_inventory_readonly_id_token(
+        token_with_header(b'{"alg":"RS256","kid":"fixed-key"}'),
+        expected_nonce=bytearray(b"nonce-bound-to-transaction"),
+        client_id="000000000000-syntheticclient.apps.googleusercontent.com",
+        login_email="synthetic-one@example.test",
+        now=1_000.0,
+    )
+
+    assert verified.subject_id == "synthetic-subject-one"
+    assert calls and calls[0][2:] == (
+        "000000000000-syntheticclient.apps.googleusercontent.com",
+        60,
+    )
+    with pytest.raises(oauth_session.GoogleOAuthSessionError) as raised:
+        verifier.verify_inventory_readonly_id_token(
+            token_with_header(b'{"alg":"ES256","kid":"fixed-key"}'),
+            expected_nonce=bytearray(b"nonce-bound-to-transaction"),
+            client_id="000000000000-syntheticclient.apps.googleusercontent.com",
+            login_email="synthetic-one@example.test",
+            now=1_000.0,
+        )
+    assert raised.value.code == "oauth.id_token_invalid"
+    assert len(calls) == 1
+
+
+def test_control_service_binds_the_fixed_inventory_id_token_verifier(
+    tmp_path: Path,
+) -> None:
+    """Break caught: Inventory authorization must not depend on a caller-selected verifier."""
+
+    service, _ingress, _exchange, _manager_instance = _service(tmp_path)
+
+    assert type(service._inventory_id_token_verifier) is (
+        oauth_session._GoogleInventoryReadonlyIdTokenVerifierV1
+    )
+
+
+def test_control_service_binds_the_fixed_inventory_code_exchange_when_legacy_exchange_has_no_private_method(
+    tmp_path: Path,
+) -> None:
+    """Break caught: GA-I2d must not fall back to the legacy OAuth exchange path."""
+
+    service, _ingress, _exchange, _manager_instance = _service(tmp_path)
+
+    assert type(service._inventory_code_exchange) is (
+        oauth_session._GoogleInventoryReadonlyCodeExchangeV1
+    )
+
+
+def test_fixed_inventory_code_exchange_has_only_the_google_token_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: a caller-controlled token endpoint must not be reachable."""
+
+    requests: list[urllib.request.Request] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return "https://oauth2.googleapis.com/token"
+
+        def read(self, maximum: int) -> bytes:
+            assert maximum == 64 * 1024 + 1
+            return (
+                b'{"access_token":"synthetic-private-access","id_token":"synthetic-private-id",'
+                b'"refresh_token":"synthetic-private-refresh"}'
+            )
+
+    def fake_urlopen(request: urllib.request.Request, *, timeout: int):
+        requests.append(request)
+        assert timeout == 10
+        assert "client_secret" not in urllib.parse.parse_qs(
+            bytes(request.data).decode("ascii")
+        )
+        return Response()
+
+    monkeypatch.setattr(oauth_session.urllib.request, "urlopen", fake_urlopen)
+
+    class FixedOpener:
+        open = staticmethod(fake_urlopen)
+
+    monkeypatch.setattr(
+        oauth_session.urllib.request, "build_opener", lambda *handlers: FixedOpener()
+    )
+    exchange = oauth_session._GoogleInventoryReadonlyCodeExchangeV1()
+    result = exchange.exchange_inventory_readonly(
+        {
+            "client_id": "000000000000-syntheticclient.apps.googleusercontent.com",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        },
+        code="synthetic-authorization-code",
+        redirect_uri="http://127.0.0.1:8765/callback",
+        pkce_verifier="pkce-verifier",
+    )
+
+    assert len(requests) == 1
+    assert requests[0].full_url == "https://oauth2.googleapis.com/token"
+    assert requests[0].method == "POST"
+    assert result.refresh_token == bytearray(b"synthetic-private-refresh")
+    result.clear()
+    with pytest.raises(oauth_session.GoogleOAuthSessionError) as raised:
+        exchange.exchange_inventory_readonly(
+            {
+                "client_id": "000000000000-syntheticclient.apps.googleusercontent.com",
+                "client_secret": "synthetic-private-synthetic-client-secret",
+                "token_uri": "https://attacker.example.test/token",
+            },
+            code="synthetic-authorization-code",
+            redirect_uri="http://127.0.0.1:8765/callback",
+            pkce_verifier="pkce-verifier",
+        )
+    assert raised.value.code == "oauth.exchange_failed"
+    assert len(requests) == 1
+
+
+def test_fixed_inventory_exchange_rejects_client_secret_before_provider_io(
+    monkeypatch,
+) -> None:
+    def forbidden(*args, **kwargs):
+        pytest.fail("provider I/O must not run for a client_secret document")
+
+    monkeypatch.setattr(oauth_session.urllib.request, "urlopen", forbidden)
+    with pytest.raises(
+        oauth_session.GoogleOAuthSessionError, match="oauth.exchange_failed"
+    ):
+        oauth_session._GoogleInventoryReadonlyCodeExchangeV1().exchange_inventory_readonly(
+            {
+                "client_id": "000000000000-syntheticclient.apps.googleusercontent.com",
+                "client_secret": "synthetic-rejected-secret",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            },
+            code="synthetic-code",
+            redirect_uri="http://127.0.0.1:8765/callback",
+            pkce_verifier="synthetic-verifier",
+        )
+
+
+def test_fixed_inventory_exchange_rejects_http_redirects_before_forwarding() -> None:
+    handler = oauth_session._InventoryReadonlyNoRedirectHandlerV1()
+    with pytest.raises(
+        oauth_session.GoogleOAuthSessionError, match="oauth.exchange_failed"
+    ):
+        handler.redirect_request(
+            urllib.request.Request("https://oauth2.googleapis.com/token"),
+            None,
+            307,
+            "synthetic-redirect",
+            {},
+            "https://untrusted.example.test/token",
+        )
+
+
+def test_private_inventory_authorization_uses_fixed_readonly_nonce_pkce_and_a_redacted_one_shot_effect(
+    tmp_path: Path,
+) -> None:
+    exchange = _InventoryReadonlyExchange()
+    service, ingress, _exchange, _manager_instance = _service(
+        tmp_path, exchange=exchange
+    )
+    verifier = _InventoryReadonlyVerifier()
+    service._inventory_id_token_verifier = verifier
+    _plan, _session, imported = _import_client(service, ingress)
+
+    transaction = service._for_test_legacy_begin_inventory_readonly_authorization(
+        "google-synthetic-account-01",
+        oauth_client_ref=imported.client_ref,
+        redirect_uri="http://127.0.0.1:8765/callback",
+        expected_generation=1,
+        idempotency_key="synthetic-inventory-authorize-one",
+        principal="synthetic-operator-one",
+    )
+
+    query = urllib.parse.parse_qs(
+        urllib.parse.urlsplit(transaction.authorization_url).query
+    )
+    assert query["scope"] == [
+        "https://www.googleapis.com/auth/cloud-billing.readonly "
+        "https://www.googleapis.com/auth/cloud-platform.read-only "
+        "https://www.googleapis.com/auth/userinfo.email openid"
+    ]
+    assert query["code_challenge_method"] == ["S256"]
+    assert len(query["nonce"]) == 1
+    assert query["nonce"][0] != query["state"][0]
+    assert "synthetic-private-synthetic-inventory-synthetic-refresh-token" not in repr(
+        transaction
+    )
+    with pytest.raises(TypeError):
+        pickle.dumps(transaction)
+
+    effect = service._for_test_legacy_complete_inventory_readonly_authorization(
+        transaction.id,
+        code="synthetic-inventory-code",
+        account_ref="google-synthetic-account-01",
+        redirect_uri="http://127.0.0.1:8765/callback",
+        expected_generation=1,
+        state=query["state"][0],
+    )
+
+    assert exchange.inventory_calls
+    assert exchange.access_token == bytearray(len(exchange.access_token))
+    assert exchange.id_token == bytearray(len(exchange.id_token))
+    assert len(verifier.calls) == 1
+    (
+        account_ref,
+        subject_id,
+        generation,
+        client_fingerprint,
+        scope_fingerprint,
+        token,
+    ) = effect._consume_for_authority()
+    assert (account_ref, subject_id, generation) == (
+        "google-synthetic-account-01",
+        "synthetic-subject-one",
+        1,
+    )
+    assert client_fingerprint.startswith("sha256:")
+    assert (
+        scope_fingerprint
+        == oauth_session.resolve_google_oauth_profile_v1(
+            GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+            oauth_session.GoogleOAuthOperationV1.PROJECTS_SEARCH,
+        ).scope_fingerprint
+    )
+    assert token == bytearray(
+        b"synthetic-private-synthetic-inventory-synthetic-refresh-token"
+    )
+    assert "synthetic-private-synthetic-inventory-synthetic-refresh-token" not in repr(
+        effect
+    )
+    with pytest.raises(TypeError):
+        pickle.dumps(effect)
+    with pytest.raises(
+        oauth_session.GoogleOAuthSessionError, match="oauth.inventory_effect_consumed"
+    ):
+        effect._consume_for_authority()
+
+
+def test_private_inventory_authorization_fail_closed_without_a_verifier_or_private_exchange(
+    tmp_path: Path,
+) -> None:
+    service, ingress, _exchange, _manager_instance = _service(tmp_path)
+    service._inventory_id_token_verifier = None
+    _plan, _session, imported = _import_client(service, ingress)
+
+    with pytest.raises(
+        oauth_session.GoogleOAuthSessionError, match="oauth.inventory_unavailable"
+    ):
+        service._for_test_legacy_begin_inventory_readonly_authorization(
+            "google-synthetic-account-01",
+            oauth_client_ref=imported.client_ref,
+            redirect_uri="http://127.0.0.1:8765/callback",
+            expected_generation=1,
+            idempotency_key="synthetic-inventory-authorize-unavailable",
+            principal="synthetic-operator-one",
+        )
+
+
+def test_private_inventory_authorization_rejects_a_wrong_nonce_without_masking_the_callback_error(
+    tmp_path: Path,
+) -> None:
+    """A verifier's nonce mismatch must stay a closed OAuth failure, not TypeError."""
+
+    exchange = _InventoryReadonlyExchange()
+    service, ingress, _exchange, _manager_instance = _service(
+        tmp_path, exchange=exchange
+    )
+    service._inventory_id_token_verifier = _WrongInventoryReadonlyNonceVerifier()
+    _plan, _session, imported = _import_client(service, ingress)
+    transaction = service._for_test_legacy_begin_inventory_readonly_authorization(
+        "google-synthetic-account-01",
+        oauth_client_ref=imported.client_ref,
+        redirect_uri="http://127.0.0.1:8765/callback",
+        expected_generation=1,
+        idempotency_key="synthetic-inventory-authorize-wrong-nonce",
+        principal="synthetic-operator-one",
+    )
+    state = urllib.parse.parse_qs(
+        urllib.parse.urlsplit(transaction.authorization_url).query
+    )["state"][0]
+
+    with pytest.raises(oauth_session.GoogleOAuthSessionError) as raised:
+        service._for_test_legacy_complete_inventory_readonly_authorization(
+            transaction.id,
+            code="synthetic-inventory-code",
+            account_ref="google-synthetic-account-01",
+            redirect_uri="http://127.0.0.1:8765/callback",
+            expected_generation=1,
+            state=state,
+        )
+
+    assert raised.value.code == "oauth.id_token_invalid"
+    assert exchange.access_token == bytearray(len(exchange.access_token))
+    assert exchange.id_token == bytearray(len(exchange.id_token))
+
+
+def test_private_fixed_inventory_authorization_leaf_delegates_only_its_fixed_begin_and_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: the future Authority must not supply OAuth configuration."""
+
+    service, _ingress, _exchange, _manager_instance = _service(tmp_path)
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    effect = object()
+    transaction = oauth_session._InventoryReadonlyAuthorizationTransactionV1(
+        "synthetic-inventory-oauth-test",
+        "https://accounts.google.com/redacted",
+        123.0,
+        7,
+    )
+
+    def begin(control, account_ref: str, **kwargs: object):
+        assert control is service
+        calls.append(("begin", (account_ref,), kwargs))
+        return transaction
+
+    def complete(control, transaction_id: str, **kwargs: object):
+        assert control is service
+        calls.append(("complete", (transaction_id,), kwargs))
+        return effect
+
+    monkeypatch.setattr(
+        oauth_session.GoogleOAuthControlService,
+        "_for_test_legacy_begin_inventory_readonly_authorization",
+        begin,
+    )
+    monkeypatch.setattr(
+        oauth_session.GoogleOAuthControlService,
+        "_for_test_legacy_complete_inventory_readonly_authorization",
+        complete,
+    )
+    preflight = oauth_session._InventoryReadonlyAuthorizationPreflightForTestV1()
+    driver = oauth_session._InventoryReadonlyAuthorizationCallbackDriverV1(
+        account_ref="acct-test-a",
+        oauth_client_ref="synthetic-client-test-a",
+        redirect_uri="http://127.0.0.1:8765/callback",
+        expected_generation=7,
+        idempotency_key="authorize-test-a",
+        principal="control-service",
+        code="synthetic-code-a",
+        state="synthetic-state-a",
+    )
+    leaf = oauth_session._for_test_the_hive_inventory_readonly_authorization_port(
+        control_service=service,
+        callback_driver=driver,
+        preflight=preflight,
+    )
+
+    assert leaf.authorize() is effect
+    assert preflight.calls == 1
+    assert calls == [
+        (
+            "begin",
+            ("acct-test-a",),
+            {
+                "oauth_client_ref": "synthetic-client-test-a",
+                "redirect_uri": "http://127.0.0.1:8765/callback",
+                "expected_generation": 7,
+                "idempotency_key": "authorize-test-a",
+                "principal": "control-service",
+            },
+        ),
+        (
+            "complete",
+            ("synthetic-inventory-oauth-test",),
+            {
+                "code": "synthetic-code-a",
+                "account_ref": "acct-test-a",
+                "redirect_uri": "http://127.0.0.1:8765/callback",
+                "expected_generation": 7,
+                "state": "synthetic-state-a",
+            },
+        ),
+    ]
+    assert "acct-test-a" not in repr(leaf)
+    with pytest.raises(TypeError):
+        pickle.dumps(leaf)
+
+
+def test_private_fixed_inventory_authorization_leaf_preflights_then_is_redacted_unavailable() -> (
+    None
+):
+    """Break caught: absent private OAuth material is an authorize-time failure only."""
+
+    preflight = oauth_session._InventoryReadonlyAuthorizationPreflightForTestV1()
+    leaf = oauth_session._for_test_the_hive_inventory_readonly_authorization_port(
+        control_service=None,
+        callback_driver=None,
+        preflight=preflight,
+    )
+
+    with pytest.raises(oauth_session.GoogleOAuthSessionError) as raised:
+        leaf.authorize()
+
+    assert raised.value.code == "oauth.inventory_unavailable"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert preflight.calls == 1
+
+
+def test_private_fixed_inventory_authorization_leaf_rejects_caller_replaceable_inputs() -> (
+    None
+):
+    """Break caught: its sole production factory cannot accept caller OAuth ports."""
+
+    with pytest.raises(oauth_session.GoogleOAuthSessionError) as raised:
+        oauth_session._new_the_hive_inventory_readonly_authorization_port(
+            vault_components=object(), manager=object()
+        )
+
+    assert raised.value.code == "oauth.inventory_unavailable"
 
 
 def test_oauth_transaction_is_account_bound_and_code_is_consumed_once(
@@ -669,7 +1230,7 @@ def test_oauth_transaction_is_account_bound_and_code_is_consumed_once(
 
     receipt = _complete(service, transaction)
     assert receipt == GoogleOAuthSessionReceipt(
-        account_ref="google-account-01",
+        account_ref="google-synthetic-account-01",
         subject_bound=True,
         refresh_token_stored=True,
     )
@@ -684,19 +1245,19 @@ def test_account_oauth_state_tracks_missing_pending_and_ready_authority(
     service, ingress, _exchange, _manager_instance = _service(tmp_path)
     _plan, _session, imported = _import_client(service, ingress)
 
-    assert service.account_oauth_state("google-account-01", expected_generation=1) == (
-        "needs_auth"
-    )
+    assert service.account_oauth_state(
+        "google-synthetic-account-01", expected_generation=1
+    ) == ("needs_auth")
 
     transaction = _begin(service, imported.client_ref)
-    assert service.account_oauth_state("google-account-01", expected_generation=1) == (
-        "pending"
-    )
+    assert service.account_oauth_state(
+        "google-synthetic-account-01", expected_generation=1
+    ) == ("pending")
 
     _complete(service, transaction)
-    assert service.account_oauth_state("google-account-01", expected_generation=1) == (
-        "ready"
-    )
+    assert service.account_oauth_state(
+        "google-synthetic-account-01", expected_generation=1
+    ) == ("ready")
 
 
 def test_provisioner_oauth_profile_is_stored_for_write_authority(
@@ -708,13 +1269,13 @@ def test_provisioner_oauth_profile_is_stored_for_write_authority(
     )
     _plan, _session, imported = _import_client(service, ingress)
     transaction = service.begin_oauth_transaction(
-        "google-account-01",
+        "google-synthetic-account-01",
         oauth_client_ref=imported.client_ref,
         redirect_uri="http://127.0.0.1:8765/callback",
         scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
         expected_generation=1,
         idempotency_key="oauth-provisioner",
-        principal="operator-one",
+        principal="synthetic-operator-one",
     )
 
     assert "cloud-platform.read-only" not in transaction.authorization_url
@@ -722,7 +1283,7 @@ def test_provisioner_oauth_profile_is_stored_for_write_authority(
     assert _complete(service, transaction).refresh_token_stored is True
     assert token_writer.writes == [
         (
-            "google-account-01",
+            "google-synthetic-account-01",
             GoogleOAuthProfileIdV1.PROVISIONER.value,
             oauth_session.resolve_google_oauth_profile_v1(
                 GoogleOAuthProfileIdV1.PROVISIONER,
@@ -743,6 +1304,7 @@ def test_first_subject_binding_rebases_active_client_generation(
             receipt = super().store_refresh_token(*args, **kwargs)
             document = yaml.safe_load(inventory.read_text(encoding="utf-8"))
             document["google_accounts"][0]["subject_id"] = receipt.subject_id
+            document["authority_generation"] += 1
             inventory.write_text(yaml.safe_dump(document), encoding="utf-8")
             inventory.chmod(0o600)
             manager.reload(expected_generation=1)
@@ -756,7 +1318,7 @@ def test_first_subject_binding_rebases_active_client_generation(
 
     assert _complete(service, transaction).subject_bound is True
     binding = service.default_oauth_client_binding(
-        "google-account-01", expected_generation=2
+        "google-synthetic-account-01", expected_generation=2
     )
     assert (
         binding.availability is oauth_session.GoogleOAuthClientAvailabilityV1.AVAILABLE
@@ -775,9 +1337,9 @@ def test_oauth_begin_replays_same_receipt_after_restart_and_conflicts_on_rebind(
         "scope_profile": GoogleOAuthProfileIdV1.INVENTORY_READONLY,
         "expected_generation": 1,
         "idempotency_key": "oauth-begin-one",
-        "principal": "operator-one",
+        "principal": "synthetic-operator-one",
     }
-    first = service.begin_oauth_transaction("google-account-01", **values)
+    first = service.begin_oauth_transaction("google-synthetic-account-01", **values)
     restarted, _ingress, _exchange, _manager_instance = _service(
         tmp_path,
         ingress=ingress,
@@ -785,10 +1347,13 @@ def test_oauth_begin_replays_same_receipt_after_restart_and_conflicts_on_rebind(
         manager=manager,
     )
 
-    assert restarted.begin_oauth_transaction("google-account-01", **values) == first
+    assert (
+        restarted.begin_oauth_transaction("google-synthetic-account-01", **values)
+        == first
+    )
     with pytest.raises(GoogleOAuthSessionError, match="control.idempotency_conflict"):
         restarted.begin_oauth_transaction(
-            "google-account-01",
+            "google-synthetic-account-01",
             **{**values, "redirect_uri": "http://127.0.0.1:8766/callback"},
         )
     document = json.loads(
@@ -800,7 +1365,7 @@ def test_oauth_begin_replays_same_receipt_after_restart_and_conflicts_on_rebind(
 @pytest.mark.parametrize(
     ("override", "code"),
     (
-        ({"account_ref": "google-account-02"}, "oauth.account_mismatch"),
+        ({"account_ref": "google-synthetic-account-02"}, "oauth.account_mismatch"),
         ({"expected_generation": 2}, "oauth.generation_mismatch"),
         (
             {"redirect_uri": "http://127.0.0.1:8766/callback"},
@@ -825,7 +1390,7 @@ def test_oauth_callback_binding_mismatch_is_terminal_without_token_write(
 
 def test_subject_mismatch_is_terminal_and_writes_no_token(tmp_path: Path) -> None:
     service, ingress, _exchange, _manager_instance = _service(
-        tmp_path, exchange=_Exchange("subject-two")
+        tmp_path, exchange=_Exchange("synthetic-subject-two")
     )
     _plan, _session, imported = _import_client(service, ingress)
     transaction = _begin(service, imported.client_ref)
@@ -868,6 +1433,7 @@ def test_inventory_generation_change_prevents_token_write(tmp_path: Path) -> Non
     service, ingress, exchange, manager = _service(tmp_path)
     _plan, _session, imported = _import_client(service, ingress)
     transaction = _begin(service, imported.client_ref)
+    _advance_inventory_generation(tmp_path)
     assert manager.reload().generation == 2
 
     with pytest.raises(GoogleOAuthSessionError, match="oauth.generation_mismatch"):
@@ -912,7 +1478,7 @@ def test_client_import_apply_is_idempotent_but_ingress_cannot_be_replayed(
 
     assert service.apply_oauth_client_import(first_plan, first_session) == first
     second_plan = service.plan_oauth_client_import(
-        "google-account-01",
+        "google-synthetic-account-01",
         expected_generation=1,
         idempotency_key="import-two",
     )
@@ -923,17 +1489,19 @@ def test_client_import_apply_is_idempotent_but_ingress_cannot_be_replayed(
 def test_client_import_and_transaction_projections_are_redacted_and_digit_free(
     tmp_path: Path,
 ) -> None:
-    marker = "private-client-secret-marker"
+    marker = "synthetic-private-synthetic-client-synthetic-secret-marker"
     service, ingress, _exchange, _manager_instance = _service(tmp_path)
     plan = service.plan_oauth_client_import(
-        "google-account-01", expected_generation=1, idempotency_key="import-one"
+        "google-synthetic-account-01",
+        expected_generation=1,
+        idempotency_key="import-one",
     )
     imported = service.apply_oauth_client_import(
         plan, ingress.put(plan, _client_json(marker))
     )
     transaction = _begin(service, imported.client_ref)
 
-    assert imported.account_ref == "google-account-01"
+    assert imported.account_ref == "google-synthetic-account-01"
     assert not any(character.isdigit() for character in imported.display_name)
     assert "mji-client" not in imported.display_name.casefold()
     assert "hive-ref" not in imported.display_name.casefold()
@@ -952,7 +1520,7 @@ def test_client_import_and_transaction_projections_are_redacted_and_digit_free(
     )
     stored = b"".join(
         path.read_bytes()
-        for path in (tmp_path / "client-vault").iterdir()
+        for path in (tmp_path / "synthetic-client-vault").iterdir()
         if path.is_file()
     )
     state = b"".join(
@@ -970,13 +1538,13 @@ def test_oauth_client_ref_cannot_cross_accounts(tmp_path: Path) -> None:
 
     with pytest.raises(GoogleOAuthSessionError, match="oauth.client_account_mismatch"):
         service.begin_oauth_transaction(
-            "google-account-02",
+            "google-synthetic-account-02",
             oauth_client_ref=imported.client_ref,
             redirect_uri="http://127.0.0.1:8765/callback",
             scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
             expected_generation=1,
             idempotency_key="oauth-cross-account",
-            principal="operator-one",
+            principal="synthetic-operator-one",
         )
 
 
@@ -987,27 +1555,27 @@ def test_default_oauth_client_binding_is_exact_account_scoped_and_redacted(
     _plan, _session, imported = _import_client(service, ingress)
 
     bound = service.default_oauth_client_binding(
-        "google-account-01", expected_generation=1
+        "google-synthetic-account-01", expected_generation=1
     )
     missing = service.default_oauth_client_binding(
-        "google-account-02", expected_generation=1
+        "google-synthetic-account-02", expected_generation=1
     )
 
     assert bound == oauth_session.GoogleOAuthClientBindingV1(
-        account_ref="google-account-01",
+        account_ref="google-synthetic-account-01",
         inventory_generation=1,
         default_oauth_client_ref=imported.client_ref,
         availability=oauth_session.GoogleOAuthClientAvailabilityV1.AVAILABLE,
     )
     assert missing == oauth_session.GoogleOAuthClientBindingV1(
-        account_ref="google-account-02",
+        account_ref="google-synthetic-account-02",
         inventory_generation=1,
         default_oauth_client_ref=None,
         availability=oauth_session.GoogleOAuthClientAvailabilityV1.MISSING,
     )
     rendered = repr((bound, missing))
-    assert "private-client-secret" not in rendered
-    assert "577074103233-clientpart" not in rendered
+    assert "synthetic-private-synthetic-client-secret" not in rendered
+    assert "000000000000-clientpart" not in rendered
 
 
 def test_active_oauth_client_material_is_account_bound_and_redacted(
@@ -1017,14 +1585,16 @@ def test_active_oauth_client_material_is_account_bound_and_redacted(
     _import_client(service, ingress)
 
     material = service.active_oauth_client_material(
-        "google-account-01", expected_generation=1
+        "google-synthetic-account-01", expected_generation=1
     )
 
-    assert material.client_id == "577074103233-clientpart.apps.googleusercontent.com"
-    assert material.client_secret == "private-client-secret"
+    assert (
+        material.client_id == "000000000000-syntheticclient.apps.googleusercontent.com"
+    )
+    assert material.client_secret == "synthetic-private-synthetic-client-secret"
     assert material.token_uri == "https://oauth2.googleapis.com/token"
     assert material.client_fingerprint.startswith("sha256:")
-    assert "private-client-secret" not in repr(material)
+    assert "synthetic-private-synthetic-client-secret" not in repr(material)
 
 
 def test_default_oauth_client_binding_disables_stale_or_revoked_projection(
@@ -1034,14 +1604,15 @@ def test_default_oauth_client_binding_disables_stale_or_revoked_projection(
     _plan, _session, _imported = _import_client(service, ingress)
 
     service._client_vault.revoke_account(
-        service._client_vault_ref("google-account-01"), expected_generation=1
+        service._client_vault_ref("google-synthetic-account-01"), expected_generation=1
     )
     revoked = service.default_oauth_client_binding(
-        "google-account-01", expected_generation=1
+        "google-synthetic-account-01", expected_generation=1
     )
+    _advance_inventory_generation(tmp_path)
     manager.reload(expected_generation=1)
     stale = service.default_oauth_client_binding(
-        "google-account-01", expected_generation=2
+        "google-synthetic-account-01", expected_generation=2
     )
 
     assert stale.default_oauth_client_ref is None
@@ -1066,7 +1637,7 @@ def test_default_oauth_client_binding_degrades_journal_lock_fault(
 
     monkeypatch.setattr(service._state, "locked", unavailable_lock)
     binding = service.default_oauth_client_binding(
-        "google-account-01", expected_generation=1
+        "google-synthetic-account-01", expected_generation=1
     )
 
     assert binding.default_oauth_client_ref is None
@@ -1083,7 +1654,7 @@ def test_default_oauth_client_binding_degrades_corrupt_journal_read(
     _import_client(service, ingress)
     service._state.replace_json(oauth_session._CONTROL_DOCUMENT, {"schema_version": 3})
     binding = service.default_oauth_client_binding(
-        "google-account-01", expected_generation=1
+        "google-synthetic-account-01", expected_generation=1
     )
 
     assert binding.default_oauth_client_ref is None
@@ -1105,7 +1676,9 @@ def test_default_oauth_client_binding_does_not_hide_programming_or_control_error
 
     monkeypatch.setattr(service, "_read_locked", broken_read)
     with pytest.raises(RuntimeError) as captured:
-        service.default_oauth_client_binding("google-account-01", expected_generation=1)
+        service.default_oauth_client_binding(
+            "google-synthetic-account-01", expected_generation=1
+        )
     assert captured.value is programming_error
 
     domain_error = GoogleOAuthSessionError("oauth.request_invalid")
@@ -1115,7 +1688,9 @@ def test_default_oauth_client_binding_does_not_hide_programming_or_control_error
 
     monkeypatch.setattr(service, "_read_locked", invalid_domain_read)
     with pytest.raises(GoogleOAuthSessionError) as invalid_domain:
-        service.default_oauth_client_binding("google-account-01", expected_generation=1)
+        service.default_oauth_client_binding(
+            "google-synthetic-account-01", expected_generation=1
+        )
     assert invalid_domain.value is domain_error
 
     control_signal = KeyboardInterrupt()
@@ -1127,7 +1702,9 @@ def test_default_oauth_client_binding_does_not_hide_programming_or_control_error
 
     monkeypatch.setattr(service._state, "locked", interrupted_lock)
     with pytest.raises(KeyboardInterrupt) as interrupted:
-        service.default_oauth_client_binding("google-account-01", expected_generation=1)
+        service.default_oauth_client_binding(
+            "google-synthetic-account-01", expected_generation=1
+        )
     assert interrupted.value is control_signal
 
 
@@ -1139,13 +1716,13 @@ def test_non_profile_grant_is_rejected_before_any_transaction_or_token_write(
 
     with pytest.raises(GoogleOAuthSessionError, match="oauth.scope_mismatch"):
         service.begin_oauth_transaction(
-            "google-account-01",
+            "google-synthetic-account-01",
             oauth_client_ref=imported.client_ref,
             redirect_uri="http://127.0.0.1:8765/callback",
             scope_profile="provisioner",  # type: ignore[arg-type]
             expected_generation=1,
             idempotency_key="oauth-wrong-profile",
-            principal="operator-one",
+            principal="synthetic-operator-one",
         )
 
     document = json.loads(
@@ -1160,7 +1737,9 @@ def test_client_import_recovers_receipt_after_control_write_crash(
 ) -> None:
     service, ingress, exchange, manager = _service(tmp_path)
     plan = service.plan_oauth_client_import(
-        "google-account-01", expected_generation=1, idempotency_key="import-one"
+        "google-synthetic-account-01",
+        expected_generation=1,
+        idempotency_key="import-one",
     )
     session = ingress.put(plan, _client_json())
     original_write = service._write_locked
@@ -1182,7 +1761,7 @@ def test_client_import_recovers_receipt_after_control_write_crash(
         tmp_path, ingress=ingress, exchange=exchange, manager=manager
     )
     receipt = restarted.reconcile_oauth_client_import(plan, session)
-    assert receipt.account_ref == "google-account-01"
+    assert receipt.account_ref == "google-synthetic-account-01"
     assert receipt.inventory_generation == 1
     assert session.acknowledged is True
 
@@ -1225,7 +1804,7 @@ def test_token_write_receipt_recovers_after_control_write_crash(
     assert (
         restarted.reconcile_oauth_transaction(
             transaction.id,
-            account_ref="google-account-01",
+            account_ref="google-synthetic-account-01",
             redirect_uri="http://127.0.0.1:8765/callback",
             expected_generation=1,
             state=_state(transaction),
@@ -1477,7 +2056,7 @@ def test_client_import_reconciles_vault_effect_after_plan_expiry(
     clock = _Clock()
     service, ingress, exchange, manager = _service(tmp_path, clock=clock)
     plan = service.plan_oauth_client_import(
-        "google-account-01",
+        "google-synthetic-account-01",
         expected_generation=1,
         idempotency_key="import-expiry-recovery",
         ttl_seconds=1,
@@ -1532,6 +2111,7 @@ def test_token_receipt_reconciles_after_inventory_generation_changes(
     with pytest.raises(GoogleOAuthSessionError, match="oauth.token_write_failed"):
         _complete(service, transaction)
     monkeypatch.setattr(service, "_write_locked", original_write)
+    _advance_inventory_generation(tmp_path)
     assert manager.reload().generation == 2
 
     restarted, _ingress, _exchange, _manager_instance = _service(
@@ -1721,7 +2301,7 @@ def test_primary_base_exception_survives_cleanup_base_exception(
 def test_secret_ingress_errors_are_typed_and_redacted(
     tmp_path: Path, boundary: str, fatal: bool
 ) -> None:
-    marker = "private-ingress-exception-marker"
+    marker = "synthetic-private-ingress-exception-marker"
 
     class SecretIngressFailure(BaseException if fatal else Exception):
         def __str__(self) -> str:
@@ -1746,7 +2326,7 @@ def test_secret_ingress_errors_are_typed_and_redacted(
         tmp_path, ingress=ingress
     )
     plan = service.plan_oauth_client_import(
-        "google-account-01",
+        "google-synthetic-account-01",
         expected_generation=1,
         idempotency_key=f"ingress-{boundary}-{fatal}",
     )
@@ -1770,7 +2350,7 @@ def test_secret_ingress_errors_are_typed_and_redacted(
 def test_secret_ingress_callable_property_failure_is_typed_and_redacted(
     tmp_path: Path,
 ) -> None:
-    marker = "private-ingress-property-marker"
+    marker = "synthetic-private-ingress-property-marker"
 
     class PropertyFailure(BaseException):
         def __str__(self) -> str:
@@ -1791,7 +2371,7 @@ def test_secret_ingress_callable_property_failure_is_typed_and_redacted(
             tmp_path / "oauth-state",
             manager=manager,
             client_vault=CredentialVault.for_test(
-                tmp_path / "client-vault", key=b"k" * 32, clock=clock
+                tmp_path / "synthetic-client-vault", key=b"k" * 32, clock=clock
             ),
             token_writer=_TokenWriter(),
             secret_ingress=PropertyIngress(),
@@ -1807,7 +2387,7 @@ def test_secret_ingress_callable_property_failure_is_typed_and_redacted(
 def test_ingress_ack_failure_remains_retryable_until_claim_cleanup(
     tmp_path: Path,
 ) -> None:
-    marker = "private-ack-retry-marker"
+    marker = "synthetic-private-ack-retry-marker"
 
     class RetryableAckIngress(_SecretIngress):
         fail = True
@@ -1822,7 +2402,9 @@ def test_ingress_ack_failure_remains_retryable_until_claim_cleanup(
         tmp_path, ingress=ingress
     )
     plan = service.plan_oauth_client_import(
-        "google-account-01", expected_generation=1, idempotency_key="ack-retry"
+        "google-synthetic-account-01",
+        expected_generation=1,
+        idempotency_key="ack-retry",
     )
     session = ingress.put(plan, _client_json())
 
@@ -1844,7 +2426,9 @@ def test_acknowledged_import_recovers_after_final_journal_crash(
 ) -> None:
     service, ingress, exchange, manager = _service(tmp_path)
     plan = service.plan_oauth_client_import(
-        "google-account-01", expected_generation=1, idempotency_key="ack-crash"
+        "google-synthetic-account-01",
+        expected_generation=1,
+        idempotency_key="ack-crash",
     )
     session = ingress.put(plan, _client_json())
     original_write = service._write_locked
@@ -1887,7 +2471,7 @@ def test_expired_import_retries_claim_cleanup_before_terminalizing(
 
         def acknowledge_oauth_client(self, *args, **kwargs):
             if self.fail:
-                raise RuntimeError("private-expiry-cleanup-marker")
+                raise RuntimeError("synthetic-private-expiry-cleanup-marker")
             return super().acknowledge_oauth_client(*args, **kwargs)
 
     clock = _Clock()
@@ -1896,7 +2480,7 @@ def test_expired_import_retries_claim_cleanup_before_terminalizing(
         tmp_path, clock=clock, ingress=ingress
     )
     plan = service.plan_oauth_client_import(
-        "google-account-01",
+        "google-synthetic-account-01",
         expected_generation=1,
         idempotency_key="expiry-cleanup",
         ttl_seconds=1,
@@ -1925,7 +2509,9 @@ def test_v1_ambiguous_import_migrates_to_manual_repair_block(
 ) -> None:
     service, ingress, exchange, manager = _service(tmp_path)
     plan = service.plan_oauth_client_import(
-        "google-account-01", expected_generation=1, idempotency_key="legacy-claim"
+        "google-synthetic-account-01",
+        expected_generation=1,
+        idempotency_key="legacy-claim",
     )
     path = tmp_path / "oauth-state" / "google-oauth-control.json"
     document = json.loads(path.read_text())
@@ -1942,11 +2528,11 @@ def test_v1_ambiguous_import_migrates_to_manual_repair_block(
     assert migrated["imports"][0]["state"] == "repair_required"
     with pytest.raises(GoogleOAuthSessionError, match="oauth.client_repair_required"):
         restarted.plan_oauth_client_import(
-            "google-account-01",
+            "google-synthetic-account-01",
             expected_generation=1,
             idempotency_key="new-import",
         )
-    assert plan.account_ref == "google-account-01"
+    assert plan.account_ref == "google-synthetic-account-01"
 
 
 def test_v1_succeeded_import_migrates_terminal_without_obsolete_ack(

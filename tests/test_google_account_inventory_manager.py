@@ -46,21 +46,23 @@ def fresh_document(
     *,
     secret: str | None = SYNTHETIC_SECRET,
     key_id: object = "000654",
+    generation: int = 1,
 ) -> object:
     if root.exists():
         root = root / "inventory"
     document = {
-        "schema_version": 1,
+        "schema_version": 3,
+        "authority_generation": generation,
         "google_accounts": [
             {
-                "ref": "google-account-01",
+                "ref": "synthetic-account-01",
                 "login_email": "account@example.test",
                 "recovery_email": None,
                 "label": "Test account",
                 "subject_id": "000123",
                 "billing_accounts": [
                     {
-                        "ref": "billing-01",
+                        "ref": "synthetic-billing-01",
                         "billing_account_id": "000456",
                         "label": "Trial",
                     }
@@ -68,13 +70,16 @@ def fresh_document(
                 "projects": [
                     {
                         "ref": "the-hive-1",
-                        "billing_account_ref": "billing-01",
+                        "billing_account_ref": "synthetic-billing-01",
                         "status": "active",
                         "project_id": "000789",
                         "project_number": "000987",
                         "key_id": key_id,
                         "key_uid": "000321",
                         "secret": secret,
+                        "purpose": "hive",
+                        "project_name": "Synthetic Project",
+                        "key_name": "Synthetic Project Key",
                     }
                 ],
             }
@@ -93,6 +98,7 @@ def projection_document(
     *,
     private_marker: str,
     public_overrides: dict[str, str] | None = None,
+    generation: int = 1,
 ) -> object:
     if root.exists():
         root = root / "inventory"
@@ -100,12 +106,12 @@ def projection_document(
     for number, account_ref, project_ref, label, subject_id in (
         (
             1,
-            "google-account-01",
+            "synthetic-account-01",
             "the-hive-1",
             "Quiet account",
-            f"{private_marker}-subject-one",
+            f"{private_marker}-synthetic-subject-one",
         ),
-        (2, "google-account-02", "the-hive-2", "Calm account", None),
+        (2, "synthetic-account-02", "the-hive-2", "Calm account", None),
     ):
         accounts.append(
             {
@@ -115,28 +121,28 @@ def projection_document(
                 "label": label,
                 "subject_id": subject_id,
                 "auth": {
-                    "access_token": f"{private_marker}-access-{number}",
-                    "refresh_token": f"{private_marker}-refresh-{number}",
+                    "access_token": f"{private_marker}-synthetic-access-{number}",
+                    "refresh_token": f"{private_marker}-synthetic-refresh-{number}",
                     "cookies": [{"value": f"{private_marker}-cookie-{number}"}],
                     "client_fingerprint": f"{private_marker}-fingerprint-{number}",
                 },
                 "billing_accounts": [
                     {
-                        "ref": f"billing-{number:02d}",
-                        "billing_account_id": f"{private_marker}-billing-{number}",
+                        "ref": f"synthetic-billing-{number:02d}",
+                        "billing_account_id": f"{private_marker}-synthetic-billing-{number}",
                         "label": f"Billing {number}",
                     }
                 ],
                 "projects": [
                     {
                         "ref": project_ref,
-                        "billing_account_ref": f"billing-{number:02d}",
+                        "billing_account_ref": f"synthetic-billing-{number:02d}",
                         "status": "active" if number == 1 else "blocked",
-                        "project_id": f"{private_marker}-project-{number}",
+                        "project_id": f"{private_marker}-synthetic-project-{number}",
                         "project_number": f"{private_marker}-number-{number}",
-                        "key_id": f"{private_marker}-key-{number}",
-                        "key_uid": f"{private_marker}-uid-{number}",
-                        "secret": f"{private_marker}-secret-{number}"
+                        "key_id": f"{private_marker}-synthetic-key-{number}",
+                        "key_uid": f"{private_marker}-synthetic-identifier-{number}",
+                        "secret": f"{private_marker}-synthetic-secret-{number}"
                         if number == 1
                         else None,
                         "project_name": (
@@ -167,7 +173,12 @@ def projection_document(
     path = root / "api-token.yaml"
     path.write_text(
         yaml.safe_dump(
-            {"schema_version": 2, "google_accounts": accounts}, sort_keys=False
+            {
+                "schema_version": 3,
+                "authority_generation": generation,
+                "google_accounts": accounts,
+            },
+            sort_keys=False,
         ),
         encoding="utf-8",
     )
@@ -211,12 +222,12 @@ test_manager.__test__ = False
 
 def test_default_manager_initializes_empty_and_reload_failure_is_redacted() -> None:
     manager = GoogleAccountInventoryManager()
-    failure = manager_module._ReloadFailureV1("private-code")
+    failure = manager_module._ReloadFailureV1("synthetic-code")
 
     assert manager.status().state is InventoryManagerStateV1.EMPTY
     assert manager.status().generation is None
     assert repr(failure) == "_ReloadFailureV1()"
-    assert "private-code" not in repr(failure)
+    assert "synthetic-code" not in repr(failure)
     with pytest.raises(TypeError, match="not serializable"):
         pickle.dumps(failure)
 
@@ -245,7 +256,7 @@ def issue_valid_lease(
 ) -> object:
     return manager._issue_secret_lease(
         expected_generation=snapshot.generation,
-        account_ref="google-account-01",
+        account_ref="synthetic-account-01",
         project_ref="the-hive-1",
         key_id=key_id,  # type: ignore[arg-type]
         purpose=_SecretLeasePurposeV1.PROVIDER_REQUEST,
@@ -261,7 +272,7 @@ def consume_valid_lease(
 ) -> str:
     binding = {
         "expected_generation": snapshot.generation,
-        "account_ref": "google-account-01",
+        "account_ref": "synthetic-account-01",
         "project_ref": "the-hive-1",
         "key_id": "000654",
         "purpose": _SecretLeasePurposeV1.PROVIDER_REQUEST,
@@ -346,10 +357,10 @@ def _exception_graph_values(error: BaseException) -> list[object]:
 def _assert_reload_failure_graph_is_redacted(error: BaseException) -> None:
     forbidden_markers = (
         SYNTHETIC_SECRET,
-        "google-account-01",
+        "synthetic-account-01",
         "account@example.test",
         "000123",
-        "billing-01",
+        "synthetic-billing-01",
         "000456",
         "the-hive-1",
         "000789",
@@ -460,10 +471,10 @@ def test_review_reload_success_returns_only_redacted_status(tmp_path: Path) -> N
     )
     markers = (
         SYNTHETIC_SECRET,
-        "google-account-01",
+        "synthetic-account-01",
         "account@example.test",
         "000123",
-        "billing-01",
+        "synthetic-billing-01",
         "000456",
         "the-hive-1",
         "000789",
@@ -487,7 +498,7 @@ def test_first_reload_publishes_immutable_generation_one_snapshot(
     assert status.generation == 1
     assert status.source_type is InventorySourceTypeV1.TEST
     assert status.loaded_at_utc == "2026-08-23T12:00:00Z"
-    assert snapshot.by_account_ref["google-account-01"].ref == "google-account-01"
+    assert snapshot.by_account_ref["synthetic-account-01"].ref == "synthetic-account-01"
     assert snapshot.by_project_ref["the-hive-1"].hive_slot == 1
     assert snapshot.by_hive_slot[1].ref == "the-hive-1"
 
@@ -516,39 +527,39 @@ def test_status_and_snapshot_public_projection_are_redacted_aggregates(
 def test_admin_views_are_immutable_redacted_and_account_isolated(
     tmp_path: Path,
 ) -> None:
-    private_marker = "private-provider-marker"
+    private_marker = "synthetic-provider-marker"
     manager = test_manager(projection_document(tmp_path, private_marker=private_marker))
     manager.reload()
 
     accounts = manager.list_accounts()
     assert accounts == (
         {
-            "ref": "google-account-01",
+            "ref": "synthetic-account-01",
             "label": "Quiet account",
             "subject_bound": True,
             "inventory_generation": 1,
             "project_count": 1,
             "billing_count": 1,
-            "billing_refs": ("billing-01",),
+            "billing_refs": ("synthetic-billing-01",),
         },
         {
-            "ref": "google-account-02",
+            "ref": "synthetic-account-02",
             "label": "Calm account",
             "subject_bound": False,
             "inventory_generation": 1,
             "project_count": 1,
             "billing_count": 1,
-            "billing_refs": ("billing-02",),
+            "billing_refs": ("synthetic-billing-02",),
         },
     )
-    assert manager.get_account("google-account-01") == accounts[0]
-    assert manager.list_projects("google-account-01") == (
+    assert manager.get_account("synthetic-account-01") == accounts[0]
+    assert manager.list_projects("synthetic-account-01") == (
         {
             "ref": "the-hive-1",
             "project_name": "Quietglow Aurorabay",
             "key_name": "Quietglow Aurorabay Key",
             "purpose": "hive",
-            "billing_ref": "billing-01",
+            "billing_ref": "synthetic-billing-01",
             "status": "active",
             "inventory_generation": 1,
         },
@@ -557,8 +568,8 @@ def test_admin_views_are_immutable_redacted_and_account_isolated(
     assert private_marker not in repr(
         (
             accounts,
-            manager.get_account("google-account-01"),
-            manager.list_projects("google-account-01"),
+            manager.get_account("synthetic-account-01"),
+            manager.list_projects("synthetic-account-01"),
         )
     )
     with pytest.raises(TypeError):
@@ -569,7 +580,7 @@ def test_admin_views_are_immutable_redacted_and_account_isolated(
     ("field", "value", "operation"),
     [
         ("ref", "/private/credential.json", "accounts"),
-        ("label", "private-login@example.test", "accounts"),
+        ("label", "synthetic-login@example.test", "accounts"),
         ("label", "RuntimeError: provider exploded", "accounts"),
         ("label", "ＣＬＩＥＮＴＳＥＣＲＥＴ topvalue", "accounts"),
         ("label", "client%5Fsecret=topvalue", "accounts"),
@@ -589,7 +600,7 @@ def test_admin_views_reject_private_smuggling_in_public_source_fields(
     manager = test_manager(
         projection_document(
             tmp_path,
-            private_marker="private-source-marker",
+            private_marker="synthetic-source-marker",
             public_overrides={field: value},
         )
     )
@@ -599,7 +610,7 @@ def test_admin_views_reject_private_smuggling_in_public_source_fields(
         if operation == "accounts":
             manager.list_accounts()
         else:
-            manager.list_projects("google-account-01")
+            manager.list_projects("synthetic-account-01")
 
     assert caught.value.code == "control.response_private"
     assert value not in repr(caught.value)
@@ -609,13 +620,13 @@ def test_admin_views_keep_safe_unicode_label(tmp_path: Path) -> None:
     manager = test_manager(
         projection_document(
             tmp_path,
-            private_marker="private-source-marker",
+            private_marker="synthetic-source-marker",
             public_overrides={"label": "Café München"},
         )
     )
     manager.reload()
 
-    assert manager.get_account("google-account-01")["label"] == "Café München"
+    assert manager.get_account("synthetic-account-01")["label"] == "Café München"
 
 
 def test_admin_views_use_one_existing_snapshot_per_call(
@@ -626,7 +637,9 @@ def test_admin_views_use_one_existing_snapshot_per_call(
     )
     second_manager = test_manager(
         projection_document(tmp_path / "second-one", private_marker="second-private"),
-        projection_document(tmp_path / "second-two", private_marker="second-private"),
+        projection_document(
+            tmp_path / "second-two", private_marker="second-private", generation=2
+        ),
     )
     first_manager.reload()
     second_manager.reload()
@@ -641,8 +654,10 @@ def test_admin_views_use_one_existing_snapshot_per_call(
     monkeypatch.setattr(first_manager, "_document_loader", reject_second_yaml_read)
     generation_reads = (
         lambda: first_manager.list_accounts()[0]["inventory_generation"],
-        lambda: first_manager.get_account("google-account-01")["inventory_generation"],
-        lambda: first_manager.list_projects("google-account-01")[0][
+        lambda: first_manager.get_account("synthetic-account-01")[
+            "inventory_generation"
+        ],
+        lambda: first_manager.list_projects("synthetic-account-01")[0][
             "inventory_generation"
         ],
         first_manager.inventory_generation,
@@ -659,7 +674,7 @@ def test_admin_views_use_one_existing_snapshot_per_call(
 def test_admin_views_fail_closed_for_unknown_and_duplicate_account_refs(
     tmp_path: Path,
 ) -> None:
-    private_marker = "private-error-marker"
+    private_marker = "synthetic-error-marker"
     manager = test_manager(
         projection_document(tmp_path / "valid", private_marker=private_marker)
     )
@@ -672,7 +687,8 @@ def test_admin_views_fail_closed_for_unknown_and_duplicate_account_refs(
 
     duplicate = tmp_path / "duplicate"
     document = {
-        "schema_version": 1,
+        "schema_version": 3,
+        "authority_generation": 1,
         "google_accounts": [
             {
                 "ref": "duplicate-account",
@@ -750,7 +766,7 @@ def test_later_successful_reload_publishes_next_generation_and_reopens_gate(
     manager = test_manager(
         fresh_document(tmp_path / "first"),
         GoogleAccountInventoryError("credential.inventory_schema_invalid"),
-        fresh_document(tmp_path / "second"),
+        fresh_document(tmp_path / "second", generation=2),
     )
     manager.reload()
     with pytest.raises(GoogleAccountInventoryError):
@@ -1057,7 +1073,7 @@ def test_reload_and_snapshot_reader_never_observe_partial_generation(
     reader_started = threading.Event()
     reader_finished = threading.Event()
     first = fresh_document(tmp_path / "first")
-    second = fresh_document(tmp_path / "second")
+    second = fresh_document(tmp_path / "second", generation=2)
     manager = GoogleAccountInventoryManager._for_test_loader(
         blocking_sequence_loader(
             first, second_load_entered, release_second_load, second
@@ -1094,8 +1110,8 @@ def test_parallel_reloads_publish_strictly_increasing_generations(
 ) -> None:
     manager = test_manager(
         fresh_document(tmp_path / "first"),
-        fresh_document(tmp_path / "second"),
-        fresh_document(tmp_path / "third"),
+        fresh_document(tmp_path / "second", generation=2),
+        fresh_document(tmp_path / "third", generation=3),
     )
     assert manager.reload().generation == 1
     results: list[int] = []
@@ -1192,7 +1208,7 @@ ISSUE_BINDING_TYPE_CASES = [
     ("account_ref", {}, "credential.account_not_found"),
     (
         "account_ref",
-        StringSubclass("google-account-01"),
+        StringSubclass("synthetic-account-01"),
         "credential.account_not_found",
     ),
     ("account_ref", ExplodingComparison(), "credential.account_not_found"),
@@ -1244,7 +1260,7 @@ def test_review_issue_binding_types_fail_before_index_or_equality(
     status = manager.reload()
     arguments: dict[str, object] = {
         "expected_generation": status.generation,
-        "account_ref": "google-account-01",
+        "account_ref": "synthetic-account-01",
         "project_ref": "the-hive-1",
         "key_id": "000654",
         "purpose": _SecretLeasePurposeV1.PROVIDER_REQUEST,
@@ -1279,7 +1295,7 @@ CONSUME_BINDING_TYPE_CASES = [
     ("account_ref", {}, "credential.secret_lease_binding_mismatch"),
     (
         "account_ref",
-        StringSubclass("google-account-01"),
+        StringSubclass("synthetic-account-01"),
         "credential.secret_lease_binding_mismatch",
     ),
     (
@@ -1340,7 +1356,7 @@ def test_review_consume_binding_types_fail_before_equality_or_clock(
     lease = issue_valid_lease(manager, status, ttl_seconds=10.0)
     arguments: dict[str, object] = {
         "expected_generation": status.generation,
-        "account_ref": "google-account-01",
+        "account_ref": "synthetic-account-01",
         "project_ref": "the-hive-1",
         "key_id": "000654",
         "purpose": _SecretLeasePurposeV1.PROVIDER_REQUEST,
@@ -1383,10 +1399,10 @@ def test_review_public_contract_hides_snapshot_and_identifiers(
     assert all(
         marker not in value
         for marker in (
-            "google-account-01",
+            "synthetic-account-01",
             "account@example.test",
             "000123",
-            "billing-01",
+            "synthetic-billing-01",
             "000456",
             "the-hive-1",
             "000789",
@@ -1519,7 +1535,7 @@ def test_review_issued_record_is_non_dataclass_nonserializable_and_redacted(
         marker not in repr(record)
         for marker in (
             SYNTHETIC_SECRET,
-            "google-account-01",
+            "synthetic-account-01",
             "the-hive-1",
             "000654",
         )
@@ -1614,7 +1630,7 @@ def test_review_key_binding_requires_two_nonempty_equal_strings(tmp_path: Path) 
             issue_valid_lease(manager, status, key_id=request_key)  # type: ignore[arg-type]
 
 
-def test_review_generation_limit_is_checked_before_loader_and_source_consume(
+def test_review_generation_rollback_is_checked_after_fresh_load(
     tmp_path: Path,
 ) -> None:
     load_count = 0
@@ -1633,15 +1649,15 @@ def test_review_generation_limit_is_checked_before_loader_and_source_consume(
 
     with pytest.raises(
         GoogleAccountInventoryError,
-        match="credential.inventory_generation_exhausted",
+        match="credential.inventory_reload_failed",
     ):
         manager.reload()
 
-    assert load_count == 0
+    assert load_count == 1
     assert manager.status().state is InventoryManagerStateV1.EMPTY
 
 
-def test_review_generation_limit_blocks_active_manager_source_free(
+def test_review_generation_rollback_blocks_active_manager_source_free(
     tmp_path: Path,
 ) -> None:
     load_count = 0
@@ -1664,11 +1680,11 @@ def test_review_generation_limit_blocks_active_manager_source_free(
 
     with pytest.raises(
         GoogleAccountInventoryError,
-        match="credential.inventory_generation_exhausted",
+        match="credential.inventory_reload_failed",
     ):
         manager.reload()
 
-    assert load_count == 1
+    assert load_count == 2
     assert manager.status().state is InventoryManagerStateV1.RELOAD_BLOCKED
     assert manager._active.source is None
     assert manager._active.document is None

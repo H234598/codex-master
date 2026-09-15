@@ -20,6 +20,8 @@ class GoogleOAuthOperationV1(str, Enum):
     KEYS_GET = "keys.get"
     KEYS_LIST = "keys.list"
     PROJECTS_GET_BILLING_INFO = "projects.getBillingInfo"
+    BILLING_ACCOUNTS_LIST = "billingAccounts.list"
+    SERVICES_LIST = "services.list"
     PROJECTS_CREATE = "projects.create"
     PROJECTS_PATCH = "projects.patch"
     SERVICES_ENABLE = "services.enable"
@@ -68,12 +70,14 @@ _INVENTORY_READONLY_SCOPES: Final[tuple[str, ...]] = (
     "openid",
 )
 _INVENTORY_READONLY_OPERATIONS: Final[tuple[GoogleOAuthOperationV1, ...]] = (
+    GoogleOAuthOperationV1.BILLING_ACCOUNTS_LIST,
     GoogleOAuthOperationV1.KEYS_GET,
     GoogleOAuthOperationV1.KEYS_LIST,
     GoogleOAuthOperationV1.KEYS_LOOKUP_KEY,
     GoogleOAuthOperationV1.PROJECTS_GET,
     GoogleOAuthOperationV1.PROJECTS_GET_BILLING_INFO,
     GoogleOAuthOperationV1.PROJECTS_SEARCH,
+    GoogleOAuthOperationV1.SERVICES_LIST,
 )
 _INVENTORY_READONLY_PROFILE_ID: Final[str] = (
     GoogleOAuthProfileIdV1.INVENTORY_READONLY.value

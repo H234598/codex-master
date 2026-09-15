@@ -1,513 +1,293 @@
+"""Closed public CLI contract for the Google inventory authority.
+
+The defect these tests protect against is an adapter that restores a legacy
+route or reflects an authority's sensitive internal values to stdout.
+"""
+
 from __future__ import annotations
 
-import argparse
-import os
+import ast
+import json
 from pathlib import Path
-from types import SimpleNamespace
-import time
+import re
+import subprocess
+import sys
 
 import pytest
 
 from the_hive import google_account_manager_cli as cli
-from the_hive import server
-from the_hive.google_account_manager_cli import _load_quota_evidence, build_parser
-from the_hive.google_cloud_provisioner import GoogleCloudProvisionerError
 
 
-INVENTORY_FINGERPRINT = "sha256:" + "a" * 64
+_ROOT = Path(__file__).resolve().parents[1]
+_SCRIPT = _ROOT / "scripts" / "google-account-manager"
+_FIXED_NONFIXTURE_LITERALS = {
+    "google-account-manager",
+    "google-account-subject-id",
+    "google.oauth-client-import",
+}
+_CANDIDATE_TEST_FILES = (
+    "test_google_account_inventory.py",
+    "test_google_account_inventory_manager.py",
+    "test_google_account_manager_cli.py",
+    "test_google_account_subject_id.py",
+    "test_google_inventory_authority_transaction.py",
+    "test_google_inventory_desktop_client_registry.py",
+    "test_google_inventory_oauth_leaf.py",
+    "test_google_inventory_readonly_control_service.py",
+    "test_google_inventory_readonly_control_transaction.py",
+    "test_google_inventory_readonly_scan.py",
+    "test_google_inventory_scan_lease.py",
+    "test_google_inventory_schema3_migration.py",
+    "test_google_inventory_schema_v2.py",
+    "test_google_inventory_schema_v3.py",
+    "test_google_inventory_store.py",
+    "test_google_inventory_token_vault.py",
+    "test_google_oauth_authorization.py",
+    "test_google_oauth_session.py",
+)
 
 
-def test_cli_has_inventory_oauth_rename_and_private_quota_evidence_only() -> None:
-    parser = build_parser()
+def _non_docstring_string_literals(path: Path) -> list[tuple[int, str]]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    docstring_lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)) and node.body:
+            first = node.body[0]
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                docstring_lines.add(first.lineno)
+    return [
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.lineno not in docstring_lines
+    ]
 
-    oauth = parser.parse_args(
-        [
-            "oauth-authorize",
-            "--account",
-            "google-account-04",
-            "--client-file",
-            "/private/client.json",
-            "--browser-profile",
-            "/private/profile",
-            "--browser-debug-port",
-            "9241",
-        ]
+
+def test_candidate_fixture_literals_use_explicit_synthetic_markers() -> None:
+    """Identity- and synthetic-secret-shaped test values must never resemble live material."""
+
+    marker = re.compile(
+        r"(?<!synthetic-)(?:private|secret|subject|account|client|access|refresh|id|"
+        r"authorization|inventory|operator|project|billing|key|token)" + r"-",
+        re.IGNORECASE,
     )
-    assert oauth.browser_debug_port == 9241
+    violations = [
+        (path.name, line)
+        for name in _CANDIDATE_TEST_FILES
+        for path in (_ROOT / "tests" / name,)
+        for line, value in _non_docstring_string_literals(path)
+        if value not in _FIXED_NONFIXTURE_LITERALS and marker.search(value)
+    ]
 
-    inventory = parser.parse_args(
+    assert not violations
+
+
+class _Service:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object | None]] = []
+
+    def authorize(self) -> dict[str, str]:
+        self.calls.append(("authorize", None))
+        return {"status": "authorized"}
+
+    def scan_plan(self) -> dict[str, object]:
+        self.calls.append(("scan_plan", None))
+        return {
+            "status": "planned",
+            "plan_reference": "plan-opaque-reference",
+            "account_count": 1,
+            "project_count": 2,
+            "billing_account_count": 3,
+            "service_count": 4,
+            "key_count": 5,
+            "changes": {"canonical_account": 1},
+        }
+
+    def apply(self, reference: object) -> dict[str, str]:
+        self.calls.append(("apply", reference))
+        return {"status": "applied"}
+
+
+def test_parser_accepts_only_closed_inventory_actions() -> None:
+    parser = cli.build_parser()
+
+    authorized = parser.parse_args(["inventory", "authorize"])
+    planned = parser.parse_args(["inventory", "scan", "--plan"])
+    applied = parser.parse_args(["inventory", "--apply", "plan-opaque-reference"])
+
+    assert (authorized.command, authorized.inventory_action) == (
+        "inventory",
+        "authorize",
+    )
+    assert (planned.command, planned.inventory_action, planned.plan) == (
+        "inventory",
+        "scan",
+        True,
+    )
+    assert (applied.command, applied.inventory_action, applied.plan_reference) == (
+        "inventory",
+        None,
+        "plan-opaque-reference",
+    )
+
+    for arguments in (
+        ["oauth-authorize"],
+        ["provision"],
+        ["rename-existing"],
+        ["inventory"],
+        ["inventory", "scan"],
+        ["inventory", "authorize", "--account", "blocked"],
+        ["inventory", "scan", "--plan", "--synthetic-client-file", "blocked"],
         [
             "inventory",
-            "--account",
-            "google-account-01",
-            "--client-file",
-            "/private/client.json",
-        ]
-    )
-    assert inventory.command == "inventory"
-
-    provision = parser.parse_args(
-        [
-            "provision",
-            "--account",
-            "google-account-01",
-            "--client-file",
-            "/private/client.json",
-            "--fill-to-quota",
-            "--quota-evidence-file",
-            "/private/quota.json",
-        ]
-    )
-    assert provision.fill_to_quota is True
-    assert provision.quota_evidence_file.as_posix() == "/private/quota.json"
-
-    with pytest.raises(SystemExit):
-        parser.parse_args(
-            [
-                "provision",
-                "--account",
-                "google-account-01",
-                "--client-file",
-                "/private/client.json",
-                "--fill-to-quota",
-                "--quota-remaining",
-                "37",
-            ]
-        )
-
-    with pytest.raises(SystemExit):
-        parser.parse_args(
-            [
-                "provision",
-                "--account",
-                "google-account-01",
-                "--client-file",
-                "/private/client.json",
-                "--fill-to",
-                "10",
-            ]
-        )
+            "--apply",
+            "plan-opaque-reference",
+            "--method",
+            "blocked",
+        ],
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(arguments)
 
 
-def _private_evidence_file(tmp_path, payload: str):
-    path = tmp_path / "quota.json"
-    path.write_text(payload, encoding="utf-8")
-    path.chmod(0o600)
-    return path
-
-
-def test_private_quota_evidence_file_loads_exact_schema(tmp_path) -> None:
-    path = _private_evidence_file(
-        tmp_path,
-        '{"remaining":23,"observed_at":"2026-08-28T12:00:00Z",'
-        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        '"inventory_generation":7,"inventory_fingerprint":"sha256:' + "a" * 64 + '"}',
+def test_single_private_dispatcher_owns_construction_and_closed_status_job(
+    monkeypatch, capsys
+) -> None:
+    calls = []
+    monkeypatch.setattr(cli, "GoogleInventoryReadonlyControlService", _Service)
+    monkeypatch.setattr(
+        cli,
+        "_dispatch_inventory_job",
+        lambda *arguments: calls.append(arguments) or {"status": "authorized"},
+        raising=False,
     )
 
-    evidence = _load_quota_evidence(path)
+    assert cli.main(["inventory", "authorize"]) == 0
+    assert cli.subject_id_main([]) == 0
+    assert calls == [("authorize",), ("subject_status",)]
+    capsys.readouterr()
 
-    assert evidence.remaining == 23
-    assert evidence.inventory_generation == 7
-    assert "secret" not in repr(evidence).casefold()
+    tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+    owners = [
+        function.name
+        for function in tree.body
+        if isinstance(function, ast.FunctionDef)
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "GoogleInventoryReadonlyControlService"
+    ]
+    assert owners == ["_dispatch_inventory_job"]
+
+
+def test_dispatcher_rejects_unknown_jobs_before_constructing_service(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "GoogleInventoryReadonlyControlService",
+        lambda: pytest.fail("invalid job constructed a service"),
+    )
+    with pytest.raises(Exception) as captured:
+        cli._dispatch_inventory_job("unknown")
+    assert getattr(captured.value, "code", None) == cli._REQUEST_INVALID
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("arguments", "expected", "calls"),
     [
-        '{"remaining":1,"remaining":2,"observed_at":"2026-08-28T12:00:00Z",'
-        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        '"inventory_generation":7,"inventory_fingerprint":"sha256:' + "a" * 64 + '"}',
-        '{"remaining":NaN,"observed_at":"2026-08-28T12:00:00Z",'
-        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        '"inventory_generation":7,"inventory_fingerprint":"sha256:' + "a" * 64 + '"}',
-        '{"remaining":null,"observed_at":"2026-08-28T12:00:00Z",'
-        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        '"inventory_generation":7,"inventory_fingerprint":"sha256:' + "a" * 64 + '"}',
-        '{"remaining":1,"observed_at":"2026-08-28T12:00:00Z",'
-        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        '"inventory_generation":7,"inventory_fingerprint":"sha256:'
-        + "a" * 64
-        + '","access_token":"private-secret"}',
+        (
+            ["inventory", "authorize"],
+            {"status": "authorized"},
+            [("authorize", None)],
+        ),
+        (
+            ["inventory", "scan", "--plan"],
+            {
+                "status": "planned",
+                "plan_reference": "plan-opaque-reference",
+                "account_count": 1,
+                "project_count": 2,
+                "billing_account_count": 3,
+                "service_count": 4,
+                "key_count": 5,
+                "changes": {"canonical_account": 1},
+            },
+            [("scan_plan", None)],
+        ),
+        (
+            ["inventory", "--apply", "plan-opaque-reference"],
+            {"status": "applied"},
+            [("apply", "plan-opaque-reference")],
+        ),
     ],
 )
-def test_private_quota_evidence_file_rejects_ambiguous_or_extra_data(
-    tmp_path, payload: str
+def test_inventory_commands_only_project_authority_public_results(
+    arguments, expected, calls, monkeypatch, capsys
 ) -> None:
-    path = _private_evidence_file(tmp_path, payload)
+    service = _Service()
+    monkeypatch.setattr(cli, "GoogleInventoryReadonlyControlService", lambda: service)
 
-    with pytest.raises(
-        GoogleCloudProvisionerError, match="quota.evidence_file_invalid"
-    ):
-        _load_quota_evidence(path)
+    assert cli.main(arguments) == 0
 
-
-def test_private_quota_evidence_file_rejects_unsafe_file_and_oversize(tmp_path) -> None:
-    unsafe = _private_evidence_file(tmp_path, "{}")
-    unsafe.chmod(0o644)
-    with pytest.raises(
-        GoogleCloudProvisionerError, match="quota.evidence_file_invalid"
-    ):
-        _load_quota_evidence(unsafe)
-
-    target = _private_evidence_file(tmp_path, "{}")
-    link = tmp_path / "quota-link.json"
-    os.symlink(target, link)
-    with pytest.raises(
-        GoogleCloudProvisionerError, match="quota.evidence_file_invalid"
-    ):
-        _load_quota_evidence(link)
-
-    oversized = _private_evidence_file(tmp_path, " " * 16_385)
-    with pytest.raises(
-        GoogleCloudProvisionerError, match="quota.evidence_file_invalid"
-    ):
-        _load_quota_evidence(oversized)
+    assert json.loads(capsys.readouterr().out) == expected
+    assert service.calls == calls
 
 
-def test_cli_binds_evidence_to_current_manager_generation_before_provider_search(
-    tmp_path, monkeypatch
+def test_cli_fails_closed_when_authority_projection_has_sensitive_field(
+    monkeypatch, capsys
 ) -> None:
-    path = _private_evidence_file(
-        tmp_path,
-        json_payload(
-            remaining=1,
-            observed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            inventory_generation=2,
-        ),
+    class SensitiveService(_Service):
+        def scan_plan(self) -> dict[str, object]:
+            result = super().scan_plan()
+            result["unexpected_identity"] = "redacted-marker"
+            return result
+
+    monkeypatch.setattr(cli, "GoogleInventoryReadonlyControlService", SensitiveService)
+
+    assert cli.main(["inventory", "scan", "--plan"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "inventory.readonly_control_unavailable"
+
+
+def test_cli_prints_only_a_code_for_unrecognized_sensitive_argument(capsys) -> None:
+    assert cli.main(["inventory", "authorize", "--unexpected", "blocked"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "inventory.readonly_control_request_invalid"
+
+
+def test_goblin_uses_the_hive_cli_and_fails_closed_without_private_config() -> None:
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT), "inventory", "authorize"],
+        cwd=_ROOT,
+        env={"PYTHONPATH": str(_ROOT / "src")},
+        check=False,
+        capture_output=True,
+        text=True,
     )
 
-    class Store:
-        def _read(self):
-            return b"", {
-                "google_accounts": [
-                    {
-                        "ref": "google-account-01",
-                        "subject_id": "subject-one",
-                    }
-                ]
-            }
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "inventory.readonly_control_unavailable"
 
-    class Api:
-        searches = 0
 
-        def subject_id(self):
-            return "subject-one"
-
-        def search_projects(self):
-            self.searches += 1
-            return []
-
-    class Manager:
-        closed = False
-
-        def reload(self):
-            return None
-
-        def _snapshot_for_internal_use(self):
-            account = SimpleNamespace(subject_id="subject-one")
-            return SimpleNamespace(
-                generation=1,
-                content_fingerprint=INVENTORY_FINGERPRINT,
-                by_account_ref={"google-account-01": account},
-            )
-
-        def close(self):
-            self.closed = True
-
-    api = Api()
-    manager = Manager()
-    monkeypatch.setattr(cli, "GoogleInventoryStore", Store)
-    monkeypatch.setattr(cli, "_api", lambda *_: api)
-    monkeypatch.setattr(cli, "GoogleAccountInventoryManager", lambda: manager)
-    arguments = build_parser().parse_args(
-        [
-            "provision",
-            "--account",
-            "google-account-01",
-            "--client-file",
-            "/private/client.json",
-            "--fill-to-quota",
-            "--quota-evidence-file",
-            str(path),
-        ]
+def test_manager_goblin_redacts_package_import_failure() -> None:
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT), "inventory", "authorize"],
+        cwd=_ROOT,
+        env={},
+        check=False,
+        capture_output=True,
+        text=True,
     )
 
-    with pytest.raises(
-        GoogleCloudProvisionerError, match="quota.evidence_generation_mismatch"
-    ):
-        cli.run(arguments)
-
-    assert api.searches == 0
-    assert manager.closed is True
-
-
-def test_cli_plans_from_manager_snapshot_without_second_inventory_read(
-    tmp_path, monkeypatch, capsys
-) -> None:
-    path = _private_evidence_file(
-        tmp_path,
-        json_payload(
-            remaining=1,
-            observed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            inventory_generation=1,
-        ),
-    )
-
-    class Store:
-        def _read(self):
-            raise AssertionError("raw inventory reread")
-
-    class Api:
-        def subject_id(self):
-            return "subject-one"
-
-        def search_projects(self):
-            return []
-
-    account = SimpleNamespace(
-        ref="google-account-01", subject_id="subject-one", projects=()
-    )
-    snapshot = SimpleNamespace(
-        generation=1,
-        content_fingerprint=INVENTORY_FINGERPRINT,
-        accounts=(account,),
-        by_account_ref={"google-account-01": account},
-    )
-
-    class Manager:
-        closed = False
-
-        def reload(self):
-            return None
-
-        def _snapshot_for_internal_use(self):
-            return snapshot
-
-        def close(self):
-            self.closed = True
-
-    manager = Manager()
-    monkeypatch.setattr(cli, "GoogleInventoryStore", Store)
-    monkeypatch.setattr(cli, "_api", lambda *_: Api())
-    monkeypatch.setattr(cli, "GoogleAccountInventoryManager", lambda: manager)
-    arguments = build_parser().parse_args(
-        [
-            "provision",
-            "--account",
-            "google-account-01",
-            "--client-file",
-            "/private/client.json",
-            "--fill-to-quota",
-            "--quota-evidence-file",
-            str(path),
-        ]
-    )
-
-    assert cli.run(arguments) == 2
-    assert '"planned_projects": 1' in capsys.readouterr().out
-    assert manager.closed is True
-
-
-def test_untrusted_private_evidence_blocks_apply_before_token_factory(
-    tmp_path, monkeypatch, capsys
-) -> None:
-    path = _private_evidence_file(
-        tmp_path,
-        json_payload(
-            remaining=1,
-            observed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            inventory_generation=1,
-        ),
-    )
-    inventory_fingerprint = "sha256:" + "a" * 64
-    account = SimpleNamespace(
-        ref="google-account-01", subject_id="subject-one", projects=()
-    )
-    snapshot = SimpleNamespace(
-        generation=1,
-        content_fingerprint=inventory_fingerprint,
-        accounts=(account,),
-        by_account_ref={"google-account-01": account},
-    )
-
-    class Store:
-        def __init__(self):
-            self.mutations = 0
-
-        def _read(self):
-            return b"", {
-                "google_accounts": [
-                    {
-                        "ref": "google-account-01",
-                        "subject_id": "subject-one",
-                        "projects": [],
-                    }
-                ]
-            }
-
-        def atomic_update(self, transform):
-            self.mutations += 1
-            raise AssertionError("untrusted mutation")
-
-    class Api:
-        creates = 0
-
-        def subject_id(self):
-            return "subject-one"
-
-        def search_projects(self):
-            return []
-
-        def create_project(self, *_):
-            self.creates += 1
-            return {"name": "projects/123"}
-
-    class Manager:
-        def reload(self):
-            return None
-
-        def _snapshot_for_internal_use(self):
-            return snapshot
-
-        def close(self):
-            return None
-
-    store = Store()
-    api = Api()
-
-    def mutating_token_factory(store_arg, *, account_ref, client_file):
-        store_arg.mutations += 1
-        return "opaque"
-
-    monkeypatch.setattr(cli, "GoogleInventoryStore", lambda: store)
-    monkeypatch.setattr(cli, "load_access_token", mutating_token_factory)
-    monkeypatch.setattr(cli, "GoogleCloudApi", lambda token: api)
-    monkeypatch.setattr(cli, "GoogleAccountInventoryManager", Manager)
-    arguments = build_parser().parse_args(
-        [
-            "provision",
-            "--account",
-            "google-account-01",
-            "--client-file",
-            "/private/client.json",
-            "--fill-to-quota",
-            "--quota-evidence-file",
-            str(path),
-            "--yes",
-        ]
-    )
-
-    with pytest.raises(GoogleCloudProvisionerError, match="quota_evidence_untrusted"):
-        cli.run(arguments)
-
-    assert capsys.readouterr().out == ""
-    assert api.creates == 0
-    assert store.mutations == 0
-
-
-def json_payload(*, remaining: int, observed_at: str, inventory_generation: int) -> str:
-    return (
-        f'{{"remaining":{remaining},"observed_at":"{observed_at}",'
-        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        f'"inventory_generation":{inventory_generation},'
-        f'"inventory_fingerprint":"{INVENTORY_FINGERPRINT}"}}'
-    )
-
-
-def test_masterjet_google_inventory_bypasses_legacy_cli_adapter(monkeypatch) -> None:
-    from test_admin_service import principal, service_at
-
-    service, _owners = service_at()
-    monkeypatch.setattr(
-        server,
-        "_MASTERJET_ADMIN_BINDING",
-        (service, principal("fleet.read")),
-    )
-    monkeypatch.setattr(
-        cli,
-        "run",
-        lambda _arguments: (_ for _ in ()).throw(AssertionError("legacy CLI used")),
-    )
-
-    result = server.call_validated_tool("fleet_google_inventory", {})
-
-    assert result["accounts"][0]["ref"] == "google-one"
-
-
-def test_document_returns_the_store_document() -> None:
-    document = {"google_accounts": []}
-
-    class Store:
-        def _read(self):
-            return b"ignored", document
-
-    assert cli._document(Store()) is document
-
-
-def test_account_selects_exactly_one_matching_inventory_account() -> None:
-    document = {"google_accounts": [{"ref": "one"}]}
-
-    assert cli._account(document, "one") == {"ref": "one"}
-    with pytest.raises(ValueError, match="inventory.account_invalid"):
-        cli._account(document, "missing")
-
-
-def test_api_builds_cloud_api_from_the_account_bound_access_token(monkeypatch) -> None:
-    captured: list[object] = []
-
-    class FakeApi:
-        def __init__(self, token: str) -> None:
-            captured.append(token)
-
-    monkeypatch.setattr(cli, "load_access_token", lambda *args, **kwargs: "test-token")
-    monkeypatch.setattr(cli, "GoogleCloudApi", FakeApi)
-
-    assert isinstance(cli._api(object(), "one", Path("/private/client.json")), FakeApi)
-    assert captured == ["test-token"]
-
-
-def test_run_inventory_reports_only_subject_bound_project_counts(monkeypatch, capsys) -> None:
-    class Store:
-        pass
-
-    class Api:
-        def subject_id(self) -> str:
-            return "subject-one"
-
-        def search_projects(self):
-            return [{"state": "ACTIVE"}, {"state": "DELETE_REQUESTED"}]
-
-    monkeypatch.setattr(cli, "GoogleInventoryStore", Store)
-    monkeypatch.setattr(cli, "_api", lambda *args: Api())
-    monkeypatch.setattr(
-        cli,
-        "_document",
-        lambda store: {
-            "google_accounts": [{"ref": "one", "subject_id": "subject-one"}]
-        },
-    )
-
-    result = cli.run(
-        argparse.Namespace(
-            command="inventory",
-            account="one",
-            client_file=Path("/private/client.json"),
-        )
-    )
-
-    assert result == 0
-    assert capsys.readouterr().out.strip() == (
-        '{"account": "one", "active_project_count": 1, "project_count": 2}'
-    )
-
-
-def test_main_converts_unexpected_failures_to_a_stable_exit_code(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(cli, "build_parser", lambda: object())
-    monkeypatch.setattr(
-        cli,
-        "run",
-        lambda arguments: (_ for _ in ()).throw(ValueError("private")),
-    )
-
-    assert cli.main() == 1
-    assert capsys.readouterr().err.strip() == "google.account_manager_failed"
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "inventory.readonly_control_unavailable"

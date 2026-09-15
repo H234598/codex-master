@@ -30,6 +30,7 @@ MAX_YAML_NODES = 4_096
 MAX_YAML_SCALAR_BYTES = 32 * 1024
 MAX_YAML_ALIASES = 0
 MAX_HIVE_SLOT_DIGITS = 9
+MAX_AUTHORITY_GENERATION = 2**63 - 1
 
 _ACCOUNT_FIELDS_V1 = frozenset(
     {
@@ -174,6 +175,7 @@ class GoogleAccountInventoryDocumentV1:
     """Private immutable parsed inventory; runtime state belongs to GA-I1."""
 
     schema_version: int
+    authority_generation: int
     accounts: tuple[GoogleAccountV1, ...]
     content_fingerprint: str
     by_ref: _FrozenIndex[GoogleAccountV1 | GoogleBillingAccountV1 | GoogleProjectV1] = (
@@ -202,6 +204,7 @@ class GoogleAccountInventoryDocumentV1:
         return MappingProxyType(
             {
                 "schema_version": self.schema_version,
+                "authority_generation": self.authority_generation,
                 "account_count": len(self.accounts),
                 "billing_account_count": sum(
                     len(account.billing_accounts) for account in self.accounts
@@ -309,18 +312,22 @@ class GoogleAccountInventoryLoader:
         return loader
 
     def load(self) -> GoogleAccountInventoryDocumentV1:
-        raw = _read_private_inventory_bytes(self._path)
-        if b"\x00" in raw:
-            _unavailable()
-        try:
-            parsed = _load_strict_yaml(raw.decode("utf-8"))
-            return _build_document(parsed)
-        except UnicodeError:
-            _unavailable()
-        except GoogleAccountInventoryError:
-            raise
-        except (yaml.YAMLError, RecursionError, ValueError, OverflowError, TypeError):
-            _schema_invalid()
+        return _document_from_bytes(_read_private_inventory_bytes(self._path))
+
+
+def _document_from_bytes(raw: bytes) -> GoogleAccountInventoryDocumentV1:
+    """Parse one exact canonical source; no file read or legacy fallback."""
+
+    if type(raw) is not bytes or len(raw) > MAX_INVENTORY_BYTES or b"\x00" in raw:
+        _unavailable()
+    try:
+        return _build_document(_load_strict_yaml(raw.decode("utf-8")))
+    except UnicodeError:
+        _unavailable()
+    except GoogleAccountInventoryError:
+        raise
+    except (yaml.YAMLError, RecursionError, ValueError, OverflowError, TypeError):
+        _schema_invalid()
 
 
 class _InventoryYamlBoundaryError(yaml.YAMLError):
@@ -329,7 +336,7 @@ class _InventoryYamlBoundaryError(yaml.YAMLError):
 
 @dataclass(frozen=True)
 class _YamlIntegerLiteral:
-    """Deferred YAML integer scalar; only schema_version may consume it."""
+    """Deferred canonical integer, consumed only by schema and generation."""
 
     value: str
 
@@ -385,7 +392,11 @@ class _StrictInventoryYamlLoader(yaml.SafeLoader):
         return result
 
     def construct_yaml_int(self, node: ScalarNode) -> _YamlIntegerLiteral:
-        if node.value not in {"1", "2"}:
+        if (
+            len(node.value) > 19
+            or re.fullmatch(r"[1-9][0-9]*", node.value) is None
+            or int(node.value) > MAX_AUTHORITY_GENERATION
+        ):
             raise _InventoryYamlBoundaryError("integer")
         return _YamlIntegerLiteral(node.value)
 
@@ -667,13 +678,18 @@ def _validate_private_auth(value: object) -> None:
         if type(cookie) is not dict or len(cookie) > 24:
             _schema_invalid()
         for key, item in cookie.items():
-            if type(key) is not str or not key or type(item) not in {
-                str,
-                int,
-                float,
-                bool,
-                type(None),
-            }:
+            if (
+                type(key) is not str
+                or not key
+                or type(item)
+                not in {
+                    str,
+                    int,
+                    float,
+                    bool,
+                    type(None),
+                }
+            ):
                 _schema_invalid()
 
 
@@ -690,13 +706,18 @@ def _hive_slot(ref: str) -> int:
 def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
     top = _mapping(
         document,
-        frozenset({"schema_version", "google_accounts"}),
-        frozenset({"schema_version", "google_accounts"}),
+        frozenset({"schema_version", "authority_generation", "google_accounts"}),
+        frozenset({"schema_version", "authority_generation", "google_accounts"}),
     )
     schema_version = top["schema_version"]
-    if type(schema_version) is not _YamlIntegerLiteral:
+    if type(schema_version) is not _YamlIntegerLiteral or schema_version.value != "3":
         _schema_invalid()
-    version = int(schema_version.value)
+    generation = top["authority_generation"]
+    if type(generation) is not _YamlIntegerLiteral:
+        _schema_invalid()
+    authority_generation = int(generation.value)
+    if not 1 <= authority_generation <= MAX_AUTHORITY_GENERATION:
+        _schema_invalid()
     accounts: list[GoogleAccountV1] = []
     seen_refs: set[str] = set()
     seen_login_emails: set[str] = set()
@@ -712,7 +733,7 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
     for raw_account in _list(top["google_accounts"], MAX_INVENTORY_BYTES):
         data = _mapping(
             raw_account,
-            _ACCOUNT_FIELDS_V2 if version == 2 else _ACCOUNT_FIELDS_V1,
+            _ACCOUNT_FIELDS_V2,
             frozenset({"ref", "login_email", "billing_accounts", "projects"}),
         )
         account_ref = _required_string(data["ref"])
@@ -728,8 +749,7 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
         seen_login_emails.add(login_email.casefold())
         if subject_id is not None:
             seen_subject_ids.add(subject_id)
-        if version == 2:
-            _validate_private_auth(data.get("auth"))
+        _validate_private_auth(data.get("auth"))
 
         billings: list[GoogleBillingAccountV1] = []
         billing_refs: set[str] = set()
@@ -757,18 +777,12 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
 
         projects: list[GoogleProjectV1] = []
         for raw_project in _list(data["projects"], MAX_PROJECT_SLOTS_PER_ACCOUNT):
-            project_fields = (
-                _PROJECT_FIELDS_V2 if version == 2 else _PROJECT_FIELDS_V1
-            )
+            project_fields = _PROJECT_FIELDS_V2
             project_data = _mapping(raw_project, project_fields, project_fields)
             project_ref = _required_string(project_data["ref"])
             hive_slot = _hive_slot(project_ref)
             billing_ref = _optional_string(project_data["billing_account_ref"])
-            purpose = (
-                _required_string(project_data["purpose"])
-                if version == 2
-                else "hive"
-            )
+            purpose = _required_string(project_data["purpose"])
             if purpose not in _PROJECT_PURPOSES:
                 _schema_invalid()
             status = _required_string(project_data["status"])
@@ -787,13 +801,9 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
             project_number = _external_id(project_data["project_number"])
             key_id = _external_id(project_data["key_id"])
             key_uid = _external_id(project_data["key_uid"])
-            project_name = (
-                _project_name(project_data["project_name"])
-                if version == 2
-                else None
-            )
-            key_name = _key_name(project_data["key_name"]) if version == 2 else None
-            if version == 2 and project_id is not None and project_name is None:
+            project_name = _project_name(project_data["project_name"])
+            key_name = _key_name(project_data["key_name"])
+            if project_id is not None and project_name is None:
                 _schema_invalid()
             if (
                 project_ref in seen_refs
@@ -851,7 +861,8 @@ def _build_document(document: object) -> GoogleAccountInventoryDocumentV1:
 
     ordered = tuple(sorted(accounts, key=lambda item: item.ref))
     result = GoogleAccountInventoryDocumentV1(
-        schema_version=version,
+        schema_version=3,
+        authority_generation=authority_generation,
         accounts=ordered,
         content_fingerprint=_redacted_fingerprint(ordered),
         by_ref=_frozen_index(

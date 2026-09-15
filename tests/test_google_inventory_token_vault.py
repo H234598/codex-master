@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy, deepcopy
 from dataclasses import asdict
 import base64
 import errno
@@ -46,19 +47,20 @@ def _manager(
     tmp_path: Path,
     *,
     account_ref: str = "test-account",
-    subject_id: str = "subject-001",
-    login_email: str = "login@example.test",
+    subject_id: str = "synthetic-subject-001",
+    login_email: str = "synthetic-login@example.test",
 ) -> GoogleAccountInventoryManager:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(
         yaml.safe_dump(
             {
-                "schema_version": 1,
+                "schema_version": 3,
+                "authority_generation": 1,
                 "google_accounts": [
                     {
                         "ref": account_ref,
                         "login_email": login_email,
-                        "recovery_email": "recovery@example.test",
+                        "recovery_email": "synthetic-recovery@example.test",
                         "label": None,
                         "subject_id": subject_id,
                         "billing_accounts": [],
@@ -88,7 +90,8 @@ def _manager_for_accounts(
     inventory_path.write_text(
         yaml.safe_dump(
             {
-                "schema_version": 1,
+                "schema_version": 3,
+                "authority_generation": 1,
                 "google_accounts": [
                     {
                         "ref": account_ref,
@@ -141,7 +144,7 @@ def _store(
     *,
     token: bytearray | None = None,
     generation: int | None = None,
-    subject_id: str = "subject-001",
+    subject_id: str = "synthetic-subject-001",
     account_ref: str = "test-account",
     client_fingerprint: str | None = None,
 ):
@@ -160,7 +163,7 @@ def _delete(
     manager: GoogleAccountInventoryManager,
     *,
     generation: int | None = None,
-    subject_id: str = "subject-001",
+    subject_id: str = "synthetic-subject-001",
     account_ref: str = "test-account",
     client_fingerprint: str | None = None,
 ):
@@ -209,14 +212,12 @@ def _private_file_state(path: Path) -> tuple[int, int, int, int, int, bytes]:
 
 
 def _fixed_user_vault_tree(tmp_path: Path) -> dict[str, Path]:
-    home = tmp_path / "home"
-    config = home / ".config"
-    application = config / "codex-master-mcp"
+    home = tmp_path / "synthetic-state-root"
+    application = home / "the-hive-mcp"
     oauth = application / "google-oauth"
     tokens = oauth / "tokens"
     home.mkdir(mode=0o700)
-    config.mkdir(mode=0o755)
-    application.mkdir(mode=0o755)
+    application.mkdir(mode=0o700)
     oauth.mkdir(mode=0o700)
     tokens.mkdir(mode=0o700)
     record = tokens / "test-account.json"
@@ -227,7 +228,7 @@ def _fixed_user_vault_tree(tmp_path: Path) -> dict[str, Path]:
     lock.chmod(0o600)
     return {
         "home": home,
-        "config": config,
+        "config": home,
         "application": application,
         "oauth": oauth,
         "tokens": tokens,
@@ -237,15 +238,13 @@ def _fixed_user_vault_tree(tmp_path: Path) -> dict[str, Path]:
 
 
 def _preflight_parent_tree(tmp_path: Path) -> dict[str, Path]:
-    home = tmp_path / "home"
-    config = home / ".config"
-    application = config / "codex-master-mcp"
+    home = tmp_path / "synthetic-state-root"
+    application = home / "the-hive-mcp"
     home.mkdir(mode=0o700)
-    config.mkdir(mode=0o755)
-    application.mkdir(mode=0o755)
+    application.mkdir(mode=0o700)
     return {
         "home": home,
-        "config": config,
+        "config": home,
         "application": application,
         "oauth": application / "google-oauth",
         "tokens": application / "google-oauth/tokens",
@@ -323,7 +322,7 @@ def _open_fixed_user_vault_tree(
         ]
     )
     try:
-        code = vault_module._append_user_tokens_directory_components(
+        code = vault_module._append_the_hive_vault_tokens_directory_components(
             capability,
             effective_uid=(os.geteuid() if expected_owner is None else expected_owner),
         )
@@ -444,7 +443,7 @@ def _process_raced_mutation(
     else:
         raise AssertionError("unknown race barrier")
 
-    token = bytearray(b"subprocess-race-secret-marker")
+    token = bytearray(b"subprocess-race-synthetic-secret-marker")
     try:
         if operation == "store":
             result = (
@@ -513,7 +512,7 @@ def _process_preflight_rollback_swap(
     try:
         if not hasattr(vault_module, "_ensure_private_directory_component"):
             ready.set()  # type: ignore[union-attr]
-            output.put(("raw", "missing-private-directory-ensure"))  # type: ignore[union-attr]
+            output.put(("raw", "missing-synthetic-private-directory-ensure"))  # type: ignore[union-attr]
             return
         original_ensure = vault_module._ensure_private_directory_component
 
@@ -578,7 +577,7 @@ def _run_raced_mutation(
 
 
 def _assert_no_race_secret(
-    directory: Path, marker: bytes = b"subprocess-race-secret-marker"
+    directory: Path, marker: bytes = b"subprocess-race-synthetic-secret-marker"
 ) -> None:
     encoded = base64.b64encode(marker)
     for path in directory.iterdir():
@@ -612,6 +611,103 @@ def test_preflight_creates_only_missing_secret_directories_via_private_capabilit
         assert vault_module._revalidate_directory_capability(tokens_capability) is None
     finally:
         vault_module._close_directory_capability(tokens_capability)
+
+
+def test_fixed_the_hive_components_share_one_resolved_state_tree_for_preflight_and_vault(
+    tmp_path: Path,
+) -> None:
+    """Break caught: preflight and GA-I2b could bind different secret trees."""
+
+    state_root = tmp_path / "synthetic-state-root"
+    state_root.mkdir(mode=0o700)
+    state_capability = _test_user_home_capability(state_root)
+    try:
+        components = (
+            vault_module._for_test_the_hive_inventory_vault_production_components(
+                state_capability
+            )
+        )
+    finally:
+        vault_module._close_directory_capability(state_capability)
+
+    gate = components._preflight
+    vault = components._vault
+    assert repr(components) == "_TheHiveInventoryVaultProductionComponents(<redacted>)"
+    assert repr(gate) == "_TheHiveInventorySecretTreePreflightCapability(<redacted>)"
+    with pytest.raises(TypeError):
+        pickle.dumps(gate)
+    gate._preflight_for_inventory_authorize()
+    canonical_root = state_root / "the-hive-mcp" / "google-oauth"
+    tokens = canonical_root / "tokens"
+    assert tokens.is_dir()
+    assert not (state_root / "codex-master-mcp").exists()
+    code, opened = vault._open_tokens_directory()
+    try:
+        assert code is None
+        assert opened is not None
+        assert os.fstat(opened.fd).st_ino == os.lstat(tokens).st_ino
+        assert os.fstat(opened.fd).st_dev == os.lstat(tokens).st_dev
+    finally:
+        vault_module._close_directory_capability(opened)
+    components.clear()
+
+
+def test_fixed_the_hive_components_fail_closed_with_a_redacted_legacy_layout_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """Break caught: a historical vault tree could be silently reused or repaired."""
+
+    state_root = tmp_path / "synthetic-state-root"
+    state_root.mkdir(mode=0o700)
+    legacy = state_root / "codex-master-mcp"
+    legacy.mkdir(mode=0o700)
+    state_capability = _test_user_home_capability(state_root)
+    try:
+        with pytest.raises(GoogleInventoryReadonlyTokenVaultError) as raised:
+            vault_module._for_test_the_hive_inventory_vault_production_components(
+                state_capability
+            )
+    finally:
+        vault_module._close_directory_capability(state_capability)
+
+    assert raised.value.code == "credential.inventory_token_vault_legacy_layout"
+    assert "codex-master" not in repr(raised.value)
+    assert not (legacy / "google-oauth").exists()
+
+
+def test_production_components_resolve_the_fixed_state_root_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: the fixed authority graph could resolve a second vault root."""
+
+    state_root = tmp_path / "synthetic-state-root"
+    state_root.mkdir(mode=0o700)
+    calls = 0
+
+    def resolved_inventory_path() -> Path:
+        nonlocal calls
+        calls += 1
+        return state_root / "api-token.yaml"
+
+    monkeypatch.setattr(
+        vault_module._inventory,
+        "systemd_google_account_inventory_path",
+        resolved_inventory_path,
+    )
+
+    components = vault_module._new_the_hive_inventory_vault_production_components()
+    try:
+        assert calls == 1
+        components._preflight_for_inventory_authorize()
+        code, opened = components._vault._open_tokens_directory()
+        try:
+            assert code is None
+            assert opened is not None
+        finally:
+            vault_module._close_directory_capability(opened)
+        assert calls == 1
+    finally:
+        components.clear()
 
 
 def test_preflight_is_idempotent_and_keeps_existing_secret_tree_empty(
@@ -677,7 +773,7 @@ def test_preflight_rejects_wrong_owner_without_creating_secret_tree(
 
 @pytest.mark.parametrize(
     ("component", "mode"),
-    (("config", 0o775), ("application", 0o757)),
+    (("application", 0o757),),
 )
 def test_preflight_rejects_writable_nonsecret_parent_without_creation(
     tmp_path: Path, component: str, mode: int
@@ -694,27 +790,19 @@ def test_preflight_rejects_writable_nonsecret_parent_without_creation(
     assert not os.path.lexists(tree["oauth"])
 
 
-@pytest.mark.parametrize("drift", ("config_symlink", "application_file"))
-def test_preflight_rejects_nonsecret_symlink_or_type_drift_without_creation(
-    tmp_path: Path, drift: str
+def test_preflight_rejects_a_symlinked_or_non_directory_canonical_root_without_creation(
+    tmp_path: Path,
 ) -> None:
     tree = _preflight_parent_tree(tmp_path)
-    if drift == "config_symlink":
-        real_config = tree["home"] / ".config-real"
-        tree["config"].rename(real_config)
-        tree["config"].symlink_to(real_config, target_is_directory=True)
-        application = real_config / "codex-master-mcp"
-    else:
-        tree["application"].rmdir()
-        tree["application"].write_bytes(b"not-a-directory")
-        tree["application"].chmod(0o600)
-        application = tree["application"]
+    real_application = tree["home"] / "the-hive-mcp-real"
+    tree["application"].rename(real_application)
+    tree["application"].symlink_to(real_application, target_is_directory=True)
 
     assert _error_code(lambda: _call_preflight(tree["home"])) == (
         "credential.inventory_token_vault_path_invalid"
     )
 
-    assert not os.path.lexists(application / "google-oauth")
+    assert not os.path.lexists(real_application / "google-oauth")
 
 
 @pytest.mark.parametrize("component", ("oauth", "tokens"))
@@ -1009,12 +1097,12 @@ def test_subprocess_preflight_parent_swap_is_detected_before_secret_creation(
         args=(os.fspath(tree["home"]), ready, proceed, output),
     )
     process.start()
-    old_application = tree["config"] / "codex-master-mcp-before-swap"
+    old_application = tree["home"] / "the-hive-mcp-before-swap"
     try:
         assert ready.wait(timeout=5)
         tree["application"].rename(old_application)
-        tree["application"].mkdir(mode=0o755)
-        tree["application"].chmod(0o755)
+        tree["application"].mkdir(mode=0o700)
+        tree["application"].chmod(0o700)
         proceed.set()
         result = output.get(timeout=5)
     finally:
@@ -1104,37 +1192,13 @@ def test_same_uid_mkdir_to_first_attestation_swap_is_an_out_of_scope_counterexam
     assert tree["tokens"].is_dir()
 
 
-def test_current_host_production_open_allows_0755_nonsecret_parents_and_is_read_only() -> (
-    None
-):
-    home = Path.home()
-    config = home / ".config"
-    application = config / "codex-master-mcp"
-    oauth = application / "google-oauth"
-    if (
-        home != Path("/home/teladi")
-        or not config.is_dir()
-        or not application.is_dir()
-        or os.path.lexists(oauth)
-    ):
-        pytest.skip("current-host read-only evidence preconditions are absent")
-    assert os.lstat(config).st_uid == os.geteuid()
-    assert os.lstat(application).st_uid == os.geteuid()
-    assert stat.S_IMODE(os.lstat(config).st_mode) == 0o755
-    assert stat.S_IMODE(os.lstat(application).st_mode) == 0o755
-    before = tuple(_directory_state(path) for path in (home, config, application))
+def test_direct_vault_open_is_unavailable_without_the_fixed_authority_layout() -> None:
+    """Break caught: a direct GA-I2b owner could resolve a second production tree."""
 
-    code, capability = vault_module._open_production_tokens_directory()
-    try:
-        assert code == "credential.inventory_token_vault_unavailable"
-        assert capability is None
-    finally:
-        vault_module._close_directory_capability(capability)
-
-    assert tuple(_directory_state(path) for path in (home, config, application)) == (
-        before
+    assert GoogleInventoryReadonlyTokenVault()._open_tokens_directory() == (
+        "credential.inventory_token_vault_unavailable",
+        None,
     )
-    assert not os.path.lexists(oauth)
 
 
 def test_temp_user_chain_accepts_owner_0755_nonwritable_parents_read_only(
@@ -1158,7 +1222,7 @@ def test_temp_user_chain_accepts_owner_0755_nonwritable_parents_read_only(
 
 @pytest.mark.parametrize(
     ("component", "mode"),
-    (("config", 0o775), ("application", 0o757)),
+    (("application", 0o757),),
 )
 def test_temp_user_chain_rejects_writable_nonsecret_parent_without_file_mutation(
     tmp_path: Path, component: str, mode: int
@@ -1197,15 +1261,15 @@ def test_temp_user_chain_rejects_wrong_owner_without_file_mutation(
     )
 
 
-def test_temp_user_chain_rejects_symlinked_nonsecret_parent_without_file_mutation(
+def test_temp_user_chain_rejects_symlinked_canonical_root_without_file_mutation(
     tmp_path: Path,
 ) -> None:
     tree = _fixed_user_vault_tree(tmp_path)
-    real_config = tree["home"] / ".config-real"
-    tree["config"].rename(real_config)
-    tree["config"].symlink_to(real_config, target_is_directory=True)
-    record = real_config / "codex-master-mcp/google-oauth/tokens/test-account.json"
-    lock = real_config / "codex-master-mcp/google-oauth/tokens/test-account.lock"
+    real_application = tree["home"] / "the-hive-mcp-real"
+    tree["application"].rename(real_application)
+    tree["application"].symlink_to(real_application, target_is_directory=True)
+    record = real_application / "google-oauth/tokens/test-account.json"
+    lock = real_application / "google-oauth/tokens/test-account.lock"
     before = (_private_file_state(record), _private_file_state(lock))
 
     code, capability = _open_fixed_user_vault_tree(tree["home"])
@@ -1239,14 +1303,12 @@ def test_temp_user_chain_rejects_nonprivate_secret_directory_without_file_mutati
 def test_temp_user_chain_missing_secret_subtree_is_unavailable_and_not_created(
     tmp_path: Path,
 ) -> None:
-    home = tmp_path / "home"
-    config = home / ".config"
-    application = config / "codex-master-mcp"
+    home = tmp_path / "synthetic-state-root"
+    application = home / "the-hive-mcp"
     home.mkdir(mode=0o700)
-    config.mkdir(mode=0o755)
-    application.mkdir(mode=0o755)
+    application.mkdir(mode=0o700)
     oauth = application / "google-oauth"
-    before = tuple(_directory_state(path) for path in (home, config, application))
+    before = tuple(_directory_state(path) for path in (home, application))
 
     code, capability = _open_fixed_user_vault_tree(home)
     try:
@@ -1254,9 +1316,7 @@ def test_temp_user_chain_missing_secret_subtree_is_unavailable_and_not_created(
     finally:
         vault_module._close_directory_capability(capability)
 
-    assert tuple(_directory_state(path) for path in (home, config, application)) == (
-        before
-    )
+    assert tuple(_directory_state(path) for path in (home, application)) == (before)
     assert not os.path.lexists(oauth)
 
 
@@ -1277,7 +1337,7 @@ def test_store_writes_bound_readonly_record_and_returns_generation(
     receipt = vault.store_inventory_refresh_token(
         _manager(tmp_path),
         account_ref="test-account",
-        subject_id="subject-001",
+        subject_id="synthetic-subject-001",
         oauth_client_fingerprint=_client_fingerprint(),
         refresh_token=refresh_token,
         expected_vault_generation=None,
@@ -1287,15 +1347,116 @@ def test_store_writes_bound_readonly_record_and_returns_generation(
     assert refresh_token == bytearray(len(refresh_token))
 
 
+def test_private_authorization_token_port_recovers_only_an_opaque_bound_receipt_after_a_crash(
+    tmp_path: Path,
+) -> None:
+    """Break caught: recovery could accept identity input or expose the written token."""
+
+    vault = _vault(tmp_path)
+    manager = _manager(tmp_path)
+    port = vault_module._new_inventory_readonly_authorization_token_port(vault, manager)
+    operation_digest = _client_fingerprint("synthetic-authorization-operation")
+    client_fingerprint = _client_fingerprint("synthetic-authorization-client")
+    first = bytearray(b"synthetic-authorization-synthetic-refresh-material")
+
+    stored = port.store_authorization_refresh_token(
+        operation_digest=operation_digest,
+        account_ref="test-account",
+        subject_id="synthetic-subject-001",
+        oauth_client_fingerprint=client_fingerprint,
+        inventory_generation=1,
+        expected_vault_generation=None,
+        refresh_token=first,
+    )
+
+    assert first == bytearray(len(first))
+    assert repr(port) == "_InventoryReadonlyAuthorizationTokenPort(<redacted>)"
+    assert repr(stored) == "_InventoryReadonlyAuthorizationTokenReceipt(<redacted>)"
+    with pytest.raises(TypeError):
+        copy(port)
+    with pytest.raises(TypeError):
+        deepcopy(port)
+    with pytest.raises(TypeError):
+        pickle.dumps(port)
+    with pytest.raises(TypeError):
+        copy(stored)
+    with pytest.raises(TypeError):
+        deepcopy(stored)
+    with pytest.raises(TypeError):
+        pickle.dumps(stored)
+    with pytest.raises(TypeError):
+        asdict(stored)
+    assert "synthetic-authorization-synthetic-refresh-material" not in repr(stored)
+    assert not hasattr(stored, "_account_ref")
+    assert not hasattr(stored, "_subject_id")
+    assert not hasattr(stored, "_operation_digest")
+    assert not hasattr(port, "load")
+    assert not hasattr(port, "read")
+
+    replay = bytearray(b"synthetic-replayed-synthetic-refresh-material")
+    repeated = port.store_authorization_refresh_token(
+        operation_digest=operation_digest,
+        account_ref="test-account",
+        subject_id="synthetic-subject-001",
+        oauth_client_fingerprint=client_fingerprint,
+        inventory_generation=1,
+        expected_vault_generation=None,
+        refresh_token=replay,
+    )
+
+    assert replay == bytearray(len(replay))
+    assert repeated._vault_generation == 1
+    assert repeated._binding_fingerprint == stored._binding_fingerprint
+
+    # A newly constructed private port models the authority process after its
+    # token write committed but before it persisted an authorization receipt.
+    recovered_port = vault_module._new_inventory_readonly_authorization_token_port(
+        vault, manager
+    )
+    looked_up = recovered_port.lookup_authorization_refresh_receipt(
+        operation_digest=operation_digest,
+        binding_fingerprint=stored._binding_fingerprint,
+    )
+    assert looked_up is not None
+    assert looked_up._vault_generation == 1
+    assert looked_up._binding_fingerprint == stored._binding_fingerprint
+    with pytest.raises(TypeError):
+        recovered_port.lookup_authorization_refresh_receipt(
+            operation_digest=operation_digest,
+            binding_fingerprint=stored._binding_fingerprint,
+            account_ref="test-account",
+        )
+    assert (
+        recovered_port.lookup_authorization_refresh_receipt(
+            operation_digest=_client_fingerprint(
+                "different-synthetic-authorization-operation"
+            ),
+            binding_fingerprint=stored._binding_fingerprint,
+        )
+        is None
+    )
+    assert (
+        recovered_port.lookup_authorization_refresh_receipt(
+            operation_digest=operation_digest,
+            binding_fingerprint=_client_fingerprint(
+                "different-synthetic-authorization-binding"
+            ),
+        )
+        is None
+    )
+
+
 def test_record_is_bound_to_snapshot_login_not_recovery_email(tmp_path: Path) -> None:
     vault = _vault(tmp_path)
     _store(vault, _manager(tmp_path))
 
     record = _record(tmp_path)
 
-    assert record["subject_fingerprint"] == _client_fingerprint("subject-001")
-    assert record["login_fingerprint"] == _client_fingerprint("login@example.test")
-    assert _client_fingerprint("recovery@example.test") not in record.values()
+    assert record["subject_fingerprint"] == _client_fingerprint("synthetic-subject-001")
+    assert record["login_fingerprint"] == _client_fingerprint(
+        "synthetic-login@example.test"
+    )
+    assert _client_fingerprint("synthetic-recovery@example.test") not in record.values()
     assert record["profile_id"] == "inventory_readonly"
     assert record["scope_fingerprint"] == (
         "sha256:9b2a7ff6966db417c590bbaae896036309e4391f414c7c93cf727873ed7d7e7f"
@@ -1365,7 +1526,7 @@ def test_binding_failure_precedes_generation_conflict(tmp_path: Path) -> None:
     ("field", "value"),
     (
         ("account_ref", b"test-account"),
-        ("subject_id", b"subject-001"),
+        ("subject_id", b"synthetic-subject-001"),
         ("oauth_client_fingerprint", "sha256:" + "A" * 64),
         ("refresh_token", b"synthetic-token"),
         ("expected_vault_generation", True),
@@ -1378,7 +1539,7 @@ def test_request_boundary_rejects_nonexact_inputs_and_zeroizes_token(
     token = bytearray(b"synthetic-token")
     kwargs: dict[str, object] = {
         "account_ref": "test-account",
-        "subject_id": "subject-001",
+        "subject_id": "synthetic-subject-001",
         "oauth_client_fingerprint": _client_fingerprint(),
         "refresh_token": token,
         "expected_vault_generation": None,
@@ -1402,9 +1563,11 @@ def test_schema_rejects_unknown_fields_and_invalid_token_payload(
         "format_version": 1,
         "record_kind": "google_inventory_readonly_refresh_token_v1",
         "vault_generation": 1,
+        "inventory_generation": 1,
+        "operation_digest": _client_fingerprint("legacy-operation"),
         "account_ref": "test-account",
-        "subject_fingerprint": _client_fingerprint("subject-001"),
-        "login_fingerprint": _client_fingerprint("login@example.test"),
+        "subject_fingerprint": _client_fingerprint("synthetic-subject-001"),
+        "login_fingerprint": _client_fingerprint("synthetic-login@example.test"),
         "oauth_client_fingerprint": _client_fingerprint(),
         "profile_id": "inventory_readonly",
         "scope_fingerprint": "sha256:9b2a7ff6966db417c590bbaae896036309e4391f414c7c93cf727873ed7d7e7f",
@@ -1468,7 +1631,7 @@ def test_public_receipts_and_errors_do_not_expose_secret_or_identifier(
 ) -> None:
     vault = _vault(tmp_path)
     manager = _manager(tmp_path)
-    marker = "synthetic-private-refresh-marker"
+    marker = "synthetic-private-synthetic-refresh-marker"
     token = bytearray(marker.encode("ascii"))
     receipt = _store(vault, manager, token=token)
     error: GoogleInventoryReadonlyTokenVaultError
@@ -1669,7 +1832,7 @@ def test_foreign_identifier_values_fail_before_hash_or_equality(
             lambda: vault.store_inventory_refresh_token(
                 manager,
                 account_ref=value,
-                subject_id="subject-001",
+                subject_id="synthetic-subject-001",
                 oauth_client_fingerprint=_client_fingerprint(),
                 refresh_token=token,
                 expected_vault_generation=None,
@@ -1754,7 +1917,7 @@ def test_only_exact_bytearray_is_accepted_for_refresh_token(
             lambda: vault.store_inventory_refresh_token(
                 _manager(tmp_path),
                 account_ref="test-account",
-                subject_id="subject-001",
+                subject_id="synthetic-subject-001",
                 oauth_client_fingerprint=_client_fingerprint(),
                 refresh_token=refresh_token,
                 expected_vault_generation=None,
@@ -1941,14 +2104,14 @@ def test_cleanup_close_failure_is_code_only_and_zeroizes_input(
 def test_temp_cleanup_drops_secret_and_identifier_locals_before_unlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    account_marker = "cleanup-account-marker"
-    subject_id = "subject-cleanup"
+    account_marker = "cleanup-synthetic-account-marker"
+    subject_id = "synthetic-subject-cleanup"
     vault = _vault(tmp_path)
     manager = _manager(
         tmp_path,
         account_ref=account_marker,
         subject_id=subject_id,
-        login_email="cleanup@example.test",
+        login_email="synthetic-cleanup@example.test",
     )
     _store(
         vault,
@@ -1958,7 +2121,7 @@ def test_temp_cleanup_drops_secret_and_identifier_locals_before_unlink(
     )
     record_path = tmp_path / "tokens" / f"{account_marker}.json"
     before = record_path.read_bytes()
-    token_marker = b"cleanup-secret-marker"
+    token_marker = b"cleanup-synthetic-secret-marker"
     encoded_marker = base64.b64encode(token_marker).decode("ascii")
     production_locals: list[str] = []
     original_unlink = vault_module.os.unlink
@@ -2253,15 +2416,15 @@ def test_multiple_cleanup_failures_continue_and_primary_error_wins(
 def test_cleanup_errors_have_fully_redacted_error_graphs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
-    account_marker = f"{operation}-cleanup-account-marker"
-    subject_marker = f"{operation}-cleanup-subject-marker"
-    token_marker = f"{operation}-cleanup-token-marker"
+    account_marker = f"{operation}-cleanup-synthetic-account-marker"
+    subject_marker = f"{operation}-cleanup-synthetic-subject-marker"
+    token_marker = f"{operation}-cleanup-synthetic-token-marker"
     vault = _vault(tmp_path)
     manager = _manager(
         tmp_path,
         account_ref=account_marker,
         subject_id=subject_marker,
-        login_email=f"{operation}-cleanup-login-marker@example.test",
+        login_email=f"{operation}synthetic--cleanup-login-marker@example.test",
     )
     if operation == "delete":
         _store(
@@ -2318,7 +2481,7 @@ def test_cleanup_errors_have_fully_redacted_error_graphs(
 def test_error_constructor_rejects_marker_without_retaining_it_in_product_frame() -> (
     None
 ):
-    marker = "invalid-error-code-marker"
+    marker = "invalsynthetic-id-error-code-marker"
     try:
         GoogleInventoryReadonlyTokenVaultError(marker)
     except TypeError as caught:
@@ -2573,7 +2736,7 @@ def test_every_pre_rename_failure_preserves_old_record_cleans_temp_and_retries(
     monkeypatch.setattr(vault_module.os, "close", fail_close)
     monkeypatch.setattr(vault_module.os, "replace", fail_replace)
     monkeypatch.setattr(vault_module.os, "unlink", fail_cleanup)
-    token_marker = b"all-pre-rename-secret-marker"
+    token_marker = b"all-pre-rename-synthetic-secret-marker"
     token = bytearray(token_marker)
 
     assert (
@@ -2598,16 +2761,9 @@ def test_directory_node_repr_is_a_fixed_redacted_capability_label() -> None:
     )
 
 
-def test_open_production_tokens_directory_classifies_root_open_failure(
-    monkeypatch,
-) -> None:
-    def denied(*args, **kwargs):
-        raise OSError(vault_module.errno.EACCES, "denied")
-
-    monkeypatch.setattr(vault_module.os, "open", denied)
-
+def test_open_production_tokens_directory_is_closed_without_fixed_components() -> None:
     assert vault_module._open_production_tokens_directory() == (
-        "credential.inventory_token_vault_permissions",
+        "credential.inventory_token_vault_unavailable",
         None,
     )
 
@@ -2687,8 +2843,8 @@ def test_different_account_refs_do_not_share_a_global_process_lock(
     manager = _manager_for_accounts(
         tmp_path,
         (
-            ("account-a", "subject-a", "a@example.test"),
-            ("account-b", "subject-b", "b@example.test"),
+            ("synthetic-account-a", "synthetic-subject-a", "synthetic-a@example.test"),
+            ("synthetic-account-b", "synthetic-subject-b", "synthetic-b@example.test"),
         ),
     )
     entered = threading.Event()
@@ -2697,7 +2853,7 @@ def test_different_account_refs_do_not_share_a_global_process_lock(
 
     def block_account_a(*args: object, **kwargs: object) -> str | None:
         record_name = args[1]
-        if os.fspath(record_name) == "account-a.json":  # type: ignore[arg-type]
+        if os.fspath(record_name) == "synthetic-account-a.json":  # type: ignore[arg-type]
             entered.set()
             assert release.wait(timeout=5)
         return original_write_record(*args, **kwargs)  # type: ignore[arg-type]
@@ -2711,8 +2867,8 @@ def test_different_account_refs_do_not_share_a_global_process_lock(
                 _store(
                     vault,
                     manager,
-                    account_ref="account-a",
-                    subject_id="subject-a",
+                    account_ref="synthetic-account-a",
+                    subject_id="synthetic-subject-a",
                 )
             )
         except GoogleInventoryReadonlyTokenVaultError as error:
@@ -2725,8 +2881,8 @@ def test_different_account_refs_do_not_share_a_global_process_lock(
         second = _store(
             vault,
             manager,
-            account_ref="account-b",
-            subject_id="subject-b",
+            account_ref="synthetic-account-b",
+            subject_id="synthetic-subject-b",
         )
         assert second.vault_generation == 1
     finally:
@@ -2745,14 +2901,14 @@ def test_registry_stays_empty_across_many_validation_error_and_reload_like_cycle
     for index in range(24):
         cycle = tmp_path / f"cycle-{index}"
         cycle.mkdir(mode=0o700)
-        account_ref = f"cycle-account-{index}"
-        subject_id = f"cycle-subject-{index}"
+        account_ref = f"cycle-synthetic-account-{index}"
+        subject_id = f"cycle-synthetic-subject-{index}"
         vault = _vault(cycle)
         manager = _manager(
             cycle,
             account_ref=account_ref,
             subject_id=subject_id,
-            login_email=f"cycle-{index}@example.test",
+            login_email=f"synthetic-cycle-{index}@example.test",
         )
         assert (
             _store(
@@ -2803,7 +2959,7 @@ def test_parent_fd_capability_mode_change_fails_before_child_access(
 ) -> None:
     vault = _vault(tmp_path)
     manager = _manager(tmp_path)
-    token = bytearray(b"parent-mode-secret-marker")
+    token = bytearray(b"parent-mode-synthetic-secret-marker")
     tmp_path.chmod(0o770)
     try:
         assert _error_code(lambda: _store(vault, manager, token=token)) == (
@@ -2852,7 +3008,7 @@ def test_tokens_parent_close_failure_does_not_skip_root_parent_close(
     monkeypatch.setattr(vault_module.os, "dup", track_dup)
     monkeypatch.setattr(vault_module.os, "open", track_open)
     monkeypatch.setattr(vault_module.os, "close", fail_tokens_close)
-    token = bytearray(b"parent-close-secret-marker")
+    token = bytearray(b"parent-close-synthetic-secret-marker")
 
     assert _error_code(lambda: _store(vault, manager, token=token)) == (
         "credential.inventory_token_vault_write_failed"
@@ -2876,15 +3032,15 @@ def test_vault_public_surface_remains_store_delete_only(tmp_path: Path) -> None:
 def test_unexpected_record_binding_error_is_fresh_and_fully_redacted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
-    account_marker = f"{operation}-unexpected-account-marker"
-    subject_marker = f"{operation}-unexpected-subject-marker"
-    token_marker = f"{operation}-unexpected-token-marker"
+    account_marker = f"{operation}-unexpected-synthetic-account-marker"
+    subject_marker = f"{operation}-unexpected-synthetic-subject-marker"
+    token_marker = f"{operation}-unexpected-synthetic-token-marker"
     vault = _vault(tmp_path)
     manager = _manager(
         tmp_path,
         account_ref=account_marker,
         subject_id=subject_marker,
-        login_email=f"{operation}-unexpected-login-marker@example.test",
+        login_email=f"{operation}synthetic--unexpected-login-marker@example.test",
     )
     _store(
         vault,

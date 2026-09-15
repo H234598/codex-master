@@ -1,335 +1,245 @@
-"""CLI for isolated Google account inventory and quota provisioning."""
+"""Closed CLI adapter for the read-only Google inventory authority."""
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping, Sequence
 import json
-from pathlib import Path
 import sys
-import time
-from typing import cast
+from typing import Final
 
-from .google_account_inventory import GoogleAccountInventoryError
-from .google_account_inventory import _read_private_inventory_bytes
-from .google_account_inventory_manager import (
-    GoogleAccountInventoryManager,
-    _GoogleAccountInventorySnapshotV1,
+from .google_inventory_readonly_control_service import (
+    GoogleInventoryReadonlyControlService,
 )
-from .google_cloud_api import GoogleCloudApi
-from .google_cloud_inventory import rename_and_reconcile_existing_projects
-from .google_cloud_provisioner import (
-    GoogleCloudProvisionerError,
-    GoogleQuotaEvidenceV1,
-    _validate_quota_evidence,
-    build_fill_to_quota_plan,
-)
-from .google_inventory_store import GoogleInventoryStore
-from .google_oauth_session import authorize_google_account, load_access_token
 
 
-_QUOTA_EVIDENCE_FIELDS = frozenset(
+_REQUEST_INVALID: Final[str] = "inventory.readonly_control_request_invalid"
+_UNAVAILABLE: Final[str] = "inventory.readonly_control_unavailable"
+_SAFE_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
-        "remaining",
-        "observed_at",
-        "source",
-        "account_ref",
-        "inventory_generation",
-        "inventory_fingerprint",
+        "oauth.interactive_authorization_required",
+        _REQUEST_INVALID,
+        _UNAVAILABLE,
+        "inventory.readonly_control_plan_invalid",
+        "inventory.readonly_control_plan_expired",
+        "inventory.readonly_control_plan_consumed",
+        "inventory.readonly_control_plan_stale",
+        "inventory.readonly_control_apply_failed",
+        "inventory.readonly_control_reload_failed",
+        "inventory.readonly_control_recovery_failed",
     }
 )
-_MAX_QUOTA_EVIDENCE_BYTES = 16 * 1024
+_SCAN_RESULT_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "status",
+        "plan_reference",
+        "account_count",
+        "project_count",
+        "billing_account_count",
+        "service_count",
+        "key_count",
+        "changes",
+    }
+)
+_SCAN_CHANGE_KINDS: Final[frozenset[str]] = frozenset({"canonical_account"})
+_MAX_PLAN_REFERENCE_BYTES: Final[int] = 192
 
 
-def _common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--account", required=True)
-    parser.add_argument("--client-file", required=True, type=Path)
+class _CliFailure(Exception):
+    __slots__ = ("code",)
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class _ParseFailure(SystemExit):
+    __slots__ = ()
+    code: Final[str] = _REQUEST_INVALID
+
+    def __init__(self) -> None:
+        super().__init__(2)
+
+
+class _ClosedArgumentParser(argparse.ArgumentParser):
+    """Parser that never reflects invalid caller input to stderr."""
+
+    def error(self, message: str) -> None:
+        del message
+        raise _ParseFailure()
+
+    def parse_args(
+        self,
+        args: Sequence[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        parsed = super().parse_args(args, namespace)
+        if self.prog == "google-account-manager" and not _valid_arguments(parsed):
+            self.error("")
+        return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="google-account-manager")
+    parser = _ClosedArgumentParser(prog="google-account-manager", add_help=False)
     commands = parser.add_subparsers(dest="command", required=True)
-
-    oauth = commands.add_parser("oauth-authorize")
-    _common(oauth)
-    oauth.add_argument("--browser-profile", required=True, type=Path)
-    oauth.add_argument("--browser-debug-port", type=int)
-
-    inventory = commands.add_parser("inventory")
-    _common(inventory)
-
-    rename = commands.add_parser("rename-existing")
-    _common(rename)
-    rename.add_argument("--control-project-id", action="append", default=[])
-    rename.add_argument("--yes", action="store_true")
-
-    provision = commands.add_parser("provision")
-    _common(provision)
-    provision.add_argument("--fill-to-quota", action="store_true", required=True)
-    provision.add_argument("--quota-evidence-file", type=Path, required=True)
-    provision.add_argument("--yes", action="store_true")
+    inventory = commands.add_parser("inventory", add_help=False)
+    inventory.add_argument("inventory_action", choices=("authorize", "scan"), nargs="?")
+    inventory.add_argument("--plan", action="store_true")
+    inventory.add_argument("--apply", dest="plan_reference")
     return parser
 
 
-def _document(store: GoogleInventoryStore) -> dict[str, object]:
-    return store._read()[1]
-
-
-def _account(document: dict[str, object], ref: str) -> dict[str, object]:
-    accounts = document.get("google_accounts")
-    if type(accounts) is not list:
-        raise ValueError("inventory.invalid")
-    found = [item for item in accounts if type(item) is dict and item.get("ref") == ref]
-    if len(found) != 1:
-        raise ValueError("inventory.account_invalid")
-    return found[0]
-
-
-def _api(
-    store: GoogleInventoryStore, account: str, client_file: Path
-) -> GoogleCloudApi:
-    return GoogleCloudApi(
-        load_access_token(store, account_ref=account, client_file=client_file)
+def _is_plan_reference(value: object) -> bool:
+    if type(value) is not str or not value.startswith("plan-"):
+        return False
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeError:
+        return False
+    return (
+        len(encoded) <= _MAX_PLAN_REFERENCE_BYTES
+        and len(encoded) > len("plan-")
+        and all(character.isalnum() or character in "-_" for character in value)
     )
 
 
-def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError
-        result[key] = value
+def _valid_arguments(arguments: argparse.Namespace) -> bool:
+    if getattr(arguments, "command", None) != "inventory":
+        return False
+    action = getattr(arguments, "inventory_action", None)
+    plan = getattr(arguments, "plan", None)
+    reference = getattr(arguments, "plan_reference", None)
+    return (
+        (action == "authorize" and plan is False and reference is None)
+        or (action == "scan" and plan is True and reference is None)
+        or (action is None and plan is False and _is_plan_reference(reference))
+    )
+
+
+def _project_authorize(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping) or dict(value) != {"status": "authorized"}:
+        raise _CliFailure(_UNAVAILABLE)
+    return {"status": "authorized"}
+
+
+def _project_apply(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping) or dict(value) != {"status": "applied"}:
+        raise _CliFailure(_UNAVAILABLE)
+    return {"status": "applied"}
+
+
+def _project_subject_status(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != {"status"}:
+        raise _CliFailure(_UNAVAILABLE)
+    status = value.get("status")
+    if status not in {"bound", "unavailable"}:
+        raise _CliFailure(_UNAVAILABLE)
+    assert type(status) is str
+    return {"status": status}
+
+
+def _project_scan(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != _SCAN_RESULT_FIELDS:
+        raise _CliFailure(_UNAVAILABLE)
+    if value.get("status") != "planned" or not _is_plan_reference(
+        value.get("plan_reference")
+    ):
+        raise _CliFailure(_UNAVAILABLE)
+    result: dict[str, object] = {
+        "status": "planned",
+        "plan_reference": value["plan_reference"],
+    }
+    for field in (
+        "account_count",
+        "project_count",
+        "billing_account_count",
+        "service_count",
+        "key_count",
+    ):
+        count = value.get(field)
+        if type(count) is not int or count < 0:
+            raise _CliFailure(_UNAVAILABLE)
+        result[field] = count
+    changes = value.get("changes")
+    if (
+        not isinstance(changes, Mapping)
+        or set(changes) - _SCAN_CHANGE_KINDS
+        or any(type(count) is not int or count < 0 for count in changes.values())
+    ):
+        raise _CliFailure(_UNAVAILABLE)
+    result["changes"] = {kind: changes[kind] for kind in sorted(changes)}
     return result
 
 
-def _reject_nonfinite(_: str) -> object:
-    raise ValueError
-
-
-def _load_quota_evidence(path: Path) -> GoogleQuotaEvidenceV1:
-    try:
-        raw = _read_private_inventory_bytes(path)
-        if not 0 < len(raw) <= _MAX_QUOTA_EVIDENCE_BYTES or b"\x00" in raw:
-            raise ValueError
-        parsed = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=_strict_json_object,
-            parse_constant=_reject_nonfinite,
-        )
-        if type(parsed) is not dict or set(parsed) != _QUOTA_EVIDENCE_FIELDS:
-            raise ValueError
-        evidence = GoogleQuotaEvidenceV1(
-            remaining=parsed["remaining"],
-            observed_at=parsed["observed_at"],
-            source=parsed["source"],
-            account_ref=parsed["account_ref"],
-            inventory_generation=parsed["inventory_generation"],
-            inventory_fingerprint=parsed["inventory_fingerprint"],
-        )
-        _validate_quota_evidence(
-            evidence,
-            account_ref=evidence.account_ref,
-            inventory_generation=evidence.inventory_generation,
-            inventory_fingerprint=evidence.inventory_fingerprint,
-            now=evidence.observed_at,
-        )
-        return evidence
-    except (
-        GoogleAccountInventoryError,
-        GoogleCloudProvisionerError,
-        UnicodeError,
-        ValueError,
-        TypeError,
-    ):
-        raise GoogleCloudProvisionerError("quota.evidence_file_invalid") from None
-
-
-def _provision_document(
-    snapshot: _GoogleAccountInventorySnapshotV1,
+def _dispatch_inventory_job(
+    job: str, plan_reference: object = None
 ) -> dict[str, object]:
-    return {
-        "google_accounts": [
-            {
-                "ref": account.ref,
-                "subject_id": account.subject_id,
-                "projects": [
-                    {
-                        "ref": project.ref,
-                        "purpose": project.purpose,
-                        "project_name": project.project_name,
-                        "status": project.status,
-                        "project_id": project.project_id,
-                        "project_number": project.project_number,
-                        "key_name": project.key_name,
-                    }
-                    for project in account.projects
-                ],
-            }
-            for account in snapshot.accounts
-        ]
-    }
+    """The only construction and dispatch boundary, including private status."""
+
+    if (
+        job not in {"authorize", "scan_plan", "apply", "subject_status"}
+        or (job == "apply" and not _is_plan_reference(plan_reference))
+        or (job != "apply" and plan_reference is not None)
+    ):
+        raise _CliFailure(_REQUEST_INVALID)
+    service = GoogleInventoryReadonlyControlService()
+    if job == "authorize":
+        return _project_authorize(service.authorize())
+    if job == "scan_plan":
+        return _project_scan(service.scan_plan())
+    if job == "apply":
+        return _project_apply(service.apply(plan_reference))
+    return _project_subject_status(service.subject_status())
 
 
 def run(arguments: argparse.Namespace) -> int:
-    if arguments.command == "provision" and arguments.yes:
-        raise GoogleCloudProvisionerError("quota_evidence_untrusted")
-    store = GoogleInventoryStore()
-    if arguments.command == "oauth-authorize":
-        receipt = authorize_google_account(
-            store,
-            account_ref=arguments.account,
-            client_file=arguments.client_file,
-            browser_profile=arguments.browser_profile,
-            browser_debug_port=arguments.browser_debug_port,
-        )
-        print(
-            json.dumps(
-                {
-                    "account": receipt.account_ref,
-                    "subject_bound": receipt.subject_bound,
-                    "refresh_token_stored": receipt.refresh_token_stored,
-                },
-                sort_keys=True,
-            )
-        )
-        return 0
+    """Forward one fixed grammar action to the sole control authority."""
 
-    api = _api(store, arguments.account, arguments.client_file)
-    if arguments.command == "provision":
-        evidence = _load_quota_evidence(arguments.quota_evidence_file)
-        manager = GoogleAccountInventoryManager()
-        try:
-            manager.reload()
-            snapshot = manager._snapshot_for_internal_use()
-            generation = snapshot.generation
-            inventory_fingerprint = snapshot.content_fingerprint
-            try:
-                account = snapshot.by_account_ref[arguments.account]
-            except KeyError:
-                raise GoogleCloudProvisionerError(
-                    "provisioner.account_invalid"
-                ) from None
-            subject = account.subject_id
-            if type(subject) is not str or not subject or api.subject_id() != subject:
-                raise GoogleCloudProvisionerError("provisioner.subject_mismatch")
-            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            _validate_quota_evidence(
-                evidence,
-                account_ref=arguments.account,
-                inventory_generation=generation,
-                inventory_fingerprint=inventory_fingerprint,
-                now=now,
-            )
-            cloud_projects = api.search_projects()
-            plan = build_fill_to_quota_plan(
-                _provision_document(snapshot),
-                account_ref=arguments.account,
-                expected_subject_id=subject,
-                quota_evidence=evidence,
-                inventory_generation=generation,
-                inventory_fingerprint=inventory_fingerprint,
-                now=now,
-                visible_project_names={
-                    cast(str, item["displayName"])
-                    for item in cloud_projects
-                    if type(item.get("displayName")) is str
-                },
-                reserved_project_ids={
-                    cast(str, item["projectId"])
-                    for item in cloud_projects
-                    if type(item.get("projectId")) is str
-                },
-            )
-            print(
-                json.dumps(
-                    {
-                        "account": arguments.account,
-                        "planned_projects": len(plan.projects),
-                        "projects": [
-                            {
-                                "ref": item.ref,
-                                "project_name": item.project_name,
-                                "project_id": item.project_id,
-                                "key_name": item.key_display_name,
-                            }
-                            for item in plan.projects
-                        ],
-                        "fingerprint": plan.fingerprint,
-                        "execute": False,
-                        "apply_blocked_reason": "quota_evidence_untrusted",
-                    },
-                    sort_keys=True,
-                )
-            )
-            return 2
-        finally:
-            manager.close()
-
-    document = _document(store)
-    account = _account(document, arguments.account)
-    subject = account.get("subject_id")
-    if type(subject) is not str or not subject or api.subject_id() != subject:
-        raise ValueError("inventory.subject_mismatch")
-
-    if arguments.command == "inventory":
-        projects = api.search_projects()
-        print(
-            json.dumps(
-                {
-                    "account": arguments.account,
-                    "project_count": len(projects),
-                    "active_project_count": sum(
-                        item.get("state") == "ACTIVE" for item in projects
-                    ),
-                },
-                sort_keys=True,
-            )
-        )
-        return 0
-
-    if arguments.command == "rename-existing":
-        projects = api.search_projects()
-        preview = {
-            "account": arguments.account,
-            "active_projects_to_rename": sum(
-                item.get("state") == "ACTIVE" for item in projects
-            ),
-            "execute": bool(arguments.yes),
-        }
-        print(json.dumps(preview, sort_keys=True))
-        if not arguments.yes:
-            return 2
-        receipt = rename_and_reconcile_existing_projects(
-            document,
-            account_ref=arguments.account,
-            expected_subject_id=subject,
-            api=api,
-            store=store,
-            control_project_ids=set(arguments.control_project_id),
-        )
-        print(
-            json.dumps(
-                {
-                    "projects_renamed": receipt.projects_renamed,
-                    "keys_renamed": receipt.keys_renamed,
-                },
-                sort_keys=True,
-            )
-        )
-        return 0
-
-    raise ValueError("command.invalid")
+    if not _valid_arguments(arguments):
+        raise _CliFailure(_REQUEST_INVALID)
+    action = getattr(arguments, "inventory_action", None)
+    if action == "authorize":
+        result = _dispatch_inventory_job("authorize")
+    elif action == "scan" and getattr(arguments, "plan", None) is True:
+        result = _dispatch_inventory_job("scan_plan")
+    elif action is None:
+        result = _dispatch_inventory_job("apply", arguments.plan_reference)
+    else:
+        raise _CliFailure(_REQUEST_INVALID)
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
 
 
-def main() -> int:
+def _error_code(error: BaseException) -> str:
+    code = getattr(error, "code", None)
+    return code if type(code) is str and code in _SAFE_ERROR_CODES else _UNAVAILABLE
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     try:
-        return run(build_parser().parse_args())
-    except Exception as error:
-        code = getattr(error, "code", None)
-        print(
-            code if type(code) is str else "google.account_manager_failed",
-            file=sys.stderr,
-        )
+        return run(build_parser().parse_args(argv))
+    except _ParseFailure as error:
+        print(error.code, file=sys.stderr)
         return 1
+    except Exception as error:
+        print(_error_code(error), file=sys.stderr)
+        return 1
+
+
+def subject_id_main(argv: Sequence[str] | None = None) -> int:
+    """Print only the subject-binding status from the same authority."""
+
+    arguments = sys.argv[1:] if argv is None else argv
+    if len(arguments) != 0:
+        print(_REQUEST_INVALID, file=sys.stderr)
+        return 1
+    try:
+        result = _dispatch_inventory_job("subject_status")
+    except Exception as error:
+        print(_error_code(error), file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
 
 
 if __name__ == "__main__":
