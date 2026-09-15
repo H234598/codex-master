@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":8,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":9,"schema_version":1} -->\n'
 )
 
 
@@ -27,13 +27,13 @@ def write_policy(tmp_path: Path, content: bytes) -> Path:
 
 def test_loads_canonical_policy_with_complete_file_digest() -> None:
     policy_api = load_policy_api()
-    path = Path("src/codex_master/markdown/common.md")
+    path = Path("src/the_hive/markdown/common.md")
     expected_bytes = path.read_bytes()
 
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 8
+    assert contract.generation == 9
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 

@@ -6,6 +6,28 @@ names `the-hive-mcp`, `the-hive-admin`, `the-hive-agent-api`,
 `the-hive-host-agent`, and `google-account-manager`. Declaring an entry point
 does not make a checkout a trusted runtime installation.
 
+## Public documentation OPSEC
+
+Treat published documentation as public and machine-indexable by default. It
+must not include:
+
+- personal identifiers, including real names, user names, email addresses, or
+  private account names;
+- secrets and credentials, including keys, tokens, cookies, credential
+  identifiers or material, or values from credential files;
+- internal resource identifiers, including session, lease, invocation,
+  subject, project, or billing identifiers that are not explicitly public
+  examples;
+- private network addresses and local absolute paths; or
+- raw logs, stack traces, or screenshots that expose identities, paths,
+  window titles, metadata, or credentials.
+
+Use portable placeholders such as `$HOME`, `<account>`, `<host>`, `<repo>`,
+and `<session-id>` instead. Keep internal operational documentation clearly
+separate from public project documentation. Secrets are never permitted, even
+there. If an operational identifier is truly necessary, put it only in an
+explicitly access-restricted internal document.
+
 ## Focused verification
 
 The CI workflow establishes the test invocation shape

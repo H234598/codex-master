@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":8,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":9,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -37,6 +37,17 @@ Ein vorhandenes grünes Testergebnis darf nur bei unveränderten relevanten Inpu
 und noch gültigem Evidence-Reuse-Fenster wiederverwendet werden. Andernfalls den
 Test neu ausführen. Vorgeschriebene Voll- und Release-Gates bleiben verbindlich
 und werden einmal am passenden Gate ausgeführt.
+
+## Public documentation OPSEC
+
+For all documentation work, treat published documentation as public and
+machine-indexable by default. Do not include personal identifiers, secrets or
+credentials, internal resource identifiers, private network addresses or local
+absolute paths, or raw logs, stack traces, or screenshots. Use portable
+placeholders only. Keep internal operational documentation separate; when an
+operational identifier is truly necessary, confine it to an explicitly
+access-restricted document. Secrets are never permitted. Apply the detailed
+rule at `docs/development.md#public-documentation-opsec`.
 
 ## Obsidian Annotation Marker
 
