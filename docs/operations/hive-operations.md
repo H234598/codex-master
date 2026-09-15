@@ -1,226 +1,47 @@
-# Hive Operations
+# The Hive Operations
 
-The Hive is a bounded control plane for typed principals, repository bindings,
-grants, workpackages, queue state, admissions, and reports. The default MCP
-surface is read-only and returns `raw_output: not_returned`.
+## Verifizierter Umfang
 
-Useful local checks:
+The Hive enthält einen lokalen, datenarmen Kontrollbereich für typisierte
+Principals, Repository-Bindungen, Grants, Workpackages, Queue- und
+Admission-Zustand sowie Reporting-Metadaten. Der Hive-CLI-Adapter implementiert
+die Diagnosepfade `hive validate`, `hive status`, `hive doctor`,
+`hive migration-status`, `hive runtime-status`, den ausdrücklich trockenen
+`hive rollback --dry-run`, `selection-status` und die
+Reset-Anker-Vorschau.
 
-```sh
-./bin/codex-master-mcp tools
-./bin/codex-master-mcp hive status
-./bin/codex-master-mcp hive doctor
-./bin/codex-master-mcp hive migration-status
-./bin/codex-master-mcp hive rollback --dry-run
-./bin/codex-master-mcp selection-status
-./bin/codex-master-mcp selection-policy-status
-./bin/codex-master-mcp reset-anchor-run --dry-run --anchor-key sha256:<64-hex>
-```
+Diese Namen beschreiben Parseroberflächen im Quellstand. Der eingecheckte
+`bin/the-hive-mcp`-Einstiegspunkt verlangt Release-Root, Generation und
+Manifest-Digest und ist nicht als direkter Aufruf dokumentiert. Die
+`.mcp.json` verweist auf den stabilen, installierten Launcher
+`/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp`; dessen Existenz und
+aktueller Laufzeitzustand wurden nicht geprüft.
 
-Global requests are planned as independent repository dispatches. Unknown
-repositories and breaking/destructive constraints remain blocked. A productive
-multi-repository saga needs an explicit registry, pilot allowlist, user gates,
-and injected create/execute/compensation callbacks; there is no global commit
-or hidden atomicity.
+## Aktuelle Fail-closed-Grenzen
 
-Cooperative pause is checkpointed. A work-orchestration request must be
-followed by a typed safe progress report before a workpackage can enter
-`paused`. Selection fairness and SP0–SP3 never stop, interrupt, restart, or
-take over a lease. Resuming requires fresh admission and scope revalidation.
+`codex-hive.json` hat zwar den Modus `enforced`, schaltet aber alle vier
+SP-Featureflags aus. Die Pilot-Gate-Implementierung akzeptiert keine
+bereitgestellte positive Account-Attestierung und liefert ohne die geforderte
+Laufzeitevidenz einen blockierenden Grundcode. Externe Freigaben, reale
+Provider-Credentials und eine produktive Pilotzulassung sind daher in diesem
+Dokument nicht nachgewiesen.
 
-Emergency-Queen control is serialized under the private Masterjet state root.
-`emergency_queen_status` is read-only; `emergency_queen_plan_completed`
-advances one generation-bound plan queue. A completion after emergency mode
-ends moves the Queen to `draining` and sends a graceful shutdown signal. No
-second Queen is started while the state is active. Queens are logical Hive
-principals with `home_policy: none`; this excludes a permanent series home,
-not a lease-bound runtime home. The currently materialized q-homes carry
-Teamleiterin profiles, but provider and series are not class bindings; an
-arbitrary native home is nevertheless never silently promoted to a Queen.
-Until the planned logical Queen runtime adapter is materialized, the controller
-returns the explicit blocker `queen_spawn_unavailable:hive_queen_runtime_not_materialized`
-and does not simulate a successful spawn. Queen children are registered in the
-same generation-bound state, so draining waits for both the Queen and
-registered children.
+Die logische Königin ist gegenwärtig nicht materialisiert. Der
+Emergency-Queen-Pfad hat keine Kandidaten und meldet
+`queen_spawn_unavailable:hive_queen_runtime_not_materialized`, statt einen
+Erfolg zu simulieren. Ein Zustandsname oder eine vorhandene q-Home ersetzt
+diese fehlende Laufzeitanbindung nicht.
 
-Private state is bounded, lock-protected, no-follow, and redacted at public
-boundaries. Real provider credentials and external pilot approval remain
-operational gates.
+Private Hive-Zustände werden in der Implementierung begrenzt, gelockt und
+über no-follow-Dateiprüfungen behandelt. Historische Kennungen in
+Zustandsverzeichnissen oder Umgebungsvariablen bleiben technische
+Kompatibilitätsverträge, keine Produktbezeichnung.
 
-The hourly Goddess Reporter, its UTC bucket contract, single-leader lock,
-Vault writer, CLI commands, and degraded-state semantics are documented in
+## Operative Entscheidung
+
+Diese Seite enthält absichtlich keine produktiven Start-, Provisionierungs-
+oder Callback-Schritte. Eine solche Handlung benötigt zusätzlich einen
+autorisierten Ablauf, belegte Repository- und Scope-Bindungen, frische
+Laufzeitevidenz sowie die jeweils erforderlichen externen Freigaben. Für den
+Berichtspfad gilt die separat begrenzte Beschreibung in
 [`goddess-reporting.md`](goddess-reporting.md).
-
-## Runtime assembly and recovery
-
-The server-side admission adapter must be built from one explicit
-`HiveRuntime` bundle containing the validated Hive config, principal registry,
-repository registry, authority engine, and private `HiveEventStore`.
-`build_current_hive_runtime` keeps
-local repository roots caller-supplied because paths are not part of the
-public configuration; principal materialization is opt-in and exact config
-parity is required.
-
-`HiveEventStore` persists bounded, payload-free assignment, queue, and completion
-metadata under the Hive state root. Pass this store explicitly to
-`execute_server_queen_assignment()` when the Queen path is productive. The
-adapter records `queued` before callbacks and a sanitized terminal/blocked
-status afterward. Persistence failure before execution blocks the call; failure
-after execution is returned as `event_persistence: failed`. Pure transition
-helpers remain side-effect-free.
-
-For the persistent admission path, construct
-`FileCompletionJournal(..., event_store=runtime.events)`. It emits idempotent
-`executing` and `completed` events alongside the recovery journal. Recovery
-remains based on the completion journal; the reporter never treats a missing
-event as successful execution.
-
-When an executor is attached, pass a private `FileCompletionJournal` to the
-runtime adapter. It durably records only a bounded admission revision and
-opaque operation/result digests. A started record without a completed record
-is unresolved after a crash and is never guessed as successful. A completed
-record can be consumed by `SelectionService.reconcile_incomplete()` from a
-fresh process. Provider responses, prompts, credentials, paths, and result
-values are not written to the journal.
-
-`create_assignment_admission()` is the explicit bridge from a verified
-`QueenAssignmentPlan`, `WorkPackage`, `AssignmentIntent`, `DelegationGrant`,
-and repository registry to one immutable `PLANNED` admission. It checks the
-cross-object identities and the live grant without consuming it, binds the
-concrete write paths to the scope digest, and carries the workpackage version
-and grant binding digest forward. It does not reserve capacity, claim a lease,
-start a provider, or mutate a repository. The server authority gate rejects a
-record whose grant digest has changed since materialization.
-
-Every `FileAdmissionStore` lifecycle transition goes through the same
-cross-process lock and atomic state replacement as the initial reservation.
-That includes revalidation, admission, execution, finalization, denial and
-compensation; a fresh process therefore cannot observe a stale in-memory
-state after a transition.
-
-`build_server_selection_service()` is the explicit server factory for this
-durable path. It couples `FileAdmissionStore` to the fixed
-`ServerAdmissionRuntime` gate order, but it is not called by an MCP tool and
-does not enable execution by itself. Missing Hive bindings therefore remain a
-normal fail-closed result.
-
-Completion records additionally carry one digest over the assignment,
-workpackage, grant, scope, resource and lease bindings. The digest is checked
-before idempotent completion and during fresh-process recovery; the journal
-stores none of those private values themselves.
-
-For a productive callback, use `build_server_lease_executor()` explicitly with
-an allowlisted operation map. Immediately before the named callback runs, it
-reads the agent lease again and compares the state and, when present, the
-immutable lease id from the admission record. The adapter passes that private
-snapshot to the callback but never claims, releases, starts, sends, or invokes
-a provider on its own. The callback must route to an existing low-level
-operation and own its completion/release behavior; direct calls still require
-an `EXECUTING` admission record.
-
-`execute_server_hive_assignment()` is the explicit bridge for this full local
-flow. It creates a fresh planned admission from the authoritative Hive
-objects, builds the persistent SelectionService, and supplies the allowlisted
-lease executor. Retry attempts receive distinct admission IDs; no MCP tool
-calls the bridge implicitly, and no provider operation exists unless the
-caller supplies the operation callback.
-
-## Obsidian section and annotation responses
-
-### Operator materialization
-
-Every direct answer to a document section must be bidirectionally linked, even
-without an Annotation Marker. The answer contains exactly one uniquely
-resolved normal Markdown link to the primary source section or its heading.
-The source section contains exactly one backlink to the concrete answer target
-and answer heading. For multiple source chapters, uniquely resolve every
-actually referenced source heading before any mutation. The answer text
-contains exactly one normal Markdown link for every actually referenced source
-heading. Each respective source section contains exactly one idempotent
-backlink to the same answer. If a source is missing, ambiguous, or conflicting,
-the entire multi-source mutation is fail-closed: write neither answer chapter
-nor any backlink. For a section-only answer, an existing Annotation ID is an
-optional additional anchor, not a prerequisite. A direct annotation answer
-still requires the Annotation ID.
-
-Before mutating a section answer, uniquely resolve the source document, source
-section, source heading, source-link target, answer target, and answer heading.
-A missing, ambiguous, or contradictory resolution is fail-closed: write
-neither answer chapter nor backlink. Reuse a matching existing backlink and
-answer link. A conflicting existing backlink or answer link is a blocker;
-never write a second backlink or answer link. Resolve and compare these values
-again before every retry.
-
-When directly answering an Obsidian annotation, first find and read the
-matching Annotation Marker sidecar under
-`.obsidian/plugins/annotation-marker/annotations/`. Its `color1`–`color6`
-suffix is authoritative; evaluate `data-annotation-note` and use
-`data-annotation-id` to distinguish markers. Retain marker data and notes. If
-the matching sidecar is absent, do not change the Obsidian source.
-
-For a direct annotation, append each answer, explanation, ADR, or question as
-its own chapter at the end of the document. The answer heading must use
-exactly this Markdown form:
-
-```text
-## <exakte Annotation-Überschrift ohne finale ID> — [<Annotation-ID>](<eindeutiger Link auf referenzierten Annotationsabschnitt oder dessen Überschrift>)
-```
-
-Keep the exact annotation heading before the literal em dash `—`; keep the
-visible identifier exact and unchanged. The heading identifier is a normal
-Markdown link, never an Obsidian wikilink. Resolve its target uniquely to the
-referenced annotation section or heading before writing. Add exactly one
-idempotent backlink to the cited source section.
-
-The source section receives exactly one idempotent inline backlink. The linked
-answer to an annotation appears directly after the concrete
-annotation. It is visibly exactly `(A)`; for example:
-`<Annotation> (A). Hier weiterer Text.` The canonical Markdown form of the
-visible link is `[(A)](<Antwortziel>#<Antwortueberschrift>)`. Keep exactly one
-space between annotation and link, and put the link before following
-punctuation or additional text. There is no separate `Beantwortung der Frage ...`
-line. `(A)` is only the backlink; the complete answer remains its own
-chapter at the end of the document. The answer chapter retains the unique
-normal Markdown link to the source annotation/source heading and the
-`data-annotation-id`.
-
-Use an inline annotation's surrounding Markdown heading unchanged as the base
-of the answer heading only when it contains neither a terminal annotation
-identifier nor a conflicting ID link. Otherwise fail closed: do not mutate the
-document and never automatically trim, remove, or normalize the heading. The
-answer heading appends only the current linked annotation identifier at its end.
-
-Before any document mutation, resolve Quellabschnitt,
-Source-Heading-Markdownziel, Annotation-ID, Antwortziel, and
-Antwortüberschrift uniquely. Jeder Wert muss genau einen Wert ergeben.
-Fehlende, mehrdeutige oder konfliktierende Daten erzwingen fail-closed: weder
-Quellzeile noch Antwortkapitel schreiben. Ein passender vorhandener
-Rückverweis wird wiederverwendet. Ein nichtpassender vorhandener Rückverweis
-ist ein Blocker, nie eine zweite Zeile. On retry, resolve and compare these
-values again before writing.
-
-### Generator and provider projection
-
-`src/codex_master/markdown/common.md` is the sole canonical policy source.
-When it changes, bump its `generation` header according to the strict
-`CommonPolicyContract` contract. `load_common_policy()` validates and loads
-the complete bytes; `CommonPolicyContract.project()` builds both provider
-variants; `fleet_markdown_projection()` selects the provider artifact and
-materializes the class profile. Do not maintain parallel policy copies or edit
-`AGENTS.md` / `.gemini/GEMINI.md` directly.
-
-The Codex `AGENTS.md` and Gemini `.gemini/GEMINI.md` projections must retain
-the same canonical common-policy bytes and differ only in their provider
-profile reference. Verify this contract with the focused checks:
-
-```sh
-pytest -q tests/test_hive_policy.py tests/test_fleet_markdown.py
-```
-
-### OpenAI account stickiness and automatic reset gate
-
-The binding account-stickiness and automated reset gate are defined only in
-the `OpenAI-Account- und Context-Reset-Policy` section of
-`src/codex_master/markdown/common.md`. Apply them from the generator's
-materialized `AGENTS.md` or `.gemini/GEMINI.md` projection for the managed
-home; do not copy or locally restate the rules here.

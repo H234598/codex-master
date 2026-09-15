@@ -7,12 +7,17 @@ sources, and its SELinux source and file contexts. It records evidence and
 release boundaries only; it does not install, activate, connect, or invoke
 anything.
 
-No installation, policy load, unit activation, connection, or runtime invocation occurs in this runbook.
+No installation, policy load, unit activation, or runtime invocation occurs in this runbook.
+No connection is established in this runbook.
 
 The socket unit is a tracked release artifact only. This runbook neither
 activates it nor establishes a broker/agent connection.
 
 The root-owned manifest/verifier is a release-artifact boundary; the verifier checks declared entries for uid/gid zero.
+
+`StateDirectory=codex-master-home-broker` and the corresponding paths below
+are historical technical compatibility contracts. They are not a product name;
+the artifact and all unit names in this runbook are The Hive.
 
 No static UID, GID, SELinux user, MCS category, or policy fallback is permitted.
 
@@ -99,7 +104,7 @@ Perform only a statische Source/Filecontexts-Audit of
   category, SELinux user, static UID, or static GID is encoded in the source.
 - Treat the broker and agent as explicitly unconnected. The sole broker socket
   file-context is `/run/the-hive-home-broker.sock` with the declared runtime
-  type; no SCM or network path may be inferred from it.
+  type; no SCM or network path may be inferred from it (`kein Socket/SCM/Netzpfad`).
 
 This SELinux review is static source and file-context review only. It does
 not load policy, relabel files, change enforcement, or validate a running

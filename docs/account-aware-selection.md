@@ -1,73 +1,34 @@
-# Account-aware Selection
+# The Hive: accountbewusste Auswahl
 
-Selection treats an account as an opaque, locally derived identity. Public
-responses expose agent/model/band and reason codes, never account keys,
-provider credentials, prompts, or terminal output.
+Die Auswahl verarbeitet Konten als lokal abgeleitete, opaque Identitäten.
+Öffentliche Auswahl- und Statusdaten sollen keine Account-Schlüssel,
+Provider-Credentials, Prompts oder Roh-Ausgaben enthalten.
 
-The pipeline is deliberately two-dimensional:
+## Aktueller Produktstand
 
-- DP is work priority: DP0–DP3, deadline, dependencies, and queue fairness.
-- SP is resource preference: passive reset evidence, verified short windows,
-  secondary-model eligibility, and account fairness.
+Die eingecheckte `codex-hive.json` setzt `sp0_passive`, `sp1_deadline`,
+`sp2_secondary_model` und `sp3_fairness` sämtlich auf `false`. Der
+read-only-Statuspfad meldet deshalb `preview_only`. Daraus folgt keine
+produktive Reservierung, Start-, Stop-, Interrupt- oder Preemption-Aktion.
+Eine beobachtete Account- oder Modellerreichbarkeit wurde nicht erhoben und
+bleibt unbekannt.
 
-`preview_selection` is deterministic and read-only. `AdmissionMode.OFF` and
-`SHADOW` do not reserve resources. `ENFORCED` still requires every explicit
-authority, repository, scope, account, model, usage, lease, process, auth, and
-config gate through `ServerAdmissionRuntime`.
+Die Auswahlbibliothek bietet eine deterministische Vorschau über Eignung und
+Rangfolge. Fehlende, veraltete oder mehrdeutige Nutzungsdaten sind kein Grund,
+ein Reset- oder Quotenereignis zu erraten. Der passive Reset-Anker kann eine
+Vorschau erstellen; sein Ausführungspfad antwortet fail-closed mit
+`selection_proactive_anchor_safety_gate` und führt keine Mutation aus.
 
-Usage-v2 payloads must be typed and fresh. Unknown or stale semantics are
-excluded from SP0/SP1 rather than guessed. SP2 permits a secondary-simple model
-only for positively simple work and an enabled policy flag; complex or unknown
-work remains primary-only.
+## Policy-Grenze
 
-The passive reset anchor can be previewed with `reset-anchor-run --dry-run`.
-Its execution path remains blocked by `selection_proactive_anchor_safety_gate`
-until a separately verified sandbox, token budget, runtime limit, and kill
-switch contract exists.
+Die private Policy wird ausschließlich über
+`the_hive.selection.config.load_selection_policy` geladen. Der Loader verlangt
+eine absolute, reguläre Datei ohne Symlink, begrenzt Größe und Felder und
+akzeptiert für den Modus nur `disabled`, `shadow` oder `enforced`. Öffentliche
+Policy-Projektionen enthalten Zähler, Feature-Zustände und einen Digest, aber
+keine Allowlist-Werte.
 
-The private policy example is loaded through
-`codex_master.selection.config.load_selection_policy`. The loader rejects
-unknown fields, duplicate allowlist entries, symlink/hardlink files, stale
-types, and out-of-range reservation/freshness values. It maps only passive
-feature flags into the deterministic core; `allows_pilot()` is an allowlist
-check, not authority, credential, reservation, or provider evidence. Shadow,
-kill-switch, and missing gates therefore remain closed for execution.
-
-When the private policy file is present, the server preview applies it as an
-upper bound: requested SP flags cannot exceed configured featureflags and an
-`enforced` request is capped by the configured mode. An active kill-switch
-clears every SP flag and forces `off`. The wrapper exposes this decision via
-`selection-policy-status` and includes only a redacted policy digest in the
-selection preview.
-
-The current private-policy schema uses `disabled`, `shadow`, and `enforced` as
-the execution-boundary modes (`off`, `shadow`, and `enforced` internally).
-The broader Hive design terms `observe` and `auto` are not accepted aliases:
-their runtime semantics are not defined by this contract, so they remain
-fail-closed until a separate policy decision specifies their gates.
-
-## Resolver offer and account availability
-
-`agent_selection_options` is the first-round resolver surface for one target
-series account. It combines the verified principal's delegable classes with the
-checked-in class and model catalogs plus current `codex-usage` availability.
-The response contains only valid class/lifecycle/model/reasoning tuples. It
-never exposes account keys or an invalid cross-product of independent lists.
-
-The offer has a stable digest in `generation`. A caller sends its last digest as
-`known_generation`; `options_changed` is true when catalog or account
-availability changed. The offer reserves no slot. Start and assignment perform
-fresh routing and feed the request through the same resolver before mutation.
-
-Spark is offered only when `codex-usage` reports Spark routing for the target
-account. If Spark becomes unavailable, the next offer omits it and the normal
-default becomes Luna. An explicit unavailable model is not silently accepted:
-the effective selection has `fallback: true` and a stable reason code such as
-`requested_model_unavailable`. Public output includes the replacement model and
-effort so the requester can accept it, choose another offered tuple, or stop.
-
-Authority is not caller-supplied data. An unverified call fails safe to
-Arbeitsbiene authority. A verified principal sees only transitively delegable
-non-leadership classes. No request can elevate its caller into any leadership
-class, including a request by a Teamleiterin for Teamleiterin authority; this
-also forbids promotion to Gottbiene or Koenigin.
+Eine Policy-Allowlist ist keine Autorisierung, Credential-, Provider- oder
+Reservierungsevidenz. Kill-Switch, fehlende oder unfrische Evidenz und nicht
+erfüllte Laufzeitgrenzen bleiben blockierend. Diese Seite dokumentiert keinen
+Rollout, weil die zugehörigen Produktflags derzeit deaktiviert sind.

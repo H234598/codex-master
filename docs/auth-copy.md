@@ -1,159 +1,40 @@
-# Auth Copy
+# The Hive: Authentifizierungsdateien im Pool
 
-`codex-master` treats authentication data as per-Agentin state. The pool spec
-does not contain credentials. For every configured Codex series, it names the
-`codex_usage_account`; on provisioning the canonical source is copied as a
-regular private file:
+## Grenze
 
-```text
-/home/teladi/.local/share/codex-usage/profiles/<ACCOUNT>/codex-home/auth.json
-```
+`auth.json` ist private, pro Agentin gehaltene Laufzeitinformation. Der
+eingecheckte Poolvertrag enthält keine Credentials. Die dort enthaltenen
+Codex-Usage-Account-Kennungen bestimmen nur, aus welchem lokalen Profil der
+Pool-Installer bei einer fehlenden Zieldatei lesen darf; sie belegen weder eine
+vorhandene Anmeldung noch Berechtigung zur Nutzung.
 
-Existing target auth is preserved. A missing profile or auth file blocks the
-provisioning operation with an explicit error; there is no silent cross-account
-fallback.
+Der aktuelle Installer übernimmt eine fehlende Authentifizierungsdatei als
+reguläre private Datei aus dem zugeordneten Profil. Bereits vorhandene
+Zieldateien werden nicht ersetzt. Fehlt das erwartete Profil oder ist eine
+Quelle nicht regulär und ohne Symlink erreichbar, schlägt die Operation fehl.
+Eine aktuelle Verfügbarkeit von Profilen oder Authentifizierungen ist nicht
+Teil dieses Dokuments und daher unbekannt.
 
-Example target files:
+## Explizite Kopie und Aktualisierung
 
-```text
-~/.codex-agents/a1/auth.json
-~/.codex-agents/b1/auth.json
-```
+Die Serveroberfläche enthält `pool copy_auth` und `pool refresh_auth`.
+`copy_auth` prüft Quelle, Zielhomes und Selektor; ohne `--yes` bleibt es eine
+Vorschau. Mit `--yes` ist es eine Credential-Mutation. `refresh_auth` liest
+nur das zur Agentin konfigurierte Profil und verlangt bei einer Ausführung mit
+`--yes` einen gestoppten, nicht verwendeten Zielzustand.
 
-The mapping is stored beside each `series` entry, for example
-`"codex_usage_account": "BW_Work"`.
+Für beide Pfade gilt:
 
-## What The Command Does
+- Quelle und Ziel müssen reguläre Dateien beziehungsweise reale
+  Verzeichnisse ohne Symlink sein.
+- Vorhandene Zielauthentifizierung bleibt ohne ausdrückliches Überschreiben
+  erhalten.
+- Antwortdaten enthalten keinen Credential-Inhalt und keinen lokalen Poolpfad.
+- Symlinks und Hardlinks für `auth.json` sind kein unterstützter
+  Vertrauenspfad.
 
-`pool copy_auth` remains available for an intentional, explicit copy from one
-already provisioned source home into a selected group of
-installed Agentin homes:
-
-```sh
-./bin/codex-master-mcp pool copy_auth \
-  --spec codex-agent-pool.json \
-  --from-agent a1 \
-  --to a-series
-```
-
-That first command is a dry-run. It returns counts only:
-
-```json
-{
-  "dry_run": true,
-  "source_agent": "not_returned",
-  "source_agent_state": "set",
-  "target_selector": "not_returned",
-  "target_selector_state": "set",
-  "target_count": 99,
-  "copyable_count": 99,
-  "copied_count": 0,
-  "skipped_existing_count": 0,
-  "skipped_missing_home_count": 0,
-  "auth_content": "not_returned",
-  "pool_root": "not_returned"
-}
-```
-
-To actually copy, repeat the same command with `--yes`:
-
-```sh
-./bin/codex-master-mcp pool copy_auth \
-  --spec codex-agent-pool.json \
-  --from-agent a1 \
-  --to a-series \
-  --yes
-```
-
-## Selectors
-
-The target selector is resolved through `codex-agent-pool.json`.
-
-Common selectors:
-
-- `a-series`: all A-series Agentinnen
-- `b-series`: all B-series Agentinnen
-- `c-series`: all C-series Agentinnen
-- `all`: every Agentin from the spec
-- `a2`: one concrete Agentin
-
-If the selector includes the source Agentin, the source is skipped. For example,
-`--from-agent a1 --to a-series` copies to `a2..a100`, not back to `a1`.
-
-## Safety Model
-
-The copy path is deliberately conservative:
-
-- `auth.json` must be a regular file, not a symlink
-- the source Agentin home must be a real directory, not a symlink
-- oversized source files are rejected
-- target homes must be real directories, not symlinks
-- existing target auth files are skipped unless `--overwrite` is set
-- target files are written as private files
-- command responses never include auth content
-- command responses never echo the source Agentin id
-- command responses never echo the requested target selector
-- command responses never include local pool paths
-
-This preserves the main data-minimization rule: callers can see what is possible
-and what happened, but they do not receive the credential material.
-
-## Overwrite
-
-By default, existing target auth is left untouched:
-
-```sh
-./bin/codex-master-mcp pool copy_auth \
-  --spec codex-agent-pool.json \
-  --from-agent b1 \
-  --to b-series \
-  --yes
-```
-
-Use `--overwrite` only when replacing existing target auth is intentional:
-
-```sh
-./bin/codex-master-mcp pool copy_auth \
-  --spec codex-agent-pool.json \
-  --from-agent b1 \
-  --to b-series \
-  --yes \
-  --overwrite
-```
-
-## Install-Time Auth Copy
-
-`pool install` performs the configured profile-to-home copy automatically while
-creating or refreshing homes. It can additionally run the old explicit
-home-to-home copy:
-
-```sh
-./bin/codex-master-mcp pool install \
-  --spec codex-agent-pool.json \
-  --target-dir "$HOME/.codex-agents" \
-  --copy-auth-from a1 \
-  --copy-auth-to a-series
-```
-
-That is still dry-run for auth unless `--yes` is present:
-
-```sh
-./bin/codex-master-mcp pool install \
-  --spec codex-agent-pool.json \
-  --target-dir "$HOME/.codex-agents" \
-  --copy-auth-from a1 \
-  --copy-auth-to a-series \
-  --yes
-```
-
-## Why Not Link Auth
-
-Symlinking `auth.json` is not the intended model. It crosses the no-follow trust
-boundary and makes it harder to reason about which Agentin owns which secret.
-
-Hardlinking is also not the intended model. It keeps one shared inode behind
-multiple filenames. If one Agentin updates, rotates, truncates, or corrupts that
-file, every hardlinked Agentin sees the same change.
-
-Auth files are small. Copying them costs little disk space and gives each
-Agentin an independent failure domain.
+Diese Seite ist keine Kopierfreigabe. Der eingecheckte
+`bin/the-hive-mcp`-Einstiegspunkt benötigt ein attestiertes Release-Binding;
+die konfigurierte stabile MCP-Referenz liegt außerhalb des Arbeitsbaums. Eine
+produktive Authentifizierungsänderung benötigt daher ein separat autorisiertes
+Runbook und aktuelle Quellenprüfung.
