@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import ast
 import hashlib
 import os
@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import tempfile
+import threading
 
 import pytest
 
@@ -84,6 +85,9 @@ def _request(
     payload_kind: str = "inline",
     payload_bytes: bytes = b"payload",
 ) -> dict[str, object]:
+    idempotency_hex = (
+        idempotency_suffix * 32 if len(idempotency_suffix) == 1 else idempotency_suffix
+    )
     event_type = "result.proposed" if payload_kind in {"blob", "artifact"} else "assignment.created"
     payload_digest = _digest(payload_bytes)
     reference = f"{payload_kind}:{payload_digest}"
@@ -93,7 +97,7 @@ def _request(
         "schema_version": 1,
         "event_type": event_type,
         "partition": "repo/repo-1/task/task-1",
-        "idempotency_key": "idempotency-v1-" + (idempotency_suffix * 32),
+        "idempotency_key": "idempotency-v1-" + idempotency_hex,
         "producer_principal_id": "producer-principal-v1-0123456789abcdef0123456789abcdef",
         "producer_session_id": "producer-session-v1-0123456789abcdef0123456789abcdef",
         "producer_epoch": 1,
@@ -135,6 +139,53 @@ def _store(root: Path, clock: FakeClock) -> HiveBusStore:
     result = HiveBusStore.initialize(root, clock=clock)
     assert isinstance(result, HiveBusStore)
     return result
+
+
+_GROUP = "consumer-group-1"
+_PARTITION = "repo/repo-1/task/task-1"
+
+
+def _delivery_diagnostic(
+    value: object,
+    code: str,
+    severity: DiagnosticSeverityV2,
+    *,
+    retryable: bool,
+    action: str,
+    retry_after_seconds: int | None = None,
+) -> None:
+    assert isinstance(value, DiagnosticV2)
+    assert value.code == code
+    assert value.severity is severity
+    assert value.retryable is retryable
+    assert value.action == action
+    assert value.retry_after_seconds == retry_after_seconds
+    assert value.fallback_applied is False
+    assert value.requested_choice is None
+    assert value.effective_choice is None
+    assert value.causes == ()
+
+
+def _append_events(store: HiveBusStore, count: int) -> list[object]:
+    events: list[object] = []
+    for sequence in range(1, count + 1):
+        event = store.append(
+            _request(idempotency_suffix=f"{sequence:032x}", producer_seq=sequence),
+            payload_bytes=b"payload",
+        )
+        assert not isinstance(event, DiagnosticV2)
+        events.append(event)
+    return events
+
+
+def _prepared_delivery(
+    store: HiveBusStore, *, manifest: bytes = b"opaque-manifest"
+) -> tuple[str, object]:
+    generation = store.record_manifest_bytes(_GROUP, manifest_bytes=manifest)
+    assert isinstance(generation, str)
+    opened = store.open_cursor_once(_GROUP, _PARTITION, generation)
+    assert opened == 0
+    return generation, store.poll_headers(_GROUP, _PARTITION, generation)
 
 
 @pytest.fixture
@@ -464,6 +515,797 @@ def test_close_checkpoint_warning_is_idempotent(secure_tmp_path: Path) -> None:
     assert store.close() is None
 
 
+def test_b_manifest_cursor_and_public_bounds_are_opaque_and_fail_closed(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "bus-state", FakeClock())
+    try:
+        invalid_manifest = store.record_manifest_bytes(_GROUP, manifest_bytes=b"")
+        _delivery_diagnostic(
+            invalid_manifest,
+            "BUS_E_SCHEMA",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="reject_request",
+        )
+        invalid_group = store.record_manifest_bytes("Bad", manifest_bytes=b"opaque")
+        _delivery_diagnostic(
+            invalid_group,
+            "BUS_E_SCHEMA",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="reject_request",
+        )
+        generation = store.record_manifest_bytes(_GROUP, manifest_bytes=b"opaque")
+        assert generation == _digest(b"opaque")
+        assert store.record_manifest_bytes(_GROUP, manifest_bytes=b"opaque") == generation
+        assert store._connection.execute(  # noqa: SLF001 - opaque byte persistence.
+            "SELECT manifest_bytes,manifest_size_bytes FROM subscription_manifests"
+        ).fetchall() == [(b"opaque", 6)]
+        missing = store.open_cursor_once(_GROUP, _PARTITION, _digest(b"missing"))
+        _delivery_diagnostic(
+            missing,
+            "BUS_E_SUBSCRIPTION_STALE",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="refresh_subscription",
+        )
+        assert store.open_cursor_once(_GROUP, _PARTITION, generation) is None
+        assert store._connection.execute("SELECT COUNT(*) FROM cursors").fetchone() == (0,)  # noqa: SLF001
+        _append_events(store, 1)
+        assert store.open_cursor_once(_GROUP, _PARTITION, generation) == 0
+        alternate = store.record_manifest_bytes(_GROUP, manifest_bytes=b"alternate")
+        assert isinstance(alternate, str)
+        stale = store.open_cursor_once(_GROUP, _PARTITION, alternate)
+        _delivery_diagnostic(
+            stale,
+            "BUS_E_SUBSCRIPTION_STALE",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="refresh_subscription",
+        )
+        assert store._connection.execute(  # noqa: SLF001 - stale opening writes nothing.
+            "SELECT generation,acked_seq FROM cursors"
+        ).fetchall() == [(generation, 0)]
+    finally:
+        assert store.close() is None
+
+
+def test_b_poll_is_header_bounded_and_parallel_lease_persists_only_digest(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        _append_events(store, 33)
+        generation = store.record_manifest_bytes(_GROUP, manifest_bytes=b"opaque")
+        assert isinstance(generation, str)
+        assert store.open_cursor_once(_GROUP, _PARTITION, generation) == 0
+        gate = threading.Barrier(2)
+        results: list[object] = []
+
+        def poll() -> None:
+            gate.wait()
+            results.append(store.poll_headers(_GROUP, _PARTITION, generation))
+
+        first = threading.Thread(target=poll)
+        second = threading.Thread(target=poll)
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+        batches = [value for value in results if hasattr(value, "delivery_token")]
+        active = [value for value in results if isinstance(value, DiagnosticV2)]
+        assert len(batches) == 1
+        assert len(active) == 1
+        batch = batches[0]
+        assert batch.from_seq == 1
+        assert batch.scan_through_seq == 32
+        assert len(batch.headers) == 32
+        assert all(type(header) is bytes and len(header) <= 4096 for header in batch.headers)
+        assert sum(map(len, batch.headers)) <= 65536
+        assert batch.delivery_token.startswith("lease-v1-")
+        persisted = store._connection.execute(  # noqa: SLF001 - bearer never reaches SQLite.
+            "SELECT delivery_token,leased_at_utc,expires_at_utc FROM delivery_leases"
+        ).fetchone()
+        assert persisted is not None
+        assert persisted[0] == _digest(batch.delivery_token.encode("ascii"))
+        assert persisted[0] != batch.delivery_token
+        _delivery_diagnostic(
+            active[0],
+            "BUS_E_DELIVERY_LEASE_ACTIVE",
+            DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            action="retry_delivery",
+            retry_after_seconds=60,
+        )
+    finally:
+        assert store.close() is None
+
+
+def test_b_cursor_cas_effect_idempotence_and_crash_boundary(
+    secure_tmp_path: Path,
+) -> None:
+    root = secure_tmp_path / "bus-state"
+    clock = FakeClock()
+    store = _store(root, clock)
+    try:
+        events = _append_events(store, 1)
+        event = events[0]
+        generation, delivery = _prepared_delivery(store)
+        assert hasattr(delivery, "delivery_token")
+        token = delivery.delivery_token
+        effect_digest = _digest(b"effect-one")
+        stale_generation = store.ack(
+            _GROUP, _PARTITION, _digest(b"other-generation"), token, delivery.scan_through_seq
+        )
+        _delivery_diagnostic(
+            stale_generation,
+            "BUS_E_SUBSCRIPTION_STALE",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="refresh_subscription",
+        )
+        other_bearer = "lease-v1-" + ("A" * 43)
+        if other_bearer == token:
+            other_bearer = "lease-v1-" + ("B" * 43)
+        wrong_bearer = store.ack(
+            _GROUP, _PARTITION, generation, other_bearer, delivery.scan_through_seq
+        )
+        _delivery_diagnostic(
+            wrong_bearer,
+            "BUS_E_DELIVERY_STALE",
+            DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            action="repoll_headers",
+        )
+        missing = store.ack(_GROUP, _PARTITION, generation, token, delivery.scan_through_seq)
+        _delivery_diagnostic(
+            missing,
+            "BUS_E_CURSOR_CONFLICT",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="repoll_headers",
+        )
+        wrong_scan = store.ack(_GROUP, _PARTITION, generation, token, 2)
+        _delivery_diagnostic(
+            wrong_scan,
+            "BUS_E_CURSOR_CONFLICT",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="repoll_headers",
+        )
+        begin = store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            token,
+            event.event_id,
+            effect_digest=effect_digest,
+        )
+        assert begin.state == "apply"
+        assert begin.attempt_count == 0
+        conflict = store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            token,
+            event.event_id,
+            effect_digest=_digest(b"different-effect"),
+        )
+        _delivery_diagnostic(
+            conflict,
+            "BUS_E_EFFECT_CONFLICT",
+            DiagnosticSeverityV2.CRITICAL,
+            retryable=False,
+            action="operator_intervention",
+        )
+        assert store.commit_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            token,
+            event.event_id,
+            effect_digest=effect_digest,
+        ) is None
+        assert store.close() is None
+        reopened = HiveBusStore.initialize(root, clock=clock)
+        assert isinstance(reopened, HiveBusStore)
+        try:
+            replay = reopened.begin_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                token,
+                event.event_id,
+                effect_digest=effect_digest,
+            )
+            assert replay.state == "committed"
+            assert replay.attempt_count == 0
+            assert reopened.ack(
+                _GROUP, _PARTITION, generation, token, delivery.scan_through_seq
+            ) == 1
+            stale = reopened.ack(
+                _GROUP, _PARTITION, generation, token, delivery.scan_through_seq
+            )
+            _delivery_diagnostic(
+                stale,
+                "BUS_E_DELIVERY_STALE",
+                DiagnosticSeverityV2.WARNING,
+                retryable=True,
+                action="repoll_headers",
+            )
+        finally:
+            assert reopened.close() is None
+        store = reopened
+    finally:
+        assert store.close() is None
+
+
+def test_b_backoff_expiry_counting_fifth_dlq_and_nonurgent_ack(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        events = _append_events(store, 1)
+        event = events[0]
+        generation, delivery = _prepared_delivery(store)
+        assert hasattr(delivery, "delivery_token")
+        effect_digest = _digest(b"effect")
+        expected_delays = (5, 15, 60, 300)
+        for expected_count, delay in enumerate(expected_delays, start=1):
+            begin = store.begin_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                event.event_id,
+                effect_digest=effect_digest,
+            )
+            assert begin.state == "apply"
+            assert begin.attempt_count == expected_count - 1
+            backoff = store.fail_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                event.event_id,
+                effect_digest=effect_digest,
+                error_code="BUS_E_SCHEMA",
+                error_fingerprint=_digest(f"failure-{expected_count}".encode()),
+            )
+            _delivery_diagnostic(
+                backoff,
+                "BUS_E_DELIVERY_BACKOFF",
+                DiagnosticSeverityV2.WARNING,
+                retryable=True,
+                action="retry_delivery",
+                retry_after_seconds=delay,
+            )
+            before = store.poll_headers(_GROUP, _PARTITION, generation)
+            _delivery_diagnostic(
+                before,
+                "BUS_E_DELIVERY_BACKOFF",
+                DiagnosticSeverityV2.WARNING,
+                retryable=True,
+                action="retry_delivery",
+                retry_after_seconds=delay,
+            )
+            clock.now += timedelta(seconds=delay)
+            delivery = store.poll_headers(_GROUP, _PARTITION, generation)
+            assert hasattr(delivery, "delivery_token")
+        begin = store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            event.event_id,
+            effect_digest=effect_digest,
+        )
+        assert begin.state == "apply"
+        assert begin.attempt_count == 4
+        poison = store.fail_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            event.event_id,
+            effect_digest=effect_digest,
+            error_code="BUS_E_SCHEMA",
+            error_fingerprint=_digest(b"failure-5"),
+        )
+        _delivery_diagnostic(
+            poison,
+            "BUS_E_POISON",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="inspect_dead_letter",
+        )
+        assert store._connection.execute(  # noqa: SLF001 - fifth failure is atomic evidence.
+            "SELECT state,attempt_count FROM consumer_effects"
+        ).fetchall() == [("dead_lettered", 5)]
+        assert store._connection.execute(  # noqa: SLF001 - fifth failure is atomic evidence.
+            "SELECT attempt_count,error_code FROM dead_letters"
+        ).fetchall() == [(5, "BUS_E_SCHEMA")]
+        assert store.ack(
+            _GROUP, _PARTITION, generation, delivery.delivery_token, delivery.scan_through_seq
+        ) == 1
+    finally:
+        assert store.close() is None
+
+
+def test_b_fifth_pending_lease_expiry_persists_dlq_and_returns_poison(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        event = _append_events(store, 1)[0]
+        generation, delivery = _prepared_delivery(store)
+        assert hasattr(delivery, "delivery_token")
+        effect_digest = _digest(b"fifth-expiry-effect")
+        for count, delay in enumerate((5, 15, 60, 300), start=1):
+            assert store.begin_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                event.event_id,
+                effect_digest=effect_digest,
+            ).state == "apply"
+            _delivery_diagnostic(
+                store.fail_effect(
+                    _GROUP,
+                    _PARTITION,
+                    generation,
+                    delivery.delivery_token,
+                    event.event_id,
+                    effect_digest=effect_digest,
+                    error_code="BUS_E_SCHEMA",
+                    error_fingerprint=_digest(f"fifth-expiry-{count}".encode()),
+                ),
+                "BUS_E_DELIVERY_BACKOFF",
+                DiagnosticSeverityV2.WARNING,
+                retryable=True,
+                action="retry_delivery",
+                retry_after_seconds=delay,
+            )
+            clock.now += timedelta(seconds=delay)
+            delivery = store.poll_headers(_GROUP, _PARTITION, generation)
+            assert hasattr(delivery, "delivery_token")
+        assert store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            event.event_id,
+            effect_digest=effect_digest,
+        ).attempt_count == 4
+        clock.now += timedelta(seconds=60)
+
+        terminal = store.poll_headers(_GROUP, _PARTITION, generation)
+
+        _delivery_diagnostic(
+            terminal,
+            "BUS_E_POISON",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="inspect_dead_letter",
+        )
+        assert store._connection.execute(  # noqa: SLF001 - terminal expiry is durable.
+            "SELECT state,attempt_count,last_error_code FROM consumer_effects"
+        ).fetchone() == ("dead_lettered", 5, "BUS_E_DELIVERY_STALE")
+        assert store._connection.execute(  # noqa: SLF001 - terminal expiry is durable.
+            "SELECT attempt_count,error_code,error_fingerprint FROM dead_letters"
+        ).fetchone() == (
+            5,
+            "BUS_E_DELIVERY_STALE",
+            _digest(b"delivery_lease_expired_v1"),
+        )
+        assert store._connection.execute("SELECT COUNT(*) FROM delivery_leases").fetchone() == (0,)  # noqa: SLF001
+    finally:
+        assert store.close() is None
+
+
+def test_b_poll_leases_committed_prefix_before_later_effect_backoff(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        first_event, second_event = _append_events(store, 2)
+        generation, initial = _prepared_delivery(store)
+        assert hasattr(initial, "delivery_token")
+        assert initial.scan_through_seq == 2
+        first_digest = _digest(b"prefix-first")
+        second_digest = _digest(b"prefix-second")
+        assert store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            initial.delivery_token,
+            first_event.event_id,
+            effect_digest=first_digest,
+        ).state == "apply"
+        assert store.commit_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            initial.delivery_token,
+            first_event.event_id,
+            effect_digest=first_digest,
+        ) is None
+        assert store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            initial.delivery_token,
+            second_event.event_id,
+            effect_digest=second_digest,
+        ).state == "apply"
+        _delivery_diagnostic(
+            store.fail_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                initial.delivery_token,
+                second_event.event_id,
+                effect_digest=second_digest,
+                error_code="BUS_E_SCHEMA",
+                error_fingerprint=_digest(b"prefix-failure"),
+            ),
+            "BUS_E_DELIVERY_BACKOFF",
+            DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            action="retry_delivery",
+            retry_after_seconds=5,
+        )
+
+        prefix = store.poll_headers(_GROUP, _PARTITION, generation)
+
+        assert hasattr(prefix, "delivery_token")
+        assert (prefix.from_seq, prefix.scan_through_seq, len(prefix.headers)) == (1, 1, 1)
+        assert store.ack(
+            _GROUP, _PARTITION, generation, prefix.delivery_token, prefix.scan_through_seq
+        ) == 1
+        blocked = store.poll_headers(_GROUP, _PARTITION, generation)
+        _delivery_diagnostic(
+            blocked,
+            "BUS_E_DELIVERY_BACKOFF",
+            DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            action="retry_delivery",
+            retry_after_seconds=5,
+        )
+        assert store._connection.execute("SELECT COUNT(*) FROM delivery_leases").fetchone() == (0,)  # noqa: SLF001
+    finally:
+        assert store.close() is None
+
+
+def test_b_begin_effect_serializes_pending_attempts_within_a_lease(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        first_event, second_event = _append_events(store, 2)
+        generation, initial = _prepared_delivery(store)
+        assert hasattr(initial, "delivery_token")
+        first_digest = _digest(b"serialized-first")
+        second_digest = _digest(b"serialized-second")
+        assert store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            initial.delivery_token,
+            first_event.event_id,
+            effect_digest=first_digest,
+        ).state == "apply"
+        blocked_peer = store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            initial.delivery_token,
+            second_event.event_id,
+            effect_digest=second_digest,
+        )
+        _delivery_diagnostic(
+            blocked_peer,
+            "BUS_E_CURSOR_CONFLICT",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="repoll_headers",
+        )
+        assert store._connection.execute(  # noqa: SLF001 - peer start made no journal row.
+            "SELECT event_id,attempt_count FROM consumer_effects"
+        ).fetchall() == [(first_event.event_id, 0)]
+        _delivery_diagnostic(
+            store.fail_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                initial.delivery_token,
+                first_event.event_id,
+                effect_digest=first_digest,
+                error_code="BUS_E_SCHEMA",
+                error_fingerprint=_digest(b"serialized-failure"),
+            ),
+            "BUS_E_DELIVERY_BACKOFF",
+            DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            action="retry_delivery",
+            retry_after_seconds=5,
+        )
+        _delivery_diagnostic(
+            store.poll_headers(_GROUP, _PARTITION, generation),
+            "BUS_E_DELIVERY_BACKOFF",
+            DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            action="retry_delivery",
+            retry_after_seconds=5,
+        )
+        clock.now += timedelta(seconds=5)
+        retry = store.poll_headers(_GROUP, _PARTITION, generation)
+        assert hasattr(retry, "delivery_token")
+        replay = store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            retry.delivery_token,
+            first_event.event_id,
+            effect_digest=first_digest,
+        )
+        assert (replay.state, replay.attempt_count) == ("apply", 1)
+        assert store._connection.execute(  # noqa: SLF001 - peer never became uncounted pending.
+            "SELECT COUNT(*) FROM consumer_effects WHERE event_id=?", (second_event.event_id,)
+        ).fetchone() == (0,)
+    finally:
+        assert store.close() is None
+
+
+def test_b_begin_effect_rejects_duplicate_live_bearer_without_reauthorizing(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        event = _append_events(store, 1)[0]
+        generation, delivery = _prepared_delivery(store)
+        assert hasattr(delivery, "delivery_token")
+        effect_digest = _digest(b"duplicate-live-bearer")
+        first = store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            event.event_id,
+            effect_digest=effect_digest,
+        )
+        assert (first.state, first.attempt_count) == ("apply", 0)
+        before = store._connection.execute(  # noqa: SLF001 - duplicate begin must not mutate.
+            "SELECT state,attempt_count,lease_token FROM consumer_effects"
+        ).fetchone()
+
+        duplicate = store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            event.event_id,
+            effect_digest=effect_digest,
+        )
+
+        _delivery_diagnostic(
+            duplicate,
+            "BUS_E_CURSOR_CONFLICT",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="repoll_headers",
+        )
+        assert store._connection.execute(  # noqa: SLF001 - duplicate begin must not mutate.
+            "SELECT state,attempt_count,lease_token FROM consumer_effects"
+        ).fetchone() == before
+        _delivery_diagnostic(
+            store.fail_effect(
+                _GROUP,
+                _PARTITION,
+                generation,
+                delivery.delivery_token,
+                event.event_id,
+                effect_digest=effect_digest,
+                error_code="BUS_E_SCHEMA",
+                error_fingerprint=_digest(b"duplicate-live-bearer-failure"),
+            ),
+            "BUS_E_DELIVERY_BACKOFF",
+            DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            action="retry_delivery",
+            retry_after_seconds=5,
+        )
+        clock.now += timedelta(seconds=5)
+        retry = store.poll_headers(_GROUP, _PARTITION, generation)
+        assert hasattr(retry, "delivery_token")
+        resumed = store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            retry.delivery_token,
+            event.event_id,
+            effect_digest=effect_digest,
+        )
+        assert (resumed.state, resumed.attempt_count) == ("apply", 1)
+    finally:
+        assert store.close() is None
+
+
+def test_b_expired_pending_effect_counts_once_and_old_bearer_cannot_ack(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        events = _append_events(store, 1)
+        event = events[0]
+        generation, delivery = _prepared_delivery(store)
+        assert hasattr(delivery, "delivery_token")
+        assert store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            event.event_id,
+            effect_digest=_digest(b"pending-expiry"),
+        ).state == "apply"
+        clock.now += timedelta(seconds=60)
+        materialized = store.poll_headers(_GROUP, _PARTITION, generation)
+        _delivery_diagnostic(
+            materialized,
+            "BUS_E_DELIVERY_BACKOFF",
+            DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            action="retry_delivery",
+            retry_after_seconds=5,
+        )
+        stale = store.ack(
+            _GROUP,
+            _PARTITION,
+            generation,
+            delivery.delivery_token,
+            delivery.scan_through_seq,
+        )
+        _delivery_diagnostic(
+            stale,
+            "BUS_E_DELIVERY_STALE",
+            DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            action="repoll_headers",
+        )
+        assert store._connection.execute(  # noqa: SLF001 - one expiry creates one failure.
+            "SELECT state,attempt_count,retry_not_before_utc FROM consumer_effects"
+        ).fetchone() == ("pending", 1, "2026-09-15T10:12:17.345Z")
+        assert store._connection.execute("SELECT acked_seq FROM cursors").fetchone() == (0,)  # noqa: SLF001
+        clock.now += timedelta(seconds=5)
+        retry = store.poll_headers(_GROUP, _PARTITION, generation)
+        assert hasattr(retry, "delivery_token")
+        replay = store.begin_effect(
+            _GROUP,
+            _PARTITION,
+            generation,
+            retry.delivery_token,
+            event.event_id,
+            effect_digest=_digest(b"pending-expiry"),
+        )
+        assert (replay.state, replay.attempt_count) == ("apply", 1)
+    finally:
+        assert store.close() is None
+
+
+@pytest.mark.parametrize("event_type", ("assignment.cancelled", "artifact.archived"))
+def test_b_lease_expiry_counts_only_pending_and_poison_blocks_static_ack(
+    secure_tmp_path: Path,
+    event_type: str,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        if event_type == "artifact.archived":
+            request = _request(payload_kind="artifact") | {
+                "event_type": event_type,
+                "partition": "repo/repo-1/artifact/artifact-1",
+                "workpackage_id": None,
+                "retention_class": "audit",
+            }
+            event = store.append(request, payload_bytes=None)
+        else:
+            request = _request() | {"event_type": event_type}
+            event = store.append(request, payload_bytes=b"payload")
+        assert not isinstance(event, DiagnosticV2)
+        partition = event.partition
+        generation = store.record_manifest_bytes(_GROUP, manifest_bytes=b"opaque-manifest")
+        assert isinstance(generation, str)
+        assert store.open_cursor_once(_GROUP, partition, generation) == 0
+        untouched = store.poll_headers(_GROUP, partition, generation)
+        assert hasattr(untouched, "delivery_token")
+        clock.now += timedelta(seconds=60)
+        replacement = store.poll_headers(_GROUP, partition, generation)
+        assert hasattr(replacement, "delivery_token")
+        first = store.begin_effect(
+            _GROUP,
+            partition,
+            generation,
+            replacement.delivery_token,
+            event.event_id,
+            effect_digest=_digest(b"urgent-effect"),
+        )
+        assert first.state == "apply"
+        for count, delay in enumerate((5, 15, 60, 300), start=1):
+            result = store.fail_effect(
+                _GROUP,
+                partition,
+                generation,
+                replacement.delivery_token,
+                event.event_id,
+                effect_digest=_digest(b"urgent-effect"),
+                error_code="BUS_E_SCHEMA",
+                error_fingerprint=_digest(f"urgent-{count}".encode()),
+            )
+            _delivery_diagnostic(
+                result,
+                "BUS_E_DELIVERY_BACKOFF",
+                DiagnosticSeverityV2.WARNING,
+                retryable=True,
+                action="retry_delivery",
+                retry_after_seconds=delay,
+            )
+            clock.now += timedelta(seconds=delay)
+            replacement = store.poll_headers(_GROUP, partition, generation)
+            assert hasattr(replacement, "delivery_token")
+            begun = store.begin_effect(
+                _GROUP,
+                partition,
+                generation,
+                replacement.delivery_token,
+                event.event_id,
+                effect_digest=_digest(b"urgent-effect"),
+            )
+            assert begun.state == "apply"
+        poison = store.fail_effect(
+            _GROUP,
+            partition,
+            generation,
+            replacement.delivery_token,
+            event.event_id,
+            effect_digest=_digest(b"urgent-effect"),
+            error_code="BUS_E_SCHEMA",
+            error_fingerprint=_digest(b"urgent-5"),
+        )
+        _delivery_diagnostic(
+            poison,
+            "BUS_E_POISON",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="inspect_dead_letter",
+        )
+        blocked = store.ack(
+            _GROUP,
+            partition,
+            generation,
+            replacement.delivery_token,
+            replacement.scan_through_seq,
+        )
+        _delivery_diagnostic(
+            blocked,
+            "BUS_E_POISON",
+            DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            action="inspect_dead_letter",
+        )
+        assert store._connection.execute("SELECT acked_seq FROM cursors").fetchone() == (0,)  # noqa: SLF001
+    finally:
+        assert store.close() is None
+
+
 def test_every_store_diagnostic_call_is_direct_and_uses_d135_literals() -> None:
     source = Path("src/the_hive/hive/bus_store.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -482,6 +1324,13 @@ def test_every_store_diagnostic_call_is_direct_and_uses_d135_literals() -> None:
         "BUS_E_STORE_SCHEMA_UNKNOWN": ("CRITICAL", False, "operator_intervention"),
         "BUS_E_STORE_INTEGRITY": ("CRITICAL", False, "operator_intervention"),
         "BUS_E_PARTITION_SEQ_CONFLICT": ("CRITICAL", False, "operator_intervention"),
+        "BUS_E_CURSOR_CONFLICT": ("ERROR", False, "repoll_headers"),
+        "BUS_E_SUBSCRIPTION_STALE": ("ERROR", False, "refresh_subscription"),
+        "BUS_E_DELIVERY_LEASE_ACTIVE": ("WARNING", True, "retry_delivery"),
+        "BUS_E_DELIVERY_STALE": ("WARNING", True, "repoll_headers"),
+        "BUS_E_DELIVERY_BACKOFF": ("WARNING", True, "retry_delivery"),
+        "BUS_E_POISON": ("ERROR", False, "inspect_dead_letter"),
+        "BUS_E_EFFECT_CONFLICT": ("CRITICAL", False, "operator_intervention"),
         "BUS_E_SCHEMA": {
             ("ERROR", False, "reject_publish"),
             ("ERROR", False, "reject_request"),
@@ -519,7 +1368,6 @@ def test_every_store_diagnostic_call_is_direct_and_uses_d135_literals() -> None:
         action = keywords["action"].value
         assert (severity, retryable, action) in expected_values
         for name, value in (
-            ("retry_after_seconds", None),
             ("fallback_applied", False),
             ("requested_choice", None),
             ("effective_choice", None),
@@ -527,6 +1375,12 @@ def test_every_store_diagnostic_call_is_direct_and_uses_d135_literals() -> None:
             literal = keywords[name]
             assert isinstance(literal, ast.Constant)
             assert literal.value == value
+        retry_after = keywords["retry_after_seconds"]
+        if code in {"BUS_E_DELIVERY_LEASE_ACTIVE", "BUS_E_DELIVERY_BACKOFF"}:
+            assert not isinstance(retry_after, ast.Constant)
+        else:
+            assert isinstance(retry_after, ast.Constant)
+            assert retry_after.value is None
         causes = keywords["causes"]
         assert isinstance(causes, ast.Tuple)
         assert causes.elts == []

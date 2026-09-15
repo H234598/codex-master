@@ -3,19 +3,28 @@
 from __future__ import annotations
 
 import ctypes
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
+import math
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import stat
 from threading import RLock
-from typing import Final
+from typing import Final, Literal
 
-from the_hive.diagnostics import DiagnosticSeverityV2, DiagnosticV2, diagnostic_for
+from the_hive.diagnostics import (
+    DIAGNOSTIC_CODE_SPECS_V2,
+    DiagnosticSeverityV2,
+    DiagnosticV2,
+    diagnostic_for,
+)
 from the_hive.hive.bus_types import (
+    EVENT_TYPE_MATRIX,
     HiveBusContractError,
     HiveBusEventV1,
     MAX_PAYLOAD_BYTES,
@@ -23,8 +32,9 @@ from the_hive.hive.bus_types import (
     create_hive_bus_event_v1,
     event_id_for_publish_request,
     serialize_hive_bus_event_v1,
+    validate_topic_partition,
 )
-from the_hive.hive.types import Clock
+from the_hive.hive.types import Clock, HiveValidationError, validate_identifier
 
 
 _DATABASE_NAME: Final = "bus_store.sqlite3"
@@ -33,6 +43,31 @@ _SCHEMA_NAME: Final = "hive_bus_store"
 _GENERATION: Final = 1
 _MAX_HEADER_BYTES: Final = 4096
 _EVENT_ID_RE: Final = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+_LEASE_TOKEN_RE: Final = re.compile(r"lease-v1-[A-Za-z0-9_-]{43}\Z", re.ASCII)
+_MAX_DELIVERY_HEADERS: Final = 32
+_MAX_DELIVERY_HEADER_BYTES: Final = 65536
+_LEASE_SECONDS: Final = 60
+_MAX_SIGNED_SQLITE_INTEGER: Final = (2**63) - 1
+_BACKOFF_SECONDS: Final = (5, 15, 60, 300, 900)
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryBatchV1:
+    """One bounded, header-only bearer delivery returned by BUS-S1/B."""
+
+    delivery_token: str
+    generation: str
+    from_seq: int
+    scan_through_seq: int
+    headers: tuple[bytes, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EffectBeginResultV1:
+    """The closed durable-effect permission state for one delivered event."""
+
+    state: Literal["apply", "committed", "dead_lettered"]
+    attempt_count: int
 
 _TABLE_DDL: Final = (
     "CREATE TABLE bus_store_meta (schema_name TEXT PRIMARY KEY CHECK(schema_name='hive_bus_store'),generation INTEGER NOT NULL CHECK(generation>=1),schema_digest TEXT NOT NULL UNIQUE,created_at_utc TEXT NOT NULL)",
@@ -102,15 +137,34 @@ _FSTATFS.argtypes = [ctypes.c_int, ctypes.POINTER(_LinuxStatFs)]
 _FSTATFS.restype = ctypes.c_int
 
 
-def _utc_now(clock: Clock) -> str:
+def _utc_datetime(clock: Clock) -> datetime:
     value = clock.wall_time_utc()
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ValueError
-    utc = value.astimezone(timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _format_utc(utc: datetime) -> str:
     result = utc.strftime("%Y-%m-%dT%H:%M:%S")
     if utc.microsecond:
         result += "." + f"{utc.microsecond:06d}".rstrip("0")
     return result + "Z"
+
+
+def _utc_now(clock: Clock) -> str:
+    return _format_utc(_utc_datetime(clock))
+
+
+def _stored_utc(value: object) -> datetime:
+    if type(value) is not str or not value.endswith("Z"):
+        raise ValueError
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        raise ValueError from None
+    if parsed.tzinfo is None or _format_utc(parsed.astimezone(timezone.utc)) != value:
+        raise ValueError
+    return parsed.astimezone(timezone.utc)
 
 
 def _identity(info: os.stat_result) -> tuple[int, int]:
@@ -794,6 +848,375 @@ class HiveBusStore:
                 )
             return None
 
+    @staticmethod
+    def _schema_error() -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_SCHEMA",
+            severity=DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            retry_after_seconds=None,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="reject_request",
+            causes=(),
+        )
+
+    @staticmethod
+    def _subscription_stale() -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_SUBSCRIPTION_STALE",
+            severity=DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            retry_after_seconds=None,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="refresh_subscription",
+            causes=(),
+        )
+
+    @staticmethod
+    def _cursor_conflict() -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_CURSOR_CONFLICT",
+            severity=DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            retry_after_seconds=None,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="repoll_headers",
+            causes=(),
+        )
+
+    @staticmethod
+    def _delivery_stale() -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_DELIVERY_STALE",
+            severity=DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            retry_after_seconds=None,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="repoll_headers",
+            causes=(),
+        )
+
+    @staticmethod
+    def _poison() -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_POISON",
+            severity=DiagnosticSeverityV2.ERROR,
+            retryable=False,
+            retry_after_seconds=None,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="inspect_dead_letter",
+            causes=(),
+        )
+
+    @staticmethod
+    def _effect_conflict() -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_EFFECT_CONFLICT",
+            severity=DiagnosticSeverityV2.CRITICAL,
+            retryable=False,
+            retry_after_seconds=None,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="operator_intervention",
+            causes=(),
+        )
+
+    @staticmethod
+    def _delivery_active(retry_after_seconds: int) -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_DELIVERY_LEASE_ACTIVE",
+            severity=DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            retry_after_seconds=retry_after_seconds,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="retry_delivery",
+            causes=(),
+        )
+
+    @staticmethod
+    def _delivery_backoff(retry_after_seconds: int) -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_DELIVERY_BACKOFF",
+            severity=DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            retry_after_seconds=retry_after_seconds,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="retry_delivery",
+            causes=(),
+        )
+
+    @staticmethod
+    def _store_integrity() -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_STORE_INTEGRITY",
+            severity=DiagnosticSeverityV2.CRITICAL,
+            retryable=False,
+            retry_after_seconds=None,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="operator_intervention",
+            causes=(),
+        )
+
+    @staticmethod
+    def _store_busy() -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_STORE_BUSY",
+            severity=DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            retry_after_seconds=None,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="retry_operation",
+            causes=(),
+        )
+
+    @staticmethod
+    def _validate_group_partition_generation(
+        consumer_group_id: object, partition: object, generation: object
+    ) -> tuple[str, str, str]:
+        group = validate_identifier(consumer_group_id, field="consumer_group_id")
+        checked_partition = validate_topic_partition(partition)
+        if type(generation) is not str or _EVENT_ID_RE.fullmatch(generation) is None:
+            raise ValueError
+        return group, checked_partition, generation
+
+    @staticmethod
+    def _validate_digest(value: object) -> str:
+        if type(value) is not str or _EVENT_ID_RE.fullmatch(value) is None:
+            raise ValueError
+        return value
+
+    @staticmethod
+    def _validate_delivery_token(value: object) -> str:
+        if type(value) is not str or _LEASE_TOKEN_RE.fullmatch(value) is None:
+            raise ValueError
+        return value
+
+    @staticmethod
+    def _validate_error_code(value: object) -> str:
+        if (
+            type(value) is not str
+            or not value.isascii()
+            or len(value) > 128
+            or not value.startswith("BUS_E_")
+            or value == "BUS_E_POISON"
+            or value not in DIAGNOSTIC_CODE_SPECS_V2
+        ):
+            raise ValueError
+        return value
+
+    @staticmethod
+    def _remaining_seconds(until: datetime, now: datetime, *, maximum: int) -> int:
+        seconds = math.ceil((until - now).total_seconds())
+        if not 1 <= seconds <= maximum:
+            raise ValueError
+        return seconds
+
+    def _valid_current_lease(
+        self,
+        group: str,
+        partition: str,
+        generation: str,
+        token_digest: str,
+        now: datetime,
+    ) -> tuple[int, int, datetime] | None:
+        row = self._connection.execute(
+            "SELECT generation,delivery_token,from_seq,scan_through_seq,expires_at_utc "
+            "FROM delivery_leases WHERE consumer_group_id=? AND partition=?",
+            (group, partition),
+        ).fetchone()
+        if row is None:
+            return None
+        lease_generation, persisted_digest, from_seq, scan_through_seq, expires_at = row
+        expiry = _stored_utc(expires_at)
+        if (
+            lease_generation != generation
+            or persisted_digest != token_digest
+            or type(from_seq) is not int
+            or type(scan_through_seq) is not int
+            or not 1 <= from_seq <= scan_through_seq
+            or now >= expiry
+        ):
+            return None
+        return from_seq, scan_through_seq, expiry
+
+    def _cursor_generation_matches(
+        self, group: str, partition: str, generation: str
+    ) -> tuple[int, ...] | None:
+        row = self._connection.execute(
+            "SELECT acked_seq FROM cursors WHERE consumer_group_id=? AND partition=? AND generation=?",
+            (group, partition, generation),
+        ).fetchone()
+        if row is None or type(row[0]) is not int or row[0] < 0:
+            return None
+        return row
+
+    def _event_in_lease(
+        self,
+        group: str,
+        partition: str,
+        event_id: str,
+        from_seq: int,
+        scan_through_seq: int,
+    ) -> tuple[int, str] | None:
+        row = self._connection.execute(
+            "SELECT partition_seq,event_type FROM events WHERE event_id=? AND partition=?",
+            (event_id, partition),
+        ).fetchone()
+        if (
+            row is None
+            or type(row[0]) is not int
+            or type(row[1]) is not str
+            or not from_seq <= row[0] <= scan_through_seq
+        ):
+            return None
+        return row
+
+    def _earlier_lease_effects_are_settled(
+        self,
+        group: str,
+        partition: str,
+        generation: str,
+        from_seq: int,
+        event_seq: int,
+    ) -> bool:
+        """Require serial application within one bearer range without policy lookup."""
+
+        rows = self._connection.execute(
+            "SELECT events.event_type,consumer_effects.state,consumer_effects.attempt_count "
+            "FROM events LEFT JOIN consumer_effects ON "
+            "consumer_effects.consumer_group_id=? AND consumer_effects.event_id=events.event_id "
+            "AND consumer_effects.generation=? "
+            "WHERE events.partition=? AND events.partition_seq BETWEEN ? AND ? "
+            "ORDER BY events.partition_seq",
+            (group, generation, partition, from_seq, event_seq - 1),
+        ).fetchall()
+        if len(rows) != event_seq - from_seq:
+            raise ValueError
+        for event_type, state, attempt_count in rows:
+            if type(event_type) is not str or event_type not in EVENT_TYPE_MATRIX:
+                raise ValueError
+            if state == "committed":
+                continue
+            if (
+                state == "dead_lettered"
+                and attempt_count == 5
+                and not EVENT_TYPE_MATRIX[event_type].urgent
+                and event_type != "artifact.archived"
+            ):
+                continue
+            return False
+        return True
+
+    def _materialize_expired_lease(
+        self,
+        group: str,
+        partition: str,
+        token_digest: str,
+        now: datetime,
+    ) -> bool:
+        """Close only persisted pending attempts for one expired bearer lease."""
+
+        now_text = _format_utc(now)
+        terminal_poisoned = False
+        pending = self._connection.execute(
+            "SELECT event_id,attempt_count FROM consumer_effects "
+            "WHERE consumer_group_id=? AND partition=? AND state='pending' AND lease_token=?",
+            (group, partition, token_digest),
+        ).fetchall()
+        for event_id, attempt_count in pending:
+            if type(event_id) is not str or type(attempt_count) is not int or not 0 <= attempt_count < 5:
+                raise ValueError
+            next_attempt = attempt_count + 1
+            if next_attempt < 5:
+                retry_at = _format_utc(now + timedelta(seconds=_BACKOFF_SECONDS[next_attempt - 1]))
+                changed = self._connection.execute(
+                    "UPDATE consumer_effects SET attempt_count=?,retry_not_before_utc=?,"
+                    "lease_token=NULL,lease_expires_at_utc=NULL,last_error_code=?,updated_at_utc=? "
+                    "WHERE consumer_group_id=? AND event_id=? AND state='pending' AND lease_token=? AND attempt_count=?",
+                    (
+                        next_attempt,
+                        retry_at,
+                        "BUS_E_DELIVERY_STALE",
+                        now_text,
+                        group,
+                        event_id,
+                        token_digest,
+                        attempt_count,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise sqlite3.DatabaseError
+                continue
+            changed = self._connection.execute(
+                "UPDATE consumer_effects SET state='dead_lettered',attempt_count=5,"
+                "retry_not_before_utc=NULL,lease_token=NULL,lease_expires_at_utc=NULL,"
+                "last_error_code=?,updated_at_utc=? WHERE consumer_group_id=? AND event_id=? "
+                "AND state='pending' AND lease_token=? AND attempt_count=?",
+                (
+                    "BUS_E_DELIVERY_STALE",
+                    now_text,
+                    group,
+                    event_id,
+                    token_digest,
+                    attempt_count,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise sqlite3.DatabaseError
+            effect = self._connection.execute(
+                "SELECT partition,partition_seq,generation FROM consumer_effects "
+                "WHERE consumer_group_id=? AND event_id=?",
+                (group, event_id),
+            ).fetchone()
+            if (
+                effect is None
+                or type(effect[0]) is not str
+                or type(effect[1]) is not int
+                or type(effect[2]) is not str
+            ):
+                raise ValueError
+            self._connection.execute(
+                "INSERT INTO dead_letters(consumer_group_id,event_id,partition,partition_seq,"
+                "generation,attempt_count,error_code,error_fingerprint,created_at_utc) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    group,
+                    event_id,
+                    effect[0],
+                    effect[1],
+                    effect[2],
+                    5,
+                    "BUS_E_DELIVERY_STALE",
+                    _digest(b"delivery_lease_expired_v1"),
+                    now_text,
+                ),
+            )
+            terminal_poisoned = True
+        self._connection.execute(
+            "DELETE FROM delivery_leases WHERE consumer_group_id=? AND partition=? AND delivery_token=?",
+            (group, partition, token_digest),
+        )
+        return terminal_poisoned
+
     def append(
         self, request: object, *, payload_bytes: bytes | None
     ) -> HiveBusEventV1 | DiagnosticV2:
@@ -1155,6 +1578,728 @@ class HiveBusStore:
                     action="operator_intervention",
                     causes=(),
                 )
+
+    def record_manifest_bytes(
+        self, consumer_group_id: str, *, manifest_bytes: bytes
+    ) -> str | DiagnosticV2:
+        """Persist one opaque manifest generation without interpreting subscription policy."""
+
+        with self._lock:
+            unusable = self._usable()
+            if unusable is not None:
+                return unusable
+            try:
+                group = validate_identifier(consumer_group_id, field="consumer_group_id")
+                if type(manifest_bytes) is not bytes or not 1 <= len(manifest_bytes) <= 65536:
+                    raise ValueError
+                generation = _digest(manifest_bytes)
+            except (HiveValidationError, ValueError):
+                return self._schema_error()
+            try:
+                now = _utc_now(self._clock)
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._connection.execute(
+                    "INSERT INTO subscription_manifests(consumer_group_id,generation,manifest_bytes,"
+                    "manifest_size_bytes,created_at_utc) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(consumer_group_id,generation) DO NOTHING",
+                    (group, generation, manifest_bytes, len(manifest_bytes), now),
+                )
+                persisted = self._connection.execute(
+                    "SELECT manifest_bytes,manifest_size_bytes FROM subscription_manifests "
+                    "WHERE consumer_group_id=? AND generation=?",
+                    (group, generation),
+                ).fetchone()
+                if persisted != (manifest_bytes, len(manifest_bytes)):
+                    raise ValueError
+                self._connection.execute("COMMIT")
+                return generation
+            except sqlite3.OperationalError as exc:
+                self._rollback(self._connection)
+                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+            except (ValueError, sqlite3.DatabaseError):
+                self._rollback(self._connection)
+                return self._store_integrity()
+
+    def open_cursor_once(
+        self, consumer_group_id: str, partition: str, generation: str
+    ) -> int | None | DiagnosticV2:
+        """Create only a zero cursor for one existing opaque generation and live partition."""
+
+        with self._lock:
+            unusable = self._usable()
+            if unusable is not None:
+                return unusable
+            try:
+                group, checked_partition, checked_generation = self._validate_group_partition_generation(
+                    consumer_group_id, partition, generation
+                )
+            except (HiveBusContractError, HiveValidationError, ValueError):
+                return self._schema_error()
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                manifest = self._connection.execute(
+                    "SELECT 1 FROM subscription_manifests WHERE consumer_group_id=? AND generation=?",
+                    (group, checked_generation),
+                ).fetchone()
+                if manifest is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._subscription_stale()
+                partition_row = self._connection.execute(
+                    "SELECT 1 FROM partitions WHERE partition=?", (checked_partition,)
+                ).fetchone()
+                if partition_row is None:
+                    self._connection.execute("ROLLBACK")
+                    return None
+                cursor = self._connection.execute(
+                    "SELECT generation,acked_seq FROM cursors WHERE consumer_group_id=? AND partition=?",
+                    (group, checked_partition),
+                ).fetchone()
+                if cursor is not None:
+                    if cursor[0] != checked_generation or type(cursor[1]) is not int or cursor[1] < 0:
+                        self._connection.execute("ROLLBACK")
+                        return self._subscription_stale()
+                    self._connection.execute("ROLLBACK")
+                    return cursor[1]
+                now = _utc_now(self._clock)
+                self._connection.execute(
+                    "INSERT INTO cursors(consumer_group_id,partition,generation,acked_seq,gap_snapshot_id,"
+                    "gap_from_seq,gap_through_seq,updated_at_utc) VALUES(?,?,?,?,?,?,?,?)",
+                    (group, checked_partition, checked_generation, 0, None, None, None, now),
+                )
+                self._connection.execute("COMMIT")
+                return 0
+            except sqlite3.OperationalError as exc:
+                self._rollback(self._connection)
+                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+            except (ValueError, sqlite3.DatabaseError):
+                self._rollback(self._connection)
+                return self._store_integrity()
+
+    def poll_headers(
+        self, consumer_group_id: str, partition: str, generation: str
+    ) -> DeliveryBatchV1 | None | DiagnosticV2:
+        """Lease the next bounded contiguous canonical headers, never payload bytes."""
+
+        with self._lock:
+            unusable = self._usable()
+            if unusable is not None:
+                return unusable
+            try:
+                group, checked_partition, checked_generation = self._validate_group_partition_generation(
+                    consumer_group_id, partition, generation
+                )
+            except (HiveBusContractError, HiveValidationError, ValueError):
+                return self._schema_error()
+            try:
+                now = _utc_datetime(self._clock)
+                now_text = _format_utc(now)
+                self._connection.execute("BEGIN IMMEDIATE")
+                cursor = self._cursor_generation_matches(group, checked_partition, checked_generation)
+                if cursor is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._subscription_stale()
+                expired_lease_materialized = False
+                active = self._connection.execute(
+                    "SELECT delivery_token,expires_at_utc FROM delivery_leases "
+                    "WHERE consumer_group_id=? AND partition=?",
+                    (group, checked_partition),
+                ).fetchone()
+                if active is not None:
+                    if type(active[0]) is not str:
+                        raise ValueError
+                    expires_at = _stored_utc(active[1])
+                    if now < expires_at:
+                        self._connection.execute("ROLLBACK")
+                        return self._delivery_active(
+                            self._remaining_seconds(expires_at, now, maximum=_LEASE_SECONDS)
+                        )
+                    terminal_expiry = self._materialize_expired_lease(
+                        group, checked_partition, active[0], now
+                    )
+                    expired_lease_materialized = True
+                    if terminal_expiry:
+                        self._connection.execute("COMMIT")
+                        return self._poison()
+                first_open_seq = cursor[0] + 1
+                rows = self._connection.execute(
+                    "SELECT partition_seq,header_bytes,header_digest FROM events "
+                    "WHERE partition=? AND partition_seq>=? ORDER BY partition_seq LIMIT ?",
+                    (checked_partition, first_open_seq, _MAX_DELIVERY_HEADERS),
+                ).fetchall()
+                headers: list[bytes] = []
+                expected_seq = first_open_seq
+                total_bytes = 0
+                for sequence, header, header_digest in rows:
+                    if (
+                        type(sequence) is not int
+                        or sequence != expected_seq
+                        or type(header) is not bytes
+                        or not 1 <= len(header) <= _MAX_HEADER_BYTES
+                        or type(header_digest) is not str
+                        or _digest(header) != header_digest
+                    ):
+                        raise ValueError
+                    if total_bytes + len(header) > _MAX_DELIVERY_HEADER_BYTES:
+                        break
+                    effect = self._connection.execute(
+                        "SELECT state,retry_not_before_utc FROM consumer_effects "
+                        "WHERE consumer_group_id=? AND partition=? AND partition_seq=? AND generation=?",
+                        (group, checked_partition, sequence, checked_generation),
+                    ).fetchone()
+                    if effect is not None:
+                        if type(effect[0]) is not str or effect[0] not in {
+                            "pending",
+                            "committed",
+                            "dead_lettered",
+                        }:
+                            raise ValueError
+                        if effect[0] == "pending" and effect[1] is not None:
+                            retry_at = _stored_utc(effect[1])
+                            if now < retry_at:
+                                if headers:
+                                    break
+                                self._connection.execute(
+                                    "COMMIT" if expired_lease_materialized else "ROLLBACK"
+                                )
+                                return self._delivery_backoff(
+                                    self._remaining_seconds(
+                                        retry_at, now, maximum=_BACKOFF_SECONDS[-1]
+                                    )
+                                )
+                    headers.append(header)
+                    total_bytes += len(header)
+                    expected_seq += 1
+                if not headers:
+                    self._connection.execute(
+                        "COMMIT" if expired_lease_materialized else "ROLLBACK"
+                    )
+                    return None
+                raw_token = "lease-v1-" + secrets.token_urlsafe(32)
+                if _LEASE_TOKEN_RE.fullmatch(raw_token) is None:
+                    raise ValueError
+                token_digest = _digest(raw_token.encode("ascii"))
+                scan_through_seq = first_open_seq + len(headers) - 1
+                expires_at = now + timedelta(seconds=_LEASE_SECONDS)
+                self._connection.execute(
+                    "INSERT INTO delivery_leases(consumer_group_id,partition,generation,delivery_token,"
+                    "from_seq,scan_through_seq,leased_at_utc,expires_at_utc,created_monotonic) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        group,
+                        checked_partition,
+                        checked_generation,
+                        token_digest,
+                        first_open_seq,
+                        scan_through_seq,
+                        now_text,
+                        _format_utc(expires_at),
+                        self._clock.monotonic(),
+                    ),
+                )
+                self._connection.execute("COMMIT")
+                return DeliveryBatchV1(
+                    delivery_token=raw_token,
+                    generation=checked_generation,
+                    from_seq=first_open_seq,
+                    scan_through_seq=scan_through_seq,
+                    headers=tuple(headers),
+                )
+            except sqlite3.OperationalError as exc:
+                self._rollback(self._connection)
+                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+            except (OSError, ValueError, sqlite3.DatabaseError):
+                self._rollback(self._connection)
+                return self._store_integrity()
+
+    def begin_effect(
+        self,
+        consumer_group_id: str,
+        partition: str,
+        generation: str,
+        delivery_token: str,
+        event_id: str,
+        *,
+        effect_digest: str,
+    ) -> EffectBeginResultV1 | DiagnosticV2:
+        """Durably bind one caller-owned effect digest before external application."""
+
+        with self._lock:
+            unusable = self._usable()
+            if unusable is not None:
+                return unusable
+            try:
+                group, checked_partition, checked_generation = self._validate_group_partition_generation(
+                    consumer_group_id, partition, generation
+                )
+                raw_token = self._validate_delivery_token(delivery_token)
+                checked_event_id = self._validate_digest(event_id)
+                checked_effect_digest = self._validate_digest(effect_digest)
+            except (HiveBusContractError, HiveValidationError, ValueError):
+                return self._schema_error()
+            try:
+                now = _utc_datetime(self._clock)
+                now_text = _format_utc(now)
+                token_digest = _digest(raw_token.encode("ascii"))
+                self._connection.execute("BEGIN IMMEDIATE")
+                if self._cursor_generation_matches(group, checked_partition, checked_generation) is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._subscription_stale()
+                lease = self._valid_current_lease(
+                    group, checked_partition, checked_generation, token_digest, now
+                )
+                if lease is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._delivery_stale()
+                event = self._event_in_lease(
+                    group,
+                    checked_partition,
+                    checked_event_id,
+                    lease[0],
+                    lease[1],
+                )
+                if event is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._cursor_conflict()
+                if not self._earlier_lease_effects_are_settled(
+                    group,
+                    checked_partition,
+                    checked_generation,
+                    lease[0],
+                    event[0],
+                ):
+                    self._connection.execute("ROLLBACK")
+                    return self._cursor_conflict()
+                persisted = self._connection.execute(
+                    "SELECT generation,state,effect_digest,attempt_count,retry_not_before_utc,lease_token "
+                    "FROM consumer_effects WHERE consumer_group_id=? AND event_id=?",
+                    (group, checked_event_id),
+                ).fetchone()
+                if persisted is None:
+                    self._connection.execute(
+                        "INSERT INTO consumer_effects(consumer_group_id,event_id,partition,partition_seq,"
+                        "generation,state,effect_digest,attempt_count,retry_not_before_utc,lease_token,"
+                        "lease_expires_at_utc,last_error_code,updated_at_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            group,
+                            checked_event_id,
+                            checked_partition,
+                            event[0],
+                            checked_generation,
+                            "pending",
+                            checked_effect_digest,
+                            0,
+                            None,
+                            token_digest,
+                            _format_utc(lease[2]),
+                            None,
+                            now_text,
+                        ),
+                    )
+                    self._connection.execute("COMMIT")
+                    return EffectBeginResultV1("apply", 0)
+                if (
+                    persisted[0] != checked_generation
+                    or type(persisted[1]) is not str
+                    or type(persisted[2]) is not str
+                    or type(persisted[3]) is not int
+                    or not 0 <= persisted[3] <= 5
+                    or (persisted[5] is not None and type(persisted[5]) is not str)
+                ):
+                    raise ValueError
+                if persisted[2] != checked_effect_digest:
+                    self._connection.execute("ROLLBACK")
+                    return self._effect_conflict()
+                if persisted[1] == "committed":
+                    self._connection.execute("ROLLBACK")
+                    return EffectBeginResultV1("committed", persisted[3])
+                if persisted[1] == "dead_lettered":
+                    self._connection.execute("ROLLBACK")
+                    return EffectBeginResultV1("dead_lettered", persisted[3])
+                if persisted[1] != "pending":
+                    raise ValueError
+                if persisted[5] == token_digest:
+                    self._connection.execute("ROLLBACK")
+                    return self._cursor_conflict()
+                if persisted[4] is not None:
+                    retry_at = _stored_utc(persisted[4])
+                    if now < retry_at:
+                        self._connection.execute("ROLLBACK")
+                        return self._delivery_backoff(
+                            self._remaining_seconds(retry_at, now, maximum=_BACKOFF_SECONDS[-1])
+                        )
+                changed = self._connection.execute(
+                    "UPDATE consumer_effects SET retry_not_before_utc=NULL,lease_token=?,"
+                    "lease_expires_at_utc=?,updated_at_utc=? WHERE consumer_group_id=? AND event_id=? "
+                    "AND state='pending' AND effect_digest=? AND attempt_count=?",
+                    (
+                        token_digest,
+                        _format_utc(lease[2]),
+                        now_text,
+                        group,
+                        checked_event_id,
+                        checked_effect_digest,
+                        persisted[3],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise sqlite3.DatabaseError
+                self._connection.execute("COMMIT")
+                return EffectBeginResultV1("apply", persisted[3])
+            except sqlite3.OperationalError as exc:
+                self._rollback(self._connection)
+                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+            except (ValueError, sqlite3.DatabaseError):
+                self._rollback(self._connection)
+                return self._store_integrity()
+
+    def commit_effect(
+        self,
+        consumer_group_id: str,
+        partition: str,
+        generation: str,
+        delivery_token: str,
+        event_id: str,
+        *,
+        effect_digest: str,
+    ) -> None | DiagnosticV2:
+        """Atomically mark only the current matching pending journal committed."""
+
+        with self._lock:
+            unusable = self._usable()
+            if unusable is not None:
+                return unusable
+            try:
+                group, checked_partition, checked_generation = self._validate_group_partition_generation(
+                    consumer_group_id, partition, generation
+                )
+                raw_token = self._validate_delivery_token(delivery_token)
+                checked_event_id = self._validate_digest(event_id)
+                checked_effect_digest = self._validate_digest(effect_digest)
+            except (HiveBusContractError, HiveValidationError, ValueError):
+                return self._schema_error()
+            try:
+                now = _utc_datetime(self._clock)
+                now_text = _format_utc(now)
+                token_digest = _digest(raw_token.encode("ascii"))
+                self._connection.execute("BEGIN IMMEDIATE")
+                if self._cursor_generation_matches(group, checked_partition, checked_generation) is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._subscription_stale()
+                lease = self._valid_current_lease(
+                    group, checked_partition, checked_generation, token_digest, now
+                )
+                if lease is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._delivery_stale()
+                if self._event_in_lease(
+                    group, checked_partition, checked_event_id, lease[0], lease[1]
+                ) is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._cursor_conflict()
+                effect = self._connection.execute(
+                    "SELECT generation,state,effect_digest,lease_token FROM consumer_effects "
+                    "WHERE consumer_group_id=? AND event_id=?",
+                    (group, checked_event_id),
+                ).fetchone()
+                if effect is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._cursor_conflict()
+                if effect[0] != checked_generation or type(effect[1]) is not str or type(effect[2]) is not str:
+                    raise ValueError
+                if effect[2] != checked_effect_digest:
+                    self._connection.execute("ROLLBACK")
+                    return self._effect_conflict()
+                if effect[1] == "committed":
+                    self._connection.execute("ROLLBACK")
+                    return None
+                if effect[1] != "pending" or effect[3] != token_digest:
+                    self._connection.execute("ROLLBACK")
+                    return self._cursor_conflict()
+                changed = self._connection.execute(
+                    "UPDATE consumer_effects SET state='committed',retry_not_before_utc=NULL,"
+                    "updated_at_utc=? WHERE consumer_group_id=? AND event_id=? AND state='pending' "
+                    "AND effect_digest=? AND lease_token=?",
+                    (now_text, group, checked_event_id, checked_effect_digest, token_digest),
+                ).rowcount
+                if changed != 1:
+                    raise sqlite3.DatabaseError
+                self._connection.execute("COMMIT")
+                return None
+            except sqlite3.OperationalError as exc:
+                self._rollback(self._connection)
+                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+            except (ValueError, sqlite3.DatabaseError):
+                self._rollback(self._connection)
+                return self._store_integrity()
+
+    def fail_effect(
+        self,
+        consumer_group_id: str,
+        partition: str,
+        generation: str,
+        delivery_token: str,
+        event_id: str,
+        *,
+        effect_digest: str,
+        error_code: str,
+        error_fingerprint: str,
+    ) -> DiagnosticV2:
+        """Count one valid pending effect failure and persist bounded retry or DLQ evidence."""
+
+        with self._lock:
+            unusable = self._usable()
+            if unusable is not None:
+                return unusable
+            try:
+                group, checked_partition, checked_generation = self._validate_group_partition_generation(
+                    consumer_group_id, partition, generation
+                )
+                raw_token = self._validate_delivery_token(delivery_token)
+                checked_event_id = self._validate_digest(event_id)
+                checked_effect_digest = self._validate_digest(effect_digest)
+                checked_error_code = self._validate_error_code(error_code)
+                checked_error_fingerprint = self._validate_digest(error_fingerprint)
+            except (HiveBusContractError, HiveValidationError, ValueError):
+                return self._schema_error()
+            try:
+                now = _utc_datetime(self._clock)
+                now_text = _format_utc(now)
+                token_digest = _digest(raw_token.encode("ascii"))
+                self._connection.execute("BEGIN IMMEDIATE")
+                if self._cursor_generation_matches(group, checked_partition, checked_generation) is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._subscription_stale()
+                lease = self._valid_current_lease(
+                    group, checked_partition, checked_generation, token_digest, now
+                )
+                if lease is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._delivery_stale()
+                if self._event_in_lease(
+                    group, checked_partition, checked_event_id, lease[0], lease[1]
+                ) is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._cursor_conflict()
+                effect = self._connection.execute(
+                    "SELECT generation,state,effect_digest,attempt_count,lease_token "
+                    "FROM consumer_effects WHERE consumer_group_id=? AND event_id=?",
+                    (group, checked_event_id),
+                ).fetchone()
+                if effect is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._cursor_conflict()
+                if (
+                    effect[0] != checked_generation
+                    or type(effect[1]) is not str
+                    or type(effect[2]) is not str
+                    or type(effect[3]) is not int
+                    or not 0 <= effect[3] <= 5
+                ):
+                    raise ValueError
+                if effect[2] != checked_effect_digest:
+                    self._connection.execute("ROLLBACK")
+                    return self._effect_conflict()
+                if effect[1] == "dead_lettered":
+                    self._connection.execute("ROLLBACK")
+                    return self._poison()
+                if effect[1] != "pending" or effect[4] != token_digest:
+                    self._connection.execute("ROLLBACK")
+                    return self._cursor_conflict()
+                next_attempt = effect[3] + 1
+                if next_attempt < 5:
+                    retry_at = now + timedelta(seconds=_BACKOFF_SECONDS[next_attempt - 1])
+                    changed = self._connection.execute(
+                        "UPDATE consumer_effects SET attempt_count=?,retry_not_before_utc=?,"
+                        "lease_token=NULL,lease_expires_at_utc=NULL,last_error_code=?,updated_at_utc=? "
+                        "WHERE consumer_group_id=? AND event_id=? AND state='pending' AND effect_digest=? "
+                        "AND lease_token=? AND attempt_count=?",
+                        (
+                            next_attempt,
+                            _format_utc(retry_at),
+                            checked_error_code,
+                            now_text,
+                            group,
+                            checked_event_id,
+                            checked_effect_digest,
+                            token_digest,
+                            effect[3],
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise sqlite3.DatabaseError
+                    deleted = self._connection.execute(
+                        "DELETE FROM delivery_leases WHERE consumer_group_id=? AND partition=? "
+                        "AND delivery_token=?",
+                        (group, checked_partition, token_digest),
+                    ).rowcount
+                    if deleted != 1:
+                        raise sqlite3.DatabaseError
+                    self._connection.execute("COMMIT")
+                    return self._delivery_backoff(
+                        self._remaining_seconds(retry_at, now, maximum=_BACKOFF_SECONDS[-1])
+                    )
+                changed = self._connection.execute(
+                    "UPDATE consumer_effects SET state='dead_lettered',attempt_count=5,"
+                    "retry_not_before_utc=NULL,last_error_code=?,updated_at_utc=? "
+                    "WHERE consumer_group_id=? AND event_id=? AND state='pending' AND effect_digest=? "
+                    "AND lease_token=? AND attempt_count=?",
+                    (
+                        checked_error_code,
+                        now_text,
+                        group,
+                        checked_event_id,
+                        checked_effect_digest,
+                        token_digest,
+                        effect[3],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise sqlite3.DatabaseError
+                self._connection.execute(
+                    "INSERT INTO dead_letters(consumer_group_id,event_id,partition,partition_seq,generation,"
+                    "attempt_count,error_code,error_fingerprint,created_at_utc) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        group,
+                        checked_event_id,
+                        checked_partition,
+                        self._event_in_lease(
+                            group, checked_partition, checked_event_id, lease[0], lease[1]
+                        )[0],
+                        checked_generation,
+                        5,
+                        checked_error_code,
+                        checked_error_fingerprint,
+                        now_text,
+                    ),
+                )
+                self._connection.execute("COMMIT")
+                return self._poison()
+            except sqlite3.OperationalError as exc:
+                self._rollback(self._connection)
+                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+            except (ValueError, sqlite3.DatabaseError):
+                self._rollback(self._connection)
+                return self._store_integrity()
+
+    def ack(
+        self,
+        consumer_group_id: str,
+        partition: str,
+        generation: str,
+        delivery_token: str,
+        scan_through_seq: int,
+    ) -> int | DiagnosticV2:
+        """CAS-advance a cursor only after every leased effect is durably ACKable."""
+
+        with self._lock:
+            unusable = self._usable()
+            if unusable is not None:
+                return unusable
+            try:
+                group, checked_partition, checked_generation = self._validate_group_partition_generation(
+                    consumer_group_id, partition, generation
+                )
+                raw_token = self._validate_delivery_token(delivery_token)
+                if (
+                    type(scan_through_seq) is not int
+                    or isinstance(scan_through_seq, bool)
+                    or not 1 <= scan_through_seq <= _MAX_SIGNED_SQLITE_INTEGER
+                ):
+                    raise ValueError
+            except (HiveBusContractError, HiveValidationError, ValueError):
+                return self._schema_error()
+            try:
+                now = _utc_datetime(self._clock)
+                now_text = _format_utc(now)
+                token_digest = _digest(raw_token.encode("ascii"))
+                self._connection.execute("BEGIN IMMEDIATE")
+                cursor = self._cursor_generation_matches(group, checked_partition, checked_generation)
+                if cursor is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._subscription_stale()
+                lease = self._valid_current_lease(
+                    group, checked_partition, checked_generation, token_digest, now
+                )
+                if lease is None:
+                    self._connection.execute("ROLLBACK")
+                    return self._delivery_stale()
+                if lease[0] != cursor[0] + 1 or lease[1] != scan_through_seq:
+                    self._connection.execute("ROLLBACK")
+                    return self._cursor_conflict()
+                events = self._connection.execute(
+                    "SELECT event_id,partition_seq,event_type FROM events WHERE partition=? "
+                    "AND partition_seq BETWEEN ? AND ? ORDER BY partition_seq",
+                    (checked_partition, lease[0], lease[1]),
+                ).fetchall()
+                if len(events) != lease[1] - lease[0] + 1:
+                    raise ValueError
+                for expected_seq, event in enumerate(events, start=lease[0]):
+                    event_id, partition_seq, event_type = event
+                    if (
+                        type(event_id) is not str
+                        or type(partition_seq) is not int
+                        or partition_seq != expected_seq
+                        or type(event_type) is not str
+                        or event_type not in EVENT_TYPE_MATRIX
+                    ):
+                        raise ValueError
+                    effect = self._connection.execute(
+                        "SELECT generation,state,attempt_count FROM consumer_effects "
+                        "WHERE consumer_group_id=? AND event_id=?",
+                        (group, event_id),
+                    ).fetchone()
+                    if (
+                        effect is None
+                        or effect[0] != checked_generation
+                        or type(effect[1]) is not str
+                        or type(effect[2]) is not int
+                    ):
+                        self._connection.execute("ROLLBACK")
+                        return self._cursor_conflict()
+                    if effect[1] == "committed":
+                        continue
+                    if effect[1] != "dead_lettered" or effect[2] != 5:
+                        self._connection.execute("ROLLBACK")
+                        return self._cursor_conflict()
+                    dead_letter = self._connection.execute(
+                        "SELECT attempt_count,generation FROM dead_letters "
+                        "WHERE consumer_group_id=? AND event_id=?",
+                        (group, event_id),
+                    ).fetchone()
+                    if dead_letter != (5, checked_generation):
+                        raise ValueError
+                    if EVENT_TYPE_MATRIX[event_type].urgent or event_type == "artifact.archived":
+                        self._connection.execute("ROLLBACK")
+                        return self._poison()
+                changed = self._connection.execute(
+                    "UPDATE cursors SET acked_seq=?,updated_at_utc=? WHERE consumer_group_id=? "
+                    "AND partition=? AND generation=? AND acked_seq=?",
+                    (
+                        scan_through_seq,
+                        now_text,
+                        group,
+                        checked_partition,
+                        checked_generation,
+                        cursor[0],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise sqlite3.DatabaseError
+                deleted = self._connection.execute(
+                    "DELETE FROM delivery_leases WHERE consumer_group_id=? AND partition=? "
+                    "AND delivery_token=? AND generation=?",
+                    (group, checked_partition, token_digest, checked_generation),
+                ).rowcount
+                if deleted != 1:
+                    raise sqlite3.DatabaseError
+                self._connection.execute("COMMIT")
+                return scan_through_seq
+            except sqlite3.OperationalError as exc:
+                self._rollback(self._connection)
+                return self._store_busy() if _sqlite_is_busy(exc) else self._store_integrity()
+            except (ValueError, sqlite3.DatabaseError):
+                self._rollback(self._connection)
+                return self._store_integrity()
 
     def _block_partition(self, partition: str, now: str) -> None:
         try:
