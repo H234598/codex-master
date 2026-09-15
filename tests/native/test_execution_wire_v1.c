@@ -224,6 +224,92 @@ static size_t locate_bytes(const uint8_t *bytes, size_t length, const uint8_t *n
     return 0U;
 }
 
+typedef struct CborAuditCursor {
+    const uint8_t *bytes;
+    size_t length;
+    size_t position;
+} CborAuditCursor;
+
+static uint64_t cbor_audit_head(CborAuditCursor *cursor, uint8_t *major) {
+    uint8_t initial;
+    uint8_t additional;
+    uint8_t width;
+    uint8_t index;
+    uint64_t value = 0U;
+    assert(cursor->position < cursor->length);
+    initial = cursor->bytes[cursor->position++];
+    *major = initial >> 5U;
+    additional = initial & 0x1fU;
+    assert(additional != 31U);
+    if (additional < 24U) return additional;
+    width = additional == 24U ? 1U : additional == 25U ? 2U : additional == 26U ? 4U : 8U;
+    assert(additional <= 27U && (size_t)width <= cursor->length - cursor->position);
+    for (index = 0U; index < width; ++index) value = (value << 8U) | cursor->bytes[cursor->position++];
+    return value;
+}
+
+static int cbor_audit_compare_key(const uint8_t *left, size_t left_length, const uint8_t *right, size_t right_length) {
+    size_t shortest = left_length < right_length ? left_length : right_length;
+    int comparison = memcmp(left, right, shortest);
+    if (comparison != 0) return comparison;
+    return left_length < right_length ? -1 : left_length > right_length ? 1 : 0;
+}
+
+static void cbor_audit_item(CborAuditCursor *cursor) {
+    uint8_t major;
+    uint64_t argument = cbor_audit_head(cursor, &major);
+    uint64_t index;
+    if (major == 0U || major == 1U || major == 7U) return;
+    if (major == 2U || major == 3U) {
+        assert(argument <= (uint64_t)(cursor->length - cursor->position));
+        cursor->position += (size_t)argument;
+        return;
+    }
+    if (major == 4U) {
+        for (index = 0U; index < argument; ++index) cbor_audit_item(cursor);
+        return;
+    }
+    if (major == 5U) {
+        const uint8_t *previous_key = NULL;
+        size_t previous_length = 0U;
+        for (index = 0U; index < argument; ++index) {
+            size_t key_start = cursor->position;
+            cbor_audit_item(cursor);
+            assert(previous_key == NULL || cbor_audit_compare_key(previous_key, previous_length, cursor->bytes + key_start, cursor->position - key_start) < 0);
+            previous_key = cursor->bytes + key_start;
+            previous_length = cursor->position - key_start;
+            cbor_audit_item(cursor);
+        }
+        return;
+    }
+    if (major == 6U) {
+        cbor_audit_item(cursor);
+        return;
+    }
+    assert(!"unsupported CBOR major type");
+}
+
+static void encoded_maps_are_rfc8949_ordered(void) {
+    uint8_t bytes[65536];
+    size_t length;
+    CborAuditCursor cursor;
+    D73AuthorizedExecutionTupleV1 tuple_value = tuple();
+    ApprovalRecordV1 approval_value = approval(&tuple_value);
+    ExecutionWireV1Digest approval_digest = digest(70U);
+    ExecutionEnvelopeV1 envelope_value = envelope(&tuple_value, &approval_value, &approval_digest);
+#define AUDIT_ENCODED_MAPS(encode_call) do { \
+    length = sizeof(bytes); \
+    assert((encode_call) == EXECUTION_WIRE_V1_OK); \
+    cursor = (CborAuditCursor){.bytes = bytes, .length = length, .position = 0U}; \
+    cbor_audit_item(&cursor); \
+    assert(cursor.position == length); \
+} while (0)
+    AUDIT_ENCODED_MAPS(execution_wire_v1_encode_tuple(&tuple_value, limits(), bytes, &length));
+    AUDIT_ENCODED_MAPS(execution_wire_v1_encode_approval(&approval_value, limits(), bytes, &length));
+    AUDIT_ENCODED_MAPS(execution_wire_v1_encode_envelope(&envelope_value, limits(), bytes, &length));
+#undef AUDIT_ENCODED_MAPS
+}
+
 static bool same_digest(const ExecutionWireV1Digest *left, const ExecutionWireV1Digest *right) {
     return memcmp(left->bytes, right->bytes, EXECUTION_WIRE_V1_DIGEST_SIZE) == 0;
 }
@@ -493,7 +579,7 @@ static void rejects_decoded_duplicate_snapshot_identity(void) {
 static void enforces_envelope_fd_key_order(void) {
     uint8_t bytes[65536];
     uint8_t changed[65536];
-    uint8_t cloexec_member[12];
+    uint8_t number_member[11];
     size_t length = sizeof(bytes);
     size_t cloexec;
     size_t number;
@@ -505,12 +591,13 @@ static void enforces_envelope_fd_key_order(void) {
     assert(execution_wire_v1_encode_envelope(&envelope_value, limits(), bytes, &length) == EXECUTION_WIRE_V1_OK);
     cloexec = locate(bytes, length, "fd_cloexec");
     number = locate(bytes, length, "fd_number");
-    assert(cloexec < number);
-    assert(cloexec > 0U && number == cloexec + sizeof(cloexec_member));
+    assert(bytes[number - 1U] == 0x69U && bytes[cloexec - 1U] == 0x6aU);
+    assert(number < cloexec);
+    assert(number > 0U && cloexec == number + sizeof(number_member));
     memcpy(changed, bytes, length);
-    memcpy(cloexec_member, changed + cloexec - 1U, sizeof(cloexec_member));
-    memmove(changed + cloexec - 1U, changed + number - 1U, 11U);
-    memcpy(changed + cloexec - 1U + 11U, cloexec_member, sizeof(cloexec_member));
+    memcpy(number_member, changed + number - 1U, sizeof(number_member));
+    memmove(changed + number - 1U, changed + cloexec - 1U, 12U);
+    memcpy(changed + number - 1U + 12U, number_member, sizeof(number_member));
     assert(execution_wire_v1_decode_envelope(changed, length, limits(), &decoded) != EXECUTION_WIRE_V1_OK);
 }
 
@@ -658,6 +745,7 @@ int main(void) {
     rejects_snapshot_array_order_and_identity_duplicates();
     rejects_decoded_duplicate_snapshot_identity();
     enforces_envelope_fd_key_order();
+    encoded_maps_are_rfc8949_ordered();
     rejects_mutated_wire_and_bindings();
     rejects_approval_wire_byteflip_against_tuple();
     rejects_all_cross_object_mismatches();

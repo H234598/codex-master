@@ -1251,8 +1251,8 @@ static ExecutionWireV1Status validate_envelope(const ExecutionEnvelopeV1 *value,
 static void writer_envelope(WireWriter *writer, const ExecutionEnvelopeV1 *value) {
     writer_map(writer, 22U);
     writer_key(writer, "phase"); writer_uint(writer, value->phase);
-    writer_key(writer, "fd_cloexec"); writer_bool(writer, value->fd_cloexec);
     writer_key(writer, "fd_number"); writer_uint(writer, value->fd_number);
+    writer_key(writer, "fd_cloexec"); writer_bool(writer, value->fd_cloexec);
     writer_key(writer, "generation"); writer_uint(writer, value->generation);
     writer_key(writer, "snapshot_a"); writer_snapshot(writer, &value->snapshot_a);
     writer_key(writer, "snapshot_b"); writer_snapshot(writer, &value->snapshot_b);
@@ -1279,8 +1279,8 @@ static ExecutionWireV1Status reader_envelope(WireReader *reader, const Execution
     memset(value, 0, sizeof(*value));
     if ((status = reader_map_exact(reader, 22U)) != EXECUTION_WIRE_V1_OK ||
         (status = reader_key(reader, "phase")) != EXECUTION_WIRE_V1_OK || (status = reader_uint(reader, &value->phase)) != EXECUTION_WIRE_V1_OK ||
-        (status = reader_key(reader, "fd_cloexec")) != EXECUTION_WIRE_V1_OK || (status = reader_bool(reader, &value->fd_cloexec)) != EXECUTION_WIRE_V1_OK ||
         (status = reader_key(reader, "fd_number")) != EXECUTION_WIRE_V1_OK || (status = reader_uint(reader, &value->fd_number)) != EXECUTION_WIRE_V1_OK ||
+        (status = reader_key(reader, "fd_cloexec")) != EXECUTION_WIRE_V1_OK || (status = reader_bool(reader, &value->fd_cloexec)) != EXECUTION_WIRE_V1_OK ||
         (status = reader_key(reader, "generation")) != EXECUTION_WIRE_V1_OK || (status = reader_uint(reader, &value->generation)) != EXECUTION_WIRE_V1_OK ||
         (status = reader_key(reader, "snapshot_a")) != EXECUTION_WIRE_V1_OK || (status = reader_snapshot(reader, limits, &value->snapshot_a)) != EXECUTION_WIRE_V1_OK ||
         (status = reader_key(reader, "snapshot_b")) != EXECUTION_WIRE_V1_OK || (status = reader_snapshot(reader, limits, &value->snapshot_b)) != EXECUTION_WIRE_V1_OK ||
