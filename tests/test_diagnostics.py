@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, MISSING
 from pathlib import Path
 from types import MappingProxyType
 
@@ -213,7 +213,15 @@ D129_BUS_CODES = frozenset(
     }
 )
 
-EXPECTED_CODES = PLAN_08_CODES | D129_BUS_CODES
+D141_BUS_DIAGNOSTIC_CODES = frozenset(
+    {
+        "BUS_E_CURSOR_CONFLICT",
+        "BUS_E_DELIVERY_STALE",
+        "BUS_E_POISON",
+    }
+)
+
+EXPECTED_CODES = PLAN_08_CODES | D129_BUS_CODES | D141_BUS_DIAGNOSTIC_CODES
 WIRE_KEYS = (
     "schema_version",
     "code",
@@ -279,6 +287,58 @@ def test_severity_is_closed_and_code_specs_are_immutable_membership_only() -> No
         next(iter(DIAGNOSTIC_CODE_SPECS_V2.values())).code = "other.code"  # type: ignore[misc]
     assert DiagnosticCodeSpecV2.__slots__ == ("code",)
     assert not hasattr(next(iter(DIAGNOSTIC_CODE_SPECS_V2.values())), "retryable")
+
+
+def test_d141_bus_codes_are_membership_only_without_policy_defaults() -> None:
+    assert D141_BUS_DIAGNOSTIC_CODES.isdisjoint(D129_BUS_CODES)
+    assert set(DIAGNOSTIC_CODE_SPECS_V2) == EXPECTED_CODES
+    assert tuple(DiagnosticCodeSpecV2.__dataclass_fields__) == ("code",)
+    assert tuple(DiagnosticCodeSpecV2.__annotations__) == ("code",)
+    assert all(
+        field.default is MISSING and field.default_factory is MISSING
+        for field in DiagnosticCodeSpecV2.__dataclass_fields__.values()
+    )
+
+    for code in D141_BUS_DIAGNOSTIC_CODES:
+        spec = DIAGNOSTIC_CODE_SPECS_V2[code]
+        assert spec == DiagnosticCodeSpecV2(code)
+        assert spec.code == code
+        assert not any(
+            hasattr(spec, field)
+            for field in (
+                "severity",
+                "action",
+                "retryable",
+                "retry_after_seconds",
+                "fallback_applied",
+                "requested_choice",
+                "effective_choice",
+                "causes",
+                "legacy_code",
+            )
+        )
+
+
+@pytest.mark.parametrize("code", sorted(D141_BUS_DIAGNOSTIC_CODES))
+def test_d141_bus_codes_construct_and_round_trip_through_canonical_wire(
+    code: str,
+) -> None:
+    value = diagnostic_for(
+        code,
+        severity=DiagnosticSeverityV2.WARNING,
+        retryable=True,
+        retry_after_seconds=1,
+        fallback_applied=False,
+        requested_choice=None,
+        effective_choice=None,
+        action="retry_diagnostic",
+        causes=(),
+    )
+
+    wire = serialize_diagnostic_v2(value)
+    assert tuple(wire) == WIRE_KEYS
+    assert wire["code"] == code
+    assert parse_diagnostic_v2(wire) == value
 
 
 def test_diagnostic_for_validates_and_produces_a_frozen_slotted_value() -> None:
