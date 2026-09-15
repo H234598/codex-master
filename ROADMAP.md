@@ -1,112 +1,76 @@
 # The Hive Roadmap
 
-Status is intentionally separated into source-integrated work, prepared work,
-blockers, and later work. It is based on repository snapshot
-`e7b3286ab0752b3f110f1fa02d0f366aa6f710cb` (tree
-`184da8c6e517b6021079a6d2a9d8c55338c125e3`); it makes no live-runtime,
-provider, approval, deployment, or CI-success claim. The historical
-documentation parity and consolidation basis is
-`b5def7d6156d7862606a0edcbd7226652cf4833f`.
+This is the canonical end-to-end roadmap for The Hive. It records durable
+milestones from the documented project start to the planned documentation
+end-state; it does not establish runtime, provider, installation, deployment,
+release, or service availability.
 
-In the product-source comparison, `a65fe3972f7859e808ec6f09a39808fa240d4f49`
-source-integrates the local, fail-closed BUS-S1 Slice-A Store-Foundation
-(`HiveBusStore`) and its focused test. The preceding
-`4eef3d90db78f72efb96d1888d15af8c024cd5a0` additionally contains only the
-`DiagnosticV2` code registrations `BUS_E_CURSOR_CONFLICT`,
-`BUS_E_DELIVERY_STALE`, and `BUS_E_POISON`. Commit
-`9e0ce708a803ce6f6b961ea678e367cc31e2888c` source-integrates
-Delivery-/Effectsicherheitslogik. Current-Main adds four additive
-Testmatrixnachweise in `tests/test_hive_bus_store.py`. This is source/test
-evidence only, not evidence of a running bus, broker, service, or deployment.
+```mermaid
+flowchart LR
+  M1["2026-06-07: local tmux MCP controller"] --> M2["The Hive local control-plane foundation"]
+  M2 --> M3["Source/test coordination foundation — Hier sind wir"]
+  M3 --> M4["Geplant: provider capacity and model routing"]
+  M4 --> M5["Geplant: topic bus, archive, and resume"]
+  M5 --> M6["Geplant: remote leadership, control, and fleet surfaces"]
+  M6 --> M7["Geplant: diagnostics and Google inventory"]
+  M7 --> M8["Geplant: decision projection and CourseGuard"]
+  M8 --> M9["Geplant: verified provenance, path cutover, and guide publication"]
+```
 
-## Now — integrated in the repository
+Textalternative: lokaler tmux-MCP-Controller → The-Hive-Control-Plane-Fundament
+→ source-/testgestützte Koordinationsgrundlage → geplante Kapazitäts- und
+Modellsteuerung → geplanter Topic-Bus mit Archiv und Resume → geplante Remote-
+Leitung und Flottenoberflächen → geplante Diagnostik und Google-Inventar →
+geplante Entscheidungsprojektion und CourseGuard → geplante geprüfte
+Provenienz, Pfadbereinigung und stabilisierte Anleitungsveröffentlichung.
 
-- **The Hive package and runtime entrypoints.** The package metadata exposes
-  The Hive entrypoints, and [`.mcp.json`](.mcp.json) selects the attested stable
-  MCP launcher. The stable launcher and the three-argument runtime wrapper
-  are present in [`bin/`](bin/). Evidence: [pyproject.toml](pyproject.toml),
-  [`.mcp.json`](.mcp.json), [`bin/the-hive-mcp-stable`](bin/the-hive-mcp-stable),
-  and [`bin/the-hive-mcp`](bin/the-hive-mcp).
-- **Bounded Hive control-plane source.** Typed principals, repository
-  bindings, grants, work packages, admission, queues, and event records are
-  implemented as source contracts. Evidence: [src/the_hive/hive/](src/the_hive/hive/)
-  and the associated `tests/test_hive_*.py` files.
-- **DiagnosticV2 P0.** The source contains the canonical, redacted
-  `DiagnosticV2` value and wire contract with focused tests. Evidence:
-  [src/the_hive/diagnostics.py](src/the_hive/diagnostics.py) and
-  [tests/test_diagnostics.py](tests/test_diagnostics.py). No deployment or
-  downstream adoption beyond the source contract is inferred.
-- **BUS-S0 contract.** Commit `02613e7` adds the bounded BUS-S0 type contract;
-  commit `68450b6` normalizes its file endings. Evidence:
-  [src/the_hive/hive/bus_types.py](src/the_hive/hive/bus_types.py) and
-  [tests/test_hive_bus_types.py](tests/test_hive_bus_types.py). This is a
-  static contract, not evidence of a running bus broker or transport.
-- **BUS-S1 Slice-A Store-Foundation.** Commit
-  `a65fe3972f7859e808ec6f09a39808fa240d4f49` source-integrates the local,
-  fail-closed `HiveBusStore` and its focused test. Evidence:
-  `src/the_hive/hive/bus_store.py` and `tests/test_hive_bus_store.py`. This is a
-  source/test foundation, not evidence of a running bus, broker, service, or
-  deployment.
-- **Additional DiagnosticV2 code registrations.** Commit
-  `4eef3d90db78f72efb96d1888d15af8c024cd5a0` additionally registers only
-  `BUS_E_CURSOR_CONFLICT`, `BUS_E_DELIVERY_STALE`, and `BUS_E_POISON` in
-  `DiagnosticV2`. These registrations alone do not establish a running bus,
-  broker, service, or deployment.
-- **BUS-S1/B source/test additions.** Commit
-  `9e0ce708a803ce6f6b961ea678e367cc31e2888c` source-integrates
-  Delivery-/Effectsicherheitslogik. Current-Main
-  `e7b3286ab0752b3f110f1fa02d0f366aa6f710cb` (tree
-  `184da8c6e517b6021079a6d2a9d8c55338c125e3`) adds four additive
-  Testmatrixnachweise in `tests/test_hive_bus_store.py`. These are source/test
-  evidence only, not evidence of a running bus, broker, service, or deployment.
+## Meilenstein 1: Projektanfang
 
-## Next — prepared, but not active by this repository alone
+Am 2026-06-07 ist ein lokaler tmux-MCP-Controller für Codex-Agenten als
+belegter Projektanfang dokumentiert.
 
-- **Fail-closed admission execution.** The runtime adapter has a fixed gate
-  order and needs an injected executor; a missing gate, stale evidence, or
-  missing callback denies execution. The server factory is explicitly not
-  called by an MCP tool. Evidence:
-  [src/the_hive/admission_runtime.py](src/the_hive/admission_runtime.py) and
-  [src/the_hive/server.py](src/the_hive/server.py).
-- **Reversible local pilot provisioning.** The pilot provisioner can plan,
-  apply, verify, kill-switch, and roll back a narrowly defined pilot. This is
-  implementation readiness, not proof that a pilot is approved or currently
-  running on any host. Evidence:
-  [src/the_hive/hive/pilot_provisioner.py](src/the_hive/hive/pilot_provisioner.py)
-  and [docs/operations/hive-pilot-provisioner.md](docs/operations/hive-pilot-provisioner.md).
-- **Explicit multi-repository saga boundary.** The source accepts work only
-  when pilot allowlists, confirmed user gates, and create/execute/compensate
-  callbacks are supplied. Evidence:
-  [src/the_hive/hive/dispatch.py](src/the_hive/hive/dispatch.py). It is not a
-  hidden, globally atomic execution path.
+## Meilenstein 2: The-Hive-Control-Plane-Fundament
 
-## Blocked — external evidence or unfinished runtime work required
+Die dauerhafte The-Hive- und Local-Control-Plane-Grundlage bildet die Basis
+für die nachfolgenden Produktbereiche.
 
-- **Logical Queen runtime.** The documented controller returns
-  `queen_spawn_unavailable:hive_queen_runtime_not_materialized`; it does not
-  pretend to have started a Queen. Evidence:
-  [docs/operations/hive-operations.md](docs/operations/hive-operations.md).
-- **Provider use and operational approval.** Credentials, provider reachability,
-  current resource/account/lease/auth/config gates, pilot approval, and
-  operator acceptance are external runtime facts. They require fresh
-  evidence, not only this checkout. Evidence:
-  [src/the_hive/admission_runtime.py](src/the_hive/admission_runtime.py) and
-  [docs/security/hive-security.md](docs/security/hive-security.md).
-- **CI manifest identity conflict.** The checked-in plugin and app manifests
-  use The Hive keys, while [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
-  still asserts the historical `codex-master` plugin name and app key. Until
-  that contradiction is corrected and a run is independently verified, CI is
-  a blocker and not a success signal.
+## Meilenstein 3: Source- und Test-Koordinationsgrundlage
 
-## Later — planned, not integrated
+Die belegte Koordinationsgrundlage umfasst ausschließlich source-integrierte
+BUS-S1/A- und BUS-S1/B-Artefakte sowie zugehörige Tests. Daraus folgt kein
+Broker, Consumer, Transport, Service, Deployment oder Laufzeitbetrieb.
 
-- **CourseGuard.** It is a planned item for this documentation programme, not
-  an integrated product capability. No matching CourseGuard source, test, or
-  current product-documentation artifact was found in this snapshot; no
-  behavior or delivery date is inferred.
+## Meilenstein 4: Providerkapazität und Modellrouting (geplant)
 
-## Reading this roadmap
+Geplant sind dynamischer Accountpool und Home-Lifecycle, Resource Admission
+mit htop-/Telemetriebezug sowie providerübergreifende Kapazitäts-,
+Modellrouting- und Cachebetrachtung einschließlich Gemini/Vertex. Siehe
+[Providerkapazität und Modellrouting](docs/provider-capacity-and-model-routing.md).
 
-For product and operator navigation, use [docs/README.md](docs/README.md).
-Historical plans, templates, and handoffs are working material, not evidence
-that a feature has been integrated or activated.
+## Meilenstein 5: Topic-Bus, Archiv und Resume (geplant)
+
+Geplant sind ein dauerhafter Topic-Bus mit Archiv- und Resume-Grenzen für die
+Koordination. Siehe [Hive-Bus und Resume](docs/hive-bus-and-resume.md).
+
+## Meilenstein 6: Remote-Leitung, Control und Flotte (geplant)
+
+Geplant sind Remote-Leitung, ein Control-/Execution-Host sowie
+Flottenoberflächen. Siehe
+[Remote Control und Flotte](docs/remote-control-and-fleet.md).
+
+## Meilenstein 7: Diagnostik und Google-Inventar (geplant)
+
+Geplant sind diagnostische Oberflächen und ein Google-Inventar-Helper. Siehe
+[Google-Inventar und Diagnostik](docs/google-inventory-and-diagnostics.md).
+
+## Meilenstein 8: Entscheidungsprojektion und CourseGuard (geplant)
+
+Geplant sind Entscheidungsprojektion und CourseGuard als getrennte
+Fachbereiche. Siehe [Entscheidungsprojektion](docs/decision-projection.md)
+und [CourseGuard](docs/courseguard.md).
+
+## Meilenstein 9: Geprüfte Provenienz und Anleitungsveröffentlichung (geplant)
+
+Der planbelegte Endzustand umfasst geprüfte und freigegebene Fachpfade,
+bereinigte Altpfade sowie stabilisierte veröffentlichte Anleitungen. Er ist
+geplant und kein Nachweis einer bereits erfolgten Umstellung.

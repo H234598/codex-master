@@ -1,15 +1,14 @@
 # The Hive documentation
 
 This is the normal, versioned repository documentation navigation for The
-Hive. It deliberately separates product and operator material from plans,
-templates, and handoffs. It does not use Wiki navigation.
+Hive. It separates product and operator material from plans, templates, and
+handoffs; it does not use Wiki navigation.
 
 ## Start here
 
-- [Repository overview](../README.md): scope, installation boundary, basic
-  configuration, operation, and trust-boundary summary.
-- [Roadmap](../ROADMAP.md): source-integrated work, prepared work, blockers,
-  and later work.
+- [Repository overview](../README.md) — purpose, entry points, and concise
+  operational orientation.
+- [Roadmap](../ROADMAP.md) — the canonical end-to-end project timeline.
 
 ## Core product and operator documentation
 
@@ -36,9 +35,6 @@ templates, and handoffs. It does not use Wiki navigation.
 - [Releases](releases.md) — manifest-attested runtime-image release boundary.
 - [Changelog](../CHANGELOG.md) — recorded changes, not runtime-installation
   evidence.
-- [Consolidation record](migration/wiki-consolidation.md) — preservation and
-  classification record for former versioned Wiki sources; it is historical
-  documentation, not an operational instruction.
 
 ## Specialist documentation
 
@@ -54,6 +50,21 @@ templates, and handoffs. It does not use Wiki navigation.
   resource-evidence service and lifecycle boundary.
 - [Notification language usage](operations/notification-language-uses.md)
 - [Selection migration](migration/hive-selection-migration.md)
+- [Consolidation record](migration/wiki-consolidation.md) — preservation and
+  classification record for former versioned Wiki sources; it is historical
+  documentation, not an operational instruction.
+
+## Geplante Produktbereiche
+
+These pages describe plan-backed directions rather than available product
+capabilities.
+
+- [Provider capacity and model routing](provider-capacity-and-model-routing.md)
+- [Hive bus and resume](hive-bus-and-resume.md)
+- [Remote control and fleet](remote-control-and-fleet.md)
+- [Google inventory and diagnostics](google-inventory-and-diagnostics.md)
+- [Decision projection](decision-projection.md)
+- [CourseGuard](courseguard.md)
 
 ## Work material, not active product navigation
 
