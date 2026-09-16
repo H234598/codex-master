@@ -2,6 +2,8 @@ from pathlib import Path
 
 import pytest
 
+from the_hive.agent_resolver import build_selection_offer, policies_from_catalogs
+from the_hive.hive.config import load_agent_class_catalog
 from the_hive.selection.model_policy import ModelDefinition, ModelPolicyError, ModelPolicyRegistry, load_model_policy
 
 
@@ -40,4 +42,27 @@ def test_model_policy_loads_resolver_metadata() -> None:
     assert sol.reasoning_levels == ("xhigh", "max")
     assert sol.default_reasoning == "xhigh"
     assert sol.spawn_behavior == "manual"
-    assert {item["family"] for item in registry.public()} == {"spark", "luna", "terra", "sol"}
+    assert {item["family"] for item in registry.public()} == {"luna", "terra", "sol"}
+
+
+def test_active_policy_does_not_turn_a_spark_id_only_availability_into_an_offer() -> None:
+    root = Path(__file__).resolve().parents[1]
+    active_policy = root / "codex-model-policy.json"
+    registry = load_model_policy(active_policy)
+
+    assert active_policy.read_bytes() == (root / "examples/codex-model-policy.json").read_bytes()
+    assert registry.get_exact("gpt-5.3-codex-spark") is None
+    assert registry.resolve_alias("spark") is None
+    assert all(item["family"] != "spark" for item in registry.public())
+
+    classes, models = policies_from_catalogs(
+        load_agent_class_catalog(root / "codex-agent-classes.json"), registry
+    )
+    offer = build_selection_offer(
+        classes=classes,
+        models=models,
+        available_models={item.model_id for item in models} | {"gpt-5.3-codex-spark"},
+    )
+
+    assert "gpt-5.3-codex-spark" not in offer.models
+    assert all(option.model != "gpt-5.3-codex-spark" for option in offer.options)

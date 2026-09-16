@@ -118,6 +118,7 @@ from the_hive.usage_snapshot import (
     UsageEvidenceV2,
     UsageSnapshot,
     display_snapshot_from_evidence,
+    find_model_invocability,
     read_usage_evidence_v2,
 )
 from the_hive.hive.state import HiveStateStore
@@ -10674,8 +10675,179 @@ def validate_codex_usage_routing_decision(
     return result
 
 
+_MODEL_INVOCABILITY_UNATTESTED = "provider.model_invocability_unattested"
+_MODEL_RUNNER_UNSUPPORTED = "provider.model_runner_unsupported"
+_MODEL_INVOCABILITY_STATUSES = frozenset(
+    {"complete", "unattested", "invalid", "stale"}
+)
+_USAGE_EVIDENCE_STATUSES = frozenset(
+    {"complete", "stale", "partial", "busy", "unavailable", "invalid"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelRunnerAdmission:
+    allowed: bool
+    reason_code: str
+    evidence_source: str
+    evidence_status: str
+    missing_factor: str | None
+
+
+def _model_invocability_projection_details(
+    evidence: UsageEvidenceV2,
+) -> tuple[str, str]:
+    """Return bounded projection diagnostics without exposing producer internals."""
+
+    projection = (
+        evidence.model_invocability if type(evidence) is UsageEvidenceV2 else None
+    )
+    status = getattr(projection, "status", "unattested")
+    source = getattr(projection, "source", "unknown")
+    if not isinstance(status, str) or status not in _MODEL_INVOCABILITY_STATUSES:
+        status = "invalid"
+    if (
+        not isinstance(source, str)
+        or re.fullmatch(r"[a-z][a-z0-9._:-]{0,127}", source) is None
+    ):
+        source = "unknown"
+    return status, source
+
+
+def _model_runner_admission(
+    agent: str,
+    model: str,
+    *,
+    descriptor: AgentDescriptor | None = None,
+    evidence: UsageEvidenceV2 | None = None,
+) -> _ModelRunnerAdmission:
+    """Resolve one account/model/runner capability without any visibility fallback."""
+
+    attested = evidence
+    if attested is None:
+        attested = read_usage_evidence_v2(
+            clock=lambda: _dt.datetime.now(_dt.timezone.utc)
+        )
+    projection_status, projection_source = _model_invocability_projection_details(
+        attested
+    )
+    evidence_status = getattr(attested, "status", "invalid")
+    if (
+        not isinstance(evidence_status, str)
+        or evidence_status not in _USAGE_EVIDENCE_STATUSES
+    ):
+        evidence_status = "invalid"
+    if evidence_status != "complete":
+        return _ModelRunnerAdmission(
+            False,
+            _MODEL_INVOCABILITY_UNATTESTED,
+            projection_source,
+            evidence_status,
+            f"usage_evidence_{evidence_status}",
+        )
+    selected = descriptor
+    if selected is None:
+        selected = current_agent_inventory().agents.get(agent)
+    account_id = getattr(selected, "account_id", None)
+    runner = getattr(selected, "runner", None)
+    if (
+        selected is None
+        or not isinstance(account_id, str)
+        or not account_id
+        or not isinstance(runner, RunnerKind)
+    ):
+        return _ModelRunnerAdmission(
+            False,
+            _MODEL_INVOCABILITY_UNATTESTED,
+            projection_source,
+            projection_status,
+            "account_runner_binding",
+        )
+    capability = find_model_invocability(
+        attested,
+        account_id=account_id,
+        model_id=model,
+        runner_id=runner.value,
+    )
+    if capability is None:
+        return _ModelRunnerAdmission(
+            False,
+            _MODEL_INVOCABILITY_UNATTESTED,
+            projection_source,
+            projection_status,
+            "account_model_runner_capability"
+            if projection_status == "complete"
+            else f"projection_{projection_status}",
+        )
+    if capability.meter_visible is not True:
+        return _ModelRunnerAdmission(
+            False,
+            _MODEL_INVOCABILITY_UNATTESTED,
+            projection_source,
+            projection_status,
+            "meter_visible",
+        )
+    if capability.catalog_visible is not True:
+        return _ModelRunnerAdmission(
+            False,
+            _MODEL_INVOCABILITY_UNATTESTED,
+            projection_source,
+            projection_status,
+            "catalog_visible",
+        )
+    if capability.runner_invocable is not True:
+        return _ModelRunnerAdmission(
+            False,
+            _MODEL_RUNNER_UNSUPPORTED,
+            projection_source,
+            projection_status,
+            "runner_invocable",
+        )
+    return _ModelRunnerAdmission(
+        True, "allowed", projection_source, projection_status, None
+    )
+
+
+def _require_model_runner_admission(
+    agent: str,
+    model: str,
+    *,
+    descriptor: AgentDescriptor | None = None,
+    evidence: UsageEvidenceV2 | None = None,
+) -> None:
+    """Fail closed with one source-bound reason before a model reaches a runner."""
+
+    selected = descriptor
+    if selected is None:
+        selected = current_agent_inventory().agents.get(agent)
+    admission = _model_runner_admission(
+        agent,
+        model,
+        descriptor=selected,
+        evidence=evidence,
+    )
+    if admission.allowed:
+        return
+    raise AgentError(
+        admission.reason_code,
+        {
+            "error_code": admission.reason_code,
+            "reason_code": admission.reason_code,
+            "evidence_source": admission.evidence_source,
+            "evidence_status": admission.evidence_status,
+            "missing_factor": admission.missing_factor,
+            "model": model,
+            "runner": getattr(selected, "runner", None).value
+            if isinstance(getattr(selected, "runner", None), RunnerKind)
+            else "unknown",
+            "raw_output": "not_returned",
+        },
+    )
+
+
 def resolve_runtime_agent_selection(
     *,
+    agent: str,
     role: str,
     routing: Mapping[str, Any] | None,
     task_profile: TaskProfile,
@@ -10720,7 +10892,11 @@ def resolve_runtime_agent_selection(
         ):
             allowed_class_ids.add("teamleiterin")
         classes = tuple(item for item in classes if item.class_id in allowed_class_ids)
-    available_models = available_model_ids_for_routing(models, routing)
+    available_models = available_model_ids_for_routing(models, routing, agent=agent)
+    if requested_model is not None and any(
+        item.model_id == requested_model for item in models
+    ):
+        _require_model_runner_admission(agent, requested_model)
     try:
         return resolve_agent_selection(
             ResolutionRequest(
@@ -10750,12 +10926,26 @@ def classify_runtime_task(request: TaskClassificationRequest) -> TaskProfile:
 
 
 def available_model_ids_for_routing(
-    models: tuple[ModelPolicy, ...], routing: Mapping[str, Any] | None
+    models: tuple[ModelPolicy, ...],
+    routing: Mapping[str, Any] | None,
+    *,
+    agent: str,
 ) -> set[str]:
-    available = {item.model_id for item in models}
-    if routing is not None and routing.get("decision") != "spark":
-        available -= {item.model_id for item in models if item.family == "spark"}
-    return available
+    """Return only models with one positive current account/runner capability."""
+
+    del routing
+    descriptor = current_agent_inventory().agents.get(agent)
+    evidence = read_usage_evidence_v2(clock=lambda: _dt.datetime.now(_dt.timezone.utc))
+    return {
+        item.model_id
+        for item in models
+        if _model_runner_admission(
+            agent,
+            item.model_id,
+            descriptor=descriptor,
+            evidence=evidence,
+        ).allowed
+    }
 
 
 def public_task_profile(profile: TaskProfile) -> dict[str, Any]:
@@ -10897,7 +11087,7 @@ def agent_selection_options(
         allowed_class_ids.add("teamleiterin")
     classes = tuple(item for item in classes if item.class_id in allowed_class_ids)
     ensure_agent_not_blocked_by_codex_usage(agent)
-    available_models = available_model_ids_for_routing(models, None)
+    available_models = available_model_ids_for_routing(models, None, agent=agent)
     try:
         offer = build_selection_offer(
             classes=classes,
@@ -12629,6 +12819,45 @@ def start_agent(
                 )
 
 
+def _already_running_tmux_start_result(
+    agent: str,
+    session: str,
+    *,
+    replacement_reservation_id: str | None = None,
+) -> dict[str, Any]:
+    """Return the established session result without entering spawn preparation."""
+
+    if replacement_reservation_id is not None:
+        _raise_replacement_capacity_denied(
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "reason_codes": ["session_metrics_unavailable"],
+            }
+        )
+    process_summary = agent_home_process_summary(agent)
+    if process_summary["external_process_count"] is None:
+        raise AgentError(
+            f"agent {agent} CODEX_HOME process scan is unavailable; retry before starting"
+        )
+    if process_summary["external_process_count"]:
+        raise AgentError(
+            f"agent {agent} is already running in tmux, but CODEX_HOME is also used by "
+            f"{process_summary['external_process_count']} external process(es); stop the external process(es) first"
+        )
+    require_managed_tmux_session(agent, process_summary)
+    return {
+        "agent": agent,
+        "status": "already_running",
+        "backend": "tmux",
+        "session": session,
+        "pid": pane_pid(session),
+        "lease": agent_lease_status(agent),
+        "meta": public_agent_meta(read_meta(agent)),
+        "home_external_process_count": process_summary["external_process_count"],
+        "raw_output": "not_returned",
+    }
+
+
 def _start_agent_unlocked(
     agent: str,
     cwd: str | None = None,
@@ -12710,35 +12939,11 @@ def _start_agent_unlocked(
                 f"runner for agent {agent} must be a regular executable file"
             )
     if tmux_alive(session):
-        if replacement_reservation_id is not None:
-            _raise_replacement_capacity_denied(
-                {
-                    "error_code": "spawn_capacity_unavailable",
-                    "reason_codes": ["session_metrics_unavailable"],
-                }
-            )
-        process_summary = agent_home_process_summary(agent)
-        if process_summary["external_process_count"] is None:
-            raise AgentError(
-                f"agent {agent} CODEX_HOME process scan is unavailable; retry before starting"
-            )
-        if process_summary["external_process_count"]:
-            raise AgentError(
-                f"agent {agent} is already running in tmux, but CODEX_HOME is also used by "
-                f"{process_summary['external_process_count']} external process(es); stop the external process(es) first"
-            )
-        require_managed_tmux_session(agent, process_summary)
-        return {
-            "agent": agent,
-            "status": "already_running",
-            "backend": "tmux",
-            "session": session,
-            "pid": pane_pid(session),
-            "lease": agent_lease_status(agent),
-            "meta": public_agent_meta(read_meta(agent)),
-            "home_external_process_count": process_summary["external_process_count"],
-            "raw_output": "not_returned",
-        }
+        return _already_running_tmux_start_result(
+            agent,
+            session,
+            replacement_reservation_id=replacement_reservation_id,
+        )
 
     with spawn_admission_lock():
         if replacement_reservation_id is not None:
@@ -12901,6 +13106,11 @@ def _start_agent_unlocked(
         close_runner_execution_fd(agent)
         tmux_prefix = ["-L", g5_scope.socket_name]
         try:
+            _require_model_runner_admission(
+                agent,
+                effective_model,
+                descriptor=descriptor,
+            )
             cp = run_tmux(
                 [
                     *tmux_prefix,
@@ -12915,6 +13125,7 @@ def _start_agent_unlocked(
         except Exception:
             _cleanup_failed_g5_start(g5_runtime, g5_scope, raw_log)
             close_runner_execution_fd(agent)
+            release_start_lease_if_safe(agent, lease, release_lease_on_failure)
             raise
         if cp.returncode != 0:
             _cleanup_failed_g5_start(g5_runtime, g5_scope, raw_log)
@@ -14696,6 +14907,26 @@ def _start_agent_with_lease_unlocked(
         if confirm_home_refresh:
             raise AgentError("agent_home_refresh_not_supported_for_headless")
         return _start_headless_agent_unlocked(agent)
+    session = agent_config(agent)["session"]
+    if tmux_alive(session):
+        ollama_descriptor = _ollama_descriptor(agent)
+        if ollama_descriptor is not None:
+            auth_gate = {
+                "authenticated": True,
+                "provider": Provider.OLLAMA_LOCAL.value,
+                "state": "not_applicable",
+                "raw_output": "not_returned",
+            }
+        else:
+            auth_gate = require_authenticated_agent_for_mutation(
+                agent,
+                operation="agent_start",
+                allow_unauthenticated=allow_unauthenticated,
+            )
+        result = _already_running_tmux_start_result(agent, session)
+        result["auth_gate"] = auth_gate
+        result["selection"] = public_resolution_decision(None)
+        return result
     task_profile = classify_runtime_task(
         TaskClassificationRequest(
             objective="agent_start",
@@ -14729,6 +14960,7 @@ def _start_agent_with_lease_unlocked(
             authority_class,
         )
         selection = resolve_runtime_agent_selection(
+            agent=agent,
             role="arbeitsbiene",
             routing=None,
             task_profile=task_profile,
@@ -18154,6 +18386,7 @@ def _assign_agent_unlocked(
             authority_class,
         )
         selection = resolve_runtime_agent_selection(
+            agent=agent,
             role=role,
             routing=None,
             task_profile=task_profile,

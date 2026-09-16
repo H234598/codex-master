@@ -1,8 +1,10 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from the_hive.hive.types import TaskComplexity
+from the_hive.fleet_registry import RunnerKind
 from the_hive.agent_resolver import (
     AgentClassPolicy,
     ModelPolicy,
@@ -14,6 +16,11 @@ from the_hive.agent_resolver import (
 )
 from the_hive.hive.config import load_agent_class_catalog
 from the_hive.selection.model_policy import load_model_policy
+from the_hive.usage_snapshot import (
+    ModelInvocabilityProjectionV1,
+    ModelInvocabilityV1,
+    UsageEvidenceV2,
+)
 from the_hive.server import (
     AgentError,
     _main_cli_impl,
@@ -143,6 +150,51 @@ def runtime_profile(*, complexity_override: TaskComplexity | None = None, scope_
             root_cause_known=scope_kind == "write",
             complexity_override=complexity_override,
         )
+    )
+
+
+def runtime_model_invocability_evidence() -> UsageEvidenceV2:
+    observed_at = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+    return UsageEvidenceV2(
+        (),
+        "complete",
+        observed_at,
+        observed_at,
+        model_invocability=ModelInvocabilityProjectionV1(
+            "complete",
+            "pool_authority-v3.model_capabilities",
+            tuple(
+                ModelInvocabilityV1(
+                    "account-resolver",
+                    model_id,
+                    "codex_cli",
+                    True,
+                    True,
+                    True,
+                    True,
+                )
+                for model_id in (
+                    "gpt-5.3-codex-spark",
+                    "gpt-5.6-luna",
+                    "gpt-5.6-terra",
+                    "gpt-5.6-sol",
+                )
+            ),
+        ),
+    )
+
+
+def runtime_codex_inventory(*agents: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        agents={
+            agent: SimpleNamespace(
+                account_id="account-resolver",
+                runner=RunnerKind.CODEX_CLI,
+                series_prefix=agent[0],
+                skill_profile="teamleiterin" if agent.startswith("q") else "arbeitsbiene",
+            )
+            for agent in agents
+        }
     )
 
 
@@ -879,27 +931,35 @@ def test_legacy_codex_usage_main_model_is_normalized_to_luna_with_reason() -> No
     }
 
 
-def test_runtime_resolver_uses_task_complexity_after_codex_usage_account_gate() -> None:
-    simple = resolve_runtime_agent_selection(
-        role="arbeitsbiene",
-        routing={"decision": "spark", "model": "gpt-5.3-codex-spark"},
-        task_profile=runtime_profile(),
-    )
-    complex_job = resolve_runtime_agent_selection(
-        role="arbeitsbiene",
-        routing={"decision": "spark", "model": "gpt-5.3-codex-spark"},
-        task_profile=runtime_profile(complexity_override=TaskComplexity.COMPLEX),
-    )
-    no_spark = resolve_runtime_agent_selection(
-        role="arbeitsbiene",
-        routing={"decision": "main", "model": "gpt-5.6-luna"},
-        task_profile=runtime_profile(),
-    )
+def test_runtime_resolver_does_not_materialize_attested_spark_id_from_usage_routing() -> None:
+    inventory = runtime_codex_inventory("a1")
+    evidence = runtime_model_invocability_evidence()
+    with patch("the_hive.server.current_agent_inventory", return_value=inventory), patch(
+        "the_hive.server.read_usage_evidence_v2", return_value=evidence
+    ):
+        simple = resolve_runtime_agent_selection(
+            agent="a1",
+            role="arbeitsbiene",
+            routing={"decision": "spark", "model": "gpt-5.3-codex-spark"},
+            task_profile=runtime_profile(),
+        )
+        complex_job = resolve_runtime_agent_selection(
+            agent="a1",
+            role="arbeitsbiene",
+            routing={"decision": "spark", "model": "gpt-5.3-codex-spark"},
+            task_profile=runtime_profile(complexity_override=TaskComplexity.COMPLEX),
+        )
+        no_spark = resolve_runtime_agent_selection(
+            agent="a1",
+            role="arbeitsbiene",
+            routing={"decision": "main", "model": "gpt-5.6-luna"},
+            task_profile=runtime_profile(),
+        )
 
     assert (simple.class_id, simple.model, simple.reasoning) == (
         "arbeitsbiene",
-        "gpt-5.3-codex-spark",
-        "low",
+        "gpt-5.6-luna",
+        "medium",
     )
     assert (complex_job.class_id, complex_job.model, complex_job.reasoning) == (
         "spezialistin",
@@ -907,24 +967,24 @@ def test_runtime_resolver_uses_task_complexity_after_codex_usage_account_gate() 
         "high",
     )
     assert (no_spark.class_id, no_spark.model, no_spark.reasoning) == (
-        "arbeitsbiene",
-        "gpt-5.6-luna",
-        "medium",
+        "arbeitsbiene", "gpt-5.6-luna", "medium",
     )
+    assert "default_model_unavailable" in simple.reason_codes
     assert "default_model_unavailable" in no_spark.reason_codes
+    assert simple.fallback is True
     assert no_spark.fallback is True
 
 
 def test_selection_options_keeps_q_target_bound_to_requester_authority() -> None:
-    inventory = SimpleNamespace(
-        agents={"q1": SimpleNamespace(series_prefix="q", skill_profile="teamleiterin")},
-        agent_ids=("q1",),
-    )
+    inventory = runtime_codex_inventory("q1")
     with patch("the_hive.server.canonical_agent_id", return_value="q1"), patch(
         "the_hive.server.current_agent_inventory", return_value=inventory
     ), patch(
         "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
         return_value={"blocked": False},
+    ), patch(
+        "the_hive.server.read_usage_evidence_v2",
+        return_value=runtime_model_invocability_evidence(),
     ):
         offer = agent_selection_options("q1", requester_class="teamleiterin")
         unchanged = agent_selection_options(
@@ -941,15 +1001,15 @@ def test_selection_options_keeps_q_target_bound_to_requester_authority() -> None
 
 
 def test_selection_options_hides_teamlead_for_worker_authority() -> None:
-    inventory = SimpleNamespace(
-        agents={"q1": SimpleNamespace(series_prefix="q", skill_profile="teamleiterin")},
-        agent_ids=("q1",),
-    )
+    inventory = runtime_codex_inventory("q1")
     with patch("the_hive.server.canonical_agent_id", return_value="q1"), patch(
         "the_hive.server.current_agent_inventory", return_value=inventory
     ), patch(
         "the_hive.server.ensure_agent_not_blocked_by_codex_usage",
         return_value={"blocked": False},
+    ), patch(
+        "the_hive.server.read_usage_evidence_v2",
+        return_value=runtime_model_invocability_evidence(),
     ):
         offer = agent_selection_options("q1", requester_class="arbeitsbiene")
     assert "teamleiterin" not in offer["classes"]
@@ -1003,13 +1063,24 @@ def test_q_target_does_not_bind_leadership_from_series_metadata() -> None:
 
 
 def test_unbound_leadership_request_remains_filtered_by_principal_authority() -> None:
-    decision = resolve_runtime_agent_selection(
-        role="exploriererin",
-        routing={"decision": "main", "model": "gpt-5.6-sol"},
-        task_profile=runtime_profile(complexity_override=TaskComplexity.COMPLEX, scope_kind="read"),
-        requested_class="teamleiterin",
-        authority_class="teamleiterin",
-    )
+    with patch(
+        "the_hive.server.current_agent_inventory",
+        return_value=runtime_codex_inventory("a1"),
+    ), patch(
+        "the_hive.server.read_usage_evidence_v2",
+        return_value=runtime_model_invocability_evidence(),
+    ):
+        decision = resolve_runtime_agent_selection(
+            agent="a1",
+            role="exploriererin",
+            routing={"decision": "main", "model": "gpt-5.6-sol"},
+            task_profile=runtime_profile(
+                complexity_override=TaskComplexity.COMPLEX,
+                scope_kind="read",
+            ),
+            requested_class="teamleiterin",
+            authority_class="teamleiterin",
+        )
     assert decision.class_id != "teamleiterin"
     assert decision.model != "gpt-5.6-sol"
     assert decision.fallback is True
@@ -1017,26 +1088,42 @@ def test_unbound_leadership_request_remains_filtered_by_principal_authority() ->
 
 
 def test_runtime_missing_class_auto_selects_specialist_for_complex_teamlead_work() -> None:
-    decision = resolve_runtime_agent_selection(
-        role="arbeitsbiene",
-        routing={"decision": "main", "model": "gpt-5.6-luna"},
-        task_profile=runtime_profile(complexity_override=TaskComplexity.COMPLEX),
-        requested_class=None,
-        authority_class="teamleiterin",
-    )
+    with patch(
+        "the_hive.server.current_agent_inventory",
+        return_value=runtime_codex_inventory("a1"),
+    ), patch(
+        "the_hive.server.read_usage_evidence_v2",
+        return_value=runtime_model_invocability_evidence(),
+    ):
+        decision = resolve_runtime_agent_selection(
+            agent="a1",
+            role="arbeitsbiene",
+            routing={"decision": "main", "model": "gpt-5.6-luna"},
+            task_profile=runtime_profile(complexity_override=TaskComplexity.COMPLEX),
+            requested_class=None,
+            authority_class="teamleiterin",
+        )
 
     assert decision.class_id == "spezialistin"
     assert "class_auto_selected" in decision.reason_codes
 
 
 def test_bound_teamlead_selection_keeps_persistent_terra_xhigh_defaults() -> None:
-    decision = resolve_runtime_agent_selection(
-        role="arbeitsbiene",
-        routing={"decision": "main", "model": "gpt-5.6-sol"},
-        task_profile=runtime_profile(),
-        requested_class="teamleiterin",
-        authority_class=None,
-    )
+    with patch(
+        "the_hive.server.current_agent_inventory",
+        return_value=runtime_codex_inventory("a1"),
+    ), patch(
+        "the_hive.server.read_usage_evidence_v2",
+        return_value=runtime_model_invocability_evidence(),
+    ):
+        decision = resolve_runtime_agent_selection(
+            agent="a1",
+            role="arbeitsbiene",
+            routing={"decision": "main", "model": "gpt-5.6-sol"},
+            task_profile=runtime_profile(),
+            requested_class="teamleiterin",
+            authority_class=None,
+        )
     assert (decision.class_id, decision.lifecycle, decision.model, decision.reasoning) == (
         "teamleiterin",
         "persistent",

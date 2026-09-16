@@ -506,6 +506,230 @@ def _rebind_payload_and_authority(
     refresh_current_binding(paths)
 
 
+def _model_capability_entry(**overrides: object) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "account_id": "synthetic-alpha",
+        "catalog_fresh_until": "2026-08-31T12:15:00Z",
+        "catalog_observed_at": "2026-08-31T12:00:00Z",
+        "catalog_visible": True,
+        "meter_visible": True,
+        "model_id": "gpt-5.3-codex-spark",
+        "runner_id": "codex_cli",
+        "runner_invocable": True,
+        "supported_in_api": True,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _rebind_model_invocability(
+    paths: dict[str, Path], projection: object
+) -> None:
+    """Bind a V3 model-capability projection through the real generation chain."""
+    authority = json.loads(paths["authority"].read_text(encoding="utf-8"))
+    authority["pool_authority_schema_version"] = 3
+    authority["model_capabilities"] = projection
+    _write_json(paths["authority"], authority)
+    refresh_current_binding(paths)
+
+    binding = json.loads(paths["binding"].read_text(encoding="utf-8"))
+    authority["usage_binding_sha256"] = digest(canonical(binding["usage_binding"]))
+    _write_json(paths["authority"], authority)
+    refresh_current_binding(paths)
+
+
+def _model_invocability_projection(*entries: object) -> dict[str, object]:
+    return {"capability_schema_version": 1, "entries": list(entries)}
+
+
+def test_06537_model_invocability_is_unattested_without_bound_v3_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, _paths = write_producer_golden(tmp_path, monkeypatch)
+
+    evidence = read_golden(state_home)
+
+    assert evidence.status == "complete"
+    assert evidence.model_invocability.status == "unattested"
+    assert evidence.model_invocability.capabilities == ()
+    assert (
+        usage_snapshot.find_model_invocability(
+            evidence,
+            account_id="synthetic-alpha",
+            model_id="gpt-5.3-codex-spark",
+            runner_id="codex_cli",
+        )
+        is None
+    )
+
+
+def test_06537_bound_native_model_capability_preserves_usage_display(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    payload = _payload_with_complete_evidence(paths)
+    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))["authorities"]
+    _rebind_payload_and_authority(paths, payload, authorities)
+    _rebind_model_invocability(
+        paths, _model_invocability_projection(_model_capability_entry())
+    )
+
+    evidence = read_golden(state_home)
+    capability = usage_snapshot.find_model_invocability(
+        evidence,
+        account_id="synthetic-alpha",
+        model_id="gpt-5.3-codex-spark",
+        runner_id="codex_cli",
+    )
+    display = usage_snapshot.display_snapshot_from_evidence(
+        evidence, known_account_ids=frozenset({"synthetic-alpha"})
+    )
+
+    assert evidence.status == "complete"
+    assert evidence.model_invocability.status == "complete"
+    assert capability == usage_snapshot.ModelInvocabilityV1(
+        "synthetic-alpha",
+        "gpt-5.3-codex-spark",
+        "codex_cli",
+        True,
+        True,
+        True,
+        True,
+    )
+    assert display.source == "live"
+    assert tuple(limit.pool for limit in display.accounts[0].limits) == ("main", "spark")
+
+
+def test_06537_positive_interactive_codex_cli_capability_keeps_api_state_separate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    _rebind_model_invocability(
+        paths,
+        _model_invocability_projection(
+            _model_capability_entry(supported_in_api=False, runner_invocable=True)
+        ),
+    )
+
+    capability = usage_snapshot.find_model_invocability(
+        read_golden(state_home),
+        account_id="synthetic-alpha",
+        model_id="gpt-5.3-codex-spark",
+        runner_id="codex_cli",
+    )
+
+    assert capability is not None
+    assert capability.runner_id == "codex_cli"
+    assert capability.catalog_visible is True
+    assert capability.supported_in_api is False
+    assert capability.runner_invocable is True
+
+
+def test_06537_meter_only_model_evidence_never_attests_catalog_or_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    _rebind_model_invocability(
+        paths,
+        _model_invocability_projection(
+            _model_capability_entry(
+                catalog_visible=False,
+                supported_in_api=False,
+                runner_invocable=False,
+            )
+        ),
+    )
+
+    capability = usage_snapshot.find_model_invocability(
+        read_golden(state_home),
+        account_id="synthetic-alpha",
+        model_id="gpt-5.3-codex-spark",
+        runner_id="codex_cli",
+    )
+
+    assert capability is not None
+    assert capability.meter_visible is True
+    assert capability.catalog_visible is False
+    assert capability.runner_invocable is False
+
+
+def test_06537_extreme_model_capability_timestamp_is_locally_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    payload = _payload_with_complete_evidence(paths)
+    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))["authorities"]
+    _rebind_payload_and_authority(paths, payload, authorities)
+    _rebind_model_invocability(
+        paths,
+        _model_invocability_projection(
+            _model_capability_entry(
+                catalog_observed_at="9999-12-31T23:50:00Z",
+                catalog_fresh_until="9999-12-31T23:59:59Z",
+            )
+        ),
+    )
+
+    evidence = read_golden(state_home)
+    display = usage_snapshot.display_snapshot_from_evidence(
+        evidence, known_account_ids=frozenset({"synthetic-alpha"})
+    )
+
+    assert evidence.status == "complete"
+    assert evidence.model_invocability.status == "invalid"
+    assert evidence.model_invocability.capabilities == ()
+    assert display.source == "live"
+    assert tuple(limit.pool for limit in display.accounts[0].limits) == ("main", "spark")
+
+
+@pytest.mark.parametrize(
+    "projection",
+    (
+        {"capability_schema_version": 1, "entries": [{"account_id": "synthetic-alpha"}]},
+        _model_invocability_projection(
+            _model_capability_entry(), _model_capability_entry()
+        ),
+        _model_invocability_projection(
+            _model_capability_entry(catalog_visible=False)
+        ),
+        _model_invocability_projection(
+            _model_capability_entry(
+                catalog_observed_at="2026-08-31T11:46:00Z",
+                catalog_fresh_until="2026-08-31T12:01:00Z",
+            )
+        ),
+        _model_invocability_projection(
+            _model_capability_entry(visibility="list")
+        ),
+    ),
+)
+def test_06537_malformed_duplicate_contradictory_stale_or_visibility_only_model_evidence_is_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    projection: object,
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    _rebind_model_invocability(paths, projection)
+
+    evidence = read_golden(state_home)
+
+    assert evidence.status == "complete"
+    assert evidence.model_invocability.status in {"invalid", "stale"}
+    assert evidence.model_invocability.capabilities == ()
+    assert (
+        usage_snapshot.find_model_invocability(
+            evidence,
+            account_id="synthetic-alpha",
+            model_id="gpt-5.3-codex-spark",
+            runner_id="codex_cli",
+        )
+        is None
+    )
+    assert usage_snapshot.display_snapshot_from_evidence(
+        evidence, known_account_ids=frozenset({"synthetic-alpha"})
+    ).source == "live"
+
+
 def test_06537_missing_entrypoint_record_row_after_rebinding_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

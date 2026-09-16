@@ -31,6 +31,7 @@ _MAX_LIMITS = 32
 _MAX_TRENDS = 32
 _MAX_TOTAL_TRENDS = 3200
 _MAX_POOL_AUTHORITIES = 256
+_MAX_MODEL_CAPABILITIES = 512
 _MAX_ATTESTATION_FILE_BYTES = 4 * 1024 * 1024
 _MAX_RELEASE_TREE_ENTRIES = 4096
 _MAX_RELEASE_TREE_BYTES = 128 * 1024 * 1024
@@ -46,6 +47,7 @@ _AUTHORITY_POOL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _MODEL_FAMILY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+_MODEL_INVOCABILITY_SOURCE = "pool_authority-v3.model_capabilities"
 _LIFECYCLES = frozenset(("ephemeral", "session", "persistent"))
 _PAYLOAD_STATUSES = frozenset(("ok", "partial", "error", "login_required", "unknown"))
 _TRACKER_COVERAGES = frozenset(("complete", "partial", "insufficient", "stale"))
@@ -189,6 +191,36 @@ class AccountUsageEvidenceV2:
     tracker_evidence: tuple[TrackerEvidenceV2, ...]
 
 
+ModelInvocabilityStatus = Literal["complete", "unattested", "invalid", "stale"]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelInvocabilityV1:
+    """One account/model/runner capability from a bound catalog projection."""
+
+    account_id: str
+    model_id: str
+    runner_id: str
+    meter_visible: bool
+    catalog_visible: bool
+    supported_in_api: bool
+    runner_invocable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ModelInvocabilityProjectionV1:
+    """Bound model capability evidence, kept separate from usage display evidence."""
+
+    status: ModelInvocabilityStatus
+    source: str
+    capabilities: tuple[ModelInvocabilityV1, ...]
+
+
+_UNATTESTED_MODEL_INVOCABILITY = ModelInvocabilityProjectionV1(
+    "unattested", _MODEL_INVOCABILITY_SOURCE, ()
+)
+
+
 @dataclass(frozen=True, slots=True)
 class UsageEvidenceV2:
     accounts: tuple[AccountUsageEvidenceV2, ...]
@@ -196,6 +228,9 @@ class UsageEvidenceV2:
     captured_at: datetime | None
     generated_at: datetime | None
     pool_authorities: tuple["PoolAuthorityV2", ...] = ()
+    model_invocability: ModelInvocabilityProjectionV1 = (
+        _UNATTESTED_MODEL_INVOCABILITY
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +269,7 @@ class _PoolAuthorityProjectionV2:
     release_id: str
     usage_binding_sha256: str
     usage_payload_sha256: str
+    model_invocability: ModelInvocabilityProjectionV1
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +279,7 @@ class _ValidatedGenerationV2:
     captured_at: datetime | None
     generated_at: datetime
     authorities: tuple[PoolAuthorityV2, ...]
+    model_invocability: ModelInvocabilityProjectionV1
     binding: _EvidenceBindingV2
 
 
@@ -707,25 +744,173 @@ def _binding_v2(payload: bytes) -> _EvidenceBindingV2:
     )
 
 
-def _pool_authority_v2(payload: bytes) -> _PoolAuthorityProjectionV2:
-    value = _canonical_json(payload, _MAX_POOL_AUTHORITY_BYTES)
-    _exact(
-        value,
-        {
-            "authorities",
-            "expires_at",
-            "generation_id",
-            "issued_at",
-            "pool_authority_schema_version",
-            "producer_version",
-            "release_id",
-            "usage_binding_sha256",
-            "usage_payload_sha256",
-        },
+def _invalid_model_invocability() -> ModelInvocabilityProjectionV1:
+    return ModelInvocabilityProjectionV1(
+        "invalid", _MODEL_INVOCABILITY_SOURCE, ()
     )
+
+
+def _model_invocability_v1(
+    value: object, *, issued_at: datetime, now: datetime
+) -> ModelInvocabilityProjectionV1:
+    """Parse only a bound V3 capability projection; never infer a capability."""
+    try:
+        if type(value) is not dict:
+            raise _Invalid()
+        _exact(value, {"capability_schema_version", "entries"})
+        if (
+            type(value["capability_schema_version"]) is not int
+            or value["capability_schema_version"] != 1
+            or type(value["entries"]) is not list
+            or len(value["entries"]) > _MAX_MODEL_CAPABILITIES
+        ):
+            raise _Invalid()
+        capabilities: list[ModelInvocabilityV1] = []
+        canonical_entries: list[dict[str, object]] = []
+        keys: list[tuple[str, str, str]] = []
+        stale = False
+        for raw in value["entries"]:
+            if type(raw) is not dict:
+                raise _Invalid()
+            _exact(
+                raw,
+                {
+                    "account_id",
+                    "catalog_fresh_until",
+                    "catalog_observed_at",
+                    "catalog_visible",
+                    "meter_visible",
+                    "model_id",
+                    "runner_id",
+                    "runner_invocable",
+                    "supported_in_api",
+                },
+            )
+            account_id = raw["account_id"]
+            if (
+                type(account_id) is not str
+                or account_id in {".", ".."}
+                or _ACCOUNT_RE.fullmatch(account_id) is None
+                or any(
+                    type(raw[field]) is not bool
+                    for field in (
+                        "meter_visible",
+                        "catalog_visible",
+                        "supported_in_api",
+                        "runner_invocable",
+                    )
+                )
+            ):
+                raise _Invalid()
+            model_id = _payload_token(raw["model_id"], 128)
+            runner_id = _payload_token(raw["runner_id"], 64)
+            observed_at = _canonical_timestamp(raw["catalog_observed_at"])
+            fresh_until = _canonical_timestamp(raw["catalog_fresh_until"])
+            try:
+                expected_fresh_until = observed_at + timedelta(minutes=15)
+            except OverflowError:
+                return _invalid_model_invocability()
+            if (
+                observed_at > issued_at
+                or fresh_until != expected_fresh_until
+                or issued_at >= fresh_until
+            ):
+                raise _Invalid()
+            catalog_visible = raw["catalog_visible"]
+            supported_in_api = raw["supported_in_api"]
+            runner_invocable = raw["runner_invocable"]
+            if not catalog_visible and (supported_in_api or runner_invocable):
+                raise _Invalid()
+            key = (account_id, model_id, runner_id)
+            keys.append(key)
+            canonical_entries.append(
+                {
+                    "account_id": account_id,
+                    "catalog_fresh_until": fresh_until.isoformat().replace(
+                        "+00:00", "Z"
+                    ),
+                    "catalog_observed_at": observed_at.isoformat().replace(
+                        "+00:00", "Z"
+                    ),
+                    "catalog_visible": catalog_visible,
+                    "meter_visible": raw["meter_visible"],
+                    "model_id": model_id,
+                    "runner_id": runner_id,
+                    "runner_invocable": runner_invocable,
+                    "supported_in_api": supported_in_api,
+                }
+            )
+            capabilities.append(
+                ModelInvocabilityV1(
+                    account_id,
+                    model_id,
+                    runner_id,
+                    raw["meter_visible"],
+                    catalog_visible,
+                    supported_in_api,
+                    runner_invocable,
+                )
+            )
+            if now >= fresh_until:
+                stale = True
+        if len(set(keys)) != len(keys) or keys != sorted(keys):
+            raise _Invalid()
+        _scan_payload_secrets(
+            {
+                "capability_schema_version": 1,
+                "entries": canonical_entries,
+            }
+        )
+    except _Invalid:
+        return _invalid_model_invocability()
+    return ModelInvocabilityProjectionV1(
+        "stale" if stale else "complete",
+        _MODEL_INVOCABILITY_SOURCE,
+        () if stale else tuple(capabilities),
+    )
+
+
+def _pool_authority_v2(
+    payload: bytes, *, now: datetime
+) -> _PoolAuthorityProjectionV2:
+    value = _canonical_json(payload, _MAX_POOL_AUTHORITY_BYTES)
+    schema_version = value.get("pool_authority_schema_version")
+    if schema_version == 2:
+        _exact(
+            value,
+            {
+                "authorities",
+                "expires_at",
+                "generation_id",
+                "issued_at",
+                "pool_authority_schema_version",
+                "producer_version",
+                "release_id",
+                "usage_binding_sha256",
+                "usage_payload_sha256",
+            },
+        )
+    elif schema_version == 3:
+        _exact(
+            value,
+            {
+                "authorities",
+                "expires_at",
+                "generation_id",
+                "issued_at",
+                "model_capabilities",
+                "pool_authority_schema_version",
+                "producer_version",
+                "release_id",
+                "usage_binding_sha256",
+                "usage_payload_sha256",
+            },
+        )
+    else:
+        raise _Invalid()
     if (
         type(value["pool_authority_schema_version"]) is not int
-        or value["pool_authority_schema_version"] != 2
+        or value["pool_authority_schema_version"] not in {2, 3}
         or value["producer_version"] != "0.6.537"
         or type(value["authorities"]) is not list
         or len(value["authorities"]) > _MAX_POOL_AUTHORITIES
@@ -836,12 +1021,19 @@ def _pool_authority_v2(payload: bytes) -> _PoolAuthorityProjectionV2:
             "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
             "generation_id": value["generation_id"],
             "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
-            "pool_authority_schema_version": 2,
+            "pool_authority_schema_version": schema_version,
             "producer_version": "0.6.537",
             "release_id": value["release_id"],
             "usage_binding_sha256": value["usage_binding_sha256"],
             "usage_payload_sha256": value["usage_payload_sha256"],
         }
+    )
+    model_invocability = (
+        _UNATTESTED_MODEL_INVOCABILITY
+        if schema_version == 2
+        else _model_invocability_v1(
+            value["model_capabilities"], issued_at=issued_at, now=now
+        )
     )
     return _PoolAuthorityProjectionV2(
         authorities=tuple(authorities),
@@ -851,6 +1043,7 @@ def _pool_authority_v2(payload: bytes) -> _PoolAuthorityProjectionV2:
         release_id=_release_id(value["release_id"]),
         usage_binding_sha256=_hex(value["usage_binding_sha256"]),
         usage_payload_sha256=_hex(value["usage_payload_sha256"]),
+        model_invocability=model_invocability,
     )
 
 
@@ -2292,7 +2485,7 @@ def _validate_generation_v2(
         _MAX_POOL_AUTHORITY_BYTES,
         missing_is_unavailable=True,
     )
-    authority = _pool_authority_v2(authority_bytes)
+    authority = _pool_authority_v2(authority_bytes, now=now)
     if (
         len(authority_bytes) != binding.pool_authority_size_bytes
         or hashlib.sha256(authority_bytes).hexdigest() != binding.pool_authority_sha256
@@ -2314,12 +2507,19 @@ def _validate_generation_v2(
         raise _Invalid()
     if now >= authority.expires_at:
         status = "stale"
+    model_invocability = authority.model_invocability
+    if model_invocability.status == "complete" and any(
+        capability.account_id not in {account.account_id for account in accounts}
+        for capability in model_invocability.capabilities
+    ):
+        model_invocability = _invalid_model_invocability()
     return _ValidatedGenerationV2(
         accounts,
         status,
         captured_at,
         generated_at,
         authority.authorities,
+        model_invocability,
         binding,
     )
 
@@ -2332,6 +2532,7 @@ def _read_chain_v2(
     datetime | None,
     datetime,
     tuple[PoolAuthorityV2, ...],
+    ModelInvocabilityProjectionV1,
 ]:
     if type(state_home) is not type(Path()) or not state_home.is_absolute():
         raise _Invalid()
@@ -2440,6 +2641,7 @@ def _read_chain_v2(
             current.captured_at,
             current.generated_at,
             current.authorities,
+            current.model_invocability,
         )
     finally:
         for descriptor in reversed(locked):
@@ -2523,16 +2725,60 @@ def read_usage_evidence_v2(
     """Read one V2 generation; no retry, fallback, cache, process, or mutation."""
     try:
         now = _clock(clock or (lambda: datetime.now(UTC)))
-        accounts, status, captured_at, generated_at, authorities = _read_chain_v2(
+        (
+            accounts,
+            status,
+            captured_at,
+            generated_at,
+            authorities,
+            model_invocability,
+        ) = _read_chain_v2(
             state_home or _default_state_home(), now
         )
-        return UsageEvidenceV2(accounts, status, captured_at, generated_at, authorities)
+        return UsageEvidenceV2(
+            accounts,
+            status,
+            captured_at,
+            generated_at,
+            authorities,
+            model_invocability,
+        )
     except _Busy:
         return UsageEvidenceV2((), "busy", None, None)
     except _Unavailable:
         return UsageEvidenceV2((), "unavailable", None, None)
     except Exception:
         return UsageEvidenceV2((), "invalid", None, None)
+
+
+def find_model_invocability(
+    evidence: UsageEvidenceV2,
+    *,
+    account_id: str,
+    model_id: str,
+    runner_id: str,
+) -> ModelInvocabilityV1 | None:
+    """Return one complete bound capability; never synthesize a negative or positive."""
+    if (
+        type(evidence) is not UsageEvidenceV2
+        or evidence.status != "complete"
+        or evidence.model_invocability.status != "complete"
+        or not all(
+            type(value) is str and value
+            for value in (account_id, model_id, runner_id)
+        )
+    ):
+        return None
+    matches = tuple(
+        capability
+        for capability in evidence.model_invocability.capabilities
+        if (
+            capability.account_id == account_id
+            and capability.model_id == model_id
+            and capability.runner_id == runner_id
+        )
+    )
+    return matches[0] if len(matches) == 1 else None
 
 
 def display_snapshot_from_evidence(
@@ -2577,6 +2823,9 @@ def display_snapshot_from_evidence(
 __all__ = [
     "AccountUsage",
     "AccountUsageEvidenceV2",
+    "ModelInvocabilityProjectionV1",
+    "ModelInvocabilityStatus",
+    "ModelInvocabilityV1",
     "PoolAuthorityV2",
     "ReaderStatus",
     "TrackerEvidenceV2",
@@ -2588,5 +2837,6 @@ __all__ = [
     "UsageSnapshot",
     "UsageTrendV2",
     "display_snapshot_from_evidence",
+    "find_model_invocability",
     "read_usage_evidence_v2",
 ]

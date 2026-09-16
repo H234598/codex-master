@@ -58,6 +58,8 @@ from the_hive.resource_monitor import (
 from the_hive.selection.task_classification import TaskClassificationRequest, TaskClassifier
 from the_hive.usage_snapshot import (
     AccountUsageEvidenceV2,
+    ModelInvocabilityProjectionV1,
+    ModelInvocabilityV1,
     TrackerEvidenceV2,
     UsageEvidenceV2,
     UsageLimitV2,
@@ -18125,36 +18127,49 @@ google_accounts:
                 )
 
     def test_runtime_selection_filters_leadership_spoofing_by_bound_authority(self) -> None:
-        for authority_class, expected_class in (
-            ("arbeitsbiene", "arbeitsbiene"),
-            ("teamleiterin", "spezialistin"),
+        available_models = {
+            "gpt-5.3-codex-spark",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+        }
+        with patch.object(
+            server_module,
+            "available_model_ids_for_routing",
+            return_value=available_models,
         ):
-            for spoofed_class in ("teamleiterin", "koenigin", "gottbiene"):
-                with self.subTest(
-                    authority_class=authority_class,
-                    spoofed_class=spoofed_class,
-                ):
-                    decision = server_module.resolve_runtime_agent_selection(
-                        role="arbeitsbiene",
-                        routing=None,
-                        task_profile=complex_task_profile(),
-                        requested_class=spoofed_class,
+            for authority_class, expected_class in (
+                ("arbeitsbiene", "arbeitsbiene"),
+                ("teamleiterin", "spezialistin"),
+            ):
+                for spoofed_class in ("teamleiterin", "koenigin", "gottbiene"):
+                    with self.subTest(
                         authority_class=authority_class,
-                    )
+                        spoofed_class=spoofed_class,
+                    ):
+                        decision = server_module.resolve_runtime_agent_selection(
+                            agent="a1",
+                            role="arbeitsbiene",
+                            routing=None,
+                            task_profile=complex_task_profile(),
+                            requested_class=spoofed_class,
+                            authority_class=authority_class,
+                        )
 
-                    self.assertEqual(decision.class_id, expected_class)
-                    self.assertNotIn(
-                        decision.class_id,
-                        {"teamleiterin", "koenigin", "gottbiene"},
-                    )
+                        self.assertEqual(decision.class_id, expected_class)
+                        self.assertNotIn(
+                            decision.class_id,
+                            {"teamleiterin", "koenigin", "gottbiene"},
+                        )
 
-        permitted = server_module.resolve_runtime_agent_selection(
-            role="arbeitsbiene",
-            routing=None,
-            task_profile=complex_task_profile(),
-            requested_class="spezialistin",
-            authority_class="teamleiterin",
-        )
+            permitted = server_module.resolve_runtime_agent_selection(
+                agent="a1",
+                role="arbeitsbiene",
+                routing=None,
+                task_profile=complex_task_profile(),
+                requested_class="spezialistin",
+                authority_class="teamleiterin",
+            )
         self.assertEqual(permitted.class_id, "spezialistin")
 
     def test_q_series_does_not_imply_teamleader_selection(self) -> None:
@@ -18171,22 +18186,44 @@ google_accounts:
 
         self.assertIsNone(target_class)
         self.assertEqual(authority_class, "koenigin")
-        decision = server_module.resolve_runtime_agent_selection(
-            role="exploriererin",
-            routing=None,
-            task_profile=complex_task_profile(),
-            requested_class=target_class,
-            authority_class=authority_class,
-        )
+        with patch.object(
+            server_module,
+            "available_model_ids_for_routing",
+            return_value={
+                "gpt-5.3-codex-spark",
+                "gpt-5.6-luna",
+                "gpt-5.6-terra",
+                "gpt-5.6-sol",
+            },
+        ):
+            decision = server_module.resolve_runtime_agent_selection(
+                agent="q1",
+                role="exploriererin",
+                routing=None,
+                task_profile=complex_task_profile(),
+                requested_class=target_class,
+                authority_class=authority_class,
+            )
         self.assertEqual(decision.class_id, "spezialistin")
 
     def test_trusted_internal_runtime_selection_keeps_explicit_gottbiene(self) -> None:
-        decision = server_module.resolve_runtime_agent_selection(
-            role="arbeitsbiene",
-            routing=None,
-            task_profile=complex_task_profile(),
-            requested_class="gottbiene",
-        )
+        with patch.object(
+            server_module,
+            "available_model_ids_for_routing",
+            return_value={
+                "gpt-5.3-codex-spark",
+                "gpt-5.6-luna",
+                "gpt-5.6-terra",
+                "gpt-5.6-sol",
+            },
+        ):
+            decision = server_module.resolve_runtime_agent_selection(
+                agent="a1",
+                role="arbeitsbiene",
+                routing=None,
+                task_profile=complex_task_profile(),
+                requested_class="gottbiene",
+            )
 
         self.assertEqual(
             (decision.class_id, decision.lifecycle, decision.model, decision.reasoning),
@@ -25310,6 +25347,19 @@ google_accounts:
     @patch("the_hive.server.tmux_alive", return_value=False)
     @patch("the_hive.server.start_agent")
     def test_start_agent_with_lease_releases_fresh_successful_start(self, mock_start_agent, _mock_tmux_alive) -> None:
+        selection = SimpleNamespace(
+            class_id="arbeitsbiene",
+            lifecycle="persistent",
+            model=DEFAULT_AGENT_MODEL,
+            reasoning=DEFAULT_AGENT_MODEL_EFFORT,
+            reason_codes=(),
+            fallback=False,
+            requested_class=None,
+            requested_lifecycle=None,
+            requested_model=None,
+            requested_reasoning=None,
+        )
+
         def fake_start(agent, cwd=None, prompt=None, lease=None, release_lease_on_failure=False, **kwargs):
             return {
                 "agent": agent,
@@ -25329,6 +25379,8 @@ google_accounts:
                 "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
                 "the_hive.server.LEASE_DIR", state / "leases"
+            ), patch(
+                "the_hive.server.resolve_runtime_agent_selection", return_value=selection
             ):
                 with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     result = start_agent_with_lease("a", "/tmp/work", "hi", allow_unauthenticated=True)
@@ -25341,6 +25393,12 @@ google_accounts:
         self.assertEqual(next_claim["status"], "claimed")
 
     def test_start_agent_with_lease_keeps_claim_when_start_fails_with_home_process(self) -> None:
+        selection = SimpleNamespace(
+            class_id="arbeitsbiene",
+            lifecycle="persistent",
+            model=DEFAULT_AGENT_MODEL,
+            reasoning=DEFAULT_AGENT_MODEL_EFFORT,
+        )
         with patch.dict(
             "the_hive.server.AGENTS",
             {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
@@ -25358,7 +25416,9 @@ google_accounts:
         ), patch("the_hive.server.start_agent", side_effect=AgentError("tmux pipe-pane failed")), patch(
             "the_hive.server.agent_home_process_summary",
             return_value={"process_count": 1, "external_process_count": 1, "managed_process_count": 0},
-        ), patch("the_hive.server.release_agent") as mock_release:
+        ), patch("the_hive.server.release_agent") as mock_release, patch(
+            "the_hive.server.resolve_runtime_agent_selection", return_value=selection
+        ):
             with self.assertRaisesRegex(AgentError, "tmux pipe-pane failed"):
                 start_agent_with_lease("a1", allow_unauthenticated=True)
 
@@ -25367,6 +25427,19 @@ google_accounts:
     @patch("the_hive.server.tmux_alive", return_value=False)
     @patch("the_hive.server.start_agent")
     def test_start_agent_with_lease_keeps_existing_same_client_claim(self, mock_start_agent, _mock_tmux_alive) -> None:
+        selection = SimpleNamespace(
+            class_id="arbeitsbiene",
+            lifecycle="persistent",
+            model=DEFAULT_AGENT_MODEL,
+            reasoning=DEFAULT_AGENT_MODEL_EFFORT,
+            reason_codes=(),
+            fallback=False,
+            requested_class=None,
+            requested_lifecycle=None,
+            requested_model=None,
+            requested_reasoning=None,
+        )
+
         def fake_start(agent, cwd=None, prompt=None, lease=None, release_lease_on_failure=False, **kwargs):
             return {
                 "agent": agent,
@@ -25386,6 +25459,8 @@ google_accounts:
                 "the_hive.server.LOCK_DIR", state / "locks"
             ), patch(
                 "the_hive.server.LEASE_DIR", state / "leases"
+            ), patch(
+                "the_hive.server.resolve_runtime_agent_selection", return_value=selection
             ):
                 with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
@@ -25398,91 +25473,138 @@ google_accounts:
         self.assertEqual(result["lease"]["holder"], "this_server")
         self.assertFalse(mock_start_agent.call_args.kwargs["release_lease_on_failure"])
 
-    @patch("the_hive.server.tmux_alive", return_value=True)
-    @patch("the_hive.server.start_agent")
-    def test_start_agent_with_lease_blocks_running_foreign_lease(self, mock_start_agent, _mock_tmux_alive) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            state = root / "state"
-            with patch("the_hive.server.STATE_ROOT", state), patch(
-                "the_hive.server.RAW_DIR", state / "raw"
-            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
-                "the_hive.server.LOCK_DIR", state / "locks"
-            ), patch(
-                "the_hive.server.LEASE_DIR", state / "leases"
-            ):
-                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-one"):
-                    claim_agent("b", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                with patch("the_hive.server.SERVER_INSTANCE_ID", "owner-two"):
-                    with self.assertRaises(AgentBusyError) as caught:
-                        start_agent_with_lease("b", "/tmp/work", "hi", allow_unauthenticated=True)
-
-        self.assertEqual(caught.exception.payload["error_code"], "agent_lease_held_by_other_client")
-        self.assertEqual(caught.exception.payload["lease"]["holder"], "other_server")
-        self.assertEqual(caught.exception.payload["raw_output"], "not_returned")
-        mock_start_agent.assert_not_called()
-
-    @patch("the_hive.server.start_agent")
-    @patch("the_hive.server.claim_agent")
-    @patch("the_hive.server.tmux_alive", return_value=True)
-    def test_start_agent_with_lease_rejects_running_model_mismatch(
-        self, _mock_alive, mock_claim, mock_start_agent
-    ) -> None:
-        mock_claim.return_value = {
-            "status": "renewed",
-            "lease": {"held_by_this_server": True},
-        }
-        mock_start_agent.return_value = {
-            "agent": "a",
-            "status": "already_running",
-            "meta": {
-                "model": WRITE_AGENT_MODEL,
-                "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
-            },
+    def test_start_agent_with_lease_returns_running_session_before_claim_or_selection(self) -> None:
+        inventory = SimpleNamespace(
+            agents={
+                "a1": SimpleNamespace(
+                    account_id="account-d204",
+                    runner=server_module.RunnerKind.CODEX_CLI,
+                    provider=server_module.Provider.OPENAI_CHATGPT,
+                )
+            }
+        )
+        process_summary = {
+            "external_process_count": 0,
+            "managed_process_count": 1,
             "raw_output": "not_returned",
         }
+        lease = {"state": "held", "held_by_this_server": True}
+        with contextlib.ExitStack() as patch_stack:
+            patch_stack.enter_context(
+                patch("the_hive.server.require_resource_capacity_preflight")
+            )
+            patch_stack.enter_context(
+                patch("the_hive.server.require_fleet_recovery_ready")
+            )
+            patch_stack.enter_context(
+                patch("the_hive.server.canonical_agent_id", return_value="a1")
+            )
+            patch_stack.enter_context(
+                patch(
+                    "the_hive.server.agent_lifecycle_lock",
+                    return_value=contextlib.nullcontext(),
+                )
+            )
+            patch_stack.enter_context(
+                patch(
+                    "the_hive.server.hive_capacity_probe_guard",
+                    return_value=contextlib.nullcontext(),
+                )
+            )
+            patch_stack.enter_context(
+                patch(
+                    "the_hive.server._resource_gate_composer_scope",
+                    return_value=contextlib.nullcontext(),
+                )
+            )
+            patch_stack.enter_context(
+                patch("the_hive.server.current_agent_inventory", return_value=inventory)
+            )
+            patch_stack.enter_context(
+                patch("the_hive.server._headless_descriptor", return_value=None)
+            )
+            patch_stack.enter_context(
+                patch(
+                    "the_hive.server.agent_config",
+                    return_value={"session": "a1-session"},
+                )
+            )
+            patch_stack.enter_context(
+                patch("the_hive.server.tmux_alive", return_value=True)
+            )
+            patch_stack.enter_context(
+                patch("the_hive.server._ollama_descriptor", return_value=None)
+            )
+            patch_stack.enter_context(
+                patch(
+                    "the_hive.server.require_authenticated_agent_for_mutation",
+                    return_value={"authenticated": True},
+                )
+            )
+            patch_stack.enter_context(
+                patch(
+                    "the_hive.server.agent_home_process_summary",
+                    return_value=process_summary,
+                )
+            )
+            patch_stack.enter_context(
+                patch("the_hive.server.require_managed_tmux_session")
+            )
+            patch_stack.enter_context(
+                patch("the_hive.server.pane_pid", return_value=17)
+            )
+            patch_stack.enter_context(
+                patch("the_hive.server.agent_lease_status", return_value=lease)
+            )
+            patch_stack.enter_context(patch("the_hive.server.read_meta", return_value={}))
+            classify = patch_stack.enter_context(
+                patch(
+                    "the_hive.server.classify_runtime_task",
+                    side_effect=AssertionError("running TUI must not enter routing"),
+                )
+            )
+            resolver = patch_stack.enter_context(
+                patch(
+                    "the_hive.server.resolve_runtime_agent_selection",
+                    side_effect=AssertionError("running TUI must not resolve a model"),
+                )
+            )
+            offers = patch_stack.enter_context(
+                patch(
+                    "the_hive.server.available_model_ids_for_routing",
+                    side_effect=AssertionError("running TUI must not offer models"),
+                )
+            )
+            evidence = patch_stack.enter_context(
+                patch(
+                    "the_hive.server.read_usage_evidence_v2",
+                    side_effect=AssertionError("running TUI must not read usage evidence"),
+                )
+            )
+            claim = patch_stack.enter_context(
+                patch(
+                    "the_hive.server.claim_agent",
+                    side_effect=AssertionError("running TUI must not claim a lease"),
+                )
+            )
+            start = patch_stack.enter_context(
+                patch(
+                    "the_hive.server.start_agent",
+                    side_effect=AssertionError("running TUI must not invoke start"),
+                )
+            )
+            result = start_agent_with_lease("a", allow_unauthenticated=True)
 
-        with patch(
-            "the_hive.server.agent_auth_status",
-            return_value={"authenticated": True, "auth_state": "present_regular"},
-        ):
-            with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
-                start_agent_with_lease("a")
-
-
-    @patch("the_hive.server.release_agent")
-    @patch("the_hive.server.agent_home_process_summary", return_value={"process_count": 1})
-    @patch("the_hive.server.agent_lease_status", return_value={"held_by_this_server": True})
-    @patch("the_hive.server.start_agent")
-    @patch("the_hive.server.claim_agent")
-    @patch("the_hive.server.tmux_alive", return_value=True)
-    def test_start_agent_with_lease_releases_transient_claim_for_existing_session_failure(
-        self,
-        _mock_alive,
-        mock_claim,
-        mock_start_agent,
-        _mock_lease_status,
-        _mock_processes,
-        mock_release,
-    ) -> None:
-        mock_claim.return_value = {
-            "status": "claimed",
-            "lease": {"held_by_this_server": True},
-        }
-        mock_start_agent.return_value = {
-            "agent": "a",
-            "status": "already_running",
-            "meta": {
-                "model": WRITE_AGENT_MODEL,
-                "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
-            },
-            "raw_output": "not_returned",
-        }
-
-        with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
-            start_agent_with_lease("a", allow_unauthenticated=True)
-
-        mock_release.assert_called_once_with("a1", force=True)
+        self.assertEqual(result["status"], "already_running")
+        self.assertIsNone(result["selection"])
+        self.assertEqual(result["session"], "a1-session")
+        self.assertEqual(result["lease"], lease)
+        classify.assert_not_called()
+        resolver.assert_not_called()
+        offers.assert_not_called()
+        evidence.assert_not_called()
+        claim.assert_not_called()
+        start.assert_not_called()
 
     @patch("the_hive.server.start_agent")
     @patch("the_hive.server.claim_agent")
@@ -25504,7 +25626,14 @@ google_accounts:
             "raw_output": "not_returned",
         }
 
+        selection = SimpleNamespace(
+            class_id="arbeitsbiene",
+            model=DEFAULT_AGENT_MODEL,
+            reasoning=DEFAULT_AGENT_MODEL_EFFORT,
+        )
         with patch(
+            "the_hive.server.resolve_runtime_agent_selection", return_value=selection
+        ), patch(
             "the_hive.server.agent_lease_status",
             return_value={"held_by_this_server": True},
         ), patch("the_hive.server.release_agent") as mock_release:
@@ -25512,57 +25641,6 @@ google_accounts:
                 start_agent_with_lease("a", allow_unauthenticated=True)
             mock_release.assert_called_once_with("a1", force=True)
 
-
-    @patch("the_hive.server.start_agent")
-    @patch("the_hive.server.claim_agent")
-    @patch("the_hive.server.tmux_alive", return_value=True)
-    def test_start_agent_with_lease_rejects_running_reasoning_effort_mismatch(
-        self, _mock_alive, mock_claim, mock_start_agent
-    ) -> None:
-        mock_claim.return_value = {
-            "status": "renewed",
-            "lease": {"held_by_this_server": True},
-        }
-        mock_start_agent.return_value = {
-            "agent": "a",
-            "status": "already_running",
-            "meta": {
-                "model": DEFAULT_AGENT_MODEL,
-                "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
-            },
-            "raw_output": "not_returned",
-        }
-
-        with patch("the_hive.server.agent_auth_status", return_value={"authenticated": True}):
-            with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
-                start_agent_with_lease("a", allow_unauthenticated=True)
-
-
-    def test_start_agent_with_lease_claims_transient_lease_for_running_session(self) -> None:
-        lease = {"state": "held", "holder": "this_server", "held_by_this_server": True}
-        with patch("the_hive.server.tmux_alive", return_value=True), patch(
-            "the_hive.server.claim_agent", return_value={"status": "claimed", "lease": lease}
-        ) as mock_claim, patch(
-            "the_hive.server.start_agent",
-            return_value={
-                "agent": "a",
-                "status": "already_running",
-                "meta": {"model": DEFAULT_AGENT_MODEL},
-                "raw_output": "not_returned",
-            },
-        ) as mock_start, patch(
-            "the_hive.server.agent_lease_status",
-            return_value={"held_by_this_server": True},
-        ), patch(
-            "the_hive.server.release_agent", return_value={"lease": {"state": "unclaimed"}}
-        ) as mock_release:
-            result = start_agent_with_lease("a", allow_unauthenticated=True)
-
-        self.assertEqual(result["status"], "already_running")
-        mock_claim.assert_called_once_with("a1")
-        self.assertEqual(mock_start.call_args.kwargs["lease"], lease)
-        self.assertTrue(mock_start.call_args.kwargs["release_lease_on_failure"])
-        mock_release.assert_called_once_with("a1", force=True)
 
     def test_agent_claim_wait_rejects_invalid_direct_interval_values(self) -> None:
         with self.assertRaisesRegex(AgentError, "wait_seconds must be an integer or forever"):
@@ -42396,6 +42474,506 @@ def test_regular_enforced_mcp_surfaces_remain_principal_scoped() -> None:
     assert surfaces["teamleiterin"] < surfaces["koenigin"]
     assert "master_fleet_home_v2_cutover" in surfaces["koenigin"]
     assert "master_fleet_home_v2_cutover" not in surfaces["teamleiterin"]
+
+
+def _d204_model_invocability_evidence(
+    *capabilities: ModelInvocabilityV1,
+    evidence_status: str = "complete",
+    projection_status: str = "complete",
+    projection_source: str = "pool_authority-v3.model_capabilities",
+) -> UsageEvidenceV2:
+    observed_at = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+    return UsageEvidenceV2(
+        (),
+        evidence_status,  # type: ignore[arg-type]
+        observed_at,
+        observed_at,
+        model_invocability=ModelInvocabilityProjectionV1(
+            projection_status,  # type: ignore[arg-type]
+            projection_source,
+            capabilities,
+        ),
+    )
+
+
+def _d204_codex_descriptor() -> SimpleNamespace:
+    return SimpleNamespace(
+        account_id="account-d204",
+        runner=server_module.RunnerKind.CODEX_CLI,
+        provider=server_module.Provider.OPENAI_CHATGPT,
+        model="gpt-5.6-luna",
+    )
+
+
+def test_d204_supported_in_api_false_is_attested_for_persistent_tui() -> None:
+    descriptor = _d204_codex_descriptor()
+    evidence = _d204_model_invocability_evidence(
+        ModelInvocabilityV1(
+            "account-d204",
+            "gpt-5.3-codex-spark",
+            "codex_cli",
+            True,
+            True,
+            False,
+            True,
+        ),
+        ModelInvocabilityV1(
+            "account-d204",
+            "gpt-5.6-luna",
+            "codex_cli",
+            True,
+            True,
+            True,
+            True,
+        ),
+    )
+    inventory = SimpleNamespace(agents={"a1": descriptor})
+    with (
+        patch.object(server_module, "canonical_agent_id", return_value="a1"),
+        patch.object(server_module, "current_agent_inventory", return_value=inventory),
+        patch.object(
+            server_module, "ensure_agent_not_blocked_by_codex_usage", return_value={"blocked": False}
+        ),
+        patch.object(server_module, "read_usage_evidence_v2", return_value=evidence),
+    ):
+        available = server_module.available_model_ids_for_routing(
+            (
+                SimpleNamespace(model_id="gpt-5.3-codex-spark"),
+                SimpleNamespace(model_id="gpt-5.6-luna"),
+            ),
+            None,
+            agent="a1",
+        )
+
+    assert "gpt-5.3-codex-spark" in available
+    assert "gpt-5.6-luna" in available
+    admission = server_module._model_runner_admission(
+        "a1",
+        "gpt-5.3-codex-spark",
+        descriptor=descriptor,
+        evidence=evidence,
+    )
+    assert admission.allowed is True
+    assert admission.reason_code == "allowed"
+
+
+def test_d204_admission_diagnostics_preserve_projection_and_missing_factor() -> None:
+    descriptor = _d204_codex_descriptor()
+    negative_capabilities = {
+        "meter_visible": ModelInvocabilityV1(
+            "account-d204", "gpt-5.6-luna", "codex_cli", False, True, False, True
+        ),
+        "catalog_visible": ModelInvocabilityV1(
+            "account-d204", "gpt-5.6-luna", "codex_cli", True, False, False, False
+        ),
+        "runner_invocable": ModelInvocabilityV1(
+            "account-d204", "gpt-5.6-luna", "codex_cli", True, True, False, False
+        ),
+    }
+    cases = (
+        (
+            _d204_model_invocability_evidence(projection_status="unattested"),
+            "provider.model_invocability_unattested",
+            "unattested",
+            "projection_unattested",
+        ),
+        (
+            _d204_model_invocability_evidence(projection_status="invalid"),
+            "provider.model_invocability_unattested",
+            "invalid",
+            "projection_invalid",
+        ),
+        (
+            _d204_model_invocability_evidence(projection_status="stale"),
+            "provider.model_invocability_unattested",
+            "stale",
+            "projection_stale",
+        ),
+        (
+            _d204_model_invocability_evidence(negative_capabilities["meter_visible"]),
+            "provider.model_invocability_unattested",
+            "complete",
+            "meter_visible",
+        ),
+        (
+            _d204_model_invocability_evidence(negative_capabilities["catalog_visible"]),
+            "provider.model_invocability_unattested",
+            "complete",
+            "catalog_visible",
+        ),
+        (
+            _d204_model_invocability_evidence(negative_capabilities["runner_invocable"]),
+            "provider.model_runner_unsupported",
+            "complete",
+            "runner_invocable",
+        ),
+    )
+    for evidence, error_code, evidence_status, missing_factor in cases:
+        with pytest.raises(AgentError) as raised:
+            server_module._require_model_runner_admission(
+                "a1",
+                "gpt-5.6-luna",
+                descriptor=descriptor,
+                evidence=evidence,
+            )
+
+        assert raised.value.payload["error_code"] == error_code
+        assert raised.value.payload["evidence_source"] == (
+            "pool_authority-v3.model_capabilities"
+        )
+        assert raised.value.payload["evidence_status"] == evidence_status
+        assert raised.value.payload["missing_factor"] == missing_factor
+
+
+def test_d204_root_usage_status_blocks_capability_lookup_with_bound_diagnostics() -> None:
+    descriptor = _d204_codex_descriptor()
+    positive_capability = ModelInvocabilityV1(
+        "account-d204", "gpt-5.6-luna", "codex_cli", True, True, False, True
+    )
+    for evidence_status in ("stale", "invalid", "unavailable"):
+        evidence = _d204_model_invocability_evidence(
+            positive_capability,
+            evidence_status=evidence_status,
+        )
+        with patch.object(
+            server_module,
+            "find_model_invocability",
+            side_effect=AssertionError("root usage evidence must gate capability lookup"),
+        ) as lookup, pytest.raises(AgentError) as raised:
+            server_module._require_model_runner_admission(
+                "a1",
+                "gpt-5.6-luna",
+                descriptor=descriptor,
+                evidence=evidence,
+            )
+
+        lookup.assert_not_called()
+        assert raised.value.payload["error_code"] == "provider.model_invocability_unattested"
+        assert raised.value.payload["evidence_source"] == (
+            "pool_authority-v3.model_capabilities"
+        )
+        assert raised.value.payload["evidence_status"] == evidence_status
+        assert raised.value.payload["missing_factor"] == f"usage_evidence_{evidence_status}"
+
+
+def test_d204_positive_capability_allows_only_its_attested_runner() -> None:
+    descriptor = _d204_codex_descriptor()
+    evidence = _d204_model_invocability_evidence(
+        ModelInvocabilityV1(
+            "account-d204",
+            "gpt-5.6-luna",
+            "gemini_cli",
+            True,
+            True,
+            True,
+            True,
+        ),
+        ModelInvocabilityV1(
+            "account-d204",
+            "gpt-5.6-luna",
+            "codex_cli",
+            True,
+            True,
+            True,
+            True,
+        ),
+    )
+
+    codex_admission = server_module._model_runner_admission(
+        "a1",
+        "gpt-5.6-luna",
+        descriptor=descriptor,
+        evidence=evidence,
+    )
+    assert codex_admission.allowed is True
+    gemini_descriptor = SimpleNamespace(
+        account_id="account-d204",
+        runner=server_module.RunnerKind.GEMINI_CLI,
+        provider=server_module.Provider.GEMINI_API,
+        model="gpt-5.6-luna",
+    )
+    gemini_admission = server_module._model_runner_admission(
+        "a1",
+        "gpt-5.6-luna",
+        descriptor=gemini_descriptor,
+        evidence=evidence,
+    )
+    assert gemini_admission.allowed is True
+    only_codex = _d204_model_invocability_evidence(
+        ModelInvocabilityV1(
+            "account-d204",
+            "gpt-5.6-luna",
+            "codex_cli",
+            True,
+            True,
+            True,
+            True,
+        )
+    )
+    unmatched_admission = server_module._model_runner_admission(
+        "a1",
+        "gpt-5.6-luna",
+        descriptor=gemini_descriptor,
+        evidence=only_codex,
+    )
+    assert unmatched_admission.allowed is False
+    assert unmatched_admission.reason_code == "provider.model_invocability_unattested"
+    assert unmatched_admission.missing_factor == "account_model_runner_capability"
+
+
+def test_d204_existing_tui_session_does_not_recheck_model_invocability() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        runner = root / "codex"
+        runner.write_text("#!/bin/sh\n", encoding="utf-8")
+        runner.chmod(0o700)
+        descriptor = SimpleNamespace(
+            account_id="account-d204",
+            runner=server_module.RunnerKind.CODEX_CLI,
+            provider=server_module.Provider.OPENAI_CHATGPT,
+            model="gpt-5.6-luna",
+            home=root / "agent-home",
+            series_prefix="a",
+        )
+        inventory = SimpleNamespace(agents={"a1": descriptor})
+        process_summary = {
+            "external_process_count": 0,
+            "managed_process_count": 1,
+            "raw_output": "not_returned",
+        }
+        with (
+            patch.object(server_module, "require_fleet_recovery_ready"),
+            patch.object(server_module, "canonical_agent_id", return_value="a1"),
+            patch.object(server_module, "_ollama_descriptor", return_value=None),
+            patch.object(server_module, "ensure_state"),
+            patch.object(
+                server_module,
+                "agent_config",
+                return_value={
+                    "runner": runner,
+                    "session": "a1-session",
+                    "home": descriptor.home,
+                    "label": "A 1",
+                },
+            ),
+            patch.object(server_module, "current_agent_inventory", return_value=inventory),
+            patch.object(
+                server_module, "_managed_codex_runner_candidate", return_value=False
+            ),
+            patch.object(server_module, "tmux_alive", return_value=True),
+            patch.object(
+                server_module, "agent_home_process_summary", return_value=process_summary
+            ),
+            patch.object(server_module, "require_managed_tmux_session"),
+            patch.object(server_module, "pane_pid", return_value=17),
+            patch.object(server_module, "agent_lease_status", return_value={"state": "held"}),
+            patch.object(server_module, "read_meta", return_value={}),
+            patch.object(server_module, "read_usage_evidence_v2") as evidence_reader,
+            patch.object(server_module, "require_spawn_capacity") as spawn_capacity,
+        ):
+            result = server_module._start_agent_unlocked("a1")
+
+    assert result["status"] == "already_running"
+    evidence_reader.assert_not_called()
+    spawn_capacity.assert_not_called()
+
+
+def test_d204_lease_start_returns_existing_tui_before_usage_or_resolver() -> None:
+    existing = {
+        "agent": "a1",
+        "status": "already_running",
+        "backend": "tmux",
+        "session": "a1-session",
+        "pid": 17,
+        "lease": {"state": "held"},
+        "meta": {},
+        "home_external_process_count": 0,
+        "raw_output": "not_returned",
+    }
+    auth_gate = {
+        "authenticated": True,
+        "provider": "openai",
+        "state": "authenticated",
+        "raw_output": "not_returned",
+    }
+    with (
+        patch.object(server_module, "require_fleet_recovery_ready"),
+        patch.object(server_module, "canonical_agent_id", return_value="a1"),
+        patch.object(server_module, "_headless_descriptor", return_value=None),
+        patch.object(
+            server_module, "agent_config", return_value={"session": "a1-session"}
+        ),
+        patch.object(server_module, "tmux_alive", return_value=True),
+        patch.object(server_module, "_ollama_descriptor", return_value=None),
+        patch.object(
+            server_module, "require_authenticated_agent_for_mutation", return_value=auth_gate
+        ) as auth,
+        patch.object(
+            server_module, "_already_running_tmux_start_result", return_value=existing
+        ) as existing_result,
+        patch.object(
+            server_module,
+            "classify_runtime_task",
+            side_effect=AssertionError("existing TUI must not classify for routing"),
+        ),
+        patch.object(
+            server_module,
+            "resolve_runtime_agent_selection",
+            side_effect=AssertionError("existing TUI must not resolve a model"),
+        ),
+        patch.object(
+            server_module,
+            "available_model_ids_for_routing",
+            side_effect=AssertionError("existing TUI must not offer models"),
+        ),
+        patch.object(
+            server_module,
+            "read_usage_evidence_v2",
+            side_effect=AssertionError("existing TUI must not read missing or stale evidence"),
+        ),
+    ):
+        result = server_module._start_agent_with_lease_unlocked("a1")
+
+    assert result["status"] == "already_running"
+    assert result["auth_gate"] == auth_gate
+    assert result["selection"] is None
+    auth.assert_called_once_with(
+        "a1", operation="agent_start", allow_unauthenticated=False
+    )
+    existing_result.assert_called_once_with("a1", "a1-session")
+
+
+def test_d204_final_recheck_blocks_tmux_sink_after_start_preparation() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        runner = root / "codex"
+        runner.write_text("#!/bin/sh\n", encoding="utf-8")
+        runner.chmod(0o700)
+        descriptor = SimpleNamespace(
+            account_id="account-d204",
+            runner=server_module.RunnerKind.CODEX_CLI,
+            provider=server_module.Provider.OPENAI_CHATGPT,
+            model="gpt-5.6-luna",
+            home=root / "agent-home",
+            series_prefix="a",
+        )
+        inventory = SimpleNamespace(agents={"a1": descriptor})
+        events: list[str] = []
+        lease = {"lease_id": "d204-lease", "held_by_this_server": True}
+
+        def red_evidence(**_kwargs: object) -> UsageEvidenceV2:
+            assert events == ["log-prepared", "scope-prepared"]
+            return _d204_model_invocability_evidence(projection_status="stale")
+
+        with contextlib.ExitStack() as patch_stack:
+            patch_stack.enter_context(
+                patch.object(server_module, "require_fleet_recovery_ready")
+            )
+            patch_stack.enter_context(
+                patch.object(server_module, "canonical_agent_id", return_value="a1")
+            )
+            patch_stack.enter_context(
+                patch.object(server_module, "_ollama_descriptor", return_value=None)
+            )
+            patch_stack.enter_context(patch.object(server_module, "ensure_state"))
+            patch_stack.enter_context(
+                patch.object(
+                    server_module,
+                    "agent_config",
+                    return_value={
+                        "runner": runner,
+                        "session": "a1-session",
+                        "home": descriptor.home,
+                        "label": "A 1",
+                    },
+                )
+            )
+            patch_stack.enter_context(
+                patch.object(
+                    server_module, "current_agent_inventory", return_value=inventory
+                )
+            )
+            patch_stack.enter_context(
+                patch.object(
+                    server_module, "_managed_codex_runner_candidate", return_value=False
+                )
+            )
+            patch_stack.enter_context(
+                patch.object(server_module, "tmux_alive", return_value=False)
+            )
+            patch_stack.enter_context(
+                patch.object(
+                    server_module,
+                    "spawn_admission_lock",
+                    return_value=contextlib.nullcontext(),
+                )
+            )
+            patch_stack.enter_context(
+                patch.object(server_module, "require_spawn_capacity")
+            )
+            patch_stack.enter_context(
+                patch.object(
+                    server_module,
+                    "agent_home_process_summary",
+                    return_value={
+                        "external_process_count": 0,
+                        "managed_process_count": 0,
+                        "raw_output": "not_returned",
+                    },
+                )
+            )
+            patch_stack.enter_context(
+                patch.object(server_module, "agent_identity_guard", return_value={"ok": True})
+            )
+            patch_stack.enter_context(
+                patch.object(server_module, "close_runner_execution_fd")
+            )
+            patch_stack.enter_context(
+                patch.object(server_module, "agent_base_args", return_value=[])
+            )
+            patch_stack.enter_context(
+                patch.object(server_module, "open_runner_execution_path", return_value=object())
+            )
+            patch_stack.enter_context(
+                patch.object(
+                    server_module,
+                    "write_private_new_bytes",
+                    side_effect=lambda *_args: events.append("log-prepared"),
+                )
+            )
+            patch_stack.enter_context(patch.object(server_module, "prune_raw_logs"))
+            patch_stack.enter_context(
+                patch.object(
+                    server_module,
+                    "_g5_start_scope",
+                    side_effect=lambda *_args: (
+                        events.append("scope-prepared") or object(),
+                        SimpleNamespace(socket_name="d204-socket"),
+                    ),
+                )
+            )
+            patch_stack.enter_context(
+                patch.object(server_module, "read_usage_evidence_v2", side_effect=red_evidence)
+            )
+            cleanup = patch_stack.enter_context(
+                patch.object(server_module, "_cleanup_failed_g5_start")
+            )
+            release_lease = patch_stack.enter_context(
+                patch.object(server_module, "release_start_lease_if_safe")
+            )
+            tmux_sink = patch_stack.enter_context(patch.object(server_module, "run_tmux"))
+            with pytest.raises(AgentError, match="provider.model_invocability_unattested") as raised:
+                server_module._start_agent_unlocked(
+                    "a1",
+                    lease=lease,
+                    release_lease_on_failure=True,
+                )
+
+    assert raised.value.payload["evidence_status"] == "stale"
+    assert raised.value.payload["missing_factor"] == "projection_stale"
+    cleanup.assert_called_once()
+    release_lease.assert_called_once_with("a1", lease, True)
+    tmux_sink.assert_not_called()
 
 
 if __name__ == "__main__":
