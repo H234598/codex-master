@@ -23,12 +23,14 @@ _TASK9_KEYS = frozenset(
         "grants",
         "messages",
         "workpackages",
+        "pool_dispatches",
         "by_message_id",
         "by_correlation_id",
         "by_causation_id",
     }
 )
-_LEDGER_KEYS = ("grants", "messages", "workpackages")
+_LEGACY_TASK9_KEYS = _TASK9_KEYS - {"pool_dispatches"}
+_LEDGER_KEYS = ("grants", "messages", "workpackages", "pool_dispatches")
 _INDEX_KEYS = ("by_message_id", "by_correlation_id", "by_causation_id")
 
 
@@ -93,6 +95,11 @@ class HiveControlPlaneStore:
     def _load_task9_locked(self) -> dict[str, object]:
         try:
             document = self._state.read_json_locked(_TASK9_PATH, max_bytes=MAX_HIVE_STATE_BYTES)
+            if _is_legacy_v1_without_pool_dispatches(document):
+                normalized = dict(document)
+                normalized["pool_dispatches"] = []
+                document = _validate_document(normalized)
+                self._state.replace_json_locked(_TASK9_PATH, document)
             return _validate_document(document)
         except HiveStateError as exc:
             raise HiveStateError("control_plane_state_unavailable") from exc
@@ -108,10 +115,19 @@ def _empty_document(now: datetime) -> dict[str, object]:
         "grants": [],
         "messages": [],
         "workpackages": [],
+        "pool_dispatches": [],
         "by_message_id": {},
         "by_correlation_id": {},
         "by_causation_id": {},
     }
+
+
+def _is_legacy_v1_without_pool_dispatches(value: object) -> bool:
+    return (
+        type(value) is dict
+        and set(value) == _LEGACY_TASK9_KEYS
+        and value.get("schema_version") == 1
+    )
 
 
 def _expected_revision(value: int) -> int:

@@ -94,7 +94,7 @@ class ServerAdmissionRuntime:
         execute: AdmissionExecutor | None = None,
         execution_completed: CompletionEvidence | None = None,
         completion_journal: CompletionJournal | None = None,
-        pool_authority_reader: Callable[[], UsageEvidenceV2] | None = None,
+        pool_authority_reader: Callable[[], UsageEvidenceV2],
         now: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(gates, Mapping):
@@ -114,7 +114,7 @@ class ServerAdmissionRuntime:
             raise AdmissionRuntimeError("invalid_completion_journal")
         if completion_journal is not None and execution_completed is not None:
             raise AdmissionRuntimeError("ambiguous_completion_evidence")
-        if pool_authority_reader is not None and not callable(pool_authority_reader):
+        if not callable(pool_authority_reader):
             raise AdmissionRuntimeError("invalid_pool_authority_reader")
         self._gates = dict(gates)
         self._execute = execute

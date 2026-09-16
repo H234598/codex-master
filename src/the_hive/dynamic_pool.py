@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import re
 from types import MappingProxyType
 
-from the_hive.usage_snapshot import UsageEvidenceV2, read_usage_evidence_v2
+from the_hive.usage_snapshot import UsageEvidenceV2
 
 
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -186,17 +186,16 @@ def resolve_dynamic_pool_selection(
 def exact_pool_authority_revalidation(
     binding: AccountPoolBindingV1,
     *,
-    reader: Callable[[], UsageEvidenceV2] | None = None,
+    reader: Callable[[], UsageEvidenceV2],
 ) -> bool:
-    """Freshly accept only one complete V2 reader entry with the exact triple."""
+    """Freshly accept one explicit complete V2 reader entry with the exact triple."""
 
     if not isinstance(binding, AccountPoolBindingV1):
         return False
-    read = reader or read_usage_evidence_v2
-    if not callable(read):
+    if not callable(reader):
         return False
     try:
-        evidence = read()
+        evidence = reader()
     except Exception:
         return False
     if not isinstance(evidence, UsageEvidenceV2) or evidence.status != "complete":
@@ -210,7 +209,7 @@ def exact_pool_authority_revalidation(
             and authority.provider == binding.authority_provider
         )
     )
-    return len(matches) == 1
+    return len(matches) == 1 and matches[0].hive_available is True
 
 
 __all__ = [

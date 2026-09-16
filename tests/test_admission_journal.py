@@ -17,6 +17,7 @@ from the_hive.admission_journal import CompletionJournal, CompletionJournalError
 from the_hive.admission_runtime import ADMISSION_RUNTIME_GATES, AdmissionRuntimeError, RuntimeGateDecision, ServerAdmissionRuntime
 from the_hive.hive.events import HiveEventStore
 from the_hive.selection_service import SelectionService
+from the_hive.usage_snapshot import UsageEvidenceV2
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
@@ -76,6 +77,12 @@ def allow_all():
         name: (lambda _record, name=name: RuntimeGateDecision(True, f"{name}_verified"))
         for name in ADMISSION_RUNTIME_GATES
     }
+
+
+def unused_pool_authority_reader() -> UsageEvidenceV2:
+    return UsageEvidenceV2(
+        accounts=(), status="complete", captured_at=NOW, generated_at=NOW
+    )
 
 
 def test_file_completion_journal_survives_reload_without_result_values(tmp_path: Path) -> None:
@@ -154,6 +161,7 @@ def test_runtime_writes_completion_before_a_fresh_process_recovers(tmp_path: Pat
         allow_all(),
         execute=lambda _record, operation: executed.append(operation) or {"status": "ok"},
         completion_journal=journal,
+        pool_authority_reader=unused_pool_authority_reader,
         now=lambda: NOW,
     )
     store = AdmissionStore()
@@ -170,7 +178,11 @@ def test_runtime_writes_completion_before_a_fresh_process_recovers(tmp_path: Pat
 
     assert runtime.execute(executing, "assign") == {"status": "ok"}
     assert executed == ["assign"]
-    fresh_runtime = ServerAdmissionRuntime(allow_all(), completion_journal=FileCompletionJournal(tmp_path / "journal", now=lambda: NOW))
+    fresh_runtime = ServerAdmissionRuntime(
+        allow_all(),
+        completion_journal=FileCompletionJournal(tmp_path / "journal", now=lambda: NOW),
+        pool_authority_reader=unused_pool_authority_reader,
+    )
     assert fresh_runtime.execution_completed(executing) is True
 
 
@@ -181,10 +193,16 @@ def test_runtime_rejects_ambiguous_completion_sources_and_journal_failure(tmp_pa
             allow_all(),
             execution_completed=lambda _record: True,
             completion_journal=journal,
+            pool_authority_reader=unused_pool_authority_reader,
         )
 
     record = executing_record()
-    runtime = ServerAdmissionRuntime(allow_all(), completion_journal=journal, now=lambda: NOW)
+    runtime = ServerAdmissionRuntime(
+        allow_all(),
+        completion_journal=journal,
+        pool_authority_reader=unused_pool_authority_reader,
+        now=lambda: NOW,
+    )
     with pytest.raises(AdmissionRuntimeError, match="runtime_not_revalidated"):
         runtime.execute(record, "assign")
 
@@ -203,7 +221,12 @@ def test_selection_recovery_uses_persisted_completion_evidence(tmp_path: Path) -
     journal = FileCompletionJournal(tmp_path / "journal", now=lambda: NOW)
     journal.record_started(executing, "assign")
     journal.record_completed(executing, "assign", {"status": "ok"})
-    runtime = ServerAdmissionRuntime(allow_all(), completion_journal=journal, now=lambda: NOW)
+    runtime = ServerAdmissionRuntime(
+        allow_all(),
+        completion_journal=journal,
+        pool_authority_reader=unused_pool_authority_reader,
+        now=lambda: NOW,
+    )
 
     result = SelectionService(store, runtime, now=lambda: NOW).reconcile_incomplete()
 

@@ -31,6 +31,12 @@ SHADOW_CONFIG = ROOT / "tests" / "fixtures" / "hive" / "hive-shadow-valid.json"
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
 
 
+def unused_pool_authority_reader() -> UsageEvidenceV2:
+    return UsageEvidenceV2(
+        accounts=(), status="complete", captured_at=NOW, generated_at=NOW
+    )
+
+
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo-one"
     root.mkdir()
@@ -234,11 +240,18 @@ def test_server_factory_accepts_one_bundle_and_rejects_split_authority_state(tmp
         materialize_principals=True,
         now=lambda: NOW,
     )
-    assert build_server_admission_runtime(hive_runtime=bundle) is not None
+    assert (
+        build_server_admission_runtime(
+            hive_runtime=bundle,
+            pool_authority_reader=unused_pool_authority_reader,
+        )
+        is not None
+    )
     with pytest.raises(AgentError, match="conflicting_repository_runtime"):
         build_server_admission_runtime(
             hive_runtime=bundle,
             repository_registry=RepositoryRegistry(()),
+            pool_authority_reader=unused_pool_authority_reader,
         )
 
 

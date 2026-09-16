@@ -20,9 +20,16 @@ from the_hive.admission import (
 )
 from the_hive.admission_runtime import RuntimeGateDecision
 from the_hive.fleet_registry import AgentDescriptor, InventorySnapshot, Provider, RunnerKind
+from the_hive.usage_snapshot import UsageEvidenceV2
 
 
 NOW = datetime(2026, 8, 30, 12, tzinfo=timezone.utc)
+
+
+def unused_pool_authority_reader() -> UsageEvidenceV2:
+    return UsageEvidenceV2(
+        accounts=(), status="complete", captured_at=NOW, generated_at=NOW
+    )
 
 
 def make_admission(
@@ -244,6 +251,7 @@ def test_build_server_admission_runtime_binds_repository_scope_and_denies_missin
     runtime = server.build_server_admission_runtime(
         authority_engine=authority,
         repository_registry=repository,
+        pool_authority_reader=unused_pool_authority_reader,
         now=lambda: NOW,
     )
 
@@ -254,7 +262,9 @@ def test_build_server_admission_runtime_binds_repository_scope_and_denies_missin
     assert_decision(runtime._gates["repository"](make_admission()), True, "repository_verified")
     assert_decision(runtime._gates["scope"](make_admission()), True, "scope_verified")
 
-    missing = server.build_server_admission_runtime(now=lambda: NOW)
+    missing = server.build_server_admission_runtime(
+        pool_authority_reader=unused_pool_authority_reader, now=lambda: NOW
+    )
     assert missing.revalidate(make_admission()) is False
     assert missing.last_failure() == {"allowed": False, "reason_code": "missing_authority_gate"}
 

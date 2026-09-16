@@ -26,6 +26,7 @@ def _empty_document(*, created: datetime = NOW, updated: datetime = NOW) -> dict
         "grants": [],
         "messages": [],
         "workpackages": [],
+        "pool_dispatches": [],
         "by_message_id": {},
         "by_correlation_id": {},
         "by_causation_id": {},
@@ -117,6 +118,22 @@ def test_load_rejects_missing_invalid_unknown_and_incomplete_documents_without_m
         with pytest.raises(HiveStateError, match="^control_plane_state_unavailable$"):
             control.load_task9()
         assert path.read_bytes() == before
+
+
+def test_load_normalizes_legacy_v1_document_missing_pool_dispatches_under_its_lock(tmp_path: Path) -> None:
+    state = RecordingStore(tmp_path / "state")
+    control = HiveControlPlaneStore(state)
+    legacy = _empty_document()
+    del legacy["pool_dispatches"]
+    state.replace_private_bytes(TASK9_PATH, json.dumps(legacy).encode("utf-8"))
+
+    loaded = control.load_task9()
+
+    assert loaded["pool_dispatches"] == []
+    assert state.replacements == [TASK9_PATH]
+    candidate = control.replace_task9(loaded, expected_revision=0, now=NOW + timedelta(minutes=1))
+    assert candidate["pool_dispatches"] == []
+    assert json.loads((tmp_path / "state" / TASK9_PATH).read_text(encoding="utf-8"))["pool_dispatches"] == []
 
 
 def test_initialize_is_only_missing_file_bootstrap_and_returns_defensive_v1_document(tmp_path: Path) -> None:

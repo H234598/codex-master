@@ -40236,8 +40236,16 @@ def build_server_lease_executor(
         # The bridge entry deliberately stays ungated: planning, shadow,
         # reconciliation, compensation, and teardown are safe under red.
         with agent_lifecycle_lock(admission.resource.agent_id):
+            try:
+                fresh_lease = read_lease(admission.resource.agent_id)
+            except Exception as exc:
+                raise AgentError("lease_executor_unavailable") from exc
+            if not isinstance(fresh_lease, Mapping) or not _server_lease_binding_matches(
+                admission, fresh_lease
+            ):
+                raise AgentError("lease_executor_conflict")
             with hive_capacity_probe_guard(operation):
-                result = callback(admission, MappingProxyType(dict(lease)))
+                result = callback(admission, MappingProxyType(dict(fresh_lease)))
         if not isinstance(result, Mapping):
             raise AgentError("lease_operation_result_invalid")
         return dict(result)
@@ -40370,7 +40378,7 @@ def build_server_admission_runtime(
     execute: Any = None,
     execution_completed: Any = None,
     completion_journal: CompletionJournal | None = None,
-    pool_authority_reader: Callable[[], UsageEvidenceV2] | None = None,
+    pool_authority_reader: Callable[[], UsageEvidenceV2],
     hive_runtime: HiveRuntime | None = None,
     now: Callable[[], _dt.datetime] | None = None,
 ) -> ServerAdmissionRuntime:
@@ -40382,6 +40390,8 @@ def build_server_admission_runtime(
     nevertheless attached here so the final adapter has one fixed gate order.
     """
 
+    if not callable(pool_authority_reader):
+        raise AgentError("invalid_pool_authority_reader")
     if hive_runtime is not None:
         if not isinstance(hive_runtime, HiveRuntime):
             raise AgentError("invalid_hive_runtime")
@@ -40459,7 +40469,7 @@ def build_server_selection_service(
     execute: Any = None,
     execution_completed: Any = None,
     completion_journal: CompletionJournal | None = None,
-    pool_authority_reader: Callable[[], UsageEvidenceV2] | None = None,
+    pool_authority_reader: Callable[[], UsageEvidenceV2],
     hive_runtime: HiveRuntime | None = None,
     now: Callable[[], _dt.datetime] | None = None,
     sleeper: Callable[[float], None] | None = None,
@@ -40471,6 +40481,8 @@ def build_server_selection_service(
     revalidation; no MCP tool calls this factory implicitly.
     """
 
+    if not callable(pool_authority_reader):
+        raise AgentError("invalid_pool_authority_reader")
     store = FileAdmissionStore(
         state_path if state_path is not None else ADMISSION_STATE_FILE,
         lock_path if lock_path is not None else ADMISSION_LOCK_FILE,
@@ -40492,6 +40504,155 @@ def build_server_selection_service(
     return SelectionService(store, runtime, now=now, sleeper=sleeper)
 
 
+@dataclass(frozen=True, slots=True)
+class _ServerHiveAssignmentExecutionBridge:
+    """Private composition of one typed Hive unit and the admission adapter."""
+
+    workpackage: WorkPackage
+    intent: AssignmentIntent
+    grant: DelegationGrant
+    authority_engine: AuthorityEngine
+    repository_registry: RepositoryRegistry
+    admission_id: str
+    lease_context: LeaseBinding
+    budget_key: str
+    expected_usage_micro: int
+    priority: AdmissionPriority
+    state_path: Path | None
+    lock_path: Path | None
+    completion_journal: CompletionJournal | None
+    authority_capability: str
+    ttl_seconds: int
+    now: Callable[[], _dt.datetime] | None
+    sleeper: Callable[[float], None] | None
+
+    def scope_digest(self, repo_id: str, mode: str, paths: tuple[str, ...]) -> str:
+        """Read the canonical scope digest from the bound repository owner."""
+
+        return self.repository_registry.scope_digest(repo_id, mode, paths)
+
+    def base_admission_id(self) -> str:
+        """Read the already validated base ID bound to this private bridge."""
+
+        return self.admission_id
+
+    def execute(
+        self,
+        *,
+        plan: QueenAssignmentPlan,
+        pool_authority_reader: Callable[[], UsageEvidenceV2],
+        hive_assignment_callback: Callable[
+            [AdmissionRecord, Mapping[str, object]], Mapping[str, object]
+        ],
+    ) -> Mapping[str, object]:
+        """Forward one already-bound plan without resolving or selecting."""
+
+        if not isinstance(plan, QueenAssignmentPlan):
+            raise AgentError("invalid_hive_assignment_plan")
+        if not callable(pool_authority_reader):
+            raise AgentError("invalid_pool_authority_reader")
+        if not callable(hive_assignment_callback):
+            raise AgentError("invalid_hive_assignment_callback")
+        return execute_server_hive_assignment(
+            plan=plan,
+            workpackage=self.workpackage,
+            intent=self.intent,
+            grant=self.grant,
+            authority_engine=self.authority_engine,
+            repository_registry=self.repository_registry,
+            admission_id=self.admission_id,
+            lease_context=self.lease_context,
+            budget_key=self.budget_key,
+            expected_usage_micro=self.expected_usage_micro,
+            priority=self.priority,
+            operations={"hive_assignment_callback": hive_assignment_callback},
+            pool_authority_reader=pool_authority_reader,
+            operation="hive_assignment_callback",
+            state_path=self.state_path,
+            lock_path=self.lock_path,
+            completion_journal=self.completion_journal,
+            authority_capability=self.authority_capability,
+            ttl_seconds=self.ttl_seconds,
+            now=self.now,
+            sleeper=self.sleeper,
+        )
+
+
+def _build_server_hive_assignment_execution_bridge(
+    *,
+    workpackage: WorkPackage,
+    intent: AssignmentIntent,
+    grant: DelegationGrant,
+    authority_engine: AuthorityEngine,
+    repository_registry: RepositoryRegistry,
+    admission_id: str,
+    lease_context: LeaseBinding,
+    budget_key: str,
+    expected_usage_micro: int,
+    priority: AdmissionPriority,
+    state_path: Path | None = None,
+    lock_path: Path | None = None,
+    completion_journal: CompletionJournal | None = None,
+    authority_capability: str = "hive.specialist.assign",
+    ttl_seconds: int = 30,
+    now: Callable[[], _dt.datetime] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+) -> _ServerHiveAssignmentExecutionBridge:
+    """Bind verified Hive/admission dependencies for the private dispatcher."""
+
+    if not isinstance(workpackage, WorkPackage):
+        raise AgentError("invalid_hive_workpackage")
+    if not isinstance(intent, AssignmentIntent):
+        raise AgentError("invalid_hive_assignment_intent")
+    if not isinstance(grant, DelegationGrant):
+        raise AgentError("invalid_hive_delegation_grant")
+    if not isinstance(authority_engine, AuthorityEngine):
+        raise AgentError("invalid_authority_engine")
+    if not isinstance(repository_registry, RepositoryRegistry):
+        raise AgentError("invalid_repository_registry")
+    if not isinstance(admission_id, str) or not admission_id:
+        raise AgentError("invalid_admission_id")
+    if not isinstance(lease_context, LeaseBinding):
+        raise AgentError("invalid_lease_context")
+    if not isinstance(budget_key, str) or not budget_key:
+        raise AgentError("invalid_budget_key")
+    if type(expected_usage_micro) is not int or expected_usage_micro < 0:
+        raise AgentError("invalid_expected_usage_micro")
+    if not isinstance(priority, AdmissionPriority):
+        raise AgentError("invalid_admission_priority")
+    if completion_journal is not None and not isinstance(
+        completion_journal, CompletionJournal
+    ):
+        raise AgentError("invalid_completion_journal")
+    if not isinstance(authority_capability, str) or not authority_capability:
+        raise AgentError("invalid_authority_capability")
+    if type(ttl_seconds) is not int or ttl_seconds <= 0:
+        raise AgentError("invalid_admission_ttl")
+    if now is not None and not callable(now):
+        raise AgentError("invalid_admission_clock")
+    if sleeper is not None and not callable(sleeper):
+        raise AgentError("invalid_admission_sleeper")
+    return _ServerHiveAssignmentExecutionBridge(
+        workpackage=workpackage,
+        intent=intent,
+        grant=grant,
+        authority_engine=authority_engine,
+        repository_registry=repository_registry,
+        admission_id=admission_id,
+        lease_context=lease_context,
+        budget_key=budget_key,
+        expected_usage_micro=expected_usage_micro,
+        priority=priority,
+        state_path=state_path,
+        lock_path=lock_path,
+        completion_journal=completion_journal,
+        authority_capability=authority_capability,
+        ttl_seconds=ttl_seconds,
+        now=now,
+        sleeper=sleeper,
+    )
+
+
 def execute_server_hive_assignment(
     *,
     plan: QueenAssignmentPlan,
@@ -40508,6 +40669,7 @@ def execute_server_hive_assignment(
     operations: Mapping[
         str, Callable[[AdmissionRecord, Mapping[str, Any]], Mapping[str, object]]
     ],
+    pool_authority_reader: Callable[[], UsageEvidenceV2],
     operation: str = "hive_assignment_callback",
     state_path: Path | None = None,
     lock_path: Path | None = None,
@@ -40531,6 +40693,8 @@ def execute_server_hive_assignment(
         raise AgentError("invalid_admission_clock")
     if plan.account_pool_binding is None:
         raise AgentError("dynamic_pool_binding_missing")
+    if not callable(pool_authority_reader):
+        raise AgentError("invalid_pool_authority_reader")
     if not isinstance(admission_id, str) or not admission_id:
         raise AgentError("invalid_admission_id")
     clock = now or (lambda: _dt.datetime.now(_dt.timezone.utc))
@@ -40543,6 +40707,7 @@ def execute_server_hive_assignment(
         authority_capability=authority_capability,
         execute=runtime_executor,
         completion_journal=completion_journal,
+        pool_authority_reader=pool_authority_reader,
         now=clock,
         sleeper=sleeper,
     )

@@ -1,4 +1,6 @@
+import ast
 import contextlib
+import inspect
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -7,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from the_hive import server
+from the_hive.hive import work_dispatcher as work_dispatcher_module
 from the_hive.hive.dispatch import HiveDispatchError
 from the_hive.hive.events import HiveEventStore
 from the_hive.hive.messages import validate_message
@@ -19,6 +22,87 @@ GREEN_HIVE_PROBE = {
     "reason_code": "probe_ready",
     "raw_output": "not_returned",
 }
+
+
+def test_dynamic_pool_product_callback_has_one_private_dispatcher_callsite_and_no_tool_bypass() -> None:
+    """D69 binding and its effect callback stay out of every public server path."""
+
+    dispatcher_tree = ast.parse(inspect.getsource(work_dispatcher_module))
+    dispatcher_calls = [
+        node
+        for node in ast.walk(dispatcher_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "plan_queen_assignment_from_selection"
+    ]
+    callback_keywords = [
+        keyword
+        for node in ast.walk(dispatcher_tree)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "hive_assignment_callback"
+    ]
+    callback = next(
+        node
+        for node in ast.walk(dispatcher_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_hive_assignment_callback"
+    )
+    callback_tokens = {
+        node.id
+        for node in ast.walk(callback)
+        if isinstance(node, ast.Name)
+    } | {
+        node.attr
+        for node in ast.walk(callback)
+        if isinstance(node, ast.Attribute)
+    }
+
+    assert len(dispatcher_calls) == 1
+    assert len(callback_keywords) == 1
+    assert isinstance(callback_keywords[0].value, ast.Attribute)
+    assert callback_keywords[0].value.attr == "_hive_assignment_callback"
+    assert callback_tokens.isdisjoint(
+        {"call_tool", "agent_start", "_assign_agent_unlocked"}
+    )
+
+    server_tree = ast.parse(inspect.getsource(server))
+    bridge = next(
+        node
+        for node in ast.walk(server_tree)
+        if isinstance(node, ast.ClassDef)
+        and node.name == "_ServerHiveAssignmentExecutionBridge"
+    )
+    bridge_execute = next(
+        node
+        for node in bridge.body
+        if isinstance(node, ast.FunctionDef) and node.name == "execute"
+    )
+    bridge_tokens = {
+        node.id
+        for node in ast.walk(bridge_execute)
+        if isinstance(node, ast.Name)
+    } | {
+        node.attr
+        for node in ast.walk(bridge_execute)
+        if isinstance(node, ast.Attribute)
+    }
+
+    assert bridge_tokens.isdisjoint(
+        {
+            "call_tool",
+            "agent_start",
+            "_assign_agent_unlocked",
+            "resolve_agent_selection",
+            "plan_queen_assignment_from_selection",
+        }
+    )
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "build_server_hive_assignment_execution_bridge"
+        for node in ast.walk(server_tree)
+    )
+    assert "hive_work_dispatcher" not in inspect.getsource(server.call_tool)
 
 
 @pytest.mark.parametrize(

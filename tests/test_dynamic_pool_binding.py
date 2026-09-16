@@ -1,7 +1,6 @@
 """D69 contracts for the immutable dynamic PoolAuthorityV2 binding."""
 
 import ast
-import subprocess
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,7 +81,10 @@ def inventory(
 
 
 def evidence(
-    *, status: str = "complete", authority_provider: str = "openai"
+    *,
+    status: str = "complete",
+    authority_provider: str = "openai",
+    hive_available: bool = True,
 ) -> UsageEvidenceV2:
     return UsageEvidenceV2(
         accounts=(),
@@ -96,7 +98,7 @@ def evidence(
                 provider=authority_provider,
                 allowed_lifecycles=("persistent",),
                 allowed_model_families=("gpt-primary",),
-                hive_available=True,
+                hive_available=hive_available,
                 persistent_leadership_eligible=True,
                 long_running_leadership_eligible=True,
                 reasoning_minimum="low",
@@ -183,6 +185,15 @@ def test_binding_is_normal_frozen_value_and_keeps_runtime_provider_separate() ->
         selected.pool_id = "other-pool"  # type: ignore[misc]
 
 
+def test_exact_revalidation_requires_an_explicit_reader_without_a_fallback() -> None:
+    """A product binding cannot silently read an ambient authority snapshot."""
+
+    with pytest.raises(TypeError):
+        exact_pool_authority_revalidation(binding())
+
+    assert exact_pool_authority_revalidation(binding(), reader=None) is False  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     ("status", "authority_provider"),
     (
@@ -203,6 +214,14 @@ def test_fresh_reader_rejects_unknown_stale_and_exact_provider_mismatch(
         )
         is False
     )
+
+
+def test_fresh_reader_rejects_an_exact_but_unavailable_pool_authority() -> None:
+    """An exact triple is not executable while its Hive availability is false."""
+
+    assert exact_pool_authority_revalidation(
+        binding(), reader=lambda: evidence(hive_available=False)
+    ) is False
 
 
 def test_resolver_selects_only_the_explicit_injected_inventory_entry() -> None:
@@ -423,7 +442,7 @@ def test_fresh_revalidation_runs_before_execution_and_the_actual_callback() -> N
 
 def test_reserve_to_callback_authority_drift_blocks_the_callback() -> None:
     callbacks: list[str] = []
-    values = iter((evidence(), evidence(authority_provider="other-provider")))
+    values = iter((evidence(), evidence(hive_available=False)))
     gates = {
         name: lambda _record, name=name: RuntimeGateDecision(True, f"{name}_verified")
         for name in ADMISSION_RUNTIME_GATES
@@ -732,24 +751,13 @@ def test_static_allowlist_rejects_actual_factory_bypass_forms() -> None:
     assert sites["opaque"] == {f"{fixture}:10", f"{fixture}:15"}
 
 
-def test_tracked_product_code_allows_binding_construction_only_in_the_resolver_module() -> (
+def test_all_candidate_product_code_allows_binding_construction_only_in_the_resolver_module() -> (
     None
 ):
     root = Path(__file__).resolve().parents[1]
-    tracked = set(
-        subprocess.run(
-            ["git", "ls-files", "src"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.splitlines()
-    )
-    tracked.add("src/the_hive/dynamic_pool.py")
     sources = {
-        relative: (root / relative).read_text(encoding="utf-8")
-        for relative in sorted(tracked)
-        if relative.endswith(".py")
+        path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted((root / "src").rglob("*.py"))
     }
 
     sites = _structural_binding_issuer_sites(sources)

@@ -31,6 +31,7 @@ from the_hive.hive.hourly_probe import PROBE_GATE_LOCK_NAME, run_probe
 from the_hive.runtime_layout import RuntimeLayout
 from the_hive.server import AgentError, build_server_admission_runtime, build_server_lease_executor, build_server_selection_service
 from the_hive.selection_service import SelectionDeniedError, SelectionService
+from the_hive.usage_snapshot import UsageEvidenceV2
 
 
 NOW = datetime.now(timezone.utc)
@@ -201,11 +202,45 @@ def allow_all(events: list[str]):
     }
 
 
+def unused_pool_authority_reader() -> UsageEvidenceV2:
+    """Supply an explicit reader on non-pool records without ambient fallback."""
+
+    return UsageEvidenceV2(
+        accounts=(), status="complete", captured_at=NOW, generated_at=NOW
+    )
+
+
+def test_runtime_and_server_factories_require_an_explicit_pool_authority_reader(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(TypeError, match="pool_authority_reader"):
+        ServerAdmissionRuntime(allow_all([]))
+    with pytest.raises(TypeError, match="pool_authority_reader"):
+        build_server_admission_runtime()
+    with pytest.raises(TypeError, match="pool_authority_reader"):
+        build_server_selection_service(
+            state_path=tmp_path / "admissions.json",
+            lock_path=tmp_path / "admissions.lock",
+        )
+
+    with pytest.raises(AdmissionRuntimeError, match="invalid_pool_authority_reader"):
+        ServerAdmissionRuntime(allow_all([]), pool_authority_reader=None)  # type: ignore[arg-type]
+    with pytest.raises(AgentError, match="invalid_pool_authority_reader"):
+        build_server_admission_runtime(pool_authority_reader=None)  # type: ignore[arg-type]
+    with pytest.raises(AgentError, match="invalid_pool_authority_reader"):
+        build_server_selection_service(
+            state_path=tmp_path / "admissions.json",
+            lock_path=tmp_path / "admissions.lock",
+            pool_authority_reader=None,  # type: ignore[arg-type]
+        )
+
+
 def test_runtime_requires_every_gate_in_fixed_order_before_execute() -> None:
     events: list[str] = []
     runtime = ServerAdmissionRuntime(
         allow_all(events),
         execute=lambda _record, operation: {"operation": operation, "status": "ok"},
+        pool_authority_reader=unused_pool_authority_reader,
         now=lambda: NOW,
     )
     record = revalidating_record()
@@ -221,6 +256,7 @@ def test_runtime_composes_with_selection_service_revision_transitions() -> None:
     runtime = ServerAdmissionRuntime(
         allow_all([]),
         execute=lambda _record, operation: executed.append(operation) or {"status": "ok"},
+        pool_authority_reader=unused_pool_authority_reader,
         now=lambda: NOW,
     )
     store = AdmissionStore()
@@ -239,6 +275,7 @@ def test_server_selection_factory_uses_persistent_store_but_missing_hive_stays_c
         state_path=state_path,
         lock_path=lock_path,
         execute=lambda *_args: pytest.fail("executor must not run"),
+        pool_authority_reader=unused_pool_authority_reader,
         now=lambda: NOW,
         sleeper=lambda _delay: None,
     )
@@ -254,6 +291,7 @@ def test_selection_service_persists_every_transition_with_file_store(tmp_path) -
     runtime = ServerAdmissionRuntime(
         allow_all([]),
         execute=lambda _record, _operation: {"status": "ok"},
+        pool_authority_reader=unused_pool_authority_reader,
         now=lambda: NOW,
     )
     result = SelectionService(store, runtime, now=lambda: NOW, sleeper=lambda _delay: None).execute_with_retry(
@@ -269,7 +307,9 @@ def test_selection_service_persists_every_transition_with_file_store(tmp_path) -
 def test_runtime_missing_hive_bindings_denies_and_never_executes() -> None:
     called = []
     runtime = build_server_admission_runtime(
-        execute=lambda *_args: called.append(True), now=lambda: NOW
+        execute=lambda *_args: called.append(True),
+        pool_authority_reader=unused_pool_authority_reader,
+        now=lambda: NOW,
     )
     record = revalidating_record()
 
@@ -281,7 +321,11 @@ def test_runtime_missing_hive_bindings_denies_and_never_executes() -> None:
 
 
 def test_runtime_revalidation_is_single_use_and_executor_is_required() -> None:
-    runtime = ServerAdmissionRuntime(allow_all([]), now=lambda: NOW)
+    runtime = ServerAdmissionRuntime(
+        allow_all([]),
+        pool_authority_reader=unused_pool_authority_reader,
+        now=lambda: NOW,
+    )
     record = revalidating_record()
 
     assert runtime.revalidate(record) is True
@@ -322,7 +366,12 @@ def test_server_lease_executor_composes_with_runtime_revalidation(
         operations={"hive_assignment_callback": lambda _record, lease: {"lease_state": lease["state"]}},
         lease_reader=lambda _agent: {"state": "unclaimed", "held_by_this_server": False, "lease_id": None},
     )
-    runtime = ServerAdmissionRuntime(allow_all([]), execute=executor, now=lambda: NOW)
+    runtime = ServerAdmissionRuntime(
+        allow_all([]),
+        execute=executor,
+        pool_authority_reader=unused_pool_authority_reader,
+        now=lambda: NOW,
+    )
     assert runtime.revalidate(revalidating_record()) is True
 
     assert runtime.execute(executing_record(), "hive_assignment_callback") == {"lease_state": "unclaimed"}
@@ -367,6 +416,42 @@ def test_server_lease_executor_rechecks_after_its_mutation_lock(
         executor(executing_record(), "hive_assignment_callback")
 
     assert seen == ["mutation-lock"]
+
+
+def test_server_lease_executor_rereads_lease_inside_lifecycle_lock_before_callback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    materialize_probe_record(tmp_path, monkeypatch, "fresh-green")
+    configure_real_mutation_lock(tmp_path, monkeypatch)
+    actual_mutation_lock = server.agent_lifecycle_lock
+    lease = {"state": "unclaimed", "held_by_this_server": False, "lease_id": None}
+    reads: list[str] = []
+    callbacks: list[str] = []
+
+    @contextlib.contextmanager
+    def mutation_lock(agent: str):
+        with actual_mutation_lock(agent):
+            lease["state"] = "held"
+            yield
+
+    def read_lease(_agent: str) -> dict[str, object]:
+        reads.append("read")
+        return dict(lease)
+
+    monkeypatch.setattr(server, "agent_lifecycle_lock", mutation_lock)
+    executor = build_server_lease_executor(
+        operations={
+            "hive_assignment_callback": lambda *_args: callbacks.append("callback")
+            or {"status": "unexpected"}
+        },
+        lease_reader=read_lease,
+    )
+
+    with pytest.raises(AgentError, match="lease_executor_conflict"):
+        executor(executing_record(), "hive_assignment_callback")
+
+    assert reads == ["read", "read"]
+    assert callbacks == []
 
 
 @pytest.mark.parametrize(
@@ -591,7 +676,10 @@ def test_runtime_gate_exception_and_unknown_completion_fail_closed() -> None:
     gates = allow_all([])
     gates["scope"] = lambda _record: (_ for _ in ()).throw(RuntimeError("scope unavailable"))
     runtime = ServerAdmissionRuntime(
-        gates, execution_completed=lambda _record: "yes", now=lambda: NOW
+        gates,
+        execution_completed=lambda _record: "yes",
+        pool_authority_reader=unused_pool_authority_reader,
+        now=lambda: NOW,
     )
     record = revalidating_record()
 
@@ -602,4 +690,6 @@ def test_runtime_gate_exception_and_unknown_completion_fail_closed() -> None:
 
 def test_runtime_rejects_unknown_gate_names() -> None:
     with pytest.raises(AdmissionRuntimeError, match="unknown_runtime_gate"):
-        ServerAdmissionRuntime({"typo": None})
+        ServerAdmissionRuntime(
+            {"typo": None}, pool_authority_reader=unused_pool_authority_reader
+        )
