@@ -49,6 +49,18 @@ _MAX_DELIVERY_HEADER_BYTES: Final = 65536
 _LEASE_SECONDS: Final = 60
 _MAX_SIGNED_SQLITE_INTEGER: Final = (2**63) - 1
 _BACKOFF_SECONDS: Final = (5, 15, 60, 300, 900)
+_CAPACITY_WARNING_HEADERS: Final = 7_500
+_CAPACITY_WARNING_BYTES: Final = 50_331_648
+_CAPACITY_HARD_HEADERS: Final = 10_000
+_CAPACITY_HARD_BYTES: Final = 67_108_864
+_CAPACITY_HARD_EXCEPTIONS: Final = frozenset(
+    {
+        "authority.revoked",
+        "provider.hard_stopped",
+        "security.critical",
+        "artifact.archived",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +80,37 @@ class EffectBeginResultV1:
 
     state: Literal["apply", "committed", "dead_lettered"]
     attempt_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityStateV1:
+    """Current bounded capacity counters for one partition."""
+
+    header_count: int
+    managed_payload_bytes: int
+    at_warning_watermark: bool
+    at_hard_watermark: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AppendResultV1:
+    """One atomically appended event and its post-commit capacity state."""
+
+    event: HiveBusEventV1
+    capacity: CapacityStateV1
+
+
+@dataclass(frozen=True, slots=True)
+class DigestAnchorV1:
+    """One persisted, header-only digest anchor for a contiguous interval."""
+
+    partition: str
+    from_seq: int
+    through_seq: int
+    event_count: int
+    header_bytes: int
+    digest: str
+    digest_bytes: bytes
 
 
 _GEN1_TABLE_DDL: Final = (
@@ -1306,6 +1349,50 @@ class HiveBusStore:
         )
 
     @staticmethod
+    def _backpressure() -> DiagnosticV2:
+        return diagnostic_for(
+            "BUS_E_BACKPRESSURE",
+            severity=DiagnosticSeverityV2.WARNING,
+            retryable=True,
+            retry_after_seconds=None,
+            fallback_applied=False,
+            requested_choice=None,
+            effective_choice=None,
+            action="defer_publish",
+            causes=(),
+        )
+
+    def _capacity_state(self, partition: str) -> CapacityStateV1:
+        row = self._connection.execute(
+            "SELECT COUNT(*),COALESCE(SUM(CASE WHEN events.payload_kind IN "
+            "('inline','blob') AND payloads.body_state='present' "
+            "AND payloads.body IS NOT NULL THEN payloads.size_bytes ELSE 0 END),0) "
+            "FROM events LEFT JOIN payloads ON payloads.kind=events.payload_kind "
+            "AND payloads.digest=events.payload_digest AND payloads.ref=events.payload_ref "
+            "WHERE events.partition=?",
+            (partition,),
+        ).fetchone()
+        if (
+            not isinstance(row, tuple)
+            or len(row) != 2
+            or type(row[0]) is not int
+            or type(row[1]) is not int
+            or row[0] < 0
+            or row[1] < 0
+        ):
+            raise sqlite3.DatabaseError
+        return CapacityStateV1(
+            header_count=row[0],
+            managed_payload_bytes=row[1],
+            at_warning_watermark=(
+                row[0] >= _CAPACITY_WARNING_HEADERS or row[1] >= _CAPACITY_WARNING_BYTES
+            ),
+            at_hard_watermark=(
+                row[0] >= _CAPACITY_HARD_HEADERS or row[1] >= _CAPACITY_HARD_BYTES
+            ),
+        )
+
+    @staticmethod
     def _validate_group_partition_generation(
         consumer_group_id: object, partition: object, generation: object
     ) -> tuple[str, str, str]:
@@ -1540,9 +1627,45 @@ class HiveBusStore:
         )
         return terminal_poisoned
 
+    def read_capacity(self, partition: str) -> CapacityStateV1 | None | DiagnosticV2:
+        """Read one partition's current noncompacted header and payload counters."""
+
+        try:
+            checked_partition = validate_topic_partition(partition)
+        except HiveBusContractError:
+            return self._schema_error()
+        with self._lock:
+            unusable = self._usable()
+            if unusable is not None:
+                return unusable
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                exists = self._connection.execute(
+                    "SELECT 1 FROM partitions WHERE partition=?",
+                    (checked_partition,),
+                ).fetchone()
+                if exists is None:
+                    self._connection.execute("COMMIT")
+                    return None
+                if exists != (1,):
+                    raise sqlite3.DatabaseError
+                state = self._capacity_state(checked_partition)
+                self._connection.execute("COMMIT")
+                return state
+            except sqlite3.OperationalError as exc:
+                self._rollback(self._connection)
+                return (
+                    self._store_busy()
+                    if _sqlite_is_busy(exc)
+                    else self._store_integrity()
+                )
+            except (ValueError, sqlite3.DatabaseError):
+                self._rollback(self._connection)
+                return self._store_integrity()
+
     def append(
         self, request: object, *, payload_bytes: bytes | None
-    ) -> HiveBusEventV1 | DiagnosticV2:
+    ) -> AppendResultV1 | DiagnosticV2:
         """Atomically persist one validated producer event or return a redacted diagnostic."""
 
         with self._lock:
@@ -1720,8 +1843,8 @@ class HiveBusStore:
                     ),
                 ).fetchone()
                 if retry is not None:
-                    self._connection.execute("ROLLBACK")
                     if retry[1] != request_digest:
+                        self._connection.execute("ROLLBACK")
                         return diagnostic_for(
                             "BUS_E_IDEMPOTENCY_CONFLICT",
                             severity=DiagnosticSeverityV2.ERROR,
@@ -1733,12 +1856,45 @@ class HiveBusStore:
                             action="reject_publish",
                             causes=(),
                         )
-                    return self._stored_event(request, retry[0])
+                    stored = self._stored_event(request, retry[0])
+                    if isinstance(stored, DiagnosticV2):
+                        self._rollback(self._connection)
+                        return stored
+                    capacity = self._capacity_state(probe.partition)
+                    self._connection.execute("COMMIT")
+                    return AppendResultV1(event=stored, capacity=capacity)
                 now = _utc_now(self._clock)
                 partition_row = self._connection.execute(
                     "SELECT next_seq,state FROM partitions WHERE partition=?",
                     (probe.partition,),
                 ).fetchone()
+                if partition_row is not None and partition_row[1] != "active":
+                    self._connection.execute("ROLLBACK")
+                    return diagnostic_for(
+                        "BUS_E_PARTITION_SEQ_CONFLICT",
+                        severity=DiagnosticSeverityV2.CRITICAL,
+                        retryable=False,
+                        retry_after_seconds=None,
+                        fallback_applied=False,
+                        requested_choice=None,
+                        effective_choice=None,
+                        action="operator_intervention",
+                        causes=(),
+                    )
+                current_capacity = self._capacity_state(probe.partition)
+                managed_payload_delta = (
+                    payload.size_bytes if payload.kind in {"inline", "blob"} else 0
+                )
+                projected_header_count = current_capacity.header_count + 1
+                projected_payload_bytes = (
+                    current_capacity.managed_payload_bytes + managed_payload_delta
+                )
+                if probe.event_type not in _CAPACITY_HARD_EXCEPTIONS and (
+                    projected_header_count >= _CAPACITY_HARD_HEADERS
+                    or projected_payload_bytes >= _CAPACITY_HARD_BYTES
+                ):
+                    self._connection.execute("ROLLBACK")
+                    return self._backpressure()
                 if partition_row is None:
                     partition_seq = 1
                     self._connection.execute(
@@ -1746,19 +1902,6 @@ class HiveBusStore:
                         (probe.partition, 2, 1, "active", None, now, now),
                     )
                 else:
-                    if partition_row[1] != "active":
-                        self._connection.execute("ROLLBACK")
-                        return diagnostic_for(
-                            "BUS_E_PARTITION_SEQ_CONFLICT",
-                            severity=DiagnosticSeverityV2.CRITICAL,
-                            retryable=False,
-                            retry_after_seconds=None,
-                            fallback_applied=False,
-                            requested_choice=None,
-                            effective_choice=None,
-                            action="operator_intervention",
-                            causes=(),
-                        )
                     partition_seq = partition_row[0]
                     changed = self._connection.execute(
                         "UPDATE partitions SET next_seq=?,updated_at_utc=? WHERE partition=? AND next_seq=?",
@@ -1922,10 +2065,11 @@ class HiveBusStore:
                         now,
                     ),
                 )
+                capacity = self._capacity_state(probe.partition)
                 _append_checkpoint("before_commit")
                 self._connection.execute("COMMIT")
                 _append_checkpoint("after_commit")
-                return event
+                return AppendResultV1(event=event, capacity=capacity)
             except sqlite3.OperationalError as exc:
                 self._rollback(self._connection)
                 if not _sqlite_is_busy(exc):
@@ -1978,6 +2122,240 @@ class HiveBusStore:
                     action="operator_intervention",
                     causes=(),
                 )
+
+    @staticmethod
+    def _digest_anchor_from_row(row: object) -> DigestAnchorV1 | None:
+        if not isinstance(row, tuple) or len(row) != 9:
+            return None
+        (
+            partition,
+            from_seq,
+            through_seq,
+            event_count,
+            header_bytes,
+            digest,
+            digest_bytes,
+            digest_size_bytes,
+            created_at_utc,
+        ) = row
+        if (
+            type(partition) is not str
+            or type(from_seq) is not int
+            or type(through_seq) is not int
+            or type(event_count) is not int
+            or type(header_bytes) is not int
+            or type(digest) is not str
+            or type(digest_bytes) is not bytes
+            or type(digest_size_bytes) is not int
+            or type(created_at_utc) is not str
+            or _EVENT_ID_RE.fullmatch(digest) is None
+            or from_seq < 1
+            or through_seq < from_seq
+            or event_count != through_seq - from_seq + 1
+            or not 1 <= event_count <= _MAX_DELIVERY_HEADERS
+            or not 1 <= header_bytes <= 69_632
+            or not 1 <= len(digest_bytes) <= 65_536
+            or digest_size_bytes != len(digest_bytes)
+            or digest != _digest(digest_bytes)
+        ):
+            return None
+        try:
+            validate_topic_partition(partition)
+            _stored_utc(created_at_utc)
+        except (HiveBusContractError, ValueError):
+            return None
+        return DigestAnchorV1(
+            partition=partition,
+            from_seq=from_seq,
+            through_seq=through_seq,
+            event_count=event_count,
+            header_bytes=header_bytes,
+            digest=digest,
+            digest_bytes=digest_bytes,
+        )
+
+    @staticmethod
+    def _canonical_digest_bytes(
+        *,
+        partition: str,
+        from_seq: int,
+        through_seq: int,
+        event_count: int,
+        header_bytes: int,
+        entries: list[dict[str, object]],
+    ) -> bytes:
+        """Compose the canonical digest object within the shared JSON item bound."""
+
+        if not 1 <= len(entries) <= _MAX_DELIVERY_HEADERS:
+            raise ValueError
+        # Canonicalize the entries independently: 32 entries with three fields
+        # exactly consume the existing 128-item canonical JSON budget.  The
+        # outer scalar fields are then joined in the canonical sorted-key order.
+        encoded_entries = canonical_json_bytes(entries)
+        return b"".join(
+            (
+                b'{"entries":',
+                encoded_entries,
+                b',"event_count":',
+                canonical_json_bytes(event_count),
+                b',"from_seq":',
+                canonical_json_bytes(from_seq),
+                b',"header_bytes":',
+                canonical_json_bytes(header_bytes),
+                b',"partition":',
+                canonical_json_bytes(partition),
+                b',"schema_version":',
+                canonical_json_bytes(1),
+                b',"through_seq":',
+                canonical_json_bytes(through_seq),
+                b"}",
+            )
+        )
+
+    def materialize_digest(
+        self, partition: str, *, through_seq: int
+    ) -> DigestAnchorV1 | DiagnosticV2:
+        """Persist the next bounded contiguous header digest interval on demand."""
+
+        try:
+            checked_partition = validate_topic_partition(partition)
+        except HiveBusContractError:
+            return self._schema_error()
+        if (
+            type(through_seq) is not int
+            or not 1 <= through_seq <= _MAX_SIGNED_SQLITE_INTEGER
+        ):
+            return self._schema_error()
+        with self._lock:
+            unusable = self._usable()
+            if unusable is not None:
+                return unusable
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                existing_row = self._connection.execute(
+                    "SELECT partition,from_seq,through_seq,event_count,header_bytes,digest,digest_bytes,digest_size_bytes,created_at_utc "
+                    "FROM digest_anchors WHERE partition=? AND through_seq=?",
+                    (checked_partition, through_seq),
+                ).fetchone()
+                if existing_row is not None:
+                    anchor = self._digest_anchor_from_row(existing_row)
+                    if anchor is None:
+                        self._rollback(self._connection)
+                        return self._store_integrity()
+                    self._connection.execute("COMMIT")
+                    return anchor
+
+                max_row = self._connection.execute(
+                    "SELECT MAX(through_seq) FROM digest_anchors WHERE partition=?",
+                    (checked_partition,),
+                ).fetchone()
+                next_seq = (
+                    1 if max_row is None or max_row[0] is None else max_row[0] + 1
+                )
+                if type(next_seq) is not int or through_seq < next_seq:
+                    self._rollback(self._connection)
+                    return self._schema_error()
+
+                rows = self._connection.execute(
+                    "SELECT partition_seq,event_id,header_bytes,header_digest FROM events "
+                    "WHERE partition=? AND partition_seq>=? AND partition_seq<=? "
+                    "ORDER BY partition_seq,event_id LIMIT 33",
+                    (checked_partition, next_seq, through_seq),
+                ).fetchall()
+                if not rows:
+                    self._rollback(self._connection)
+                    return self._schema_error()
+
+                selected: list[tuple[int, str, bytes, str]] = []
+                expected_seq = next_seq
+                total_header_bytes = 0
+                for row in rows:
+                    if len(selected) >= _MAX_DELIVERY_HEADERS:
+                        break
+                    if not isinstance(row, tuple) or len(row) != 4:
+                        self._rollback(self._connection)
+                        return self._store_integrity()
+                    sequence, event_id, header, header_digest = row
+                    if sequence != expected_seq:
+                        self._rollback(self._connection)
+                        return self._store_integrity()
+                    if (
+                        type(sequence) is not int
+                        or type(event_id) is not str
+                        or _EVENT_ID_RE.fullmatch(event_id) is None
+                        or type(header) is not bytes
+                        or not 1 <= len(header) <= _MAX_HEADER_BYTES
+                        or type(header_digest) is not str
+                        or _EVENT_ID_RE.fullmatch(header_digest) is None
+                        or _digest(header) != header_digest
+                    ):
+                        self._rollback(self._connection)
+                        return self._store_integrity()
+                    if total_header_bytes + len(header) > 69_632:
+                        break
+                    selected.append((sequence, event_id, header, header_digest))
+                    total_header_bytes += len(header)
+                    expected_seq += 1
+
+                if not selected:
+                    self._rollback(self._connection)
+                    return self._store_integrity()
+                actual_through_seq = selected[-1][0]
+                entries = [
+                    {
+                        "partition_seq": sequence,
+                        "event_id": event_id,
+                        "header_digest": header_digest,
+                    }
+                    for sequence, event_id, _header, header_digest in selected
+                ]
+                digest_bytes = self._canonical_digest_bytes(
+                    partition=checked_partition,
+                    from_seq=next_seq,
+                    through_seq=actual_through_seq,
+                    event_count=len(selected),
+                    header_bytes=total_header_bytes,
+                    entries=entries,
+                )
+                if not 1 <= len(digest_bytes) <= 65_536:
+                    self._rollback(self._connection)
+                    return self._store_integrity()
+                digest = _digest(digest_bytes)
+                created_at_utc = _utc_now(self._clock)
+                self._connection.execute(
+                    "INSERT INTO digest_anchors(partition,from_seq,through_seq,event_count,header_bytes,digest,digest_bytes,digest_size_bytes,created_at_utc) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        checked_partition,
+                        next_seq,
+                        actual_through_seq,
+                        len(selected),
+                        total_header_bytes,
+                        digest,
+                        digest_bytes,
+                        len(digest_bytes),
+                        created_at_utc,
+                    ),
+                )
+                persisted = self._connection.execute(
+                    "SELECT partition,from_seq,through_seq,event_count,header_bytes,digest,digest_bytes,digest_size_bytes,created_at_utc "
+                    "FROM digest_anchors WHERE partition=? AND through_seq=?",
+                    (checked_partition, actual_through_seq),
+                ).fetchone()
+                anchor = self._digest_anchor_from_row(persisted)
+                if anchor is None:
+                    raise sqlite3.DatabaseError
+                self._connection.execute("COMMIT")
+                return anchor
+            except sqlite3.OperationalError as exc:
+                self._rollback(self._connection)
+                return (
+                    self._store_busy()
+                    if _sqlite_is_busy(exc)
+                    else self._store_integrity()
+                )
+            except (HiveBusContractError, ValueError, sqlite3.DatabaseError):
+                self._rollback(self._connection)
+                return self._store_integrity()
 
     def record_manifest_bytes(
         self, consumer_group_id: str, *, manifest_bytes: bytes

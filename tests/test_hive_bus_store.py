@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import ast
+from dataclasses import fields
 import hashlib
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import sqlite3
 import stat
 import tempfile
 import threading
+from typing import get_args, get_type_hints
 
 import pytest
 
@@ -248,11 +250,12 @@ def _delivery_diagnostic(
 def _append_events(store: HiveBusStore, count: int) -> list[object]:
     events: list[object] = []
     for sequence in range(1, count + 1):
-        event = store.append(
+        result = store.append(
             _request(idempotency_suffix=f"{sequence:032x}", producer_seq=sequence),
             payload_bytes=b"payload",
         )
-        assert not isinstance(event, DiagnosticV2)
+        assert not isinstance(result, DiagnosticV2)
+        event = getattr(result, "event", result)
         events.append(event)
     return events
 
@@ -505,6 +508,208 @@ def _persisted_schema(root: Path) -> dict[str, str]:
         )
     finally:
         connection.close()
+
+
+def _append_result(
+    store: HiveBusStore, request: dict[str, object], payload_bytes: bytes | None
+) -> tuple[object, object, object]:
+    """Require the C1 append result and expose its event/capacity pair."""
+
+    result = store.append(request, payload_bytes=payload_bytes)
+    assert type(result).__name__ == "AppendResultV1"
+    event = getattr(result, "event")
+    capacity = getattr(result, "capacity")
+    assert type(event).__name__ == "HiveBusEventV1"
+    assert type(capacity).__name__ == "CapacityStateV1"
+    return result, event, capacity
+
+
+def _capacity_values(state: object) -> tuple[int, int, bool, bool]:
+    assert type(state).__name__ == "CapacityStateV1"
+    return (
+        getattr(state, "header_count"),
+        getattr(state, "managed_payload_bytes"),
+        getattr(state, "at_warning_watermark"),
+        getattr(state, "at_hard_watermark"),
+    )
+
+
+def _long_header_request(*, producer_seq: int) -> dict[str, object]:
+    request = _request(
+        idempotency_suffix=f"{producer_seq:032x}", producer_seq=producer_seq
+    )
+    request["causation_ids"] = [f"sha256:{value:064x}" for value in range(1, 17)]
+    return request
+
+
+def _guard_request(
+    event_type: str, *, producer_seq: int
+) -> tuple[dict[str, object], bytes | None]:
+    payload_kind = "artifact" if event_type == "artifact.archived" else "inline"
+    request = _request(
+        idempotency_suffix=f"{producer_seq:032x}",
+        producer_seq=producer_seq,
+        payload_kind=payload_kind,
+    )
+    request["event_type"] = event_type
+    if event_type == "authority.revoked":
+        request["retention_class"] = "audit"
+    elif event_type == "provider.hard_stopped":
+        request.update(
+            partition="provider/provider-1/status",
+            repo_id=None,
+            topic_id=None,
+            workpackage_id=None,
+            retention_class="transient",
+        )
+    elif event_type == "security.critical":
+        request.update(
+            partition="security/repo/repo-1",
+            repo_id="repo-1",
+            topic_id=None,
+            workpackage_id=None,
+            retention_class="audit",
+        )
+    elif event_type == "artifact.archived":
+        request.update(
+            partition="repo/repo-1/artifact/artifact-1",
+            repo_id="repo-1",
+            topic_id=None,
+            workpackage_id=None,
+            retention_class="audit",
+        )
+    return request, None if payload_kind == "artifact" else b"payload"
+
+
+def _seed_capacity_rows(
+    store: HiveBusStore,
+    *,
+    partition: str = _PARTITION,
+    artifact_count: int = 0,
+    payload_count: int = 0,
+    payload_size: int = 1_048_576,
+    payload_kind: str = "inline",
+) -> None:
+    """Seed only valid persisted rows for exact capacity boundary tests."""
+
+    assert artifact_count >= 0
+    assert payload_count >= 0
+    assert payload_kind in {"inline", "blob"}
+    total = artifact_count + payload_count
+    now = "2026-09-15T10:11:12.345Z"
+    principal = "producer-principal-v1-0123456789abcdef0123456789abcdef"
+    session = "producer-session-v1-0123456789abcdef0123456789abcdef"
+    connection = store._connection  # noqa: SLF001 - bounded capacity fixture.
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute(
+        "INSERT INTO partitions(partition,next_seq,first_retained_seq,state,blocked_code,created_at_utc,updated_at_utc) VALUES(?,?,?,?,?,?,?)",
+        (partition, total + 1, 1, "active", None, now, now),
+    )
+    artifact_digest = _digest(b"capacity-artifact")
+    artifact_ref = f"artifact:artifact-1@{artifact_digest}"
+    if artifact_count:
+        connection.execute(
+            "INSERT INTO payloads(kind,digest,ref,size_bytes,body,body_state,artifact_id,quarantine_code,created_at_utc) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                "artifact",
+                artifact_digest,
+                artifact_ref,
+                0,
+                None,
+                "reference",
+                "artifact-1",
+                None,
+                now,
+            ),
+        )
+    for index in range(1, total + 1):
+        event_id = _digest(f"capacity-event-{index}".encode())
+        idempotency_key = f"idempotency-v1-{index:032x}"
+        header = b"h"
+        if index <= artifact_count:
+            kind = "artifact"
+            digest = artifact_digest
+            reference = artifact_ref
+            size_bytes = 0
+        else:
+            payload_index = index - artifact_count
+            kind = payload_kind
+            digest = _digest(f"capacity-payload-{payload_index}".encode())
+            reference = f"{kind}:{digest}"
+            size_bytes = payload_size
+            connection.execute(
+                "INSERT INTO payloads(kind,digest,ref,size_bytes,body,body_state,artifact_id,quarantine_code,created_at_utc) VALUES(?,?,?,?,zeroblob(?),?,?,?,?)",
+                (
+                    kind,
+                    digest,
+                    reference,
+                    payload_size,
+                    payload_size,
+                    "present",
+                    None,
+                    None,
+                    now,
+                ),
+            )
+        connection.execute(
+            "INSERT INTO events(event_id,partition,partition_seq,schema_version,event_type,idempotency_key,producer_principal_id,producer_session_id,producer_epoch,producer_seq,repo_id,topic_id,workpackage_id,correlation_id,causation_ids_bytes,authority_grant_id,authority_scope_digest,authority_principal_version,classification,retention_class,created_at_utc,accepted_at_utc,payload_kind,payload_digest,payload_ref,payload_size_bytes,header_bytes,header_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                event_id,
+                partition,
+                index,
+                1,
+                "result.proposed" if kind != "inline" else "assignment.created",
+                idempotency_key,
+                principal,
+                session,
+                1,
+                index,
+                "repo-1",
+                None,
+                "task-1",
+                "correlation-v1-0123456789abcdef0123456789abcdef",
+                b"[]",
+                "authority-grant-v1-0123456789abcdef0123456789abcdef",
+                _digest(b"scope"),
+                1,
+                "internal",
+                "work",
+                now,
+                now,
+                kind,
+                digest,
+                reference,
+                size_bytes,
+                header,
+                _digest(header),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO idempotency(producer_principal_id,producer_epoch,idempotency_key,event_id,canonical_request_digest,partition_seq,accepted_at_utc,created_at_utc) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                principal,
+                1,
+                idempotency_key,
+                event_id,
+                _digest(f"capacity-request-{index}".encode()),
+                index,
+                now,
+                now,
+            ),
+        )
+    if total:
+        connection.execute(
+            "INSERT INTO producer_epochs(producer_principal_id,producer_epoch,producer_session_id,last_seq,last_event_id,updated_at_utc) VALUES(?,?,?,?,?,?)",
+            (
+                principal,
+                1,
+                session,
+                total,
+                _digest(f"capacity-event-{total}".encode()),
+                now,
+            ),
+        )
+    connection.commit()
 
 
 @pytest.fixture
@@ -1006,15 +1211,17 @@ def test_append_is_atomic_idempotent_and_uses_canonical_header(
     store = _store(secure_tmp_path / "bus-state", FakeClock())
     request = _request()
     try:
-        first = store.append(request, payload_bytes=b"payload")
-        assert not isinstance(first, DiagnosticV2)
+        first_result = store.append(request, payload_bytes=b"payload")
+        assert not isinstance(first_result, DiagnosticV2)
+        first = getattr(first_result, "event", first_result)
         assert first.partition_seq == 1
         assert first.accepted_at_utc == "2026-09-15T10:11:12.345Z"
         expected_header = canonical_json_bytes(serialize_hive_bus_event_v1(first))
         assert store.read_event_header(first.event_id) == expected_header
 
-        retried = store.append(request, payload_bytes=b"payload")
-        assert retried == first
+        retried_result = store.append(request, payload_bytes=b"payload")
+        assert not isinstance(retried_result, DiagnosticV2)
+        assert getattr(retried_result, "event", retried_result) == first
         assert store._connection.execute("SELECT COUNT(*) FROM events").fetchone() == (
             1,
         )  # noqa: SLF001
@@ -1148,20 +1355,27 @@ def test_idempotency_is_scoped_to_producer_principal_epoch_and_conflicts_do_not_
     store = _store(secure_tmp_path / "bus-state", FakeClock())
     first_request = _request()
     try:
-        first = store.append(first_request, payload_bytes=b"payload")
-        assert not isinstance(first, DiagnosticV2)
-        different_principal = store.append(
+        first_result = store.append(first_request, payload_bytes=b"payload")
+        assert not isinstance(first_result, DiagnosticV2)
+        first = getattr(first_result, "event", first_result)
+        different_principal_result = store.append(
             _request(
                 producer_principal_hex="fedcba9876543210fedcba9876543210",
                 producer_seq=1,
             ),
             payload_bytes=b"payload",
         )
-        assert not isinstance(different_principal, DiagnosticV2)
-        different_epoch = store.append(
+        assert not isinstance(different_principal_result, DiagnosticV2)
+        different_principal = getattr(
+            different_principal_result, "event", different_principal_result
+        )
+        different_epoch_result = store.append(
             _request(producer_epoch=2, producer_seq=1), payload_bytes=b"payload"
         )
-        assert not isinstance(different_epoch, DiagnosticV2)
+        assert not isinstance(different_epoch_result, DiagnosticV2)
+        different_epoch = getattr(
+            different_epoch_result, "event", different_epoch_result
+        )
         assert {
             first.partition_seq,
             different_principal.partition_seq,
@@ -1171,7 +1385,9 @@ def test_idempotency_is_scoped_to_producer_principal_epoch_and_conflicts_do_not_
             2,
             3,
         }
-        assert store.append(first_request, payload_bytes=b"payload") == first
+        retried = store.append(first_request, payload_bytes=b"payload")
+        assert not isinstance(retried, DiagnosticV2)
+        assert getattr(retried, "event", retried) == first
         before = store._connection.execute(  # noqa: SLF001 - conflict writes nothing.
             "SELECT COUNT(*),MAX(partition_seq) FROM events"
         ).fetchone()
@@ -1297,8 +1513,9 @@ def test_open_recovery_and_header_read_fail_closed_on_drift(
     root = secure_tmp_path / "bus-state"
     clock = FakeClock()
     store = _store(root, clock)
-    event = store.append(_request(), payload_bytes=b"payload")
-    assert not isinstance(event, DiagnosticV2)
+    event_result = store.append(_request(), payload_bytes=b"payload")
+    assert not isinstance(event_result, DiagnosticV2)
+    event = getattr(event_result, "event", event_result)
     keeper = sqlite3.connect(root / "bus_store.sqlite3")
     keeper.execute("BEGIN")
     keeper.execute("SELECT event_id FROM events").fetchone()
@@ -2130,6 +2347,7 @@ def test_b_lease_expiry_counts_only_pending_and_poison_blocks_static_ack(
             request = _request() | {"event_type": event_type}
             event = store.append(request, payload_bytes=b"payload")
         assert not isinstance(event, DiagnosticV2)
+        event = getattr(event, "event", event)
         partition = event.partition
         generation = store.record_manifest_bytes(
             _GROUP, manifest_bytes=b"opaque-manifest"
@@ -2474,6 +2692,7 @@ def test_every_store_diagnostic_call_is_direct_and_uses_d135_literals() -> None:
         "BUS_E_PAYLOAD_DIGEST": {("ERROR", False, "reject_publish")},
         "BUS_E_STORE_OWNER_ACTIVE": ("WARNING", True, "retry_open"),
         "BUS_E_STORE_BUSY": ("WARNING", True, "retry_operation"),
+        "BUS_E_BACKPRESSURE": ("WARNING", True, "defer_publish"),
         "BUS_W_CHECKPOINT_INCOMPLETE": ("WARNING", False, "inspect_checkpoint"),
     }
     assert "def _diagnostic" not in source
@@ -2511,3 +2730,589 @@ def test_every_store_diagnostic_call_is_direct_and_uses_d135_literals() -> None:
         causes = keywords["causes"]
         assert isinstance(causes, ast.Tuple)
         assert causes.elts == []
+
+
+def test_c1_digest_materializes_only_on_explicit_call_at_31_to_32_boundary(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "bus-state", clock)
+    try:
+        for sequence in range(1, 32):
+            _append_result(
+                store,
+                _request(
+                    idempotency_suffix=f"{sequence:032x}",
+                    producer_seq=sequence,
+                ),
+                b"payload",
+            )
+        assert store._connection.execute(  # noqa: SLF001 - explicit tick boundary.
+            "SELECT COUNT(*) FROM digest_anchors"
+        ).fetchone() == (0,)
+
+        clock.now += timedelta(days=1)
+        assert store._connection.execute(  # noqa: SLF001 - FakeClock is not a scheduler.
+            "SELECT COUNT(*) FROM digest_anchors"
+        ).fetchone() == (0,)
+
+        first_anchor = store.materialize_digest(_PARTITION, through_seq=31)
+        assert type(first_anchor).__name__ == "DigestAnchorV1"
+        rows = store._connection.execute(  # noqa: SLF001 - persisted anchor contract.
+            "SELECT from_seq,through_seq,event_count,header_bytes,digest,digest_bytes,digest_size_bytes "
+            "FROM digest_anchors ORDER BY through_seq"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0:3] == (1, 31, 31)
+        assert rows[0][3] == sum(
+            len(header)
+            for _, header in store._connection.execute(  # noqa: SLF001
+                "SELECT partition_seq,header_bytes FROM events WHERE partition=? ORDER BY partition_seq",
+                (_PARTITION,),
+            ).fetchall()
+        )
+        assert rows[0][3] <= 69_632
+        assert isinstance(rows[0][4], str) and rows[0][4].startswith("sha256:")
+        assert isinstance(rows[0][5], bytes)
+        assert rows[0][6] == len(rows[0][5])
+        assert b"payload" not in rows[0][5]
+
+        _append_result(
+            store,
+            _request(idempotency_suffix=f"{32:032x}", producer_seq=32),
+            b"payload",
+        )
+        assert store._connection.execute(  # noqa: SLF001 - append never auto-anchors.
+            "SELECT COUNT(*) FROM digest_anchors"
+        ).fetchone() == (1,)
+
+        second_anchor = store.materialize_digest(_PARTITION, through_seq=32)
+        assert type(second_anchor).__name__ == "DigestAnchorV1"
+        assert store.materialize_digest(_PARTITION, through_seq=32) is not None
+        rows = store._connection.execute(  # noqa: SLF001 - idempotent endpoint.
+            "SELECT from_seq,through_seq,event_count FROM digest_anchors ORDER BY through_seq"
+        ).fetchall()
+        assert rows == [(1, 31, 31), (32, 32, 1)]
+    finally:
+        assert store.close() is None
+
+
+def test_c1_digest_stops_before_header_cap_and_covers_64k_crossing_without_overlap(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "bus-state", FakeClock())
+    try:
+        for sequence in range(1, 33):
+            _append_result(
+                store,
+                _long_header_request(producer_seq=sequence),
+                b"payload",
+            )
+        headers = store._connection.execute(  # noqa: SLF001 - cap fixture.
+            "SELECT partition_seq,header_bytes FROM events WHERE partition=? ORDER BY partition_seq",
+            (_PARTITION,),
+        ).fetchall()
+        total_header_bytes = sum(len(header) for _, header in headers)
+        assert total_header_bytes > 65_536
+
+        first = store.materialize_digest(_PARTITION, through_seq=32)
+        assert type(first).__name__ == "DigestAnchorV1"
+        rows = store._connection.execute(  # noqa: SLF001 - persisted anchor bounds.
+            "SELECT from_seq,through_seq,event_count,header_bytes,digest_bytes FROM digest_anchors ORDER BY through_seq"
+        ).fetchall()
+        assert rows
+        first_from, first_through, first_count, first_bytes, first_digest_bytes = rows[
+            0
+        ]
+        assert (first_from, first_count) == (1, first_through)
+        assert first_through < 33
+        assert 1 <= first_count <= 32
+        assert 1 <= first_bytes <= 69_632
+        assert first_bytes == sum(
+            len(header) for sequence, header in headers if sequence <= first_through
+        )
+        assert (
+            first_through == 32 or first_bytes + len(headers[first_through][1]) > 69_632
+        )
+        assert b"payload" not in first_digest_bytes
+
+        second = store.materialize_digest(_PARTITION, through_seq=32)
+        assert type(second).__name__ == "DigestAnchorV1"
+        rows = store._connection.execute(  # noqa: SLF001 - contiguous anchor coverage.
+            "SELECT from_seq,through_seq,event_count,header_bytes FROM digest_anchors ORDER BY through_seq"
+        ).fetchall()
+        expected_from = 1
+        for from_seq, through_seq, event_count, header_bytes in rows:
+            assert from_seq == expected_from
+            assert through_seq >= from_seq
+            assert event_count == through_seq - from_seq + 1
+            assert 1 <= header_bytes <= 69_632
+            expected_from = through_seq + 1
+        assert expected_from == 33
+    finally:
+        assert store.close() is None
+
+
+def test_c1_digest_reopen_resumes_after_max_through_and_is_idempotent(
+    secure_tmp_path: Path,
+) -> None:
+    root = secure_tmp_path / "bus-state"
+    clock = FakeClock()
+    store = _store(root, clock)
+    for sequence in range(1, 3):
+        _append_result(
+            store,
+            _request(idempotency_suffix=f"{sequence:032x}", producer_seq=sequence),
+            b"payload",
+        )
+    try:
+        assert type(store.materialize_digest(_PARTITION, through_seq=2)).__name__ == (
+            "DigestAnchorV1"
+        )
+        assert store._connection.execute(  # noqa: SLF001 - idempotency count.
+            "SELECT COUNT(*) FROM digest_anchors"
+        ).fetchone() == (1,)
+        assert store.close() is None
+        reopened = HiveBusStore.initialize(root, clock=clock)
+        assert isinstance(reopened, HiveBusStore)
+        store = reopened
+        assert type(store.materialize_digest(_PARTITION, through_seq=2)).__name__ == (
+            "DigestAnchorV1"
+        )
+        assert store._connection.execute(  # noqa: SLF001 - reopen does not duplicate.
+            "SELECT COUNT(*) FROM digest_anchors"
+        ).fetchone() == (1,)
+        _append_result(
+            store,
+            _request(idempotency_suffix=f"{3:032x}", producer_seq=3),
+            b"payload",
+        )
+        assert type(store.materialize_digest(_PARTITION, through_seq=3)).__name__ == (
+            "DigestAnchorV1"
+        )
+        assert store._connection.execute(  # noqa: SLF001 - MAX(through_seq)+1.
+            "SELECT from_seq,through_seq FROM digest_anchors ORDER BY through_seq"
+        ).fetchall() == [(1, 2), (3, 3)]
+    finally:
+        assert store.close() is None
+
+
+def test_c1_materialize_append_race_is_gapless_and_non_overlapping(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "bus-state", FakeClock())
+    try:
+        for sequence in range(1, 32):
+            _append_result(
+                store,
+                _request(
+                    idempotency_suffix=f"{sequence:032x}",
+                    producer_seq=sequence,
+                ),
+                b"payload",
+            )
+        barrier = threading.Barrier(2)
+        outcomes: list[object] = []
+        failures: list[BaseException] = []
+
+        def materialize() -> None:
+            try:
+                barrier.wait()
+                outcomes.append(store.materialize_digest(_PARTITION, through_seq=32))
+            except BaseException as exc:  # pragma: no cover - diagnostic evidence.
+                failures.append(exc)
+
+        def append() -> None:
+            try:
+                barrier.wait()
+                outcomes.append(
+                    store.append(
+                        _request(idempotency_suffix=f"{32:032x}", producer_seq=32),
+                        payload_bytes=b"payload",
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - diagnostic evidence.
+                failures.append(exc)
+
+        materializer = threading.Thread(target=materialize)
+        appender = threading.Thread(target=append)
+        materializer.start()
+        appender.start()
+        materializer.join()
+        appender.join()
+        assert failures == []
+        assert len(outcomes) == 2
+        assert any(type(value).__name__ == "AppendResultV1" for value in outcomes)
+        assert any(type(value).__name__ == "DigestAnchorV1" for value in outcomes)
+
+        store.materialize_digest(_PARTITION, through_seq=32)
+        rows = store._connection.execute(  # noqa: SLF001 - race coverage.
+            "SELECT from_seq,through_seq,event_count FROM digest_anchors ORDER BY through_seq"
+        ).fetchall()
+        assert rows[0][0] == 1
+        expected_from = 1
+        for from_seq, through_seq, event_count in rows:
+            assert from_seq == expected_from
+            assert event_count == through_seq - from_seq + 1
+            expected_from = through_seq + 1
+        assert expected_from == 33
+    finally:
+        assert store.close() is None
+
+
+@pytest.mark.parametrize(
+    ("header_count", "expected_warning", "expected_hard"),
+    ((7_500, True, False), (10_000, True, True)),
+)
+def test_c1_capacity_header_count_warning_and_hard_boundaries(
+    secure_tmp_path: Path,
+    header_count: int,
+    expected_warning: bool,
+    expected_hard: bool,
+) -> None:
+    store = _store(secure_tmp_path / f"headers-{header_count}", FakeClock())
+    try:
+        _seed_capacity_rows(store, artifact_count=header_count)
+        state = store.read_capacity(_PARTITION)
+        assert _capacity_values(state) == (
+            header_count,
+            0,
+            expected_warning,
+            expected_hard,
+        )
+    finally:
+        assert store.close() is None
+
+
+@pytest.mark.parametrize(
+    ("payload_count", "expected_warning", "expected_hard"),
+    ((48, True, False), (64, True, True)),
+)
+def test_c1_capacity_managed_bytes_warning_and_hard_boundaries(
+    secure_tmp_path: Path,
+    payload_count: int,
+    expected_warning: bool,
+    expected_hard: bool,
+) -> None:
+    store = _store(secure_tmp_path / f"payload-{payload_count}", FakeClock())
+    try:
+        _seed_capacity_rows(
+            store,
+            payload_count=payload_count,
+            payload_size=1_048_576,
+            payload_kind="inline",
+        )
+        state = store.read_capacity(_PARTITION)
+        assert _capacity_values(state) == (
+            payload_count,
+            payload_count * 1_048_576,
+            expected_warning,
+            expected_hard,
+        )
+    finally:
+        assert store.close() is None
+
+
+def test_c1_noncritical_count_hard_projection_is_rejected_without_mutation(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "count-hard", FakeClock())
+    try:
+        _seed_capacity_rows(store, artifact_count=9_999)
+        before = store._connection.execute(  # noqa: SLF001 - pre-mutation snapshot.
+            "SELECT (SELECT COUNT(*) FROM events),(SELECT COUNT(*) FROM payloads),"
+            "(SELECT COUNT(*) FROM idempotency),(SELECT next_seq FROM partitions WHERE partition=?)",
+            (_PARTITION,),
+        ).fetchone()
+        result = store.append(_request(producer_seq=10_000), payload_bytes=b"payload")
+        assert isinstance(result, DiagnosticV2)
+        assert (
+            store._connection.execute(  # noqa: SLF001 - rejection must be atomic.
+                "SELECT (SELECT COUNT(*) FROM events),(SELECT COUNT(*) FROM payloads),"
+                "(SELECT COUNT(*) FROM idempotency),(SELECT next_seq FROM partitions WHERE partition=?)",
+                (_PARTITION,),
+            ).fetchone()
+            == before
+        )
+    finally:
+        assert store.close() is None
+
+
+def test_c1_noncritical_byte_hard_projection_is_rejected_without_mutation(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "bytes-hard", FakeClock())
+    try:
+        _seed_capacity_rows(
+            store,
+            payload_count=255,
+            payload_size=262_144,
+            payload_kind="blob",
+        )
+        request = _request(
+            idempotency_suffix=f"{256:032x}",
+            producer_seq=256,
+            payload_kind="blob",
+            payload_bytes=b"b" * 262_144,
+        )
+        before = store._connection.execute(  # noqa: SLF001 - pre-mutation snapshot.
+            "SELECT (SELECT COUNT(*) FROM events),(SELECT COUNT(*) FROM payloads),"
+            "(SELECT COUNT(*) FROM idempotency),(SELECT next_seq FROM partitions WHERE partition=?)",
+            (_PARTITION,),
+        ).fetchone()
+        result = store.append(request, payload_bytes=b"b" * 262_144)
+        assert isinstance(result, DiagnosticV2)
+        assert (
+            store._connection.execute(  # noqa: SLF001 - rejection must be atomic.
+                "SELECT (SELECT COUNT(*) FROM events),(SELECT COUNT(*) FROM payloads),"
+                "(SELECT COUNT(*) FROM idempotency),(SELECT next_seq FROM partitions WHERE partition=?)",
+                (_PARTITION,),
+            ).fetchone()
+            == before
+        )
+    finally:
+        assert store.close() is None
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    (
+        "authority.revoked",
+        "provider.hard_stopped",
+        "security.critical",
+        "artifact.archived",
+    ),
+)
+def test_c1_exact_four_hard_capacity_exceptions_append_at_projection(
+    secure_tmp_path: Path, event_type: str
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / event_type.replace(".", "-"), clock)
+    request, payload_bytes = _guard_request(event_type, producer_seq=10_000)
+    partition = request["partition"]
+    assert isinstance(partition, str)
+    try:
+        _seed_capacity_rows(store, partition=partition, artifact_count=9_999)
+        result, event, _ = _append_result(store, request, payload_bytes)
+        assert type(result).__name__ == "AppendResultV1"
+        assert getattr(event, "partition_seq") == 10_000
+        assert store._connection.execute(  # noqa: SLF001 - exception is the only bypass.
+            "SELECT COUNT(*) FROM events WHERE partition=?", (partition,)
+        ).fetchone() == (10_000,)
+    finally:
+        assert store.close() is None
+
+
+def test_c1_urgency_does_not_widen_hard_capacity_exception_set(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "urgent-nonexception", FakeClock())
+    try:
+        _seed_capacity_rows(store, artifact_count=9_999)
+        request = _request(producer_seq=10_000) | {"event_type": "assignment.cancelled"}
+        before = store._connection.execute(  # noqa: SLF001 - pre-mutation snapshot.
+            "SELECT COUNT(*),next_seq FROM events JOIN partitions ON partitions.partition=events.partition "
+            "WHERE events.partition=?",
+            (_PARTITION,),
+        ).fetchone()
+        result = store.append(request, payload_bytes=b"payload")
+        assert isinstance(result, DiagnosticV2)
+        assert (
+            store._connection.execute(  # noqa: SLF001 - urgent remains noncritical.
+                "SELECT COUNT(*),next_seq FROM events JOIN partitions ON partitions.partition=events.partition "
+                "WHERE events.partition=?",
+                (_PARTITION,),
+            ).fetchone()
+            == before
+        )
+    finally:
+        assert store.close() is None
+
+
+def test_c1_idempotent_retry_returns_stored_event_and_current_capacity(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "idempotent-capacity", FakeClock())
+    try:
+        request = _request()
+        first_result, first_event, _ = _append_result(store, request, b"payload")
+        _append_result(
+            store,
+            _request(idempotency_suffix=f"{2:032x}", producer_seq=2),
+            b"payload",
+        )
+        retried_result, retried_event, retry_capacity = _append_result(
+            store, request, b"payload"
+        )
+        assert type(first_result).__name__ == "AppendResultV1"
+        assert type(retried_result).__name__ == "AppendResultV1"
+        assert getattr(retried_event, "event_id") == getattr(first_event, "event_id")
+        current = store.read_capacity(_PARTITION)
+        assert _capacity_values(retry_capacity) == _capacity_values(current)
+        assert _capacity_values(retry_capacity) == (2, 14, False, False)
+    finally:
+        assert store.close() is None
+
+
+def test_c1_artifact_is_zero_managed_bytes_and_shared_payload_refs_are_logical(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "logical-payload-refs", FakeClock())
+    try:
+        _append_result(store, _request(producer_seq=1), b"payload")
+        _append_result(
+            store,
+            _request(idempotency_suffix=f"{2:032x}", producer_seq=2),
+            b"payload",
+        )
+        _append_result(
+            store,
+            _request(
+                idempotency_suffix=f"{3:032x}",
+                producer_seq=3,
+                payload_kind="blob",
+                payload_bytes=b"blob",
+            ),
+            b"blob",
+        )
+        artifact_request = _request(
+            idempotency_suffix=f"{4:032x}",
+            producer_seq=4,
+            payload_kind="artifact",
+            payload_bytes=b"external-artifact",
+        )
+        artifact_payload = artifact_request["payload"]
+        assert isinstance(artifact_payload, dict)
+        artifact_request["payload"] = artifact_payload | {"size_bytes": 1_048_577}
+        _append_result(store, artifact_request, None)
+
+        state = store.read_capacity(_PARTITION)
+        assert _capacity_values(state) == (4, 7 + 7 + 4, False, False)
+        assert store._connection.execute(  # noqa: SLF001 - artifact body is external.
+            "SELECT size_bytes,body,body_state FROM payloads WHERE kind='artifact'"
+        ).fetchone() == (1_048_577, None, "reference")
+    finally:
+        assert store.close() is None
+
+
+def test_c1_spec_digest_anchor_exposes_exactly_the_seven_plan_fields() -> None:
+    assert tuple(field.name for field in fields(bus_store.DigestAnchorV1)) == (
+        "partition",
+        "from_seq",
+        "through_seq",
+        "event_count",
+        "header_bytes",
+        "digest",
+        "digest_bytes",
+    )
+
+
+def test_c1_spec_read_capacity_returns_none_for_unknown_partition_but_not_empty_known_partition(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "capacity-partitions", FakeClock())
+    unknown_partition = "repo/repo-1/task/task-unknown"
+    try:
+        assert store.read_capacity(unknown_partition) is None
+        store._connection.execute(  # noqa: SLF001 - existing empty partition fixture.
+            "INSERT INTO partitions(partition,next_seq,first_retained_seq,state,blocked_code,created_at_utc,updated_at_utc) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                _PARTITION,
+                1,
+                1,
+                "active",
+                None,
+                "2026-09-15T10:11:12.345Z",
+                "2026-09-15T10:11:12.345Z",
+            ),
+        )
+        store._connection.commit()  # noqa: SLF001 - existing empty partition fixture.
+        assert _capacity_values(store.read_capacity(_PARTITION)) == (0, 0, False, False)
+    finally:
+        assert store.close() is None
+
+
+def test_c1_spec_digest_bytes_are_exact_canonical_mapping_and_sha256(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "digest-gold", FakeClock())
+    body = b"body-freetext-must-not-enter-digest"
+    try:
+        for sequence in range(1, 3):
+            _append_result(
+                store,
+                _request(
+                    idempotency_suffix=f"{sequence:032x}",
+                    producer_seq=sequence,
+                    payload_bytes=body,
+                ),
+                body,
+            )
+        anchor = store.materialize_digest(_PARTITION, through_seq=2)
+        assert type(anchor).__name__ == "DigestAnchorV1"
+        rows = store._connection.execute(  # noqa: SLF001 - independent mapping inputs.
+            "SELECT partition_seq,event_id,header_digest FROM events "
+            "WHERE partition=? ORDER BY partition_seq,event_id",
+            (_PARTITION,),
+        ).fetchall()
+        entries = [
+            {
+                "partition_seq": sequence,
+                "event_id": event_id,
+                "header_digest": header_digest,
+            }
+            for sequence, event_id, header_digest in rows
+        ]
+        expected_mapping = {
+            "entries": entries,
+            "event_count": 2,
+            "from_seq": 1,
+            "header_bytes": store._connection.execute(  # noqa: SLF001
+                "SELECT SUM(length(header_bytes)) FROM events WHERE partition=?",
+                (_PARTITION,),
+            ).fetchone()[0],
+            "partition": _PARTITION,
+            "schema_version": 1,
+            "through_seq": 2,
+        }
+        expected_bytes = canonical_json_bytes(expected_mapping)
+        assert set(expected_mapping) == {
+            "entries",
+            "event_count",
+            "from_seq",
+            "header_bytes",
+            "partition",
+            "schema_version",
+            "through_seq",
+        }
+        assert all(
+            set(entry) == {"partition_seq", "event_id", "header_digest"}
+            for entry in entries
+        )
+        assert body not in expected_bytes
+        assert getattr(anchor, "digest_bytes") == expected_bytes
+        assert getattr(anchor, "digest") == _digest(expected_bytes)
+    finally:
+        assert store.close() is None
+
+
+def test_c1_spec_materialize_digest_return_annotation_is_anchor_or_diagnostic() -> None:
+    return_annotation = get_type_hints(bus_store.HiveBusStore.materialize_digest)[
+        "return"
+    ]
+
+    assert return_annotation == bus_store.DigestAnchorV1 | DiagnosticV2
+    assert type(None) not in get_args(return_annotation)
+
+
+def test_c1_materialize_empty_next_interval_returns_schema_diagnostic(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "empty-digest", FakeClock())
+    try:
+        _seed_capacity_rows(store)
+        result = store.materialize_digest(_PARTITION, through_seq=1)
+        _diagnostic(result, "BUS_E_SCHEMA", DiagnosticSeverityV2.ERROR)
+    finally:
+        assert store.close() is None
