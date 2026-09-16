@@ -69,6 +69,8 @@ RELEASE = BrokerReleaseSpec(
     "the_hive_control_t",
     "the_hive_home_broker_runtime_t",
     "the_hive_agent_t",
+    "TH-ROOT-OWNER-LAYOUT/1",
+    "a" * 64,
 )
 
 
@@ -233,7 +235,36 @@ def test_builder_derives_only_fixed_topology_and_issued_release_binding() -> Non
         RELEASE.provider_abi,
         RELEASE.unit_digest,
         RELEASE.selinux_digest,
+        RELEASE.owner_layout_abi,
+        RELEASE.owner_layout_digest,
     )
+
+
+@pytest.mark.parametrize(
+    ("owner_layout_abi", "owner_layout_digest"),
+    (
+        ("TH-ROOT-OWNER-LAYOUT/2", "a" * 64),
+        ("TH-ROOT-OWNER-LAYOUT/1", "A" * 64),
+        ("TH-ROOT-OWNER-LAYOUT/1", "a" * 63),
+    ),
+)
+def test_joint_release_rejects_invalid_owner_layout_binding(
+    owner_layout_abi: str, owner_layout_digest: str
+) -> None:
+    with pytest.raises(BrokerSystemError, match="joint release evidence is invalid"):
+        BrokerJointReleaseEvidence(
+            RELEASE.joint_release_version,
+            RELEASE.release_id,
+            RELEASE.server_digest,
+            RELEASE.broker_manifest_digest,
+            RELEASE.chpb_abi,
+            RELEASE.policy_abi,
+            RELEASE.provider_abi,
+            RELEASE.unit_digest,
+            RELEASE.selinux_digest,
+            owner_layout_abi,
+            owner_layout_digest,
+        )
 
 
 @pytest.mark.parametrize(
@@ -352,6 +383,8 @@ def _system_evidence(**changes: object) -> BrokerSystemEvidence:
             RELEASE.provider_abi,
             RELEASE.unit_digest,
             RELEASE.selinux_digest,
+            RELEASE.owner_layout_abi,
+            RELEASE.owner_layout_digest,
         ),
     }
     values.update(changes)
@@ -939,6 +972,8 @@ def test_directory_and_socket_evidence_reject_every_typed_field_mutation(
             RELEASE.provider_abi,
             RELEASE.unit_digest,
             RELEASE.selinux_digest,
+            RELEASE.owner_layout_abi,
+            RELEASE.owner_layout_digest,
         ),
     ],
 )

@@ -213,6 +213,8 @@ class BrokerJointReleaseEvidence:
     provider_abi: str
     unit_digest: str
     selinux_digest: str
+    owner_layout_abi: str
+    owner_layout_digest: str
 
     def __post_init__(self) -> None:
         _positive_integer(self.joint_release_version, "joint release version")
@@ -225,8 +227,20 @@ class BrokerJointReleaseEvidence:
             (self.provider_abi, "provider ABI"),
             (self.unit_digest, "unit digest"),
             (self.selinux_digest, "SELinux digest"),
+            (self.owner_layout_abi, "owner layout ABI"),
+            (self.owner_layout_digest, "owner layout digest"),
         ):
             _nonempty_text(value, label)
+        if (
+            self.owner_layout_abi != "TH-ROOT-OWNER-LAYOUT/1"
+            or type(self.owner_layout_digest) is not str
+            or len(self.owner_layout_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.owner_layout_digest
+            )
+        ):
+            _fail("joint release evidence is invalid")
 
 
 class _BrokerSystemPlanCarrier:
@@ -373,6 +387,8 @@ def build_broker_system_plan(grant: StartGrant) -> BrokerSystemPlan:
             release.provider_abi,
             release.unit_digest,
             release.selinux_digest,
+            release.owner_layout_abi,
+            release.owner_layout_digest,
         ),
     )
 
@@ -454,6 +470,8 @@ def _validated_joint_release(value: object) -> BrokerJointReleaseEvidence:
         value.provider_abi,
         value.unit_digest,
         value.selinux_digest,
+        value.owner_layout_abi,
+        value.owner_layout_digest,
     )
 
 

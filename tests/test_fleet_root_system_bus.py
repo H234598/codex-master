@@ -135,6 +135,8 @@ def release_spec() -> BrokerReleaseSpec:
         "the_hive_control_t",
         "the_hive_home_broker_runtime_t",
         "the_hive_agent_t",
+        "TH-ROOT-OWNER-LAYOUT/1",
+        "a" * 64,
     )
 
 
@@ -473,6 +475,8 @@ def r2a_evidence(**changes: object) -> broker_system.BrokerSystemEvidence:
             "provider-v1",
             "3" * 64,
             "4" * 64,
+            "TH-ROOT-OWNER-LAYOUT/1",
+            "a" * 64,
         ),
     }
     values.update(changes)

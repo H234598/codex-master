@@ -86,6 +86,8 @@ class BrokerReleaseSpec:
     gateway_domain: str
     socket_type: str
     agent_domain: str
+    owner_layout_abi: str
+    owner_layout_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +232,7 @@ def _validate_release_spec(value: object) -> BrokerReleaseSpec:
         or value.gateway_domain != "the_hive_control_t"
         or value.socket_type != "the_hive_home_broker_runtime_t"
         or value.agent_domain != "the_hive_agent_t"
+        or value.owner_layout_abi != "TH-ROOT-OWNER-LAYOUT/1"
     ):
         _fail("broker release is invalid")
     digests = (
@@ -237,6 +240,7 @@ def _validate_release_spec(value: object) -> BrokerReleaseSpec:
         value.broker_manifest_digest,
         value.unit_digest,
         value.selinux_digest,
+        value.owner_layout_digest,
     )
     if any(
         type(digest) is not str

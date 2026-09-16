@@ -26,6 +26,7 @@ from the_hive.fleet_home_broker_runtime import (
     RuntimePrincipalResolver,
     StartGrant,
     TrustedPrincipalGrantContext,
+    _validate_release_spec,
     attest_kernel_peer,
 )
 from the_hive.fleet_home_broker_transport import BrokerPeer
@@ -62,6 +63,8 @@ def release_spec(**changes):
         "gateway_domain": "the_hive_control_t",
         "socket_type": "the_hive_home_broker_runtime_t",
         "agent_domain": "the_hive_agent_t",
+        "owner_layout_abi": "TH-ROOT-OWNER-LAYOUT/1",
+        "owner_layout_digest": "a" * 64,
     }
     values.update(changes)
     return BrokerReleaseSpec(**values)
@@ -361,6 +364,8 @@ def test_release_spec_is_frozen_slotted_and_has_only_root_release_fields():
         "gateway_domain",
         "socket_type",
         "agent_domain",
+        "owner_layout_abi",
+        "owner_layout_digest",
     )
 
     assert dataclasses.is_dataclass(BrokerReleaseSpec)
@@ -368,13 +373,28 @@ def test_release_spec_is_frozen_slotted_and_has_only_root_release_fields():
     assert hasattr(BrokerReleaseSpec, "__slots__")
     assert tuple(field.name for field in dataclasses.fields(RELEASE)) == expected_fields
     fields = dataclasses.fields(BrokerReleaseSpec)
-    assert fields[-1].name == "agent_domain"
+    assert fields[-1].name == "owner_layout_digest"
     assert fields[-1].default is dataclasses.MISSING
     assert fields[-1].default_factory is dataclasses.MISSING
     assert "mcs_pair" not in expected_fields
     assert "enforcing" not in expected_fields
     with pytest.raises(FrozenInstanceError):
         RELEASE.release_id = "0.10.5"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("owner_layout_abi", "TH-ROOT-OWNER-LAYOUT/2"),
+        ("owner_layout_digest", "A" * 64),
+        ("owner_layout_digest", "a" * 63),
+    ),
+)
+def test_release_spec_rejects_owner_layout_binding_drift_directly(
+    field: str, value: str
+) -> None:
+    with pytest.raises(RuntimeBoundaryError, match="broker release is invalid"):
+        _validate_release_spec(release_spec(**{field: value}))
 
 
 def test_attestation_has_one_explicit_trusted_release_input_and_no_payload_input():
@@ -422,6 +442,8 @@ def test_attestation_has_one_explicit_trusted_release_input_and_no_payload_input
         ("agent_domain", "the_hive_agent_exec_t"),
         ("agent_domain", "unconfined_t"),
         ("agent_domain", ""),
+        ("owner_layout_abi", "TH-ROOT-OWNER-LAYOUT/2"),
+        ("owner_layout_digest", "A" * 64),
     ],
 )
 def test_release_drift_is_rejected_before_projection(field, value):

@@ -85,6 +85,7 @@ def validate_dynamic_teamlead_a3_runtime_context(
         or release.gateway_domain != "the_hive_control_t"
         or release.socket_type != "the_hive_home_broker_runtime_t"
         or release.agent_domain != "the_hive_agent_t"
+        or release.owner_layout_abi != "TH-ROOT-OWNER-LAYOUT/1"
         or type(release.policy_abi) is not str
         or not release.policy_abi
         or type(release.provider_abi) is not str
@@ -98,6 +99,7 @@ def validate_dynamic_teamlead_a3_runtime_context(
                 release.broker_manifest_digest,
                 release.unit_digest,
                 release.selinux_digest,
+                release.owner_layout_digest,
             )
         )
     ):

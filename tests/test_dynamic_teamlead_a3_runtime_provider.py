@@ -172,6 +172,8 @@ def release() -> BrokerReleaseSpec:
         gateway_domain="the_hive_control_t",
         socket_type="the_hive_home_broker_runtime_t",
         agent_domain="the_hive_agent_t",
+        owner_layout_abi="TH-ROOT-OWNER-LAYOUT/1",
+        owner_layout_digest="a" * 64,
     )
 
 
@@ -268,6 +270,22 @@ def test_validate_returns_same_frozen_context_repeatedly() -> None:
     assert validate_dynamic_teamlead_a3_runtime_context(value) is value
     with pytest.raises(FrozenInstanceError):
         value.release = release()  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    (
+        ("owner_layout_abi", "TH-ROOT-OWNER-LAYOUT/2"),
+        ("owner_layout_digest", "A" * 64),
+        ("owner_layout_digest", "a" * 63),
+    ),
+)
+def test_runtime_context_rejects_owner_layout_binding_drift_separately(
+    field: str, changed: str
+) -> None:
+    value = valid_value()
+
+    assert_invalid(replace(value, release=replace(value.release, **{field: changed})))
 
 
 def test_rejects_equal_but_distinct_snapshot() -> None:

@@ -92,6 +92,8 @@ def release_spec(**changes: object) -> BrokerReleaseSpec:
         "gateway_domain": "the_hive_control_t",
         "socket_type": "the_hive_home_broker_runtime_t",
         "agent_domain": "the_hive_agent_t",
+        "owner_layout_abi": "TH-ROOT-OWNER-LAYOUT/1",
+        "owner_layout_digest": "a" * 64,
     }
     values.update(changes)
     return BrokerReleaseSpec(**values)
