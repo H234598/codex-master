@@ -54,7 +54,7 @@ typedef struct ExecutionWireV1Digest {
     uint8_t bytes[EXECUTION_WIRE_V1_DIGEST_SIZE];
 } ExecutionWireV1Digest;
 
-/* Text is always ASCII.  Identifiers permit [a-z0-9][a-z0-9._-]* only. */
+/* Text is ASCII; identifiers and non-empty relative-path segments match [a-z][a-z0-9._-]* exactly. */
 typedef struct ExecutionWireV1Text {
     uint8_t bytes[EXECUTION_WIRE_V1_TEXT_CAPACITY + 1U];
     size_t length;

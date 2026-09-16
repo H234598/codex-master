@@ -734,6 +734,47 @@ static void rejects_approval_wire_byteflip_against_tuple(void) {
     assert(execution_wire_v1_validate_approval_for_tuple(&decoded, &tuple_value, limits()) == EXECUTION_WIRE_V1_MISMATCH);
 }
 
+static void enforces_identifier_and_path_segment_starts(void) {
+    static const char *const valid_identifiers[] = {
+        "a", "a1service", "a.service", "a_service", "a-service"
+    };
+    static const char *const invalid_identifiers[] = {
+        "1service", ".service", "_service", "-service"
+    };
+    static const char *const valid_path_segments[] = {
+        "a/a", "a/a1service", "a/a.service", "a/a_service", "a/a-service"
+    };
+    static const char *const invalid_path_segments[] = {
+        "a/1service", "a/.service", "a/_service", "a/-service"
+    };
+    uint8_t bytes[65536];
+    size_t length;
+    size_t index;
+    D73AuthorizedExecutionTupleV1 tuple_value = tuple();
+
+    for (index = 0U; index < sizeof(valid_identifiers) / sizeof(valid_identifiers[0]); ++index) {
+        tuple_value.authority_domain = text(valid_identifiers[index]);
+        length = sizeof(bytes);
+        assert(execution_wire_v1_encode_tuple(&tuple_value, limits(), bytes, &length) == EXECUTION_WIRE_V1_OK);
+    }
+    for (index = 0U; index < sizeof(invalid_identifiers) / sizeof(invalid_identifiers[0]); ++index) {
+        tuple_value.authority_domain = text(invalid_identifiers[index]);
+        length = sizeof(bytes);
+        assert(execution_wire_v1_encode_tuple(&tuple_value, limits(), bytes, &length) != EXECUTION_WIRE_V1_OK);
+    }
+    tuple_value.authority_domain = text("d73-authority");
+    for (index = 0U; index < sizeof(valid_path_segments) / sizeof(valid_path_segments[0]); ++index) {
+        tuple_value.roles[0].relative_path = text(valid_path_segments[index]);
+        length = sizeof(bytes);
+        assert(execution_wire_v1_encode_tuple(&tuple_value, limits(), bytes, &length) == EXECUTION_WIRE_V1_OK);
+    }
+    for (index = 0U; index < sizeof(invalid_path_segments) / sizeof(invalid_path_segments[0]); ++index) {
+        tuple_value.roles[0].relative_path = text(invalid_path_segments[index]);
+        length = sizeof(bytes);
+        assert(execution_wire_v1_encode_tuple(&tuple_value, limits(), bytes, &length) != EXECUTION_WIRE_V1_OK);
+    }
+}
+
 int main(void) {
     round_trip_tuple();
     round_trip_approval_and_envelope();
@@ -749,6 +790,7 @@ int main(void) {
     rejects_mutated_wire_and_bindings();
     rejects_approval_wire_byteflip_against_tuple();
     rejects_all_cross_object_mismatches();
+    enforces_identifier_and_path_segment_starts();
     puts("test_execution_wire_v1: PASS");
     return 0;
 }
