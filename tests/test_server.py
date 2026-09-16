@@ -58,8 +58,10 @@ from the_hive.resource_monitor import (
 from the_hive.selection.task_classification import TaskClassificationRequest, TaskClassifier
 from the_hive.usage_snapshot import (
     AccountUsageEvidenceV2,
+    ModelInvocabilityStatus,
     ModelInvocabilityProjectionV1,
     ModelInvocabilityV1,
+    ReaderStatus,
     TrackerEvidenceV2,
     UsageEvidenceV2,
     UsageLimitV2,
@@ -1112,6 +1114,46 @@ ADMITTED_SPAWN_DECISION = {
     "reason_codes": [],
     "raw_output": "not_returned",
 }
+
+
+@contextlib.contextmanager
+def attested_codex_model_reader_for_test(
+    *account_ids: str,
+    model_ids: tuple[str, ...] = (
+        "gpt-5.3-codex-spark",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+    ),
+) -> Iterator[UsageEvidenceV2]:
+    """Supply explicit account/model/codex-cli capability evidence to one fixture."""
+
+    observed_at = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+    evidence = UsageEvidenceV2(
+        (),
+        "complete",
+        observed_at,
+        observed_at,
+        model_invocability=ModelInvocabilityProjectionV1(
+            "complete",
+            "pool_authority-v3.model_capabilities",
+            tuple(
+                ModelInvocabilityV1(
+                    account_id,
+                    model_id,
+                    server_module.RunnerKind.CODEX_CLI.value,
+                    True,
+                    True,
+                    False,
+                    True,
+                )
+                for account_id in account_ids
+                for model_id in model_ids
+            ),
+        ),
+    )
+    with patch("the_hive.server.read_usage_evidence_v2", return_value=evidence):
+        yield evidence
 LOW_HIVE_IO_PRESSURE = CgroupIoPressureEvidenceV1(
     some_avg10=0.0,
     full_avg10=0.0,
@@ -3295,15 +3337,22 @@ class ServerHelpersTest(unittest.TestCase):
         completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
         descriptor = server_module.AgentDescriptor(
             "r1", "r", 1, "Registry R1", server_module.RunnerKind.CODEX_CLI,
-            server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+            server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, "d254-r1",
             Path("/home/r1"), "g5session", True, Path("/runner"),
         )
         inventory = server_module.InventorySnapshot(
             ("r1",), {"r1": descriptor}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
         )
-        with server_module.temporary_agent_inventory(inventory), patch(
+        with server_module.temporary_agent_inventory(inventory), attested_codex_model_reader_for_test(
+            "d254-r1"
+        ), patch(
             "the_hive.server.read_meta",
-            return_value={"agent": "r1", "session": "g5session", "tmux_socket": socket_name},
+            return_value={
+                "agent": "r1",
+                "session": "g5session",
+                "tmux_socket": socket_name,
+                "model": DEFAULT_AGENT_MODEL,
+            },
         ), patch("the_hive.server.require_fleet_recovery_ready"), patch(
             "the_hive.server.require_invocation_status"
         ), patch(
@@ -3673,7 +3722,7 @@ class ServerHelpersTest(unittest.TestCase):
                         )
                         yield
 
-                with patch.dict(
+                with attested_codex_model_reader_for_test("legacy-a"), patch.dict(
                     "the_hive.server.AGENTS",
                     {"a": {"label": "A", "runner": runner, "home": root, "session": "g5session"}},
                     clear=False,
@@ -3797,7 +3846,7 @@ class ServerHelpersTest(unittest.TestCase):
                     except Exception as exc:  # pragma: no cover - asserted below
                         outcomes[agent] = exc
 
-                with patch.dict("the_hive.server.AGENTS", agents, clear=False), patch(
+                with attested_codex_model_reader_for_test("legacy-a", "legacy-b"), patch.dict("the_hive.server.AGENTS", agents, clear=False), patch(
                     "the_hive.server.STATE_ROOT", state
                 ), patch("the_hive.server.RAW_DIR", state / "raw"), patch(
                     "the_hive.server.META_DIR", state / "meta"
@@ -5324,6 +5373,17 @@ class ServerHelpersTest(unittest.TestCase):
         )
         session_model.start()
         self.addCleanup(session_model.stop)
+        if self._testMethodName.startswith("test_send_agent_"):
+            model_runner_admission = patch(
+                "the_hive.server._require_model_runner_admission"
+            )
+            model_runner_admission.start()
+            self.addCleanup(model_runner_admission.stop)
+            active_model = patch(
+                "the_hive.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL}
+            )
+            active_model.start()
+            self.addCleanup(active_model.stop)
         if not dedicated_scan_test:
             process_summary = patch(
                 "the_hive.server.agent_home_process_summary",
@@ -18064,7 +18124,18 @@ google_accounts:
             )
 
     def test_unverified_selection_offer_fails_safe_to_arbeitsbiene(self) -> None:
-        result = call_tool("agent_selection_options", {"agent": "a"})
+        descriptor = server_module.AgentDescriptor(
+            "a", "a", 1, "A", server_module.RunnerKind.CODEX_CLI,
+            server_module.Provider.OPENAI_CHATGPT, "gpt-5.6-luna", "d254-offer-a",
+            Path("/tmp/d254-offer-a"), "d254-offer-a", True, Path("/tmp/d254-codex"),
+        )
+        inventory = server_module.InventorySnapshot(
+            ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
+        )
+        with server_module.temporary_agent_inventory(inventory), attested_codex_model_reader_for_test(
+            "d254-offer-a"
+        ):
+            result = call_tool("agent_selection_options", {"agent": "a"})
 
         self.assertEqual(result["classes"], ["arbeitsbiene"])
         self.assertNotIn("teamleiterin", result["classes"])
@@ -18074,11 +18145,22 @@ google_accounts:
     def test_verified_teamleader_offer_contains_only_delegable_resolver_options(
         self,
     ) -> None:
-        result = call_tool(
-            "agent_selection_options",
-            {"agent": "a"},
-            principal_class="teamleiterin",
+        descriptor = server_module.AgentDescriptor(
+            "a", "a", 1, "A", server_module.RunnerKind.CODEX_CLI,
+            server_module.Provider.OPENAI_CHATGPT, "gpt-5.6-luna", "d254-offer-a",
+            Path("/tmp/d254-offer-a"), "d254-offer-a", True, Path("/tmp/d254-codex"),
         )
+        inventory = server_module.InventorySnapshot(
+            ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
+        )
+        with server_module.temporary_agent_inventory(inventory), attested_codex_model_reader_for_test(
+            "d254-offer-a"
+        ):
+            result = call_tool(
+                "agent_selection_options",
+                {"agent": "a"},
+                principal_class="teamleiterin",
+            )
 
         self.assertEqual(result["classes"], ["arbeitsbiene", "spezialistin"])
         self.assertTrue(result["options"])
@@ -18101,11 +18183,22 @@ google_accounts:
     def test_verified_queen_offer_includes_direct_teamleader_for_non_q_target(
         self,
     ) -> None:
-        result = call_tool(
-            "agent_selection_options",
-            {"agent": "a1"},
-            principal_class="koenigin",
+        descriptor = server_module.AgentDescriptor(
+            "a1", "a", 1, "A1", server_module.RunnerKind.CODEX_CLI,
+            server_module.Provider.OPENAI_CHATGPT, "gpt-5.6-luna", "d254-offer-a1",
+            Path("/tmp/d254-offer-a1"), "d254-offer-a1", True, Path("/tmp/d254-codex"),
         )
+        inventory = server_module.InventorySnapshot(
+            ("a1",), {"a1": descriptor}, {"a-series": ("a1",)}, {"a1": 0}, ("a",)
+        )
+        with server_module.temporary_agent_inventory(inventory), attested_codex_model_reader_for_test(
+            "d254-offer-a1"
+        ):
+            result = call_tool(
+                "agent_selection_options",
+                {"agent": "a1"},
+                principal_class="koenigin",
+            )
 
         self.assertEqual(result["classes"], ["arbeitsbiene", "spezialistin", "teamleiterin"])
         teamleader_options = [option for option in result["options"] if option["class"] == "teamleiterin"]
@@ -18394,7 +18487,28 @@ google_accounts:
             "state": "authenticated",
         }
         lease = {"state": "held", "holder": "test", "held_by_this_server": True}
-        evidence = UsageEvidenceV2((), "unavailable", None, None)
+        observed_at = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+        evidence = UsageEvidenceV2(
+            (),
+            "complete",
+            observed_at,
+            observed_at,
+            model_invocability=ModelInvocabilityProjectionV1(
+                "complete",
+                "pool_authority-v3.model_capabilities",
+                (
+                    ModelInvocabilityV1(
+                        "legacy-a",
+                        "gpt-5.6-luna",
+                        "codex_cli",
+                        True,
+                        True,
+                        False,
+                        True,
+                    ),
+                ),
+            ),
+        )
         with (
             patch("the_hive.server.require_fleet_recovery_ready"),
             patch("the_hive.server._headless_descriptor", return_value=None),
@@ -18424,7 +18538,7 @@ google_accounts:
 
         self.assertEqual(start.call_args.kwargs["model"], "gpt-5.6-luna")
         self.assertEqual(result["selection"]["model"], "gpt-5.6-luna")
-        read_evidence.assert_called_once()
+        self.assertEqual(read_evidence.call_count, 2)
         tracker.assert_not_called()
 
     def test_confirmed_assign_write_can_select_spark_and_audit_profile(self) -> None:
@@ -18465,6 +18579,22 @@ google_accounts:
             "complete",
             now,
             now,
+            model_invocability=ModelInvocabilityProjectionV1(
+                "complete",
+                "pool_authority-v3.model_capabilities",
+                tuple(
+                    ModelInvocabilityV1(
+                        "account-a1",
+                        model_id,
+                        "codex_cli",
+                        True,
+                        True,
+                        False,
+                        True,
+                    )
+                    for model_id in ("gpt-5.3-codex-spark", "gpt-5.6-luna")
+                ),
+            ),
         )
         with (
             patch("the_hive.server.require_fleet_recovery_ready"),
@@ -18488,6 +18618,9 @@ google_accounts:
                     agents={
                         "a1": SimpleNamespace(
                             account_id="account-a1",
+                            runner=server_module.RunnerKind.CODEX_CLI,
+                            provider=server_module.Provider.OPENAI_CHATGPT,
+                            model="gpt-5.6-luna",
                             series_prefix="a",
                             skill_profile="arbeitsbiene",
                         )
@@ -18519,12 +18652,13 @@ google_accounts:
                 root_cause_known=True,
             )
 
-        self.assertEqual(result["model"], "gpt-5.3-codex-spark")
+        self.assertEqual(result["model"], "gpt-5.6-luna")
         self.assertTrue(result["task_profile"]["spark_eligible"])
+        self.assertIn("default_model_unavailable", result["selection"]["reason_codes"])
         self.assertEqual(
             record.call_args.args[0]["task_profile"], result["task_profile"]
         )
-        read_evidence.assert_called_once()
+        self.assertEqual(read_evidence.call_count, 2)
         tracker.assert_called_once()
 
     def test_task_evidence_is_write_assignment_only_and_boolean_strict(self) -> None:
@@ -18638,6 +18772,10 @@ google_accounts:
             requested_model: str | None = None,
             requested_reasoning: str | None = None,
         ) -> dict[str, Any]:
+            descriptor.account_id = f"d254-{descriptor.agent_id}"
+            descriptor.runner = server_module.RunnerKind.CODEX_CLI
+            descriptor.provider = server_module.Provider.OPENAI_CHATGPT
+            descriptor.model = "gpt-5.6-luna"
             inventory = SimpleNamespace(
                 agents={descriptor.agent_id: descriptor},
                 agent_ids=(descriptor.agent_id,),
@@ -18649,6 +18787,7 @@ google_accounts:
                 "expires_at_utc": None,
             }
             with (
+                attested_codex_model_reader_for_test(descriptor.account_id),
                 patch(
                     "the_hive.server.current_agent_inventory",
                     return_value=inventory,
@@ -18858,14 +18997,11 @@ google_accounts:
             "raw_output": "not_returned",
         }
         with (
+            attested_codex_model_reader_for_test("legacy-a"),
             patch(
                 "the_hive.server.agent_auth_status",
                 return_value={"authenticated": False, "auth_state": "missing"},
             ),
-            patch(
-                "the_hive.server.read_usage_evidence_v2",
-                return_value=UsageEvidenceV2((), "unavailable", None, None),
-            ) as read_evidence,
             patch(
                 "the_hive.server.claim_for_agent_mutation",
                 return_value=(lease, True),
@@ -18888,7 +19024,6 @@ google_accounts:
                 allow_unauthenticated=True,
             )
 
-        read_evidence.assert_called_once()
         self.assertNotIn("routing", result)
         self.assertEqual(record.call_args.args[0]["model"], DEFAULT_AGENT_MODEL)
         self.assertNotIn("routing", record.call_args.args[0])
@@ -19040,7 +19175,7 @@ google_accounts:
             raw_dir.mkdir()
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
 
-            with patch.dict(
+            with attested_codex_model_reader_for_test("legacy-a"), patch.dict(
                 "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
                 clear=False,
@@ -19132,7 +19267,7 @@ google_accounts:
                     events.append("send-keys")
                 return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-            with patch.dict(
+            with attested_codex_model_reader_for_test("legacy-a"), patch.dict(
                 "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
@@ -19612,6 +19747,7 @@ google_accounts:
             "raw_output": "not_returned",
         }
         with (
+            attested_codex_model_reader_for_test("legacy-a"),
             patch(
                 "the_hive.server.agent_auth_status",
                 return_value={"authenticated": False, "auth_state": "missing"},
@@ -19690,7 +19826,7 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
-            with patch("the_hive.server.STATE_ROOT", state), patch(
+            with attested_codex_model_reader_for_test("legacy-a"), patch("the_hive.server.STATE_ROOT", state), patch(
                 "the_hive.server.RAW_DIR", state / "raw"
             ), patch("the_hive.server.META_DIR", state / "meta"), patch(
                 "the_hive.server.LOCK_DIR", state / "locks"
@@ -25473,22 +25609,30 @@ google_accounts:
         self.assertEqual(result["lease"]["holder"], "this_server")
         self.assertFalse(mock_start_agent.call_args.kwargs["release_lease_on_failure"])
 
-    def test_start_agent_with_lease_returns_running_session_before_claim_or_selection(self) -> None:
-        inventory = SimpleNamespace(
-            agents={
-                "a1": SimpleNamespace(
-                    account_id="account-d204",
-                    runner=server_module.RunnerKind.CODEX_CLI,
-                    provider=server_module.Provider.OPENAI_CHATGPT,
-                )
-            }
-        )
-        process_summary = {
-            "external_process_count": 0,
-            "managed_process_count": 1,
+    def test_start_agent_with_lease_revalidates_running_session_before_success(self) -> None:
+        existing = {
+            "agent": "a1",
+            "status": "already_running",
+            "session": "a1-session",
+            "lease": {"state": "held"},
+            "meta": {
+                "model": "gpt-5.6-luna",
+                "model_reasoning_effort": "medium",
+            },
             "raw_output": "not_returned",
         }
-        lease = {"state": "held", "held_by_this_server": True}
+        selection = SimpleNamespace(
+            class_id="arbeitsbiene",
+            lifecycle="ephemeral",
+            model="gpt-5.6-luna",
+            reasoning="medium",
+            requested_class=None,
+            requested_lifecycle=None,
+            requested_model=None,
+            requested_reasoning=None,
+            fallback=False,
+            reason_codes=(),
+        )
         with contextlib.ExitStack() as patch_stack:
             patch_stack.enter_context(
                 patch("the_hive.server.require_resource_capacity_preflight")
@@ -25518,9 +25662,6 @@ google_accounts:
                 )
             )
             patch_stack.enter_context(
-                patch("the_hive.server.current_agent_inventory", return_value=inventory)
-            )
-            patch_stack.enter_context(
                 patch("the_hive.server._headless_descriptor", return_value=None)
             )
             patch_stack.enter_context(
@@ -25541,70 +25682,46 @@ google_accounts:
                     return_value={"authenticated": True},
                 )
             )
-            patch_stack.enter_context(
-                patch(
-                    "the_hive.server.agent_home_process_summary",
-                    return_value=process_summary,
-                )
-            )
-            patch_stack.enter_context(
-                patch("the_hive.server.require_managed_tmux_session")
-            )
-            patch_stack.enter_context(
-                patch("the_hive.server.pane_pid", return_value=17)
-            )
-            patch_stack.enter_context(
-                patch("the_hive.server.agent_lease_status", return_value=lease)
-            )
-            patch_stack.enter_context(patch("the_hive.server.read_meta", return_value={}))
             classify = patch_stack.enter_context(
                 patch(
                     "the_hive.server.classify_runtime_task",
-                    side_effect=AssertionError("running TUI must not enter routing"),
+                    return_value=SimpleNamespace(),
                 )
             )
             resolver = patch_stack.enter_context(
                 patch(
                     "the_hive.server.resolve_runtime_agent_selection",
-                    side_effect=AssertionError("running TUI must not resolve a model"),
-                )
-            )
-            offers = patch_stack.enter_context(
-                patch(
-                    "the_hive.server.available_model_ids_for_routing",
-                    side_effect=AssertionError("running TUI must not offer models"),
-                )
-            )
-            evidence = patch_stack.enter_context(
-                patch(
-                    "the_hive.server.read_usage_evidence_v2",
-                    side_effect=AssertionError("running TUI must not read usage evidence"),
+                    return_value=selection,
                 )
             )
             claim = patch_stack.enter_context(
                 patch(
                     "the_hive.server.claim_agent",
-                    side_effect=AssertionError("running TUI must not claim a lease"),
+                    return_value={"status": "renewed", "lease": {"state": "held"}},
                 )
+            )
+            admission = patch_stack.enter_context(
+                patch("the_hive.server._require_model_runner_admission")
             )
             start = patch_stack.enter_context(
                 patch(
                     "the_hive.server.start_agent",
-                    side_effect=AssertionError("running TUI must not invoke start"),
+                    return_value=existing,
                 )
+            )
+            patch_stack.enter_context(
+                patch("the_hive.server.read_meta", return_value={"agent_class": "arbeitsbiene"})
             )
             result = start_agent_with_lease("a", allow_unauthenticated=True)
 
         self.assertEqual(result["status"], "already_running")
-        self.assertIsNone(result["selection"])
+        self.assertEqual(result["selection"]["model"], "gpt-5.6-luna")
         self.assertEqual(result["session"], "a1-session")
-        self.assertEqual(result["lease"], lease)
-        classify.assert_not_called()
-        resolver.assert_not_called()
-        offers.assert_not_called()
-        evidence.assert_not_called()
-        claim.assert_not_called()
-        start.assert_not_called()
+        classify.assert_called_once()
+        resolver.assert_called_once()
+        claim.assert_called_once_with("a1")
+        admission.assert_called_once_with("a1", "gpt-5.6-luna")
+        start.assert_called_once()
 
     @patch("the_hive.server.start_agent")
     @patch("the_hive.server.claim_agent")
@@ -26141,7 +26258,9 @@ google_accounts:
 
         mock_lock.side_effect = lambda agent: FakeLock(agent)
 
-        with patch("the_hive.server.ensure_agent_not_blocked_by_codex_usage"):
+        with attested_codex_model_reader_for_test("legacy-a"), patch(
+            "the_hive.server.ensure_agent_not_blocked_by_codex_usage"
+        ):
             result = call_tool("agent_start", {"agent": "a", "cwd": "/tmp/work", "prompt": "hi"})
 
         self.assertEqual(result["results"][0]["agent"], "a1")
@@ -26403,6 +26522,8 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             pool, descriptor, inventory = write_managed_class_home_for_test(root)
+            descriptor = dataclass_replace(descriptor, account_id="d254-a")
+            inventory = dataclass_replace(inventory, agents={"a": descriptor})
             home = descriptor.home
             unmanaged = home / "operator-notes.md"
             unmanaged.write_text("keep me\n", encoding="utf-8")
@@ -26415,7 +26536,7 @@ google_accounts:
                 self.assertTrue((home / "AGENTS.class-worker.md").is_file())
                 return fake_g5_start_scope_for_test(session)
 
-            with patch.object(server_module, "AGENT_POOL_ROOT", pool), patch.object(
+            with attested_codex_model_reader_for_test("d254-a"), patch.object(server_module, "AGENT_POOL_ROOT", pool), patch.object(
                 server_module, "STATE_ROOT", root / "state"
             ), patch.object(server_module, "LOCK_DIR", root / "state" / "locks"), patch.object(
                 server_module, "RAW_DIR", raw_dir
@@ -26764,6 +26885,7 @@ google_accounts:
                 legacy_descriptor,
                 model="gpt-5.6-luna",
                 skill_profile="generic",
+                account_id="d254-a3",
             )
             inventory = dataclass_replace(
                 legacy_inventory,
@@ -26875,7 +26997,7 @@ google_accounts:
                     return subprocess.CompletedProcess(args, 1, "", "")
                 return subprocess.CompletedProcess(args, 0, "", "")
 
-            with patch.object(server_module, "AGENT_POOL_ROOT", pool), patch.object(
+            with attested_codex_model_reader_for_test("d254-a3"), patch.object(server_module, "AGENT_POOL_ROOT", pool), patch.object(
                 server_module, "STATE_ROOT", root / "state"
             ), patch.object(server_module, "LOCK_DIR", root / "state" / "locks"), patch.object(
                 server_module, "RAW_DIR", raw_dir
@@ -28675,7 +28797,7 @@ google_accounts:
                 agent: {"label": agent.upper(), "runner": runner, "home": root, "session": f"session-{agent}"}
                 for agent, runner in runners.items()
             }
-            with patch.dict("the_hive.server.AGENTS", agents, clear=True), patch(
+            with attested_codex_model_reader_for_test("legacy-a", "legacy-b"), patch.dict("the_hive.server.AGENTS", agents, clear=True), patch(
                 "the_hive.server.STATE_ROOT", state
             ), patch("the_hive.server.RAW_DIR", state / "raw"), patch(
                 "the_hive.server.META_DIR", state / "meta"
@@ -29117,7 +29239,7 @@ google_accounts:
                 return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
             mock_run_tmux.side_effect = fake_run_tmux
-            with patch.dict(
+            with attested_codex_model_reader_for_test("legacy-a"), patch.dict(
                 "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
@@ -29158,7 +29280,7 @@ google_accounts:
                 code = 1 if command == "pipe-pane" else 0
                 return subprocess.CompletedProcess(["tmux", *args], code, "", "")
 
-            with patch.dict(
+            with attested_codex_model_reader_for_test("legacy-a"), patch.dict(
                 "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
@@ -29204,7 +29326,7 @@ google_accounts:
                 return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
             mock_run_tmux.side_effect = fake_run_tmux
-            with patch.dict(
+            with attested_codex_model_reader_for_test("legacy-a"), patch.dict(
                 "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
@@ -29475,7 +29597,7 @@ google_accounts:
             raw_dir.mkdir()
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
 
-            with patch.dict(
+            with attested_codex_model_reader_for_test("legacy-a"), patch.dict(
                 "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
                 clear=False,
@@ -29518,7 +29640,7 @@ google_accounts:
             write_managed_codex_launcher_for_test(runner, Path(tmpdir))
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "new-session"], 1, "", "start failed")
 
-            with patch.dict(
+            with attested_codex_model_reader_for_test("legacy-a"), patch.dict(
                 "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
@@ -29618,7 +29740,7 @@ google_accounts:
                     "home": root,
                     "session": f"session-{agent}",
                 }
-            with patch.dict("the_hive.server.AGENTS", agents, clear=True), patch(
+            with attested_codex_model_reader_for_test("legacy-a"), patch.dict("the_hive.server.AGENTS", agents, clear=True), patch(
                 "the_hive.server.STATE_ROOT", state
             ), patch("the_hive.server.RAW_DIR", state / "raw"), patch(
                 "the_hive.server.META_DIR", state / "meta"
@@ -29726,7 +29848,7 @@ google_accounts:
             write_managed_codex_launcher_for_test(runner, Path(tmpdir))
             mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "new-session"], 1, "", "duplicate session")
 
-            with patch.dict(
+            with attested_codex_model_reader_for_test("legacy-a"), patch.dict(
                 "the_hive.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
@@ -30560,7 +30682,6 @@ google_accounts:
             "requested": {
                 "class": "arbeitsbiene",
                 "lifecycle": "invocation",
-                "model": "gpt-5.3-codex-spark",
                 "reasoning": "low",
             },
             "fallback": True,
@@ -30811,7 +30932,7 @@ google_accounts:
             skill.parent.mkdir(parents=True, exist_ok=True)
             skill.write_text("Skill body must not be returned\n", encoding="utf-8")
 
-            with patch("the_hive.server.STATE_ROOT", state), patch(
+            with attested_codex_model_reader_for_test("legacy-a"), patch("the_hive.server.STATE_ROOT", state), patch(
                 "the_hive.server.RAW_DIR", state / "raw"
             ), patch("the_hive.server.META_DIR", state / "meta"), patch(
                 "the_hive.server.LOCK_DIR", state / "locks"
@@ -31413,6 +31534,7 @@ google_accounts:
         self,
     ) -> None:
         with (
+            attested_codex_model_reader_for_test("legacy-a"),
             patch.dict(
                 "the_hive.server.AGENTS",
                 {
@@ -31473,11 +31595,16 @@ google_accounts:
                 home=home,
                 session="q1-tmux",
                 runner_path=home / "codex",
+                runner=server_module.RunnerKind.CODEX_CLI,
+                provider=server_module.Provider.OPENAI_CHATGPT,
+                model="gpt-5.6-luna",
+                account_id="d254-q1",
                 enabled=True,
                 skill_profile="teamleiterin",
             )
             inventory = SimpleNamespace(agents={"q1": descriptor}, agent_ids=("q1",))
             with (
+                attested_codex_model_reader_for_test("d254-q1"),
                 patch(
                     "the_hive.server.ensure_assignment_session_model",
                     return_value={"status": "unchanged"},
@@ -31554,6 +31681,7 @@ google_accounts:
         self,
     ) -> None:
         with (
+            attested_codex_model_reader_for_test("legacy-a"),
             patch.dict(
                 "the_hive.server.AGENTS",
                 {
@@ -31614,7 +31742,7 @@ google_accounts:
     ) -> None:
         mock_switch.return_value = {"status": "unchanged", "previous_model": DEFAULT_AGENT_MODEL}
 
-        with patch.dict(
+        with attested_codex_model_reader_for_test("legacy-a"), patch.dict(
             "the_hive.server.AGENTS",
             {
                 "a1": {
@@ -31727,7 +31855,7 @@ google_accounts:
             state = home / "state"
             assignment_log = home / "assignments.jsonl"
 
-            with patch("the_hive.server.STATE_ROOT", state), patch(
+            with attested_codex_model_reader_for_test("legacy-a"), patch("the_hive.server.STATE_ROOT", state), patch(
                 "the_hive.server.RAW_DIR", state / "raw"
             ), patch("the_hive.server.META_DIR", state / "meta"), patch(
                 "the_hive.server.LOCK_DIR", state / "locks"
@@ -31802,7 +31930,7 @@ google_accounts:
             (home / "auth.json").write_text("{}\n", encoding="utf-8")
             state = home / "state"
             assignment_log = home / "assignments.jsonl"
-            with patch("the_hive.server.STATE_ROOT", state), patch(
+            with attested_codex_model_reader_for_test("legacy-a"), patch("the_hive.server.STATE_ROOT", state), patch(
                 "the_hive.server.RAW_DIR", state / "raw"
             ), patch("the_hive.server.META_DIR", state / "meta"), patch(
                 "the_hive.server.LOCK_DIR", state / "locks"
@@ -31877,7 +32005,7 @@ google_accounts:
             skill.parent.mkdir(parents=True, exist_ok=True)
             skill.write_text("body\n", encoding="utf-8")
 
-            with patch("the_hive.server.STATE_ROOT", state), patch(
+            with attested_codex_model_reader_for_test("legacy-b"), patch("the_hive.server.STATE_ROOT", state), patch(
                 "the_hive.server.RAW_DIR", state / "raw"
             ), patch("the_hive.server.META_DIR", state / "meta"), patch(
                 "the_hive.server.LOCK_DIR", state / "locks"
@@ -32064,7 +32192,7 @@ google_accounts:
             (home / "auth.json").write_text("{}\n", encoding="utf-8")
             state = home / "state"
             assignment_log = home / "assignments.jsonl"
-            with patch("the_hive.server.STATE_ROOT", state), patch(
+            with attested_codex_model_reader_for_test("legacy-a"), patch("the_hive.server.STATE_ROOT", state), patch(
                 "the_hive.server.RAW_DIR", state / "raw"
             ), patch("the_hive.server.META_DIR", state / "meta"), patch(
                 "the_hive.server.LOCK_DIR", state / "locks"
@@ -34379,7 +34507,16 @@ class CliLifecycleTest(unittest.TestCase):
         mock_print_json.return_value = 0
         lease = {"state": "held", "holder": "test", "held_by_this_server": True}
         inventory = SimpleNamespace(
-            agents={"a1": SimpleNamespace(series_prefix="a", skill_profile="arbeitsbiene")},
+            agents={
+                "a1": SimpleNamespace(
+                    series_prefix="a",
+                    skill_profile="arbeitsbiene",
+                    account_id="d254-cli-a1",
+                    runner=server_module.RunnerKind.CODEX_CLI,
+                    provider=server_module.Provider.OPENAI_CHATGPT,
+                    model="gpt-5.6-luna",
+                )
+            },
             agent_ids=("a1",),
             positions={"a1": 0},
         )
@@ -34451,6 +34588,7 @@ class CliLifecycleTest(unittest.TestCase):
             patch("the_hive.server.record_assignment"),
         ]
         with contextlib.ExitStack() as stack:
+            stack.enter_context(attested_codex_model_reader_for_test("d254-cli-a1"))
             for item in patches:
                 stack.enter_context(item)
             reserve = stack.enter_context(patch("the_hive.server.reserve_managed_replacement"))
@@ -34538,6 +34676,8 @@ class CliLifecycleTest(unittest.TestCase):
                 clear=False,
             ), patch(
                 "the_hive.server.require_fleet_recovery_ready"
+            ), patch(
+                "the_hive.server._require_model_runner_admission"
             ), server_module.temporary_agent_inventory(inventory):
                 result = send_agent("a", "hello", True)
 
@@ -42478,18 +42618,18 @@ def test_regular_enforced_mcp_surfaces_remain_principal_scoped() -> None:
 
 def _d204_model_invocability_evidence(
     *capabilities: ModelInvocabilityV1,
-    evidence_status: str = "complete",
-    projection_status: str = "complete",
+    evidence_status: ReaderStatus = "complete",
+    projection_status: ModelInvocabilityStatus = "complete",
     projection_source: str = "pool_authority-v3.model_capabilities",
 ) -> UsageEvidenceV2:
     observed_at = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
     return UsageEvidenceV2(
         (),
-        evidence_status,  # type: ignore[arg-type]
+        evidence_status,
         observed_at,
         observed_at,
         model_invocability=ModelInvocabilityProjectionV1(
-            projection_status,  # type: ignore[arg-type]
+            projection_status,
             projection_source,
             capabilities,
         ),
@@ -42721,6 +42861,216 @@ def test_d204_positive_capability_allows_only_its_attested_runner() -> None:
     assert unmatched_admission.missing_factor == "account_model_runner_capability"
 
 
+def test_d236_ollama_model_runner_admission_uses_local_provider_authority_without_account_id() -> None:
+    descriptor = SimpleNamespace(
+        account_id=None,
+        runner=server_module.RunnerKind.CODEX_CLI,
+        provider=server_module.Provider.OLLAMA_LOCAL,
+        model="qwen2.5-coder:7b",
+    )
+    inventory = SimpleNamespace(agents={"o1": descriptor})
+    resource = {
+        "allowed": True,
+        "provider": "ollama_local",
+        "reason_codes": [],
+        "raw_output": "not_returned",
+    }
+    with (
+        patch.object(server_module, "current_agent_inventory", return_value=inventory),
+        patch.object(server_module, "ollama_resource_status", return_value=resource) as local_gate,
+        patch.object(
+            server_module,
+            "read_usage_evidence_v2",
+            side_effect=AssertionError("local authority must not require an account projection"),
+        ),
+    ):
+        admission = server_module._model_runner_admission(
+            "o1", "qwen2.5-coder:7b", descriptor=descriptor
+        )
+
+    assert admission.allowed is True
+    assert admission.evidence_source == "ollama_local.runner_configuration"
+    local_gate.assert_called_once_with("o1")
+
+
+def test_d236_ollama_model_runner_admission_rejects_wrong_model_or_runner() -> None:
+    descriptor = SimpleNamespace(
+        account_id=None,
+        runner=server_module.RunnerKind.CODEX_CLI,
+        provider=server_module.Provider.OLLAMA_LOCAL,
+        model="qwen2.5-coder:7b",
+    )
+    resource = {"allowed": True, "reason_codes": [], "raw_output": "not_returned"}
+    with patch.object(server_module, "ollama_resource_status", return_value=resource):
+        wrong_model = server_module._model_runner_admission(
+            "o1", "other-model", descriptor=descriptor
+        )
+    wrong_runner = server_module._model_runner_admission(
+        "o1",
+        "qwen2.5-coder:7b",
+        descriptor=SimpleNamespace(
+            account_id=None,
+            runner=server_module.RunnerKind.GEMINI_CLI,
+            provider=server_module.Provider.OLLAMA_LOCAL,
+            model="qwen2.5-coder:7b",
+        ),
+    )
+
+    assert wrong_model.allowed is False
+    assert wrong_model.missing_factor == "provider_model_binding"
+    assert wrong_runner.allowed is False
+    assert wrong_runner.missing_factor == "provider_runner_binding"
+
+
+def test_d244_ollama_model_runner_admission_keeps_resource_gate_for_lifecycle() -> None:
+    descriptor = server_module.AgentDescriptor(
+        agent_id="o1",
+        series_prefix="o",
+        ordinal=1,
+        label="Ollama O1",
+        runner=server_module.RunnerKind.CODEX_CLI,
+        provider=server_module.Provider.OLLAMA_LOCAL,
+        model="qwen2.5-coder:7b",
+        account_id=None,
+        home=Path("/tmp/d244-o1-home"),
+        session="o1-session",
+        enabled=True,
+    )
+    inventory = server_module.InventorySnapshot(
+        ("o1",), {"o1": descriptor}, {"o": ("o1",)}, {"o1": 0}, ("o",)
+    )
+    with patch.object(
+        server_module, "current_agent_inventory", return_value=inventory
+    ), patch.object(
+        server_module,
+        "ollama_resource_status",
+        return_value={"allowed": False, "reason_codes": ["cpu_pressure_high"]},
+    ) as local_gate:
+        admission = server_module._model_runner_admission(
+            "o1", "qwen2.5-coder:7b", descriptor=descriptor
+        )
+
+    assert admission.allowed is False
+    assert admission.missing_factor == "ollama_resource_admission"
+    local_gate.assert_called_once_with("o1")
+
+
+def test_d244_ollama_communication_status_skips_resource_admission() -> None:
+    descriptor = server_module.AgentDescriptor(
+        agent_id="o1",
+        series_prefix="o",
+        ordinal=1,
+        label="Ollama O1",
+        runner=server_module.RunnerKind.CODEX_CLI,
+        provider=server_module.Provider.OLLAMA_LOCAL,
+        model="qwen2.5-coder:7b",
+        account_id=None,
+        home=Path("/tmp/d244-o1-home"),
+        session="o1-session",
+        enabled=True,
+    )
+    inventory = server_module.InventorySnapshot(
+        ("o1",), {"o1": descriptor}, {"o": ("o1",)}, {"o1": 0}, ("o",)
+    )
+    with (
+        patch.object(server_module, "current_agent_inventory", return_value=inventory),
+        patch.object(server_module, "tmux_alive", return_value=True),
+        patch.object(
+            server_module, "agent_home_process_summary", return_value={"process_count": 1}
+        ),
+        patch.object(
+            server_module,
+            "ollama_resource_status",
+            side_effect=AssertionError("pure communication must not query spawn resources"),
+        ) as local_gate,
+    ):
+        status = server_module.require_invocation_status(
+            "o1", operation="agent_send", enforce_ollama_resource=False
+        )
+
+    assert status["running"] is True
+    assert status["limit_state"]["limited"] is False
+    assert status["limit_state"]["resource_admission"] == "not_required_for_pure_communication"
+    local_gate.assert_not_called()
+
+
+def test_d244_ollama_pure_send_skips_resource_gate_but_keeps_model_runner_binding() -> None:
+    descriptor = server_module.AgentDescriptor(
+        agent_id="o1",
+        series_prefix="o",
+        ordinal=1,
+        label="Ollama O1",
+        runner=server_module.RunnerKind.CODEX_CLI,
+        provider=server_module.Provider.OLLAMA_LOCAL,
+        model="qwen2.5-coder:7b",
+        account_id=None,
+        home=Path("/tmp/d244-o1-home"),
+        session="o1-session",
+        enabled=True,
+    )
+    inventory = server_module.InventorySnapshot(
+        ("o1",), {"o1": descriptor}, {"o": ("o1",)}, {"o1": 0}, ("o",)
+    )
+    status_calls: list[tuple[str, bool]] = []
+
+    def require_status(
+        _agent: str, *, operation: str, enforce_ollama_resource: bool = True
+    ) -> None:
+        assert operation in {"agent_send", "agent_report_request"}
+        status_calls.append((operation, enforce_ollama_resource))
+
+    class Completed:
+        returncode = 0
+
+    with (
+        patch.object(server_module, "canonical_agent_id", return_value="o1"),
+        patch.object(server_module, "require_invocation_status", side_effect=require_status),
+        patch.object(
+            server_module, "agent_config", return_value={"session": "o1-session"}
+        ),
+        patch.object(server_module, "agent_lifecycle_lock", return_value=contextlib.nullcontext()),
+        patch.object(server_module, "tmux_alive", return_value=True),
+        patch.object(server_module, "require_managed_tmux_session"),
+        patch.object(server_module, "wait_agent_input_ready", return_value={"ready": True}),
+        patch.object(server_module, "current_agent_inventory", return_value=inventory),
+        patch.object(
+            server_module,
+            "ollama_resource_status",
+            side_effect=AssertionError("pure communication must not query spawn resources"),
+        ) as local_gate,
+        patch.object(
+            server_module,
+            "read_usage_evidence_v2",
+            side_effect=AssertionError("local communication must not require account evidence"),
+        ),
+        patch.object(
+            server_module, "_tmux_args_for_session", side_effect=lambda _session, args: args
+        ),
+        patch.object(
+            server_module, "run_tmux", return_value=Completed()
+        ) as tmux_sink,
+        patch.object(
+            server_module, "list_assignments", return_value={"records": []}
+        ),
+        patch.object(
+            server_module,
+            "agent_lease_status",
+            return_value={"state": "unclaimed", "raw_output": "not_returned"},
+        ),
+    ):
+        result = server_module.send_agent("o1", "status")
+        report = server_module.request_agent_report("o1")
+
+    assert result["status"] == "sent"
+    assert report["status"] == "report_requested"
+    assert status_calls == [
+        ("agent_send", False),
+        ("agent_report_request", False),
+    ]
+    local_gate.assert_not_called()
+    assert tmux_sink.call_count == 6
+
+
 def test_d204_existing_tui_session_does_not_recheck_model_invocability() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
@@ -42778,7 +43128,7 @@ def test_d204_existing_tui_session_does_not_recheck_model_invocability() -> None
     spawn_capacity.assert_not_called()
 
 
-def test_d204_lease_start_returns_existing_tui_before_usage_or_resolver() -> None:
+def test_d236_existing_tui_requires_bound_selection_lease_and_model_admission() -> None:
     existing = {
         "agent": "a1",
         "status": "already_running",
@@ -42786,7 +43136,7 @@ def test_d204_lease_start_returns_existing_tui_before_usage_or_resolver() -> Non
         "session": "a1-session",
         "pid": 17,
         "lease": {"state": "held"},
-        "meta": {},
+        "meta": {"model": "gpt-5.6-luna", "model_reasoning_effort": "medium"},
         "home_external_process_count": 0,
         "raw_output": "not_returned",
     }
@@ -42809,38 +43159,235 @@ def test_d204_lease_start_returns_existing_tui_before_usage_or_resolver() -> Non
             server_module, "require_authenticated_agent_for_mutation", return_value=auth_gate
         ) as auth,
         patch.object(
-            server_module, "_already_running_tmux_start_result", return_value=existing
-        ) as existing_result,
-        patch.object(
-            server_module,
-            "classify_runtime_task",
-            side_effect=AssertionError("existing TUI must not classify for routing"),
+            server_module, "classify_runtime_task", return_value=SimpleNamespace()
         ),
         patch.object(
             server_module,
             "resolve_runtime_agent_selection",
-            side_effect=AssertionError("existing TUI must not resolve a model"),
-        ),
+            return_value=SimpleNamespace(
+                class_id="arbeitsbiene",
+                lifecycle="ephemeral",
+                model="gpt-5.6-luna",
+                reasoning="medium",
+                requested_class=None,
+                requested_lifecycle=None,
+                requested_model=None,
+                requested_reasoning=None,
+                fallback=False,
+                reason_codes=(),
+            ),
+        ) as resolver,
         patch.object(
             server_module,
-            "available_model_ids_for_routing",
-            side_effect=AssertionError("existing TUI must not offer models"),
-        ),
+            "claim_agent",
+            return_value={"status": "renewed", "lease": {"state": "held"}},
+        ) as claim,
+        patch.object(server_module, "_require_model_runner_admission") as admission,
+        patch.object(server_module, "start_agent", return_value=existing) as start,
         patch.object(
-            server_module,
-            "read_usage_evidence_v2",
-            side_effect=AssertionError("existing TUI must not read missing or stale evidence"),
+            server_module, "read_meta", return_value={"agent_class": "arbeitsbiene"}
         ),
     ):
         result = server_module._start_agent_with_lease_unlocked("a1")
 
     assert result["status"] == "already_running"
     assert result["auth_gate"] == auth_gate
-    assert result["selection"] is None
+    assert result["selection"]["model"] == "gpt-5.6-luna"
     auth.assert_called_once_with(
         "a1", operation="agent_start", allow_unauthenticated=False
     )
-    existing_result.assert_called_once_with("a1", "a1-session")
+    resolver.assert_called_once()
+    claim.assert_called_once_with("a1")
+    admission.assert_called_once_with("a1", "gpt-5.6-luna")
+    start.assert_called_once()
+
+
+def test_d236_existing_tui_rejects_missing_openai_model_effort_metadata() -> None:
+    existing = {
+        "agent": "a1",
+        "status": "already_running",
+        "meta": {},
+        "raw_output": "not_returned",
+    }
+    selection = SimpleNamespace(
+        class_id="arbeitsbiene",
+        lifecycle="ephemeral",
+        model="gpt-5.6-luna",
+        reasoning="medium",
+        requested_class=None,
+        requested_lifecycle=None,
+        requested_model=None,
+        requested_reasoning=None,
+        fallback=False,
+        reason_codes=(),
+    )
+    with (
+        patch.object(server_module, "require_fleet_recovery_ready"),
+        patch.object(server_module, "canonical_agent_id", return_value="a1"),
+        patch.object(server_module, "_headless_descriptor", return_value=None),
+        patch.object(server_module, "agent_config", return_value={"session": "a1-session"}),
+        patch.object(server_module, "tmux_alive", return_value=True),
+        patch.object(server_module, "_ollama_descriptor", return_value=None),
+        patch.object(
+            server_module,
+            "require_authenticated_agent_for_mutation",
+            return_value={"authenticated": True},
+        ),
+        patch.object(server_module, "ensure_agent_not_blocked_by_codex_usage"),
+        patch.object(server_module, "classify_runtime_task", return_value=SimpleNamespace()),
+        patch.object(server_module, "resolve_runtime_agent_selection", return_value=selection),
+        patch.object(
+            server_module,
+            "claim_agent",
+            return_value={"status": "renewed", "lease": {"state": "held"}},
+        ),
+        patch.object(server_module, "_require_model_runner_admission"),
+        patch.object(server_module, "start_agent", return_value=existing),
+        patch.object(server_module, "read_meta", return_value={"agent_class": "arbeitsbiene"}),
+    ):
+        with pytest.raises(AgentError, match="routed model or class differs"):
+            server_module._start_agent_with_lease_unlocked("a1")
+
+
+def test_d236_existing_tui_rejects_foreign_lease_before_start() -> None:
+    with (
+        patch.object(server_module, "require_fleet_recovery_ready"),
+        patch.object(server_module, "canonical_agent_id", return_value="a1"),
+        patch.object(server_module, "_headless_descriptor", return_value=None),
+        patch.object(server_module, "_ollama_descriptor", return_value=None),
+        patch.object(
+            server_module,
+            "require_authenticated_agent_for_mutation",
+            return_value={"authenticated": True},
+        ),
+        patch.object(server_module, "ensure_agent_not_blocked_by_codex_usage"),
+        patch.object(server_module, "classify_runtime_task", return_value=SimpleNamespace()),
+        patch.object(
+            server_module,
+            "resolve_runtime_agent_selection",
+            return_value=SimpleNamespace(
+                model="gpt-5.6-luna", reasoning="medium", class_id="arbeitsbiene"
+            ),
+        ),
+        patch.object(server_module, "claim_agent", side_effect=AgentError("agent_busy")),
+        patch.object(server_module, "start_agent") as start,
+    ):
+        with pytest.raises(AgentError, match="agent_busy"):
+            server_module._start_agent_with_lease_unlocked("a1")
+
+    start.assert_not_called()
+
+
+def test_d236_headless_start_rechecks_exact_model_runner_admission_before_marker() -> None:
+    descriptor = SimpleNamespace(
+        account_id="gemini-d236",
+        runner=server_module.RunnerKind.GEMINI_CLI,
+        provider=server_module.Provider.GEMINI_API,
+        model="gemini-2.5-pro",
+    )
+    with (
+        patch.object(server_module, "canonical_agent_id", return_value="g1"),
+        patch.object(
+            server_module,
+            "_resolve_gemini_headless_route",
+            return_value=("g1", descriptor, {"action": "allow"}, None),
+        ),
+        patch.object(
+            server_module,
+            "read_usage_evidence_v2",
+            return_value=_d204_model_invocability_evidence(projection_status="stale"),
+        ),
+        patch.object(
+            server_module,
+            "status_agent",
+            side_effect=AssertionError("headless marker path must remain unopened"),
+        ),
+        patch.object(server_module, "_write_headless_marker") as marker,
+    ):
+        with pytest.raises(AgentError, match="provider.model_invocability_unattested") as raised:
+            server_module._start_headless_agent_after_capacity_probe_unlocked("g1")
+
+    assert raised.value.payload["evidence_status"] == "stale"
+    marker.assert_not_called()
+
+
+def test_d236_send_agent_blocks_toctou_stale_model_evidence_before_tmux_effect() -> None:
+    descriptor = _d204_codex_descriptor()
+    inventory = SimpleNamespace(agents={"a1": descriptor})
+    with (
+        patch.object(server_module, "canonical_agent_id", return_value="a1"),
+        patch.object(server_module, "require_invocation_status"),
+        patch.object(server_module, "agent_config", return_value={"session": "a1-session"}),
+        patch.object(server_module, "agent_lifecycle_lock", return_value=contextlib.nullcontext()),
+        patch.object(server_module, "tmux_alive", return_value=True),
+        patch.object(server_module, "require_managed_tmux_session"),
+        patch.object(server_module, "wait_agent_input_ready", return_value={"ready": True}),
+        patch.object(server_module, "current_agent_inventory", return_value=inventory),
+        patch.object(server_module, "read_meta", return_value={"model": "gpt-5.6-luna"}),
+        patch.object(
+            server_module,
+            "read_usage_evidence_v2",
+            return_value=_d204_model_invocability_evidence(projection_status="stale"),
+        ),
+        patch.object(server_module, "run_tmux") as tmux_sink,
+    ):
+        with pytest.raises(AgentError, match="provider.model_invocability_unattested") as raised:
+            server_module.send_agent("a1", "assign this")
+
+    assert raised.value.payload["missing_factor"] == "projection_stale"
+    tmux_sink.assert_not_called()
+
+
+def test_d244_send_agent_blocks_toctou_mismatched_runner_evidence_before_tmux_effect() -> None:
+    descriptor = server_module.AgentDescriptor(
+        agent_id="g1",
+        series_prefix="g",
+        ordinal=1,
+        label="Gemini G1",
+        runner=server_module.RunnerKind.GEMINI_CLI,
+        provider=server_module.Provider.GEMINI_API,
+        model="gemini-2.5-pro",
+        account_id="gemini-d244",
+        home=Path("/tmp/d244-g1-home"),
+        session="g1-session",
+        enabled=True,
+    )
+    inventory = server_module.InventorySnapshot(
+        ("g1",), {"g1": descriptor}, {"g": ("g1",)}, {"g1": 0}, ("g",)
+    )
+    evidence = _d204_model_invocability_evidence(
+        ModelInvocabilityV1(
+            "gemini-d244",
+            "gemini-2.5-pro",
+            "codex_cli",
+            True,
+            True,
+            True,
+            True,
+        )
+    )
+    with (
+        patch.object(server_module, "canonical_agent_id", return_value="g1"),
+        patch.object(server_module, "require_invocation_status"),
+        patch.object(
+            server_module, "agent_config", return_value={"session": "g1-session"}
+        ),
+        patch.object(server_module, "agent_lifecycle_lock", return_value=contextlib.nullcontext()),
+        patch.object(server_module, "tmux_alive", return_value=True),
+        patch.object(server_module, "require_managed_tmux_session"),
+        patch.object(server_module, "wait_agent_input_ready", return_value={"ready": True}),
+        patch.object(server_module, "current_agent_inventory", return_value=inventory),
+        patch.object(
+            server_module, "read_meta", return_value={"model": "gemini-2.5-pro"}
+        ),
+        patch.object(server_module, "read_usage_evidence_v2", return_value=evidence),
+        patch.object(server_module, "run_tmux") as tmux_sink,
+    ):
+        with pytest.raises(AgentError, match="provider.model_invocability_unattested") as raised:
+            server_module.send_agent("g1", "assign this")
+
+    assert raised.value.payload["missing_factor"] == "account_model_runner_capability"
+    tmux_sink.assert_not_called()
 
 
 def test_d204_final_recheck_blocks_tmux_sink_after_start_preparation() -> None:

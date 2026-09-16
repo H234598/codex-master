@@ -891,21 +891,19 @@ def _pool_authority_v2(
             },
         )
     elif schema_version == 3:
-        _exact(
-            value,
-            {
-                "authorities",
-                "expires_at",
-                "generation_id",
-                "issued_at",
-                "model_capabilities",
-                "pool_authority_schema_version",
-                "producer_version",
-                "release_id",
-                "usage_binding_sha256",
-                "usage_payload_sha256",
-            },
-        )
+        v3_names = {
+            "authorities",
+            "expires_at",
+            "generation_id",
+            "issued_at",
+            "pool_authority_schema_version",
+            "producer_version",
+            "release_id",
+            "usage_binding_sha256",
+            "usage_payload_sha256",
+        }
+        if set(value) not in (v3_names, v3_names | {"model_capabilities"}):
+            raise _Invalid()
     else:
         raise _Invalid()
     if (
@@ -1031,6 +1029,7 @@ def _pool_authority_v2(
     model_invocability = (
         _UNATTESTED_MODEL_INVOCABILITY
         if schema_version == 2
+        or "model_capabilities" not in value
         else _model_invocability_v1(
             value["model_capabilities"], issued_at=issued_at, now=now
         )

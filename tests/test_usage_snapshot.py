@@ -538,6 +538,20 @@ def _rebind_model_invocability(
     refresh_current_binding(paths)
 
 
+def _rebind_without_model_invocability(paths: dict[str, Path]) -> None:
+    """Bind a V3 authority whose valid usage data has no capability projection."""
+    authority = json.loads(paths["authority"].read_text(encoding="utf-8"))
+    authority["pool_authority_schema_version"] = 3
+    authority.pop("model_capabilities", None)
+    _write_json(paths["authority"], authority)
+    refresh_current_binding(paths)
+
+    binding = json.loads(paths["binding"].read_text(encoding="utf-8"))
+    authority["usage_binding_sha256"] = digest(canonical(binding["usage_binding"]))
+    _write_json(paths["authority"], authority)
+    refresh_current_binding(paths)
+
+
 def _model_invocability_projection(*entries: object) -> dict[str, object]:
     return {"capability_schema_version": 1, "entries": list(entries)}
 
@@ -561,6 +575,27 @@ def test_06537_model_invocability_is_unattested_without_bound_v3_projection(
         )
         is None
     )
+
+
+def test_d236_missing_v3_model_capabilities_preserve_valid_usage_but_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    payload = _payload_with_complete_evidence(paths)
+    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))["authorities"]
+    _rebind_payload_and_authority(paths, payload, authorities)
+    _rebind_without_model_invocability(paths)
+
+    evidence = read_golden(state_home)
+    display = usage_snapshot.display_snapshot_from_evidence(
+        evidence, known_account_ids=frozenset({"synthetic-alpha"})
+    )
+
+    assert evidence.status == "complete"
+    assert evidence.model_invocability.status == "unattested"
+    assert evidence.model_invocability.capabilities == ()
+    assert display.source == "live"
+    assert tuple(limit.pool for limit in display.accounts[0].limits) == ("main", "spark")
 
 
 def test_06537_bound_native_model_capability_preserves_usage_display(
@@ -693,17 +728,11 @@ def test_06537_extreme_model_capability_timestamp_is_locally_fail_closed(
             _model_capability_entry(catalog_visible=False)
         ),
         _model_invocability_projection(
-            _model_capability_entry(
-                catalog_observed_at="2026-08-31T11:46:00Z",
-                catalog_fresh_until="2026-08-31T12:01:00Z",
-            )
-        ),
-        _model_invocability_projection(
             _model_capability_entry(visibility="list")
         ),
     ),
 )
-def test_06537_malformed_duplicate_contradictory_stale_or_visibility_only_model_evidence_is_fail_closed(
+def test_d236_malformed_model_capabilities_are_invalid_but_preserve_usage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     projection: object,
@@ -714,7 +743,7 @@ def test_06537_malformed_duplicate_contradictory_stale_or_visibility_only_model_
     evidence = read_golden(state_home)
 
     assert evidence.status == "complete"
-    assert evidence.model_invocability.status in {"invalid", "stale"}
+    assert evidence.model_invocability.status == "invalid"
     assert evidence.model_invocability.capabilities == ()
     assert (
         usage_snapshot.find_model_invocability(
@@ -725,6 +754,30 @@ def test_06537_malformed_duplicate_contradictory_stale_or_visibility_only_model_
         )
         is None
     )
+    assert usage_snapshot.display_snapshot_from_evidence(
+        evidence, known_account_ids=frozenset({"synthetic-alpha"})
+    ).source == "live"
+
+
+def test_d236_stale_model_capabilities_are_distinct_from_invalid_and_preserve_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    _rebind_model_invocability(
+        paths,
+        _model_invocability_projection(
+            _model_capability_entry(
+                catalog_observed_at="2026-08-31T11:46:00Z",
+                catalog_fresh_until="2026-08-31T12:01:00Z",
+            )
+        ),
+    )
+
+    evidence = read_golden(state_home)
+
+    assert evidence.status == "complete"
+    assert evidence.model_invocability.status == "stale"
+    assert evidence.model_invocability.capabilities == ()
     assert usage_snapshot.display_snapshot_from_evidence(
         evidence, known_account_ids=frozenset({"synthetic-alpha"})
     ).source == "live"

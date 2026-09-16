@@ -10694,6 +10694,17 @@ class _ModelRunnerAdmission:
     missing_factor: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _ActiveOllamaSessionBinding:
+    descriptor: AgentDescriptor
+    session: str
+    runner: str
+    model: str
+    agent_class: str | None
+    run_id: str
+    started_at_utc: str
+
+
 def _model_invocability_projection_details(
     evidence: UsageEvidenceV2,
 ) -> tuple[str, str]:
@@ -10720,9 +10731,59 @@ def _model_runner_admission(
     *,
     descriptor: AgentDescriptor | None = None,
     evidence: UsageEvidenceV2 | None = None,
+    enforce_ollama_resource: bool = True,
 ) -> _ModelRunnerAdmission:
-    """Resolve one account/model/runner capability without any visibility fallback."""
+    """Resolve one model/runner capability; lifecycle callers also require local resources."""
 
+    selected = descriptor
+    if selected is None:
+        selected = current_agent_inventory().agents.get(agent)
+    if getattr(selected, "provider", None) is Provider.OLLAMA_LOCAL:
+        runner = getattr(selected, "runner", None)
+        configured_model = getattr(selected, "model", None)
+        if runner is not RunnerKind.CODEX_CLI:
+            return _ModelRunnerAdmission(
+                False,
+                _MODEL_INVOCABILITY_UNATTESTED,
+                "ollama_local.runner_configuration",
+                "complete",
+                "provider_runner_binding",
+            )
+        if not isinstance(configured_model, str) or model != configured_model:
+            return _ModelRunnerAdmission(
+                False,
+                _MODEL_INVOCABILITY_UNATTESTED,
+                "ollama_local.runner_configuration",
+                "complete",
+                "provider_model_binding",
+            )
+        if not enforce_ollama_resource:
+            return _ModelRunnerAdmission(
+                True,
+                "allowed",
+                "ollama_local.runner_configuration",
+                "complete",
+                None,
+            )
+        try:
+            local_admission = ollama_resource_status(agent)
+        except (AgentError, OSError, RuntimeError, ValueError):
+            local_admission = None
+        if isinstance(local_admission, Mapping) and local_admission.get("allowed") is True:
+            return _ModelRunnerAdmission(
+                True,
+                "allowed",
+                "ollama_local.runner_configuration",
+                "complete",
+                None,
+            )
+        return _ModelRunnerAdmission(
+            False,
+            _MODEL_INVOCABILITY_UNATTESTED,
+            "ollama_local.runner_configuration",
+            "complete",
+            "ollama_resource_admission",
+        )
     attested = evidence
     if attested is None:
         attested = read_usage_evidence_v2(
@@ -10745,9 +10806,6 @@ def _model_runner_admission(
             evidence_status,
             f"usage_evidence_{evidence_status}",
         )
-    selected = descriptor
-    if selected is None:
-        selected = current_agent_inventory().agents.get(agent)
     account_id = getattr(selected, "account_id", None)
     runner = getattr(selected, "runner", None)
     if (
@@ -10814,6 +10872,7 @@ def _require_model_runner_admission(
     *,
     descriptor: AgentDescriptor | None = None,
     evidence: UsageEvidenceV2 | None = None,
+    enforce_ollama_resource: bool = True,
 ) -> None:
     """Fail closed with one source-bound reason before a model reaches a runner."""
 
@@ -10825,6 +10884,7 @@ def _require_model_runner_admission(
         model,
         descriptor=selected,
         evidence=evidence,
+        enforce_ollama_resource=enforce_ollama_resource,
     )
     if admission.allowed:
         return
@@ -13639,6 +13699,7 @@ def _start_headless_agent_after_capacity_probe_unlocked(
     agent, descriptor, structured_gate, routing_gate = _resolve_gemini_headless_route(
         requested_agent
     )
+    _require_model_runner_admission(agent, descriptor.model, descriptor=descriptor)
     status = status_agent(agent, initialize_state=False)
     identity = status.get("identity_guard")
     if isinstance(identity, Mapping) and identity.get("ok") is not True:
@@ -14907,26 +14968,6 @@ def _start_agent_with_lease_unlocked(
         if confirm_home_refresh:
             raise AgentError("agent_home_refresh_not_supported_for_headless")
         return _start_headless_agent_unlocked(agent)
-    session = agent_config(agent)["session"]
-    if tmux_alive(session):
-        ollama_descriptor = _ollama_descriptor(agent)
-        if ollama_descriptor is not None:
-            auth_gate = {
-                "authenticated": True,
-                "provider": Provider.OLLAMA_LOCAL.value,
-                "state": "not_applicable",
-                "raw_output": "not_returned",
-            }
-        else:
-            auth_gate = require_authenticated_agent_for_mutation(
-                agent,
-                operation="agent_start",
-                allow_unauthenticated=allow_unauthenticated,
-            )
-        result = _already_running_tmux_start_result(agent, session)
-        result["auth_gate"] = auth_gate
-        result["selection"] = public_resolution_decision(None)
-        return result
     task_profile = classify_runtime_task(
         TaskClassificationRequest(
             objective="agent_start",
@@ -14978,27 +15019,21 @@ def _start_agent_with_lease_unlocked(
         if result.get("status") != "already_running":
             return
         active_meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-        active_model = active_meta.get("model") or (
-            ollama_descriptor.model
-            if ollama_descriptor is not None
-            else DEFAULT_AGENT_MODEL
+        active_model = (
+            active_meta.get("model")
+            if ollama_descriptor is None
+            else active_meta.get("model") or ollama_descriptor.model
         )
-        active_effort = active_meta.get("model_reasoning_effort") or (
-            None
-            if ollama_descriptor is not None
-            else WRITE_AGENT_MODEL_EFFORT
-            if active_model == WRITE_AGENT_MODEL
-            else DEFAULT_AGENT_MODEL_EFFORT
+        active_effort = (
+            active_meta.get("model_reasoning_effort")
+            if ollama_descriptor is None
+            else active_meta.get("model_reasoning_effort")
         )
         active_class = read_meta(agent).get("agent_class")
         if (
             active_model != selected_model
             or active_effort != selected_effort
-            or (
-                selection is not None
-                and active_class is not None
-                and active_class != selection.class_id
-            )
+            or (selection is not None and active_class != selection.class_id)
         ):
             raise AgentError(
                 "routed model or class differs from active session; controlled restart requires "
@@ -15030,6 +15065,7 @@ def _start_agent_with_lease_unlocked(
 
     if tmux_alive(agent_config(agent)["session"]):
         try:
+            _require_model_runner_admission(agent, selected_model)
             result = invoke_start()
             validate_existing_session(result)
         except Exception:
@@ -16086,6 +16122,7 @@ def require_invocation_status(
     *,
     operation: str,
     enforce_identity: bool = True,
+    enforce_ollama_resource: bool = True,
 ) -> dict[str, Any]:
     """Take a cheap, fresh status snapshot immediately before invocation."""
 
@@ -16122,12 +16159,19 @@ def require_invocation_status(
         }
     if enforce_identity and running and identity.get("ok") is not True:
         raise AgentError(f"{operation}: session identity could not be verified")
-    if descriptor.provider is Provider.OLLAMA_LOCAL:
+    if descriptor.provider is Provider.OLLAMA_LOCAL and enforce_ollama_resource:
         resource = ollama_resource_status(agent)
         limit_state = {
             "allowed": resource.get("allowed") is True,
             "limited": resource.get("allowed") is not True,
             "reason_codes": resource.get("reason_codes", []),
+        }
+    elif descriptor.provider is Provider.OLLAMA_LOCAL:
+        limit_state = {
+            "allowed": None,
+            "limited": False,
+            "reason_codes": [],
+            "resource_admission": "not_required_for_pure_communication",
         }
     else:
         meta = read_meta(agent)
@@ -19258,10 +19302,14 @@ def request_agent_report(
     assignment_id: Any = None,
     enter: bool = True,
     lease: dict[str, Any] | None = None,
+    ollama_binding: _ActiveOllamaSessionBinding | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     with agent_lifecycle_lock(agent):
-        return _request_agent_report_unlocked(agent, assignment_id, enter, lease=lease)
+        kwargs: dict[str, Any] = {"lease": lease}
+        if ollama_binding is not None:
+            kwargs["ollama_binding"] = ollama_binding
+        return _request_agent_report_unlocked(agent, assignment_id, enter, **kwargs)
 
 
 def _request_agent_report_unlocked(
@@ -19269,6 +19317,7 @@ def _request_agent_report_unlocked(
     assignment_id: Any = None,
     enter: bool = True,
     lease: dict[str, Any] | None = None,
+    ollama_binding: _ActiveOllamaSessionBinding | None = None,
 ) -> dict[str, Any]:
     resolved_assignment_id = None
     if assignment_id:
@@ -19293,14 +19342,21 @@ def _request_agent_report_unlocked(
         )
     else:
         text = "Bitte liefere einen knappen Statusbericht: Aufgabe, Stand, Tests, offene Risiken. Keine Rohlogs."
-    lease = lease or agent_lease_status(agent)
-    sent = send_agent(agent, text, enter, operation="agent_report_request")
+    reported_lease = lease or agent_lease_status(agent)
+    sent = send_agent(
+        agent,
+        text,
+        enter,
+        operation="agent_report_request",
+        lease=lease,
+        ollama_binding=ollama_binding,
+    )
     return {
         "agent": agent,
         "status": "report_requested",
         "submitted": enter,
         "assignment_id": resolved_assignment_id,
-        "lease": lease,
+        "lease": reported_lease,
         "result_tool": "agent_assignment_report",
         "prompt_output": "not_returned",
         "response_output": "not_returned",
@@ -25262,6 +25318,121 @@ def wait_agent_input_ready(
         time.sleep(min(SEND_READY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
 
+def _active_ollama_session_binding(agent: str) -> _ActiveOllamaSessionBinding:
+    """Read the one managed local session binding used by pure communication."""
+
+    agent = canonical_agent_id(agent)
+    descriptor = _ollama_descriptor(agent)
+    cfg = agent_config(agent)
+    session = cfg.get("session")
+    runner = cfg.get("runner")
+    if (
+        descriptor is None
+        or descriptor.runner is not RunnerKind.CODEX_CLI
+        or not isinstance(session, str)
+        or not session
+        or not isinstance(runner, Path)
+        or not tmux_alive(session)
+    ):
+        raise AgentError("ollama_session_binding_unverified")
+    require_managed_tmux_session(agent)
+    meta = read_meta(agent)
+    agent_class = meta.get("agent_class")
+    run_id = meta.get("run_id")
+    started_at_utc = meta.get("started_at_utc")
+    if (
+        meta.get("agent") != agent
+        or meta.get("backend") != "tmux"
+        or meta.get("session") != session
+        or meta.get("runner") != str(runner)
+        or meta.get("model") != descriptor.model
+        or meta.get("model_reasoning_effort") is not None
+        or "agent_class" not in meta
+        or (agent_class is not None and not isinstance(agent_class, str))
+        or not isinstance(run_id, str)
+        or not run_id
+        or not isinstance(started_at_utc, str)
+        or not started_at_utc
+    ):
+        raise AgentError("ollama_session_binding_unverified")
+    return _ActiveOllamaSessionBinding(
+        descriptor=descriptor,
+        session=session,
+        runner=str(runner),
+        model=descriptor.model,
+        agent_class=agent_class,
+        run_id=run_id,
+        started_at_utc=started_at_utc,
+    )
+
+
+def _require_agent_lease_binding(agent: str, lease: Mapping[str, Any]) -> None:
+    """Fail closed unless the effect still holds the exact claimed fence."""
+
+    lease_id = lease.get("lease_id")
+    if (
+        lease.get("state") != "held"
+        or lease.get("held_by_this_server") is not True
+        or not isinstance(lease_id, str)
+        or not lease_id
+    ):
+        raise AgentError("agent_lease_binding_unverified")
+    current = agent_lease_status(agent)
+    if (
+        current.get("state") != "held"
+        or current.get("held_by_this_server") is not True
+        or current.get("lease_id") != lease_id
+    ):
+        raise AgentError("agent_lease_binding_unverified")
+
+
+def _require_send_admission_binding(
+    agent: str,
+    *,
+    descriptor: AgentDescriptor,
+    model: str,
+    lease: Mapping[str, Any] | None,
+    ollama_binding: _ActiveOllamaSessionBinding | None,
+) -> None:
+    """Fail closed unless the current lease, session route, and runner still agree."""
+
+    current_descriptor = current_agent_inventory().agents.get(agent)
+    if current_descriptor != descriptor:
+        raise AgentError("agent_session_binding_unverified")
+    if lease is not None:
+        _require_agent_lease_binding(agent, lease)
+    if ollama_binding is not None:
+        current_binding = _active_ollama_session_binding(agent)
+        if current_binding != ollama_binding or current_binding.model != model:
+            raise AgentError("ollama_session_binding_unverified")
+    _require_model_runner_admission(
+        agent,
+        model,
+        descriptor=current_descriptor,
+        enforce_ollama_resource=False,
+    )
+
+
+def _require_send_effect_binding(
+    agent: str,
+    *,
+    descriptor: AgentDescriptor,
+    model: str,
+    lease: Mapping[str, Any] | None,
+    ollama_binding: _ActiveOllamaSessionBinding | None,
+) -> None:
+    """Revalidate managed-session identity immediately before a delivery effect."""
+
+    require_managed_tmux_session(agent)
+    _require_send_admission_binding(
+        agent,
+        descriptor=descriptor,
+        model=model,
+        lease=lease,
+        ollama_binding=ollama_binding,
+    )
+
+
 def send_agent(
     agent: str,
     text: str,
@@ -25269,6 +25440,8 @@ def send_agent(
     *,
     ready_timeout_seconds: float = DEFAULT_SEND_READY_TIMEOUT_SECONDS,
     operation: str = "agent_send",
+    lease: Mapping[str, Any] | None = None,
+    ollama_binding: _ActiveOllamaSessionBinding | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     text = (
@@ -25277,7 +25450,9 @@ def send_agent(
         )
         or ""
     )
-    require_invocation_status(agent, operation=operation)
+    require_invocation_status(
+        agent, operation=operation, enforce_ollama_resource=False
+    )
     cfg = agent_config(agent)
     session = cfg["session"]
     with agent_lifecycle_lock(agent):
@@ -25301,6 +25476,35 @@ def send_agent(
                 },
             )
         require_managed_tmux_session(agent)
+        descriptor = current_agent_inventory().agents.get(agent)
+        if descriptor is None:
+            raise AgentError(f"{operation} blocked by unknown agent status")
+        active_model = (
+            descriptor.model
+            if descriptor.provider is Provider.OLLAMA_LOCAL
+            else read_meta(agent).get("model")
+        )
+        if not isinstance(active_model, str) or not active_model:
+            raise AgentError(
+                _MODEL_INVOCABILITY_UNATTESTED,
+                {
+                    "error_code": _MODEL_INVOCABILITY_UNATTESTED,
+                    "reason_code": _MODEL_INVOCABILITY_UNATTESTED,
+                    "evidence_source": "unknown",
+                    "evidence_status": "invalid",
+                    "missing_factor": "active_model_binding",
+                    "model": "unknown",
+                    "runner": descriptor.runner.value,
+                    "raw_output": "not_returned",
+                },
+            )
+        _require_send_admission_binding(
+            agent,
+            descriptor=descriptor,
+            model=active_model,
+            lease=lease,
+            ollama_binding=ollama_binding,
+        )
         paste_mode = "bracketed_paste" if "\n" in text else "plain_paste"
         payload = (
             f"{BRACKETED_PASTE_BEGIN}{text}{BRACKETED_PASTE_END}"
@@ -25316,7 +25520,13 @@ def send_agent(
         if cp.returncode != 0:
             raise AgentError(f"tmux load-buffer failed for agent {agent}")
         try:
-            require_managed_tmux_session(agent)
+            _require_send_effect_binding(
+                agent,
+                descriptor=descriptor,
+                model=active_model,
+                lease=lease,
+                ollama_binding=ollama_binding,
+            )
             cp = run_tmux(
                 _tmux_args_for_session(
                     session,
@@ -25327,6 +25537,13 @@ def send_agent(
             if cp.returncode != 0:
                 raise AgentError(f"tmux paste-buffer failed for agent {agent}")
             if enter:
+                _require_send_effect_binding(
+                    agent,
+                    descriptor=descriptor,
+                    model=active_model,
+                    lease=lease,
+                    ollama_binding=ollama_binding,
+                )
                 cp = run_tmux(
                     _tmux_args_for_session(
                         session,
@@ -25797,6 +26014,41 @@ def call_authenticated_agent_mutation(
     return result
 
 
+def call_active_ollama_communication(
+    agent: str,
+    *,
+    operation: str,
+    fn: Callable[[Mapping[str, Any], _ActiveOllamaSessionBinding], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run bounded communication against one active local session without spawn admission."""
+
+    binding = _active_ollama_session_binding(agent)
+    claim = _claim_agent_unlocked(agent, enforce_recovery_gate=False)
+    lease = claim.get("lease") if isinstance(claim, Mapping) else None
+    if not isinstance(lease, Mapping):
+        raise AgentError("agent_lease_binding_unverified")
+    _require_agent_lease_binding(agent, lease)
+    release_on_failure = claim.get("status") in {"claimed", "claimed_expired"}
+    try:
+        result = fn(lease, binding)
+    except Exception:
+        if release_on_failure:
+            release_start_lease_if_safe(
+                agent, dict(lease), True, existing_session=True
+            )
+        raise
+    result["auth_gate"] = {
+        "authenticated": True,
+        "provider": Provider.OLLAMA_LOCAL.value,
+        "state": "not_applicable",
+        "required": False,
+        "override": False,
+        "operation": operation,
+        "raw_output": "not_returned",
+    }
+    return result
+
+
 def call_tool(
     name: str,
     args: dict[str, Any],
@@ -26241,6 +26493,24 @@ def call_tool(
         selected_agent = single_agent_id(
             str(args.get("agent", "")), "agent_report_request"
         )
+        if (
+            _ollama_descriptor(selected_agent) is not None
+            and tmux_alive(agent_config(selected_agent)["session"])
+        ):
+            return call_agent_lifecycle(
+                selected_agent,
+                lambda: call_active_ollama_communication(
+                    selected_agent,
+                    operation="agent_report_request",
+                    fn=lambda lease, binding: request_agent_report(
+                        selected_agent,
+                        args.get("assignment_id"),
+                        bool_arg(args, "enter", True),
+                        lease=dict(lease),
+                        ollama_binding=binding,
+                    ),
+                ),
+            )
         return call_agent_lifecycle(
             selected_agent,
             lambda: call_authenticated_agent_mutation(
@@ -26508,6 +26778,28 @@ def call_tool(
         text = args.get("text")
         if not isinstance(text, str) or text == "":
             raise AgentError("agent_send requires non-empty text")
+        if (
+            _ollama_descriptor(selected_agent) is not None
+            and tmux_alive(agent_config(selected_agent)["session"])
+        ):
+            return call_agent_lifecycle(
+                selected_agent,
+                lambda: call_active_ollama_communication(
+                    selected_agent,
+                    operation="agent_send",
+                    fn=lambda lease, binding: {
+                        **send_agent(
+                            selected_agent,
+                            text,
+                            bool_arg(args, "enter", True),
+                            operation="agent_send",
+                            lease=lease,
+                            ollama_binding=binding,
+                        ),
+                        "lease": dict(lease),
+                    },
+                ),
+            )
         return call_agent_lifecycle(
             selected_agent,
             lambda: call_authenticated_agent_mutation(
@@ -26522,6 +26814,7 @@ def call_tool(
                             text,
                             bool_arg(args, "enter", True),
                             operation="agent_send",
+                            lease=lease,
                         ),
                         "lease": lease,
                     },

@@ -14,6 +14,11 @@ from the_hive.hive.dispatch import HiveDispatchError
 from the_hive.hive.events import HiveEventStore
 from the_hive.hive.messages import validate_message
 from the_hive.hive.config import load_agent_class_catalog, load_hive_config
+from the_hive.usage_snapshot import (
+    ModelInvocabilityProjectionV1,
+    ModelInvocabilityV1,
+    UsageEvidenceV2,
+)
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
@@ -796,6 +801,45 @@ def test_red_probe_allows_pure_send_and_report_to_a_running_agent(
     class Completed:
         returncode = 0
 
+    observed_at = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    descriptor = server.AgentDescriptor(
+        agent_id="a1",
+        series_prefix="a",
+        ordinal=1,
+        label="Agentin A1",
+        runner=server.RunnerKind.CODEX_CLI,
+        provider=server.Provider.OPENAI_CHATGPT,
+        model="gpt-5.6-terra",
+        account_id="account-d205",
+        home=Path("/tmp/d205-a1-home"),
+        session="a1",
+        enabled=True,
+    )
+    inventory = server.InventorySnapshot(
+        ("a1",), {"a1": descriptor}, {"a": ("a1",)}, {"a1": 0}, ("a",)
+    )
+    evidence = UsageEvidenceV2(
+        (),
+        "complete",
+        observed_at,
+        observed_at,
+        model_invocability=ModelInvocabilityProjectionV1(
+            "complete",
+            "pool_authority-v3.model_capabilities",
+            (
+                ModelInvocabilityV1(
+                    "account-d205",
+                    "gpt-5.6-terra",
+                    "codex_cli",
+                    True,
+                    True,
+                    True,
+                    True,
+                ),
+            ),
+        ),
+    )
+
     def capacity_or_recovery_gate_used(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("pure communication must not use a capacity gate")
 
@@ -815,6 +859,9 @@ def test_red_probe_allows_pure_send_and_report_to_a_running_agent(
     monkeypatch.setattr(server, "agent_config", lambda _agent: {"session": "a1"})
     monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
     monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
+    monkeypatch.setattr(server, "current_agent_inventory", lambda: inventory)
+    monkeypatch.setattr(server, "read_meta", lambda _agent: {"model": "gpt-5.6-terra"})
+    monkeypatch.setattr(server, "read_usage_evidence_v2", lambda **_kwargs: evidence)
     monkeypatch.setattr(
         server,
         "wait_agent_input_ready",
@@ -833,6 +880,337 @@ def test_red_probe_allows_pure_send_and_report_to_a_running_agent(
 
     assert server.send_agent("a1", "status")["status"] == "sent"
     assert server.request_agent_report("a1")["status"] == "report_requested"
+
+
+def test_d244_tool_pure_ollama_send_and_report_skip_spawn_and_auth_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Completed:
+        returncode = 0
+
+    descriptor = server.AgentDescriptor(
+        agent_id="o1",
+        series_prefix="o",
+        ordinal=1,
+        label="Ollama O1",
+        runner=server.RunnerKind.CODEX_CLI,
+        provider=server.Provider.OLLAMA_LOCAL,
+        model="qwen2.5-coder:7b",
+        account_id=None,
+        home=Path("/tmp/d244-o1-home"),
+        session="o1-session",
+        enabled=True,
+    )
+    inventory = server.InventorySnapshot(
+        ("o1",), {"o1": descriptor}, {"o": ("o1",)}, {"o1": 0}, ("o",)
+    )
+    metadata: dict[str, object] = {
+        "agent": "o1",
+        "backend": "tmux",
+        "session": "o1-session",
+        "runner": "/tmp/d244-o1-runner",
+        "model": "qwen2.5-coder:7b",
+        "model_reasoning_effort": None,
+        "agent_class": None,
+        "run_id": "d244-o1-run",
+        "started_at_utc": "2026-09-16T12:00:00+00:00",
+    }
+    lease: dict[str, object] = {
+        "state": "held",
+        "held_by_this_server": True,
+        "lease_id": "d244-fence-o1",
+        "raw_output": "not_returned",
+    }
+
+    def gate_used(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("pure local communication must not use this gate")
+
+    def invocation_status(
+        _agent: str, *, operation: str, enforce_ollama_resource: bool = True
+    ) -> None:
+        assert operation in {"agent_send", "agent_report_request"}
+        assert enforce_ollama_resource is False
+
+    monkeypatch.setattr(server, "single_agent_id", lambda _agent, _operation: "o1")
+    monkeypatch.setattr(server, "current_agent_inventory", lambda: inventory)
+    monkeypatch.setattr(
+        server,
+        "agent_config",
+        lambda _agent: {"session": "o1-session", "runner": Path("/tmp/d244-o1-runner")},
+    )
+    monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
+    monkeypatch.setattr(
+        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
+    monkeypatch.setattr(server, "read_meta", lambda _agent: metadata)
+    monkeypatch.setattr(server, "require_invocation_status", invocation_status)
+    monkeypatch.setattr(
+        server, "wait_agent_input_ready", lambda *_args, **_kwargs: {"ready": True}
+    )
+    monkeypatch.setattr(server, "agent_lease_status", lambda _agent: lease)
+    monkeypatch.setattr(
+        server,
+        "_claim_agent_unlocked",
+        lambda *_args, **_kwargs: {"status": "renewed", "lease": lease},
+    )
+    monkeypatch.setattr(server, "list_assignments", lambda *_args, **_kwargs: {"records": []})
+    monkeypatch.setattr(server, "_tmux_args_for_session", lambda _session, args: list(args))
+    tmux_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        server,
+        "run_tmux",
+        lambda args, **_kwargs: (tmux_calls.append(tuple(args)) or Completed()),
+    )
+    monkeypatch.setattr(server, "require_authenticated_agent_for_mutation", gate_used)
+    monkeypatch.setattr(server, "ensure_agent_not_blocked_by_codex_usage", gate_used)
+    monkeypatch.setattr(server, "require_resource_capacity_preflight", gate_used)
+    monkeypatch.setattr(server, "require_fleet_recovery_ready", gate_used)
+    monkeypatch.setattr(server, "hive_capacity_probe_guard", gate_used)
+    monkeypatch.setattr(server, "ollama_resource_status", gate_used)
+    monkeypatch.setattr(server, "read_usage_evidence_v2", gate_used)
+
+    sent = server.call_tool("agent_send", {"agent": "o1", "text": "status"})
+    report = server.call_tool("agent_report_request", {"agent": "o1"})
+
+    assert sent["status"] == "sent"
+    assert sent["auth_gate"]["provider"] == "ollama_local"
+    assert report["status"] == "report_requested"
+    assert report["auth_gate"]["provider"] == "ollama_local"
+    assert len(tmux_calls) == 6
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "replacement"),
+    (("model", "other-model"), ("runner", "/tmp/d244-o1-other-runner")),
+)
+def test_d244_tool_ollama_rejects_mismatched_session_binding_before_tmux_effect(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_key: str,
+    replacement: str,
+) -> None:
+    descriptor = server.AgentDescriptor(
+        agent_id="o1",
+        series_prefix="o",
+        ordinal=1,
+        label="Ollama O1",
+        runner=server.RunnerKind.CODEX_CLI,
+        provider=server.Provider.OLLAMA_LOCAL,
+        model="qwen2.5-coder:7b",
+        account_id=None,
+        home=Path("/tmp/d244-o1-home"),
+        session="o1-session",
+        enabled=True,
+    )
+    inventory = server.InventorySnapshot(
+        ("o1",), {"o1": descriptor}, {"o": ("o1",)}, {"o1": 0}, ("o",)
+    )
+    metadata: dict[str, object] = {
+        "agent": "o1",
+        "backend": "tmux",
+        "session": "o1-session",
+        "runner": "/tmp/d244-o1-runner",
+        "model": "other-model",
+        "model_reasoning_effort": None,
+        "agent_class": None,
+        "run_id": "d244-o1-run",
+        "started_at_utc": "2026-09-16T12:00:00+00:00",
+    }
+    metadata[metadata_key] = replacement
+
+    def unexpected_auth(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("active local communication must not enter provider auth")
+
+    tmux_called = False
+
+    def tmux_sink(*_args: object, **_kwargs: object) -> object:
+        nonlocal tmux_called
+        tmux_called = True
+        raise AssertionError("changed binding must stop before a tmux sink")
+
+    monkeypatch.setattr(server, "single_agent_id", lambda _agent, _operation: "o1")
+    monkeypatch.setattr(server, "current_agent_inventory", lambda: inventory)
+    monkeypatch.setattr(
+        server,
+        "agent_config",
+        lambda _agent: {"session": "o1-session", "runner": Path("/tmp/d244-o1-runner")},
+    )
+    monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
+    monkeypatch.setattr(
+        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
+    monkeypatch.setattr(server, "read_meta", lambda _agent: metadata)
+    monkeypatch.setattr(server, "require_authenticated_agent_for_mutation", unexpected_auth)
+    monkeypatch.setattr(server, "run_tmux", tmux_sink)
+
+    with pytest.raises(server.AgentError, match="ollama_session_binding_unverified"):
+        server.call_tool("agent_send", {"agent": "o1", "text": "status"})
+
+    assert tmux_called is False
+
+
+def test_d244_tool_ollama_rejects_fencing_change_before_tmux_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = server.AgentDescriptor(
+        agent_id="o1",
+        series_prefix="o",
+        ordinal=1,
+        label="Ollama O1",
+        runner=server.RunnerKind.CODEX_CLI,
+        provider=server.Provider.OLLAMA_LOCAL,
+        model="qwen2.5-coder:7b",
+        account_id=None,
+        home=Path("/tmp/d244-o1-home"),
+        session="o1-session",
+        enabled=True,
+    )
+    inventory = server.InventorySnapshot(
+        ("o1",), {"o1": descriptor}, {"o": ("o1",)}, {"o1": 0}, ("o",)
+    )
+    metadata: dict[str, object] = {
+        "agent": "o1",
+        "backend": "tmux",
+        "session": "o1-session",
+        "runner": "/tmp/d244-o1-runner",
+        "model": "qwen2.5-coder:7b",
+        "model_reasoning_effort": None,
+        "agent_class": None,
+        "run_id": "d244-o1-run",
+        "started_at_utc": "2026-09-16T12:00:00+00:00",
+    }
+    expected_lease: dict[str, object] = {
+        "state": "held",
+        "held_by_this_server": True,
+        "lease_id": "d244-fence-old",
+        "raw_output": "not_returned",
+    }
+    changed_lease: dict[str, object] = {
+        "state": "held",
+        "held_by_this_server": True,
+        "lease_id": "d244-fence-new",
+        "raw_output": "not_returned",
+    }
+
+    def unexpected_auth(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("active local communication must not enter provider auth")
+
+    def invocation_status(
+        _agent: str, *, operation: str, enforce_ollama_resource: bool = True
+    ) -> None:
+        assert operation == "agent_send"
+        assert enforce_ollama_resource is False
+
+    tmux_called = False
+
+    def tmux_sink(*_args: object, **_kwargs: object) -> object:
+        nonlocal tmux_called
+        tmux_called = True
+        raise AssertionError("fencing mismatch must stop before a tmux sink")
+
+    monkeypatch.setattr(server, "single_agent_id", lambda _agent, _operation: "o1")
+    monkeypatch.setattr(server, "current_agent_inventory", lambda: inventory)
+    monkeypatch.setattr(
+        server,
+        "agent_config",
+        lambda _agent: {"session": "o1-session", "runner": Path("/tmp/d244-o1-runner")},
+    )
+    monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
+    monkeypatch.setattr(
+        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
+    monkeypatch.setattr(server, "read_meta", lambda _agent: metadata)
+    monkeypatch.setattr(server, "require_invocation_status", invocation_status)
+    monkeypatch.setattr(
+        server, "wait_agent_input_ready", lambda *_args, **_kwargs: {"ready": True}
+    )
+    monkeypatch.setattr(server, "_claim_agent_unlocked", lambda *_args, **_kwargs: {"status": "renewed", "lease": expected_lease})
+    monkeypatch.setattr(server, "agent_lease_status", lambda _agent: changed_lease)
+    monkeypatch.setattr(server, "require_authenticated_agent_for_mutation", unexpected_auth)
+    monkeypatch.setattr(server, "run_tmux", tmux_sink)
+
+    with pytest.raises(server.AgentError, match="agent_lease_binding_unverified"):
+        server.call_tool("agent_send", {"agent": "o1", "text": "status"})
+
+    assert tmux_called is False
+
+
+def test_d244_tool_send_blocks_stale_evidence_before_tmux_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Completed:
+        returncode = 0
+
+    descriptor = server.AgentDescriptor(
+        agent_id="a1",
+        series_prefix="a",
+        ordinal=1,
+        label="Agentin A1",
+        runner=server.RunnerKind.CODEX_CLI,
+        provider=server.Provider.OPENAI_CHATGPT,
+        model="gpt-5.6-terra",
+        account_id="account-d244",
+        home=Path("/tmp/d244-a1-home"),
+        session="a1-session",
+        enabled=True,
+    )
+    inventory = server.InventorySnapshot(
+        ("a1",), {"a1": descriptor}, {"a": ("a1",)}, {"a1": 0}, ("a",)
+    )
+    observed_at = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+    stale_evidence = UsageEvidenceV2(
+        (),
+        "complete",
+        observed_at,
+        observed_at,
+        model_invocability=ModelInvocabilityProjectionV1(
+            "stale", "pool_authority-v3.model_capabilities", ()
+        ),
+    )
+    lease: dict[str, object] = {
+        "state": "held",
+        "held_by_this_server": True,
+        "lease_id": "d244-fence-a1",
+        "raw_output": "not_returned",
+    }
+    tmux_commands: list[str] = []
+
+    def tmux_sink(args: list[str], **_kwargs: object) -> Completed:
+        tmux_commands.append(args[0])
+        return Completed()
+
+    monkeypatch.setattr(server, "single_agent_id", lambda _agent, _operation: "a1")
+    monkeypatch.setattr(server, "current_agent_inventory", lambda: inventory)
+    monkeypatch.setattr(server, "agent_config", lambda _agent: {"session": "a1-session"})
+    monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
+    monkeypatch.setattr(
+        server, "agent_lifecycle_lock", lambda *_args, **_kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
+    monkeypatch.setattr(server, "require_invocation_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server, "wait_agent_input_ready", lambda *_args, **_kwargs: {"ready": True}
+    )
+    monkeypatch.setattr(server, "read_meta", lambda _agent: {"model": "gpt-5.6-terra"})
+    monkeypatch.setattr(server, "read_usage_evidence_v2", lambda **_kwargs: stale_evidence)
+    monkeypatch.setattr(
+        server,
+        "require_authenticated_agent_for_mutation",
+        lambda *_args, **_kwargs: {"authenticated": True, "raw_output": "not_returned"},
+    )
+    monkeypatch.setattr(
+        server, "run_with_agent_lease", lambda _agent, fn: fn(lease)
+    )
+    monkeypatch.setattr(server, "agent_lease_status", lambda _agent: lease)
+    monkeypatch.setattr(server, "_tmux_args_for_session", lambda _session, args: list(args))
+    monkeypatch.setattr(server, "run_tmux", tmux_sink)
+
+    with pytest.raises(server.AgentError, match="provider.model_invocability_unattested"):
+        server.call_tool("agent_send", {"agent": "a1", "text": "status"})
+
+    assert tmux_commands == []
 
 
 def test_red_probe_allows_agent_assign_that_only_sends_to_a_running_agent(
