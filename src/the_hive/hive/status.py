@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING
 
 from the_hive.hive.messages import HiveMessage, HiveMessageError, record_child_report
 from the_hive.hive.principals import PrincipalRegistry
-from the_hive.hive.runtime import HiveRuntimeEvidence, read_hive_runtime_evidence
+from the_hive.hive.runtime import (
+    GlobalPilotReadinessV1,
+    HiveRuntimeEvidence,
+    read_hive_runtime_evidence,
+)
 
 if TYPE_CHECKING:
     from the_hive.selection.reset_anchor import ProactiveAnchorSafetyStatus
@@ -37,11 +41,30 @@ def _runtime_evidence(runtime_evidence: HiveRuntimeEvidence | None) -> HiveRunti
     return runtime_evidence
 
 
+def _global_pilot_readiness(
+    evidence: HiveRuntimeEvidence,
+    *,
+    trusted_reader_projection: bool,
+) -> GlobalPilotReadinessV1:
+    if trusted_reader_projection and isinstance(
+        evidence.global_pilot_readiness, GlobalPilotReadinessV1
+    ):
+        return evidence.global_pilot_readiness
+    return GlobalPilotReadinessV1(
+        pilot="blocked",
+        generation_id=None,
+        freshness="unknown",
+        candidate_count=0,
+        reason_codes=("usage_missing",),
+    )
+
+
 def hive_status(
     *,
     mode: str | None = None,
     counts: Mapping[str, int] | None = None,
     runtime_evidence: HiveRuntimeEvidence | None = None,
+    global_pilot_readiness: GlobalPilotReadinessV1 | None = None,
 ) -> Mapping[str, object]:
     if mode is not None and mode not in {"disabled", "shadow", "enforced"}:
         raise ValueError("invalid_hive_mode")
@@ -56,6 +79,10 @@ def hive_status(
     )
     if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values.values()):
         raise ValueError("invalid_hive_counts")
+    # The argument is retained for compatibility but cannot override runtime evidence.
+    readiness = _global_pilot_readiness(
+        evidence, trusted_reader_projection=runtime_evidence is None
+    )
     return {
         "schema_version": evidence.schema_version,
         "mode": evidence.mode,
@@ -71,6 +98,7 @@ def hive_status(
         "catalog_digest": evidence.catalog_digest,
         "mutation_performed": evidence.mutation_performed,
         "raw_output": "not_returned",
+        "global_pilot_readiness": readiness.public(),
     }
 
 
@@ -107,8 +135,16 @@ def admission_status(admission_id: str, *, state: str = "unknown") -> Mapping[st
     return {"admission_id": admission_id, "state": state, "account_key": "not_returned", "scope": "not_returned", "raw_output": "not_returned"}
 
 
-def hive_doctor(*, runtime_evidence: HiveRuntimeEvidence | None = None) -> Mapping[str, object]:
+def hive_doctor(
+    *,
+    runtime_evidence: HiveRuntimeEvidence | None = None,
+    global_pilot_readiness: GlobalPilotReadinessV1 | None = None,
+) -> Mapping[str, object]:
     evidence = _runtime_evidence(runtime_evidence)
+    # The argument is retained for compatibility but cannot override runtime evidence.
+    readiness = _global_pilot_readiness(
+        evidence, trusted_reader_projection=runtime_evidence is None
+    )
     return {
         "healthy": (
             evidence.authority == "ready"
@@ -128,6 +164,7 @@ def hive_doctor(*, runtime_evidence: HiveRuntimeEvidence | None = None) -> Mappi
         "catalog_digest": evidence.catalog_digest,
         "mutation_performed": evidence.mutation_performed,
         "raw_output": "not_returned",
+        "global_pilot_readiness": readiness.public(),
     }
 
 

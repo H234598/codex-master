@@ -64,11 +64,14 @@ from the_hive.hive.queue import QueueDecision, QueueError, WorkPriorityKey, Work
 from the_hive.hive.admission import ExecutionAdmission, HiveAdmissionError, create_assignment_admission
 from the_hive.hive.config import AgentClassProfile, HiveConfig, HiveConfigError, load_agent_class_catalog, load_hive_config
 from the_hive.hive.runtime import (
+    GlobalPilotReadinessV1,
     HiveRuntime,
     HiveRuntimeError,
     HiveRuntimeEvidence,
     build_hive_runtime,
     enforced_pilot_gate,
+    global_pilot_readiness_from_evidence,
+    read_global_pilot_readiness,
     read_hive_runtime_evidence,
 )
 from the_hive.hive.status import aggregate_godbee_status, aggregate_queen_status, aggregate_teamlead_status
@@ -149,10 +152,13 @@ __all__ = [
     "load_agent_class_catalog",
     "load_hive_config",
     "HiveRuntime",
+    "GlobalPilotReadinessV1",
     "HiveRuntimeError",
     "HiveRuntimeEvidence",
     "build_hive_runtime",
     "enforced_pilot_gate",
+    "global_pilot_readiness_from_evidence",
+    "read_global_pilot_readiness",
     "read_hive_runtime_evidence",
     "aggregate_godbee_status",
     "aggregate_queen_status",

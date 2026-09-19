@@ -75,6 +75,15 @@ def green_probe(checked_at: str) -> dict[str, object]:
         "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True},
         "checked_at": checked_at,
         "commands": {"runtime_status": True, "hive_status": True, "hive_doctor": True},
+        "global_pilot_readiness": {
+            "schema_version": 1,
+            "pilot": "ready",
+            "generation_id": "a" * 32,
+            "freshness": "fresh",
+            "candidate_count": 1,
+            "reason_codes": [],
+            "raw_output": "not_returned",
+        },
     }
 
 
@@ -106,6 +115,7 @@ def green_hive_runtime() -> dict[str, object]:
         "authority": "ready",
         "state": "ready",
         "pilot": "ready",
+        "global_pilot_readiness": green_probe(NOW.isoformat())["global_pilot_readiness"],
         "reason_codes": [],
         "mutation_performed": False,
         "raw_output": "not_returned",
@@ -198,12 +208,13 @@ def test_probe_evaluation_is_fail_closed_for_runtime_status_and_hive_evidence() 
         },
     )
 
-    assert set(result) == {"checks"}
+    assert set(result) == {"checks", "global_pilot_readiness"}
     assert result["checks"] == {
         "runtime_layout": False,
         "hive_runtime": False,
         "hive_doctor": False,
     }
+    assert result["global_pilot_readiness"]["pilot"] == "blocked"
 
 
 def test_probe_evaluation_requires_all_canonical_hive_evidence_fields() -> None:
@@ -219,7 +230,7 @@ def test_probe_evaluation_requires_all_canonical_hive_evidence_fields() -> None:
             hive,
             doctor,
         )
-        assert set(result) == {"checks"}
+        assert set(result) == {"checks", "global_pilot_readiness"}
         assert result["checks"]["hive_runtime"] is False
 
 
@@ -236,7 +247,7 @@ def test_probe_evaluation_rejects_unknown_canonical_hive_evidence_states() -> No
             {**base, field: "unexpected"},
             doctor,
         )
-        assert set(result) == {"checks"}
+        assert set(result) == {"checks", "global_pilot_readiness"}
         assert result["checks"]["hive_runtime"] is False
 
     result = evaluate(
@@ -244,8 +255,20 @@ def test_probe_evaluation_rejects_unknown_canonical_hive_evidence_states() -> No
         {**base, "unexpected": "field"},
         doctor,
     )
-    assert set(result) == {"checks"}
+    assert set(result) == {"checks", "global_pilot_readiness"}
     assert result["checks"]["hive_runtime"] is False
+
+
+def test_bounded_global_pilot_readiness_drops_generation_id_for_malformed_input() -> None:
+    malformed = green_probe(NOW.isoformat())["global_pilot_readiness"]
+    assert isinstance(malformed, dict)
+    malformed["reason_codes"] = "not-a-list"
+
+    bounded = hourly_probe_module._bounded_global_pilot_readiness(malformed)
+
+    assert bounded["pilot"] == "blocked"
+    assert bounded["generation_id"] is None
+    assert bounded["reason_codes"] == ["usage_invalid"]
 
 
 def test_probe_has_exactly_eight_deterministic_utc_slots() -> None:
@@ -367,7 +390,13 @@ def test_run_probe_persists_only_one_schema_v2_health_record(
         now=lambda: NOW,
         runner=runner,
     )
-    assert set(result) == {"schema_version", "checked_at", "checks", "commands"}
+    assert set(result) == {
+        "schema_version",
+        "checked_at",
+        "checks",
+        "commands",
+        "global_pilot_readiness",
+    }
     assert result["schema_version"] == 2
     assert calls == [("hive", "status"), ("hive", "doctor")]
     assert (
@@ -388,7 +417,13 @@ def test_run_probe_persists_only_one_schema_v2_health_record(
         now=lambda: NOW,
         runner=red_runner,
     )
-    assert set(result) == {"schema_version", "checked_at", "checks", "commands"}
+    assert set(result) == {
+        "schema_version",
+        "checked_at",
+        "checks",
+        "commands",
+        "global_pilot_readiness",
+    }
     assert not (state_directory / "hive-hourly-alarm.json").exists()
 
 

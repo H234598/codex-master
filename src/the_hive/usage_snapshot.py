@@ -231,6 +231,7 @@ class UsageEvidenceV2:
     model_invocability: ModelInvocabilityProjectionV1 = (
         _UNATTESTED_MODEL_INVOCABILITY
     )
+    generation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2532,6 +2533,7 @@ def _read_chain_v2(
     datetime,
     tuple[PoolAuthorityV2, ...],
     ModelInvocabilityProjectionV1,
+    str,
 ]:
     if type(state_home) is not type(Path()) or not state_home.is_absolute():
         raise _Invalid()
@@ -2641,6 +2643,7 @@ def _read_chain_v2(
             current.generated_at,
             current.authorities,
             current.model_invocability,
+            current.binding.generation_id,
         )
     finally:
         for descriptor in reversed(locked):
@@ -2731,6 +2734,7 @@ def read_usage_evidence_v2(
             generated_at,
             authorities,
             model_invocability,
+            generation_id,
         ) = _read_chain_v2(
             state_home or _default_state_home(), now
         )
@@ -2741,6 +2745,7 @@ def read_usage_evidence_v2(
             generated_at,
             authorities,
             model_invocability,
+            generation_id,
         )
     except _Busy:
         return UsageEvidenceV2((), "busy", None, None)

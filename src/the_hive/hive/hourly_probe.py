@@ -26,6 +26,7 @@ from the_hive.runtime_status import (
     RUNTIME_STATUS_MCP_TIMEOUT_SECONDS,
     runtime_status,
 )
+from the_hive.hive.runtime import GlobalPilotReadinessV1
 
 
 DETERMINISTIC_PROBE_HOURS_UTC = (0, 3, 6, 9, 12, 15, 18, 21)
@@ -33,7 +34,20 @@ STATE_FILE_NAME = "hive-hourly-health.json"
 PROBE_GATE_LOCK_NAME = ".hive-hourly-probe.lock"
 MAX_PROBE_STATE_BYTES = 64 * 1024
 MAX_PROBE_AGE_SECONDS = 4 * 60 * 60
-_PROBE_RECORD_KEYS = frozenset({"schema_version", "checked_at", "checks", "commands"})
+_PROBE_RECORD_KEYS = frozenset(
+    {"schema_version", "checked_at", "checks", "commands", "global_pilot_readiness"}
+)
+_GLOBAL_PILOT_READINESS_KEYS = frozenset(
+    {
+        "schema_version",
+        "pilot",
+        "generation_id",
+        "freshness",
+        "candidate_count",
+        "reason_codes",
+        "raw_output",
+    }
+)
 _PROBE_CHECK_KEYS = frozenset({"runtime_layout", "hive_runtime", "hive_doctor"})
 _PROBE_COMMAND_KEYS = frozenset({"runtime_status", "hive_status", "hive_doctor"})
 _HIVE_STATUS_KEYS = frozenset(
@@ -52,6 +66,7 @@ _HIVE_STATUS_KEYS = frozenset(
         "reason_codes",
         "mutation_performed",
         "raw_output",
+        "global_pilot_readiness",
     }
 )
 HIVE_DIAGNOSTIC_TIMEOUT_SECONDS = 45.0
@@ -88,6 +103,49 @@ def _digest(value: object) -> bool:
     )
 
 
+def _bounded_global_pilot_readiness(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or frozenset(value) != _GLOBAL_PILOT_READINESS_KEYS:
+        return {
+            "schema_version": 1,
+            "pilot": "blocked",
+            "generation_id": None,
+            "freshness": "unknown",
+            "candidate_count": 0,
+            "reason_codes": ["usage_missing"],
+            "raw_output": "not_returned",
+        }
+    generation_id = value.get("generation_id")
+    reasons = value.get("reason_codes")
+    if not isinstance(reasons, list):
+        return {
+            "schema_version": 1,
+            "pilot": "blocked",
+            "generation_id": None,
+            "freshness": "unknown",
+            "candidate_count": 0,
+            "reason_codes": ["usage_invalid"],
+            "raw_output": "not_returned",
+        }
+    try:
+        return GlobalPilotReadinessV1(
+            pilot=value["pilot"],
+            generation_id=generation_id,
+            freshness=value["freshness"],
+            candidate_count=value["candidate_count"],
+            reason_codes=tuple(reasons),
+        ).public()
+    except (TypeError, ValueError):
+        return {
+            "schema_version": 1,
+            "pilot": "blocked",
+            "generation_id": None,
+            "freshness": "unknown",
+            "candidate_count": 0,
+            "reason_codes": ["usage_invalid"],
+            "raw_output": "not_returned",
+        }
+
+
 def _green_hive_runtime(value: object) -> bool:
     if not isinstance(value, Mapping) or frozenset(value) != _HIVE_STATUS_KEYS:
         return False
@@ -114,6 +172,8 @@ def _green_hive_runtime(value: object) -> bool:
         and not reasons
         and value.get("mutation_performed") is False
         and value.get("raw_output") == "not_returned"
+        and value.get("global_pilot_readiness")
+        == _bounded_global_pilot_readiness(value.get("global_pilot_readiness"))
     )
 
 
@@ -157,7 +217,12 @@ def evaluate(
         "hive_runtime": _green_hive_runtime(hive),
         "hive_doctor": doctor.get("healthy") is True and doctor_ready,
     }
-    return {"checks": checks}
+    return {
+        "checks": checks,
+        "global_pilot_readiness": _bounded_global_pilot_readiness(
+            hive.get("global_pilot_readiness")
+        ),
+    }
 
 
 def probe_spawn_gate(
@@ -183,6 +248,8 @@ def probe_spawn_gate(
         or not isinstance(commands, Mapping)
         or frozenset(commands) != _PROBE_COMMAND_KEYS
         or any(value is not True for value in commands.values())
+        or payload.get("global_pilot_readiness")
+        != _bounded_global_pilot_readiness(payload.get("global_pilot_readiness"))
     ):
         return {
             "allowed": False,

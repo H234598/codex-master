@@ -109,13 +109,7 @@ class ModelPolicyRegistry:
         )
 
 
-def load_model_policy(path: Path) -> ModelPolicyRegistry:
-    if not isinstance(path, Path) or not path.is_absolute() or path.is_symlink():
-        raise ModelPolicyError("invalid_model_policy_path")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ModelPolicyError("model_policy_unavailable") from exc
+def _registry_from_payload(payload: object) -> ModelPolicyRegistry:
     if not isinstance(payload, Mapping) or payload.get("schema_version") != 1 or set(payload) - {"schema_version", "models"}:
         raise ModelPolicyError("invalid_model_policy")
     raw_models = payload.get("models")
@@ -151,4 +145,32 @@ def load_model_policy(path: Path) -> ModelPolicyRegistry:
     return ModelPolicyRegistry(definitions)
 
 
-__all__ = ["ModelDefinition", "ModelPolicyError", "ModelPolicyRegistry", "load_model_policy"]
+def load_model_policy(path: Path) -> ModelPolicyRegistry:
+    if not isinstance(path, Path) or not path.is_absolute() or path.is_symlink():
+        raise ModelPolicyError("invalid_model_policy_path")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ModelPolicyError("model_policy_unavailable") from exc
+    return _registry_from_payload(payload)
+
+
+def load_model_policy_bytes(raw: bytes) -> ModelPolicyRegistry:
+    """Load one already-attested policy document without introducing a path source."""
+
+    if not isinstance(raw, bytes):
+        raise ModelPolicyError("invalid_model_policy_bytes")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ModelPolicyError("invalid_model_policy") from exc
+    return _registry_from_payload(payload)
+
+
+__all__ = [
+    "ModelDefinition",
+    "ModelPolicyError",
+    "ModelPolicyRegistry",
+    "load_model_policy",
+    "load_model_policy_bytes",
+]

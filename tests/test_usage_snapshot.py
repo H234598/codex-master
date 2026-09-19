@@ -180,7 +180,15 @@ def test_pinned_producer_06537_golden_generation_is_complete(
     )
 
     assert result.status == "complete"
+    assert type(result) is usage_snapshot.UsageEvidenceV2
+    assert not hasattr(result, "_reader_attestation")
     assert tuple(account.account_id for account in result.accounts) == ("synthetic-alpha",)
+    pointer = json.loads(
+        (state_home / "codex-usage" / "integration" / "current.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert result.generation_id == pointer["current_generation_id"]
 
 
 def _write_json(path: Path, value: object, *, newline: bool = False) -> None:
@@ -633,6 +641,45 @@ def test_06537_bound_native_model_capability_preserves_usage_display(
     )
     assert display.source == "live"
     assert tuple(limit.pool for limit in display.accounts[0].limits) == ("main", "spark")
+
+
+def test_usage_evidence_subclass_never_attests_model_invocability_or_display(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    _rebind_model_invocability(
+        paths, _model_invocability_projection(_model_capability_entry())
+    )
+    evidence = read_golden(state_home)
+
+    class CallerUsageEvidenceV2(usage_snapshot.UsageEvidenceV2):
+        pass
+
+    derived = CallerUsageEvidenceV2(
+        evidence.accounts,
+        evidence.status,
+        evidence.captured_at,
+        evidence.generated_at,
+        evidence.pool_authorities,
+        evidence.model_invocability,
+        evidence.generation_id,
+    )
+
+    assert (
+        usage_snapshot.find_model_invocability(
+            derived,
+            account_id="synthetic-alpha",
+            model_id="gpt-5.3-codex-spark",
+            runner_id="codex_cli",
+        )
+        is None
+    )
+    display = usage_snapshot.display_snapshot_from_evidence(
+        derived, known_account_ids=frozenset({"synthetic-alpha"})
+    )
+    assert display.source == "unavailable"
+    assert display.stale is True
+    assert display.warnings == ("usage_unavailable",)
 
 
 def test_06537_positive_interactive_codex_cli_capability_keeps_api_state_separate(

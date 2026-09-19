@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import stat
+from typing import Literal
 
 from the_hive.hive.authority import AuthorityContext, AuthorityEngine
 from the_hive.hive.config import (
@@ -39,6 +40,24 @@ from the_hive.runtime_layout import (
     RuntimeLayout,
     validate_runtime_metadata,
 )
+from the_hive.agent_resolver import (
+    LEADERSHIP_CLASS_IDS,
+    REASONING_RANK,
+    policies_from_catalogs,
+    validate_canonical_agent_tuple,
+)
+from the_hive.selection.model_policy import (
+    ModelPolicyRegistry,
+    load_model_policy,
+    load_model_policy_bytes,
+)
+from the_hive.usage_snapshot import (
+    ModelInvocabilityV1,
+    ModelInvocabilityProjectionV1,
+    PoolAuthorityV2,
+    UsageEvidenceV2,
+    read_usage_evidence_v2,
+)
 
 
 class HiveRuntimeError(ValueError):
@@ -51,6 +70,77 @@ _PILOT_REPOSITORY = "codex-master"
 _PILOT_QUEEN = "queen-codex-master"
 _PILOT_REMOTE = "https://github.com/H234598/codex-master.git"
 _PILOT_FEATURE_FLAGS = frozenset({"sp0_passive", "sp1_deadline", "sp2_secondary_model", "sp3_fairness"})
+_GLOBAL_PILOT_REASON_CODES = frozenset(
+    {
+        "candidate_missing",
+        "candidate_mapping_conflict",
+        "model_capability_conflicting",
+        "model_capability_invalid",
+        "model_capability_missing",
+        "model_capability_stale",
+        "model_policy_invalid",
+        "model_policy_mismatch",
+        "model_uninvocable",
+        "pilot_class_ambiguous",
+        "pilot_class_invalid",
+        "pool_authority_ambiguous",
+        "pool_authority_missing",
+        "pool_authority_unready",
+        "usage_generation_missing",
+        "usage_invalid",
+        "usage_missing",
+        "usage_partial",
+        "usage_stale",
+        "usage_unattested",
+    }
+)
+_GLOBAL_PILOT_FRESHNESS = frozenset({"fresh", "stale", "unknown"})
+_GLOBAL_PILOT_GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+@dataclass(frozen=True, slots=True)
+class GlobalPilotReadinessV1:
+    """A bounded, diagnostic-only projection of one verified V2 generation."""
+
+    pilot: Literal["ready", "blocked"]
+    generation_id: str | None
+    freshness: Literal["fresh", "stale", "unknown"]
+    candidate_count: int
+    reason_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.pilot not in {"ready", "blocked"}
+            or self.generation_id is not None
+            and (
+                not isinstance(self.generation_id, str)
+                or _GLOBAL_PILOT_GENERATION_RE.fullmatch(self.generation_id) is None
+            )
+            or self.freshness not in _GLOBAL_PILOT_FRESHNESS
+            or type(self.candidate_count) is not int
+            or not 0 <= self.candidate_count <= 256
+            or type(self.reason_codes) is not tuple
+            or len(self.reason_codes) > 8
+            or any(
+                not isinstance(code, str) or code not in _GLOBAL_PILOT_REASON_CODES
+                for code in self.reason_codes
+            )
+            or len(set(self.reason_codes)) != len(self.reason_codes)
+        ):
+            raise HiveRuntimeError("invalid_global_pilot_readiness")
+
+    def public(self) -> dict[str, object]:
+        """Return only generation/freshness/count/reason diagnostic fields."""
+
+        return {
+            "schema_version": 1,
+            "pilot": self.pilot,
+            "generation_id": self.generation_id,
+            "freshness": self.freshness,
+            "candidate_count": self.candidate_count,
+            "reason_codes": list(self.reason_codes),
+            "raw_output": "not_returned",
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +160,7 @@ class HiveRuntimeEvidence:
     mutation_performed: bool = False
     repository_count: int = 0
     principal_count: int = 0
+    global_pilot_readiness: GlobalPilotReadinessV1 | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -103,6 +194,10 @@ class HiveRuntimeEvidence:
             or self.repository_count < 0
             or type(self.principal_count) is not int
             or self.principal_count < 0
+        ):
+            raise HiveRuntimeError("invalid_hive_runtime_evidence")
+        if self.global_pilot_readiness is not None and not isinstance(
+            self.global_pilot_readiness, GlobalPilotReadinessV1
         ):
             raise HiveRuntimeError("invalid_hive_runtime_evidence")
 
@@ -154,6 +249,398 @@ def _pool_evidence_now(clock: Callable[[], datetime] | None) -> datetime | None:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta():
         return None
     return value.astimezone(UTC)
+
+
+def _global_pilot_readiness(
+    *,
+    pilot: Literal["ready", "blocked"],
+    generation_id: str | None,
+    freshness: Literal["fresh", "stale", "unknown"],
+    candidate_count: int = 0,
+    reason_codes: tuple[str, ...] = (),
+) -> GlobalPilotReadinessV1:
+    return GlobalPilotReadinessV1(
+        pilot,
+        generation_id,
+        freshness,
+        candidate_count,
+        tuple(dict.fromkeys(reason_codes)),
+    )
+
+
+def _unknown_global_pilot_readiness(reason: str = "usage_missing") -> GlobalPilotReadinessV1:
+    if reason not in _GLOBAL_PILOT_REASON_CODES:
+        reason = "usage_invalid"
+    return _global_pilot_readiness(
+        pilot="blocked", generation_id=None, freshness="unknown", reason_codes=(reason,)
+    )
+
+
+def _pilot_class_id(
+    config: HiveConfig, classes: Mapping[str, AgentClassProfile]
+) -> str | None:
+    configured = tuple(
+        raw.get("class_id")
+        for raw in config.principals
+        if isinstance(raw, Mapping)
+        and raw.get("repo_id") is not None
+        and isinstance(raw.get("class_id"), str)
+    )
+    if len(configured) != 1:
+        return None
+    class_id = configured[0]
+    if class_id not in classes or class_id not in LEADERSHIP_CLASS_IDS:
+        return None
+    return class_id
+
+
+def _global_pilot_readiness_for_reader_fields(
+    *,
+    status: object,
+    captured_at: object,
+    generated_at: object,
+    pool_authorities: object,
+    model_invocability: object,
+    generation_id: object,
+    config: HiveConfig,
+    classes: Mapping[str, AgentClassProfile],
+    model_registry: ModelPolicyRegistry,
+    now: Callable[[], datetime] | None,
+) -> GlobalPilotReadinessV1:
+    """Project fields extracted only after the controlled V2 reader return."""
+
+    if (
+        not isinstance(generation_id, str)
+        or _GLOBAL_PILOT_GENERATION_RE.fullmatch(generation_id) is None
+    ):
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=None,
+            freshness="unknown",
+            reason_codes=("usage_generation_missing",),
+        )
+    if type(status) is not str:
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="unknown",
+            reason_codes=("usage_invalid",),
+        )
+    if status != "complete":
+        reason = {
+            "partial": "usage_partial",
+            "stale": "usage_stale",
+            "unavailable": "usage_missing",
+            "busy": "usage_missing",
+            "invalid": "usage_invalid",
+        }.get(status, "usage_invalid")
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="stale" if status == "stale" else "unknown",
+            reason_codes=(reason,),
+        )
+    if captured_at is None or generated_at is None:
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="unknown",
+            reason_codes=("usage_missing",),
+        )
+    observed_now = _pool_evidence_now(now)
+    if observed_now is None or generated_at > observed_now:
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="unknown",
+            reason_codes=("usage_invalid",),
+        )
+
+    if not isinstance(config, HiveConfig) or config.mode != "enforced":
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("pilot_class_invalid",),
+        )
+    if not isinstance(classes, Mapping) or any(
+        type(value) is not AgentClassProfile for value in classes.values()
+    ) or type(model_registry) is not ModelPolicyRegistry:
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("model_policy_invalid",),
+        )
+    class_id = _pilot_class_id(config, classes)
+    if class_id is None:
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("pilot_class_ambiguous",),
+        )
+    try:
+        class_policies, model_policies = policies_from_catalogs(classes, model_registry)
+    except Exception:
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("model_policy_invalid",),
+        )
+    class_policy = next(
+        (item for item in class_policies if item.class_id == class_id), None
+    )
+    if (
+        class_policy is None
+        or class_policy.default_lifecycle != "persistent"
+        or class_policy.allowed_lifecycles != ("persistent",)
+    ):
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("pilot_class_invalid",),
+        )
+
+    authorities = pool_authorities
+    if type(authorities) is not tuple or any(
+        type(authority) is not PoolAuthorityV2 for authority in authorities
+    ):
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("pool_authority_missing",),
+        )
+    authority_keys = tuple(
+        (item.account_id, item.pool_id, item.provider) for item in authorities
+    )
+    if len(set(authority_keys)) != len(authority_keys):
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("pool_authority_ambiguous",),
+        )
+    if not authorities:
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("pool_authority_missing",),
+        )
+
+    projection = model_invocability
+    if not isinstance(projection, ModelInvocabilityProjectionV1):
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("model_capability_missing",),
+        )
+    if projection.status == "unattested":
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("model_capability_missing",),
+        )
+    if projection.status == "stale":
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="stale",
+            reason_codes=("model_capability_stale",),
+        )
+    if projection.status != "complete" or type(projection.capabilities) is not tuple:
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("model_capability_invalid",),
+        )
+    if any(type(item) is not ModelInvocabilityV1 for item in projection.capabilities):
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("model_capability_invalid",),
+        )
+    capability_keys = tuple(
+        (item.account_id, item.model_id, item.runner_id)
+        for item in projection.capabilities
+    )
+    if len(capability_keys) != len(set(capability_keys)):
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("model_capability_conflicting",),
+        )
+    if not projection.capabilities:
+        return _global_pilot_readiness(
+            pilot="blocked",
+            generation_id=generation_id,
+            freshness="fresh",
+            reason_codes=("model_capability_missing",),
+        )
+
+    model_by_id = {item.model_id: item for item in model_policies}
+    matched_mapping = False
+    unready_pool = False
+    uninvocable = False
+    policy_mismatch = False
+    candidates = 0
+    for authority in authorities:
+        if authority.hive_available is not True:
+            unready_pool = True
+            continue
+        if (
+            authority.persistent_leadership_eligible is not True
+            or authority.long_running_leadership_eligible is not True
+            or "persistent" not in authority.allowed_lifecycles
+        ):
+            unready_pool = True
+            continue
+        if (
+            authority.reasoning_minimum not in REASONING_RANK
+            or authority.reasoning_maximum not in REASONING_RANK
+            or REASONING_RANK[authority.reasoning_minimum]
+            > REASONING_RANK[authority.reasoning_maximum]
+            or REASONING_RANK[authority.reasoning_minimum]
+            > REASONING_RANK[class_policy.min_reasoning]
+            or REASONING_RANK[authority.reasoning_maximum]
+            < REASONING_RANK[class_policy.max_reasoning]
+        ):
+            policy_mismatch = True
+            continue
+        for capability in projection.capabilities:
+            if capability.account_id != authority.account_id:
+                continue
+            matched_mapping = True
+            model_policy = model_by_id.get(capability.model_id)
+            definition = model_registry.get_exact(capability.model_id)
+            if model_policy is None or definition is None or definition.provider != authority.provider:
+                policy_mismatch = True
+                continue
+            if model_policy.family not in authority.allowed_model_families:
+                policy_mismatch = True
+                continue
+            try:
+                validate_canonical_agent_tuple(
+                    class_policy,
+                    model_policy,
+                    "persistent",
+                    class_policy.max_reasoning,
+                )
+            except ValueError:
+                policy_mismatch = True
+                continue
+            if (
+                capability.meter_visible is not True
+                or capability.catalog_visible is not True
+                or capability.supported_in_api is not True
+            ):
+                policy_mismatch = True
+                continue
+            if capability.runner_invocable is not True:
+                uninvocable = True
+                continue
+            candidates += 1
+
+    if candidates:
+        return _global_pilot_readiness(
+            pilot="ready",
+            generation_id=generation_id,
+            freshness="fresh",
+            candidate_count=candidates,
+        )
+    reasons: list[str] = []
+    if not matched_mapping:
+        reasons.append("candidate_mapping_conflict")
+    if unready_pool:
+        reasons.append("pool_authority_unready")
+    if uninvocable:
+        reasons.append("model_uninvocable")
+    if policy_mismatch:
+        reasons.append("model_policy_mismatch")
+    if not reasons:
+        reasons.append("candidate_missing")
+    return _global_pilot_readiness(
+        pilot="blocked",
+        generation_id=generation_id,
+        freshness="fresh",
+        reason_codes=tuple(reasons),
+    )
+
+
+def global_pilot_readiness_from_evidence(
+    evidence: object,
+    *,
+    config: HiveConfig,
+    classes: Mapping[str, AgentClassProfile],
+    model_registry: ModelPolicyRegistry,
+    now: Callable[[], datetime] | None = None,
+) -> GlobalPilotReadinessV1:
+    """Reject caller-supplied evidence; only the controlled reader path projects readiness."""
+
+    del evidence, config, classes, model_registry, now
+    return _unknown_global_pilot_readiness("usage_unattested")
+
+
+def _read_global_pilot_readiness_for_config(
+    *,
+    config: HiveConfig,
+    classes: Mapping[str, AgentClassProfile],
+    model_registry: ModelPolicyRegistry,
+    now: Callable[[], datetime] | None,
+) -> GlobalPilotReadinessV1:
+    observed_now = _pool_evidence_now(now)
+    if observed_now is None:
+        return _unknown_global_pilot_readiness("usage_invalid")
+    reader_result = read_usage_evidence_v2(clock=lambda: observed_now)
+    if type(reader_result) is not UsageEvidenceV2:
+        return _unknown_global_pilot_readiness("usage_unattested")
+    return _global_pilot_readiness_for_reader_fields(
+        status=reader_result.status,
+        captured_at=reader_result.captured_at,
+        generated_at=reader_result.generated_at,
+        pool_authorities=reader_result.pool_authorities,
+        model_invocability=reader_result.model_invocability,
+        generation_id=reader_result.generation_id,
+        config=config,
+        classes=classes,
+        model_registry=model_registry,
+        now=lambda: observed_now,
+    )
+
+
+def read_global_pilot_readiness(
+    *, now: Callable[[], datetime] | None = None
+) -> GlobalPilotReadinessV1:
+    """Read the canonical runtime configuration and the real V2 reader once."""
+
+    try:
+        layout = RuntimeLayout.from_module_path(Path(__file__))
+        classes_snapshot = load_agent_class_catalog_snapshot_bytes(
+            layout.read_attested_file("codex-agent-classes.json")
+        )
+        config = load_hive_config_bytes(
+            layout.read_attested_file("codex-hive.json"), classes_snapshot.classes
+        )
+        model_registry = load_model_policy_bytes(
+            layout.read_attested_file("codex-model-policy.json")
+        )
+    except (HiveConfigError, LayoutError, OSError, TypeError, ValueError):
+        return _unknown_global_pilot_readiness("model_policy_invalid")
+    return _read_global_pilot_readiness_for_config(
+        config=config,
+        classes=classes_snapshot.classes,
+        model_registry=model_registry,
+        now=now,
+    )
 
 
 def enforced_pilot_gate(
@@ -335,6 +822,7 @@ def read_hive_runtime_evidence(
             **{**empty, "reason_codes": ("hive_runtime_unavailable",)}
         )
     try:
+        model_registry: ModelPolicyRegistry
         if use_runtime_image:
             layout = RuntimeLayout.from_module_path(Path(__file__))
             snapshot = load_agent_class_catalog_snapshot_bytes(
@@ -344,13 +832,29 @@ def read_hive_runtime_evidence(
                 layout.read_attested_file("codex-hive.json"), snapshot.classes
             )
             _validate_runtime_image_repository_evidence(layout, config)
+            model_registry = load_model_policy_bytes(
+                layout.read_attested_file("codex-model-policy.json")
+            )
         else:
             assert isinstance(catalog_path, Path) and isinstance(config_path, Path)
             snapshot = load_agent_class_catalog_snapshot(catalog_path)
             config = load_hive_config(config_path, snapshot.classes)
+            model_registry = load_model_policy(
+                _default_repository_root() / "codex-model-policy.json"
+            )
     except (HiveConfigError, LayoutError, OSError, TypeError, ValueError):
         return HiveRuntimeEvidence(
             **{**empty, "reason_codes": ("hive_config_unavailable",)}
+        )
+
+    if dynamic_account_evidence is not None:
+        global_pilot_readiness = _unknown_global_pilot_readiness("usage_unattested")
+    else:
+        global_pilot_readiness = _read_global_pilot_readiness_for_config(
+            config=config,
+            classes=snapshot.classes,
+            model_registry=model_registry,
+            now=now,
         )
 
     state_kind = _existing_state_kind(state_root)
@@ -416,17 +920,16 @@ def read_hive_runtime_evidence(
         repository_count = len(config.repositories)
         principal_count = len(config.principals) if state_kind == "ready" and config.principals else 0
     reasons = list(dict.fromkeys(reasons))
-    pilot = enforced_pilot_gate(
-        config,
-        snapshot.classes,
-        dynamic_account_evidence,
-        now=now,
-    )
-    authority = (
-        "ready"
-        if diagnostics_ready and config.mode == "enforced" and pilot["allowed"] is True
-        else "fail_closed"
-    )
+    if dynamic_account_evidence is not None:
+        enforced_pilot_gate(
+            config,
+            snapshot.classes,
+            dynamic_account_evidence,
+            now=now,
+        )
+    # GlobalPilotReadinessV1 is diagnostic evidence only.  It is never passed
+    # to the concrete gate and cannot turn runtime authority green.
+    authority = "fail_closed"
     return HiveRuntimeEvidence(
         schema_version=1,
         mode=config.mode,
@@ -436,11 +939,12 @@ def read_hive_runtime_evidence(
         principal=principal_kind,
         authority=authority,
         state=state_kind,
-        pilot="ready" if pilot["allowed"] is True else "blocked",
+        pilot=global_pilot_readiness.pilot,
         reason_codes=tuple(_bounded_reason(code) for code in reasons),
         mutation_performed=False,
         repository_count=repository_count,
         principal_count=principal_count,
+        global_pilot_readiness=global_pilot_readiness,
     )
 
 
@@ -652,10 +1156,13 @@ def _verify_principal_parity(registry: PrincipalRegistry, expected: Mapping[str,
 
 
 __all__ = [
+    "GlobalPilotReadinessV1",
     "HiveRuntime",
     "HiveRuntimeError",
     "HiveRuntimeEvidence",
     "build_hive_runtime",
     "enforced_pilot_gate",
+    "global_pilot_readiness_from_evidence",
+    "read_global_pilot_readiness",
     "read_hive_runtime_evidence",
 ]

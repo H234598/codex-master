@@ -19,6 +19,7 @@ from the_hive.hive.status import (
     selection_status,
 )
 from the_hive.hive.runtime import HiveRuntimeEvidence
+from the_hive.hive.runtime import GlobalPilotReadinessV1
 
 
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
@@ -185,3 +186,80 @@ def test_status_and_doctor_project_one_canonical_runtime_evidence() -> None:
     assert doctor["mutation_performed"] is False
     assert "state_root" not in str(status)
     assert "state_root" not in str(doctor)
+
+
+def test_status_and_doctor_include_only_the_bounded_global_pilot_diagnostic() -> None:
+    evidence = HiveRuntimeEvidence(
+        schema_version=1,
+        mode="shadow",
+        config_digest=DIGEST,
+        catalog_digest=DIGEST,
+        repository="not_configured",
+        principal="not_configured",
+        authority="fail_closed",
+        state="not_configured",
+        pilot="blocked",
+        reason_codes=(),
+    )
+    readiness = GlobalPilotReadinessV1(
+        pilot="ready",
+        generation_id="a" * 32,
+        freshness="fresh",
+        candidate_count=1,
+        reason_codes=(),
+    )
+
+    status = hive_status(runtime_evidence=evidence, global_pilot_readiness=readiness)
+    doctor = hive_doctor(runtime_evidence=evidence, global_pilot_readiness=readiness)
+
+    assert status["global_pilot_readiness"] == doctor["global_pilot_readiness"] == {
+        "schema_version": 1,
+        "pilot": "blocked",
+        "generation_id": None,
+        "freshness": "unknown",
+        "candidate_count": 0,
+        "reason_codes": ["usage_missing"],
+        "raw_output": "not_returned",
+    }
+    rendered = str(status) + str(doctor)
+    assert "account_id" not in rendered
+    assert "pool_id" not in rendered
+    assert "model_id" not in rendered
+    assert "runner_id" not in rendered
+    assert "state_root" not in rendered
+
+
+def test_status_and_doctor_reject_caller_injected_nested_ready_readiness() -> None:
+    evidence = HiveRuntimeEvidence(
+        schema_version=1,
+        mode="enforced",
+        config_digest=DIGEST,
+        catalog_digest=DIGEST,
+        repository="ready",
+        principal="ready",
+        authority="fail_closed",
+        state="ready",
+        pilot="blocked",
+        reason_codes=(),
+        global_pilot_readiness=GlobalPilotReadinessV1(
+            pilot="ready",
+            generation_id="a" * 32,
+            freshness="fresh",
+            candidate_count=1,
+            reason_codes=(),
+        ),
+    )
+
+    status = hive_status(runtime_evidence=evidence)
+    doctor = hive_doctor(runtime_evidence=evidence)
+
+    for result in (status, doctor):
+        assert result["global_pilot_readiness"] == {
+            "schema_version": 1,
+            "pilot": "blocked",
+            "generation_id": None,
+            "freshness": "unknown",
+            "candidate_count": 0,
+            "reason_codes": ["usage_missing"],
+            "raw_output": "not_returned",
+        }

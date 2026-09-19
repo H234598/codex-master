@@ -4,7 +4,13 @@ import pytest
 
 from the_hive.agent_resolver import build_selection_offer, policies_from_catalogs
 from the_hive.hive.config import load_agent_class_catalog
-from the_hive.selection.model_policy import ModelDefinition, ModelPolicyError, ModelPolicyRegistry, load_model_policy
+from the_hive.selection.model_policy import (
+    ModelDefinition,
+    ModelPolicyError,
+    ModelPolicyRegistry,
+    load_model_policy,
+    load_model_policy_bytes,
+)
 
 
 def test_model_policy_resolves_exact_ids_and_aliases_without_duplicate_budget_keys() -> None:
@@ -43,6 +49,11 @@ def test_model_policy_loads_resolver_metadata() -> None:
     assert sol.default_reasoning == "xhigh"
     assert sol.spawn_behavior == "manual"
     assert {item["family"] for item in registry.public()} == {"luna", "terra", "sol"}
+
+
+def test_model_policy_bytes_loader_matches_the_strict_path_loader() -> None:
+    path = Path(__file__).resolve().parents[1] / "codex-model-policy.json"
+    assert load_model_policy_bytes(path.read_bytes()).public() == load_model_policy(path).public()
 
 
 def test_active_policy_does_not_turn_a_spark_id_only_availability_into_an_offer() -> None:

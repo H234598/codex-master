@@ -6,7 +6,10 @@ import traceback
 
 import pytest
 
+import the_hive.usage_snapshot as usage_snapshot
 from the_hive.hive.config import load_agent_class_catalog, load_agent_class_catalog_snapshot, load_hive_config
+from the_hive.hive.runtime import GlobalPilotReadinessV1
+from the_hive.dynamic_pool import AccountPoolBindingV1, exact_pool_authority_revalidation
 from the_hive.hive.events import HiveEventStore
 from the_hive.hive.runtime import (
     HiveRuntimeError,
@@ -15,6 +18,8 @@ from the_hive.hive.runtime import (
     build_hive_runtime,
     enforced_pilot_gate,
     read_hive_runtime_evidence,
+    global_pilot_readiness_from_evidence,
+    _read_global_pilot_readiness_for_config,
 )
 from the_hive.hive.repositories import RepositoryRegistry
 from the_hive.server import AgentError, build_server_admission_runtime
@@ -25,7 +30,10 @@ from the_hive.usage_snapshot import (
     UsageEvidenceV2,
     UsageLimitV2,
     UsageTrendV2,
+    ModelInvocabilityProjectionV1,
+    ModelInvocabilityV1,
 )
+from the_hive.selection.model_policy import load_model_policy
 ROOT = Path(__file__).resolve().parents[1]
 SHADOW_CONFIG = ROOT / "tests" / "fixtures" / "hive" / "hive-shadow-valid.json"
 NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
@@ -497,3 +505,265 @@ def test_enforced_pilot_gate_does_not_authorize_any_static_usage_or_authority_ev
         "reason_code": "pilot_account_attestation_invalid",
         "raw_output": "not_returned",
     }
+
+
+def _pilot_readiness_evidence(
+    *, status: str = "complete", runner_invocable: bool = True, supported_in_api: bool = True
+) -> UsageEvidenceV2:
+    authority_evidence = _attested_usage_evidence(now=NOW, status=status, with_authority=True)
+    return UsageEvidenceV2(
+        accounts=authority_evidence.accounts,
+        status=authority_evidence.status,
+        captured_at=authority_evidence.captured_at,
+        generated_at=authority_evidence.generated_at,
+        pool_authorities=authority_evidence.pool_authorities,
+        generation_id="a" * 32,
+        model_invocability=ModelInvocabilityProjectionV1(
+            "complete",
+            "pool_authority-v3.model_capabilities",
+            (
+                ModelInvocabilityV1(
+                    "attested-pool",
+                    "gpt-5.6-sol",
+                    "codex_cli",
+                    True,
+                    True,
+                    supported_in_api,
+                    runner_invocable,
+                ),
+            ),
+        ),
+    )
+
+
+def _pilot_configuration():
+    classes = load_agent_class_catalog(ROOT / "codex-agent-classes.json")
+    config = load_hive_config(ROOT / "codex-hive.json", classes)
+    models = load_model_policy(ROOT / "codex-model-policy.json")
+    return classes, config, models
+
+
+def test_global_pilot_readiness_is_a_redacted_policy_validated_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classes, config, models = _pilot_configuration()
+
+    readiness_evidence = _pilot_readiness_evidence()
+    monkeypatch.setattr(
+        "the_hive.hive.runtime.read_usage_evidence_v2",
+        lambda *, clock: readiness_evidence,
+    )
+    readiness = _read_global_pilot_readiness_for_config(
+        config=config,
+        classes=classes,
+        model_registry=models,
+        now=lambda: NOW,
+    )
+
+    assert readiness.pilot == "ready"
+    assert readiness.candidate_count == 1
+    assert readiness.reason_codes == ()
+    assert readiness.public() == {
+        "schema_version": 1,
+        "pilot": "ready",
+        "generation_id": "a" * 32,
+        "freshness": "fresh",
+        "candidate_count": 1,
+        "reason_codes": [],
+        "raw_output": "not_returned",
+    }
+    public_text = str(readiness.public())
+    assert "attested-pool" not in public_text
+    assert "gpt-5.6-sol" not in public_text
+    assert "codex_cli" not in public_text
+
+    assert enforced_pilot_gate(config, classes, readiness, now=lambda: NOW)["allowed"] is False
+    caller_readiness = global_pilot_readiness_from_evidence(
+        readiness_evidence,
+        config=config,
+        classes=classes,
+        model_registry=models,
+        now=lambda: NOW,
+    )
+    assert caller_readiness.pilot == "blocked"
+    assert caller_readiness.reason_codes == ("usage_unattested",)
+    pseudo_readiness = global_pilot_readiness_from_evidence(
+        replace(readiness_evidence, generation_id="b" * 32),
+        config=config,
+        classes=classes,
+        model_registry=models,
+        now=lambda: NOW,
+    )
+    assert pseudo_readiness.pilot == "blocked"
+    assert pseudo_readiness.reason_codes == ("usage_unattested",)
+    assert enforced_pilot_gate(
+        config,
+        classes,
+        readiness,
+        now=lambda: NOW,
+    )["allowed"] is False
+
+
+def test_global_pilot_readiness_rejects_subclassed_reader_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classes, config, models = _pilot_configuration()
+    evidence = _pilot_readiness_evidence()
+
+    class SubclassedReaderEvidence(UsageEvidenceV2):
+        pass
+
+    reader_result = SubclassedReaderEvidence(
+        evidence.accounts,
+        evidence.status,
+        evidence.captured_at,
+        evidence.generated_at,
+        evidence.pool_authorities,
+        evidence.model_invocability,
+        evidence.generation_id,
+    )
+    monkeypatch.setattr(
+        "the_hive.hive.runtime.read_usage_evidence_v2",
+        lambda *, clock: reader_result,
+    )
+
+    readiness = _read_global_pilot_readiness_for_config(
+        config=config,
+        classes=classes,
+        model_registry=models,
+        now=lambda: NOW,
+    )
+
+    assert readiness.pilot == "blocked"
+    assert readiness.reason_codes == ("usage_unattested",)
+    assert readiness.generation_id is None
+    assert readiness.candidate_count == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    (("unavailable", "usage_missing"), ("partial", "usage_partial"), ("stale", "usage_stale")),
+)
+def test_global_pilot_readiness_blocks_missing_partial_or_stale_v2(
+    status: str, reason: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    classes, config, models = _pilot_configuration()
+    monkeypatch.setattr(
+        "the_hive.hive.runtime.read_usage_evidence_v2",
+        lambda *, clock: _pilot_readiness_evidence(status=status),
+    )
+    readiness = _read_global_pilot_readiness_for_config(
+        config=config,
+        classes=classes,
+        model_registry=models,
+        now=lambda: NOW,
+    )
+
+    assert readiness.pilot == "blocked"
+    assert readiness.freshness == ("fresh" if status == "complete" else "stale" if status == "stale" else "unknown")
+    assert reason in readiness.reason_codes
+    assert readiness.candidate_count == 0
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "authority_ambiguous",
+        "model_conflicting",
+        "mapping_missing",
+        "usage_only",
+        "uninvocable",
+        "api_unavailable",
+    ),
+)
+def test_global_pilot_readiness_fail_closes_ambiguous_conflicting_mapping_and_runner_evidence(
+    variant: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    classes, config, models = _pilot_configuration()
+    evidence = _pilot_readiness_evidence()
+    if variant == "authority_ambiguous":
+        evidence = replace(evidence, pool_authorities=evidence.pool_authorities * 2)
+        expected = "pool_authority_ambiguous"
+    elif variant == "model_conflicting":
+        projection = evidence.model_invocability
+        evidence = replace(
+            evidence,
+            model_invocability=replace(
+                projection, capabilities=projection.capabilities * 2
+            ),
+        )
+        expected = "model_capability_conflicting"
+    elif variant == "mapping_missing":
+        evidence = replace(evidence, pool_authorities=())
+        expected = "pool_authority_missing"
+    elif variant == "usage_only":
+        evidence = replace(
+            evidence,
+            model_invocability=usage_snapshot._UNATTESTED_MODEL_INVOCABILITY,
+        )
+        expected = "model_capability_missing"
+    elif variant == "uninvocable":
+        evidence = _pilot_readiness_evidence(runner_invocable=False)
+        expected = "model_uninvocable"
+    else:
+        evidence = _pilot_readiness_evidence(supported_in_api=False)
+        expected = "model_policy_mismatch"
+
+    monkeypatch.setattr(
+        "the_hive.hive.runtime.read_usage_evidence_v2",
+        lambda *, clock: evidence,
+    )
+    readiness = _read_global_pilot_readiness_for_config(
+        config=config,
+        classes=classes,
+        model_registry=models,
+        now=lambda: NOW,
+    )
+    assert readiness.pilot == "blocked"
+    assert expected in readiness.reason_codes
+    assert readiness.candidate_count == 0
+
+
+def test_global_pilot_diagnostic_readiness_never_turns_runtime_authority_green(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    classes, config, _models = _pilot_configuration()
+    readiness = GlobalPilotReadinessV1(
+        pilot="ready",
+        generation_id="a" * 32,
+        freshness="fresh",
+        candidate_count=1,
+        reason_codes=(),
+    )
+    monkeypatch.setattr(
+        "the_hive.hive.runtime._read_global_pilot_readiness_for_config",
+        lambda **_kwargs: readiness,
+    )
+
+    evidence = read_hive_runtime_evidence(
+        catalog_path=ROOT / "codex-agent-classes.json",
+        config_path=ROOT / "codex-hive.json",
+        state_root=tmp_path / "state",
+        now=lambda: NOW,
+    )
+
+    assert evidence.global_pilot_readiness == readiness
+    assert evidence.authority == "fail_closed"
+
+
+def test_external_ready_object_cannot_open_enforced_gate_or_bypass_exact_request_revalidation() -> None:
+    classes, config, models = _pilot_configuration()
+    external = GlobalPilotReadinessV1(
+        pilot="ready",
+        generation_id="a" * 32,
+        freshness="fresh",
+        candidate_count=1,
+        reason_codes=(),
+    )
+    assert enforced_pilot_gate(config, classes, external, now=lambda: NOW) == {
+        "allowed": False,
+        "reason_code": "pilot_account_attestation_invalid",
+        "raw_output": "not_returned",
+    }
+    binding = AccountPoolBindingV1("attested-pool", "dynamic-pool", "openai")
+    assert exact_pool_authority_revalidation(binding, reader=lambda: external) is False
