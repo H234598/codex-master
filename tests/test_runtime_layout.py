@@ -36,8 +36,12 @@ def materialize_runtime_image(
         "#!/bin/sh\nexit 0\n",
         0o755,
     )
-    _write_file(root / "bin" / "the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
-    _write_file(root / "systemd" / "user" / "the-hive-resource-monitor.service", "[Service]\n")
+    _write_file(
+        root / "bin" / "the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755
+    )
+    _write_file(
+        root / "systemd" / "user" / "the-hive-resource-monitor.service", "[Service]\n"
+    )
     _write_file(root / "systemd" / "user" / "the-hive.slice", "[Slice]\n")
     _write_file(
         root / ".codex-plugin" / "plugin.json",
@@ -67,27 +71,52 @@ def materialize_runtime_image(
             }
         ),
     )
-    _write_file(root / ".app.json", json.dumps({"apps": {"the-hive": {"id": "connector"}}}))
+    _write_file(
+        root / ".app.json", json.dumps({"apps": {"the-hive": {"id": "connector"}}})
+    )
     _write_file(root / "hooks" / "hooks.json", json.dumps({"hooks": {}}))
-    _write_file(root / "skills" / "the-hive-fleet" / "SKILL.md", "---\nname: the-hive-fleet\n---\n")
-    _write_file(root / "codex-hive.json", json.dumps({"schema_version": 1, "mode": "shadow"}))
-    _write_file(root / "codex-agent-classes.json", json.dumps({"schema_version": 1, "classes": []}))
-    _write_file(root / "src" / "the_hive" / "_runtime_spawn_helper.so", "test helper", 0o755)
+    _write_file(
+        root / "skills" / "the-hive-fleet" / "SKILL.md",
+        "---\nname: the-hive-fleet\n---\n",
+    )
+    _write_file(
+        root / "codex-hive.json", json.dumps({"schema_version": 1, "mode": "shadow"})
+    )
+    _write_file(
+        root / "codex-agent-classes.json",
+        json.dumps({"schema_version": 1, "classes": []}),
+    )
+    _write_file(
+        root / "src" / "the_hive" / "_runtime_spawn_helper.so", "test helper", 0o755
+    )
     _write_file(root / "src" / "the_hive" / "hive" / "cli.py", "# image module\n")
     for relative in (
-        "admission.py", "admission_runtime.py", "dynamic_pool.py", "hive/__init__.py",
-        "hive/admission.py", "hive/dispatch.py", "hive/principals.py", "selection.py",
-        "selection_service.py", "server.py",
+        "admission.py",
+        "admission_runtime.py",
+        "dynamic_pool.py",
+        "hive/__init__.py",
+        "hive/admission.py",
+        "hive/dispatch.py",
+        "hive/principals.py",
+        "selection.py",
+        "selection_service.py",
+        "server.py",
     ):
         _write_file(
             root / "src" / "the_hive" / relative,
-            (Path(__file__).resolve().parents[1] / "src" / "the_hive" / relative).read_text(encoding="utf-8"),
+            (
+                Path(__file__).resolve().parents[1] / "src" / "the_hive" / relative
+            ).read_text(encoding="utf-8"),
         )
     for path in root.rglob("*"):
         if path.is_dir():
             path.chmod(0o700)
     installer = runpy.run_path(
-        str(Path(__file__).resolve().parents[1] / "scripts" / "the-hive-hive-hourly-probe-install")
+        str(
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "the-hive-hive-hourly-probe-install"
+        )
     )
     if before_manifest is not None:
         before_manifest(root)
@@ -95,7 +124,9 @@ def materialize_runtime_image(
     return root
 
 
-def test_runtime_layout_is_immutable_and_derived_only_from_a_valid_image(tmp_path: Path) -> None:
+def test_runtime_layout_is_immutable_and_derived_only_from_a_valid_image(
+    tmp_path: Path,
+) -> None:
     module = _runtime_layout_module()
     assert module is not None
     root = materialize_runtime_image(tmp_path)
@@ -113,7 +144,9 @@ def test_runtime_layout_is_immutable_and_derived_only_from_a_valid_image(tmp_pat
         layout.root = root.parent  # type: ignore[misc]
 
 
-def test_runtime_layout_rejects_relative_and_nonprivate_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_runtime_layout_rejects_relative_and_nonprivate_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     module = _runtime_layout_module()
     assert module is not None
     root = materialize_runtime_image(tmp_path)
@@ -126,7 +159,9 @@ def test_runtime_layout_rejects_relative_and_nonprivate_roots(tmp_path: Path, mo
         module.RuntimeLayout.from_runtime_root(root)
 
 
-def test_runtime_layout_rejects_an_image_reached_through_a_linked_parent(tmp_path: Path) -> None:
+def test_runtime_layout_rejects_an_image_reached_through_a_linked_parent(
+    tmp_path: Path,
+) -> None:
     module = _runtime_layout_module()
     assert module is not None
     root = materialize_runtime_image(tmp_path / "actual")
@@ -153,7 +188,9 @@ def test_runtime_layout_rejects_an_image_reached_through_a_linked_parent(tmp_pat
         ".the-hive-runtime-manifest.json",
     ),
 )
-def test_runtime_layout_rejects_missing_required_image_members(tmp_path: Path, relative_path: str) -> None:
+def test_runtime_layout_rejects_missing_required_image_members(
+    tmp_path: Path, relative_path: str
+) -> None:
     module = _runtime_layout_module()
     assert module is not None
     root = materialize_runtime_image(tmp_path)
@@ -193,7 +230,9 @@ def test_runtime_layout_rejects_linked_and_outside_entrypoints(tmp_path: Path) -
         )
 
 
-def test_runtime_layout_rejects_a_helper_or_manifest_digest_deviation(tmp_path: Path) -> None:
+def test_runtime_layout_rejects_a_helper_or_manifest_digest_deviation(
+    tmp_path: Path,
+) -> None:
     module = _runtime_layout_module()
     assert module is not None
     root = materialize_runtime_image(tmp_path)
@@ -229,7 +268,9 @@ def test_runtime_layout_rejects_a_deviating_d89_successor_binding(
         module.RuntimeLayout.from_runtime_root(root)
 
 
-def test_runtime_layout_rejects_a_replaced_generation_or_manifest_digest(tmp_path: Path) -> None:
+def test_runtime_layout_rejects_a_replaced_generation_or_manifest_digest(
+    tmp_path: Path,
+) -> None:
     module = _runtime_layout_module()
     assert module is not None
     root = materialize_runtime_image(tmp_path)
@@ -261,7 +302,9 @@ def test_runtime_layout_rejects_a_replaced_generation_or_manifest_digest(tmp_pat
         module.RuntimeLayout.from_runtime_root(root)
 
 
-def test_runtime_image_repository_root_is_not_public_or_registry_compatible(tmp_path: Path) -> None:
+def test_runtime_image_repository_root_is_not_public_or_registry_compatible(
+    tmp_path: Path,
+) -> None:
     from the_hive.hive.repositories import (
         RepositoryBinding,
         RepositoryError,
@@ -330,6 +373,7 @@ def test_runtime_layout_rejects_legacy_plugin_skill_metadata_bindings(
 ) -> None:
     module = _runtime_layout_module()
     assert module is not None
+
     def add_legacy_binding(root: Path) -> None:
         if legacy_binding == "plugin_name":
             plugin_path = root / ".codex-plugin" / "plugin.json"
@@ -355,7 +399,9 @@ def test_runtime_layout_rejects_legacy_plugin_skill_metadata_bindings(
         module.RuntimeLayout.from_runtime_root(root)
 
 
-def test_runtime_layout_rejects_legacy_python_mcp_manifest_commands(tmp_path: Path) -> None:
+def test_runtime_layout_rejects_legacy_python_mcp_manifest_commands(
+    tmp_path: Path,
+) -> None:
     module = _runtime_layout_module()
     assert module is not None
     root = materialize_runtime_image(tmp_path)
@@ -388,7 +434,11 @@ def test_runtime_layout_requires_the_external_stable_mcp_launcher_shape(
     payload["mcpServers"]["the-hive-mcp"]["cwd"] = "/tmp/attacker"
     mcp_path.write_text(json.dumps(payload), encoding="utf-8")
     installer = runpy.run_path(
-        str(Path(__file__).resolve().parents[1] / "scripts" / "the-hive-hive-hourly-probe-install")
+        str(
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "the-hive-hive-hourly-probe-install"
+        )
     )
     (root / ".the-hive-runtime-manifest.json").unlink()
     installer["_write_runtime_image_manifest"](root=root, commit="a" * 40)
@@ -406,7 +456,9 @@ def test_runtime_layout_derives_from_a_module_path_without_environment_overrides
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "untrusted-codex-home"))
     monkeypatch.setenv("CODEX_MASTER_RUNTIME_ROOT", str(tmp_path / "untrusted-runtime"))
 
-    layout = module.RuntimeLayout.from_module_path(root / "src" / "the_hive" / "hive" / "cli.py")
+    layout = module.RuntimeLayout.from_module_path(
+        root / "src" / "the_hive" / "hive" / "cli.py"
+    )
 
     assert layout.root == root
     with pytest.raises(module.LayoutError):

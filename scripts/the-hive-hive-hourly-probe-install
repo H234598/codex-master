@@ -53,7 +53,9 @@ _F25_D69_TREE = "0f459eea9d8e13bd54e74e699272c53cddaecb1d"
 _C4_COMMIT = "c4b72abcfe0e8b208b05f90cc4f8275def851581"
 _D69_DYNAMIC_POOL_BLOB = "36c1e4a2716f808dc2ac89fe0d604249b1639ddd"
 _SUCCESSOR_WITNESS_PATH = "src/the_hive/dynamic_pool.py"
-_SUCCESSOR_WITNESS_SHA256 = "3519e0acc0c90316477f9cb7ce253a05d3626fe729793709a3bf11da88ebc5a1"
+_SUCCESSOR_WITNESS_SHA256 = (
+    "3519e0acc0c90316477f9cb7ce253a05d3626fe729793709a3bf11da88ebc5a1"
+)
 _HISTORICAL_LINEAGE = {
     "d69": {
         "commit": _F25_D69_COMMIT,
@@ -92,10 +94,22 @@ _RUNTIME_IMAGE_FILES = (
     ("codex-agent-classes.json", "codex-agent-classes.json", 0o644),
     ("codex-agent-pool.json", "codex-agent-pool.json", 0o644),
     ("codex-model-policy.json", "codex-model-policy.json", 0o644),
-    ("systemd/user/the-hive-resource-monitor.service", "systemd/user/the-hive-resource-monitor.service", 0o644),
+    (
+        "systemd/user/the-hive-resource-monitor.service",
+        "systemd/user/the-hive-resource-monitor.service",
+        0o644,
+    ),
     ("systemd/user/the-hive.slice", "systemd/user/the-hive.slice", 0o644),
-    ("systemd/user/the-hive-hive-hourly-probe.service", "systemd/user/the-hive-hive-hourly-probe.service", 0o644),
-    ("systemd/user/the-hive-hive-hourly-probe.timer", "systemd/user/the-hive-hive-hourly-probe.timer", 0o644),
+    (
+        "systemd/user/the-hive-hive-hourly-probe.service",
+        "systemd/user/the-hive-hive-hourly-probe.service",
+        0o644,
+    ),
+    (
+        "systemd/user/the-hive-hive-hourly-probe.timer",
+        "systemd/user/the-hive-hive-hourly-probe.timer",
+        0o644,
+    ),
 )
 _RUNTIME_IMAGE_TREES = (
     ("src/the_hive", "src/the_hive"),
@@ -277,7 +291,9 @@ def _install_attested_bytes(target: Path, content: bytes, *, mode: int) -> None:
     descriptor = -1
     temporary = Path()
     try:
-        descriptor, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        descriptor, name = tempfile.mkstemp(
+            prefix=f".{target.name}.", dir=target.parent
+        )
         temporary = Path(name)
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
@@ -395,7 +411,11 @@ def _compile_runtime_spawn_helper(*, stage: Path) -> None:
 
 
 def _build_runtime_image(
-    *, repository: Path, stage: Path, generation: str = _R2_BASE_COMMIT, commit: str = _R2_BASE_COMMIT
+    *,
+    repository: Path,
+    stage: Path,
+    generation: str = _R2_BASE_COMMIT,
+    commit: str = _R2_BASE_COMMIT,
 ) -> None:
     _directory(stage, mode=0o700, create=False)
     for source_name, target_name, mode in _RUNTIME_IMAGE_FILES:
@@ -420,20 +440,44 @@ def _verified_release_commit(repository: Path) -> str:
     try:
         status = subprocess.run(
             ["git", "-C", os.fspath(repository), "status", "--porcelain=v1", "-z"],
-            check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=command_env,
         )
         head = subprocess.run(
-            ["git", "-C", os.fspath(repository), "rev-parse", "--verify", "HEAD^{commit}"],
-            check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [
+                "git",
+                "-C",
+                os.fspath(repository),
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=command_env,
         )
         if status.returncode != 0 or status.stdout or head.returncode != 0:
             raise InstallError("install_release_checkout_dirty")
         commit = head.stdout.decode("ascii").strip()
         ancestor = subprocess.run(
-            ["git", "-C", os.fspath(repository), "merge-base", "--is-ancestor", _R2_BASE_COMMIT, commit],
-            check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            [
+                "git",
+                "-C",
+                os.fspath(repository),
+                "merge-base",
+                "--is-ancestor",
+                _R2_BASE_COMMIT,
+                commit,
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             env=command_env,
         )
     except (OSError, UnicodeError) as exc:
@@ -622,7 +666,9 @@ def _runtime_manifest_payload(
 def _write_runtime_image_manifest(
     *, root: Path, generation: str = _R2_BASE_COMMIT, commit: str = _R2_BASE_COMMIT
 ) -> None:
-    encoded = _canonical_json(_runtime_manifest_payload(root, generation=generation, commit=commit))
+    encoded = _canonical_json(
+        _runtime_manifest_payload(root, generation=generation, commit=commit)
+    )
     if len(encoded) > _MAX_MANIFEST_BYTES:
         raise InstallError("install_target_untrusted")
     descriptor = -1
@@ -648,9 +694,7 @@ def _write_runtime_image_manifest(
 
 
 def _release_pointer_entry(layout: RuntimeLayout) -> dict[str, str]:
-    manifest = json.loads(
-        _source_bytes(layout.root / _MANIFEST_NAME).decode("utf-8")
-    )
+    manifest = json.loads(_source_bytes(layout.root / _MANIFEST_NAME).decode("utf-8"))
     generation = manifest.get("generation") if isinstance(manifest, dict) else None
     if not isinstance(generation, str):
         raise InstallError("install_release_invalid")
@@ -669,7 +713,9 @@ def _attested_release_pointer(root: Path, value: object) -> dict[str, str] | Non
         raise InstallError("install_release_pointer_invalid")
     _relative_name(generation)
     try:
-        layout = RuntimeLayout.from_runtime_root(root / _RELEASE_GENERATIONS_NAME / generation)
+        layout = RuntimeLayout.from_runtime_root(
+            root / _RELEASE_GENERATIONS_NAME / generation
+        )
     except ValueError as exc:
         raise InstallError("install_release_pointer_invalid") from exc
     if _release_pointer_entry(layout) != value or layout.manifest_digest != digest:
@@ -696,7 +742,11 @@ def _read_release_pointers(root: Path) -> dict[str, dict[str, str] | None]:
         value = json.loads(_source_bytes(pointer).decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise InstallError("install_release_pointer_invalid") from exc
-    if not isinstance(value, dict) or set(value) != {"schema_version", "current", "previous"} or value.get("schema_version") != 1:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "current", "previous"}
+        or value.get("schema_version") != 1
+    ):
         raise InstallError("install_release_pointer_invalid")
     return {
         "current": _attested_release_pointer(root, value["current"]),
@@ -715,7 +765,9 @@ def _restore_release_pointer_bytes(root: Path, previous: bytes | None) -> None:
         descriptor = -1
         temporary = Path()
         try:
-            descriptor, name = tempfile.mkstemp(prefix=f".{_RELEASE_POINTERS_NAME}.rollback.", dir=root)
+            descriptor, name = tempfile.mkstemp(
+                prefix=f".{_RELEASE_POINTERS_NAME}.rollback.", dir=root
+            )
             temporary = Path(name)
             os.fchmod(descriptor, 0o644)
             with os.fdopen(descriptor, "wb") as handle:
@@ -733,7 +785,9 @@ def _restore_release_pointer_bytes(root: Path, previous: bytes | None) -> None:
     _fsync_directory(root)
 
 
-def _write_release_pointers(root: Path, pointers: dict[str, dict[str, str] | None]) -> None:
+def _write_release_pointers(
+    root: Path, pointers: dict[str, dict[str, str] | None]
+) -> None:
     encoded = _canonical_json({"schema_version": 1, **pointers})
     descriptor = -1
     temporary = Path()
@@ -750,7 +804,9 @@ def _write_release_pointers(root: Path, pointers: dict[str, dict[str, str] | Non
         else:
             raise
     try:
-        descriptor, name = tempfile.mkstemp(prefix=f".{_RELEASE_POINTERS_NAME}.", dir=root)
+        descriptor, name = tempfile.mkstemp(
+            prefix=f".{_RELEASE_POINTERS_NAME}.", dir=root
+        )
         temporary = Path(name)
         os.fchmod(descriptor, 0o644)
         with os.fdopen(descriptor, "wb") as handle:
@@ -766,7 +822,9 @@ def _write_release_pointers(root: Path, pointers: dict[str, dict[str, str] | Non
             try:
                 _restore_release_pointer_bytes(root, previous)
             except InstallError:
-                raise InstallError("install_release_pointer_durability_unknown") from exc
+                raise InstallError(
+                    "install_release_pointer_durability_unknown"
+                ) from exc
             raise InstallError("install_release_pointer_write_failed") from exc
     except OSError as exc:
         raise InstallError("install_release_pointer_write_failed") from exc
@@ -775,7 +833,9 @@ def _write_release_pointers(root: Path, pointers: dict[str, dict[str, str] | Non
             os.close(descriptor)
 
 
-def _materialize_stable_mcp_launcher(*, layout: RuntimeLayout, release_root: Path) -> None:
+def _materialize_stable_mcp_launcher(
+    *, layout: RuntimeLayout, release_root: Path
+) -> None:
     """Install the generic MCP launcher from this exact attested generation."""
 
     try:
@@ -811,9 +871,7 @@ def _stable_mcp_launcher_bytes(release_root: Path) -> bytes | None:
         raise InstallError("install_release_pair_invalid") from exc
 
 
-def _restore_stable_mcp_launcher(
-    *, release_root: Path, previous: bytes | None
-) -> None:
+def _restore_stable_mcp_launcher(*, release_root: Path, previous: bytes | None) -> None:
     """Durably restore the launcher half when its paired pointer write fails."""
 
     target = release_root / _STABLE_MCP_LAUNCHER_NAME
@@ -909,7 +967,11 @@ def _release_publish_lock(root: Path):
         )
         os.fchmod(descriptor, 0o600)
         current = os.fstat(descriptor)
-        if not stat.S_ISREG(current.st_mode) or current.st_uid != os.geteuid() or stat.S_IMODE(current.st_mode) != 0o600:
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.geteuid()
+            or stat.S_IMODE(current.st_mode) != 0o600
+        ):
             raise InstallError("install_release_lock_invalid")
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
@@ -957,9 +1019,7 @@ def _unit_bound_generation(*, release_root: Path, source: Path) -> str | None:
     if _RELEASE_GENERATION_MARKER not in text:
         return None
     generations = set(
-        re.findall(
-            re.escape(_RELEASE_GENERATION_MARKER) + r"([^/:\s]+)", text
-        )
+        re.findall(re.escape(_RELEASE_GENERATION_MARKER) + r"([^/:\s]+)", text)
     )
     if len(generations) != 1:
         raise InstallError("install_release_retention_failed")
@@ -992,13 +1052,17 @@ def _unit_bound_generation(*, release_root: Path, source: Path) -> str | None:
             "codex-agent-classes.json",
             "codex-hive.json",
         )
-        if any(
-            f"{_RELEASE_GENERATION_MARKER}{generation}/{relative}" not in text
-            for relative in required_sources
-        ) or (
-            "ExecStart=%h/.local/bin/the-hive-resource-monitor "
-            f"%h/.local/lib/the-hive-runtime {generation} {layout.manifest_digest}"
-        ) not in text:
+        if (
+            any(
+                f"{_RELEASE_GENERATION_MARKER}{generation}/{relative}" not in text
+                for relative in required_sources
+            )
+            or (
+                "ExecStart=%h/.local/bin/the-hive-resource-monitor "
+                f"%h/.local/lib/the-hive-runtime {generation} {layout.manifest_digest}"
+            )
+            not in text
+        ):
             raise InstallError("install_release_retention_failed")
     elif source.name == "the-hive-hive-hourly-probe.service":
         if (
@@ -1048,7 +1112,11 @@ def _publish_runtime_generation(
 ) -> RuntimeLayout:
     """Publish exactly one manifest-attested generation under the sole image owner."""
 
-    if not stage.is_absolute() or not release_root.is_absolute() or stage == release_root:
+    if (
+        not stage.is_absolute()
+        or not release_root.is_absolute()
+        or stage == release_root
+    ):
         raise InstallError("install_stage_untrusted")
     _directory(release_root, mode=0o700, create=True)
     try:
@@ -1064,7 +1132,9 @@ def _publish_runtime_generation(
         }
     ):
         raise InstallError("install_release_root_legacy")
-    generations = _child_directory(release_root, (_RELEASE_GENERATIONS_NAME,), mode=0o700)
+    generations = _child_directory(
+        release_root, (_RELEASE_GENERATIONS_NAME,), mode=0o700
+    )
     for generation in live_generations:
         _relative_name(generation)
     with _release_publish_lock(release_root):

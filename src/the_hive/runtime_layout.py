@@ -31,7 +31,9 @@ _F25_D69_TREE = "0f459eea9d8e13bd54e74e699272c53cddaecb1d"
 _C4_COMMIT = "c4b72abcfe0e8b208b05f90cc4f8275def851581"
 _D69_DYNAMIC_POOL_BLOB = "36c1e4a2716f808dc2ac89fe0d604249b1639ddd"
 _SUCCESSOR_WITNESS_PATH = "src/the_hive/dynamic_pool.py"
-_SUCCESSOR_WITNESS_SHA256 = "3519e0acc0c90316477f9cb7ce253a05d3626fe729793709a3bf11da88ebc5a1"
+_SUCCESSOR_WITNESS_SHA256 = (
+    "3519e0acc0c90316477f9cb7ce253a05d3626fe729793709a3bf11da88ebc5a1"
+)
 _HISTORICAL_LINEAGE = {
     "d69": {
         "commit": _F25_D69_COMMIT,
@@ -185,7 +187,9 @@ def _read_regular_bytes(root: Path, relative_path: str, *, max_bytes: int) -> by
 
 def _read_regular_text(root: Path, relative_path: str, *, max_bytes: int) -> str:
     try:
-        return _read_regular_bytes(root, relative_path, max_bytes=max_bytes).decode("utf-8")
+        return _read_regular_bytes(root, relative_path, max_bytes=max_bytes).decode(
+            "utf-8"
+        )
     except UnicodeError as exc:
         raise _invalid() from exc
 
@@ -240,7 +244,10 @@ def _validate_metadata(root: Path) -> None:
         raise _invalid()
     server = servers.get("the-hive-mcp")
     if not isinstance(server, dict) or set(server) != {
-        "command", "args", "startup_timeout_sec", "note"
+        "command",
+        "args",
+        "startup_timeout_sec",
+        "note",
     }:
         raise _invalid()
     if (
@@ -259,7 +266,9 @@ def _validate_metadata(root: Path) -> None:
         raise _invalid()
     _read_json_object(root, "codex-hive.json")
     _read_json_object(root, "codex-agent-classes.json")
-    if not _read_regular_text(root, "skills/the-hive-fleet/SKILL.md", max_bytes=_MAX_METADATA_BYTES).strip():
+    if not _read_regular_text(
+        root, "skills/the-hive-fleet/SKILL.md", max_bytes=_MAX_METADATA_BYTES
+    ).strip():
         raise _invalid()
 
 
@@ -277,8 +286,10 @@ def _release_metadata(manifest: dict[str, object]) -> dict[str, object]:
             "systemd/user/the-hive.slice",
         ],
         "bind_sources": [
-            "bin/the-hive-resource-monitor", "src/the_hive",
-            "codex-agent-classes.json", "codex-hive.json",
+            "bin/the-hive-resource-monitor",
+            "src/the_hive",
+            "codex-agent-classes.json",
+            "codex-hive.json",
             "%h/.local/state/codex-master-mcp/hive",
         ],
     }
@@ -294,7 +305,8 @@ def _release_metadata(manifest: dict[str, object]) -> dict[str, object]:
         or generation in {".", ".."}
         or manifest.get("r2_base") != {"commit": _R2_BASE_COMMIT, "tree": _R2_BASE_TREE}
         or manifest.get("historical_lineage") != _HISTORICAL_LINEAGE
-        or manifest.get("successor_witness") != {
+        or manifest.get("successor_witness")
+        != {
             "path": _SUCCESSOR_WITNESS_PATH,
             "sha256": _SUCCESSOR_WITNESS_SHA256,
         }
@@ -314,7 +326,9 @@ def _release_metadata(manifest: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _runtime_manifest_payload(root: Path, metadata: dict[str, object]) -> dict[str, object]:
+def _runtime_manifest_payload(
+    root: Path, metadata: dict[str, object]
+) -> dict[str, object]:
     directories: dict[str, dict[str, int]] = {}
     files: dict[str, dict[str, object]] = {}
     for directory, child_directories, file_names in os.walk(root):
@@ -362,13 +376,17 @@ def _runtime_manifest_payload(root: Path, metadata: dict[str, object]) -> dict[s
     return {"schema_version": 2, **metadata, "directories": directories, "files": files}
 
 
-def _validated_manifest(root: Path, *, expected_digest: str | None = None) -> tuple[dict[str, object], str]:
+def _validated_manifest(
+    root: Path, *, expected_digest: str | None = None
+) -> tuple[dict[str, object], str]:
     raw = _read_regular_bytes(root, _MANIFEST_NAME, max_bytes=_MAX_METADATA_BYTES)
     digest = _manifest_digest(raw)
     if expected_digest is not None and digest != expected_digest:
         raise _invalid()
     try:
-        manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+        manifest = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_json_object
+        )
     except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise _invalid() from exc
     if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
@@ -540,7 +558,9 @@ class RuntimeLayout:
             raw = _read_regular_bytes(
                 release_root, _RELEASE_POINTERS_NAME, max_bytes=_MAX_METADATA_BYTES
             )
-            pointers = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+            pointers = json.loads(
+                raw.decode("utf-8"), object_pairs_hook=_unique_json_object
+            )
         except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise _invalid() from exc
         if (
@@ -549,10 +569,14 @@ class RuntimeLayout:
             or pointers.get("schema_version") != 1
         ):
             raise _invalid()
+
         def attest(value: object) -> dict[str, object] | None:
             if value is None:
                 return None
-            if not isinstance(value, dict) or set(value) != {"generation", "manifest_digest"}:
+            if not isinstance(value, dict) or set(value) != {
+                "generation",
+                "manifest_digest",
+            }:
                 raise _invalid()
             listed_generation = value.get("generation")
             listed_digest = value.get("manifest_digest")
@@ -570,6 +594,7 @@ class RuntimeLayout:
             if layout.manifest_digest != listed_digest:
                 raise _invalid()
             return {"generation": listed_generation, "manifest_digest": listed_digest}
+
         current = attest(pointers["current"])
         previous = attest(pointers["previous"])
         if pointer_name not in {"current", "previous"}:
@@ -577,7 +602,9 @@ class RuntimeLayout:
         selected = current if pointer_name == "current" else previous
         if selected != {"generation": generation, "manifest_digest": manifest_digest}:
             raise _invalid()
-        return cls.from_runtime_root(release_root / _RELEASE_GENERATIONS_NAME / generation)
+        return cls.from_runtime_root(
+            release_root / _RELEASE_GENERATIONS_NAME / generation
+        )
 
     @classmethod
     def from_module_path(cls, module_path: Path) -> RuntimeLayout:
@@ -591,7 +618,10 @@ class RuntimeLayout:
                     relative = module_path.relative_to(root)
                 except ValueError as exc:
                     raise _invalid() from exc
-                if len(relative.parts) >= 3 and relative.parts[:2] == ("src", "the_hive"):
+                if len(relative.parts) >= 3 and relative.parts[:2] == (
+                    "src",
+                    "the_hive",
+                ):
                     _validate_regular(root, relative.as_posix(), 0o644)
                     return cls.from_runtime_root(root)
             current = current.parent
@@ -619,6 +649,7 @@ class RuntimeLayout:
             raise _invalid()
         validate_runtime_metadata(self)
         return raw
+
 
 def validate_runtime_metadata(layout: RuntimeLayout) -> None:
     """Revalidate image files and metadata immediately before an MCP probe."""
