@@ -11,6 +11,7 @@ import subprocess
 
 import pytest
 
+import the_hive.runtime_layout as runtime_layout_module
 from the_hive.runtime_layout import LayoutError, RuntimeLayout
 
 
@@ -26,6 +27,9 @@ D69_DYNAMIC_POOL_BLOB = "36c1e4a2716f808dc2ac89fe0d604249b1639ddd"
 # Structural identity for private manifest fixtures only.  It is deliberately
 # not presented as a Git commit; real publication calls _verified_release_commit.
 TEST_MANIFEST_COMMIT = "a" * 40
+SUCCESSOR_WITNESS_SHA256 = (
+    "e8e9056cfde2c51af7a3a86d16c3220831f5cc4b8b5dc337df70489e38974a5c"
+)
 
 
 def _installer() -> dict[str, object]:
@@ -51,10 +55,16 @@ def test_d89_successor_witness_binds_only_the_final_the_hive_anchor_and_git_line
     tmp_path: Path,
 ) -> None:
     installer = _installer()
+    assert installer["_SUCCESSOR_WITNESS_SHA256"] == SUCCESSOR_WITNESS_SHA256
+    assert (
+        runtime_layout_module._SUCCESSOR_WITNESS_SHA256  # type: ignore[attr-defined]
+        == SUCCESSOR_WITNESS_SHA256
+    )
     stage = _stage(installer, tmp_path, "successor")
     manifest = json.loads(
         (stage / ".the-hive-runtime-manifest.json").read_text(encoding="utf-8")
     )
+    layout = RuntimeLayout.from_runtime_root(stage)
 
     assert manifest["schema_version"] == 2
     assert manifest["r2_base"] == {"commit": R2_BASE, "tree": R2_BASE_TREE}
@@ -69,10 +79,15 @@ def test_d89_successor_witness_binds_only_the_final_the_hive_anchor_and_git_line
     }
     assert manifest["successor_witness"] == {
         "path": "src/the_hive/dynamic_pool.py",
-        "sha256": hashlib.sha256(
-            (ROOT / "src/the_hive/dynamic_pool.py").read_bytes()
-        ).hexdigest(),
+        "sha256": SUCCESSOR_WITNESS_SHA256,
     }
+    assert layout.root == stage
+    assert layout.manifest_digest == (
+        "sha256:"
+        + hashlib.sha256(
+            (stage / ".the-hive-runtime-manifest.json").read_bytes()
+        ).hexdigest()
+    )
     assert "d69_anchor" not in manifest
     assert "f25_d69_source_sha256" not in manifest
     assert "f25_c4_subset_sha256" not in manifest

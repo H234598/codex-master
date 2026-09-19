@@ -243,6 +243,21 @@ def test_runtime_layout_rejects_a_helper_or_manifest_digest_deviation(
         module.RuntimeLayout.from_runtime_root(root)
 
 
+def test_runtime_layout_rejects_witness_file_drift_after_valid_manifest(
+    tmp_path: Path,
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    layout = module.RuntimeLayout.from_runtime_root(root)
+    witness = root / "src" / "the_hive" / "dynamic_pool.py"
+    witness.write_bytes(witness.read_bytes() + b"\n# drift after manifest\n")
+    witness.chmod(0o644)
+
+    with pytest.raises(module.LayoutError):
+        module.validate_runtime_metadata(layout)
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     (
