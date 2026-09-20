@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import stat
 from typing import Any
+import weakref
 
 
 class LayoutError(ValueError):
@@ -22,6 +23,24 @@ _MANIFEST_NAME = ".the-hive-runtime-manifest.json"
 _RELEASE_POINTERS_NAME = ".the-hive-release-pointers.json"
 _RELEASE_GENERATIONS_NAME = "generations"
 _RUNTIME_SPAWN_HELPER = "src/the_hive/_runtime_spawn_helper.so"
+_STATE_DIRECTORY_ENV = "STATE_DIRECTORY"
+_STATE_DIRECTORY_BASENAME = "the-hive-ga-i2d-quiescence"
+_STATE_DIRECTORY_MODE = 0o700
+_STATE_LAYOUT_FACTORY_PROVENANCE: dict[
+    int, weakref.ReferenceType[RuntimeStateLayoutV1]
+] = {}
+_RESERVED_STATE_PARENTS = frozenset(
+    {
+        "admin",
+        "codex-master-admin",
+        "codex-master-vault",
+        "image",
+        "runtime",
+        "runtime-image",
+        "the-hive-runtime",
+        "vault",
+    }
+)
 _R2_BASE_COMMIT = "5defcac83030e91b39188c8b055adb97d5f51e98"
 _R2_BASE_TREE = "6c872289709de2a0bfe69d8392ce91b49f3855f3"
 _D73_COMMIT = "f6f9348a4348d1a18bb3c4b591a93c393dfda838"
@@ -76,11 +95,83 @@ def _invalid() -> LayoutError:
     return LayoutError("runtime_layout_invalid")
 
 
+def _state_invalid() -> LayoutError:
+    return LayoutError("runtime_state_layout_invalid")
+
+
+def _remember_state_layout_factory_provenance(layout: RuntimeStateLayoutV1) -> None:
+    identity = id(layout)
+
+    def forget(reference: weakref.ReferenceType[RuntimeStateLayoutV1]) -> None:
+        if _STATE_LAYOUT_FACTORY_PROVENANCE.get(identity) is reference:
+            _STATE_LAYOUT_FACTORY_PROVENANCE.pop(identity, None)
+
+    _STATE_LAYOUT_FACTORY_PROVENANCE[identity] = weakref.ref(layout, forget)
+
+
+def _require_state_layout_factory_provenance(layout: object) -> None:
+    if type(layout) is not RuntimeStateLayoutV1:
+        raise _state_invalid()
+    reference = _STATE_LAYOUT_FACTORY_PROVENANCE.get(id(layout))
+    if reference is None or reference() is not layout:
+        raise _state_invalid()
+
+
+def _is_canonical_state_directory_entry(entry: str) -> bool:
+    if not entry.startswith("/") or entry == "/" or entry.endswith("/"):
+        return False
+    parts = entry.split("/")
+    return all(part and part not in {".", ".."} for part in parts[1:])
+
+
 def _lstat(path: Path) -> os.stat_result:
     try:
         return path.lstat()
     except OSError as exc:
         raise _invalid() from exc
+
+
+def _state_lstat(path: Path) -> os.stat_result:
+    try:
+        return path.lstat()
+    except OSError as exc:
+        raise _state_invalid() from exc
+
+
+def _validate_state_directory_path(path: Path) -> os.stat_result:
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise _state_invalid()
+    if path.name != _STATE_DIRECTORY_BASENAME:
+        raise _state_invalid()
+    if any(part in {".", ".."} for part in path.parts):
+        raise _state_invalid()
+    def reserved(part: str) -> bool:
+        normalized = part.casefold().replace("_", "-")
+        return (
+            normalized in _RESERVED_STATE_PARENTS
+            or "admin" in normalized
+            or "vault" in normalized
+            or "runtime-image" in normalized
+            or normalized.endswith("-runtime")
+        )
+
+    if any(reserved(part) for part in path.parts[:-1]):
+        raise _state_invalid()
+
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        info = _state_lstat(current)
+        if stat.S_ISLNK(info.st_mode):
+            raise _state_invalid()
+    info = _state_lstat(path)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != _STATE_DIRECTORY_MODE
+    ):
+        raise _state_invalid()
+    return info
 
 
 def _validate_root(root: Path) -> None:
@@ -466,6 +557,142 @@ def _validate_layout_values(
         or spawn_helper_digest != _spawn_helper_digest(manifest)
     ):
         raise _invalid()
+
+
+@dataclass(frozen=True, slots=True, init=False, weakref_slot=True)
+class RuntimeStateLayoutV1:
+    """The independently owned systemd state directory for GA-I2d P0."""
+
+    state_root: Path
+    state_root_device: int
+    state_root_inode: int
+
+    def __new__(cls) -> RuntimeStateLayoutV1:
+        del cls
+        raise _state_invalid()
+
+    @classmethod
+    def from_systemd_state_directory(cls) -> RuntimeStateLayoutV1:
+        """Select one exact, already materialized systemd state entry."""
+
+        if cls is not RuntimeStateLayoutV1:
+            raise _state_invalid()
+        raw = os.environ.get(_STATE_DIRECTORY_ENV)
+        if not isinstance(raw, str) or not raw:
+            raise _state_invalid()
+        raw_entries = raw.split(":")
+        if any(
+            not entry
+            or any(character.isspace() for character in entry)
+            or not _is_canonical_state_directory_entry(entry)
+            for entry in raw_entries
+        ):
+            raise _state_invalid()
+        entries = [Path(entry) for entry in raw_entries]
+        if any(not entry.is_absolute() for entry in entries):
+            raise _state_invalid()
+        candidates = [
+            entry
+            for entry in entries
+            if entry.is_absolute() and entry.name == _STATE_DIRECTORY_BASENAME
+        ]
+        if len(candidates) != 1:
+            raise _state_invalid()
+        state_root = candidates[0]
+        if any(
+            other != state_root
+            and (
+                state_root == other
+                or other in state_root.parents
+            )
+            for other in entries
+        ):
+            raise _state_invalid()
+        metadata = _validate_state_directory_path(state_root)
+        layout = object.__new__(cls)
+        object.__setattr__(layout, "state_root", state_root)
+        object.__setattr__(layout, "state_root_device", metadata.st_dev)
+        object.__setattr__(layout, "state_root_inode", metadata.st_ino)
+        _remember_state_layout_factory_provenance(layout)
+        return layout
+
+    @property
+    def state_directory(self) -> Path:
+        return self.state_root
+
+    @property
+    def basename(self) -> str:
+        return self.state_root.name
+
+    @property
+    def device(self) -> int:
+        return self.state_root_device
+
+    @property
+    def inode(self) -> int:
+        return self.state_root_inode
+
+    @property
+    def state_device(self) -> int:
+        return self.state_root_device
+
+    @property
+    def state_inode(self) -> int:
+        return self.state_root_inode
+
+    def validate(self) -> None:
+        _require_state_layout_factory_provenance(self)
+        metadata = _validate_state_directory_path(self.state_root)
+        if (metadata.st_dev, metadata.st_ino) != (
+            self.state_root_device,
+            self.state_root_inode,
+        ):
+            raise _state_invalid()
+
+    def open_dirfd(self) -> int:
+        """Open and re-attest the exact final state directory without following links."""
+
+        _require_state_layout_factory_provenance(self)
+        expected = _validate_state_directory_path(self.state_root)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        if (
+            not getattr(os, "O_NOFOLLOW", 0)
+            or not getattr(os, "O_DIRECTORY", 0)
+            or not getattr(os, "O_CLOEXEC", 0)
+        ):
+            raise _state_invalid()
+        descriptor = -1
+        try:
+            descriptor = os.open(Path(self.state_root.anchor), flags)
+            for part in self.state_root.parts[1:]:
+                child = os.open(part, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            actual = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(actual.st_mode)
+                or actual.st_uid != os.geteuid()
+                or stat.S_IMODE(actual.st_mode) != _STATE_DIRECTORY_MODE
+                or (actual.st_dev, actual.st_ino)
+                != (self.state_root_device, self.state_root_inode)
+                or (expected.st_dev, expected.st_ino)
+                != (self.state_root_device, self.state_root_inode)
+            ):
+                raise _state_invalid()
+            return descriptor
+        except OSError as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise _state_invalid() from exc
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
 
 
 @dataclass(frozen=True, slots=True)

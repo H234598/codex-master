@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 import importlib
 import json
+import os
 from pathlib import Path
 import runpy
 
@@ -478,3 +479,159 @@ def test_runtime_layout_derives_from_a_module_path_without_environment_overrides
     assert layout.root == root
     with pytest.raises(module.LayoutError):
         module.RuntimeLayout.from_module_path(tmp_path / "not-an-image.py")
+
+
+def test_runtime_state_layout_requires_the_exact_parameterless_state_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    state_directory = tmp_path / "the-hive-ga-i2d-quiescence"
+    state_directory.mkdir(mode=0o700)
+    monkeypatch.setenv("STATE_DIRECTORY", str(state_directory))
+
+    layout = module.RuntimeStateLayoutV1.from_systemd_state_directory()
+
+    assert layout.state_directory == state_directory
+    assert layout.basename == "the-hive-ga-i2d-quiescence"
+
+
+def test_runtime_state_layout_exposes_only_the_canonical_systemd_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    state_directory = tmp_path / "the-hive-ga-i2d-quiescence"
+    state_directory.mkdir(mode=0o700)
+    monkeypatch.setenv("STATE_DIRECTORY", str(state_directory))
+
+    namespace: dict[str, object] = {}
+    exec("from the_hive.runtime_layout import *", namespace)
+
+    assert "RuntimeStateLayoutV1" not in namespace
+    assert not hasattr(module.RuntimeStateLayoutV1, "from_environment")
+    assert module.RuntimeStateLayoutV1.from_systemd_state_directory().state_root == state_directory
+
+
+def test_runtime_state_layout_selects_one_exact_systemd_entry_and_is_not_constructible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    unrelated = tmp_path / "codex-master-admin"
+    unrelated.mkdir(mode=0o700)
+    state_directory = tmp_path / "the-hive-ga-i2d-quiescence"
+    state_directory.mkdir(mode=0o700)
+    monkeypatch.setenv("STATE_DIRECTORY", f"{unrelated}:{state_directory}")
+
+    layout = module.RuntimeStateLayoutV1.from_systemd_state_directory()
+
+    assert layout.state_root == state_directory
+    assert layout.state_root_device == state_directory.stat().st_dev
+    assert layout.state_root_inode == state_directory.stat().st_ino
+    layout.validate()
+    with pytest.raises(module.LayoutError):
+        module.RuntimeStateLayoutV1()
+    with pytest.raises(TypeError):
+        module.RuntimeStateLayoutV1(state_directory)  # type: ignore[call-arg]
+
+
+def test_runtime_state_layout_rejects_an_unattested_object_new_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    state_directory = tmp_path / "the-hive-ga-i2d-quiescence"
+    state_directory.mkdir(mode=0o700)
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    forged = object.__new__(module.RuntimeStateLayoutV1)
+    object.__setattr__(forged, "state_root", state_directory)
+    object.__setattr__(forged, "state_root_device", state_directory.stat().st_dev)
+    object.__setattr__(forged, "state_root_inode", state_directory.stat().st_ino)
+
+    with pytest.raises(module.LayoutError):
+        forged.open_dirfd()
+
+
+@pytest.mark.parametrize("representation", ("double_root", "trailing_slash"))
+def test_runtime_state_layout_rejects_noncanonical_raw_systemd_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, representation: str
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    state_directory = tmp_path / "the-hive-ga-i2d-quiescence"
+    state_directory.mkdir(mode=0o700)
+    if representation == "double_root":
+        raw_entry = "//" + str(state_directory).lstrip("/")
+    else:
+        raw_entry = f"{state_directory}/"
+    monkeypatch.setenv("STATE_DIRECTORY", raw_entry)
+
+    with pytest.raises(module.LayoutError):
+        module.RuntimeStateLayoutV1.from_systemd_state_directory()
+
+
+def test_runtime_state_layout_rejects_relative_entries_and_missing_safe_dirfd_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    state_directory = tmp_path / "the-hive-ga-i2d-quiescence"
+    state_directory.mkdir(mode=0o700)
+    monkeypatch.setenv("STATE_DIRECTORY", f"relative:{state_directory}")
+    with pytest.raises(module.LayoutError):
+        module.RuntimeStateLayoutV1.from_systemd_state_directory()
+
+    monkeypatch.setenv("STATE_DIRECTORY", str(state_directory))
+    layout = module.RuntimeStateLayoutV1.from_systemd_state_directory()
+    monkeypatch.delattr(os, "O_CLOEXEC", raising=False)
+    with pytest.raises(module.LayoutError):
+        layout.open_dirfd()
+
+
+def test_runtime_state_layout_rejects_missing_o_nofollow_and_component_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    state_directory = tmp_path / "private-state" / "the-hive-ga-i2d-quiescence"
+    state_directory.mkdir(mode=0o700, parents=True)
+    monkeypatch.setenv("STATE_DIRECTORY", str(state_directory))
+    layout = module.RuntimeStateLayoutV1.from_systemd_state_directory()
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    with pytest.raises(module.LayoutError):
+        layout.open_dirfd()
+
+    monkeypatch.undo()
+    target_parent = tmp_path / "actual-state"
+    target_parent.mkdir(mode=0o700)
+    linked_parent = tmp_path / "linked-state"
+    linked_parent.symlink_to(target_parent, target_is_directory=True)
+    linked_state = linked_parent / "the-hive-ga-i2d-quiescence"
+    (target_parent / "the-hive-ga-i2d-quiescence").mkdir(mode=0o700)
+    monkeypatch.setenv("STATE_DIRECTORY", str(linked_state))
+    with pytest.raises(module.LayoutError):
+        module.RuntimeStateLayoutV1.from_systemd_state_directory()
+
+
+def test_runtime_state_layout_rejects_a_final_dirfd_inode_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    state_directory = tmp_path / "private-state" / "the-hive-ga-i2d-quiescence"
+    replacement = tmp_path / "replacement-state"
+    state_directory.mkdir(mode=0o700, parents=True)
+    replacement.mkdir(mode=0o700)
+    monkeypatch.setenv("STATE_DIRECTORY", str(state_directory))
+    layout = module.RuntimeStateLayoutV1.from_systemd_state_directory()
+    original_open = os.open
+
+    def race_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if path == state_directory.name and "dir_fd" in kwargs:
+            return original_open(replacement, flags)
+        return original_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", race_open)
+    with pytest.raises(module.LayoutError):
+        layout.open_dirfd()
