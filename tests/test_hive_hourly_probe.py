@@ -1249,6 +1249,67 @@ def test_probe_installer_upgrades_a_valid_83_generation_only_unit(
     assert pointers["previous"]["generation"] == first_generation
 
 
+def test_probe_installer_rolls_back_unit_pair_after_timer_materialization_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed timer replacement leaves a complete old pair and a retryable release."""
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    release_commit = {"value": "a" * 40}
+    monkeypatch.setitem(
+        installer["install"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: release_commit["value"],
+    )
+    first = installer["install"](home=home)
+    first_generation = first["generation"]
+    assert isinstance(first_generation, str)
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    units = home / ".config" / "systemd" / "user"
+    service = units / "the-hive-hive-hourly-probe.service"
+    timer = units / "the-hive-hive-hourly-probe.timer"
+    old_service = service.read_bytes()
+    old_timer = timer.read_bytes()
+    old_pointers = (release_root / ".the-hive-release-pointers.json").read_bytes()
+    install_attested_bytes = installer["_install_attested_bytes"]
+
+    def fail_timer(target: Path, content: bytes, *, mode: int) -> None:
+        if target == timer:
+            raise installer["InstallError"]("install_target_untrusted")
+        install_attested_bytes(target, content, mode=mode)
+
+    release_commit["value"] = "b" * 40
+    monkeypatch.setitem(
+        installer["_materialize_hourly_probe_units"].__globals__,
+        "_install_attested_bytes",
+        fail_timer,
+    )
+    with pytest.raises(installer["InstallError"], match="install_target_untrusted"):
+        installer["install"](home=home)
+
+    assert service.read_bytes() == old_service
+    assert timer.read_bytes() == old_timer
+    assert (release_root / ".the-hive-release-pointers.json").read_bytes() == old_pointers
+    assert not (release_root / "generations" / ("b" * 40)).exists()
+
+    monkeypatch.setitem(
+        installer["_materialize_hourly_probe_units"].__globals__,
+        "_install_attested_bytes",
+        install_attested_bytes,
+    )
+    retried = installer["install"](home=home)
+
+    assert retried["generation"] == "b" * 40
+    assert (
+        installer["_unit_bound_generation"](release_root=release_root, source=service)
+        == retried["generation"]
+    )
+
+
 def test_legacy_probe_refuses_tampered_release_metadata_before_running_the_entrypoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

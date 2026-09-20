@@ -982,6 +982,76 @@ def _render_hourly_probe_service(
     return rendered.encode("utf-8")
 
 
+def _hourly_probe_unit_bytes(target: Path) -> bytes | None:
+    """Read one private installed hourly unit, if it is present."""
+
+    try:
+        item = target.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise InstallError("install_target_untrusted") from exc
+    if (
+        stat.S_ISLNK(item.st_mode)
+        or not stat.S_ISREG(item.st_mode)
+        or item.st_nlink != 1
+        or item.st_uid != os.geteuid()
+        or stat.S_IMODE(item.st_mode) != 0o644
+    ):
+        raise InstallError("install_target_untrusted")
+    return _source_bytes(target)
+
+
+def _snapshot_hourly_probe_units(*, units: Path) -> tuple[bytes | None, bytes | None]:
+    """Capture the complete private Unit pair before replacing either member."""
+
+    try:
+        _source_directory(units)
+        return (
+            _hourly_probe_unit_bytes(units / "the-hive-hive-hourly-probe.service"),
+            _hourly_probe_unit_bytes(units / "the-hive-hive-hourly-probe.timer"),
+        )
+    except InstallError as exc:
+        raise InstallError("install_release_retention_failed") from exc
+
+
+def _restore_hourly_probe_units(
+    *, units: Path, previous: tuple[bytes | None, bytes | None]
+) -> None:
+    """Restore a Unit pair after its unpublished replacement did not complete."""
+
+    try:
+        _source_directory(units)
+        for name, content in zip(_UNIT_NAMES, previous, strict=True):
+            target = units / name
+            current = _hourly_probe_unit_bytes(target)
+            if content is None:
+                if current is not None:
+                    target.unlink()
+            elif current != content:
+                _install_attested_bytes(target, content, mode=0o644)
+        _fsync_directory(units)
+    except InstallError as exc:
+        raise InstallError("install_release_pair_durability_unknown") from exc
+    except OSError as exc:
+        raise InstallError("install_release_pair_durability_unknown") from exc
+
+
+def _discard_unpublished_generation(
+    *, generations: Path, target: Path, entry: dict[str, str]
+) -> None:
+    """Remove one manifest-attested generation before any pointer names it."""
+
+    try:
+        layout = RuntimeLayout.from_runtime_root(target)
+        if _release_pointer_entry(layout) != entry:
+            raise InstallError("install_release_invalid")
+        shutil.rmtree(target)
+        _fsync_directory(generations)
+    except (InstallError, OSError, ValueError) as exc:
+        raise InstallError("install_release_pair_durability_unknown") from exc
+
+
 def _materialize_hourly_probe_units(
     *, layout: RuntimeLayout, units: Path, generation: str
 ) -> None:
@@ -1197,6 +1267,11 @@ def _publish_runtime_generation(
     for generation in live_generations:
         _relative_name(generation)
     with _release_publish_lock(release_root):
+        previous_hourly_units = (
+            _snapshot_hourly_probe_units(units=live_unit_dir)
+            if live_unit_dir is not None
+            else None
+        )
         try:
             staged_layout = RuntimeLayout.from_runtime_root(stage)
         except ValueError as exc:
@@ -1219,11 +1294,23 @@ def _publish_runtime_generation(
         if _release_pointer_entry(layout) != entry:
             raise InstallError("install_release_invalid")
         if live_unit_dir is not None:
-            _materialize_hourly_probe_units(
-                layout=layout,
-                units=live_unit_dir,
-                generation=entry["generation"],
-            )
+            try:
+                _materialize_hourly_probe_units(
+                    layout=layout,
+                    units=live_unit_dir,
+                    generation=entry["generation"],
+                )
+            except InstallError as exc:
+                try:
+                    _restore_hourly_probe_units(
+                        units=live_unit_dir, previous=previous_hourly_units
+                    )
+                    _discard_unpublished_generation(
+                        generations=generations, target=target, entry=entry
+                    )
+                except InstallError:
+                    raise InstallError("install_release_pair_durability_unknown") from exc
+                raise
         discovered_live = _installed_live_generations(
             release_root=release_root, units=live_unit_dir
         )
