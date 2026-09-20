@@ -44,6 +44,8 @@ _RELEASE_GENERATIONS_NAME = "generations"
 _PUBLISH_LOCK_NAME = ".the-hive-release-publish.lock"
 _STABLE_MCP_LAUNCHER_SOURCE = "bin/the-hive-mcp-stable"
 _STABLE_MCP_LAUNCHER_NAME = "the-hive-mcp"
+_LEGACY_PROBE_LAUNCHER_SOURCE = "bin/codex-master-hive-hourly-probe"
+_LEGACY_PROBE_LAUNCHER_NAME = "codex_master_hive_hourly_probe.py"
 _R2_BASE_COMMIT = "5defcac83030e91b39188c8b055adb97d5f51e98"
 _R2_BASE_TREE = "6c872289709de2a0bfe69d8392ce91b49f3855f3"
 _D73_COMMIT = "f6f9348a4348d1a18bb3c4b591a93c393dfda838"
@@ -85,6 +87,7 @@ _RELEASE_GENERATION_MARKER = "%h/.local/lib/the-hive-runtime/generations/"
 _RUNTIME_IMAGE_FILES = (
     ("bin/the-hive-mcp", "bin/the-hive-mcp", 0o755),
     (_STABLE_MCP_LAUNCHER_SOURCE, _STABLE_MCP_LAUNCHER_SOURCE, 0o755),
+    (_LEGACY_PROBE_LAUNCHER_SOURCE, _LEGACY_PROBE_LAUNCHER_SOURCE, 0o755),
     ("bin/the-hive-resource-monitor", "bin/the-hive-resource-monitor", 0o755),
     ("bin/the-hive-hive-hourly-probe", "bin/the-hive-hive-hourly-probe", 0o755),
     (".codex-plugin/plugin.json", ".codex-plugin/plugin.json", 0o644),
@@ -847,6 +850,18 @@ def _materialize_stable_mcp_launcher(
     )
 
 
+def _materialize_legacy_probe_launcher(*, layout: RuntimeLayout, libexec: Path) -> None:
+    """Replace the owned historical public probe with an attested launcher."""
+
+    try:
+        source = layout.read_attested_file(_LEGACY_PROBE_LAUNCHER_SOURCE)
+    except ValueError as exc:
+        raise InstallError("install_release_invalid") from exc
+    _install_attested_bytes(
+        libexec / _LEGACY_PROBE_LAUNCHER_NAME, source, mode=0o755
+    )
+
+
 def _stable_mcp_launcher_bytes(release_root: Path) -> bytes | None:
     """Snapshot the private stable launcher before a paired pointer update."""
 
@@ -1228,6 +1243,7 @@ def install(*, home: Path) -> dict[str, object]:
     repository = Path(__file__).resolve().parents[1]
     commit = _verified_release_commit(repository)
     library = _child_directory(home, (".local", "lib"), mode=0o700)
+    libexec = _child_directory(home, (".local", "libexec"), mode=0o700)
     state = _child_directory(home, (".local", "state", "codex-master-mcp"), mode=0o700)
     units = _child_directory(home, (".config", "systemd", "user"), mode=0o700)
     _ensure_probe_lock(state)
@@ -1246,6 +1262,7 @@ def install(*, home: Path) -> dict[str, object]:
         release_root=library / _RUNTIME_ROOT_NAME,
         live_unit_dir=units,
     )
+    _materialize_legacy_probe_launcher(layout=layout, libexec=libexec)
     _materialize_hourly_probe_units(
         layout=layout,
         units=units,

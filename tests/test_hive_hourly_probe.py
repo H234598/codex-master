@@ -169,7 +169,31 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     write(".app.json", json.dumps({"apps": {"the-hive": {}}}))
     write("hooks/hooks.json", json.dumps({"hooks": {}}))
     write("skills/the-hive-fleet/SKILL.md", "---\nname: the-hive-fleet\n---\n")
-    write("codex-hive.json", "{}")
+    write(
+        "codex-hive.json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "mode": "enforced",
+                "principals": [
+                    {
+                        "principal_id": "queen-codex-master",
+                        "class_id": "koenigin",
+                        "parent_principal_id": "godbee-main",
+                        "repo_id": "codex-master",
+                    }
+                ],
+                "repositories": [
+                    {
+                        "repo_id": "codex-master",
+                        "remote_identity": "https://example.invalid/the-hive.git",
+                        "default_branch": "main",
+                        "config_digest": "sha256:" + "c" * 64,
+                    }
+                ],
+            }
+        ),
+    )
     write("codex-agent-classes.json", "{}")
     for relative in (
         "admission.py", "admission_runtime.py", "dynamic_pool.py", "hive/__init__.py",
@@ -424,7 +448,20 @@ def test_run_probe_persists_only_one_schema_v2_health_record(
         "commands",
         "global_pilot_readiness",
     }
-    assert not (state_directory / "hive-hourly-alarm.json").exists()
+    assert json.loads(
+        (state_directory / "hive-hourly-alarm.json").read_text(encoding="utf-8")
+    ) == {
+        "schema_version": 1,
+        "checked_at": NOW.isoformat(),
+        "scope": "hive",
+        "status": "active",
+        "reason_codes": ["runtime_layout"],
+        "owner": {
+            "principal_id": "queen-codex-master",
+            "class_id": "koenigin",
+            "repo_id": "codex-master",
+        },
+    }
 
 
 def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics(
@@ -565,7 +602,7 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
     service = ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
     timer_text = timer.read_text(encoding="utf-8")
     service_text = service.read_text(encoding="utf-8")
-    assert "OnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00" in timer_text
+    assert "OnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00 UTC" in timer_text
     assert "RandomizedDelaySec" not in timer_text
     assert "CODEX_MASTER_PROBE_REPOSITORY" not in service_text
     assert "%h/codex-master/src" not in service_text
@@ -589,7 +626,7 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
     assert "codex-master-hive-probe" not in service_text
 
 
-def test_hourly_probe_direct_entrypoint_requires_json_mode(monkeypatch, capsys) -> None:
+def test_hourly_probe_direct_entrypoint_runs_without_an_argument(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         hourly_probe_module,
         "run_probe",
@@ -602,12 +639,84 @@ def test_hourly_probe_direct_entrypoint_requires_json_mode(monkeypatch, capsys) 
         },
     )
 
-    assert hourly_probe_module.main(["--json"]) == 0
+    assert hourly_probe_module.main([]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True},
     }
-    assert hourly_probe_module.main([]) == 2
-    assert capsys.readouterr().out == ""
+
+
+def test_hourly_probe_direct_entrypoint_reports_invalid_arguments(capsys) -> None:
+    assert hourly_probe_module.main(["--unexpected"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "hive_hourly_probe_error code=arguments_invalid expected=--json\n"
+    )
+
+
+def test_hourly_probe_direct_entrypoint_explains_a_red_result(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        hourly_probe_module,
+        "run_probe",
+        lambda: {
+            "checks": {
+                "runtime_layout": True,
+                "hive_runtime": False,
+                "hive_doctor": True,
+            }
+        },
+    )
+
+    assert hourly_probe_module.main([]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "checks": {"runtime_layout": True, "hive_runtime": False, "hive_doctor": True},
+    }
+    assert captured.err == "hive_hourly_probe_red failed_checks=hive_runtime\n"
+
+
+def test_red_probe_publishes_a_hive_wide_alarm_for_the_repository_queen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_directory = tmp_path / "state"
+    layout = runtime_layout(tmp_path)
+    monkeypatch.setattr(hourly_probe_module, "runtime_status", lambda *, layout: {"ok": False})
+
+    result = run_probe(
+        layout=layout,
+        state_directory=state_directory,
+        now=lambda: NOW,
+        runner=lambda _command, *arguments: (
+            green_hive_runtime()
+            if arguments == ("hive", "status")
+            else {
+                "healthy": True,
+                "checks": {
+                    "authority": "ready",
+                    "repository": "ready",
+                    "state": "ready",
+                },
+            },
+            True,
+        ),
+    )
+
+    assert result["checks"]["runtime_layout"] is False
+    alarm = json.loads(
+        (state_directory / "hive-hourly-alarm.json").read_text(encoding="utf-8")
+    )
+    assert alarm == {
+        "schema_version": 1,
+        "checked_at": NOW.isoformat(),
+        "scope": "hive",
+        "status": "active",
+        "reason_codes": ["runtime_layout"],
+        "owner": {
+            "principal_id": "queen-codex-master",
+            "class_id": "koenigin",
+            "repo_id": "codex-master",
+        },
+    }
 
 
 def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
@@ -704,9 +813,10 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         else:
             assert stat.S_ISREG(item.st_mode)
             assert item.st_nlink == 1
-    assert not (
-        home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
-    ).exists()
+    legacy_probe = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
+    assert legacy_probe.is_file()
+    assert not legacy_probe.is_symlink()
+    assert stat.S_IMODE(legacy_probe.lstat().st_mode) == 0o755
     assert not (home / ".local" / "lib" / "codex-master-hive-probe").exists()
     assert not (home / ".local" / "bin" / "codex-master-mcp").exists()
 
@@ -717,6 +827,24 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         "CODEX_HOME": str(tmp_path / "attacker-codex-home"),
         "CODEX_MASTER_MCP_STATE": str(tmp_path / "attacker-state"),
     }
+    original_entrypoint = entrypoint.read_bytes()
+    entrypoint.write_text(
+        "#!/bin/sh\n"
+        "[ \"$#\" -eq 4 ] && [ \"$4\" = \"--json\" ] || exit 66\n"
+        "printf '%s\\n' '{\"checks\":{}}'\n",
+        encoding="utf-8",
+    )
+    entrypoint.chmod(0o755)
+    legacy_completed = subprocess.run(
+        [legacy_probe],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=tmp_path,
+    )
+    assert legacy_completed.returncode in {0, 1}, legacy_completed.stderr
+    assert set(json.loads(legacy_completed.stdout)) == {"checks"}
     completed = subprocess.run(
         [entrypoint, release_root, generation, installed["manifest_digest"], "--json"],
         check=False,
@@ -727,6 +855,8 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     )
     assert completed.returncode in {0, 1}, completed.stderr
     assert set(json.loads(completed.stdout)) == {"checks"}
+    entrypoint.write_bytes(original_entrypoint)
+    entrypoint.chmod(0o755)
     runtime_status = subprocess.run(
         [
             installed_cli,
@@ -762,15 +892,6 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     tools_response = next(response for response in responses if response.get("id") == 2)
     tool_names = {tool["name"] for tool in tools_response["result"]["tools"]}
     assert tool_names == {"runtime_status"}
-    health = home / ".local" / "state" / "codex-master-mcp" / "hive-hourly-health.json"
-    health_stat = health.lstat()
-    assert stat.S_ISREG(health_stat.st_mode)
-    assert not health.is_symlink()
-    assert stat.S_IMODE(health_stat.st_mode) == 0o600
-    assert (
-        json.loads(health.read_text(encoding="utf-8"))["checks"]["runtime_layout"]
-        is True
-    )
     assert not list(runtime_root.rglob("__pycache__"))
 
 
@@ -1029,7 +1150,9 @@ def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen
         runtime_root, generation, result["manifest_digest"]
     ).root == runtime_root / "generations" / generation
     assert legacy_marker.read_text(encoding="utf-8") == "legacy root\n"
-    assert legacy_libexec.read_text(encoding="utf-8") == "legacy libexec\n"
+    assert legacy_libexec.read_text(encoding="utf-8") != "legacy libexec\n"
+    assert not legacy_libexec.is_symlink()
+    assert stat.S_IMODE(legacy_libexec.lstat().st_mode) == 0o755
     assert legacy_bin.is_symlink()
     assert legacy_bin.readlink() == foreign_bin_target
 

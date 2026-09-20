@@ -31,6 +31,7 @@ from the_hive.hive.runtime import GlobalPilotReadinessV1
 
 DETERMINISTIC_PROBE_HOURS_UTC = (0, 3, 6, 9, 12, 15, 18, 21)
 STATE_FILE_NAME = "hive-hourly-health.json"
+ALARM_FILE_NAME = "hive-hourly-alarm.json"
 PROBE_GATE_LOCK_NAME = ".hive-hourly-probe.lock"
 MAX_PROBE_STATE_BYTES = 64 * 1024
 MAX_PROBE_AGE_SECONDS = 4 * 60 * 60
@@ -554,6 +555,64 @@ def _atomic_write(path: Path, payload: Mapping[str, object]) -> None:
             os.close(descriptor)
 
 
+def _probe_alarm_owner(layout: RuntimeLayout) -> dict[str, str] | None:
+    """Return the sole configured repository queen for a Hive-wide alarm.
+
+    The Runtime Image attests the configuration bytes.  An ambiguous or absent
+    queen remains explicitly unassigned instead of guessing a recipient.
+    """
+
+    try:
+        value = json.loads(layout.read_attested_file("codex-hive.json").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(value, Mapping) or not isinstance(value.get("principals"), list):
+        return None
+    candidates: list[dict[str, str]] = []
+    for principal in value["principals"]:
+        if not isinstance(principal, Mapping) or principal.get("class_id") != "koenigin":
+            continue
+        principal_id = principal.get("principal_id")
+        repository_id = principal.get("repo_id")
+        if (
+            isinstance(principal_id, str)
+            and 1 <= len(principal_id) <= 128
+            and isinstance(repository_id, str)
+            and 1 <= len(repository_id) <= 128
+        ):
+            candidates.append(
+                {
+                    "principal_id": principal_id,
+                    "class_id": "koenigin",
+                    "repo_id": repository_id,
+                }
+            )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _probe_alarm_payload(
+    result: Mapping[str, object], *, layout: RuntimeLayout
+) -> dict[str, object]:
+    checks = result.get("checks")
+    failed_checks = (
+        sorted(name for name, ready in checks.items() if ready is not True)
+        if isinstance(checks, Mapping)
+        else ["probe_result_invalid"]
+    )
+    owner = _probe_alarm_owner(layout)
+    if owner is None:
+        failed_checks.append("alarm_owner_unavailable")
+    checked_at = result.get("checked_at")
+    return {
+        "schema_version": 1,
+        "checked_at": checked_at if isinstance(checked_at, str) else "unknown",
+        "scope": "hive",
+        "status": "active",
+        "reason_codes": failed_checks,
+        "owner": owner,
+    }
+
+
 def _emit_phase_timeout(phase: str) -> None:
     """Publish the bounded phase and its named limit without child output."""
 
@@ -699,15 +758,41 @@ def run_probe(
     state_file = state_directory / STATE_FILE_NAME
     with _probe_gate_lock(state_file, exclusive=True, create=True):
         _atomic_write(state_file, result)
+        if not all(result["checks"].values()):
+            _atomic_write(
+                state_directory / ALARM_FILE_NAME,
+                _probe_alarm_payload(result, layout=active_layout),
+            )
     return result
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    if tuple(arguments or ()) != ("--json",):
+    if tuple(arguments or ()) not in {(), ("--json",)}:
+        print(
+            "hive_hourly_probe_error code=arguments_invalid expected=--json",
+            file=sys.stderr,
+            flush=True,
+        )
         return 2
-    result = run_probe()
-    print(json.dumps({"checks": result["checks"]}, sort_keys=True))
-    return 0 if all(result["checks"].values()) else 1
+    try:
+        result = run_probe()
+    except ValueError as exc:
+        print(f"hive_hourly_probe_error code={exc}", file=sys.stderr, flush=True)
+        return 2
+    checks = result.get("checks")
+    if not isinstance(checks, Mapping):
+        print("hive_hourly_probe_error code=probe_result_invalid", file=sys.stderr, flush=True)
+        return 2
+    print(json.dumps({"checks": checks}, sort_keys=True))
+    failed_checks = sorted(name for name, ready in checks.items() if ready is not True)
+    if failed_checks:
+        print(
+            "hive_hourly_probe_red failed_checks=" + ",".join(failed_checks),
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+    return 0
 
 
 __all__ = [
