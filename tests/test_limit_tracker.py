@@ -156,7 +156,14 @@ def document(*, status: str = "ok", stale: bool = False) -> dict[str, object]:
 
 
 class EvidenceTree:
-    def __init__(self, root: Path, payload: dict[str, object]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        payload: dict[str, object],
+        *,
+        producer_version: str = "0.6.537",
+        python_version: str = "3.14",
+    ) -> None:
         self.root = private_dir(root)
         self.state_home = private_dir(root / "state")
         self.data_home = private_dir(root / "data")
@@ -170,16 +177,19 @@ class EvidenceTree:
         self.lock_state = private_dir(self.local / "state")
         self.lock_app = private_dir(self.lock_state / "codex-usage")
         self.lock_root = private_dir(self.lock_app / "locks")
-        self.release_id = f"0.6.536-{SOURCE_DIGEST[:16]}"
+        self.producer_version = producer_version
+        self.release_id = f"{producer_version}-{SOURCE_DIGEST[:16]}"
         self.release = private_dir(self.releases / self.release_id)
         private_file(self.release / "producer.whl", b"wheel")
         venv = private_dir(self.release / "venv")
         bin_dir = private_dir(venv / "bin")
         lib = private_dir(venv / "lib")
-        python = private_dir(lib / "python3.13")
+        python = private_dir(lib / f"python{python_version}")
         site = private_dir(python / "site-packages")
         package = private_dir(site / "codex_usage")
-        dist = private_dir(site / "codex_usage_integration_producer-0.6.536.dist-info")
+        dist = private_dir(
+            site / f"codex_usage_integration_producer-{producer_version}.dist-info"
+        )
         self.launcher = private_file(
             bin_dir / "codex-usage",
             b"#!/bin/sh\nexec python -B -I -m codex_usage.integration_entrypoint\n",
@@ -215,7 +225,7 @@ class EvidenceTree:
             "schema_version": 2,
             "source_manifest_sha256": SOURCE_DIGEST,
             "state_home": str(self.state_home),
-            "version": "0.6.536",
+            "version": self.producer_version,
             "wheel_path": str(self.release / "producer.whl"),
             "wheel_sha256": hashlib.sha256(
                 (self.release / "producer.whl").read_bytes()
@@ -241,7 +251,7 @@ class EvidenceTree:
             "payload_filename": "account-usage-v2.json",
             "payload_sha256": hashlib.sha256(payload).hexdigest(),
             "payload_size_bytes": len(payload),
-            "producer_version": "0.6.536",
+            "producer_version": self.producer_version,
             "published_at": payload_value["generated_at"],
             "release_id": self.release_id,
             "source_manifest_sha256": SOURCE_DIGEST,
@@ -407,11 +417,24 @@ def add_previous_generation(tree: EvidenceTree) -> Path:
     return binding_path
 
 
-def test_golden_schema2_chain_reads_complete(evidence: EvidenceTree) -> None:
+def test_active_0_6_537_python_3_14_attested_layout_reads_complete(
+    evidence: EvidenceTree,
+) -> None:
     result = read(evidence)
     assert result.status == "complete"
     assert result.generation_id == GENERATION
     assert result.document["schema_version"] == 2
+
+
+def test_old_0_6_536_python_3_13_attested_layout_is_rejected(tmp_path: Path) -> None:
+    legacy = EvidenceTree(
+        tmp_path / "legacy",
+        document(),
+        producer_version="0.6.536",
+        python_version="3.13",
+    )
+
+    assert read(legacy).status == "invalid"
 
 
 def test_active_and_current_are_reread_fd_bound_after_generation(
@@ -1022,7 +1045,7 @@ def test_previous_binding_keeps_its_historical_active_release_identity(
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
     binding.update(
         active_manifest_sha256="a" * 64,
-        release_id="0.6.536-" + "b" * 16,
+        release_id="0.6.537-" + "b" * 16,
         source_manifest_sha256="c" * 64,
     )
     private_file(binding_path, canonical(binding))

@@ -19,7 +19,7 @@ from typing import Any, Iterator
 from the_hive.usage_snapshot import UsageEvidenceV2
 
 
-_PRODUCER_VERSION = "0.6.536"
+_PRODUCER_VERSION = "0.6.537"
 _SPARK_POOL = "gpt-5.3-codex-spark"
 _WINDOW_SECONDS = frozenset({18_000, 604_800, 2_592_000})
 _MAX_POINTER_BYTES = 4_096
@@ -651,11 +651,11 @@ def _verify_active(
         "launcher_path": str(release / "venv/bin/codex-usage"),
         "entrypoint_path": str(
             release
-            / "venv/lib/python3.13/site-packages/codex_usage/integration_entrypoint.py"
+            / "venv/lib/python3.14/site-packages/codex_usage/integration_entrypoint.py"
         ),
         "record_path": str(
             release
-            / "venv/lib/python3.13/site-packages/codex_usage_integration_producer-0.6.536.dist-info/RECORD"
+            / "venv/lib/python3.14/site-packages/codex_usage_integration_producer-0.6.537.dist-info/RECORD"
         ),
     }
     if any(active[name] != value for name, value in expected_paths.items()):
@@ -670,11 +670,11 @@ def _verify_active(
         ("launcher_sha256", "./venv/bin/codex-usage"),
         (
             "entrypoint_sha256",
-            "./venv/lib/python3.13/site-packages/codex_usage/integration_entrypoint.py",
+            "./venv/lib/python3.14/site-packages/codex_usage/integration_entrypoint.py",
         ),
         (
             "record_sha256",
-            "./venv/lib/python3.13/site-packages/codex_usage_integration_producer-0.6.536.dist-info/RECORD",
+            "./venv/lib/python3.14/site-packages/codex_usage_integration_producer-0.6.537.dist-info/RECORD",
         ),
     ):
         if (
