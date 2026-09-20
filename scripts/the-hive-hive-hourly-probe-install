@@ -82,6 +82,10 @@ _BOUND_RELEASE_UNIT_NAMES = (
     "the-hive-hive-hourly-probe.service",
 )
 _RELEASE_GENERATION_MARKER = "%h/.local/lib/the-hive-runtime/generations/"
+_HOURLY_PROBE_RUNTIME_ROOT_BINDING = (
+    "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:"
+    "%h/.local/lib/the-hive-runtime:norbind"
+)
 # This is the sole product Runtime Image definition. Recursive entries carry
 # complete product trees; no Probe-specific mirror is maintained.
 _RUNTIME_IMAGE_FILES = (
@@ -955,8 +959,9 @@ def _render_hourly_probe_service(
     except UnicodeDecodeError as exc:
         raise InstallError("install_release_template_invalid") from exc
     if (
-        text.count("@MASTERJET_GENERATION@") != 4
+        text.count("@MASTERJET_GENERATION@") != 2
         or text.count("@MASTERJET_MANIFEST_DIGEST@") != 1
+        or _HOURLY_PROBE_RUNTIME_ROOT_BINDING not in text
         or "%h/.local/lib/codex-master-runtime/bin/" in text
         or "%h/codex-master" in text
     ):
@@ -964,7 +969,7 @@ def _render_hourly_probe_service(
     rendered = text.replace("@MASTERJET_GENERATION@", generation).replace(
         "@MASTERJET_MANIFEST_DIGEST@", manifest_digest
     )
-    if "@MASTERJET_" in rendered:
+    if "@MASTERJET_" in rendered or _HOURLY_PROBE_RUNTIME_ROOT_BINDING not in rendered:
         raise InstallError("install_release_template_invalid")
     expected = (
         "ExecStart=%h/.local/lib/the-hive-runtime/generations/"
@@ -1112,13 +1117,17 @@ def _unit_bound_generation(*, release_root: Path, source: Path) -> str | None:
             raise InstallError("install_release_retention_failed")
     elif source.name == "the-hive-hive-hourly-probe.service":
         if (
-            f"BindReadOnlyPaths={_RELEASE_GENERATION_MARKER}{generation}:"
-            f"{_RELEASE_GENERATION_MARKER}{generation}:norbind"
-        ) not in text or (
-            "ExecStart="
-            f"{_RELEASE_GENERATION_MARKER}{generation}/bin/the-hive-hive-hourly-probe "
-            f"%h/.local/lib/the-hive-runtime {generation} {layout.manifest_digest} --json"
-        ) not in text:
+            _HOURLY_PROBE_RUNTIME_ROOT_BINDING not in text
+            or (
+                f"BindReadOnlyPaths={_RELEASE_GENERATION_MARKER}{generation}:"
+                f"{_RELEASE_GENERATION_MARKER}{generation}:norbind"
+            ) in text
+            or (
+                "ExecStart="
+                f"{_RELEASE_GENERATION_MARKER}{generation}/bin/the-hive-hive-hourly-probe "
+                f"%h/.local/lib/the-hive-runtime {generation} {layout.manifest_digest} --json"
+            ) not in text
+        ):
             raise InstallError("install_release_retention_failed")
     else:
         raise InstallError("install_release_retention_failed")

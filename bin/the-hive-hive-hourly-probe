@@ -1,7 +1,10 @@
 #!/usr/bin/bash
 set -euo pipefail
 
-(( $# >= 3 )) || exit 64
+if (( $# < 3 )); then
+    printf '%s\n' 'hive_hourly_probe_error code=arguments_missing' >&2
+    exit 64
+fi
 release_root="$1"
 generation="$2"
 manifest_digest="$3"
@@ -12,6 +15,13 @@ exec /usr/bin/python3 -I -B -c '
 import runpy
 import sys
 from pathlib import Path
+
+
+def fail(code):
+    print(f"hive_hourly_probe_error code={code}", file=sys.stderr, flush=True)
+    raise SystemExit(64)
+
+
 root = Path(sys.argv[1])
 generation = sys.argv[2]
 manifest_digest = sys.argv[3]
@@ -24,16 +34,21 @@ if (
     or len(manifest_digest) != 71
     or any(character not in "0123456789abcdef" for character in manifest_digest[7:])
 ):
-    raise SystemExit(64)
+    fail("arguments_invalid")
 candidate = root / "generations" / generation / "src"
 try:
     sys.path.insert(0, str(candidate))
     from the_hive.runtime_layout import RuntimeLayout
     layout = RuntimeLayout.from_current_release(root, generation, manifest_digest)
 except Exception:
-    raise SystemExit(64)
+    fail("runtime_layout_unavailable")
 if layout.root / "src" != candidate:
-    raise SystemExit(64)
+    fail("runtime_layout_mismatch")
 sys.argv = [str(layout.root / "bin" / "the-hive-hive-hourly-probe"), *sys.argv[4:]]
-runpy.run_module("the_hive.hive.hourly_probe", run_name="__main__", alter_sys=True)
+try:
+    runpy.run_module("the_hive.hive.hourly_probe", run_name="__main__", alter_sys=True)
+except SystemExit:
+    raise
+except Exception:
+    fail("hourly_probe_load_failed")
 ' "$release_root" "$generation" "$manifest_digest" "${@:4}"

@@ -738,11 +738,12 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
     assert "%h/codex-master/bin/codex-master-mcp" not in service_text
     assert "%h/codex-master/codex-agent-classes.json" not in service_text
     assert "%h/codex-master/codex-hive.json" not in service_text
-    assert "%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind" not in service_text
     assert (
-        "%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:norbind"
+        "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind"
         in service_text
     )
+    assert "%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:" not in service_text
+    assert "BindReadOnlyPaths=%h/.local:%h/.local" not in service_text
     assert (
         "BindPaths=%h/.local/state/codex-master-mcp:%h/.local/state/codex-master-mcp:norbind"
         in service_text
@@ -753,6 +754,112 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
     )
     assert "libexec" not in service_text
     assert "codex-master-hive-probe" not in service_text
+
+
+def test_hourly_probe_service_renderer_rejects_a_generation_only_sandbox() -> None:
+    """Installer must refuse a unit whose sandbox hides the release pointer authority."""
+
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    install_error = installer["InstallError"]
+    template = (
+        ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
+    ).read_bytes().replace(
+        b"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind",
+        b"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:norbind",
+    )
+
+    with pytest.raises(install_error, match="install_release_template_invalid"):
+        installer["_render_hourly_probe_service"](
+            template,
+            generation="a" * 40,
+            manifest_digest="sha256:" + "b" * 64,
+        )
+
+
+def test_hourly_probe_runtime_wrapper_reports_each_local_failure_with_bounded_stderr(
+    tmp_path: Path,
+) -> None:
+    """The service wrapper never turns a local attestation failure into silent exit 64."""
+
+    wrapper = ROOT / "bin" / "the-hive-hive-hourly-probe"
+    missing_arguments = subprocess.run(
+        [wrapper], check=False, capture_output=True, text=True
+    )
+    invalid_arguments = subprocess.run(
+        [wrapper, "relative-root", "generation", "sha256:" + "a" * 64],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    unavailable_layout = subprocess.run(
+        [
+            wrapper,
+            str(tmp_path / "missing-release-root"),
+            "generation",
+            "sha256:" + "a" * 64,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    release_root = tmp_path / "release-root"
+    generation = "generation"
+    source = release_root / "generations" / generation / "src" / "the_hive"
+    source.mkdir(mode=0o700, parents=True)
+    (source / "__init__.py").write_text("", encoding="utf-8")
+    (source / "runtime_layout.py").write_text(
+        "\n".join(
+            (
+                "from pathlib import Path",
+                "class RuntimeLayout:",
+                "    @classmethod",
+                "    def from_current_release(cls, root, generation, manifest_digest):",
+                "        return type('Layout', (), {'root': Path('/different-root')})()",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    mismatched_layout = subprocess.run(
+        [wrapper, str(release_root), generation, "sha256:" + "a" * 64],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    (source / "runtime_layout.py").write_text(
+        "\n".join(
+            (
+                "from pathlib import Path",
+                "class RuntimeLayout:",
+                "    @classmethod",
+                "    def from_current_release(cls, root, generation, manifest_digest):",
+                "        return type('Layout', (), {'root': Path(root) / 'generations' / generation})()",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    probe_import_failure = subprocess.run(
+        [wrapper, str(release_root), generation, "sha256:" + "a" * 64],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    for completed, code in (
+        (missing_arguments, "arguments_missing"),
+        (invalid_arguments, "arguments_invalid"),
+        (unavailable_layout, "runtime_layout_unavailable"),
+        (mismatched_layout, "runtime_layout_mismatch"),
+        (probe_import_failure, "hourly_probe_load_failed"),
+    ):
+        assert completed.returncode == 64
+        assert completed.stdout == ""
+        assert completed.stderr == f"hive_hourly_probe_error code={code}\n"
+        assert len(completed.stderr.encode("utf-8")) <= 128
 
 
 def test_hourly_probe_direct_entrypoint_runs_without_an_argument(monkeypatch, capsys) -> None:
@@ -956,6 +1063,12 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     )
     installed_service_text = installed_service.read_text(encoding="utf-8")
     assert "@MASTERJET_" not in installed_service_text
+    assert (
+        "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind"
+        in installed_service_text
+    )
+    assert f"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime/generations/{generation}:" not in installed_service_text
+    assert "BindReadOnlyPaths=%h/.local:%h/.local" not in installed_service_text
     assert (
         "ExecStart=%h/.local/lib/the-hive-runtime/generations/"
         f"{generation}/bin/the-hive-hive-hourly-probe "
