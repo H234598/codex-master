@@ -437,6 +437,36 @@ def test_old_0_6_536_python_3_13_attested_layout_is_rejected(tmp_path: Path) -> 
     assert read(legacy).status == "invalid"
 
 
+def test_active_0_6_537_python_3_13_attestation_path_is_rejected(
+    tmp_path: Path,
+) -> None:
+    wrong_python_path = EvidenceTree(
+        tmp_path / "wrong-python-path",
+        document(),
+        producer_version="0.6.537",
+        python_version="3.13",
+    )
+
+    assert read(wrong_python_path).status == "invalid"
+
+
+def test_current_binding_0_6_536_producer_is_rejected(
+    evidence: EvidenceTree,
+) -> None:
+    binding_path = evidence.generations / GENERATION / "account-usage-v2.binding.json"
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    binding["producer_version"] = "0.6.536"
+    private_file(binding_path, canonical(binding))
+    pointer_path = evidence.integration / "current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["current_binding_sha256"] = hashlib.sha256(
+        binding_path.read_bytes()
+    ).hexdigest()
+    private_file(pointer_path, canonical(pointer))
+
+    assert read(evidence).status == "invalid"
+
+
 def test_active_and_current_are_reread_fd_bound_after_generation(
     evidence: EvidenceTree,
     monkeypatch: pytest.MonkeyPatch,
@@ -1065,6 +1095,23 @@ def test_previous_binding_must_keep_valid_historical_identity_form(
     binding_path = add_previous_generation(evidence)
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
     binding["active_manifest_sha256"] = "a" * 63
+    private_file(binding_path, canonical(binding))
+    pointer_path = evidence.integration / "current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["previous_binding_sha256"] = hashlib.sha256(
+        binding_path.read_bytes()
+    ).hexdigest()
+    private_file(pointer_path, canonical(pointer))
+
+    assert read(evidence).status == "invalid"
+
+
+def test_previous_binding_0_6_536_producer_is_rejected(
+    evidence: EvidenceTree,
+) -> None:
+    binding_path = add_previous_generation(evidence)
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    binding["producer_version"] = "0.6.536"
     private_file(binding_path, canonical(binding))
     pointer_path = evidence.integration / "current.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
