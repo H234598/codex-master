@@ -850,6 +850,32 @@ def _materialize_stable_mcp_launcher(
     )
 
 
+def _render_legacy_probe_launcher(
+    source: bytes, *, generation: str, manifest_digest: str
+) -> bytes:
+    """Bind the public launcher to this exact attested generation at install time."""
+
+    try:
+        template = source.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InstallError("install_release_invalid") from exc
+    if (
+        template.count("@MASTERJET_GENERATION@") != 1
+        or template.count("@MASTERJET_MANIFEST_DIGEST@") != 1
+    ):
+        raise InstallError("install_release_invalid")
+    rendered = (
+        template.replace("@MASTERJET_GENERATION@", generation).replace(
+            "@MASTERJET_MANIFEST_DIGEST@", manifest_digest
+        )
+    )
+    if (
+        "@MASTERJET_" in rendered
+    ):
+        raise InstallError("install_release_invalid")
+    return rendered.encode("utf-8")
+
+
 def _materialize_legacy_probe_launcher(*, layout: RuntimeLayout, libexec: Path) -> None:
     """Replace the owned historical public probe with an attested launcher."""
 
@@ -857,6 +883,11 @@ def _materialize_legacy_probe_launcher(*, layout: RuntimeLayout, libexec: Path) 
         source = layout.read_attested_file(_LEGACY_PROBE_LAUNCHER_SOURCE)
     except ValueError as exc:
         raise InstallError("install_release_invalid") from exc
+    source = _render_legacy_probe_launcher(
+        source,
+        generation=layout.root.name,
+        manifest_digest=layout.manifest_digest,
+    )
     _install_attested_bytes(
         libexec / _LEGACY_PROBE_LAUNCHER_NAME, source, mode=0o755
     )

@@ -1,4 +1,4 @@
-"""Deterministic, fail-closed Hive hourly Runtime Image probe (record v2)."""
+"""Deterministic, fail-closed Hive hourly Runtime Image probe (record v3)."""
 
 from __future__ import annotations
 
@@ -31,12 +31,19 @@ from the_hive.hive.runtime import GlobalPilotReadinessV1
 
 DETERMINISTIC_PROBE_HOURS_UTC = (0, 3, 6, 9, 12, 15, 18, 21)
 STATE_FILE_NAME = "hive-hourly-health.json"
-ALARM_FILE_NAME = "hive-hourly-alarm.json"
 PROBE_GATE_LOCK_NAME = ".hive-hourly-probe.lock"
 MAX_PROBE_STATE_BYTES = 64 * 1024
 MAX_PROBE_AGE_SECONDS = 4 * 60 * 60
 _PROBE_RECORD_KEYS = frozenset(
-    {"schema_version", "checked_at", "checks", "commands", "global_pilot_readiness"}
+    {
+        "schema_version",
+        "checked_at",
+        "checks",
+        "commands",
+        "diagnostics",
+        "alarm",
+        "global_pilot_readiness",
+    }
 )
 _GLOBAL_PILOT_READINESS_KEYS = frozenset(
     {
@@ -51,6 +58,24 @@ _GLOBAL_PILOT_READINESS_KEYS = frozenset(
 )
 _PROBE_CHECK_KEYS = frozenset({"runtime_layout", "hive_runtime", "hive_doctor"})
 _PROBE_COMMAND_KEYS = frozenset({"runtime_status", "hive_status", "hive_doctor"})
+_PROBE_ALARM_KEYS = frozenset({"scope", "status", "reason_codes", "owner"})
+_PROBE_ALARM_OWNER_KEYS = frozenset({"principal_id", "class_id", "repo_id"})
+_PROBE_DIAGNOSTIC_KEYS = _PROBE_COMMAND_KEYS
+_PROBE_DIAGNOSTIC_VALUE_KEYS = frozenset({"code", "exit_code", "stderr"})
+_SAFE_DIAGNOSTIC_CODES = frozenset(
+    {
+        "ok",
+        "runtime_status_red",
+        "mcp_timeout",
+        "mcp_cleanup_timeout",
+        "command_exit_nonzero",
+        "command_json_invalid",
+        "command_timeout",
+        "command_cleanup_bounded",
+        "command_failed",
+    }
+)
+_SAFE_DIAGNOSTIC_STDERR = frozenset({"empty", "present", "not_returned"})
 _HIVE_STATUS_KEYS = frozenset(
     {
         "schema_version",
@@ -226,12 +251,64 @@ def evaluate(
     }
 
 
+def _valid_alarm_owner(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and frozenset(value) == _PROBE_ALARM_OWNER_KEYS
+        and value.get("class_id") == "koenigin"
+        and all(
+            isinstance(value.get(key), str) and 1 <= len(value[key]) <= 128
+            for key in _PROBE_ALARM_OWNER_KEYS
+        )
+    )
+
+
+def _valid_diagnostic(value: object, *, command_ready: bool) -> bool:
+    if not isinstance(value, Mapping) or frozenset(value) != _PROBE_DIAGNOSTIC_VALUE_KEYS:
+        return False
+    code = value.get("code")
+    exit_code = value.get("exit_code")
+    stderr = value.get("stderr")
+    if (
+        not isinstance(code, str)
+        or code not in _SAFE_DIAGNOSTIC_CODES
+        or stderr not in _SAFE_DIAGNOSTIC_STDERR
+        or (exit_code is not None and (type(exit_code) is not int or not -255 <= exit_code <= 255))
+    ):
+        return False
+    if command_ready:
+        return code == "ok" and exit_code == 0 and stderr == "empty"
+    return code != "ok"
+
+
+def _valid_alarm(value: object, checks: Mapping[str, object]) -> bool:
+    if not isinstance(value, Mapping) or frozenset(value) != _PROBE_ALARM_KEYS:
+        return False
+    if value.get("scope") != "hive" or not isinstance(value.get("reason_codes"), list):
+        return False
+    reasons = value["reason_codes"]
+    if any(not isinstance(reason, str) or not reason for reason in reasons):
+        return False
+    failed_checks = sorted(name for name, ready in checks.items() if ready is not True)
+    owner = value.get("owner")
+    if all(ready is True for ready in checks.values()):
+        return (
+            value.get("status") == "cleared"
+            and reasons == []
+            and _valid_alarm_owner(owner)
+        )
+    expected_reasons = failed_checks + ([] if owner is not None else ["alarm_owner_unavailable"])
+    return (
+        value.get("status") == "active"
+        and reasons == expected_reasons
+        and (owner is None or _valid_alarm_owner(owner))
+    )
 def probe_spawn_gate(
     payload: Mapping[str, Any],
     *,
     now: datetime | Callable[[], datetime] | None = None,
 ) -> dict[str, object]:
-    """Accept only one fresh, complete and green v2 result for Hive spawning."""
+    """Accept only one fresh, complete and green v3 result for Hive spawning."""
 
     if not isinstance(payload, Mapping) or frozenset(payload) != _PROBE_RECORD_KEYS:
         return {
@@ -241,14 +318,22 @@ def probe_spawn_gate(
         }
     checks = payload.get("checks")
     commands = payload.get("commands")
+    diagnostics = payload.get("diagnostics")
     if (
-        payload.get("schema_version") != 2
+        payload.get("schema_version") != 3
         or not isinstance(checks, Mapping)
         or frozenset(checks) != _PROBE_CHECK_KEYS
         or any(value is not True for value in checks.values())
         or not isinstance(commands, Mapping)
         or frozenset(commands) != _PROBE_COMMAND_KEYS
         or any(value is not True for value in commands.values())
+        or not isinstance(diagnostics, Mapping)
+        or frozenset(diagnostics) != _PROBE_DIAGNOSTIC_KEYS
+        or any(
+            not _valid_diagnostic(diagnostics[key], command_ready=commands[key] is True)
+            for key in _PROBE_COMMAND_KEYS
+        )
+        or not _valid_alarm(payload.get("alarm"), checks)
         or payload.get("global_pilot_readiness")
         != _bounded_global_pilot_readiness(payload.get("global_pilot_readiness"))
     ):
@@ -350,7 +435,7 @@ def read_probe_gate(
     state_file: Path | None = None,
     now: datetime | Callable[[], datetime] | None = None,
 ) -> dict[str, object]:
-    """Read the private v2 record without creating or changing state."""
+    """Read the private v3 record without creating or changing state."""
 
     if state_file is None:
         state_file = _probe_state_root() / STATE_FILE_NAME
@@ -460,7 +545,7 @@ def probe_capacity_guard(
     state_file: Path | None = None,
     now: datetime | Callable[[], datetime] | None = None,
 ) -> object:
-    """Read a canonical v2 record while holding the shared publication lock."""
+    """Read a canonical v3 record while holding the shared publication lock."""
 
     capacity_lock = probe_capacity_lock(state_file=state_file)
     try:
@@ -591,23 +676,21 @@ def _probe_alarm_owner(layout: RuntimeLayout) -> dict[str, str] | None:
 
 
 def _probe_alarm_payload(
-    result: Mapping[str, object], *, layout: RuntimeLayout
+    result: Mapping[str, object], *, owner: dict[str, str] | None
 ) -> dict[str, object]:
+    """Embed the durable Hive-wide alarm in the spawn-gated health record."""
+
     checks = result.get("checks")
     failed_checks = (
         sorted(name for name, ready in checks.items() if ready is not True)
         if isinstance(checks, Mapping)
         else ["probe_result_invalid"]
     )
-    owner = _probe_alarm_owner(layout)
     if owner is None:
         failed_checks.append("alarm_owner_unavailable")
-    checked_at = result.get("checked_at")
     return {
-        "schema_version": 1,
-        "checked_at": checked_at if isinstance(checked_at, str) else "unknown",
         "scope": "hive",
-        "status": "active",
+        "status": "cleared" if not failed_checks else "active",
         "reason_codes": failed_checks,
         "owner": owner,
     }
@@ -626,7 +709,9 @@ def _emit_phase_timeout(phase: str) -> None:
 
 def _run_json(
     layout: RuntimeLayout, command: Path, *arguments: str, phase: str
-) -> tuple[dict[str, Any], bool]:
+) -> tuple[dict[str, Any], bool, dict[str, object]]:
+    """Run one bounded command and retain a safe, bounded failure cause."""
+
     try:
         completed = run_bounded(
             [os.fspath(command), *arguments],
@@ -638,20 +723,75 @@ def _run_json(
             runtime_layout=layout,
         )
         if completed.returncode != 0:
-            return {}, False
-        value = json.loads(completed.stdout)
-        return (value, True) if isinstance(value, dict) else ({}, False)
+            return (
+                {},
+                False,
+                {
+                    "code": "command_exit_nonzero",
+                    "exit_code": completed.returncode,
+                    "stderr": "present" if completed.stderr else "empty",
+                },
+            )
+        try:
+            value = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return (
+                {},
+                False,
+                {
+                    "code": "command_json_invalid",
+                    "exit_code": 0,
+                    "stderr": "present" if completed.stderr else "empty",
+                },
+            )
+        if isinstance(value, dict):
+            return (
+                value,
+                True,
+                {"code": "ok", "exit_code": 0, "stderr": "empty"},
+            )
+        return (
+            {},
+            False,
+            {
+                "code": "command_json_invalid",
+                "exit_code": 0,
+                "stderr": "present" if completed.stderr else "empty",
+            },
+        )
     except BoundedProcessError as exc:
         if exc.code == "command_timeout":
             _emit_phase_timeout(phase)
         elif exc.code == "command_cleanup_bounded":
             _emit_phase_timeout(f"{phase}_cleanup")
-        return {}, False
-    except (json.JSONDecodeError, TypeError):
-        return {}, False
+        return (
+            {},
+            False,
+            {
+                "code": (
+                    exc.code
+                    if exc.code in {"command_timeout", "command_cleanup_bounded"}
+                    else "command_failed"
+                ),
+                "exit_code": None,
+                "stderr": "not_returned",
+            },
+        )
+    except (TypeError, ValueError):
+        return (
+            {},
+            False,
+            {
+                "code": "command_json_invalid",
+                "exit_code": 0,
+                "stderr": "not_returned",
+            },
+        )
 
 
-def _runtime_status_json(layout: RuntimeLayout) -> tuple[dict[str, Any], bool]:
+def _runtime_status_json(
+    layout: RuntimeLayout,
+) -> tuple[dict[str, Any], bool, dict[str, object]]:
     """Run the one bounded MCP status check outside a bus-isolated child."""
 
     value = runtime_status(layout=layout)
@@ -660,7 +800,22 @@ def _runtime_status_json(layout: RuntimeLayout) -> tuple[dict[str, Any], bool]:
         _emit_phase_timeout("direct_mcp")
     elif reason_code == "mcp_cleanup_timeout":
         _emit_phase_timeout("direct_mcp_cleanup")
-    return (value, value.get("ok") is True)
+    ready = value.get("ok") is True
+    if ready:
+        return value, True, {"code": "ok", "exit_code": 0, "stderr": "empty"}
+    return (
+        value,
+        False,
+        {
+            "code": (
+                reason_code
+                if reason_code in {"mcp_timeout", "mcp_cleanup_timeout"}
+                else "runtime_status_red"
+            ),
+            "exit_code": None,
+            "stderr": "not_returned",
+        },
+    )
 
 
 def _current_release_binding(layout: RuntimeLayout) -> tuple[RuntimeLayout, Path, str]:
@@ -694,14 +849,51 @@ def _current_release_binding(layout: RuntimeLayout) -> tuple[RuntimeLayout, Path
     return current, release_root, generation
 
 
+def _injected_command_result(value: object) -> tuple[dict[str, Any], bool, dict[str, object]]:
+    """Normalize the narrow test seam without hiding failed injected commands."""
+
+    if (
+        isinstance(value, tuple)
+        and len(value) == 3
+        and isinstance(value[0], dict)
+        and type(value[1]) is bool
+        and isinstance(value[2], dict)
+    ):
+        return value
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and isinstance(value[0], dict)
+        and type(value[1]) is bool
+    ):
+        return (
+            value[0],
+            value[1],
+            (
+                {"code": "ok", "exit_code": 0, "stderr": "empty"}
+                if value[1]
+                else {
+                    "code": "command_failed",
+                    "exit_code": None,
+                    "stderr": "not_returned",
+                }
+            ),
+        )
+    return (
+        {},
+        False,
+        {"code": "command_failed", "exit_code": None, "stderr": "not_returned"},
+    )
+
+
 def run_probe(
     *,
     layout: RuntimeLayout | None = None,
     state_directory: Path | None = None,
     now: Callable[[], datetime] | None = None,
-    runner: Callable[..., tuple[dict[str, Any], bool]] | None = None,
+    runner: Callable[..., object] | None = None,
 ) -> dict[str, Any]:
-    """Run direct v2 checks and atomically publish exactly one v2 record."""
+    """Run direct v3 checks and atomically publish exactly one v3 record."""
 
     try:
         active_layout = (
@@ -713,30 +905,41 @@ def run_probe(
         raise ValueError("probe_runtime_layout_unavailable")
     state_directory = _state_directory(state_directory or _probe_state_root())
     if runner is not None:
-        runtime, runtime_command = _runtime_status_json(active_layout)
-        hive, hive_command = runner(active_layout.mcp_entrypoint, "hive", "status")
-        doctor, doctor_command = runner(active_layout.mcp_entrypoint, "hive", "doctor")
+        runtime, runtime_command, runtime_diagnostic = _runtime_status_json(active_layout)
+        hive, hive_command, hive_diagnostic = _injected_command_result(
+            runner(active_layout.mcp_entrypoint, "hive", "status")
+        )
+        doctor, doctor_command, doctor_diagnostic = _injected_command_result(
+            runner(active_layout.mcp_entrypoint, "hive", "doctor")
+        )
     else:
         current_layout, release_root, generation = _current_release_binding(active_layout)
-        runtime, runtime_command = _runtime_status_json(current_layout)
+        runtime, runtime_command, runtime_diagnostic = _runtime_status_json(current_layout)
         binding = (str(release_root), generation, current_layout.manifest_digest)
-        hive, hive_command = _run_json(
-            current_layout,
-            current_layout.mcp_entrypoint,
-            *binding,
-            "hive",
-            "status",
-            phase="hive_status",
+        hive, hive_command, hive_diagnostic = _injected_command_result(
+            _run_json(
+                current_layout,
+                current_layout.mcp_entrypoint,
+                *binding,
+                "hive",
+                "status",
+                phase="hive_status",
+            )
         )
-        doctor, doctor_command = _run_json(
-            current_layout,
-            current_layout.mcp_entrypoint,
-            *binding,
-            "hive",
-            "doctor",
-            phase="hive_doctor",
+        doctor, doctor_command, doctor_diagnostic = _injected_command_result(
+            _run_json(
+                current_layout,
+                current_layout.mcp_entrypoint,
+                *binding,
+                "hive",
+                "doctor",
+                phase="hive_doctor",
+            )
         )
     result = evaluate(runtime, hive, doctor)
+    owner = _probe_alarm_owner(active_layout)
+    if owner is None:
+        result["checks"]["hive_runtime"] = False
     moment = (now or (lambda: datetime.now(UTC)))()
     if (
         not isinstance(moment, datetime)
@@ -746,23 +949,24 @@ def run_probe(
         raise ValueError("probe_clock_invalid")
     result.update(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "checked_at": moment.astimezone(UTC).isoformat(),
             "commands": {
                 "runtime_status": runtime_command,
                 "hive_status": hive_command,
                 "hive_doctor": doctor_command,
             },
+            "diagnostics": {
+                "runtime_status": runtime_diagnostic,
+                "hive_status": hive_diagnostic,
+                "hive_doctor": doctor_diagnostic,
+            },
         }
     )
+    result["alarm"] = _probe_alarm_payload(result, owner=owner)
     state_file = state_directory / STATE_FILE_NAME
     with _probe_gate_lock(state_file, exclusive=True, create=True):
         _atomic_write(state_file, result)
-        if not all(result["checks"].values()):
-            _atomic_write(
-                state_directory / ALARM_FILE_NAME,
-                _probe_alarm_payload(result, layout=active_layout),
-            )
     return result
 
 

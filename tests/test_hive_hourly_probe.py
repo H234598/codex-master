@@ -71,10 +71,25 @@ def test_runtime_image_probe_time_contract_composes_each_bounded_phase() -> None
 
 def green_probe(checked_at: str) -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True},
         "checked_at": checked_at,
         "commands": {"runtime_status": True, "hive_status": True, "hive_doctor": True},
+        "diagnostics": {
+            "runtime_status": {"code": "ok", "exit_code": 0, "stderr": "empty"},
+            "hive_status": {"code": "ok", "exit_code": 0, "stderr": "empty"},
+            "hive_doctor": {"code": "ok", "exit_code": 0, "stderr": "empty"},
+        },
+        "alarm": {
+            "scope": "hive",
+            "status": "cleared",
+            "reason_codes": [],
+            "owner": {
+                "principal_id": "queen-codex-master",
+                "class_id": "koenigin",
+                "repo_id": "codex-master",
+            },
+        },
         "global_pilot_readiness": {
             "schema_version": 1,
             "pilot": "ready",
@@ -300,7 +315,7 @@ def test_probe_has_exactly_eight_deterministic_utc_slots() -> None:
     assert len(DETERMINISTIC_PROBE_HOURS_UTC) == 8
 
 
-def test_spawn_gate_accepts_only_a_fresh_complete_green_v2_record() -> None:
+def test_spawn_gate_accepts_only_a_fresh_complete_green_v3_record() -> None:
     fresh = green_probe(NOW.isoformat())
     assert probe_spawn_gate(fresh, now=NOW)["allowed"] is True
     assert probe_spawn_gate({"checks": {}}, now=NOW)["reason_code"] == "probe_ambiguous"
@@ -375,7 +390,7 @@ def test_atomic_write_never_unlinks_a_foreign_temp_swapped_before_replace_failur
     assert foreign_temporary.read_bytes() == foreign_contents
 
 
-def test_run_probe_persists_only_one_schema_v2_health_record(
+def test_run_probe_persists_only_one_schema_v3_health_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_directory = tmp_path / "state"
@@ -419,9 +434,11 @@ def test_run_probe_persists_only_one_schema_v2_health_record(
         "checked_at",
         "checks",
         "commands",
+        "diagnostics",
+        "alarm",
         "global_pilot_readiness",
     }
-    assert result["schema_version"] == 2
+    assert result["schema_version"] == 3
     assert calls == [("hive", "status"), ("hive", "doctor")]
     assert (
         read_probe_gate(
@@ -446,13 +463,14 @@ def test_run_probe_persists_only_one_schema_v2_health_record(
         "checked_at",
         "checks",
         "commands",
+        "diagnostics",
+        "alarm",
         "global_pilot_readiness",
     }
-    assert json.loads(
-        (state_directory / "hive-hourly-alarm.json").read_text(encoding="utf-8")
-    ) == {
-        "schema_version": 1,
-        "checked_at": NOW.isoformat(),
+    published = json.loads(
+        (state_directory / "hive-hourly-health.json").read_text(encoding="utf-8")
+    )
+    assert published["alarm"] == {
         "scope": "hive",
         "status": "active",
         "reason_codes": ["runtime_layout"],
@@ -462,6 +480,8 @@ def test_run_probe_persists_only_one_schema_v2_health_record(
             "repo_id": "codex-master",
         },
     }
+    assert published["diagnostics"]["runtime_status"]["code"] == "runtime_status_red"
+    assert not (state_directory / "hive-hourly-alarm.json").exists()
 
 
 def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics(
@@ -586,15 +606,55 @@ def test_bounded_hive_diagnostic_names_the_timed_out_phase(
 
     monkeypatch.setattr(hourly_probe_module, "run_bounded", timed_out)
 
-    value, command = hourly_probe_module._run_json(
+    assert hourly_probe_module._run_json(
         layout, layout.mcp_entrypoint, "hive", "doctor", phase="hive_doctor"
+    ) == (
+        {},
+        False,
+        {
+            "code": "command_timeout",
+            "exit_code": None,
+            "stderr": "not_returned",
+        },
     )
-
-    assert value == {}
-    assert command is False
     assert capsys.readouterr().err == (
         "runtime_image_probe_phase_timeout phase=hive_doctor limit_seconds=45\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("completed", "expected"),
+    (
+        (
+            BoundedProcessResult(returncode=7, stdout="{}", stderr="bounded error"),
+            {
+                "code": "command_exit_nonzero",
+                "exit_code": 7,
+                "stderr": "present",
+            },
+        ),
+        (
+            BoundedProcessResult(returncode=0, stdout="{", stderr=""),
+            {
+                "code": "command_json_invalid",
+                "exit_code": 0,
+                "stderr": "empty",
+            },
+        ),
+    ),
+)
+def test_bounded_hive_diagnostic_persists_a_safe_command_cause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completed: BoundedProcessResult,
+    expected: dict[str, object],
+) -> None:
+    layout = runtime_layout(tmp_path)
+    monkeypatch.setattr(hourly_probe_module, "run_bounded", lambda *_args, **_kwargs: completed)
+
+    assert hourly_probe_module._run_json(
+        layout, layout.mcp_entrypoint, "hive", "doctor", phase="hive_doctor"
+    ) == ({}, False, expected)
 
 
 def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
@@ -702,12 +762,10 @@ def test_red_probe_publishes_a_hive_wide_alarm_for_the_repository_queen(
     )
 
     assert result["checks"]["runtime_layout"] is False
-    alarm = json.loads(
-        (state_directory / "hive-hourly-alarm.json").read_text(encoding="utf-8")
+    published = json.loads(
+        (state_directory / "hive-hourly-health.json").read_text(encoding="utf-8")
     )
-    assert alarm == {
-        "schema_version": 1,
-        "checked_at": NOW.isoformat(),
+    assert published["alarm"] == {
         "scope": "hive",
         "status": "active",
         "reason_codes": ["runtime_layout"],
@@ -717,6 +775,61 @@ def test_red_probe_publishes_a_hive_wide_alarm_for_the_repository_queen(
             "repo_id": "codex-master",
         },
     }
+    assert published["diagnostics"]["runtime_status"] == {
+        "code": "runtime_status_red",
+        "exit_code": None,
+        "stderr": "not_returned",
+    }
+    assert not (state_directory / "hive-hourly-alarm.json").exists()
+
+
+def test_spawn_gate_rejects_a_health_record_without_a_consistent_global_alarm() -> None:
+    healthy = green_probe(NOW.isoformat())
+    assert probe_spawn_gate(healthy, now=NOW)["allowed"] is True
+
+    without_alarm = {key: value for key, value in healthy.items() if key != "alarm"}
+    assert probe_spawn_gate(without_alarm, now=NOW)["reason_code"] == "probe_ambiguous"
+
+    inconsistent = {
+        **healthy,
+        "alarm": {**healthy["alarm"], "status": "active", "reason_codes": []},
+    }
+    assert probe_spawn_gate(inconsistent, now=NOW)["reason_code"] == "probe_red"
+
+
+def test_a_green_probe_closes_the_global_alarm_in_its_same_health_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_directory = tmp_path / "state"
+    layout = runtime_layout(tmp_path)
+    direct_status: dict[str, object] = {"ok": False}
+    monkeypatch.setattr(hourly_probe_module, "runtime_status", lambda *, layout: direct_status)
+
+    def runner(_command: Path, *arguments: str) -> tuple[dict[str, object], bool]:
+        if arguments == ("hive", "status"):
+            return green_hive_runtime(), True
+        return (
+            {
+                "healthy": True,
+                "checks": {
+                    "authority": "ready",
+                    "repository": "ready",
+                    "state": "ready",
+                },
+            },
+            True,
+        )
+
+    run_probe(layout=layout, state_directory=state_directory, now=lambda: NOW, runner=runner)
+    direct_status = green_runtime_status()
+    result = run_probe(
+        layout=layout, state_directory=state_directory, now=lambda: NOW, runner=runner
+    )
+
+    assert result["alarm"]["status"] == "cleared"
+    state_file = state_directory / "hive-hourly-health.json"
+    assert read_probe_gate(state_file=state_file, now=NOW)["allowed"] is True
+    assert json.loads(state_file.read_text(encoding="utf-8"))["alarm"]["reason_codes"] == []
 
 
 def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
@@ -827,36 +940,6 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         "CODEX_HOME": str(tmp_path / "attacker-codex-home"),
         "CODEX_MASTER_MCP_STATE": str(tmp_path / "attacker-state"),
     }
-    original_entrypoint = entrypoint.read_bytes()
-    entrypoint.write_text(
-        "#!/bin/sh\n"
-        "[ \"$#\" -eq 4 ] && [ \"$4\" = \"--json\" ] || exit 66\n"
-        "printf '%s\\n' '{\"checks\":{}}'\n",
-        encoding="utf-8",
-    )
-    entrypoint.chmod(0o755)
-    legacy_completed = subprocess.run(
-        [legacy_probe],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-        cwd=tmp_path,
-    )
-    assert legacy_completed.returncode in {0, 1}, legacy_completed.stderr
-    assert set(json.loads(legacy_completed.stdout)) == {"checks"}
-    completed = subprocess.run(
-        [entrypoint, release_root, generation, installed["manifest_digest"], "--json"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-        cwd=tmp_path,
-    )
-    assert completed.returncode in {0, 1}, completed.stderr
-    assert set(json.loads(completed.stdout)) == {"checks"}
-    entrypoint.write_bytes(original_entrypoint)
-    entrypoint.chmod(0o755)
     runtime_status = subprocess.run(
         [
             installed_cli,
@@ -893,6 +976,81 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     tool_names = {tool["name"] for tool in tools_response["result"]["tools"]}
     assert tool_names == {"runtime_status"}
     assert not list(runtime_root.rglob("__pycache__"))
+
+
+def test_legacy_probe_refuses_tampered_release_metadata_before_running_the_entrypoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    monkeypatch.setitem(
+        installer["install"].__globals__, "_verified_release_commit", lambda _repository: "a" * 40
+    )
+    installed = installer["install"](home=home)
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    pointer = release_root / ".the-hive-release-pointers.json"
+    pointer_original = pointer.read_bytes()
+    pointer_mode = stat.S_IMODE(pointer.lstat().st_mode)
+    generation = installed["generation"]
+    assert isinstance(generation, str)
+    entrypoint = release_root / "generations" / generation / "bin" / "the-hive-hive-hourly-probe"
+    entrypoint_original = entrypoint.read_bytes()
+    legacy_probe = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
+    entrypoint.write_text("#!/bin/sh\nprintf 'entrypoint-ran\\n'\n", encoding="utf-8")
+    entrypoint.chmod(0o755)
+    pointer.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "current": {
+                    "generation": generation,
+                    "manifest_digest": installed["manifest_digest"],
+                },
+                "previous": {
+                    "generation": "b" * 40,
+                    "manifest_digest": "sha256:" + "b" * 64,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    pointer.chmod(pointer_mode)
+    environment = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+    corrupted_pointer = subprocess.run(
+        [legacy_probe], check=False, capture_output=True, text=True, env=environment
+    )
+    assert corrupted_pointer.returncode == 2
+    assert corrupted_pointer.stdout == ""
+    assert corrupted_pointer.stderr == (
+        "hive_hourly_probe_error code=legacy_probe_attestation_failed\n"
+    )
+
+    pointer.write_bytes(pointer_original)
+    pointer.chmod(pointer_mode)
+    corrupted_entrypoint = subprocess.run(
+        [legacy_probe], check=False, capture_output=True, text=True, env=environment
+    )
+    assert corrupted_entrypoint.returncode == 2
+    assert corrupted_entrypoint.stdout == ""
+    assert corrupted_entrypoint.stderr == (
+        "hive_hourly_probe_error code=legacy_probe_attestation_failed\n"
+    )
+
+    entrypoint.write_bytes(entrypoint_original)
+    entrypoint.chmod(0o755)
+    shim = runpy.run_path(str(legacy_probe), run_name="legacy_probe_test")
+    invoked: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        shim["runpy"],
+        "run_module",
+        lambda name, **kwargs: invoked.append((name, tuple(sorted(kwargs)))) or {},
+    )
+    monkeypatch.setattr(shim["sys"], "argv", [str(legacy_probe)])
+    assert shim["main"]() == 0
+    assert invoked == [("the_hive.hive.hourly_probe", ("alter_sys", "run_name"))]
 
 
 def test_stage_validation_uses_the_shared_hive_diagnostic_budget(

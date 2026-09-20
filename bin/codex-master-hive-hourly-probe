@@ -1,18 +1,19 @@
 #!/usr/bin/python3 -I
-"""Compatibility launcher for the historical public Hive hourly-probe path."""
+"""Attested compatibility launcher for the historical Hive probe path."""
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
-import re
+import runpy
 import stat
 import sys
 
 
-_GENERATION = re.compile(r"[0-9a-f]{40}\Z")
-_MANIFEST_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+sys.dont_write_bytecode = True
+
+_GENERATION = "@MASTERJET_GENERATION@"
+_MANIFEST_DIGEST = "@MASTERJET_MANIFEST_DIGEST@"
 
 
 def _fail(code: str) -> None:
@@ -20,72 +21,70 @@ def _fail(code: str) -> None:
     raise SystemExit(2)
 
 
-def _current_probe() -> tuple[Path, Path, str, str]:
+def _launcher_release_root() -> Path:
     launcher = Path(__file__).absolute()
-    if launcher.is_symlink() or launcher.parent.name != "libexec":
-        _fail("legacy_probe_launcher_invalid")
-    home = launcher.parents[2]
-    release_root = home / ".local" / "lib" / "the-hive-runtime"
-    pointer = release_root / ".the-hive-release-pointers.json"
     try:
-        raw = pointer.read_bytes()
-        value = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
-        _fail("legacy_probe_release_unavailable")
-    if (
-        not isinstance(value, dict)
-        or frozenset(value) != {"schema_version", "current", "previous"}
-        or value.get("schema_version") != 1
-        or not isinstance(value.get("current"), dict)
-        or frozenset(value["current"]) != {"generation", "manifest_digest"}
-    ):
-        _fail("legacy_probe_release_invalid")
-    generation = value["current"].get("generation")
-    manifest_digest = value["current"].get("manifest_digest")
-    if (
-        not isinstance(generation, str)
-        or not _GENERATION.fullmatch(generation)
-        or not isinstance(manifest_digest, str)
-        or not _MANIFEST_DIGEST.fullmatch(manifest_digest)
-    ):
-        _fail("legacy_probe_release_invalid")
-    entrypoint = (
-        release_root
-        / "generations"
-        / generation
-        / "bin"
-        / "the-hive-hive-hourly-probe"
-    )
-    try:
-        item = entrypoint.lstat()
+        item = launcher.lstat()
     except OSError:
-        _fail("legacy_probe_entrypoint_unavailable")
+        _fail("legacy_probe_launcher_unavailable")
     if (
-        stat.S_ISLNK(item.st_mode)
+        launcher.is_symlink()
+        or launcher.parent.name != "libexec"
         or not stat.S_ISREG(item.st_mode)
-        or not item.st_mode & stat.S_IXUSR
+        or item.st_nlink != 1
+        or item.st_uid != os.geteuid()
+        or stat.S_IMODE(item.st_mode) != 0o755
     ):
-        _fail("legacy_probe_entrypoint_invalid")
-    return entrypoint, release_root, generation, manifest_digest
+        _fail("legacy_probe_launcher_invalid")
+    return launcher.parents[2] / ".local" / "lib" / "the-hive-runtime"
+
+
+def _attested_layout() -> object:
+    release_root = _launcher_release_root()
+    source_root = release_root / "generations" / _GENERATION / "src"
+    try:
+        # RuntimeLayout validates the complete pointer object (including
+        # previous), all image paths without following links, bounded sizes,
+        # modes, ownership, and the full manifest before the probe module runs.
+        sys.path.insert(0, os.fspath(source_root))
+        from the_hive.runtime_layout import LayoutError, RuntimeLayout
+
+        layout = RuntimeLayout.from_current_release(
+            release_root, _GENERATION, _MANIFEST_DIGEST
+        )
+        if layout.probe_entrypoint != (
+            release_root
+            / "generations"
+            / _GENERATION
+            / "bin"
+            / "the-hive-hive-hourly-probe"
+        ):
+            raise LayoutError("runtime_layout_invalid")
+        return layout
+    except (ImportError, OSError, TypeError, ValueError):
+        _fail("legacy_probe_attestation_failed")
 
 
 def main() -> int:
-    arguments = tuple(sys.argv[1:])
-    if arguments not in {(), ("--json",)}:
+    if tuple(sys.argv[1:]) not in {(), ("--json",)}:
         _fail("arguments_invalid")
-    entrypoint, release_root, generation, manifest_digest = _current_probe()
-    os.execve(
-        os.fspath(entrypoint),
-        [
-            os.fspath(entrypoint),
-            os.fspath(release_root),
-            generation,
-            manifest_digest,
+    layout = _attested_layout()
+    del layout
+    try:
+        sys.argv = [
+            os.fspath(
+                _launcher_release_root()
+                / "generations"
+                / _GENERATION
+                / "bin"
+                / "the-hive-hive-hourly-probe"
+            ),
             "--json",
-        ],
-        os.environ,
-    )
-    raise AssertionError("unreachable")
+        ]
+        runpy.run_module("the_hive.hive.hourly_probe", run_name="__main__", alter_sys=True)
+    except (ImportError, OSError, TypeError, ValueError):
+        _fail("legacy_probe_runtime_unavailable")
+    return 0
 
 
 if __name__ == "__main__":
