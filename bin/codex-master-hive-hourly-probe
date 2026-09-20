@@ -1,19 +1,29 @@
 #!/usr/bin/python3 -I
-"""Attested compatibility launcher for the historical Hive probe path."""
+"""Fail-closed, manifest-attested launcher for the historical Hive probe."""
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import json
 import os
 from pathlib import Path
-import runpy
 import stat
 import sys
 
 
-sys.dont_write_bytecode = True
-
 _GENERATION = "@MASTERJET_GENERATION@"
 _MANIFEST_DIGEST = "@MASTERJET_MANIFEST_DIGEST@"
+_MAX_METADATA_BYTES = 256 * 1024
+_MAX_IMAGE_FILE_BYTES = 2 * 1024 * 1024
+_ROOT_MODE = 0o700
+_POINTER_NAME = ".the-hive-release-pointers.json"
+_PUBLISH_LOCK_NAME = ".the-hive-release-publish.lock"
+_MANIFEST_NAME = ".the-hive-runtime-manifest.json"
+_ENTRYPOINT = "bin/the-hive-hive-hourly-probe"
+
+
+sys.dont_write_bytecode = True
 
 
 def _fail(code: str) -> None:
@@ -21,12 +31,332 @@ def _fail(code: str) -> None:
     raise SystemExit(2)
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_json_member")
+        result[key] = value
+    return result
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _require_private_directory(path: Path) -> os.stat_result:
+    if not path.is_absolute():
+        raise ValueError("directory_invalid")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            item = current.lstat()
+        except OSError as exc:
+            raise ValueError("directory_unavailable") from exc
+        if stat.S_ISLNK(item.st_mode):
+            raise ValueError("directory_invalid")
+    if (
+        not stat.S_ISDIR(item.st_mode)
+        or item.st_uid != os.geteuid()
+        or stat.S_IMODE(item.st_mode) != _ROOT_MODE
+    ):
+        raise ValueError("directory_invalid")
+    return item
+
+
+def _read_regular(path: Path, *, maximum: int) -> tuple[bytes, os.stat_result]:
+    descriptor = -1
+    try:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or not 0 < before.st_size <= maximum
+        ):
+            raise ValueError("regular_invalid")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != before.st_uid
+            or opened.st_size != before.st_size
+            or not _same_file(opened, before)
+        ):
+            raise ValueError("regular_changed")
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) != opened.st_size or len(content) > maximum:
+            raise ValueError("regular_changed")
+        return content, opened
+    except OSError as exc:
+        raise ValueError("regular_unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _validate_manifest_file(
+    root: Path, relative: str, expected: object
+) -> tuple[Path, dict[str, object]]:
+    if not isinstance(expected, dict) or frozenset(expected) != {
+        "mode",
+        "nlink",
+        "size",
+        "sha256",
+    }:
+        raise ValueError("manifest_file_invalid")
+    mode = expected.get("mode")
+    nlink = expected.get("nlink")
+    size = expected.get("size")
+    digest = expected.get("sha256")
+    if (
+        type(mode) is not int
+        or mode & 0o022
+        or type(nlink) is not int
+        or nlink != 1
+        or type(size) is not int
+        or not 0 < size <= _MAX_IMAGE_FILE_BYTES
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError("manifest_file_invalid")
+    path = root / relative
+    content, item = _read_regular(path, maximum=_MAX_IMAGE_FILE_BYTES)
+    if (
+        stat.S_IMODE(item.st_mode) != mode
+        or item.st_nlink != nlink
+        or item.st_size != size
+        or hashlib.sha256(content).hexdigest() != digest
+    ):
+        raise ValueError("manifest_file_changed")
+    return path, expected
+
+
+def _attest_runtime_root(root: Path, *, generation: str, digest: str) -> tuple[Path, dict[str, object]]:
+    _require_private_directory(root)
+    manifest_raw, manifest_item = _read_regular(
+        root / _MANIFEST_NAME, maximum=_MAX_METADATA_BYTES
+    )
+    if stat.S_IMODE(manifest_item.st_mode) != 0o644:
+        raise ValueError("manifest_invalid")
+    if f"sha256:{hashlib.sha256(manifest_raw).hexdigest()}" != digest:
+        raise ValueError("manifest_digest_invalid")
+    try:
+        manifest = json.loads(
+            manifest_raw.decode("utf-8"), object_pairs_hook=_unique_json_object
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("manifest_invalid") from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != 2
+        or manifest.get("generation") != generation
+        or not isinstance(manifest.get("directories"), dict)
+        or not isinstance(manifest.get("files"), dict)
+    ):
+        raise ValueError("manifest_invalid")
+    directories = manifest["directories"]
+    files = manifest["files"]
+    if _MANIFEST_NAME in files:
+        raise ValueError("manifest_invalid")
+    seen_directories: dict[str, dict[str, int]] = {}
+    seen_files: dict[str, dict[str, object]] = {}
+
+    def walk(directory: Path, relative: str) -> None:
+        item = directory.lstat()
+        expected_directory = directories.get(relative)
+        if (
+            not isinstance(expected_directory, dict)
+            or frozenset(expected_directory) != {"mode", "nlink"}
+            or type(expected_directory.get("mode")) is not int
+            or type(expected_directory.get("nlink")) is not int
+            or stat.S_ISLNK(item.st_mode)
+            or not stat.S_ISDIR(item.st_mode)
+            or item.st_uid != os.geteuid()
+            or stat.S_IMODE(item.st_mode) != _ROOT_MODE
+            or item.st_nlink != expected_directory["nlink"]
+            or expected_directory["mode"] != _ROOT_MODE
+        ):
+            raise ValueError("manifest_directory_changed")
+        seen_directories[relative] = expected_directory
+        try:
+            children = sorted(os.scandir(directory), key=lambda child: child.name)
+        except OSError as exc:
+            raise ValueError("manifest_directory_unavailable") from exc
+        for child in children:
+            child_relative = child.name if relative == "." else f"{relative}/{child.name}"
+            if child_relative == _MANIFEST_NAME:
+                continue
+            child_path = directory / child.name
+            item = child_path.lstat()
+            if stat.S_ISLNK(item.st_mode):
+                raise ValueError("manifest_link_invalid")
+            if stat.S_ISDIR(item.st_mode):
+                walk(child_path, child_relative)
+            elif stat.S_ISREG(item.st_mode):
+                _path, entry = _validate_manifest_file(
+                    root, child_relative, files.get(child_relative)
+                )
+                seen_files[child_relative] = entry
+            else:
+                raise ValueError("manifest_member_invalid")
+
+    walk(root, ".")
+    if set(directories) != set(seen_directories) or set(files) != set(seen_files):
+        raise ValueError("manifest_members_changed")
+    entry_path, entry_record = _validate_manifest_file(root, _ENTRYPOINT, files.get(_ENTRYPOINT))
+    return entry_path, entry_record
+
+
+def _attest_pointer_entry(release_root: Path, value: object) -> tuple[Path, dict[str, object]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or frozenset(value) != {"generation", "manifest_digest"}:
+        raise ValueError("pointer_invalid")
+    generation = value.get("generation")
+    digest = value.get("manifest_digest")
+    if (
+        not isinstance(generation, str)
+        or len(generation) != 40
+        or any(character not in "0123456789abcdef" for character in generation)
+        or not isinstance(digest, str)
+        or len(digest) != 71
+        or not digest.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in digest[7:])
+    ):
+        raise ValueError("pointer_invalid")
+    return _attest_runtime_root(
+        release_root / "generations" / generation, generation=generation, digest=digest
+    )
+
+
+def _open_pinned_entry(path: Path, expected: dict[str, object]) -> int:
+    descriptor = -1
+    try:
+        content, before = _read_regular(path, maximum=_MAX_IMAGE_FILE_BYTES)
+        if (
+            stat.S_IMODE(before.st_mode) != expected["mode"]
+            or before.st_size != expected["size"]
+            or hashlib.sha256(content).hexdigest() != expected["sha256"]
+        ):
+            raise ValueError("entry_changed")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not _same_file(opened, before)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != expected["mode"]
+            or opened.st_size != expected["size"]
+        ):
+            raise ValueError("entry_changed")
+        content = b""
+        while len(content) <= _MAX_IMAGE_FILE_BYTES:
+            chunk = os.read(descriptor, min(65536, _MAX_IMAGE_FILE_BYTES + 1 - len(content)))
+            if not chunk:
+                break
+            content += chunk
+        if (
+            len(content) != opened.st_size
+            or hashlib.sha256(content).hexdigest() != expected["sha256"]
+        ):
+            raise ValueError("entry_changed")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except OSError as exc:
+        raise ValueError("entry_unavailable") from exc
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _attest_current_release(release_root: Path) -> int:
+    pointer_raw, pointer_item = _read_regular(
+        release_root / _POINTER_NAME, maximum=_MAX_METADATA_BYTES
+    )
+    if stat.S_IMODE(pointer_item.st_mode) & 0o022:
+        raise ValueError("pointer_invalid")
+    try:
+        pointer = json.loads(
+            pointer_raw.decode("utf-8"), object_pairs_hook=_unique_json_object
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("pointer_invalid") from exc
+    if (
+        not isinstance(pointer, dict)
+        or frozenset(pointer) != {"schema_version", "current", "previous"}
+        or pointer.get("schema_version") != 1
+    ):
+        raise ValueError("pointer_invalid")
+    current = _attest_pointer_entry(release_root, pointer["current"])
+    _attest_pointer_entry(release_root, pointer["previous"])
+    if pointer["current"] != {
+        "generation": _GENERATION,
+        "manifest_digest": _MANIFEST_DIGEST,
+    } or current is None:
+        raise ValueError("pointer_binding_invalid")
+    entry_path, entry_record = current
+    return _open_pinned_entry(entry_path, entry_record)
+
+
+def _open_release_read_lock(release_root: Path) -> int:
+    path = release_root / _PUBLISH_LOCK_NAME
+    descriptor = -1
+    try:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise ValueError("release_lock_invalid")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if not _same_file(opened, before) or stat.S_IMODE(opened.st_mode) != 0o600:
+            raise ValueError("release_lock_invalid")
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        if not _same_file(path.lstat(), opened):
+            raise ValueError("release_lock_changed")
+        return descriptor
+    except OSError as exc:
+        raise ValueError("release_lock_unavailable") from exc
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
 def _launcher_release_root() -> Path:
     launcher = Path(__file__).absolute()
     try:
         item = launcher.lstat()
-    except OSError:
-        _fail("legacy_probe_launcher_unavailable")
+    except OSError as exc:
+        raise ValueError("launcher_unavailable") from exc
     if (
         launcher.is_symlink()
         or launcher.parent.name != "libexec"
@@ -35,56 +365,51 @@ def _launcher_release_root() -> Path:
         or item.st_uid != os.geteuid()
         or stat.S_IMODE(item.st_mode) != 0o755
     ):
-        _fail("legacy_probe_launcher_invalid")
+        raise ValueError("launcher_invalid")
     return launcher.parents[2] / ".local" / "lib" / "the-hive-runtime"
 
 
-def _attested_layout() -> object:
-    release_root = _launcher_release_root()
-    source_root = release_root / "generations" / _GENERATION / "src"
-    try:
-        # RuntimeLayout validates the complete pointer object (including
-        # previous), all image paths without following links, bounded sizes,
-        # modes, ownership, and the full manifest before the probe module runs.
-        sys.path.insert(0, os.fspath(source_root))
-        from the_hive.runtime_layout import LayoutError, RuntimeLayout
-
-        layout = RuntimeLayout.from_current_release(
-            release_root, _GENERATION, _MANIFEST_DIGEST
-        )
-        if layout.probe_entrypoint != (
-            release_root
-            / "generations"
-            / _GENERATION
-            / "bin"
-            / "the-hive-hive-hourly-probe"
-        ):
-            raise LayoutError("runtime_layout_invalid")
-        return layout
-    except (ImportError, OSError, TypeError, ValueError):
-        _fail("legacy_probe_attestation_failed")
+def _minimal_environment(home: Path) -> dict[str, str]:
+    return {
+        "HOME": os.fspath(home),
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
 
 
 def main() -> int:
     if tuple(sys.argv[1:]) not in {(), ("--json",)}:
         _fail("arguments_invalid")
-    layout = _attested_layout()
-    del layout
+    lock_descriptor = -1
+    entry_descriptor = -1
     try:
-        sys.argv = [
-            os.fspath(
-                _launcher_release_root()
-                / "generations"
-                / _GENERATION
-                / "bin"
-                / "the-hive-hive-hourly-probe"
-            ),
-            "--json",
-        ]
-        runpy.run_module("the_hive.hive.hourly_probe", run_name="__main__", alter_sys=True)
-    except (ImportError, OSError, TypeError, ValueError):
-        _fail("legacy_probe_runtime_unavailable")
-    return 0
+        release_root = _launcher_release_root()
+        _require_private_directory(release_root)
+        lock_descriptor = _open_release_read_lock(release_root)
+        entry_descriptor = _attest_current_release(release_root)
+        os.set_inheritable(lock_descriptor, True)
+        os.set_inheritable(entry_descriptor, True)
+        entry = f"/proc/self/fd/{entry_descriptor}"
+        os.execve(
+            entry,
+            [entry, os.fspath(release_root), _GENERATION, _MANIFEST_DIGEST, "--json"],
+            _minimal_environment(release_root.parents[2]),
+        )
+        _fail("legacy_probe_exec_returned")
+    except SystemExit:
+        raise
+    except OSError:
+        _fail("legacy_probe_entry_exec_failed")
+    except (TypeError, ValueError):
+        _fail("legacy_probe_attestation_failed")
+    finally:
+        if entry_descriptor >= 0:
+            os.close(entry_descriptor)
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+    raise AssertionError("unreachable")
 
 
 if __name__ == "__main__":

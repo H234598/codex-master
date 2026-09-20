@@ -62,6 +62,7 @@ _PROBE_ALARM_KEYS = frozenset({"scope", "status", "reason_codes", "owner"})
 _PROBE_ALARM_OWNER_KEYS = frozenset({"principal_id", "class_id", "repo_id"})
 _PROBE_DIAGNOSTIC_KEYS = _PROBE_COMMAND_KEYS
 _PROBE_DIAGNOSTIC_VALUE_KEYS = frozenset({"code", "exit_code", "stderr"})
+_PROBE_STDERR_KEYS = frozenset({"state", "excerpt", "redaction_applied"})
 _SAFE_DIAGNOSTIC_CODES = frozenset(
     {
         "ok",
@@ -72,10 +73,20 @@ _SAFE_DIAGNOSTIC_CODES = frozenset(
         "command_json_invalid",
         "command_timeout",
         "command_cleanup_bounded",
+        "command_arguments_invalid",
+        "command_environment_invalid",
+        "command_group_unavailable",
+        "command_output_invalid",
+        "command_stdout_limit",
+        "command_stderr_limit",
+        "command_unavailable",
         "command_failed",
+        "command_stderr_warning",
+        "command_stderr_redaction_unavailable",
     }
 )
 _SAFE_DIAGNOSTIC_STDERR = frozenset({"empty", "present", "not_returned"})
+_SAFE_STDERR_EXCERPT_CHARS = 1200
 _HIVE_STATUS_KEYS = frozenset(
     {
         "schema_version",
@@ -272,12 +283,23 @@ def _valid_diagnostic(value: object, *, command_ready: bool) -> bool:
     if (
         not isinstance(code, str)
         or code not in _SAFE_DIAGNOSTIC_CODES
-        or stderr not in _SAFE_DIAGNOSTIC_STDERR
         or (exit_code is not None and (type(exit_code) is not int or not -255 <= exit_code <= 255))
+        or not isinstance(stderr, Mapping)
+        or frozenset(stderr) != _PROBE_STDERR_KEYS
+        or stderr.get("state") not in _SAFE_DIAGNOSTIC_STDERR
+        or not isinstance(stderr.get("excerpt"), str)
+        or len(stderr["excerpt"]) > _SAFE_STDERR_EXCERPT_CHARS
+        or type(stderr.get("redaction_applied")) is not bool
     ):
         return False
+    if stderr["state"] != "present" and (
+        stderr["excerpt"] or stderr["redaction_applied"]
+    ):
+        return False
+    if stderr["state"] == "present" and not stderr["excerpt"]:
+        return False
     if command_ready:
-        return code == "ok" and exit_code == 0 and stderr == "empty"
+        return code == "ok" and exit_code == 0 and stderr["state"] == "empty"
     return code != "ok"
 
 
@@ -707,6 +729,50 @@ def _emit_phase_timeout(phase: str) -> None:
     )
 
 
+def _safe_stderr(value: object) -> dict[str, object]:
+    """Project bounded child stderr through the existing redaction policy."""
+
+    if not isinstance(value, str):
+        return {"state": "not_returned", "excerpt": "", "redaction_applied": False}
+    if not value:
+        return {"state": "empty", "excerpt": "", "redaction_applied": False}
+    try:
+        # The server owns the product's established ANSI stripping, secret and
+        # absolute-path redaction policy. This is reached only after the probe
+        # module has already been loaded from an attested Runtime Image.
+        from the_hive.server import command_excerpt
+
+        excerpt, redacted = command_excerpt(value, _SAFE_STDERR_EXCERPT_CHARS)
+    except (ImportError, TypeError, ValueError):
+        return {
+            "state": "present",
+            "excerpt": "redaction_unavailable",
+            "redaction_applied": True,
+        }
+    if not isinstance(excerpt, str) or not excerpt:
+        return {
+            "state": "present",
+            "excerpt": "redaction_unavailable",
+            "redaction_applied": True,
+        }
+    return {
+        "state": "present",
+        "excerpt": excerpt,
+        "redaction_applied": redacted is True,
+    }
+
+
+def _not_returned_stderr() -> dict[str, object]:
+    return {"state": "not_returned", "excerpt": "", "redaction_applied": False}
+
+
+def _diagnostic(code: str, exit_code: int | None, stderr: object) -> dict[str, object]:
+    safe_stderr = _safe_stderr(stderr)
+    if safe_stderr["excerpt"] == "redaction_unavailable":
+        code = "command_stderr_redaction_unavailable"
+    return {"code": code, "exit_code": exit_code, "stderr": safe_stderr}
+
+
 def _run_json(
     layout: RuntimeLayout, command: Path, *arguments: str, phase: str
 ) -> tuple[dict[str, Any], bool, dict[str, object]]:
@@ -726,11 +792,13 @@ def _run_json(
             return (
                 {},
                 False,
-                {
-                    "code": "command_exit_nonzero",
-                    "exit_code": completed.returncode,
-                    "stderr": "present" if completed.stderr else "empty",
-                },
+                _diagnostic("command_exit_nonzero", completed.returncode, completed.stderr),
+            )
+        if completed.stderr:
+            return (
+                {},
+                False,
+                _diagnostic("command_stderr_warning", 0, completed.stderr),
             )
         try:
             value = json.loads(completed.stdout)
@@ -738,26 +806,18 @@ def _run_json(
             return (
                 {},
                 False,
-                {
-                    "code": "command_json_invalid",
-                    "exit_code": 0,
-                    "stderr": "present" if completed.stderr else "empty",
-                },
+                _diagnostic("command_json_invalid", 0, completed.stderr),
             )
         if isinstance(value, dict):
             return (
                 value,
                 True,
-                {"code": "ok", "exit_code": 0, "stderr": "empty"},
+                _diagnostic("ok", 0, completed.stderr),
             )
         return (
             {},
             False,
-            {
-                "code": "command_json_invalid",
-                "exit_code": 0,
-                "stderr": "present" if completed.stderr else "empty",
-            },
+            _diagnostic("command_json_invalid", 0, completed.stderr),
         )
     except BoundedProcessError as exc:
         if exc.code == "command_timeout":
@@ -768,13 +828,9 @@ def _run_json(
             {},
             False,
             {
-                "code": (
-                    exc.code
-                    if exc.code in {"command_timeout", "command_cleanup_bounded"}
-                    else "command_failed"
-                ),
+                "code": exc.code if exc.code in _SAFE_DIAGNOSTIC_CODES else "command_failed",
                 "exit_code": None,
-                "stderr": "not_returned",
+                "stderr": _not_returned_stderr(),
             },
         )
     except (TypeError, ValueError):
@@ -784,7 +840,7 @@ def _run_json(
             {
                 "code": "command_json_invalid",
                 "exit_code": 0,
-                "stderr": "not_returned",
+                "stderr": _not_returned_stderr(),
             },
         )
 
@@ -802,7 +858,11 @@ def _runtime_status_json(
         _emit_phase_timeout("direct_mcp_cleanup")
     ready = value.get("ok") is True
     if ready:
-        return value, True, {"code": "ok", "exit_code": 0, "stderr": "empty"}
+        return value, True, {
+            "code": "ok",
+            "exit_code": 0,
+            "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False},
+        }
     return (
         value,
         False,
@@ -813,7 +873,7 @@ def _runtime_status_json(
                 else "runtime_status_red"
             ),
             "exit_code": None,
-            "stderr": "not_returned",
+            "stderr": _not_returned_stderr(),
         },
     )
 
@@ -870,19 +930,27 @@ def _injected_command_result(value: object) -> tuple[dict[str, Any], bool, dict[
             value[0],
             value[1],
             (
-                {"code": "ok", "exit_code": 0, "stderr": "empty"}
+                {
+                    "code": "ok",
+                    "exit_code": 0,
+                    "stderr": {
+                        "state": "empty",
+                        "excerpt": "",
+                        "redaction_applied": False,
+                    },
+                }
                 if value[1]
                 else {
                     "code": "command_failed",
                     "exit_code": None,
-                    "stderr": "not_returned",
+                    "stderr": _not_returned_stderr(),
                 }
             ),
         )
     return (
         {},
         False,
-        {"code": "command_failed", "exit_code": None, "stderr": "not_returned"},
+        {"code": "command_failed", "exit_code": None, "stderr": _not_returned_stderr()},
     )
 
 
@@ -990,8 +1058,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
     print(json.dumps({"checks": checks}, sort_keys=True))
     failed_checks = sorted(name for name, ready in checks.items() if ready is not True)
     if failed_checks:
+        diagnostics = result.get("diagnostics")
+        diagnostic_codes = (
+            ",".join(
+                f"{name}:{diagnostic.get('code')}"
+                for name, diagnostic in sorted(diagnostics.items())
+                if isinstance(diagnostic, Mapping) and diagnostic.get("code") != "ok"
+            )
+            if isinstance(diagnostics, Mapping)
+            else ""
+        )
         print(
-            "hive_hourly_probe_red failed_checks=" + ",".join(failed_checks),
+            "hive_hourly_probe_red failed_checks="
+            + ",".join(failed_checks)
+            + (f" diagnostic_codes={diagnostic_codes}" if diagnostic_codes else ""),
             file=sys.stderr,
             flush=True,
         )
