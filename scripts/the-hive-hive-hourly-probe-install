@@ -988,6 +988,10 @@ def _materialize_hourly_probe_units(
     """Install the pair exclusively from the release that is about to be Current."""
 
     try:
+        _source_directory(units)
+    except InstallError as exc:
+        raise InstallError("install_release_retention_failed") from exc
+    try:
         service_template = layout.read_attested_file(
             "systemd/user/the-hive-hive-hourly-probe.service"
         )
@@ -1202,9 +1206,6 @@ def _publish_runtime_generation(
         if target.exists() or target.is_symlink():
             raise InstallError("install_release_generation_exists")
         pointers = _read_release_pointers(release_root)
-        discovered_live = _installed_live_generations(
-            release_root=release_root, units=live_unit_dir
-        )
         try:
             os.rename(stage, target)
         except OSError as exc:
@@ -1217,6 +1218,15 @@ def _publish_runtime_generation(
             raise InstallError("install_stage_validation_failed") from exc
         if _release_pointer_entry(layout) != entry:
             raise InstallError("install_release_invalid")
+        if live_unit_dir is not None:
+            _materialize_hourly_probe_units(
+                layout=layout,
+                units=live_unit_dir,
+                generation=entry["generation"],
+            )
+        discovered_live = _installed_live_generations(
+            release_root=release_root, units=live_unit_dir
+        )
         # Prune before Current changes.  Keep both old pointer entries for
         # this transition, which is conservative by one generation but means
         # a retention error cannot leave a caller seeing a failed publish
@@ -1303,14 +1313,15 @@ def install(*, home: Path) -> dict[str, object]:
         live_unit_dir=units,
     )
     _materialize_legacy_probe_launcher(layout=layout, libexec=libexec)
-    _materialize_hourly_probe_units(
-        layout=layout,
-        units=units,
-        generation=_release_pointer_entry(layout)["generation"],
-    )
+    generation = _release_pointer_entry(layout)["generation"]
+    if _unit_bound_generation(
+        release_root=library / _RUNTIME_ROOT_NAME,
+        source=units / "the-hive-hive-hourly-probe.service",
+    ) != generation:
+        raise InstallError("install_release_retention_failed")
     return {
         "status": "installed",
-        "generation": _release_pointer_entry(layout)["generation"],
+        "generation": generation,
         "manifest_digest": layout.manifest_digest,
         "raw_output": "not_returned",
     }

@@ -1180,6 +1180,75 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     assert not list(runtime_root.rglob("__pycache__"))
 
 
+def test_probe_installer_upgrades_a_valid_83_generation_only_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exact 83abaae unit is replaced, never accepted as post-install authority."""
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    release_commit = {"value": "a" * 40}
+    monkeypatch.setitem(
+        installer["install"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: release_commit["value"],
+    )
+    first = installer["install"](home=home)
+    first_generation = first["generation"]
+    assert isinstance(first_generation, str)
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    service = (
+        home
+        / ".config"
+        / "systemd"
+        / "user"
+        / "the-hive-hive-hourly-probe.service"
+    )
+    root_binding = (
+        "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:"
+        "%h/.local/lib/the-hive-runtime:norbind"
+    )
+    legacy_binding = (
+        "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime/generations/"
+        f"{first_generation}:%h/.local/lib/the-hive-runtime/generations/"
+        f"{first_generation}:norbind"
+    )
+    current_service = service.read_text(encoding="utf-8")
+    legacy_service = current_service.replace(
+        "# RuntimeLayout attests the release pointer and both retained generations.\n"
+        + root_binding,
+        legacy_binding,
+    )
+    assert legacy_service != current_service
+    service.write_text(legacy_service, encoding="utf-8")
+    service.chmod(0o644)
+    with pytest.raises(
+        installer["InstallError"], match="install_release_retention_failed"
+    ):
+        installer["_unit_bound_generation"](release_root=release_root, source=service)
+
+    release_commit["value"] = "b" * 40
+    upgraded = installer["install"](home=home)
+
+    upgraded_generation = upgraded["generation"]
+    assert upgraded_generation == "b" * 40
+    upgraded_service = service.read_text(encoding="utf-8")
+    assert root_binding in upgraded_service
+    assert legacy_binding not in upgraded_service
+    assert (
+        installer["_unit_bound_generation"](release_root=release_root, source=service)
+        == upgraded_generation
+    )
+    pointers = json.loads(
+        (release_root / ".the-hive-release-pointers.json").read_text(encoding="utf-8")
+    )
+    assert pointers["current"]["generation"] == upgraded_generation
+    assert pointers["previous"]["generation"] == first_generation
+
+
 def test_legacy_probe_refuses_tampered_release_metadata_before_running_the_entrypoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
