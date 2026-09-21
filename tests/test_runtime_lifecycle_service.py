@@ -179,22 +179,27 @@ def test_legacy_installer_cli_rejects_a_second_mutating_operator_route(
     assert not (tmp_path / "home").exists()
 
 
-def test_consumer_producer_contract_requires_named_attested_constants_not_substrings() -> None:
-    valid = b"\n".join(
-        (
-            *(
-                f'{name} = "{value}"'.encode("ascii")
-                for name, value in runtime_lifecycle._PRODUCER_CONSUMER_CONTRACT.items()
-            ),
-            b'if python_directory[2] != "python3.14":\n    raise ValueError()',
-        )
+def test_d299_consumer_producer_contract_accepts_only_named_06541_identity() -> None:
+    """Catches a runtime image that retains the retired .540 pin or a fallback."""
+
+    valid = (
+        b'_PRODUCER_VERSION = "0.6.541"\n'
+        b'_PRODUCER_SOURCE_MANIFEST_SHA256 = "4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce"\n'
+        b'_PRODUCER_RELEASE_ID = "0.6.541-4cb02fabfb5a4b30"\n'
+        b'if python_directory[2] != "python3.14":\n    raise ValueError()\n'
     )
-    heuristic_only = b"# " + b" ".join(
-        value.encode("ascii")
-        for value in runtime_lifecycle._PRODUCER_CONSUMER_CONTRACT.values()
+    retired = valid.replace(b'"0.6.541"', b'"0.6.540"')
+    other_version = valid.replace(b'"0.6.541"', b'"0.6.542"')
+    other_manifest = valid.replace(
+        b"4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce",
+        b"0" * 64,
     )
+    heuristic_only = b"# " + valid
 
     assert runtime_lifecycle._consumer_producer_contract(valid) is True
+    assert runtime_lifecycle._consumer_producer_contract(retired) is False
+    assert runtime_lifecycle._consumer_producer_contract(other_version) is False
+    assert runtime_lifecycle._consumer_producer_contract(other_manifest) is False
     assert runtime_lifecycle._consumer_producer_contract(heuristic_only) is False
 
 

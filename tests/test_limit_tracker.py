@@ -26,7 +26,7 @@ from the_hive.usage_snapshot import (
 
 NOW = datetime(2026, 8, 26, 18, 0, tzinfo=UTC)
 GENERATION = "1" * 32
-SOURCE_DIGEST = "7980ba26b1a64f85a54e126950021e6d75bb7dde9b7b296bd5d118fa6dadb78f"
+SOURCE_DIGEST = "4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce"
 RESET = "2026-08-27T00:00:00Z"
 
 
@@ -161,7 +161,7 @@ class EvidenceTree:
         root: Path,
         payload: dict[str, object],
         *,
-        producer_version: str = "0.6.540",
+        producer_version: str = "0.6.541",
         python_version: str = "3.14",
     ) -> None:
         self.root = private_dir(root)
@@ -507,7 +507,7 @@ def add_previous_generation(tree: EvidenceTree) -> Path:
     return binding_path
 
 
-def test_active_0_6_540_python_3_14_attested_layout_reads_complete(
+def test_d299_active_0_6_541_python_3_14_attested_layout_reads_complete(
     evidence: EvidenceTree,
 ) -> None:
     result = read(evidence)
@@ -527,20 +527,22 @@ def test_old_0_6_536_python_3_13_attested_layout_is_rejected(tmp_path: Path) -> 
     assert read(legacy).status == "invalid"
 
 
-def test_active_0_6_540_python_3_13_attestation_path_is_rejected(
+def test_d299_active_0_6_541_python_3_13_attestation_path_is_rejected(
     tmp_path: Path,
 ) -> None:
     wrong_python_path = EvidenceTree(
         tmp_path / "wrong-python-path",
         document(),
-        producer_version="0.6.540",
+        producer_version="0.6.541",
         python_version="3.13",
     )
 
     assert read(wrong_python_path).status == "invalid"
 
 
-@pytest.mark.parametrize("retired_version", ("0.6.537", "0.6.538", "0.6.539"))
+@pytest.mark.parametrize(
+    "retired_version", ("0.6.537", "0.6.538", "0.6.539", "0.6.540")
+)
 def test_current_binding_retired_producer_is_rejected(
     evidence: EvidenceTree, retired_version: str
 ) -> None:
@@ -548,6 +550,58 @@ def test_current_binding_retired_producer_is_rejected(
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
     binding["usage_binding"]["producer_version"] = retired_version
     private_file(binding_path, canonical(binding))
+    pointer_path = evidence.integration / "current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["current_binding_sha256"] = hashlib.sha256(
+        binding_path.read_bytes()
+    ).hexdigest()
+    private_file(pointer_path, canonical(pointer))
+
+    assert read(evidence).status == "invalid"
+
+
+@pytest.mark.parametrize("other_version", ("0.6.540", "0.6.542"))
+def test_d299_active_release_accepts_no_other_producer_version(
+    tmp_path: Path, other_version: str
+) -> None:
+    """Catches a consumer that accepts an adjacent or retired release line."""
+
+    candidate = EvidenceTree(
+        tmp_path / other_version,
+        document(),
+        producer_version=other_version,
+    )
+
+    assert read(candidate).status == "invalid"
+
+
+def test_d299_active_release_rejects_a_fully_rebound_other_source_manifest(
+    evidence: EvidenceTree,
+) -> None:
+    """Catches a consumer that accepts a .541 release from an unbound source tree."""
+
+    unexpected_manifest = "f" * 64
+    active_path = evidence.integration / "active.json"
+    active = json.loads(active_path.read_text(encoding="utf-8"))
+    active["source_manifest_sha256"] = unexpected_manifest
+    private_file(active_path, canonical(active))
+
+    binding_path = evidence.generations / GENERATION / "account-usage-v2.binding.json"
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    usage = binding["usage_binding"]
+    usage["active_manifest_sha256"] = hashlib.sha256(active_path.read_bytes()).hexdigest()
+    usage["source_manifest_sha256"] = unexpected_manifest
+
+    authority_path = evidence.generations / GENERATION / "pool-authority-v2.json"
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority["usage_binding_sha256"] = hashlib.sha256(canonical(usage)).hexdigest()
+    private_file(authority_path, canonical(authority))
+    binding["pool_authority_sha256"] = hashlib.sha256(
+        authority_path.read_bytes()
+    ).hexdigest()
+    binding["pool_authority_size_bytes"] = authority_path.stat().st_size
+    private_file(binding_path, canonical(binding))
+
     pointer_path = evidence.integration / "current.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
     pointer["current_binding_sha256"] = hashlib.sha256(

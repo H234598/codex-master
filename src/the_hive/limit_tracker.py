@@ -23,11 +23,11 @@ from the_hive.usage_snapshot import (
 )
 
 
-_PRODUCER_VERSION = "0.6.540"
+_PRODUCER_VERSION = "0.6.541"
 _PRODUCER_SOURCE_MANIFEST_SHA256 = (
-    "7980ba26b1a64f85a54e126950021e6d75bb7dde9b7b296bd5d118fa6dadb78f"
+    "4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce"
 )
-_PRODUCER_RELEASE_ID = "0.6.540-7980ba26b1a64f85"
+_PRODUCER_RELEASE_ID = "0.6.541-4cb02fabfb5a4b30"
 _SPARK_POOL = "gpt-5.3-codex-spark"
 _WINDOW_SECONDS = frozenset({18_000, 604_800, 2_592_000})
 _MAX_POINTER_BYTES = 4_096
@@ -675,7 +675,7 @@ def _verify_active(
         ),
         "record_path": str(
             release
-            / "venv/lib/python3.14/site-packages/codex_usage_integration_producer-0.6.540.dist-info/RECORD"
+            / "venv/lib/python3.14/site-packages/codex_usage_integration_producer-0.6.541.dist-info/RECORD"
         ),
     }
     if any(active[name] != value for name, value in expected_paths.items()):
@@ -694,7 +694,7 @@ def _verify_active(
         ),
         (
             "record_sha256",
-            "./venv/lib/python3.14/site-packages/codex_usage_integration_producer-0.6.540.dist-info/RECORD",
+            "./venv/lib/python3.14/site-packages/codex_usage_integration_producer-0.6.541.dist-info/RECORD",
         ),
     ):
         if (

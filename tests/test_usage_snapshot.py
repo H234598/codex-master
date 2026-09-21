@@ -20,7 +20,7 @@ PRODUCER_NOW = datetime(2026, 8, 31, 12, 1, tzinfo=UTC)
 PRODUCER_ROOT = Path(
     os.environ.get("THE_HIVE_TEST_CODEX_USAGE_ROOT", "/home/teladi/codex-usage")
 )
-PRODUCER_COMMIT = "a4e2c54fbf179470b7795a47d2949b43d858eb3b"
+PRODUCER_COMMIT = "61d9046077d36ecdc99efd3713d837af9a9e708b"
 PRODUCER_SOURCE_FILES = (
     "pyproject.toml",
     "src/codex_usage/__init__.py",
@@ -36,8 +36,10 @@ PRODUCER_SOURCE_FILES = (
     "src/codex_usage/json_utils.py",
     "src/codex_usage/models.py",
     "src/codex_usage/history.py",
+    "src/codex_usage/pool_authority_owner.py",
     "src/codex_usage/private_io.py",
     "src/codex_usage/source_lock.py",
+    "src/codex_usage/state_maintenance.py",
     "src/codex_usage/state.py",
     "src/codex_usage/usage_limits.py",
     "src/codex_usage/usage_resets.py",
@@ -86,7 +88,7 @@ def write_producer_source(root: Path) -> Path:
 def write_producer_golden(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, dict[str, Path]]:
-    """Create authentic, pinned 0.6.540 bytes only in pytest's temp directory."""
+    """Create authentic, pinned D299 bytes only in pytest's temp directory."""
     source_root = write_producer_source(tmp_path)
     state_home = tmp_path / "producer-state"
     data_home = tmp_path / "producer-data"
@@ -196,7 +198,7 @@ def refresh_current_binding(paths: dict[str, Path]) -> None:
     private_file(paths["pointer"], canonical(pointer))
 
 
-def test_pinned_producer_06540_golden_generation_is_complete(
+def test_d299_pinned_producer_06541_golden_generation_is_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, _paths = write_producer_golden(tmp_path, monkeypatch)
@@ -209,12 +211,31 @@ def test_pinned_producer_06540_golden_generation_is_complete(
     assert type(result) is usage_snapshot.UsageEvidenceV2
     assert not hasattr(result, "_reader_attestation")
     assert tuple(account.account_id for account in result.accounts) == ("synthetic-alpha",)
-    pointer = json.loads(
-        (state_home / "codex-usage" / "integration" / "current.json").read_text(
-            encoding="utf-8"
-        )
+    integration = state_home / "codex-usage" / "integration"
+    pointer = json.loads((integration / "current.json").read_text(encoding="utf-8"))
+    active = json.loads((integration / "active.json").read_text(encoding="utf-8"))
+    binding = json.loads(
+        (
+            integration
+            / "generations"
+            / pointer["current_generation_id"]
+            / "account-usage-v2.binding.json"
+        ).read_text(encoding="utf-8")
     )
+
     assert result.generation_id == pointer["current_generation_id"]
+    assert active["version"] == "0.6.541"
+    assert active["release_id"] == "0.6.541-4cb02fabfb5a4b30"
+    assert (
+        active["source_manifest_sha256"]
+        == "4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce"
+    )
+    assert binding["usage_binding"]["producer_version"] == "0.6.541"
+    assert binding["usage_binding"]["release_id"] == "0.6.541-4cb02fabfb5a4b30"
+    assert (
+        binding["usage_binding"]["source_manifest_sha256"]
+        == "4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce"
+    )
 
 
 def _write_json(path: Path, value: object, *, newline: bool = False) -> None:
@@ -275,7 +296,9 @@ def test_06538_closed_field_sets_are_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-@pytest.mark.parametrize("retired_version", ("0.6.537", "0.6.538", "0.6.539"))
+@pytest.mark.parametrize(
+    "retired_version", ("0.6.537", "0.6.538", "0.6.539", "0.6.540")
+)
 @pytest.mark.parametrize(
     ("target", "field"),
     (
