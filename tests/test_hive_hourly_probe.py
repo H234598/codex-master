@@ -154,7 +154,9 @@ def green_hive_runtime() -> dict[str, object]:
         "authority": "ready",
         "state": "ready",
         "pilot": "ready",
-        "global_pilot_readiness": green_probe(NOW.isoformat())["global_pilot_readiness"],
+        "global_pilot_readiness": green_probe(NOW.isoformat())[
+            "global_pilot_readiness"
+        ],
         "reason_codes": [],
         "mutation_performed": False,
         "raw_output": "not_returned",
@@ -235,9 +237,16 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     )
     write("codex-agent-classes.json", "{}")
     for relative in (
-        "admission.py", "admission_runtime.py", "dynamic_pool.py", "hive/__init__.py",
-        "hive/admission.py", "hive/dispatch.py", "hive/principals.py", "selection.py",
-        "selection_service.py", "server.py",
+        "admission.py",
+        "admission_runtime.py",
+        "dynamic_pool.py",
+        "hive/__init__.py",
+        "hive/admission.py",
+        "hive/dispatch.py",
+        "hive/principals.py",
+        "selection.py",
+        "selection_service.py",
+        "server.py",
     ):
         write(
             f"src/the_hive/{relative}",
@@ -251,9 +260,7 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
     (root / ".the-hive-runtime-manifest.json").unlink()
-    installer["_write_runtime_image_manifest"](
-        root=root, commit=TEST_NON_F25_COMMIT
-    )
+    installer["_write_runtime_image_manifest"](root=root, commit=TEST_NON_F25_COMMIT)
     return RuntimeLayout.from_runtime_root(root)
 
 
@@ -322,7 +329,9 @@ def test_probe_evaluation_rejects_unknown_canonical_hive_evidence_states() -> No
     assert result["checks"]["hive_runtime"] is False
 
 
-def test_bounded_global_pilot_readiness_drops_generation_id_for_malformed_input() -> None:
+def test_bounded_global_pilot_readiness_drops_generation_id_for_malformed_input() -> (
+    None
+):
     malformed = green_probe(NOW.isoformat())["global_pilot_readiness"]
     assert isinstance(malformed, dict)
     malformed["reason_codes"] = "not-a-list"
@@ -571,8 +580,14 @@ def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics
 
     assert status_layouts == [layout]
     assert bounded_commands == [
-        ((str(release_root), generation, layout.manifest_digest, "hive", "status"), "hive_status"),
-        ((str(release_root), generation, layout.manifest_digest, "hive", "doctor"), "hive_doctor"),
+        (
+            (str(release_root), generation, layout.manifest_digest, "hive", "status"),
+            "hive_status",
+        ),
+        (
+            (str(release_root), generation, layout.manifest_digest, "hive", "doctor"),
+            "hive_doctor",
+        ),
     ]
     assert result["commands"]["runtime_status"] is True
 
@@ -655,26 +670,26 @@ def test_bounded_hive_diagnostic_names_the_timed_out_phase(
     (
         (
             BoundedProcessResult(returncode=7, stdout="{}", stderr="bounded error"),
-                {
-                    "code": "command_exit_nonzero",
-                    "exit_code": 7,
-                    "stderr": {
-                        "state": "present",
-                        "excerpt": "bounded error",
-                        "redaction_applied": False,
-                    },
+            {
+                "code": "command_exit_nonzero",
+                "exit_code": 7,
+                "stderr": {
+                    "state": "present",
+                    "excerpt": "bounded error",
+                    "redaction_applied": False,
+                },
             },
         ),
         (
             BoundedProcessResult(returncode=0, stdout="{", stderr=""),
-                {
-                    "code": "command_json_invalid",
-                    "exit_code": 0,
-                    "stderr": {
-                        "state": "empty",
-                        "excerpt": "",
-                        "redaction_applied": False,
-                    },
+            {
+                "code": "command_json_invalid",
+                "exit_code": 0,
+                "stderr": {
+                    "state": "empty",
+                    "excerpt": "",
+                    "redaction_applied": False,
+                },
             },
         ),
     ),
@@ -686,7 +701,9 @@ def test_bounded_hive_diagnostic_persists_a_safe_command_cause(
     expected: dict[str, object],
 ) -> None:
     layout = runtime_layout(tmp_path)
-    monkeypatch.setattr(hourly_probe_module, "run_bounded", lambda *_args, **_kwargs: completed)
+    monkeypatch.setattr(
+        hourly_probe_module, "run_bounded", lambda *_args, **_kwargs: completed
+    )
 
     assert hourly_probe_module._run_json(
         layout, layout.mcp_entrypoint, "hive", "doctor", phase="hive_doctor"
@@ -742,7 +759,10 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
         "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind"
         in service_text
     )
-    assert "%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:" not in service_text
+    assert (
+        "%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:"
+        not in service_text
+    )
     assert "BindReadOnlyPaths=%h/.local:%h/.local" not in service_text
     assert (
         "BindPaths=%h/.local/state/codex-master-mcp:%h/.local/state/codex-master-mcp:norbind"
@@ -764,10 +784,12 @@ def test_hourly_probe_service_renderer_rejects_a_generation_only_sandbox() -> No
     )
     install_error = installer["InstallError"]
     template = (
-        ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
-    ).read_bytes().replace(
-        b"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind",
-        b"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:norbind",
+        (ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service")
+        .read_bytes()
+        .replace(
+            b"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind",
+            b"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:norbind",
+        )
     )
 
     with pytest.raises(install_error, match="install_release_template_invalid"):
@@ -862,7 +884,9 @@ def test_hourly_probe_runtime_wrapper_reports_each_local_failure_with_bounded_st
         assert len(completed.stderr.encode("utf-8")) <= 128
 
 
-def test_hourly_probe_direct_entrypoint_runs_without_an_argument(monkeypatch, capsys) -> None:
+def test_hourly_probe_direct_entrypoint_runs_without_an_argument(
+    monkeypatch, capsys
+) -> None:
     monkeypatch.setattr(
         hourly_probe_module,
         "run_probe",
@@ -890,7 +914,9 @@ def test_hourly_probe_direct_entrypoint_reports_invalid_arguments(capsys) -> Non
     )
 
 
-def test_hourly_probe_direct_entrypoint_explains_a_red_result(monkeypatch, capsys) -> None:
+def test_hourly_probe_direct_entrypoint_explains_a_red_result(
+    monkeypatch, capsys
+) -> None:
     monkeypatch.setattr(
         hourly_probe_module,
         "run_probe",
@@ -916,7 +942,9 @@ def test_red_probe_publishes_a_hive_wide_alarm_for_the_repository_queen(
 ) -> None:
     state_directory = tmp_path / "state"
     layout = runtime_layout(tmp_path)
-    monkeypatch.setattr(hourly_probe_module, "runtime_status", lambda *, layout: {"ok": False})
+    monkeypatch.setattr(
+        hourly_probe_module, "runtime_status", lambda *, layout: {"ok": False}
+    )
 
     result = run_probe(
         layout=layout,
@@ -963,6 +991,38 @@ def test_red_probe_publishes_a_hive_wide_alarm_for_the_repository_queen(
     assert not (state_directory / "hive-hourly-alarm.json").exists()
 
 
+def test_lifecycle_rollback_failure_publishes_the_same_fail_closed_hive_alarm(
+    tmp_path: Path,
+) -> None:
+    state_directory = tmp_path / "state"
+    layout = runtime_layout(tmp_path)
+
+    result = hourly_probe_module.publish_lifecycle_failure(
+        layout=layout,
+        state_directory=state_directory,
+        reason_code="runtime_lifecycle_rollback_failed",
+        now=lambda: NOW,
+    )
+
+    assert result["checks"] == {
+        "runtime_layout": False,
+        "hive_runtime": False,
+        "hive_doctor": False,
+    }
+    assert result["alarm"]["status"] == "active"
+    assert result["alarm"]["owner"]["principal_id"] == "queen-codex-master"
+    assert (
+        result["diagnostics"]["runtime_status"]["code"]
+        == "runtime_lifecycle_rollback_failed"
+    )
+    assert (
+        read_probe_gate(
+            state_file=state_directory / "hive-hourly-health.json", now=NOW
+        )["allowed"]
+        is False
+    )
+
+
 def test_spawn_gate_rejects_a_health_record_without_a_consistent_global_alarm() -> None:
     healthy = green_probe(NOW.isoformat())
     assert probe_spawn_gate(healthy, now=NOW)["allowed"] is True
@@ -983,7 +1043,9 @@ def test_a_green_probe_closes_the_global_alarm_in_its_same_health_record(
     state_directory = tmp_path / "state"
     layout = runtime_layout(tmp_path)
     direct_status: dict[str, object] = {"ok": False}
-    monkeypatch.setattr(hourly_probe_module, "runtime_status", lambda *, layout: direct_status)
+    monkeypatch.setattr(
+        hourly_probe_module, "runtime_status", lambda *, layout: direct_status
+    )
 
     def runner(_command: Path, *arguments: str) -> tuple[dict[str, object], bool]:
         if arguments == ("hive", "status"):
@@ -1000,7 +1062,9 @@ def test_a_green_probe_closes_the_global_alarm_in_its_same_health_record(
             True,
         )
 
-    run_probe(layout=layout, state_directory=state_directory, now=lambda: NOW, runner=runner)
+    run_probe(
+        layout=layout, state_directory=state_directory, now=lambda: NOW, runner=runner
+    )
     direct_status = green_runtime_status()
     result = run_probe(
         layout=layout, state_directory=state_directory, now=lambda: NOW, runner=runner
@@ -1009,10 +1073,13 @@ def test_a_green_probe_closes_the_global_alarm_in_its_same_health_record(
     assert result["alarm"]["status"] == "cleared"
     state_file = state_directory / "hive-hourly-health.json"
     assert read_probe_gate(state_file=state_file, now=NOW)["allowed"] is True
-    assert json.loads(state_file.read_text(encoding="utf-8"))["alarm"]["reason_codes"] == []
+    assert (
+        json.loads(state_file.read_text(encoding="utf-8"))["alarm"]["reason_codes"]
+        == []
+    )
 
 
-def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
+def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime_image(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
@@ -1020,10 +1087,10 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
     installer = runpy.run_path(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
-    installer["install"].__globals__["_verified_release_commit"] = lambda _repository: (  # type: ignore[index]
+    installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = lambda _repository: (  # type: ignore[index]
         "a" * 40
     )
-    installed = installer["install"](home=home)  # type: ignore[operator]
+    installed = installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
     assert installed["status"] == "installed"
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     pointers = json.loads(
@@ -1067,7 +1134,10 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind"
         in installed_service_text
     )
-    assert f"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime/generations/{generation}:" not in installed_service_text
+    assert (
+        f"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime/generations/{generation}:"
+        not in installed_service_text
+    )
     assert "BindReadOnlyPaths=%h/.local:%h/.local" not in installed_service_text
     assert (
         "ExecStart=%h/.local/lib/the-hive-runtime/generations/"
@@ -1076,9 +1146,7 @@ def test_probe_cold_installer_materializes_one_complete_regular_runtime_image(
         f"{generation} {installed['manifest_digest']} --json"
     ) in installed_service_text
     installed_cli = runtime_root / "bin" / "the-hive-mcp"
-    installed_source = (
-        runtime_root / "src" / "the_hive" / "hive" / "hourly_probe.py"
-    )
+    installed_source = runtime_root / "src" / "the_hive" / "hive" / "hourly_probe.py"
     for path, mode in (
         (installed_cli, 0o755),
         (installed_source, 0o644),
@@ -1192,20 +1260,16 @@ def test_probe_installer_upgrades_a_valid_83_generation_only_unit(
     )
     release_commit = {"value": "a" * 40}
     monkeypatch.setitem(
-        installer["install"].__globals__,
+        installer["_install_attested_runtime"].__globals__,
         "_verified_release_commit",
         lambda _repository: release_commit["value"],
     )
-    first = installer["install"](home=home)
+    first = installer["_install_attested_runtime"](home=home)
     first_generation = first["generation"]
     assert isinstance(first_generation, str)
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     service = (
-        home
-        / ".config"
-        / "systemd"
-        / "user"
-        / "the-hive-hive-hourly-probe.service"
+        home / ".config" / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
     )
     root_binding = (
         "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:"
@@ -1231,7 +1295,7 @@ def test_probe_installer_upgrades_a_valid_83_generation_only_unit(
         installer["_unit_bound_generation"](release_root=release_root, source=service)
 
     release_commit["value"] = "b" * 40
-    upgraded = installer["install"](home=home)
+    upgraded = installer["_install_attested_runtime"](home=home)
 
     upgraded_generation = upgraded["generation"]
     assert upgraded_generation == "b" * 40
@@ -1249,7 +1313,7 @@ def test_probe_installer_upgrades_a_valid_83_generation_only_unit(
     assert pointers["previous"]["generation"] == first_generation
 
 
-def test_probe_installer_rolls_back_unit_pair_after_timer_materialization_failure(
+def test_internal_attested_runtime_api_rolls_back_unit_pair_after_timer_materialization_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed timer replacement leaves a complete old pair and a retryable release."""
@@ -1261,11 +1325,11 @@ def test_probe_installer_rolls_back_unit_pair_after_timer_materialization_failur
     )
     release_commit = {"value": "a" * 40}
     monkeypatch.setitem(
-        installer["install"].__globals__,
+        installer["_install_attested_runtime"].__globals__,
         "_verified_release_commit",
         lambda _repository: release_commit["value"],
     )
-    first = installer["install"](home=home)
+    first = installer["_install_attested_runtime"](home=home)
     first_generation = first["generation"]
     assert isinstance(first_generation, str)
     release_root = home / ".local" / "lib" / "the-hive-runtime"
@@ -1289,11 +1353,13 @@ def test_probe_installer_rolls_back_unit_pair_after_timer_materialization_failur
         fail_timer,
     )
     with pytest.raises(installer["InstallError"], match="install_target_untrusted"):
-        installer["install"](home=home)
+        installer["_install_attested_runtime"](home=home)
 
     assert service.read_bytes() == old_service
     assert timer.read_bytes() == old_timer
-    assert (release_root / ".the-hive-release-pointers.json").read_bytes() == old_pointers
+    assert (
+        release_root / ".the-hive-release-pointers.json"
+    ).read_bytes() == old_pointers
     assert not (release_root / "generations" / ("b" * 40)).exists()
 
     monkeypatch.setitem(
@@ -1301,7 +1367,7 @@ def test_probe_installer_rolls_back_unit_pair_after_timer_materialization_failur
         "_install_attested_bytes",
         install_attested_bytes,
     )
-    retried = installer["install"](home=home)
+    retried = installer["_install_attested_runtime"](home=home)
 
     assert retried["generation"] == "b" * 40
     assert (
@@ -1319,16 +1385,20 @@ def test_legacy_probe_refuses_tampered_release_metadata_before_running_the_entry
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
     monkeypatch.setitem(
-        installer["install"].__globals__, "_verified_release_commit", lambda _repository: "a" * 40
+        installer["_install_attested_runtime"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: "a" * 40,
     )
-    installed = installer["install"](home=home)
+    installed = installer["_install_attested_runtime"](home=home)
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     pointer = release_root / ".the-hive-release-pointers.json"
     pointer_original = pointer.read_bytes()
     pointer_mode = stat.S_IMODE(pointer.lstat().st_mode)
     generation = installed["generation"]
     assert isinstance(generation, str)
-    entrypoint = release_root / "generations" / generation / "bin" / "the-hive-hive-hourly-probe"
+    entrypoint = (
+        release_root / "generations" / generation / "bin" / "the-hive-hive-hourly-probe"
+    )
     entrypoint_original = entrypoint.read_bytes()
     legacy_probe = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
     pointer.write_text(
@@ -1386,9 +1456,11 @@ def test_legacy_probe_never_imports_runtime_image_before_attestation(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
     monkeypatch.setitem(
-        installer["install"].__globals__, "_verified_release_commit", lambda _repository: "a" * 40
+        installer["_install_attested_runtime"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: "a" * 40,
     )
-    installed = installer["install"](home=home)
+    installed = installer["_install_attested_runtime"](home=home)
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     generation = installed["generation"]
     assert isinstance(generation, str)
@@ -1436,19 +1508,16 @@ def test_legacy_probe_rejects_preexisting_image_bytecode_fail_closed(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
     monkeypatch.setitem(
-        installer["install"].__globals__, "_verified_release_commit", lambda _repository: "a" * 40
+        installer["_install_attested_runtime"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: "a" * 40,
     )
-    installed = installer["install"](home=home)
+    installed = installer["_install_attested_runtime"](home=home)
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     generation = installed["generation"]
     assert isinstance(generation, str)
     bytecode = (
-        release_root
-        / "generations"
-        / generation
-        / "src"
-        / "the_hive"
-        / "__pycache__"
+        release_root / "generations" / generation / "src" / "the_hive" / "__pycache__"
     )
     bytecode.mkdir(mode=0o700)
     (bytecode / "runtime_layout.cpython-313.pyc").write_bytes(b"untrusted")
@@ -1481,18 +1550,16 @@ def test_legacy_probe_executes_the_attested_entry_by_pinned_descriptor(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
     monkeypatch.setitem(
-        installer["install"].__globals__, "_verified_release_commit", lambda _repository: "a" * 40
+        installer["_install_attested_runtime"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: "a" * 40,
     )
-    installed = installer["install"](home=home)
+    installed = installer["_install_attested_runtime"](home=home)
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     generation = installed["generation"]
     assert isinstance(generation, str)
     entrypoint = (
-        release_root
-        / "generations"
-        / generation
-        / "bin"
-        / "the-hive-hive-hourly-probe"
+        release_root / "generations" / generation / "bin" / "the-hive-hive-hourly-probe"
     )
     original = entrypoint.stat()
     legacy_probe = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
@@ -1507,7 +1574,9 @@ def test_legacy_probe_executes_the_attested_entry_by_pinned_descriptor(
     def unexpected_run_module(*_args: object, **_kwargs: object) -> object:
         raise UnexpectedPathExecution
 
-    def pinned_exec(path: str, _arguments: list[str], _environment: dict[str, str]) -> None:
+    def pinned_exec(
+        path: str, _arguments: list[str], _environment: dict[str, str]
+    ) -> None:
         replacement = entrypoint.with_name(".probe-entrypoint-replacement")
         replacement.write_text("#!/usr/bin/bash\nexit 99\n", encoding="utf-8")
         replacement.chmod(0o755)
@@ -1766,20 +1835,25 @@ def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen
     legacy_bin.parent.mkdir(mode=0o700, parents=True)
     legacy_bin.symlink_to(foreign_bin_target)
 
-    installer["install"].__globals__["_verified_release_commit"] = lambda _repository: (  # type: ignore[index]
+    installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = lambda _repository: (  # type: ignore[index]
         "a" * 40
     )
-    result = installer["install"](home=home)
+    result = installer["_install_attested_runtime"](home=home)
 
     runtime_root = library / "the-hive-runtime"
     generation = result["generation"]
     assert result["status"] == "installed"
     assert result["raw_output"] == "not_returned"
     assert isinstance(generation, str)
-    assert (runtime_root / "generations" / generation / "bin" / "the-hive-mcp").is_file()
-    assert RuntimeLayout.from_current_release(
-        runtime_root, generation, result["manifest_digest"]
-    ).root == runtime_root / "generations" / generation
+    assert (
+        runtime_root / "generations" / generation / "bin" / "the-hive-mcp"
+    ).is_file()
+    assert (
+        RuntimeLayout.from_current_release(
+            runtime_root, generation, result["manifest_digest"]
+        ).root
+        == runtime_root / "generations" / generation
+    )
     assert legacy_marker.read_text(encoding="utf-8") == "legacy root\n"
     assert legacy_libexec.read_text(encoding="utf-8") != "legacy libexec\n"
     assert not legacy_libexec.is_symlink()
@@ -1835,7 +1909,9 @@ def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
         installer["_validate_runtime_image_stage"].__globals__, "run_bounded", run
     )
     monkeypatch.setitem(
-        installer["_validate_runtime_image_stage"].__globals__, "_mcp_surface", lambda *_args: {"ok": True}
+        installer["_validate_runtime_image_stage"].__globals__,
+        "_mcp_surface",
+        lambda *_args: {"ok": True},
     )
     installer["_validate_runtime_image_stage"](stage=stage, home=tmp_path / "home")
 
@@ -1848,9 +1924,35 @@ def test_runtime_image_stage_validation_runs_only_the_three_v2_diagnostics(
         "runpy.run_module('the_hive.server', run_name='__main__', alter_sys=True)\n"
     )
     assert observed == [
-        ("/usr/bin/python3", "-I", "-B", "-c", stage_server, str(stage), "--runtime-status-mcp"),
-        ("/usr/bin/python3", "-I", "-B", "-c", stage_server, str(stage), "hive", "status"),
-        ("/usr/bin/python3", "-I", "-B", "-c", stage_server, str(stage), "hive", "doctor"),
+        (
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            "-c",
+            stage_server,
+            str(stage),
+            "--runtime-status-mcp",
+        ),
+        (
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            "-c",
+            stage_server,
+            str(stage),
+            "hive",
+            "status",
+        ),
+        (
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            "-c",
+            stage_server,
+            str(stage),
+            "hive",
+            "doctor",
+        ),
     ]
 
 
@@ -1882,14 +1984,23 @@ def test_named_runtime_generation_publish_failure_keeps_the_attested_current_poi
         "_write_release_pointers",
         fail_pointer,
     )
-    with pytest.raises(installer["InstallError"], match="install_release_pointer_write_failed"):
-        installer["_publish_runtime_generation"](stage=second, release_root=release_root)
+    with pytest.raises(
+        installer["InstallError"], match="install_release_pointer_write_failed"
+    ):
+        installer["_publish_runtime_generation"](
+            stage=second, release_root=release_root
+        )
 
-    assert (release_root / ".the-hive-release-pointers.json").read_bytes() == old_pointers
+    assert (
+        release_root / ".the-hive-release-pointers.json"
+    ).read_bytes() == old_pointers
     current = json.loads(old_pointers)["current"]
-    assert RuntimeLayout.from_current_release(
-        release_root, current["generation"], current["manifest_digest"]
-    ).root == release_root / "generations" / "first"
+    assert (
+        RuntimeLayout.from_current_release(
+            release_root, current["generation"], current["manifest_digest"]
+        ).root
+        == release_root / "generations" / "first"
+    )
 
 
 def test_runtime_image_build_failure_never_publishes_a_partial_stage(

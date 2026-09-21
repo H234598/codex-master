@@ -174,14 +174,14 @@ def test_production_publish_rechecks_clean_r2_base_descendant_after_stage_copy(
     home.mkdir(mode=0o700)
     identities = iter((TEST_MANIFEST_COMMIT, "b" * 40))
     monkeypatch.setitem(
-        installer["install"].__globals__,
+        installer["_install_attested_runtime"].__globals__,
         "_verified_release_commit",
         lambda _repository: next(identities),
     )
     with pytest.raises(
         installer["InstallError"], match="install_release_checkout_changed"
     ):  # type: ignore[index]
-        installer["install"](home=home)  # type: ignore[operator]
+        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     assert not (release_root / ".the-hive-release-pointers.json").exists()
 
@@ -238,17 +238,17 @@ def test_dirty_provenance_is_rejected_before_stage_or_pointer_mutation(
         raise installer["InstallError"]("install_release_checkout_dirty")  # type: ignore[index]
 
     monkeypatch.setitem(
-        installer["install"].__globals__, "_verified_release_commit", dirty
+        installer["_install_attested_runtime"].__globals__, "_verified_release_commit", dirty
     )
     monkeypatch.setitem(
-        installer["install"].__globals__,
+        installer["_install_attested_runtime"].__globals__,
         "_build_runtime_image",
         lambda **_kwargs: built.append("stage"),
     )
     with pytest.raises(
         installer["InstallError"], match="install_release_checkout_dirty"
     ):  # type: ignore[index]
-        installer["install"](home=home)  # type: ignore[operator]
+        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
     assert built == []
     assert not (home / ".local" / "lib" / "the-hive-runtime").exists()
 

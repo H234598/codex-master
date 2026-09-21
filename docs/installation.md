@@ -15,11 +15,9 @@ release is present or valid on a machine.
 requires a release root, generation, and manifest digest before any command
 arguments. Do not invoke it as a normal checkout command.
 
-The source-backed installer interface is:
-
-```sh
-./scripts/the-hive-hive-hourly-probe-install --home <absolute-home>
-```
+The historical `the-hive-hive-hourly-probe-install` executable is an internal
+installer entrypoint, not an operator interface. It intentionally rejects an
+operator invocation with `runtime_lifecycle_cutover_required`.
 
 ## Fleet watchdog migration
 
@@ -41,21 +39,30 @@ failure is fail-closed.  `status --home <absolute-home>` is the corresponding
 read-only, data-sparse inspection route.  Do not replace this route with
 hand-composed `systemctl` calls or let Codex-Usage manage these Fleet units.
 
-`<absolute-home>` must name an existing absolute home directory. The installer
+## Runtime lifecycle
+
+For a trusted owner's explicit authorization of the target home, the only
+public mutating runtime-lifecycle transaction is:
+
+```sh
+./scripts/the-hive-runtime-service cutover --home <absolute-home>
+```
+
+`<absolute-home>` must name an existing absolute home directory. The
+transaction binds the current source, Runtime Image and hourly-unit state,
+invokes the attested internal installer API, refreshes the same-UID user
+manager, migrates the old `codex-master-hive-hourly-probe` unit pair when
+present, and observes the installed argumentless probe. The internal installer
 requires a clean checkout, builds and validates a manifest-attested runtime
 generation, materializes the stable launcher beneath that home, and writes the
 `the-hive-hive-hourly-probe.service` and
-`the-hive-hive-hourly-probe.timer` user-unit files. This is a persistent local
-write and release-publication action, not a diagnostic command.
-
-## Authorization boundary
-
-Run the installer only through a trusted owner's current instructions and with
-explicit authorization for the target home. Apart from the Fleet-watchdog
-transaction above, this repository does not provide a verified procedure for
-user or system installation, unit activation, reload, secret provisioning, or
-a live smoke test. In particular, creating user-unit files is not evidence
-that the units are enabled or running.
+`the-hive-hive-hourly-probe.timer` user-unit files. The transaction rolls back
+the bound Runtime/unit state on a transaction error. Its only read-only
+companion commands are
+`./scripts/the-hive-runtime-service status --home <absolute-home>` and
+`./scripts/the-hive-runtime-service verify --home <absolute-home>`; both
+return bounded JSON and never start, enable, or repair units. Do not compose
+`systemctl`, wrapper, pointer, or unit-file steps outside this transaction.
 
 Do not substitute an arbitrary Python invocation, alter release pointers, or
 construct wrapper arguments manually. An attested generation binds its
@@ -63,10 +70,9 @@ manifest digest to the release layout.
 
 ## After an authorized installation
 
-Use the intended deployment interface for bounded, data-sparse status and
-diagnostics. The repository does not publish a general direct-CLI recipe for
-that interface. Record the reported generation and manifest digest without
-including secrets or raw private-state output.
+Use `./scripts/the-hive-runtime-service verify --home <absolute-home>` for the
+bounded, data-sparse postcondition report. Record its generation and manifest
+digest without including secrets or raw private-state output.
 
 See [configuration](configuration.md) for source-controlled inputs,
 [troubleshooting](operations/troubleshooting.md) for safe evidence gathering,

@@ -1,0 +1,21 @@
+#!/usr/bin/python3 -I
+"""The sole public operator surface for The-Hive runtime lifecycle changes."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "src"
+if not SOURCE.is_dir():
+    raise SystemExit("runtime_lifecycle_source_missing")
+sys.path.insert(0, os.fspath(SOURCE))
+
+from the_hive.runtime_lifecycle import main  # noqa: E402
+
+
+raise SystemExit(main())
