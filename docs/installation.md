@@ -21,6 +21,26 @@ The source-backed installer interface is:
 ./scripts/the-hive-hive-hourly-probe-install --home <absolute-home>
 ```
 
+## Fleet watchdog migration
+
+The Fleet watchdog is not a Codex-Usage publisher.  Once a trusted owner has
+authorized the local target home, its one-way namespace migration is performed
+only through this The-Hive transaction:
+
+```sh
+./scripts/the-hive-fleet-watchdog cutover --home <absolute-home>
+```
+
+The transaction binds the installed attested runtime and stable MCP launcher,
+the old and new unit files, their identities and the current user-manager
+states before it writes anything.  It stages the successor, refreshes the
+user-manager, quiesces the old Fleet supervisor, activates the successor and
+observes its bounded watchdog command before retiring the old units and wants.
+On any failure it restores and verifies the bound prior state; a rollback
+failure is fail-closed.  `status --home <absolute-home>` is the corresponding
+read-only, data-sparse inspection route.  Do not replace this route with
+hand-composed `systemctl` calls or let Codex-Usage manage these Fleet units.
+
 `<absolute-home>` must name an existing absolute home directory. The installer
 requires a clean checkout, builds and validates a manifest-attested runtime
 generation, materializes the stable launcher beneath that home, and writes the
@@ -31,10 +51,11 @@ write and release-publication action, not a diagnostic command.
 ## Authorization boundary
 
 Run the installer only through a trusted owner's current instructions and with
-explicit authorization for the target home. This repository does not provide a
-verified procedure for user or system installation, unit activation, reload,
-secret provisioning, or a live smoke test. In particular, creating user-unit
-files is not evidence that the units are enabled or running.
+explicit authorization for the target home. Apart from the Fleet-watchdog
+transaction above, this repository does not provide a verified procedure for
+user or system installation, unit activation, reload, secret provisioning, or
+a live smoke test. In particular, creating user-unit files is not evidence
+that the units are enabled or running.
 
 Do not substitute an arbitrary Python invocation, alter release pointers, or
 construct wrapper arguments manually. An attested generation binds its
