@@ -20,7 +20,7 @@ PRODUCER_NOW = datetime(2026, 8, 31, 12, 1, tzinfo=UTC)
 PRODUCER_ROOT = Path(
     os.environ.get("THE_HIVE_TEST_CODEX_USAGE_ROOT", "/home/teladi/codex-usage")
 )
-PRODUCER_COMMIT = "39b9a845d80b995e1e26f27d91001d044daca97a"
+PRODUCER_COMMIT = "a4e2c54fbf179470b7795a47d2949b43d858eb3b"
 PRODUCER_SOURCE_FILES = (
     "pyproject.toml",
     "src/codex_usage/__init__.py",
@@ -86,7 +86,7 @@ def write_producer_source(root: Path) -> Path:
 def write_producer_golden(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, dict[str, Path]]:
-    """Create authentic, pinned 0.6.539 bytes only in pytest's temp directory."""
+    """Create authentic, pinned 0.6.540 bytes only in pytest's temp directory."""
     source_root = write_producer_source(tmp_path)
     state_home = tmp_path / "producer-state"
     data_home = tmp_path / "producer-data"
@@ -196,7 +196,7 @@ def refresh_current_binding(paths: dict[str, Path]) -> None:
     private_file(paths["pointer"], canonical(pointer))
 
 
-def test_pinned_producer_06539_golden_generation_is_complete(
+def test_pinned_producer_06540_golden_generation_is_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, _paths = write_producer_golden(tmp_path, monkeypatch)
@@ -275,7 +275,7 @@ def test_06538_closed_field_sets_are_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-@pytest.mark.parametrize("retired_version", ("0.6.537", "0.6.538"))
+@pytest.mark.parametrize("retired_version", ("0.6.537", "0.6.538", "0.6.539"))
 @pytest.mark.parametrize(
     ("target", "field"),
     (
@@ -345,9 +345,9 @@ def test_06538_versions_and_legacy_parallel_path_are_invalid(
         ("binding", lambda value: value.update({"pool_authority_sha256": "0" * 64})),
         ("binding", lambda value: value.update({"pool_authority_size_bytes": 1})),
         ("binding", lambda value: value["usage_binding"].update({"generation_id": "0" * 32})),
-        ("binding", lambda value: value["usage_binding"].update({"release_id": "0.6.539-0000000000000000"})),
+        ("binding", lambda value: value["usage_binding"].update({"release_id": "0.6.540-0000000000000000"})),
         ("authority", lambda value: value.update({"generation_id": "0" * 32})),
-        ("authority", lambda value: value.update({"release_id": "0.6.539-0000000000000000"})),
+        ("authority", lambda value: value.update({"release_id": "0.6.540-0000000000000000"})),
     ),
 )
 def test_06538_digest_size_generation_and_release_crossbindings_are_invalid(

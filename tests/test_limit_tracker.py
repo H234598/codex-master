@@ -26,7 +26,7 @@ from the_hive.usage_snapshot import (
 
 NOW = datetime(2026, 8, 26, 18, 0, tzinfo=UTC)
 GENERATION = "1" * 32
-SOURCE_DIGEST = "45803c0f270971e7b8ea41104e461a80020d36187222889894f68c25304dbf14"
+SOURCE_DIGEST = "7980ba26b1a64f85a54e126950021e6d75bb7dde9b7b296bd5d118fa6dadb78f"
 RESET = "2026-08-27T00:00:00Z"
 
 
@@ -161,7 +161,7 @@ class EvidenceTree:
         root: Path,
         payload: dict[str, object],
         *,
-        producer_version: str = "0.6.539",
+        producer_version: str = "0.6.540",
         python_version: str = "3.14",
     ) -> None:
         self.root = private_dir(root)
@@ -507,7 +507,7 @@ def add_previous_generation(tree: EvidenceTree) -> Path:
     return binding_path
 
 
-def test_active_0_6_539_python_3_14_attested_layout_reads_complete(
+def test_active_0_6_540_python_3_14_attested_layout_reads_complete(
     evidence: EvidenceTree,
 ) -> None:
     result = read(evidence)
@@ -527,20 +527,20 @@ def test_old_0_6_536_python_3_13_attested_layout_is_rejected(tmp_path: Path) -> 
     assert read(legacy).status == "invalid"
 
 
-def test_active_0_6_539_python_3_13_attestation_path_is_rejected(
+def test_active_0_6_540_python_3_13_attestation_path_is_rejected(
     tmp_path: Path,
 ) -> None:
     wrong_python_path = EvidenceTree(
         tmp_path / "wrong-python-path",
         document(),
-        producer_version="0.6.539",
+        producer_version="0.6.540",
         python_version="3.13",
     )
 
     assert read(wrong_python_path).status == "invalid"
 
 
-@pytest.mark.parametrize("retired_version", ("0.6.537", "0.6.538"))
+@pytest.mark.parametrize("retired_version", ("0.6.537", "0.6.538", "0.6.539"))
 def test_current_binding_retired_producer_is_rejected(
     evidence: EvidenceTree, retired_version: str
 ) -> None:
@@ -1227,7 +1227,7 @@ def test_previous_binding_from_another_release_is_rejected(
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
     binding["usage_binding"].update(
         active_manifest_sha256="a" * 64,
-        release_id="0.6.539-" + "b" * 16,
+        release_id="0.6.540-" + "b" * 16,
         source_manifest_sha256="c" * 64,
     )
     private_file(binding_path, canonical(binding))
@@ -1258,7 +1258,7 @@ def test_previous_binding_must_keep_valid_historical_identity_form(
     assert read(evidence).status == "invalid"
 
 
-@pytest.mark.parametrize("retired_version", ("0.6.537", "0.6.538"))
+@pytest.mark.parametrize("retired_version", ("0.6.537", "0.6.538", "0.6.539"))
 def test_previous_binding_retired_producer_is_rejected(
     evidence: EvidenceTree, retired_version: str
 ) -> None:
