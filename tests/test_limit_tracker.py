@@ -26,7 +26,7 @@ from the_hive.usage_snapshot import (
 
 NOW = datetime(2026, 8, 26, 18, 0, tzinfo=UTC)
 GENERATION = "1" * 32
-SOURCE_DIGEST = "f70d0b933f11cad16915ac2114171cd2092c21b50f874113dbeb873158da8657"
+SOURCE_DIGEST = "45803c0f270971e7b8ea41104e461a80020d36187222889894f68c25304dbf14"
 RESET = "2026-08-27T00:00:00Z"
 
 
@@ -161,7 +161,7 @@ class EvidenceTree:
         root: Path,
         payload: dict[str, object],
         *,
-        producer_version: str = "0.6.538",
+        producer_version: str = "0.6.539",
         python_version: str = "3.14",
     ) -> None:
         self.root = private_dir(root)
@@ -507,7 +507,7 @@ def add_previous_generation(tree: EvidenceTree) -> Path:
     return binding_path
 
 
-def test_active_0_6_538_python_3_14_attested_layout_reads_complete(
+def test_active_0_6_539_python_3_14_attested_layout_reads_complete(
     evidence: EvidenceTree,
 ) -> None:
     result = read(evidence)
@@ -527,25 +527,26 @@ def test_old_0_6_536_python_3_13_attested_layout_is_rejected(tmp_path: Path) -> 
     assert read(legacy).status == "invalid"
 
 
-def test_active_0_6_538_python_3_13_attestation_path_is_rejected(
+def test_active_0_6_539_python_3_13_attestation_path_is_rejected(
     tmp_path: Path,
 ) -> None:
     wrong_python_path = EvidenceTree(
         tmp_path / "wrong-python-path",
         document(),
-        producer_version="0.6.538",
+        producer_version="0.6.539",
         python_version="3.13",
     )
 
     assert read(wrong_python_path).status == "invalid"
 
 
-def test_current_binding_0_6_537_producer_is_rejected(
-    evidence: EvidenceTree,
+@pytest.mark.parametrize("retired_version", ("0.6.537", "0.6.538"))
+def test_current_binding_retired_producer_is_rejected(
+    evidence: EvidenceTree, retired_version: str
 ) -> None:
     binding_path = evidence.generations / GENERATION / "account-usage-v2.binding.json"
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
-    binding["usage_binding"]["producer_version"] = "0.6.537"
+    binding["usage_binding"]["producer_version"] = retired_version
     private_file(binding_path, canonical(binding))
     pointer_path = evidence.integration / "current.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
@@ -1226,7 +1227,7 @@ def test_previous_binding_from_another_release_is_rejected(
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
     binding["usage_binding"].update(
         active_manifest_sha256="a" * 64,
-        release_id="0.6.538-" + "b" * 16,
+        release_id="0.6.539-" + "b" * 16,
         source_manifest_sha256="c" * 64,
     )
     private_file(binding_path, canonical(binding))
@@ -1257,12 +1258,13 @@ def test_previous_binding_must_keep_valid_historical_identity_form(
     assert read(evidence).status == "invalid"
 
 
-def test_previous_binding_0_6_537_producer_is_rejected(
-    evidence: EvidenceTree,
+@pytest.mark.parametrize("retired_version", ("0.6.537", "0.6.538"))
+def test_previous_binding_retired_producer_is_rejected(
+    evidence: EvidenceTree, retired_version: str
 ) -> None:
     binding_path = add_previous_generation(evidence)
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
-    binding["usage_binding"]["producer_version"] = "0.6.537"
+    binding["usage_binding"]["producer_version"] = retired_version
     private_file(binding_path, canonical(binding))
     pointer_path = evidence.integration / "current.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))

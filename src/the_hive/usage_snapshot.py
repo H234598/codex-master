@@ -43,12 +43,12 @@ _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _POOL_RE = re.compile(r"^(?:main|spark)$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
-_PRODUCER_VERSION = "0.6.538"
+_PRODUCER_VERSION = "0.6.539"
 _PRODUCER_SOURCE_MANIFEST_SHA256 = (
-    "f70d0b933f11cad16915ac2114171cd2092c21b50f874113dbeb873158da8657"
+    "45803c0f270971e7b8ea41104e461a80020d36187222889894f68c25304dbf14"
 )
-_PRODUCER_RELEASE_ID = "0.6.538-f70d0b933f11cad1"
-_RELEASE_RE = re.compile(r"^0\.6\.538-f70d0b933f11cad1$")
+_PRODUCER_RELEASE_ID = "0.6.539-45803c0f270971e7"
+_RELEASE_RE = re.compile(r"^0\.6\.539-45803c0f270971e7$")
 _RETIRED_SPARK_SOURCE_POOL = "gpt-5.3-codex-spark"
 _AUTHORITY_POOL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -1380,7 +1380,7 @@ def _active_manifest_v2(payload: bytes, state_home: Path) -> _ActiveAttestationV
         or wheel != release_dir / "producer.whl"
         or record
         != site_packages
-        / "codex_usage_integration_producer-0.6.538.dist-info"
+        / "codex_usage_integration_producer-0.6.539.dist-info"
         / "RECORD"
     ):
         raise _Invalid()
