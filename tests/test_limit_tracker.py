@@ -26,7 +26,7 @@ from the_hive.usage_snapshot import (
 
 NOW = datetime(2026, 8, 26, 18, 0, tzinfo=UTC)
 GENERATION = "1" * 32
-SOURCE_DIGEST = "2" * 64
+SOURCE_DIGEST = "f70d0b933f11cad16915ac2114171cd2092c21b50f874113dbeb873158da8657"
 RESET = "2026-08-27T00:00:00Z"
 
 
@@ -161,7 +161,7 @@ class EvidenceTree:
         root: Path,
         payload: dict[str, object],
         *,
-        producer_version: str = "0.6.537",
+        producer_version: str = "0.6.538",
         python_version: str = "3.14",
     ) -> None:
         self.root = private_dir(root)
@@ -244,20 +244,98 @@ class EvidenceTree:
         private_file(generation_dir / "account-usage-v2.json", payload)
         active_payload = canonical(self.active())
         private_file(self.integration / "active.json", active_payload)
-        binding = {
+        usage_binding = {
             "active_manifest_sha256": hashlib.sha256(active_payload).hexdigest(),
-            "binding_schema_version": 1,
             "generation_id": generation,
             "payload_filename": "account-usage-v2.json",
             "payload_sha256": hashlib.sha256(payload).hexdigest(),
             "payload_size_bytes": len(payload),
-            "producer_version": self.producer_version,
             "published_at": payload_value["generated_at"],
+            "producer_version": self.producer_version,
             "release_id": self.release_id,
             "source_manifest_sha256": SOURCE_DIGEST,
+            "usage_binding_schema_version": 2,
+        }
+        source_inputs = canonical(
+            {
+                "current_directory": {
+                    "device": 0,
+                    "gid": 0,
+                    "inode": 0,
+                    "mode": 0o700,
+                    "uid": 0,
+                },
+                "history": {
+                    "consumed_rows": [],
+                    "database": None,
+                    "shm": None,
+                    "wal": None,
+                },
+                "owner_source": {
+                    "ctime_ns": 0,
+                    "device": 0,
+                    "gid": 0,
+                    "inode": 0,
+                    "mode": 0o600,
+                    "mtime_ns": 0,
+                    "sha256": "0" * 64,
+                    "size_bytes": 0,
+                    "uid": 0,
+                },
+                "records": [],
+                "source_input_binding_schema_version": 1,
+            }
+        )
+        authority = canonical(
+            {
+                "authorities": [
+                    {
+                        "account_id": payload_value["accounts"][0]["account_id"],
+                        "allowed_lifecycles": ["persistent", "session"],
+                        "allowed_model_families": ["sol", "terra"],
+                        "hive_available": True,
+                        "long_running_leadership_eligible": True,
+                        "persistent_leadership_eligible": True,
+                        "pool_id": "openai",
+                        "provider": "openai",
+                        "reasoning_maximum": "max",
+                        "reasoning_minimum": "low",
+                    }
+                ],
+                "expires_at": (
+                    datetime.fromisoformat(
+                        str(payload_value["generated_at"]).replace("Z", "+00:00")
+                    )
+                    + timedelta(minutes=10)
+                )
+                .astimezone(UTC)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "generation_id": generation,
+                "issued_at": payload_value["generated_at"],
+                "pool_authority_schema_version": 2,
+                "producer_version": self.producer_version,
+                "release_id": self.release_id,
+                "usage_binding_sha256": hashlib.sha256(
+                    canonical(usage_binding)
+                ).hexdigest(),
+                "usage_payload_sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+        binding = {
+            "binding_schema_version": 3,
+            "pool_authority_filename": "pool-authority-v2.json",
+            "pool_authority_sha256": hashlib.sha256(authority).hexdigest(),
+            "pool_authority_size_bytes": len(authority),
+            "source_inputs_filename": "source-inputs-v2.json",
+            "source_inputs_sha256": hashlib.sha256(source_inputs).hexdigest(),
+            "source_inputs_size_bytes": len(source_inputs),
+            "usage_binding": usage_binding,
         }
         binding_payload = canonical(binding)
         private_file(generation_dir / "account-usage-v2.binding.json", binding_payload)
+        private_file(generation_dir / "pool-authority-v2.json", authority)
+        private_file(generation_dir / "source-inputs-v2.json", source_inputs)
         pointer = {
             "current_binding_sha256": hashlib.sha256(binding_payload).hexdigest(),
             "current_generation_id": generation,
@@ -396,14 +474,26 @@ def add_previous_generation(tree: EvidenceTree) -> Path:
     generation = "3" * 32
     previous = private_dir(tree.generations / generation)
     current = tree.generations / GENERATION
-    private_file(
-        previous / "account-usage-v2.json",
-        (current / "account-usage-v2.json").read_bytes(),
-    )
+    for name in (
+        "account-usage-v2.json",
+        "pool-authority-v2.json",
+        "source-inputs-v2.json",
+    ):
+        private_file(previous / name, (current / name).read_bytes())
     binding = json.loads(
         (current / "account-usage-v2.binding.json").read_text(encoding="utf-8")
     )
-    binding["generation_id"] = generation
+    usage = binding["usage_binding"]
+    usage["generation_id"] = generation
+    authority_path = previous / "pool-authority-v2.json"
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority["generation_id"] = generation
+    authority["usage_binding_sha256"] = hashlib.sha256(canonical(usage)).hexdigest()
+    private_file(authority_path, canonical(authority))
+    binding["pool_authority_sha256"] = hashlib.sha256(
+        authority_path.read_bytes()
+    ).hexdigest()
+    binding["pool_authority_size_bytes"] = authority_path.stat().st_size
     binding_path = private_file(
         previous / "account-usage-v2.binding.json", canonical(binding)
     )
@@ -417,7 +507,7 @@ def add_previous_generation(tree: EvidenceTree) -> Path:
     return binding_path
 
 
-def test_active_0_6_537_python_3_14_attested_layout_reads_complete(
+def test_active_0_6_538_python_3_14_attested_layout_reads_complete(
     evidence: EvidenceTree,
 ) -> None:
     result = read(evidence)
@@ -437,25 +527,25 @@ def test_old_0_6_536_python_3_13_attested_layout_is_rejected(tmp_path: Path) -> 
     assert read(legacy).status == "invalid"
 
 
-def test_active_0_6_537_python_3_13_attestation_path_is_rejected(
+def test_active_0_6_538_python_3_13_attestation_path_is_rejected(
     tmp_path: Path,
 ) -> None:
     wrong_python_path = EvidenceTree(
         tmp_path / "wrong-python-path",
         document(),
-        producer_version="0.6.537",
+        producer_version="0.6.538",
         python_version="3.13",
     )
 
     assert read(wrong_python_path).status == "invalid"
 
 
-def test_current_binding_0_6_536_producer_is_rejected(
+def test_current_binding_0_6_537_producer_is_rejected(
     evidence: EvidenceTree,
 ) -> None:
     binding_path = evidence.generations / GENERATION / "account-usage-v2.binding.json"
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
-    binding["producer_version"] = "0.6.536"
+    binding["usage_binding"]["producer_version"] = "0.6.537"
     private_file(binding_path, canonical(binding))
     pointer_path = evidence.integration / "current.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
@@ -465,6 +555,52 @@ def test_current_binding_0_6_536_producer_is_rejected(
     private_file(pointer_path, canonical(pointer))
 
     assert read(evidence).status == "invalid"
+
+
+def _rebind_current_authority(evidence: EvidenceTree, authority: dict[str, object]) -> None:
+    authority_path = evidence.generations / GENERATION / "pool-authority-v2.json"
+    private_file(authority_path, canonical(authority))
+    binding_path = evidence.generations / GENERATION / "account-usage-v2.binding.json"
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    binding["pool_authority_sha256"] = hashlib.sha256(
+        authority_path.read_bytes()
+    ).hexdigest()
+    binding["pool_authority_size_bytes"] = authority_path.stat().st_size
+    private_file(binding_path, canonical(binding))
+    pointer_path = evidence.integration / "current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["current_binding_sha256"] = hashlib.sha256(
+        binding_path.read_bytes()
+    ).hexdigest()
+    private_file(pointer_path, canonical(pointer))
+
+
+def test_expired_bound_authority_fails_closed_before_automatic_decision(
+    evidence: EvidenceTree,
+) -> None:
+    authority_path = evidence.generations / GENERATION / "pool-authority-v2.json"
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority["expires_at"] = "2026-08-26T18:00:00Z"
+    _rebind_current_authority(evidence, authority)
+
+    result = read(evidence)
+
+    assert result.status == "invalid"
+    assert not result.automatic_decisions_allowed
+
+
+def test_authority_payload_account_set_mismatch_fails_closed_before_automatic_decision(
+    evidence: EvidenceTree,
+) -> None:
+    authority_path = evidence.generations / GENERATION / "pool-authority-v2.json"
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority["authorities"][0]["account_id"] = "other-account"
+    _rebind_current_authority(evidence, authority)
+
+    result = read(evidence)
+
+    assert result.status == "invalid"
+    assert not result.automatic_decisions_allowed
 
 
 def test_active_and_current_are_reread_fd_bound_after_generation(
@@ -838,7 +974,7 @@ def test_all_schema_versions_require_exact_integer_type(
         active["schema_version"] = value
         private_file(active_path, canonical(active))
         binding = json.loads(binding_path.read_text(encoding="utf-8"))
-        binding["active_manifest_sha256"] = hashlib.sha256(
+        binding["usage_binding"]["active_manifest_sha256"] = hashlib.sha256(
             active_path.read_bytes()
         ).hexdigest()
         private_file(binding_path, canonical(binding))
@@ -905,7 +1041,7 @@ def test_generation_digest_and_release_drift_fail_closed(
             evidence.generations / GENERATION / "account-usage-v2.binding.json"
         )
         binding = json.loads(binding_path.read_text())
-        binding["payload_sha256"] = "f" * 64
+        binding["usage_binding"]["payload_sha256"] = "f" * 64
         private_file(binding_path, canonical(binding))
         pointer = json.loads((evidence.integration / "current.json").read_text())
         pointer["current_binding_sha256"] = hashlib.sha256(
@@ -917,7 +1053,7 @@ def test_generation_digest_and_release_drift_fail_closed(
             evidence.generations / GENERATION / "account-usage-v2.binding.json"
         )
         binding = json.loads(binding_path.read_text())
-        binding["release_id"] = "0.6.536-" + "f" * 16
+        binding["usage_binding"]["release_id"] = "0.6.536-" + "f" * 16
         private_file(binding_path, canonical(binding))
         pointer = json.loads((evidence.integration / "current.json").read_text())
         pointer["current_binding_sha256"] = hashlib.sha256(
@@ -1018,10 +1154,10 @@ def test_previous_generation_is_fully_validated(
     elif kind == "malformed":
         private_file(payload_path, b"{")
         binding = json.loads(binding_path.read_text(encoding="utf-8"))
-        binding["payload_sha256"] = hashlib.sha256(
+        binding["usage_binding"]["payload_sha256"] = hashlib.sha256(
             payload_path.read_bytes()
         ).hexdigest()
-        binding["payload_size_bytes"] = payload_path.stat().st_size
+        binding["usage_binding"]["payload_size_bytes"] = payload_path.stat().st_size
         private_file(binding_path, canonical(binding))
         pointer_path = evidence.integration / "current.json"
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
@@ -1054,9 +1190,24 @@ def test_previous_historical_payload_is_checked_at_its_own_generation_time(
         )
     private_file(payload_path, canonical(payload))
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
-    binding["payload_sha256"] = hashlib.sha256(payload_path.read_bytes()).hexdigest()
-    binding["payload_size_bytes"] = payload_path.stat().st_size
-    binding["published_at"] = payload["generated_at"]
+    binding["usage_binding"]["payload_sha256"] = hashlib.sha256(
+        payload_path.read_bytes()
+    ).hexdigest()
+    binding["usage_binding"]["payload_size_bytes"] = payload_path.stat().st_size
+    binding["usage_binding"]["published_at"] = payload["generated_at"]
+    authority_path = binding_path.with_name("pool-authority-v2.json")
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority["issued_at"] = payload["generated_at"]
+    authority["expires_at"] = "2026-08-25T18:10:00Z"
+    authority["usage_payload_sha256"] = binding["usage_binding"]["payload_sha256"]
+    authority["usage_binding_sha256"] = hashlib.sha256(
+        canonical(binding["usage_binding"])
+    ).hexdigest()
+    private_file(authority_path, canonical(authority))
+    binding["pool_authority_sha256"] = hashlib.sha256(
+        authority_path.read_bytes()
+    ).hexdigest()
+    binding["pool_authority_size_bytes"] = authority_path.stat().st_size
     private_file(binding_path, canonical(binding))
     pointer_path = evidence.integration / "current.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
@@ -1068,33 +1219,16 @@ def test_previous_historical_payload_is_checked_at_its_own_generation_time(
     assert read(evidence).status == "complete"
 
 
-def test_previous_binding_keeps_its_historical_active_release_identity(
+def test_previous_binding_from_another_release_is_rejected(
     evidence: EvidenceTree,
 ) -> None:
     binding_path = add_previous_generation(evidence)
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
-    binding.update(
+    binding["usage_binding"].update(
         active_manifest_sha256="a" * 64,
-        release_id="0.6.537-" + "b" * 16,
+        release_id="0.6.538-" + "b" * 16,
         source_manifest_sha256="c" * 64,
     )
-    private_file(binding_path, canonical(binding))
-    pointer_path = evidence.integration / "current.json"
-    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-    pointer["previous_binding_sha256"] = hashlib.sha256(
-        binding_path.read_bytes()
-    ).hexdigest()
-    private_file(pointer_path, canonical(pointer))
-
-    assert read(evidence).status == "complete"
-
-
-def test_previous_binding_must_keep_valid_historical_identity_form(
-    evidence: EvidenceTree,
-) -> None:
-    binding_path = add_previous_generation(evidence)
-    binding = json.loads(binding_path.read_text(encoding="utf-8"))
-    binding["active_manifest_sha256"] = "a" * 63
     private_file(binding_path, canonical(binding))
     pointer_path = evidence.integration / "current.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
@@ -1106,12 +1240,29 @@ def test_previous_binding_must_keep_valid_historical_identity_form(
     assert read(evidence).status == "invalid"
 
 
-def test_previous_binding_0_6_536_producer_is_rejected(
+def test_previous_binding_must_keep_valid_historical_identity_form(
     evidence: EvidenceTree,
 ) -> None:
     binding_path = add_previous_generation(evidence)
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
-    binding["producer_version"] = "0.6.536"
+    binding["usage_binding"]["active_manifest_sha256"] = "a" * 63
+    private_file(binding_path, canonical(binding))
+    pointer_path = evidence.integration / "current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["previous_binding_sha256"] = hashlib.sha256(
+        binding_path.read_bytes()
+    ).hexdigest()
+    private_file(pointer_path, canonical(pointer))
+
+    assert read(evidence).status == "invalid"
+
+
+def test_previous_binding_0_6_537_producer_is_rejected(
+    evidence: EvidenceTree,
+) -> None:
+    binding_path = add_previous_generation(evidence)
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    binding["usage_binding"]["producer_version"] = "0.6.537"
     private_file(binding_path, canonical(binding))
     pointer_path = evidence.integration / "current.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))

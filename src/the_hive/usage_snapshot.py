@@ -24,6 +24,7 @@ _MAX_POINTER_BYTES = 4096
 _MAX_BINDING_BYTES = 32768
 _MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 _MAX_POOL_AUTHORITY_BYTES = 256 * 1024
+_MAX_SOURCE_INPUT_BYTES = 512 * 1024
 _MAX_MANIFEST_BYTES = 128 * 1024
 _MAX_LOCK_BYTES = 4096
 _MAX_ACCOUNTS = 100
@@ -42,7 +43,13 @@ _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _POOL_RE = re.compile(r"^(?:main|spark)$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
-_RELEASE_RE = re.compile(r"^0\.6\.537-[0-9a-f]{16}$")
+_PRODUCER_VERSION = "0.6.538"
+_PRODUCER_SOURCE_MANIFEST_SHA256 = (
+    "f70d0b933f11cad16915ac2114171cd2092c21b50f874113dbeb873158da8657"
+)
+_PRODUCER_RELEASE_ID = "0.6.538-f70d0b933f11cad1"
+_RELEASE_RE = re.compile(r"^0\.6\.538-f70d0b933f11cad1$")
+_RETIRED_SPARK_SOURCE_POOL = "gpt-5.3-codex-spark"
 _AUTHORITY_POOL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _MODEL_FAMILY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -259,6 +266,8 @@ class _EvidenceBindingV2:
     source_manifest_sha256: str
     pool_authority_sha256: str
     pool_authority_size_bytes: int
+    source_inputs_sha256: str
+    source_inputs_size_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,6 +630,13 @@ def _release_id(value: object) -> str:
     return value
 
 
+def _source_manifest_digest(value: object) -> str:
+    digest = _hex(value)
+    if digest != _PRODUCER_SOURCE_MANIFEST_SHA256:
+        raise _Invalid()
+    return digest
+
+
 def _generation_id(value: object) -> str:
     if type(value) is not str or _GENERATION_RE.fullmatch(value) is None:
         raise _Invalid()
@@ -680,7 +696,7 @@ def _usage_binding_bytes(binding: _EvidenceBindingV2) -> bytes:
             "payload_sha256": binding.payload_sha256,
             "payload_size_bytes": binding.payload_size_bytes,
             "published_at": binding.published_at.isoformat().replace("+00:00", "Z"),
-            "producer_version": "0.6.537",
+            "producer_version": _PRODUCER_VERSION,
             "release_id": binding.release_id,
             "source_manifest_sha256": binding.source_manifest_sha256,
             "usage_binding_schema_version": 2,
@@ -697,6 +713,9 @@ def _binding_v2(payload: bytes) -> _EvidenceBindingV2:
             "pool_authority_filename",
             "pool_authority_sha256",
             "pool_authority_size_bytes",
+            "source_inputs_filename",
+            "source_inputs_sha256",
+            "source_inputs_size_bytes",
             "usage_binding",
         },
     )
@@ -720,14 +739,17 @@ def _binding_v2(payload: bytes) -> _EvidenceBindingV2:
     )
     if (
         type(value["binding_schema_version"]) is not int
-        or value["binding_schema_version"] != 2
+        or value["binding_schema_version"] != 3
         or value["pool_authority_filename"] != "pool-authority-v2.json"
         or type(value["pool_authority_size_bytes"]) is not int
         or not 1 <= value["pool_authority_size_bytes"] <= _MAX_POOL_AUTHORITY_BYTES
+        or value["source_inputs_filename"] != "source-inputs-v2.json"
+        or type(value["source_inputs_size_bytes"]) is not int
+        or not 1 <= value["source_inputs_size_bytes"] <= _MAX_SOURCE_INPUT_BYTES
         or type(usage["usage_binding_schema_version"]) is not int
         or usage["usage_binding_schema_version"] != 2
         or usage["payload_filename"] != "account-usage-v2.json"
-        or usage["producer_version"] != "0.6.537"
+        or usage["producer_version"] != _PRODUCER_VERSION
         or type(usage["payload_size_bytes"]) is not int
         or not 1 <= usage["payload_size_bytes"] <= _MAX_PAYLOAD_BYTES
     ):
@@ -739,10 +761,150 @@ def _binding_v2(payload: bytes) -> _EvidenceBindingV2:
         payload_size_bytes=usage["payload_size_bytes"],
         published_at=_canonical_timestamp(usage["published_at"]),
         release_id=_release_id(usage["release_id"]),
-        source_manifest_sha256=_hex(usage["source_manifest_sha256"]),
+        source_manifest_sha256=_source_manifest_digest(
+            usage["source_manifest_sha256"]
+        ),
         pool_authority_sha256=_hex(value["pool_authority_sha256"]),
         pool_authority_size_bytes=value["pool_authority_size_bytes"],
+        source_inputs_sha256=_hex(value["source_inputs_sha256"]),
+        source_inputs_size_bytes=value["source_inputs_size_bytes"],
     )
+
+
+def _nonnegative_int(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise _Invalid()
+    return value
+
+
+def _source_file_binding(value: object) -> dict[str, int | str]:
+    if type(value) is not dict:
+        raise _Invalid()
+    _exact(
+        value,
+        {
+            "ctime_ns",
+            "device",
+            "gid",
+            "inode",
+            "mode",
+            "mtime_ns",
+            "sha256",
+            "size_bytes",
+            "uid",
+        },
+    )
+    result: dict[str, int | str] = {
+        name: _nonnegative_int(value[name])
+        for name in {
+            "ctime_ns",
+            "device",
+            "gid",
+            "inode",
+            "mode",
+            "mtime_ns",
+            "size_bytes",
+            "uid",
+        }
+    }
+    result["sha256"] = _hex(value["sha256"])
+    if result["mode"] != 0o600 or result["size_bytes"] > _MAX_SOURCE_INPUT_BYTES:
+        raise _Invalid()
+    return result
+
+
+def _source_directory_binding(value: object) -> dict[str, int]:
+    if type(value) is not dict:
+        raise _Invalid()
+    _exact(value, {"device", "gid", "inode", "mode", "uid"})
+    result = {
+        name: _nonnegative_int(value[name])
+        for name in {"device", "gid", "inode", "mode", "uid"}
+    }
+    if result["mode"] != 0o700:
+        raise _Invalid()
+    return result
+
+
+def _source_inputs_v2(payload: bytes) -> None:
+    value = _canonical_json(payload, _MAX_SOURCE_INPUT_BYTES)
+    _exact(
+        value,
+        {
+            "current_directory",
+            "history",
+            "owner_source",
+            "records",
+            "source_input_binding_schema_version",
+        },
+    )
+    if value["source_input_binding_schema_version"] != 1:
+        raise _Invalid()
+    _source_directory_binding(value["current_directory"])
+    _source_file_binding(value["owner_source"])
+
+    records = value["records"]
+    if type(records) is not list or len(records) > _MAX_ACCOUNTS:
+        raise _Invalid()
+    record_ids: list[str] = []
+    for record in records:
+        if type(record) is not dict:
+            raise _Invalid()
+        _exact(
+            record,
+            {
+                "account_id",
+                "current_file",
+                "state_generation",
+                "state_generation_file",
+            },
+        )
+        account_id = record["account_id"]
+        if type(account_id) is not str or _ACCOUNT_RE.fullmatch(account_id) is None:
+            raise _Invalid()
+        record_ids.append(account_id)
+        _source_file_binding(record["current_file"])
+        _nonnegative_int(record["state_generation"])
+        sidecar = record["state_generation_file"]
+        if sidecar is not None:
+            _source_file_binding(sidecar)
+    if record_ids != sorted(record_ids) or len(record_ids) != len(set(record_ids)):
+        raise _Invalid()
+
+    history = value["history"]
+    if type(history) is not dict:
+        raise _Invalid()
+    _exact(history, {"consumed_rows", "database", "shm", "wal"})
+    for name in ("database", "shm", "wal"):
+        if history[name] is not None:
+            _source_file_binding(history[name])
+    rows = history["consumed_rows"]
+    if type(rows) is not list or len(rows) > _MAX_TOTAL_TRENDS:
+        raise _Invalid()
+    row_keys: list[tuple[str, str, int]] = []
+    source_pool = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}")
+    for row in rows:
+        if type(row) is not dict:
+            raise _Invalid()
+        _exact(
+            row,
+            {"account_id", "pool", "rows_sha256", "sample_count", "window_seconds"},
+        )
+        account_id = row["account_id"]
+        pool = row["pool"]
+        if (
+            type(account_id) is not str
+            or _ACCOUNT_RE.fullmatch(account_id) is None
+            or type(pool) is not str
+            or source_pool.fullmatch(pool) is None
+            or pool.casefold() == _RETIRED_SPARK_SOURCE_POOL
+        ):
+            raise _Invalid()
+        row_keys.append((account_id, pool, _nonnegative_int(row["window_seconds"])))
+        _hex(row["rows_sha256"])
+        _nonnegative_int(row["sample_count"])
+    if row_keys != sorted(row_keys) or len(row_keys) != len(set(row_keys)):
+        raise _Invalid()
 
 
 def _invalid_model_invocability() -> ModelInvocabilityProjectionV1:
@@ -910,7 +1072,7 @@ def _pool_authority_v2(
     if (
         type(value["pool_authority_schema_version"]) is not int
         or value["pool_authority_schema_version"] not in {2, 3}
-        or value["producer_version"] != "0.6.537"
+        or value["producer_version"] != _PRODUCER_VERSION
         or type(value["authorities"]) is not list
         or len(value["authorities"]) > _MAX_POOL_AUTHORITIES
     ):
@@ -1021,7 +1183,7 @@ def _pool_authority_v2(
             "generation_id": value["generation_id"],
             "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
             "pool_authority_schema_version": schema_version,
-            "producer_version": "0.6.537",
+            "producer_version": _PRODUCER_VERSION,
             "release_id": value["release_id"],
             "usage_binding_sha256": value["usage_binding_sha256"],
             "usage_payload_sha256": value["usage_payload_sha256"],
@@ -1114,7 +1276,7 @@ def _active_manifest(payload: bytes) -> _ActiveManifest:
     )
     if (
         value["active_manifest_schema_version"] != 2
-        or _token(value["producer_version"], 64) != "0.6.537"
+        or _token(value["producer_version"], 64) != _PRODUCER_VERSION
     ):
         raise _Invalid()
     if value["entry_point"] != "codex_usage.cli:main":
@@ -1129,9 +1291,11 @@ def _active_manifest(payload: bytes) -> _ActiveManifest:
         _hex(value[name])
     return _ActiveManifest(
         digest=hashlib.sha256(payload).hexdigest(),
-        producer_version="0.6.537",
-        release_id=_token(value["release_id"], 64),
-        source_manifest_sha256=_hex(value["source_manifest_sha256"]),
+        producer_version=_PRODUCER_VERSION,
+        release_id=_release_id(value["release_id"]),
+        source_manifest_sha256=_source_manifest_digest(
+            value["source_manifest_sha256"]
+        ),
     )
 
 
@@ -1183,13 +1347,13 @@ def _active_manifest_v2(payload: bytes, state_home: Path) -> _ActiveAttestationV
     if (
         type(value["schema_version"]) is not int
         or value["schema_version"] != 2
-        or value["version"] != "0.6.537"
+        or value["version"] != _PRODUCER_VERSION
         or _manifest_path(value["state_home"]) != state_home
     ):
         raise _Invalid()
     release_id = _release_id(value["release_id"])
-    source_manifest_sha256 = _hex(value["source_manifest_sha256"])
-    if release_id != f"0.6.537-{source_manifest_sha256[:16]}":
+    source_manifest_sha256 = _source_manifest_digest(value["source_manifest_sha256"])
+    if release_id != _PRODUCER_RELEASE_ID:
         raise _Invalid()
     integration = state_home / "codex-usage" / "integration"
     release_dir = _manifest_path(value["release_dir"])
@@ -1210,14 +1374,13 @@ def _active_manifest_v2(payload: bytes, state_home: Path) -> _ActiveAttestationV
         or len(python_directory) != 4
         or python_directory[:2] != ("venv", "lib")
         or python_directory[3] != "site-packages"
-        or not python_directory[2].startswith("python3.")
-        or not python_directory[2].removeprefix("python3.").isdecimal()
+        or python_directory[2] != "python3.14"
         or entrypoint != site_packages / "codex_usage" / "integration_entrypoint.py"
         or launcher != release_dir / "venv" / "bin" / "codex-usage"
         or wheel != release_dir / "producer.whl"
         or record
         != site_packages
-        / "codex_usage_integration_producer-0.6.537.dist-info"
+        / "codex_usage_integration_producer-0.6.538.dist-info"
         / "RECORD"
     ):
         raise _Invalid()
@@ -1232,7 +1395,7 @@ def _active_manifest_v2(payload: bytes, state_home: Path) -> _ActiveAttestationV
     return _ActiveAttestationV2(
         manifest=_ActiveManifest(
             digest=hashlib.sha256(payload).hexdigest(),
-            producer_version="0.6.537",
+            producer_version=_PRODUCER_VERSION,
             release_id=release_id,
             source_manifest_sha256=source_manifest_sha256,
         ),
@@ -1570,7 +1733,7 @@ def _attest_active_release(
         raise _Invalid() from exc
     if (
         "Name: codex-usage-integration-producer\n" not in metadata_text
-        or "Version: 0.6.537\n" not in metadata_text
+        or f"Version: {_PRODUCER_VERSION}\n" not in metadata_text
     ):
         raise _Invalid()
     repeated_entries, repeated_rows = _release_tree(release_fd)
@@ -2448,6 +2611,7 @@ def _validate_generation_v2(
         "account-usage-v2.binding.json",
         "account-usage-v2.json",
         "pool-authority-v2.json",
+        "source-inputs-v2.json",
     }
     if not required_names.issubset(names):
         raise _Unavailable()
@@ -2479,6 +2643,18 @@ def _validate_generation_v2(
     accounts, status, captured_at, generated_at = _payload_v2(payload, now)
     if binding.published_at != generated_at:
         raise _Invalid()
+    source_inputs = guard.read_file(
+        generation_fd,
+        "source-inputs-v2.json",
+        _MAX_SOURCE_INPUT_BYTES,
+        missing_is_unavailable=True,
+    )
+    if (
+        len(source_inputs) != binding.source_inputs_size_bytes
+        or hashlib.sha256(source_inputs).hexdigest() != binding.source_inputs_sha256
+    ):
+        raise _Invalid()
+    _source_inputs_v2(source_inputs)
     authority_bytes = guard.read_file(
         generation_fd,
         "pool-authority-v2.json",

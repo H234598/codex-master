@@ -17,8 +17,10 @@ import the_hive.usage_snapshot as usage_snapshot
 
 
 PRODUCER_NOW = datetime(2026, 8, 31, 12, 1, tzinfo=UTC)
-PRODUCER_ROOT = Path("/home/teladi/codex-usage")
-PRODUCER_COMMIT = "6c7118ffb736d947821f96690adc637587e343c5"
+PRODUCER_ROOT = Path(
+    os.environ.get("THE_HIVE_TEST_CODEX_USAGE_ROOT", "/home/teladi/codex-usage")
+)
+PRODUCER_COMMIT = "01c4a5b79646f6f0d30d6df0dda6827e922e8690"
 PRODUCER_SOURCE_FILES = (
     "pyproject.toml",
     "src/codex_usage/__init__.py",
@@ -29,17 +31,18 @@ PRODUCER_SOURCE_FILES = (
     "src/codex_usage/integration_attestation.py",
     "src/codex_usage/integration_evidence.py",
     "src/codex_usage/integration_entrypoint.py",
-    "src/codex_usage/integration_installer.py",
     "src/codex_usage/integration_pool_authority.py",
     "src/codex_usage/integration_snapshot.py",
     "src/codex_usage/json_utils.py",
     "src/codex_usage/models.py",
     "src/codex_usage/history.py",
     "src/codex_usage/private_io.py",
+    "src/codex_usage/source_lock.py",
     "src/codex_usage/state.py",
     "src/codex_usage/usage_limits.py",
     "src/codex_usage/usage_resets.py",
 )
+PRODUCER_TEST_HARNESS_FILES = ("src/codex_usage/integration_installer.py",)
 
 
 def canonical(value: object) -> bytes:
@@ -73,7 +76,7 @@ def producer_file(relative: str) -> bytes:
 def write_producer_source(root: Path) -> Path:
     source_root = root / "producer-source"
     private_dir(source_root)
-    for relative in PRODUCER_SOURCE_FILES:
+    for relative in PRODUCER_SOURCE_FILES + PRODUCER_TEST_HARNESS_FILES:
         destination = source_root / relative
         private_dir(destination.parent)
         private_file(destination, producer_file(relative))
@@ -83,7 +86,7 @@ def write_producer_source(root: Path) -> Path:
 def write_producer_golden(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, dict[str, Path]]:
-    """Create authentic, pinned 0.6.537 bytes only in pytest's temp directory."""
+    """Create authentic, pinned 0.6.538 bytes only in pytest's temp directory."""
     source_root = write_producer_source(tmp_path)
     state_home = tmp_path / "producer-state"
     data_home = tmp_path / "producer-data"
@@ -91,6 +94,7 @@ def write_producer_golden(
     lock_home = tmp_path / "producer-lock-home"
     for path in (state_home, data_home, temporary_root, lock_home):
         private_dir(path)
+    private_dir(data_home / "codex-usage")
 
     monkeypatch.syspath_prepend(str(source_root / "src"))
     from codex_usage import integration_evidence, integration_pool_authority, integration_snapshot, private_io
@@ -101,7 +105,6 @@ def write_producer_golden(
         getpwuid=lambda _uid: SimpleNamespace(pw_dir=str(lock_home))
     )
     monkeypatch.setattr(private_io, "pwd", fake_pwd)
-    monkeypatch.setattr(integration_evidence, "pwd", fake_pwd)
     release = install_release(
         source_root=source_root,
         state_home=state_home,
@@ -124,11 +127,30 @@ def write_producer_golden(
         state_home / "codex-usage" / "integration" / "pool-authority-source-v2.json",
         integration_pool_authority.serialize_pool_authority_source(authority_source),
     )
+    source_input_contract = {
+        "current_directory": {
+            "device": 0,
+            "gid": 0,
+            "inode": 0,
+            "mode": 0o700,
+            "uid": 0,
+        },
+        "history": {
+            "consumed_rows": [],
+            "database": None,
+            "shm": None,
+            "wal": None,
+        },
+        "records": [],
+        "source_input_binding_schema_version": 1,
+    }
     integration_evidence.publish_evidence_generation(
         integration_snapshot.serialize_schema2_document(payload_document),
         state_home=state_home,
         data_home=data_home,
         verified_active_manifest=verified,
+        source_input_contract=source_input_contract,
+        source_input_revalidator=lambda: source_input_contract,
     )
     monkeypatch.setattr(
         usage_snapshot,
@@ -145,6 +167,7 @@ def write_producer_golden(
         "binding": generation / "account-usage-v2.binding.json",
         "payload": generation / "account-usage-v2.json",
         "authority": generation / "pool-authority-v2.json",
+        "source_inputs": generation / "source-inputs-v2.json",
     }
 
 
@@ -158,11 +181,14 @@ def refresh_current_binding(paths: dict[str, Path]) -> None:
     binding = json.loads(paths["binding"].read_text(encoding="utf-8"))
     payload = paths["payload"].read_bytes()
     authority = paths["authority"].read_bytes()
+    source_inputs = paths["source_inputs"].read_bytes()
     usage = binding["usage_binding"]
     usage["payload_sha256"] = digest(payload)
     usage["payload_size_bytes"] = len(payload)
     binding["pool_authority_sha256"] = digest(authority)
     binding["pool_authority_size_bytes"] = len(authority)
+    binding["source_inputs_sha256"] = digest(source_inputs)
+    binding["source_inputs_size_bytes"] = len(source_inputs)
     binding_bytes = canonical(binding)
     private_file(paths["binding"], binding_bytes)
     pointer = json.loads(paths["pointer"].read_text(encoding="utf-8"))
@@ -170,7 +196,7 @@ def refresh_current_binding(paths: dict[str, Path]) -> None:
     private_file(paths["pointer"], canonical(pointer))
 
 
-def test_pinned_producer_06537_golden_generation_is_complete(
+def test_pinned_producer_06538_golden_generation_is_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, _paths = write_producer_golden(tmp_path, monkeypatch)
@@ -206,8 +232,10 @@ def _rewrite_binding(paths: dict[str, Path], binding: dict[str, object]) -> None
     _rewrite_pointer(paths, pointer)
 
 
-@pytest.mark.parametrize("target", ("active", "pointer", "binding", "payload", "authority"))
-def test_06537_missing_required_current_document_is_unavailable(
+@pytest.mark.parametrize(
+    "target", ("active", "pointer", "binding", "payload", "authority", "source_inputs")
+)
+def test_06538_missing_required_current_document_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -225,9 +253,10 @@ def test_06537_missing_required_current_document_is_unavailable(
         ("binding", lambda value: value["usage_binding"].pop("payload_sha256")),
         ("payload", lambda value: value["accounts"][0].pop("freshness")),
         ("authority", lambda value: value["authorities"][0].pop("provider")),
+        ("source_inputs", lambda value: value.pop("owner_source")),
     ),
 )
-def test_06537_closed_field_sets_are_invalid(
+def test_06538_closed_field_sets_are_invalid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target: str,
@@ -240,7 +269,7 @@ def test_06537_closed_field_sets_are_invalid(
     _write_json(paths[target], value, newline=target == "active")
     if target == "binding":
         _rewrite_binding(paths, value)
-    elif target in {"payload", "authority"}:
+    elif target in {"payload", "authority", "source_inputs"}:
         refresh_current_binding(paths)
 
     assert read_golden(state_home).status == "invalid"
@@ -249,17 +278,17 @@ def test_06537_closed_field_sets_are_invalid(
 @pytest.mark.parametrize(
     ("target", "mutate"),
     (
-        ("active", lambda value: value.update({"version": "0.6.536"})),
+        ("active", lambda value: value.update({"version": "0.6.537"})),
         ("pointer", lambda value: value.update({"pointer_schema_version": 2})),
-        ("binding", lambda value: value["usage_binding"].update({"producer_version": "0.6.536"})),
+        ("binding", lambda value: value["usage_binding"].update({"producer_version": "0.6.537"})),
         ("binding", lambda value: value.update({"binding_schema_version": 1})),
         ("binding", lambda value: value["usage_binding"].update({"usage_binding_schema_version": 1})),
         ("payload", lambda value: value.update({"schema_version": 1})),
         ("authority", lambda value: value.update({"pool_authority_schema_version": 1})),
-        ("authority", lambda value: value.update({"producer_version": "0.6.536"})),
+        ("authority", lambda value: value.update({"producer_version": "0.6.537"})),
     ),
 )
-def test_06537_versions_and_legacy_parallel_path_are_invalid(
+def test_06538_versions_and_legacy_parallel_path_are_invalid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target: str,
@@ -286,12 +315,12 @@ def test_06537_versions_and_legacy_parallel_path_are_invalid(
         ("binding", lambda value: value.update({"pool_authority_sha256": "0" * 64})),
         ("binding", lambda value: value.update({"pool_authority_size_bytes": 1})),
         ("binding", lambda value: value["usage_binding"].update({"generation_id": "0" * 32})),
-        ("binding", lambda value: value["usage_binding"].update({"release_id": "0.6.537-0000000000000000"})),
+        ("binding", lambda value: value["usage_binding"].update({"release_id": "0.6.538-0000000000000000"})),
         ("authority", lambda value: value.update({"generation_id": "0" * 32})),
-        ("authority", lambda value: value.update({"release_id": "0.6.537-0000000000000000"})),
+        ("authority", lambda value: value.update({"release_id": "0.6.538-0000000000000000"})),
     ),
 )
-def test_06537_digest_size_generation_and_release_crossbindings_are_invalid(
+def test_06538_digest_size_generation_and_release_crossbindings_are_invalid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target: str,
@@ -310,7 +339,49 @@ def test_06537_digest_size_generation_and_release_crossbindings_are_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-def test_06537_previous_current_self_link_is_invalid(
+def test_06538_source_input_digest_and_exact_manifest_pin_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path / "shape", monkeypatch)
+    source_inputs = json.loads(paths["source_inputs"].read_text(encoding="utf-8"))
+    source_inputs["owner_source"]["mode"] = 0o644
+    _write_json(paths["source_inputs"], source_inputs)
+    refresh_current_binding(paths)
+
+    assert read_golden(state_home).status == "invalid"
+
+    state_home, paths = write_producer_golden(tmp_path / "retired-source", monkeypatch)
+    source_inputs = json.loads(paths["source_inputs"].read_text(encoding="utf-8"))
+    source_inputs["history"]["consumed_rows"] = [
+        {
+            "account_id": "synthetic-alpha",
+            "pool": "gpt-5.3-codex-spark",
+            "rows_sha256": "0" * 64,
+            "sample_count": 0,
+            "window_seconds": 18000,
+        }
+    ]
+    _write_json(paths["source_inputs"], source_inputs)
+    refresh_current_binding(paths)
+
+    assert read_golden(state_home).status == "invalid"
+
+    state_home, paths = write_producer_golden(tmp_path / "digest", monkeypatch)
+    binding = json.loads(paths["binding"].read_text(encoding="utf-8"))
+    binding["source_inputs_sha256"] = "0" * 64
+    _rewrite_binding(paths, binding)
+
+    assert read_golden(state_home).status == "invalid"
+
+    state_home, paths = write_producer_golden(tmp_path / "manifest", monkeypatch)
+    active = json.loads(paths["active"].read_text(encoding="utf-8"))
+    active["source_manifest_sha256"] = "0" * 64
+    _write_json(paths["active"], active, newline=True)
+
+    assert read_golden(state_home).status == "invalid"
+
+
+def test_06538_previous_current_self_link_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -322,7 +393,7 @@ def test_06537_previous_current_self_link_is_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-def test_06537_authority_usage_account_set_mismatch_is_invalid(
+def test_06538_authority_usage_account_set_mismatch_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -338,7 +409,7 @@ def test_06537_authority_usage_account_set_mismatch_is_invalid(
 
 
 @pytest.mark.parametrize("unsafe", ("symlink", "hardlink", "mode"))
-def test_06537_authority_filesystem_substitution_is_invalid(
+def test_06538_authority_filesystem_substitution_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -356,7 +427,7 @@ def test_06537_authority_filesystem_substitution_is_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-def test_06537_payload_toctou_name_swap_is_invalid(
+def test_06538_payload_toctou_name_swap_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -380,7 +451,7 @@ def test_06537_payload_toctou_name_swap_is_invalid(
     assert swapped is True
 
 
-def test_06537_hashed_shared_lock_contention_is_busy(
+def test_06538_hashed_shared_lock_contention_is_busy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -564,7 +635,7 @@ def _model_invocability_projection(*entries: object) -> dict[str, object]:
     return {"capability_schema_version": 1, "entries": list(entries)}
 
 
-def test_06537_model_invocability_is_unattested_without_bound_v3_projection(
+def test_06538_model_invocability_is_unattested_without_bound_v3_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, _paths = write_producer_golden(tmp_path, monkeypatch)
@@ -606,7 +677,7 @@ def test_d236_missing_v3_model_capabilities_preserve_valid_usage_but_fail_closed
     assert tuple(limit.pool for limit in display.accounts[0].limits) == ("main", "spark")
 
 
-def test_06537_bound_native_model_capability_preserves_usage_display(
+def test_06538_bound_native_model_capability_preserves_usage_display(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -682,7 +753,7 @@ def test_usage_evidence_subclass_never_attests_model_invocability_or_display(
     assert display.warnings == ("usage_unavailable",)
 
 
-def test_06537_positive_interactive_codex_cli_capability_keeps_api_state_separate(
+def test_06538_positive_interactive_codex_cli_capability_keeps_api_state_separate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -707,7 +778,7 @@ def test_06537_positive_interactive_codex_cli_capability_keeps_api_state_separat
     assert capability.runner_invocable is True
 
 
-def test_06537_meter_only_model_evidence_never_attests_catalog_or_runner(
+def test_06538_meter_only_model_evidence_never_attests_catalog_or_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -735,7 +806,7 @@ def test_06537_meter_only_model_evidence_never_attests_catalog_or_runner(
     assert capability.runner_invocable is False
 
 
-def test_06537_extreme_model_capability_timestamp_is_locally_fail_closed(
+def test_06538_extreme_model_capability_timestamp_is_locally_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -830,7 +901,7 @@ def test_d236_stale_model_capabilities_are_distinct_from_invalid_and_preserve_us
     ).source == "live"
 
 
-def test_06537_missing_entrypoint_record_row_after_rebinding_is_invalid(
+def test_06538_missing_entrypoint_record_row_after_rebinding_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -839,7 +910,7 @@ def test_06537_missing_entrypoint_record_row_after_rebinding_is_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-def test_06537_rebound_unsorted_account_list_is_invalid(
+def test_06538_rebound_unsorted_account_list_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -868,7 +939,7 @@ def test_06537_rebound_unsorted_account_list_is_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-def test_06537_rebound_unsorted_limits_and_tracker_evidence_are_invalid(
+def test_06538_rebound_unsorted_limits_and_tracker_evidence_are_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -883,7 +954,7 @@ def test_06537_rebound_unsorted_limits_and_tracker_evidence_are_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-def test_06537_rebound_integer_percent_instead_of_serializer_float_is_invalid(
+def test_06538_rebound_integer_percent_instead_of_serializer_float_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -896,7 +967,7 @@ def test_06537_rebound_integer_percent_instead_of_serializer_float_is_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-def test_06537_rebound_secret_shaped_reset_generation_is_invalid(
+def test_06538_rebound_secret_shaped_reset_generation_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from codex_usage import integration_snapshot
@@ -956,7 +1027,7 @@ def _rebind_after_noncanonical_record_digest(paths: dict[str, Path]) -> None:
     refresh_current_binding(paths)
 
 
-def test_06537_rebound_noncanonical_record_base64url_digest_is_invalid(
+def test_06538_rebound_noncanonical_record_base64url_digest_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)
@@ -965,7 +1036,7 @@ def test_06537_rebound_noncanonical_record_base64url_digest_is_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-def test_06537_permissive_ancestor_in_hashed_lock_path_is_invalid(
+def test_06538_permissive_ancestor_in_hashed_lock_path_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, _paths = write_producer_golden(tmp_path, monkeypatch)
@@ -979,7 +1050,7 @@ def test_06537_permissive_ancestor_in_hashed_lock_path_is_invalid(
     assert read_golden(state_home).status == "invalid"
 
 
-def test_06537_rebound_secret_shaped_authority_pool_id_is_invalid(
+def test_06538_rebound_secret_shaped_authority_pool_id_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, paths = write_producer_golden(tmp_path, monkeypatch)

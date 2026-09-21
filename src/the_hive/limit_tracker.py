@@ -16,15 +16,25 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
-from the_hive.usage_snapshot import UsageEvidenceV2
+from the_hive.usage_snapshot import (
+    UsageEvidenceV2,
+    _pool_authority_v2,
+    _source_inputs_v2,
+)
 
 
-_PRODUCER_VERSION = "0.6.537"
+_PRODUCER_VERSION = "0.6.538"
+_PRODUCER_SOURCE_MANIFEST_SHA256 = (
+    "f70d0b933f11cad16915ac2114171cd2092c21b50f874113dbeb873158da8657"
+)
+_PRODUCER_RELEASE_ID = "0.6.538-f70d0b933f11cad1"
 _SPARK_POOL = "gpt-5.3-codex-spark"
 _WINDOW_SECONDS = frozenset({18_000, 604_800, 2_592_000})
 _MAX_POINTER_BYTES = 4_096
 _MAX_BINDING_BYTES = 32_768
 _MAX_PAYLOAD_BYTES = 2_097_152
+_MAX_POOL_AUTHORITY_BYTES = 262_144
+_MAX_SOURCE_INPUT_BYTES = 524_288
 _MAX_ACTIVE_BYTES = 32_768
 _MAX_RELEASE_FILE_BYTES = 16 * 1024 * 1024
 _ACTIVE_FIELDS = frozenset(
@@ -59,6 +69,17 @@ _POINTER_FIELDS = frozenset(
 _BINDING_FIELDS = frozenset(
     {
         "binding_schema_version",
+        "pool_authority_filename",
+        "pool_authority_sha256",
+        "pool_authority_size_bytes",
+        "source_inputs_filename",
+        "source_inputs_sha256",
+        "source_inputs_size_bytes",
+        "usage_binding",
+    }
+)
+_USAGE_BINDING_FIELDS = frozenset(
+    {
         "active_manifest_sha256",
         "generation_id",
         "payload_filename",
@@ -68,6 +89,7 @@ _BINDING_FIELDS = frozenset(
         "producer_version",
         "release_id",
         "source_manifest_sha256",
+        "usage_binding_schema_version",
     }
 )
 _DOCUMENT_FIELDS = frozenset({"accounts", "generated_at", "schema_version"})
@@ -626,10 +648,8 @@ def _verify_active(
     source_manifest = active.get("source_manifest_sha256")
     if (
         active.get("version") != _PRODUCER_VERSION
-        or not isinstance(release_id, str)
-        or not release_id.startswith(f"{_PRODUCER_VERSION}-")
-        or not _is_hex(release_id.removeprefix(f"{_PRODUCER_VERSION}-"), 16)
-        or not _is_hex(source_manifest, 64)
+        or release_id != _PRODUCER_RELEASE_ID
+        or source_manifest != _PRODUCER_SOURCE_MANIFEST_SHA256
     ):
         raise _InvalidEvidence("invalid active release")
     releases = integration / "releases"
@@ -655,7 +675,7 @@ def _verify_active(
         ),
         "record_path": str(
             release
-            / "venv/lib/python3.14/site-packages/codex_usage_integration_producer-0.6.537.dist-info/RECORD"
+            / "venv/lib/python3.14/site-packages/codex_usage_integration_producer-0.6.538.dist-info/RECORD"
         ),
     }
     if any(active[name] != value for name, value in expected_paths.items()):
@@ -674,7 +694,7 @@ def _verify_active(
         ),
         (
             "record_sha256",
-            "./venv/lib/python3.14/site-packages/codex_usage_integration_producer-0.6.537.dist-info/RECORD",
+            "./venv/lib/python3.14/site-packages/codex_usage_integration_producer-0.6.538.dist-info/RECORD",
         ),
     ):
         if (
@@ -710,30 +730,46 @@ def _validate_pointer(pointer: dict[str, Any]) -> None:
         raise _InvalidEvidence("invalid previous pointer")
 
 
-def _validate_binding_shape(binding: dict[str, Any], *, generation: str) -> None:
+def _validate_binding_shape(binding: dict[str, Any], *, generation: str) -> dict[str, Any]:
     if (
         set(binding) != _BINDING_FIELDS
         or type(binding.get("binding_schema_version")) is not int
-        or binding["binding_schema_version"] != 1
+        or binding["binding_schema_version"] != 3
     ):
         raise _InvalidEvidence("invalid binding")
-    release_id = binding.get("release_id")
+    usage = binding.get("usage_binding")
+    if not isinstance(usage, dict) or set(usage) != _USAGE_BINDING_FIELDS:
+        raise _InvalidEvidence("invalid usage binding")
+    release_id = usage.get("release_id")
     if (
-        binding.get("generation_id") != generation
-        or binding.get("payload_filename") != "account-usage-v2.json"
-        or binding.get("producer_version") != _PRODUCER_VERSION
-        or not _is_hex(binding.get("active_manifest_sha256"), 64)
-        or not _is_hex(binding.get("payload_sha256"), 64)
-        or not _is_hex(binding.get("source_manifest_sha256"), 64)
-        or not isinstance(release_id, str)
-        or not release_id.startswith(f"{_PRODUCER_VERSION}-")
-        or not _is_hex(release_id.removeprefix(f"{_PRODUCER_VERSION}-"), 16)
-        or not isinstance(binding.get("payload_size_bytes"), int)
-        or isinstance(binding.get("payload_size_bytes"), bool)
-        or not 1 <= binding["payload_size_bytes"] <= _MAX_PAYLOAD_BYTES
+        usage.get("generation_id") != generation
+        or usage.get("payload_filename") != "account-usage-v2.json"
+        or usage.get("producer_version") != _PRODUCER_VERSION
+        or usage.get("usage_binding_schema_version") != 2
+        or not _is_hex(usage.get("active_manifest_sha256"), 64)
+        or not _is_hex(usage.get("payload_sha256"), 64)
+        or usage.get("source_manifest_sha256")
+        != _PRODUCER_SOURCE_MANIFEST_SHA256
+        or release_id != _PRODUCER_RELEASE_ID
+        or not isinstance(usage.get("payload_size_bytes"), int)
+        or isinstance(usage.get("payload_size_bytes"), bool)
+        or not 1 <= usage["payload_size_bytes"] <= _MAX_PAYLOAD_BYTES
+        or binding.get("pool_authority_filename") != "pool-authority-v2.json"
+        or not _is_hex(binding.get("pool_authority_sha256"), 64)
+        or not isinstance(binding.get("pool_authority_size_bytes"), int)
+        or isinstance(binding.get("pool_authority_size_bytes"), bool)
+        or not 1
+        <= binding["pool_authority_size_bytes"]
+        <= _MAX_POOL_AUTHORITY_BYTES
+        or binding.get("source_inputs_filename") != "source-inputs-v2.json"
+        or not _is_hex(binding.get("source_inputs_sha256"), 64)
+        or not isinstance(binding.get("source_inputs_size_bytes"), int)
+        or isinstance(binding.get("source_inputs_size_bytes"), bool)
+        or not 1 <= binding["source_inputs_size_bytes"] <= _MAX_SOURCE_INPUT_BYTES
     ):
         raise _InvalidEvidence("binding drift")
-    _parse_timestamp(binding.get("published_at"))
+    _parse_timestamp(usage.get("published_at"))
+    return usage
 
 
 def _validate_binding(
@@ -742,14 +778,15 @@ def _validate_binding(
     generation: str,
     active: dict[str, Any],
     active_sha256: str,
-) -> None:
-    _validate_binding_shape(binding, generation=generation)
+) -> dict[str, Any]:
+    usage = _validate_binding_shape(binding, generation=generation)
     if (
-        binding["active_manifest_sha256"] != active_sha256
-        or binding["release_id"] != active["release_id"]
-        or binding["source_manifest_sha256"] != active["source_manifest_sha256"]
+        usage["active_manifest_sha256"] != active_sha256
+        or usage["release_id"] != active["release_id"]
+        or usage["source_manifest_sha256"] != active["source_manifest_sha256"]
     ):
         raise _InvalidEvidence("binding drift")
+    return usage
 
 
 def _generation_file_names(generation_fd: int) -> None:
@@ -758,8 +795,65 @@ def _generation_file_names(generation_fd: int) -> None:
             names = {entry.name for entry in entries}
     except OSError as exc:
         raise _InvalidEvidence("generation namespace unreadable") from exc
-    if names != {"account-usage-v2.json", "account-usage-v2.binding.json"}:
+    if names != {
+        "account-usage-v2.binding.json",
+        "account-usage-v2.json",
+        "pool-authority-v2.json",
+        "source-inputs-v2.json",
+    }:
         raise _InvalidEvidence("invalid generation namespace")
+
+
+def _validate_generation_sidecars(
+    generation_fd: int,
+    generation_dir: Path,
+    binding: dict[str, Any],
+    usage: dict[str, Any],
+    *,
+    now: datetime,
+    current_account_ids: frozenset[str] | None = None,
+) -> list[_Proof]:
+    source_inputs, source_inputs_proof = _read_private_file_at(
+        generation_fd,
+        "source-inputs-v2.json",
+        path=generation_dir / "source-inputs-v2.json",
+        maximum=_MAX_SOURCE_INPUT_BYTES,
+    )
+    authority_bytes, authority_proof = _read_private_file_at(
+        generation_fd,
+        "pool-authority-v2.json",
+        path=generation_dir / "pool-authority-v2.json",
+        maximum=_MAX_POOL_AUTHORITY_BYTES,
+    )
+    if (
+        len(source_inputs) != binding["source_inputs_size_bytes"]
+        or hashlib.sha256(source_inputs).hexdigest() != binding["source_inputs_sha256"]
+        or len(authority_bytes) != binding["pool_authority_size_bytes"]
+        or hashlib.sha256(authority_bytes).hexdigest()
+        != binding["pool_authority_sha256"]
+    ):
+        raise _InvalidEvidence("generation sidecar digest drift")
+    try:
+        _source_inputs_v2(source_inputs)
+        authority = _pool_authority_v2(authority_bytes, now=now)
+    except Exception as exc:
+        raise _InvalidEvidence("invalid generation sidecar") from exc
+    if (
+        authority.generation_id != usage["generation_id"]
+        or authority.release_id != usage["release_id"]
+        or authority.issued_at != _parse_timestamp(usage["published_at"])
+        or authority.usage_payload_sha256 != usage["payload_sha256"]
+        or authority.usage_binding_sha256
+        != hashlib.sha256(_canonical_bytes(usage)).hexdigest()
+    ):
+        raise _InvalidEvidence("generation sidecar crossbinding drift")
+    if current_account_ids is not None and (
+        now >= authority.expires_at
+        or {entry.account_id for entry in authority.authorities}
+        != current_account_ids
+    ):
+        raise _InvalidEvidence("current authority is stale or mismatched")
+    return [source_inputs_proof, authority_proof]
 
 
 def _validate_previous_binding(
@@ -767,6 +861,8 @@ def _validate_previous_binding(
     generations: Path,
     pointer: dict[str, Any],
     held_fds: list[int],
+    *,
+    now: datetime,
 ) -> list[_Proof]:
     generation = pointer.get("previous_generation_id")
     digest = pointer.get("previous_binding_sha256")
@@ -785,7 +881,7 @@ def _validate_previous_binding(
         maximum=_MAX_BINDING_BYTES,
     )
     binding = _load_canonical_json(payload)
-    _validate_binding_shape(binding, generation=generation)
+    usage = _validate_binding_shape(binding, generation=generation)
     if hashlib.sha256(payload).hexdigest() != digest:
         raise _InvalidEvidence("previous binding drift")
     document_payload, document_proof = _read_private_file_at(
@@ -795,13 +891,16 @@ def _validate_previous_binding(
         maximum=_MAX_PAYLOAD_BYTES,
     )
     if (
-        len(document_payload) != binding["payload_size_bytes"]
-        or hashlib.sha256(document_payload).hexdigest() != binding["payload_sha256"]
+        len(document_payload) != usage["payload_size_bytes"]
+        or hashlib.sha256(document_payload).hexdigest() != usage["payload_sha256"]
     ):
         raise _InvalidEvidence("previous payload digest drift")
     document = _load_canonical_json(document_payload)
     _validate_document(document, now=_parse_timestamp(document.get("generated_at")))
-    return [generation_proof, binding_proof, document_proof]
+    sidecar_proofs = _validate_generation_sidecars(
+        generation_fd, generation_dir, binding, usage, now=now
+    )
+    return [generation_proof, binding_proof, document_proof, *sidecar_proofs]
 
 
 def _validate_document(
@@ -1112,7 +1211,7 @@ def _read_current_evidence(
             )
             binding = _load_canonical_json(binding_payload)
             active_digest = hashlib.sha256(active_payload).hexdigest()
-            _validate_binding(
+            usage = _validate_binding(
                 binding,
                 generation=generation,
                 active=active,
@@ -1131,14 +1230,23 @@ def _read_current_evidence(
                 maximum=_MAX_PAYLOAD_BYTES,
             )
             if (
-                len(document_payload) != binding["payload_size_bytes"]
+                len(document_payload) != usage["payload_size_bytes"]
                 or hashlib.sha256(document_payload).hexdigest()
-                != binding["payload_sha256"]
+                != usage["payload_sha256"]
             ):
                 raise _InvalidEvidence("payload digest drift")
             document = _load_canonical_json(document_payload)
+            status, current_accounts = _validate_document(document, now=now)
             previous_proofs = _validate_previous_binding(
-                generations_fd, generations, pointer, held_fds
+                generations_fd, generations, pointer, held_fds, now=now
+            )
+            sidecar_proofs = _validate_generation_sidecars(
+                generation_fd,
+                generation_dir,
+                binding,
+                usage,
+                now=now,
+                current_account_ids=frozenset(current_accounts),
             )
             _before_payload_recheck(-1, payload_path.name, len(document_payload))
             active_post_payload, active_post_proof = _read_private_file_at(
@@ -1166,12 +1274,12 @@ def _read_current_evidence(
                 generation_proof,
                 binding_proof,
                 document_proof,
+                *sidecar_proofs,
                 *previous_proofs,
                 active_post_proof,
                 current_post_proof,
             ]:
                 _recheck(proof)
-            status, _ = _validate_document(document, now=now)
     except _BusyEvidence:
         return EvidenceReadResult(
             status="busy", error_code="usage_evidence_producer_unavailable"
