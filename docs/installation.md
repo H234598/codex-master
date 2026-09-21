@@ -31,10 +31,24 @@ write and release-publication action, not a diagnostic command.
 ## Authorization boundary
 
 Run the installer only through a trusted owner's current instructions and with
-explicit authorization for the target home. This repository does not provide a
-verified procedure for user or system installation, unit activation, reload,
-secret provisioning, or a live smoke test. In particular, creating user-unit
-files is not evidence that the units are enabled or running.
+explicit authorization for the target home. The installer alone intentionally
+does not activate a user service. The sole public lifecycle transaction is:
+
+```sh
+./scripts/the-hive-runtime-service cutover --home <absolute-home>
+```
+
+It binds the current source, Runtime Image and hourly-unit state, invokes the
+attested internal installer API, refreshes the same-UID user manager, migrates the old
+`codex-master-hive-hourly-probe` unit pair when present, and observes the
+installed argumentless probe. It rolls back the bound Runtime/unit state on a
+transaction error. Its only read-only companion commands are `status` and
+`verify` with the same required `--home`; both return bounded JSON and never
+start, enable, or repair units. Do not compose `systemctl`, wrapper, pointer,
+or unit-file steps outside this transaction.
+The historical `the-hive-hive-hourly-probe-install` executable intentionally
+rejects operator invocations with `runtime_lifecycle_cutover_required`; it is
+not a second install route.
 
 Do not substitute an arbitrary Python invocation, alter release pointers, or
 construct wrapper arguments manually. An attested generation binds its
@@ -42,10 +56,9 @@ manifest digest to the release layout.
 
 ## After an authorized installation
 
-Use the intended deployment interface for bounded, data-sparse status and
-diagnostics. The repository does not publish a general direct-CLI recipe for
-that interface. Record the reported generation and manifest digest without
-including secrets or raw private-state output.
+Use `./scripts/the-hive-runtime-service verify --home <absolute-home>` for the
+bounded, data-sparse postcondition report. Record its generation and manifest
+digest without including secrets or raw private-state output.
 
 See [configuration](configuration.md) for source-controlled inputs,
 [troubleshooting](operations/troubleshooting.md) for safe evidence gathering,

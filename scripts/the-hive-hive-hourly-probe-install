@@ -1373,7 +1373,8 @@ def _ensure_probe_lock(state: Path) -> None:
             os.close(descriptor)
 
 
-def install(*, home: Path) -> dict[str, object]:
+def _install_attested_runtime(*, home: Path) -> dict[str, object]:
+    """Internal lifecycle API; never a second public operator transaction."""
     if not home.is_absolute():
         raise InstallError("home_unavailable")
     _directory(home, mode=0o700, create=False)
@@ -1417,17 +1418,17 @@ def install(*, home: Path) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(prog="the-hive-hive-hourly-probe-install")
     parser.add_argument("--home", type=Path, default=Path.home())
-    arguments = parser.parse_args()
-    try:
-        print(json.dumps(install(home=arguments.home), sort_keys=True))
-    except InstallError as exc:
-        print(
-            json.dumps(
-                {"status": str(exc), "raw_output": "not_returned"}, sort_keys=True
-            )
+    parser.parse_args()
+    print(
+        json.dumps(
+            {
+                "status": "runtime_lifecycle_cutover_required",
+                "raw_output": "not_returned",
+            },
+            sort_keys=True,
         )
-        return 1
-    return 0
+    )
+    return 1
 
 
 if __name__ == "__main__":

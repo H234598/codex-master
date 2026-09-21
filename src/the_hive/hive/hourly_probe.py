@@ -83,6 +83,7 @@ _SAFE_DIAGNOSTIC_CODES = frozenset(
         "command_failed",
         "command_stderr_warning",
         "command_stderr_redaction_unavailable",
+        "runtime_lifecycle_rollback_failed",
     }
 )
 _SAFE_DIAGNOSTIC_STDERR = frozenset({"empty", "present", "not_returned"})
@@ -718,6 +719,64 @@ def _probe_alarm_payload(
     }
 
 
+def publish_lifecycle_failure(
+    *,
+    layout: RuntimeLayout | None,
+    state_directory: Path,
+    reason_code: str,
+    now: Callable[[], datetime] | None = None,
+) -> dict[str, Any]:
+    """Fail closed with the canonical Hive-wide alarm after lifecycle rollback loss.
+
+    This is deliberately narrower than ``run_probe``: no wrapper or diagnostic
+    subprocess is started after a transaction has already lost its rollback
+    guarantee.  It publishes only a valid red v3 record through the existing
+    probe lock and atomic writer.
+    """
+
+    if (
+        layout is not None and not isinstance(layout, RuntimeLayout)
+    ) or reason_code != "runtime_lifecycle_rollback_failed":
+        raise ValueError("probe_lifecycle_failure_invalid")
+    state_directory = _state_directory(state_directory)
+    moment = (now or (lambda: datetime.now(UTC)))()
+    if (
+        not isinstance(moment, datetime)
+        or moment.tzinfo is None
+        or moment.utcoffset() is None
+    ):
+        raise ValueError("probe_clock_invalid")
+    checks = {"runtime_layout": False, "hive_runtime": False, "hive_doctor": False}
+    diagnostic = {
+        "code": reason_code,
+        "exit_code": None,
+        "stderr": {"state": "not_returned", "excerpt": "", "redaction_applied": False},
+    }
+    result: dict[str, Any] = {
+        "schema_version": 3,
+        "checked_at": moment.astimezone(UTC).isoformat(),
+        "checks": checks,
+        "commands": {
+            "runtime_status": False,
+            "hive_status": False,
+            "hive_doctor": False,
+        },
+        "diagnostics": {
+            "runtime_status": diagnostic,
+            "hive_status": diagnostic,
+            "hive_doctor": diagnostic,
+        },
+        "global_pilot_readiness": _bounded_global_pilot_readiness(None),
+    }
+    result["alarm"] = _probe_alarm_payload(
+        result, owner=_probe_alarm_owner(layout) if layout is not None else None
+    )
+    state_file = state_directory / STATE_FILE_NAME
+    with _probe_gate_lock(state_file, exclusive=True, create=True):
+        _atomic_write(state_file, result)
+    return result
+
+
 def _emit_phase_timeout(phase: str) -> None:
     """Publish the bounded phase and its named limit without child output."""
 
@@ -1093,6 +1152,7 @@ __all__ = [
     "probe_capacity_guard",
     "probe_capacity_lock",
     "probe_spawn_gate",
+    "publish_lifecycle_failure",
     "read_probe_gate",
     "run_probe",
 ]
