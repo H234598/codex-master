@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":9,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":10,"schema_version":1} -->\n'
 )
 
 
@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 9
+    assert contract.generation == 10
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -276,6 +276,24 @@ def test_common_policy_contains_bidirectional_annotation_response_contract() -> 
         "Beantwortung der Frage am TT.MMJJJJ durch: <Biene> -: "
         "[[<Antwortziel>#<Antwortüberschrift>|<Antwortüberschrift>]]" not in raw_policy
     )
+
+
+def test_common_policy_keeps_annotation_marker_sidecars_read_only() -> None:
+    policy_api = load_policy_api()
+    policy = " ".join(
+        policy_api.load_common_policy().common_bytes.decode("utf-8").split()
+    )
+
+    required_meanings = [
+        "Annotation-Marker-Sidecars under `.obsidian/plugins/annotation-marker/annotations/` are exclusively read-only input sources",
+        "write the response, `(A)` link, explanation, decision, status, and every other change exclusively to the vault-relative original Markdown file",
+        "Never write, create, delete, rewrite, or append sidecars",
+        "If a sidecar and its original conflict, leave both unchanged",
+        "annotation_sidecar_original_conflict",
+    ]
+
+    for meaning in required_meanings:
+        assert meaning in policy
 
 
 def test_common_policy_requires_markdown_annotation_response_heading() -> None:

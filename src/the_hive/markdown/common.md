@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":9,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":10,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -71,8 +71,14 @@ use `data-annotation-id` to distinguish markers with the same text or line.
   alternatives, trade-offs, and a reasoned recommendation; do not silently
   decide for them.
 
-Annotations are working instructions, not decoration. Do not remove them from
-the sidecar when updating the canonical source.
+Annotations are working instructions, not decoration. Annotation-Marker-Sidecars
+under `.obsidian/plugins/annotation-marker/annotations/` are exclusively
+read-only input sources. When responding to an annotation or revising a
+document, write the response, `(A)` link, explanation, decision, status, and
+every other change exclusively to the vault-relative original Markdown file.
+Never write, create, delete, rewrite, or append sidecars. If a sidecar and its
+original conflict, leave both unchanged and report
+`annotation_sidecar_original_conflict`.
 
 ## Obsidian and local file links
 

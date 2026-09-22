@@ -36,6 +36,18 @@ Private Hive-Zustände werden in der Implementierung begrenzt, gelockt und
 Zustandsverzeichnissen oder Umgebungsvariablen bleiben technische
 Kompatibilitätsverträge, keine Produktbezeichnung.
 
+## Annotation-Marker-Sidecars
+
+Annotation-Marker-Sidecars unter
+`.obsidian/plugins/annotation-marker/annotations/` sind ausschließlich
+schreibgeschützte Eingabequellen. Beim Beantworten einer Annotation oder bei
+einer Dokumentüberarbeitung werden Antwort, `(A)`-Link, Erklärung,
+Entscheidung, Status und jede sonstige Änderung ausschließlich in die
+vaultrelative Original-Markdowndatei geschrieben. Sidecars dürfen niemals
+geschrieben, angelegt, gelöscht, umgeschrieben oder angehängt werden. Bei
+Widerspruch zwischen Sidecar und Original bleiben beide unverändert und es ist
+`annotation_sidecar_original_conflict` zu melden.
+
 ## Operative Entscheidung
 
 Diese Seite enthält absichtlich keine produktiven Start-, Provisionierungs-
