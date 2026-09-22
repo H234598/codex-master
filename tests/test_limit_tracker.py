@@ -26,7 +26,7 @@ from the_hive.usage_snapshot import (
 
 NOW = datetime(2026, 8, 26, 18, 0, tzinfo=UTC)
 GENERATION = "1" * 32
-SOURCE_DIGEST = "4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce"
+SOURCE_DIGEST = "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0"
 RESET = "2026-08-27T00:00:00Z"
 
 
@@ -161,7 +161,7 @@ class EvidenceTree:
         root: Path,
         payload: dict[str, object],
         *,
-        producer_version: str = "0.6.541",
+        producer_version: str = "0.6.542",
         python_version: str = "3.14",
     ) -> None:
         self.root = private_dir(root)
@@ -507,7 +507,7 @@ def add_previous_generation(tree: EvidenceTree) -> Path:
     return binding_path
 
 
-def test_d299_active_0_6_541_python_3_14_attested_layout_reads_complete(
+def test_d300_active_0_6_542_python_3_14_attested_layout_reads_complete(
     evidence: EvidenceTree,
 ) -> None:
     result = read(evidence)
@@ -527,13 +527,13 @@ def test_old_0_6_536_python_3_13_attested_layout_is_rejected(tmp_path: Path) -> 
     assert read(legacy).status == "invalid"
 
 
-def test_d299_active_0_6_541_python_3_13_attestation_path_is_rejected(
+def test_d300_active_0_6_542_python_3_13_attestation_path_is_rejected(
     tmp_path: Path,
 ) -> None:
     wrong_python_path = EvidenceTree(
         tmp_path / "wrong-python-path",
         document(),
-        producer_version="0.6.541",
+        producer_version="0.6.542",
         python_version="3.13",
     )
 
@@ -541,7 +541,7 @@ def test_d299_active_0_6_541_python_3_13_attestation_path_is_rejected(
 
 
 @pytest.mark.parametrize(
-    "retired_version", ("0.6.537", "0.6.538", "0.6.539", "0.6.540")
+    "retired_version", ("0.6.537", "0.6.538", "0.6.539", "0.6.540", "0.6.541")
 )
 def test_current_binding_retired_producer_is_rejected(
     evidence: EvidenceTree, retired_version: str
@@ -560,8 +560,8 @@ def test_current_binding_retired_producer_is_rejected(
     assert read(evidence).status == "invalid"
 
 
-@pytest.mark.parametrize("other_version", ("0.6.540", "0.6.542"))
-def test_d299_active_release_accepts_no_other_producer_version(
+@pytest.mark.parametrize("other_version", ("0.6.541", "0.6.543"))
+def test_d300_active_release_accepts_no_other_producer_version(
     tmp_path: Path, other_version: str
 ) -> None:
     """Catches a consumer that accepts an adjacent or retired release line."""
@@ -575,10 +575,10 @@ def test_d299_active_release_accepts_no_other_producer_version(
     assert read(candidate).status == "invalid"
 
 
-def test_d299_active_release_rejects_a_fully_rebound_other_source_manifest(
+def test_d300_active_release_rejects_a_fully_rebound_other_source_manifest(
     evidence: EvidenceTree,
 ) -> None:
-    """Catches a consumer that accepts a .541 release from an unbound source tree."""
+    """Catches a consumer that accepts a .542 release from an unbound source tree."""
 
     unexpected_manifest = "f" * 64
     active_path = evidence.integration / "active.json"

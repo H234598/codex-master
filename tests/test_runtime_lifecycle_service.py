@@ -179,19 +179,19 @@ def test_legacy_installer_cli_rejects_a_second_mutating_operator_route(
     assert not (tmp_path / "home").exists()
 
 
-def test_d299_consumer_producer_contract_accepts_only_named_06541_identity() -> None:
-    """Catches a runtime image that retains the retired .540 pin or a fallback."""
+def test_d300_consumer_producer_contract_accepts_only_named_06542_identity() -> None:
+    """Catches a runtime image that retains the retired .541 pin or a fallback."""
 
     valid = (
-        b'_PRODUCER_VERSION = "0.6.541"\n'
-        b'_PRODUCER_SOURCE_MANIFEST_SHA256 = "4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce"\n'
-        b'_PRODUCER_RELEASE_ID = "0.6.541-4cb02fabfb5a4b30"\n'
+        b'_PRODUCER_VERSION = "0.6.542"\n'
+        b'_PRODUCER_SOURCE_MANIFEST_SHA256 = "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0"\n'
+        b'_PRODUCER_RELEASE_ID = "0.6.542-8da41af5293cf481"\n'
         b'if python_directory[2] != "python3.14":\n    raise ValueError()\n'
     )
-    retired = valid.replace(b'"0.6.541"', b'"0.6.540"')
-    other_version = valid.replace(b'"0.6.541"', b'"0.6.542"')
+    retired = valid.replace(b'"0.6.542"', b'"0.6.541"')
+    other_version = valid.replace(b'"0.6.542"', b'"0.6.543"')
     other_manifest = valid.replace(
-        b"4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce",
+        b"8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0",
         b"0" * 64,
     )
     heuristic_only = b"# " + valid

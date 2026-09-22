@@ -20,7 +20,7 @@ PRODUCER_NOW = datetime(2026, 8, 31, 12, 1, tzinfo=UTC)
 PRODUCER_ROOT = Path(
     os.environ.get("THE_HIVE_TEST_CODEX_USAGE_ROOT", "/home/teladi/codex-usage")
 )
-PRODUCER_COMMIT = "61d9046077d36ecdc99efd3713d837af9a9e708b"
+PRODUCER_COMMIT = "df2c2b3cdd48b0fdd0f020eedbd7055343ad6b6a"
 PRODUCER_SOURCE_FILES = (
     "pyproject.toml",
     "src/codex_usage/__init__.py",
@@ -198,7 +198,7 @@ def refresh_current_binding(paths: dict[str, Path]) -> None:
     private_file(paths["pointer"], canonical(pointer))
 
 
-def test_d299_pinned_producer_06541_golden_generation_is_complete(
+def test_d300_pinned_producer_06542_golden_generation_is_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_home, _paths = write_producer_golden(tmp_path, monkeypatch)
@@ -224,17 +224,17 @@ def test_d299_pinned_producer_06541_golden_generation_is_complete(
     )
 
     assert result.generation_id == pointer["current_generation_id"]
-    assert active["version"] == "0.6.541"
-    assert active["release_id"] == "0.6.541-4cb02fabfb5a4b30"
+    assert active["version"] == "0.6.542"
+    assert active["release_id"] == "0.6.542-8da41af5293cf481"
     assert (
         active["source_manifest_sha256"]
-        == "4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce"
+        == "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0"
     )
-    assert binding["usage_binding"]["producer_version"] == "0.6.541"
-    assert binding["usage_binding"]["release_id"] == "0.6.541-4cb02fabfb5a4b30"
+    assert binding["usage_binding"]["producer_version"] == "0.6.542"
+    assert binding["usage_binding"]["release_id"] == "0.6.542-8da41af5293cf481"
     assert (
         binding["usage_binding"]["source_manifest_sha256"]
-        == "4cb02fabfb5a4b306e789cf685a6a83838e7fdd7f42e7f1af3491afd1723c7ce"
+        == "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0"
     )
 
 
