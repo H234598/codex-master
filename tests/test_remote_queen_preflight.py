@@ -725,8 +725,8 @@ def _assert_no_runtime_effects_source(source: str) -> None:
 
 def test_no_runtime_effects():
     production_paths = [
-        Path(__file__).parents[1] / "src/codex_master/remote_queen_ssh.py",
-        Path(__file__).parents[1] / "src/codex_master/remote_queen_preflight.py",
+        Path(__file__).parents[1] / "src/the_hive/remote_queen_ssh.py",
+        Path(__file__).parents[1] / "src/the_hive/remote_queen_preflight.py",
     ]
 
     for path in production_paths:

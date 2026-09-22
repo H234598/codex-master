@@ -1233,7 +1233,7 @@ def test_verify_and_rollback_request_bindings_fail_closed():
 
 
 def test_runtime_effect_gate_rejects_forbidden_imports_and_calls():
-    source_path = Path(__file__).parents[1] / "src/codex_master/remote_queen_dependencies.py"
+    source_path = Path(__file__).parents[1] / "src/the_hive/remote_queen_dependencies.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     forbidden_imports = {
         "os",
