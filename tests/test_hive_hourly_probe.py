@@ -902,6 +902,15 @@ def test_hourly_probe_direct_entrypoint_runs_without_an_argument(
     assert hourly_probe_module.main([]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True},
+        "global_pilot_readiness": {
+            "schema_version": 1,
+            "pilot": "blocked",
+            "generation_id": None,
+            "freshness": "unknown",
+            "candidate_count": 0,
+            "reason_codes": ["usage_missing"],
+            "raw_output": "not_returned",
+        },
     }
 
 
@@ -925,7 +934,16 @@ def test_hourly_probe_direct_entrypoint_explains_a_red_result(
                 "runtime_layout": True,
                 "hive_runtime": False,
                 "hive_doctor": True,
-            }
+            },
+            "global_pilot_readiness": {
+                "schema_version": 1,
+                "pilot": "blocked",
+                "generation_id": None,
+                "freshness": "fresh",
+                "candidate_count": 1,
+                "reason_codes": ["usage_generation_missing"],
+                "raw_output": "not_returned",
+            },
         },
     )
 
@@ -933,6 +951,15 @@ def test_hourly_probe_direct_entrypoint_explains_a_red_result(
     captured = capsys.readouterr()
     assert json.loads(captured.out) == {
         "checks": {"runtime_layout": True, "hive_runtime": False, "hive_doctor": True},
+        "global_pilot_readiness": {
+            "schema_version": 1,
+            "pilot": "blocked",
+            "generation_id": None,
+            "freshness": "fresh",
+            "candidate_count": 1,
+            "reason_codes": ["usage_generation_missing"],
+            "raw_output": "not_returned",
+        },
     }
     assert captured.err == "hive_hourly_probe_red failed_checks=hive_runtime\n"
 

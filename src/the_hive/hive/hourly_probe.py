@@ -1114,7 +1114,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if not isinstance(checks, Mapping):
         print("hive_hourly_probe_error code=probe_result_invalid", file=sys.stderr, flush=True)
         return 2
-    print(json.dumps({"checks": checks}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "checks": checks,
+                "global_pilot_readiness": _bounded_global_pilot_readiness(
+                    result.get("global_pilot_readiness")
+                ),
+            },
+            sort_keys=True,
+        )
+    )
     failed_checks = sorted(name for name, ready in checks.items() if ready is not True)
     if failed_checks:
         diagnostics = result.get("diagnostics")
