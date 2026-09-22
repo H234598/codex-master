@@ -270,6 +270,99 @@ def _prepared_delivery(
     return generation, store.poll_headers(_GROUP, _PARTITION, generation)
 
 
+def _c2_watermark(*, through_seq: int) -> object:
+    subscription_generation = _digest(b"c2-subscription-generation")
+    attestation = {
+        "schema_version": 1,
+        "partition": _PARTITION,
+        "retention_generation": 1,
+        "mandatory_watermark_seq": through_seq,
+        "subscription_generation": subscription_generation,
+    }
+    return bus_store.MandatoryWatermarkV1(
+        partition=_PARTITION,
+        retention_generation=1,
+        mandatory_watermark_seq=through_seq,
+        subscription_generation=subscription_generation,
+        attestation_digest=_digest(canonical_json_bytes(attestation)),
+    )
+
+
+def _c2_basis(*, run: bytes, through_seq: int, snapshot: object | None) -> object:
+    return bus_store.RetentionBasisV1(
+        run_id=_digest(run),
+        watermark=_c2_watermark(through_seq=through_seq),
+        snapshot=snapshot,
+    )
+
+
+def _c2_append(
+    store: HiveBusStore,
+    *,
+    producer_seq: int,
+    retention_class: str,
+    payload: bytes = b"payload",
+) -> None:
+    request = _request(
+        idempotency_suffix=f"{producer_seq:032x}",
+        producer_seq=producer_seq,
+        payload_bytes=payload,
+    )
+    if retention_class == "transient":
+        request["event_type"] = "digest.tick"
+    request["retention_class"] = retention_class
+    _append_result(store, request, payload)
+
+
+def _c2_seed_retention_policy(store: HiveBusStore) -> None:
+    policy_bytes = canonical_json_bytes(GEN1_RETENTION_POLICY)
+    store._connection.execute(  # noqa: SLF001 - C2 fixture for the preexisting table.
+        "INSERT INTO retention_policies(retention_generation,policy_digest,policy_bytes,created_at_utc) "
+        "VALUES(?,?,?,?)",
+        (1, _digest(policy_bytes), policy_bytes, "2026-09-15T10:11:12.345Z"),
+    )
+    store._connection.commit()  # noqa: SLF001 - retain the fixture before C2 begins.
+
+
+def _c2_mutation_state(store: HiveBusStore) -> tuple[object, ...]:
+    """Read the C2-mutated rows without examining manifest contents."""
+
+    return (
+        store._connection.execute(  # noqa: SLF001 - no-mutation test oracle.
+            "SELECT partition,next_seq,first_retained_seq,state,blocked_code,created_at_utc,updated_at_utc "
+            "FROM partitions ORDER BY partition"
+        ).fetchall(),
+        store._connection.execute(  # noqa: SLF001 - no-mutation test oracle.
+            "SELECT event_id,partition,partition_seq,retention_class,accepted_at_utc,payload_kind,"
+            "payload_digest,payload_ref FROM events ORDER BY partition,partition_seq"
+        ).fetchall(),
+        store._connection.execute(  # noqa: SLF001 - no-mutation test oracle.
+            "SELECT kind,digest,ref,size_bytes,body,body_state FROM payloads ORDER BY kind,digest,ref"
+        ).fetchall(),
+        store._connection.execute(  # noqa: SLF001 - no-mutation test oracle.
+            "SELECT partition,from_seq,through_seq,digest,digest_bytes FROM digest_anchors "
+            "ORDER BY partition,through_seq"
+        ).fetchall(),
+        store._connection.execute(  # noqa: SLF001 - no-mutation test oracle.
+            "SELECT snapshot_id,partition,through_seq,snapshot_digest,snapshot_bytes,snapshot_size_bytes "
+            "FROM snapshots ORDER BY partition,through_seq"
+        ).fetchall(),
+        store._connection.execute(  # noqa: SLF001 - no-mutation test oracle.
+            "SELECT consumer_group_id,partition,generation,acked_seq,gap_snapshot_id,gap_from_seq,"
+            "gap_through_seq FROM cursors ORDER BY consumer_group_id,partition"
+        ).fetchall(),
+        store._connection.execute(  # noqa: SLF001 - no-mutation test oracle.
+            "SELECT consumer_group_id,partition,generation,delivery_token,from_seq,scan_through_seq "
+            "FROM delivery_leases ORDER BY consumer_group_id,partition"
+        ).fetchall(),
+        store._connection.execute(  # noqa: SLF001 - no-mutation test oracle.
+            "SELECT partition,run_id,request_digest,retention_generation,basis_digest,snapshot_id,"
+            "compacted_through_seq,first_retained_seq,expired_payload_count,compacted_event_count "
+            "FROM retention_checkpoints ORDER BY partition,run_id"
+        ).fetchall(),
+    )
+
+
 def _seed_exact_gen1(root: Path, clock: FakeClock) -> None:
     """Create a fully-populated, byte-exact legacy source for migration tests."""
 
@@ -2670,7 +2763,14 @@ def test_every_store_diagnostic_call_is_direct_and_uses_d135_literals() -> None:
         "BUS_E_STORE_INTEGRITY": ("CRITICAL", False, "operator_intervention"),
         "BUS_E_PARTITION_SEQ_CONFLICT": ("CRITICAL", False, "operator_intervention"),
         "BUS_E_CURSOR_CONFLICT": ("ERROR", False, "repoll_headers"),
+        "BUS_E_CURSOR_GAP": ("ERROR", False, "revalidate_snapshot"),
         "BUS_E_SUBSCRIPTION_STALE": ("ERROR", False, "refresh_subscription"),
+        "BUS_E_RETENTION_PRECONDITION": (
+            "ERROR",
+            False,
+            "revalidate_retention_basis",
+        ),
+        "BUS_E_SNAPSHOT_TOO_LARGE": ("ERROR", False, "reduce_snapshot"),
         "BUS_E_DELIVERY_LEASE_ACTIVE": ("WARNING", True, "retry_delivery"),
         "BUS_E_DELIVERY_STALE": ("WARNING", True, "repoll_headers"),
         "BUS_E_DELIVERY_BACKOFF": ("WARNING", True, "retry_delivery"),
@@ -3316,3 +3416,476 @@ def test_c1_materialize_empty_next_interval_returns_schema_diagnostic(
         _diagnostic(result, "BUS_E_SCHEMA", DiagnosticSeverityV2.ERROR)
     finally:
         assert store.close() is None
+
+
+def test_c2_snapshot_is_opaque_bounded_canonical_and_idempotent(
+    secure_tmp_path: Path,
+) -> None:
+    store = _store(secure_tmp_path / "c2-snapshot", FakeClock())
+    snapshot_bytes = b"s" * 1_048_576
+    try:
+        _c2_append(store, producer_seq=1, retention_class="transient")
+        snapshot = store.record_snapshot(_PARTITION, 1, snapshot_bytes=snapshot_bytes)
+        assert type(snapshot).__name__ == "SnapshotAnchorV1"
+        snapshot_digest = _digest(snapshot_bytes)
+        expected_id = _digest(
+            canonical_json_bytes(
+                {
+                    "schema_version": 1,
+                    "partition": _PARTITION,
+                    "through_seq": 1,
+                    "snapshot_digest": snapshot_digest,
+                }
+            )
+        )
+        assert getattr(snapshot, "snapshot_id") == expected_id
+        assert getattr(snapshot, "snapshot_digest") == snapshot_digest
+        assert (
+            store.record_snapshot(_PARTITION, 1, snapshot_bytes=snapshot_bytes)
+            == snapshot
+        )
+        conflict = store.record_snapshot(_PARTITION, 1, snapshot_bytes=b"other")
+        _diagnostic(
+            conflict, "BUS_E_RETENTION_PRECONDITION", DiagnosticSeverityV2.ERROR
+        )
+        too_large = store.record_snapshot(
+            _PARTITION, 1, snapshot_bytes=b"x" * 1_048_577
+        )
+        _diagnostic(too_large, "BUS_E_SNAPSHOT_TOO_LARGE", DiagnosticSeverityV2.ERROR)
+        assert store._connection.execute(  # noqa: SLF001 - no failed insert.
+            "SELECT COUNT(*) FROM snapshots"
+        ).fetchone() == (1,)
+    finally:
+        assert store.close() is None
+
+
+@pytest.mark.parametrize("corruption", ("digest", "size", "type"))
+def test_c2_snapshot_persisted_bytes_are_verified_before_idempotency_or_use(
+    secure_tmp_path: Path, corruption: str
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "c2-snapshot-integrity", clock)
+    try:
+        _c2_seed_retention_policy(store)
+        _c2_append(store, producer_seq=1, retention_class="transient")
+        assert store.materialize_digest(_PARTITION, through_seq=1) is not None
+        snapshot_bytes = b"opaque-snapshot"
+        snapshot = store.record_snapshot(_PARTITION, 1, snapshot_bytes=snapshot_bytes)
+        assert type(snapshot).__name__ == "SnapshotAnchorV1"
+        snapshot_id = getattr(snapshot, "snapshot_id")
+        if corruption == "digest":
+            store._connection.execute(  # noqa: SLF001 - post-open tamper fixture.
+                "UPDATE snapshots SET snapshot_bytes=? WHERE snapshot_id=?",
+                (b"x" * len(snapshot_bytes), snapshot_id),
+            )
+        elif corruption == "size":
+            store._connection.execute(  # noqa: SLF001 - post-open tamper fixture.
+                "PRAGMA ignore_check_constraints=ON"
+            )
+            store._connection.execute(
+                "UPDATE snapshots SET snapshot_size_bytes=? WHERE snapshot_id=?",
+                (len(snapshot_bytes) + 1, snapshot_id),
+            )
+            store._connection.execute("PRAGMA ignore_check_constraints=OFF")
+        else:
+            store._connection.execute(  # noqa: SLF001 - post-open tamper fixture.
+                "UPDATE snapshots SET snapshot_bytes=CAST(? AS TEXT) WHERE snapshot_id=?",
+                (snapshot_bytes.decode("ascii"), snapshot_id),
+            )
+        store._connection.commit()  # noqa: SLF001 - preserve tamper fixture.
+        clock.now += timedelta(days=2)
+        before = _c2_mutation_state(store)
+
+        repeated = store.record_snapshot(_PARTITION, 1, snapshot_bytes=snapshot_bytes)
+        compacted = store.compact_retention(
+            _PARTITION,
+            basis=_c2_basis(run=b"corrupt-snapshot", through_seq=1, snapshot=snapshot),
+        )
+
+        _diagnostic(repeated, "BUS_E_STORE_INTEGRITY", DiagnosticSeverityV2.CRITICAL)
+        _diagnostic(compacted, "BUS_E_STORE_INTEGRITY", DiagnosticSeverityV2.CRITICAL)
+        assert _c2_mutation_state(store) == before
+    finally:
+        assert store.close() is None
+
+
+def test_c2_snapshot_can_start_at_current_retained_head_then_prove_later_gap(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "c2-post-compaction-snapshot", clock)
+    try:
+        _c2_seed_retention_policy(store)
+        _c2_append(store, producer_seq=1, retention_class="transient")
+        _c2_append(store, producer_seq=2, retention_class="transient")
+        assert store.materialize_digest(_PARTITION, through_seq=2) is not None
+        clock.now += timedelta(days=2)
+        first = store.compact_retention(
+            _PARTITION,
+            basis=_c2_basis(run=b"first-prefix", through_seq=2, snapshot=None),
+        )
+        assert getattr(first, "first_retained_seq") == 3
+
+        _c2_append(
+            store, producer_seq=3, retention_class="transient", payload=b"payload-3"
+        )
+        _c2_append(
+            store, producer_seq=4, retention_class="transient", payload=b"payload-4"
+        )
+        assert store.materialize_digest(_PARTITION, through_seq=4) is not None
+        snapshot = store.record_snapshot(_PARTITION, 4, snapshot_bytes=b"new-head")
+        assert type(snapshot).__name__ == "SnapshotAnchorV1"
+        clock.now += timedelta(days=2)
+        generation = store.record_manifest_bytes(_GROUP, manifest_bytes=b"c2-new-head")
+        assert isinstance(generation, str)
+        assert store.open_cursor_once(_GROUP, _PARTITION, generation) == 0
+
+        second = store.compact_retention(
+            _PARTITION,
+            basis=_c2_basis(run=b"second-prefix", through_seq=4, snapshot=snapshot),
+        )
+        gap = store.poll_headers(_GROUP, _PARTITION, generation)
+
+        assert getattr(second, "compacted_through_seq") == 4
+        assert type(gap).__name__ == "CursorGapV1"
+        assert getattr(gap, "snapshot") == snapshot
+        assert getattr(gap, "gap_through_seq") == 4
+    finally:
+        assert store.close() is None
+
+
+def test_c2_retention_gap_is_leaseless_until_exact_snapshot_ack(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "c2-gap", clock)
+    try:
+        _c2_seed_retention_policy(store)
+        _c2_append(store, producer_seq=1, retention_class="transient")
+        _c2_append(store, producer_seq=2, retention_class="transient")
+        _c2_append(store, producer_seq=3, retention_class="work")
+        assert store.materialize_digest(_PARTITION, through_seq=2) is not None
+        snapshot = store.record_snapshot(_PARTITION, 2, snapshot_bytes=b"opaque")
+        assert type(snapshot).__name__ == "SnapshotAnchorV1"
+        generation = store.record_manifest_bytes(_GROUP, manifest_bytes=b"c2-gap")
+        assert isinstance(generation, str)
+        assert store.open_cursor_once(_GROUP, _PARTITION, generation) == 0
+        delivery = store.poll_headers(_GROUP, _PARTITION, generation)
+        assert type(delivery).__name__ == "DeliveryBatchV1"
+        clock.now += timedelta(days=2)
+        result = store.compact_retention(
+            _PARTITION,
+            basis=_c2_basis(run=b"gap", through_seq=2, snapshot=snapshot),
+        )
+        assert type(result).__name__ == "RetentionRunResultV1"
+        opened = store.open_cursor_once(_GROUP, _PARTITION, generation)
+        polled = store.poll_headers(_GROUP, _PARTITION, generation)
+        assert type(opened).__name__ == "CursorGapV1"
+        assert type(polled).__name__ == "CursorGapV1"
+        assert getattr(opened, "snapshot") == snapshot
+        assert getattr(opened, "gap_from_seq") == 1
+        assert getattr(opened, "gap_through_seq") == 2
+        assert store._connection.execute(  # noqa: SLF001 - a gap never leases.
+            "SELECT COUNT(*) FROM delivery_leases"
+        ).fetchone() == (0,)
+        wrong_digest = _digest(b"wrong-digest")
+        wrong = bus_store.SnapshotAnchorV1(
+            snapshot_id=_digest(
+                canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "partition": _PARTITION,
+                        "through_seq": 2,
+                        "snapshot_digest": wrong_digest,
+                    }
+                )
+            ),
+            partition=_PARTITION,
+            through_seq=2,
+            snapshot_digest=wrong_digest,
+        )
+        before = _c2_mutation_state(store)
+        stale = store.ack_cursor_gap(_GROUP, _PARTITION, generation, wrong)
+        _diagnostic(stale, "BUS_E_CURSOR_CONFLICT", DiagnosticSeverityV2.ERROR)
+        assert _c2_mutation_state(store) == before
+        stale_generation = store.ack_cursor_gap(
+            _GROUP, _PARTITION, _digest(b"c2-stale-generation"), snapshot
+        )
+        _diagnostic(
+            stale_generation, "BUS_E_CURSOR_CONFLICT", DiagnosticSeverityV2.ERROR
+        )
+        assert _c2_mutation_state(store) == before
+        assert store.ack_cursor_gap(_GROUP, _PARTITION, generation, snapshot) == 2
+        assert store._connection.execute(  # noqa: SLF001 - exact ACK clears only gap.
+            "SELECT acked_seq,gap_snapshot_id,gap_from_seq,gap_through_seq FROM cursors"
+        ).fetchone() == (2, None, None, None)
+        after_ack = store.poll_headers(_GROUP, _PARTITION, generation)
+        assert type(after_ack).__name__ == "DeliveryBatchV1"
+        assert getattr(after_ack, "from_seq") == 3
+    finally:
+        assert store.close() is None
+
+
+def test_c2_invalid_retention_basis_has_no_mutation_and_no_manifest_read(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "c2-basis", clock)
+    try:
+        _c2_seed_retention_policy(store)
+        _c2_append(store, producer_seq=1, retention_class="transient")
+        assert store.materialize_digest(_PARTITION, through_seq=1) is not None
+        clock.now += timedelta(days=2)
+        basis = _c2_basis(run=b"invalid", through_seq=1, snapshot=None)
+        watermark = getattr(basis, "watermark")
+        invalid = bus_store.RetentionBasisV1(
+            run_id=getattr(basis, "run_id"),
+            watermark=bus_store.MandatoryWatermarkV1(
+                partition=getattr(watermark, "partition"),
+                retention_generation=getattr(watermark, "retention_generation"),
+                mandatory_watermark_seq=getattr(watermark, "mandatory_watermark_seq"),
+                subscription_generation=getattr(watermark, "subscription_generation"),
+                attestation_digest=_digest(b"invalid-attestation"),
+            ),
+            snapshot=None,
+        )
+        before = store._connection.execute(  # noqa: SLF001 - failed basis writes nothing.
+            "SELECT COUNT(*) FROM events"
+        ).fetchone()
+        result = store.compact_retention(_PARTITION, basis=invalid)
+        _diagnostic(result, "BUS_E_RETENTION_PRECONDITION", DiagnosticSeverityV2.ERROR)
+        assert (
+            store._connection.execute("SELECT COUNT(*) FROM events").fetchone()
+            == before
+        )  # noqa: SLF001
+
+        statements: list[str] = []
+        store._connection.set_trace_callback(statements.append)  # noqa: SLF001
+        valid = store.compact_retention(_PARTITION, basis=basis)
+        store._connection.set_trace_callback(None)  # noqa: SLF001
+        assert type(valid).__name__ == "RetentionRunResultV1"
+        assert not any("manifest_bytes" in statement for statement in statements)
+    finally:
+        assert store.close() is None
+
+
+@pytest.mark.parametrize("anchor_state", ("missing", "wrong"))
+def test_c2_missing_or_wrong_digest_anchor_is_precondition_without_mutation(
+    secure_tmp_path: Path, anchor_state: str
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / f"c2-anchor-{anchor_state}", clock)
+    try:
+        _c2_seed_retention_policy(store)
+        _c2_append(store, producer_seq=1, retention_class="transient")
+        assert store.materialize_digest(_PARTITION, through_seq=1) is not None
+        if anchor_state == "missing":
+            store._connection.execute(  # noqa: SLF001 - missing-anchor fixture.
+                "DELETE FROM digest_anchors WHERE partition=? AND through_seq=?",
+                (_PARTITION, 1),
+            )
+        else:
+            store._connection.execute(  # noqa: SLF001 - wrong-anchor fixture.
+                "UPDATE digest_anchors SET digest=? WHERE partition=? AND through_seq=?",
+                (_digest(b"wrong-anchor"), _PARTITION, 1),
+            )
+        store._connection.commit()  # noqa: SLF001 - retain corruption fixture.
+        clock.now += timedelta(days=2)
+        before = _c2_mutation_state(store)
+
+        result = store.compact_retention(
+            _PARTITION,
+            basis=_c2_basis(
+                run=anchor_state.encode("ascii"), through_seq=1, snapshot=None
+            ),
+        )
+
+        _diagnostic(result, "BUS_E_RETENTION_PRECONDITION", DiagnosticSeverityV2.ERROR)
+        assert _c2_mutation_state(store) == before
+    finally:
+        assert store.close() is None
+
+
+def test_c2_missing_snapshot_and_cursor_basis_are_preconditions_without_mutation(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "c2-snapshot-cursor-basis", clock)
+    try:
+        _c2_seed_retention_policy(store)
+        _c2_append(store, producer_seq=1, retention_class="transient")
+        assert store.materialize_digest(_PARTITION, through_seq=1) is not None
+        snapshot = store.record_snapshot(_PARTITION, 1, snapshot_bytes=b"missing")
+        assert type(snapshot).__name__ == "SnapshotAnchorV1"
+        store._connection.execute(  # noqa: SLF001 - missing-snapshot fixture.
+            "DELETE FROM snapshots WHERE snapshot_id=?",
+            (getattr(snapshot, "snapshot_id"),),
+        )
+        store._connection.commit()  # noqa: SLF001 - retain missing-snapshot fixture.
+        clock.now += timedelta(days=2)
+        before_snapshot = _c2_mutation_state(store)
+
+        missing_snapshot = store.compact_retention(
+            _PARTITION,
+            basis=_c2_basis(run=b"missing-snapshot", through_seq=1, snapshot=snapshot),
+        )
+
+        _diagnostic(
+            missing_snapshot,
+            "BUS_E_RETENTION_PRECONDITION",
+            DiagnosticSeverityV2.ERROR,
+        )
+        assert _c2_mutation_state(store) == before_snapshot
+
+        generation = store.record_manifest_bytes(
+            _GROUP, manifest_bytes=b"c2-cursor-basis"
+        )
+        assert isinstance(generation, str)
+        assert store.open_cursor_once(_GROUP, _PARTITION, generation) == 0
+        before_cursor = _c2_mutation_state(store)
+
+        missing_cursor_basis = store.compact_retention(
+            _PARTITION,
+            basis=_c2_basis(run=b"missing-cursor-basis", through_seq=1, snapshot=None),
+        )
+
+        _diagnostic(
+            missing_cursor_basis,
+            "BUS_E_RETENTION_PRECONDITION",
+            DiagnosticSeverityV2.ERROR,
+        )
+        assert _c2_mutation_state(store) == before_cursor
+    finally:
+        assert store.close() is None
+
+
+def test_c2_duplicate_run_with_different_basis_is_precondition_without_mutation(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "c2-duplicate-run", clock)
+    try:
+        _c2_seed_retention_policy(store)
+        _c2_append(store, producer_seq=1, retention_class="transient")
+        assert store.materialize_digest(_PARTITION, through_seq=1) is not None
+        clock.now += timedelta(days=2)
+        first_basis = _c2_basis(run=b"duplicate-run", through_seq=1, snapshot=None)
+        assert type(
+            store.compact_retention(_PARTITION, basis=first_basis)
+        ).__name__ == ("RetentionRunResultV1")
+        before = _c2_mutation_state(store)
+
+        different_basis = _c2_basis(run=b"duplicate-run", through_seq=0, snapshot=None)
+        duplicate = store.compact_retention(_PARTITION, basis=different_basis)
+
+        _diagnostic(
+            duplicate, "BUS_E_RETENTION_PRECONDITION", DiagnosticSeverityV2.ERROR
+        )
+        assert _c2_mutation_state(store) == before
+    finally:
+        assert store.close() is None
+
+
+def test_c2_shared_payload_expires_only_after_last_due_reference(
+    secure_tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(secure_tmp_path / "c2-shared", clock)
+    try:
+        _c2_seed_retention_policy(store)
+        _c2_append(
+            store, producer_seq=1, retention_class="transient", payload=b"shared"
+        )
+        _c2_append(store, producer_seq=2, retention_class="work", payload=b"shared")
+        assert store.materialize_digest(_PARTITION, through_seq=1) is not None
+        clock.now += timedelta(days=2)
+        first = store.compact_retention(
+            _PARTITION,
+            basis=_c2_basis(run=b"shared-first", through_seq=2, snapshot=None),
+        )
+        assert type(first).__name__ == "RetentionRunResultV1"
+        assert getattr(first, "compacted_through_seq") == 1
+        assert getattr(first, "expired_payload_count") == 0
+        assert store._connection.execute(  # noqa: SLF001 - remaining reference retains body.
+            "SELECT body_state,body FROM payloads WHERE kind='inline'"
+        ).fetchone() == ("present", b"shared")
+
+        assert store.materialize_digest(_PARTITION, through_seq=2) is not None
+        clock.now += timedelta(days=31)
+        second = store.compact_retention(
+            _PARTITION,
+            basis=_c2_basis(run=b"shared-second", through_seq=2, snapshot=None),
+        )
+        assert type(second).__name__ == "RetentionRunResultV1"
+        assert getattr(second, "expired_payload_count") == 1
+        assert store._connection.execute(  # noqa: SLF001 - final reference expires once.
+            "SELECT body_state,body FROM payloads WHERE kind='inline'"
+        ).fetchone() == ("expired", None)
+    finally:
+        assert store.close() is None
+
+
+@pytest.mark.parametrize(
+    "point",
+    (
+        "after_checkpoint_lookup",
+        "after_snapshot_validation",
+        "after_cursor_gaps",
+        "after_partition_advance",
+        "after_payload_expiry",
+        "after_header_delete",
+        "after_checkpoint_insert",
+    ),
+)
+def test_c2_retention_crash_boundaries_rollback_then_replay(
+    secure_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: str
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    root = secure_tmp_path / point
+    clock = FakeClock()
+    store = _store(root, clock)
+    _c2_seed_retention_policy(store)
+    _c2_append(store, producer_seq=1, retention_class="transient")
+    _c2_append(store, producer_seq=2, retention_class="transient")
+    assert store.materialize_digest(_PARTITION, through_seq=2) is not None
+    snapshot = store.record_snapshot(_PARTITION, 2, snapshot_bytes=b"crash-opaque")
+    generation = store.record_manifest_bytes(_GROUP, manifest_bytes=b"c2-crash")
+    assert isinstance(generation, str)
+    assert store.open_cursor_once(_GROUP, _PARTITION, generation) == 0
+    clock.now += timedelta(days=2)
+    basis = _c2_basis(run=point.encode("ascii"), through_seq=2, snapshot=snapshot)
+
+    def fault(stage: str) -> None:
+        if stage == point:
+            raise SimulatedCrash
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(bus_store, "_retention_checkpoint", fault)
+        with pytest.raises(SimulatedCrash):
+            store.compact_retention(_PARTITION, basis=basis)
+    assert store.close() is not None
+
+    reopened = _store(root, clock)
+    try:
+        assert reopened._connection.execute(  # noqa: SLF001 - one transaction rolls back.
+            "SELECT COUNT(*) FROM events"
+        ).fetchone() == (2,)
+        assert reopened._connection.execute(
+            "SELECT first_retained_seq FROM partitions"
+        ).fetchone() == (1,)
+        assert reopened._connection.execute(
+            "SELECT gap_snapshot_id FROM cursors"
+        ).fetchone() == (None,)
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM retention_checkpoints"
+        ).fetchone() == (0,)
+        assert reopened._connection.execute(
+            "SELECT body_state,body FROM payloads"
+        ).fetchone() == ("present", b"payload")
+        replay = reopened.compact_retention(_PARTITION, basis=basis)
+        assert type(replay).__name__ == "RetentionRunResultV1"
+        assert reopened.compact_retention(_PARTITION, basis=basis) == replay
+    finally:
+        assert reopened.close() is None
