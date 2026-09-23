@@ -5,9 +5,6 @@ import re
 import shutil
 import subprocess
 
-from the_hive.runtime_layout import RuntimeLayout
-
-
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
@@ -42,6 +39,23 @@ def test_ci_installs_agent_api_crypto_dependencies_before_collection() -> None:
     assert "PyJWT[crypto]>=2.9,<3" in dependency_step
 
 
+def test_plugin_manifest_gate_requires_the_hive_identity_without_a_legacy_alias() -> (
+    None
+):
+    step = workflow_step_run("Validate plugin manifests")
+
+    assert 'plugin["name"] == "the-hive"' in step
+    assert 'app["apps"]["the-hive"]' in step
+    assert "codex-master" not in step
+
+
+def test_cli_wrapper_syntax_gate_covers_the_stable_hook_launcher() -> None:
+    assert (
+        "run: bash -n ./bin/the-hive-mcp ./bin/the-hive-mcp-stable "
+        "./bin/the-hive-plugin-hook-stable"
+    ) in workflow_text()
+
+
 def test_manpage_gate_builds_and_renders_repository_source() -> None:
     workflow = workflow_text()
 
@@ -67,10 +81,10 @@ def test_external_actions_remain_full_sha_pinned_with_read_only_permissions() ->
     )
 
 
-def test_agent_pool_installer_gate_materializes_a_valid_image_for_a_fresh_home(
+def test_agent_pool_installer_gate_reports_the_runtime_lifecycle_boundary(
     tmp_path: Path,
 ) -> None:
-    """Catch a CI change that invokes the image-only wrapper before its image."""
+    """The source-only wrapper must preserve its explicit lifecycle boundary."""
 
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir(mode=0o700)
@@ -113,16 +127,14 @@ def test_agent_pool_installer_gate_materializes_a_valid_image_for_a_fresh_home(
         check=False,
     )
 
-    assert completed.returncode == 0, completed.stderr
     ci_home = runner_temp / "codex-agent-pool-ci-home"
-    release_root = ci_home / ".local" / "lib" / "the-hive-runtime"
-    current = json.loads(
-        (release_root / ".the-hive-release-pointers.json").read_text(encoding="utf-8")
-    )["current"]
-    RuntimeLayout.from_current_release(
-        release_root, current["generation"], current["manifest_digest"]
-    )
-    assert not (ci_home / ".codex-agents-ci").exists()
+    assert completed.returncode == 1, completed.stderr
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == {
+        "raw_output": "not_returned",
+        "status": "runtime_lifecycle_cutover_required",
+    }
+    assert not (ci_home / ".local").exists()
 
 
 def test_agent_pool_ci_smoke_derives_all_three_direct_wrapper_bindings_from_current() -> None:

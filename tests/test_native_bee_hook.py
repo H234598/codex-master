@@ -17,6 +17,9 @@ SPAWN_HOOK = REPO_ROOT / "hooks" / "native_spawn_admission.py"
 HOOKS_MANIFEST = REPO_ROOT / "hooks" / "hooks.json"
 PLUGIN_MANIFEST = REPO_ROOT / ".codex-plugin" / "plugin.json"
 APP_MANIFEST = REPO_ROOT / ".app.json"
+HOOK_ABI_V1_LAUNCHER = "/usr/local/libexec/the-hive/hook-abi/v1/launcher"
+NATIVE_BEE_EVENT_COMMAND = f"{HOOK_ABI_V1_LAUNCHER} native_bee_event"
+NATIVE_SPAWN_ADMISSION_COMMAND = f"{HOOK_ABI_V1_LAUNCHER} native_spawn_admission"
 
 
 class NativeBeeHookTest(unittest.TestCase):
@@ -74,7 +77,7 @@ class NativeBeeHookTest(unittest.TestCase):
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "python3 ${PLUGIN_ROOT}/hooks/native_spawn_admission.py",
+                            "command": NATIVE_SPAWN_ADMISSION_COMMAND,
                             "timeout": 10,
                         }
                     ],
@@ -84,7 +87,7 @@ class NativeBeeHookTest(unittest.TestCase):
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "python3 ${PLUGIN_ROOT}/hooks/native_bee_event.py",
+                            "command": NATIVE_BEE_EVENT_COMMAND,
                             "timeout": 10,
                         }
                     ],
@@ -96,7 +99,7 @@ class NativeBeeHookTest(unittest.TestCase):
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "python3 ${PLUGIN_ROOT}/hooks/native_bee_event.py",
+                            "command": NATIVE_BEE_EVENT_COMMAND,
                             "timeout": 1,
                         }
                     ],
@@ -107,7 +110,7 @@ class NativeBeeHookTest(unittest.TestCase):
             "hooks": [
                 {
                     "type": "command",
-                    "command": "python3 ${PLUGIN_ROOT}/hooks/native_bee_event.py",
+                    "command": NATIVE_BEE_EVENT_COMMAND,
                     "timeout": 1,
                 }
             ]
@@ -115,6 +118,31 @@ class NativeBeeHookTest(unittest.TestCase):
         for event in events:
             with self.subTest(event=event):
                 self.assertEqual(hooks[event], expected_by_event.get(event, [default]))
+
+    def test_hooks_manifest_uses_only_the_immutable_abi_v1_launcher_and_allowlisted_hook_names(
+        self,
+    ) -> None:
+        payload = json.loads(HOOKS_MANIFEST.read_text(encoding="utf-8"))
+        commands = [
+            hook["command"]
+            for event_hooks in payload["hooks"].values()
+            for registration in event_hooks
+            for hook in registration["hooks"]
+        ]
+
+        self.assertEqual(
+            set(commands),
+            {NATIVE_BEE_EVENT_COMMAND, NATIVE_SPAWN_ADMISSION_COMMAND},
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIn(
+                    command, {NATIVE_BEE_EVENT_COMMAND, NATIVE_SPAWN_ADMISSION_COMMAND}
+                )
+                self.assertNotIn("${", command)
+                self.assertNotIn("python", command.casefold())
+                self.assertNotIn("cache", command.casefold())
+                self.assertNotIn("hooks/", command)
 
     def test_spawn_hook_rejects_invalid_json_with_structured_deny(self) -> None:
         completed = self.run_spawn_hook("{")

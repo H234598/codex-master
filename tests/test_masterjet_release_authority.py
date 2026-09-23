@@ -11,6 +11,7 @@ import subprocess
 
 import pytest
 
+from the_hive.hook_session_pin_store import HookSessionPinStoreV1
 import the_hive.runtime_layout as runtime_layout_module
 from the_hive.runtime_layout import LayoutError, RuntimeLayout
 
@@ -49,6 +50,18 @@ def _stage(
         repository=ROOT, stage=stage, generation=generation, commit=commit
     )
     return stage
+
+
+def _publisher_release_root(tmp_path: Path) -> Path:
+    """Create only the canonical temporary pin authority for publisher tests."""
+
+    home = tmp_path / "publisher-home"
+    home.mkdir(mode=0o700)
+    (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
+    HookSessionPinStoreV1.create_at(
+        home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+    )
+    return home / ".local" / "lib" / "the-hive-runtime"
 
 
 def test_d89_successor_witness_binds_only_the_final_the_hive_anchor_and_git_lineage(
@@ -238,7 +251,9 @@ def test_dirty_provenance_is_rejected_before_stage_or_pointer_mutation(
         raise installer["InstallError"]("install_release_checkout_dirty")  # type: ignore[index]
 
     monkeypatch.setitem(
-        installer["_install_attested_runtime"].__globals__, "_verified_release_commit", dirty
+        installer["_install_attested_runtime"].__globals__,
+        "_verified_release_commit",
+        dirty,
     )
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,
@@ -257,7 +272,7 @@ def test_named_generation_pointer_pair_rejects_manifest_mode_and_pointer_drift(
     tmp_path: Path,
 ) -> None:
     installer = _installer()
-    release_root = tmp_path / "the-hive-runtime"
+    release_root = _publisher_release_root(tmp_path)
     first = _stage(installer, tmp_path, "first")
     installer["_publish_runtime_generation"](stage=first, release_root=release_root)  # type: ignore[operator]
     digest = (
@@ -290,7 +305,7 @@ def test_publish_lock_fsync_failure_is_atomic_and_retention_keeps_live_generatio
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     installer = _installer()
-    release_root = tmp_path / "the-hive-runtime"
+    release_root = _publisher_release_root(tmp_path)
     plugin_cache = tmp_path / "plugin-cache-sentinel"
     plugin_cache.mkdir()
     sentinel = plugin_cache / "untouched"
@@ -304,9 +319,13 @@ def test_publish_lock_fsync_failure_is_atomic_and_retention_keeps_live_generatio
     original_fsync = installer["_fsync_directory"]
     original_flock = installer["fcntl"].flock
 
+    failed = False
+
     def fail_pointer(path: Path) -> None:
+        nonlocal failed
         observed.append(path)
-        if path == release_root:
+        if path == release_root and not failed:
+            failed = True
             raise installer["InstallError"]("install_fsync_failed")  # type: ignore[operator]
         original_fsync(path)  # type: ignore[operator]
 
@@ -325,7 +344,7 @@ def test_publish_lock_fsync_failure_is_atomic_and_retention_keeps_live_generatio
     )
     with pytest.raises(installer["InstallError"], match="install_fsync_failed"):  # type: ignore[index]
         installer["_publish_runtime_generation"](
-            stage=second, release_root=release_root, live_generations=("first",)
+            stage=second, release_root=release_root
         )  # type: ignore[operator]
     assert (
         release_root / ".the-hive-release-pointers.json"
@@ -344,7 +363,7 @@ def test_pointer_post_replace_fsync_failure_restores_the_prior_durable_pair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     installer = _installer()
-    release_root = tmp_path / "the-hive-runtime"
+    release_root = _publisher_release_root(tmp_path)
     installer["_publish_runtime_generation"](  # type: ignore[operator]
         stage=_stage(installer, tmp_path, "first"), release_root=release_root
     )
@@ -374,18 +393,18 @@ def test_pointer_post_replace_fsync_failure_restores_the_prior_durable_pair(
     assert pointer.read_bytes() == old
 
 
-def test_pointer_fsync_failure_restores_the_paired_stable_launcher(
+def test_pointer_fsync_failure_restores_the_complete_stable_mcp_launcher_pair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     installer = _installer()
-    release_root = tmp_path / "the-hive-runtime"
+    release_root = _publisher_release_root(tmp_path)
     installer["_publish_runtime_generation"](  # type: ignore[operator]
         stage=_stage(installer, tmp_path, "first"), release_root=release_root
     )
     pointer = release_root / ".the-hive-release-pointers.json"
-    stable = release_root / "the-hive-mcp"
+    stable_mcp = release_root / "the-hive-mcp"
     old_pointer = pointer.read_bytes()
-    old_stable = stable.read_bytes()
+    old_mcp = stable_mcp.read_bytes()
     second = _stage(installer, tmp_path, "second")
     staged_stable = second / "bin" / "the-hive-mcp-stable"
     staged_stable.write_bytes(staged_stable.read_bytes() + b"\n# second release\n")
@@ -416,9 +435,9 @@ def test_pointer_fsync_failure_restores_the_paired_stable_launcher(
         installer["_publish_runtime_generation"](  # type: ignore[operator]
             stage=second, release_root=release_root
         )
-    assert root_fsyncs >= 5
+    assert root_fsyncs >= 6
     assert pointer.read_bytes() == old_pointer
-    assert stable.read_bytes() == old_stable
+    assert stable_mcp.read_bytes() == old_mcp
     current = json.loads(old_pointer)["current"]
     assert (
         RuntimeLayout.from_current_release(
@@ -428,11 +447,11 @@ def test_pointer_fsync_failure_restores_the_paired_stable_launcher(
     )
 
 
-def test_prune_failure_precedes_pointer_launcher_pair_mutation(
+def test_publisher_does_not_prune_after_a_visible_immutable_cutover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     installer = _installer()
-    release_root = tmp_path / "the-hive-runtime"
+    release_root = _publisher_release_root(tmp_path)
     installer["_publish_runtime_generation"](  # type: ignore[operator]
         stage=_stage(installer, tmp_path, "first"), release_root=release_root
     )
@@ -441,8 +460,11 @@ def test_prune_failure_precedes_pointer_launcher_pair_mutation(
     old_pointer = pointer.read_bytes()
     old_stable = stable.read_bytes()
     second = _stage(installer, tmp_path, "second")
+    prune_called = False
 
     def fail_prune(*_args: object, **_kwargs: object) -> None:
+        nonlocal prune_called
+        prune_called = True
         raise installer["InstallError"]("install_release_retention_failed")  # type: ignore[index]
 
     monkeypatch.setitem(
@@ -450,28 +472,26 @@ def test_prune_failure_precedes_pointer_launcher_pair_mutation(
         "_prune_release_generations",
         fail_prune,
     )
-    with pytest.raises(
-        installer["InstallError"], match="install_release_retention_failed"
-    ):  # type: ignore[index]
-        installer["_publish_runtime_generation"](  # type: ignore[operator]
-            stage=second, release_root=release_root
-        )
-    assert pointer.read_bytes() == old_pointer
+    installer["_publish_runtime_generation"](  # type: ignore[operator]
+        stage=second, release_root=release_root
+    )
+    assert prune_called is False
+    assert pointer.read_bytes() != old_pointer
     assert stable.read_bytes() == old_stable
-    current = json.loads(old_pointer)["current"]
+    current = json.loads(pointer.read_bytes())["current"]
     assert (
         RuntimeLayout.from_current_release(
             release_root, current["generation"], current["manifest_digest"]
         ).root
-        == release_root / "generations" / "first"
+        == release_root / "generations" / "second"
     )
 
 
-def test_retention_keeps_attested_unit_bound_generations_and_prunes_expired_ones(
+def test_retention_keeps_attested_unit_bound_generations_without_visible_pruning(
     tmp_path: Path,
 ) -> None:
     installer = _installer()
-    release_root = tmp_path / "the-hive-runtime"
+    release_root = _publisher_release_root(tmp_path)
     units = tmp_path / "units"
     units.mkdir(mode=0o700)
     for generation in ("one", "two"):
@@ -554,6 +574,7 @@ def test_retention_keeps_attested_unit_bound_generations_and_prunes_expired_ones
     )
     assert {item.name for item in (release_root / "generations").iterdir()} == {
         "one",
+        "two",
         "three",
         "four",
         "five",

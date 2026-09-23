@@ -311,7 +311,6 @@ class FleetDesktopEntryTest(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     server.install(
                         register=False,
-                        sync_plugin_cache=False,
                         install_desktop=True,
                     )
 
@@ -329,46 +328,6 @@ class FleetDesktopEntryTest(unittest.TestCase):
                 server.AgentError, "desktop entry changed unexpectedly"
             ):
                 server.restore_fleet_desktop_entry(snapshot)
-
-    def test_install_transaction_restores_desktop_after_later_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            wrapper = root / "wrapper"
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            wrapper.chmod(0o700)
-            desktop_path = (
-                root / "share" / "applications" / server.FLEET_DESKTOP_ENTRY_NAME
-            )
-            desktop_path.parent.mkdir(parents=True)
-            desktop_path.write_text("old desktop\n", encoding="utf-8")
-            with (
-                patch(
-                    "the_hive.server.install_lock",
-                    return_value=contextlib.nullcontext(),
-                ),
-                patch(
-                    "the_hive.server._codex_mcp_binding",
-                    return_value=contextlib.nullcontext(SimpleNamespace()),
-                ),
-                patch("the_hive.server._runtime_mcp_entrypoint", return_value=wrapper),
-                patch(
-                    "the_hive.server.fleet_desktop_entry_path",
-                    return_value=desktop_path,
-                ),
-                patch("the_hive.server.ensure_applet_action_key"),
-                patch(
-                    "the_hive.server.sync_plugin_cache_from_repo",
-                    side_effect=server.AgentError("injected failure"),
-                ),
-            ):
-                with self.assertRaisesRegex(server.AgentError, "injected failure"):
-                    server.install(
-                        register=False,
-                        sync_plugin_cache=True,
-                        install_desktop=True,
-                    )
-
-            self.assertEqual(desktop_path.read_text(encoding="utf-8"), "old desktop\n")
 
     def test_install_with_nonportable_path_skips_desktop_without_breaking_install(
         self,
@@ -402,7 +361,6 @@ class FleetDesktopEntryTest(unittest.TestCase):
             ):
                 result = server.install(
                     register=False,
-                    sync_plugin_cache=False,
                     install_desktop=True,
                 )
 

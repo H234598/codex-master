@@ -345,7 +345,6 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
                 with self.assertRaisesRegex(server.AgentError, "startup self-test"):
                     server._install_unlocked(
                         register=True,
-                        sync_plugin_cache=False,
                         binding=SimpleNamespace(),
                     )
             revoke.assert_called_once_with()

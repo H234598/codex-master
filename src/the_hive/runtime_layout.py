@@ -20,6 +20,14 @@ _MAX_IMAGE_FILE_BYTES = 2 * 1024 * 1024
 _MAX_METADATA_BYTES = 256 * 1024
 _ROOT_MODE = 0o700
 _MANIFEST_NAME = ".the-hive-runtime-manifest.json"
+_RELEASE_BINDING_NAME = "release-binding.json"
+_PLUGIN_BUNDLE_DIRECTORY = "TheHivePluginBundleV1"
+_ROOT_INSTALL_PLAN_NAME = "root-install-plan.json"
+_HOOK_ABI_V1_LAUNCHER = "/usr/local/libexec/the-hive/hook-abi/v1/launcher"
+_HOOK_ABI_V1_COMPANION = (
+    "/usr/local/libexec/the-hive/hook-abi/v1/hook_session_pin_store.py"
+)
+_HOOK_ABI_V1_CORE = "/usr/local/libexec/the-hive/hook-abi/v1/hook_abi_v1_core.py"
 _RELEASE_POINTERS_NAME = ".the-hive-release-pointers.json"
 _RELEASE_GENERATIONS_NAME = "generations"
 _RUNTIME_SPAWN_HELPER = "src/the_hive/_runtime_spawn_helper.so"
@@ -67,6 +75,20 @@ _HISTORICAL_LINEAGE = {
     },
 }
 _STABLE_MCP_LAUNCHER_SOURCE = "bin/the-hive-mcp-stable"
+_STABLE_HOOK_LAUNCHER_SOURCE = "bin/the-hive-plugin-hook-stable"
+_HOOK_BINDING_ENTRYPOINTS = {
+    "native_bee_event": "hooks/native_bee_event.py",
+    "native_spawn_admission": "hooks/native_spawn_admission.py",
+}
+_PLUGIN_BUNDLE_REQUIRED_FILES: tuple[tuple[str, int], ...] = (
+    (".codex-plugin/plugin.json", 0o644),
+    (".mcp.json", 0o644),
+    (".app.json", 0o644),
+    ("hooks/hooks.json", 0o644),
+    ("hooks/native_bee_event.py", 0o644),
+    ("hooks/native_spawn_admission.py", 0o644),
+    ("skills/the-hive-fleet/SKILL.md", 0o644),
+)
 _STABLE_MCP_COMMAND = "/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp"
 _STABLE_MCP_NOTE = (
     "Local data-sparse Codex Masterjet MCP server. Controls the sleeping "
@@ -75,12 +97,15 @@ _STABLE_MCP_NOTE = (
 _REQUIRED_FILES: tuple[tuple[str, int], ...] = (
     ("bin/the-hive-mcp", 0o755),
     (_STABLE_MCP_LAUNCHER_SOURCE, 0o755),
+    (_STABLE_HOOK_LAUNCHER_SOURCE, 0o755),
     ("bin/the-hive-resource-monitor", 0o755),
     ("bin/the-hive-hive-hourly-probe", 0o755),
     (".codex-plugin/plugin.json", 0o644),
     (".mcp.json", 0o644),
     (".app.json", 0o644),
     ("hooks/hooks.json", 0o644),
+    ("hooks/native_bee_event.py", 0o644),
+    ("hooks/native_spawn_admission.py", 0o644),
     ("skills/the-hive-fleet/SKILL.md", 0o644),
     ("codex-hive.json", 0o644),
     ("codex-agent-classes.json", 0o644),
@@ -145,6 +170,7 @@ def _validate_state_directory_path(path: Path) -> os.stat_result:
         raise _state_invalid()
     if any(part in {".", ".."} for part in path.parts):
         raise _state_invalid()
+
     def reserved(part: str) -> bool:
         normalized = part.casefold().replace("_", "-")
         return (
@@ -370,6 +396,13 @@ def _release_metadata(manifest: dict[str, object]) -> dict[str, object]:
             "bin/the-hive-mcp",
             "bin/the-hive-resource-monitor",
         ],
+        "hook_abi_source": _STABLE_HOOK_LAUNCHER_SOURCE,
+        "hook_abi": _HOOK_ABI_V1_LAUNCHER,
+        "hook_abi_companion": _HOOK_ABI_V1_COMPANION,
+        "hook_abi_core": _HOOK_ABI_V1_CORE,
+        "hook_entrypoints": list(_HOOK_BINDING_ENTRYPOINTS.values()),
+        "plugin_bundle": _PLUGIN_BUNDLE_DIRECTORY,
+        "root_install_plan": _ROOT_INSTALL_PLAN_NAME,
         "python_tree": "src/the_hive",
         "monitor_entrypoint": "bin/the-hive-resource-monitor",
         "h4_units": [
@@ -417,6 +450,194 @@ def _release_metadata(manifest: dict[str, object]) -> dict[str, object]:
     }
 
 
+def release_binding_bytes(manifest: dict[str, object], manifest_digest: str) -> bytes:
+    """Build the one canonical bundle descriptor for an attested release."""
+
+    metadata = _release_metadata(manifest)
+    generation = metadata["generation"]
+    files = manifest.get("files")
+    if (
+        not isinstance(generation, str)
+        or not isinstance(files, dict)
+        or not isinstance(manifest_digest, str)
+        or len(manifest_digest) != 71
+        or not manifest_digest.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in manifest_digest[7:])
+    ):
+        raise _invalid()
+    hook_digests: dict[str, str] = {}
+    for hook_name, entrypoint in _HOOK_BINDING_ENTRYPOINTS.items():
+        entry = files.get(f"{_PLUGIN_BUNDLE_DIRECTORY}/{entrypoint}")
+        digest = entry.get("sha256") if isinstance(entry, dict) else None
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise _invalid()
+        hook_digests[hook_name] = f"sha256:{digest}"
+    descriptor = {
+        "schema": "TheHivePluginBundleV1",
+        "plugin_id": "the-hive",
+        "generation": generation,
+        "runtime_manifest_digest": manifest_digest,
+        "launcher_abi": _HOOK_ABI_V1_LAUNCHER,
+        "hooks": hook_digests,
+    }
+    try:
+        return (
+            json.dumps(
+                descriptor, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise _invalid() from exc
+
+
+def root_install_plan_bytes(manifest: dict[str, object], manifest_digest: str) -> bytes:
+    """Build the source-only, digest-bound immutable ABI-v1 installation plan."""
+
+    metadata = _release_metadata(manifest)
+    generation = metadata["generation"]
+    files = manifest.get("files")
+    if (
+        not isinstance(generation, str)
+        or not isinstance(files, dict)
+        or not isinstance(manifest_digest, str)
+        or len(manifest_digest) != 71
+        or not manifest_digest.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in manifest_digest[7:])
+    ):
+        raise _invalid()
+
+    def source(name: str, target: str) -> dict[str, str]:
+        entry = files.get(name)
+        digest = entry.get("sha256") if isinstance(entry, dict) else None
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise _invalid()
+        return {"source": name, "target": target, "sha256": f"sha256:{digest}"}
+
+    plan = {
+        "schema": "RootInstallPlanV1",
+        "plugin_id": "the-hive",
+        "generation": generation,
+        "runtime_manifest_digest": manifest_digest,
+        "launcher": source(_STABLE_HOOK_LAUNCHER_SOURCE, _HOOK_ABI_V1_LAUNCHER),
+        "companion": source(
+            "src/the_hive/hook_session_pin_store.py", _HOOK_ABI_V1_COMPANION
+        ),
+        "core": source("src/the_hive/hook_abi_v1_core.py", _HOOK_ABI_V1_CORE),
+    }
+    try:
+        return (
+            json.dumps(plan, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise _invalid() from exc
+
+
+def _validate_release_binding(
+    root: Path, manifest: dict[str, object], manifest_digest: str
+) -> None:
+    descriptor = _read_regular_bytes(
+        root,
+        f"{_PLUGIN_BUNDLE_DIRECTORY}/{_RELEASE_BINDING_NAME}",
+        max_bytes=_MAX_METADATA_BYTES,
+    )
+    if descriptor != release_binding_bytes(manifest, manifest_digest):
+        raise _invalid()
+
+
+def _validate_root_install_plan(
+    root: Path, manifest: dict[str, object], manifest_digest: str
+) -> None:
+    plan = _read_regular_bytes(
+        root, _ROOT_INSTALL_PLAN_NAME, max_bytes=_MAX_METADATA_BYTES
+    )
+    if plan != root_install_plan_bytes(manifest, manifest_digest):
+        raise _invalid()
+
+
+def _validate_plugin_bundle(
+    root: Path, manifest: dict[str, object], manifest_digest: str
+) -> None:
+    """Cross-check the non-manifested native bundle against the sealed image."""
+
+    bundle_root = _image_path(root, _PLUGIN_BUNDLE_DIRECTORY)
+    bundle_info = _lstat(bundle_root)
+    if (
+        not stat.S_ISDIR(bundle_info.st_mode)
+        or stat.S_ISLNK(bundle_info.st_mode)
+        or bundle_info.st_uid != os.geteuid()
+        or stat.S_IMODE(bundle_info.st_mode) != _ROOT_MODE
+    ):
+        raise _invalid()
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise _invalid()
+    expected_files = {relative for relative, _mode in _PLUGIN_BUNDLE_REQUIRED_FILES}
+    expected_files.update(
+        relative
+        for relative in files
+        if relative.startswith(("skills/the-hive-fleet/", "src/the_hive/"))
+    )
+    expected_files.add(_RELEASE_BINDING_NAME)
+    observed_files: set[str] = set()
+    for directory, child_directories, file_names in os.walk(bundle_root):
+        current = Path(directory)
+        current_info = _lstat(current)
+        if (
+            stat.S_ISLNK(current_info.st_mode)
+            or not stat.S_ISDIR(current_info.st_mode)
+            or current_info.st_uid != os.geteuid()
+            or stat.S_IMODE(current_info.st_mode) != _ROOT_MODE
+        ):
+            raise _invalid()
+        child_directories[:] = sorted(child_directories)
+        for name in child_directories:
+            _image_path(
+                root,
+                f"{_PLUGIN_BUNDLE_DIRECTORY}/"
+                f"{(current / name).relative_to(bundle_root).as_posix()}",
+            )
+        for name in sorted(file_names):
+            relative = (current / name).relative_to(bundle_root).as_posix()
+            observed_files.add(relative)
+    if observed_files != expected_files:
+        raise _invalid()
+    for relative, mode in _PLUGIN_BUNDLE_REQUIRED_FILES:
+        source = _validate_regular(root, relative, mode)
+        bundle = _validate_regular(root, f"{_PLUGIN_BUNDLE_DIRECTORY}/{relative}", mode)
+        if _read_regular_bytes(
+            root, relative, max_bytes=_MAX_IMAGE_FILE_BYTES
+        ) != _read_regular_bytes(
+            root,
+            f"{_PLUGIN_BUNDLE_DIRECTORY}/{relative}",
+            max_bytes=_MAX_IMAGE_FILE_BYTES,
+        ):
+            raise _invalid()
+        if source == bundle:
+            raise _invalid()
+    for relative in expected_files - {_RELEASE_BINDING_NAME}:
+        if relative not in files:
+            raise _invalid()
+        source = _read_regular_bytes(root, relative, max_bytes=_MAX_IMAGE_FILE_BYTES)
+        bundle = _read_regular_bytes(
+            root,
+            f"{_PLUGIN_BUNDLE_DIRECTORY}/{relative}",
+            max_bytes=_MAX_IMAGE_FILE_BYTES,
+        )
+        if source != bundle:
+            raise _invalid()
+    _validate_release_binding(root, manifest, manifest_digest)
+
+
 def _runtime_manifest_payload(
     root: Path, metadata: dict[str, object]
 ) -> dict[str, object]:
@@ -443,7 +664,14 @@ def _runtime_manifest_payload(
         for name in sorted(file_names):
             path = current / name
             relative_path = path.relative_to(root).as_posix()
-            if relative_path == _MANIFEST_NAME:
+            # The descriptor binds this manifest's digest, so including its
+            # own hash here would create an unresolvable digest cycle.  It is
+            # instead revalidated byte-for-byte against this manifest below.
+            if relative_path in {
+                _MANIFEST_NAME,
+                _ROOT_INSTALL_PLAN_NAME,
+                f"{_PLUGIN_BUNDLE_DIRECTORY}/{_RELEASE_BINDING_NAME}",
+            }:
                 continue
             info = _lstat(path)
             if (
@@ -493,6 +721,8 @@ def _validated_manifest(
         or witness.get("sha256") != _SUCCESSOR_WITNESS_SHA256
     ):
         raise _invalid()
+    _validate_root_install_plan(root, manifest, digest)
+    _validate_plugin_bundle(root, manifest, digest)
     return manifest, digest
 
 
@@ -600,11 +830,7 @@ class RuntimeStateLayoutV1:
             raise _state_invalid()
         state_root = candidates[0]
         if any(
-            other != state_root
-            and (
-                state_root == other
-                or other in state_root.parents
-            )
+            other != state_root and (state_root == other or other in state_root.parents)
             for other in entries
         ):
             raise _state_invalid()

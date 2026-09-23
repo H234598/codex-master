@@ -1,0 +1,154 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+(( $# == 1 )) || exit 64
+case "$1" in
+  native_bee_event|native_spawn_admission) ;;
+  *) exit 64 ;;
+esac
+
+plugin_root="${PLUGIN_ROOT-}"
+for variable in "${!CODEX_@}"; do unset "${variable}"; done
+unset PYTHONHOME PYTHONPATH PYTHONUSERBASE VIRTUAL_ENV
+exec /usr/bin/env -i \
+  PATH=/usr/bin:/bin \
+  PLUGIN_ROOT="${plugin_root}" \
+  /usr/bin/python3 -I -B -c '
+import os
+from pathlib import Path
+import pwd
+import stat
+import sys
+import time
+import types
+
+
+_MAX_EVENT_BYTES = 64 * 1024
+_ABI_ROOT = Path("/usr/local/libexec/the-hive/hook-abi/v1")
+_ABI_CORE = Path("/usr/local/libexec/the-hive/hook-abi/v1/hook_abi_v1_core.py")
+
+
+def _read_root_owned_core():
+    descriptor = os.open(_ABI_CORE, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o644
+            or not 0 < before.st_size <= 2 * 1024 * 1024
+        ):
+            raise ValueError("untrusted ABI core")
+        chunks = []
+        remaining = before.st_size + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        len(raw) != before.st_size
+        or (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_uid,
+            before.st_nlink,
+            before.st_size,
+        )
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_nlink,
+            after.st_size,
+        )
+    ):
+        raise ValueError("ABI core drift")
+    return raw
+
+
+def _load_dispatch():
+    module = types.ModuleType("the_hive_hook_abi_v1_core")
+    module.__file__ = str(_ABI_CORE)
+    sys.modules[module.__name__] = module
+    exec(compile(_read_root_owned_core(), str(_ABI_CORE), "exec"), module.__dict__)
+    dispatch = module.__dict__.get("dispatch_hook_v1")
+    if not callable(dispatch):
+        raise ValueError("ABI core API absent")
+    return dispatch
+
+
+def _canonical_roots():
+    account_home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    if not account_home.is_absolute():
+        raise ValueError("account home unavailable")
+    return (
+        account_home / ".local" / "lib" / "the-hive-runtime",
+        account_home
+        / ".local"
+        / "state"
+        / "the-hive"
+        / "hook-session-pins-v1",
+    )
+
+
+def _restore_original_standard_input(raw):
+    descriptor = os.memfd_create("the-hive-hook-event", os.MFD_CLOEXEC)
+    try:
+        view = memoryview(raw)
+        while view:
+            view = view[os.write(descriptor, view) :]
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.dup2(descriptor, 0, inheritable=True)
+    finally:
+        os.close(descriptor)
+
+
+dispatch_result = None
+try:
+    hook_name = sys.argv[1]
+    plugin_root = Path(sys.argv[2])
+    if not plugin_root.is_absolute():
+        raise ValueError("relative plugin root")
+    raw_event = sys.stdin.buffer.read(_MAX_EVENT_BYTES + 1)
+    release_root, state_root = _canonical_roots()
+    dispatch_result = _load_dispatch()(
+        plugin_root=plugin_root,
+        release_root=release_root,
+        state_root=state_root,
+        abi_root=_ABI_ROOT,
+        abi_owner_uid=0,
+        hook_name=hook_name,
+        stdin_bytes=raw_event,
+        now_unix_ns=time.time_ns(),
+    )
+    _restore_original_standard_input(dispatch_result.stdin_bytes)
+    os.execve(
+        "/usr/bin/python3",
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            f"/proc/self/fd/{dispatch_result.hook_fd}",
+        ],
+        {
+            "PATH": "/usr/bin:/bin",
+            "PLUGIN_ROOT": f"/proc/self/fd/{dispatch_result.bundle_fd}",
+        },
+    )
+except Exception:
+    if dispatch_result is not None:
+        try:
+            dispatch_result.close()
+        except Exception:
+            pass
+    raise SystemExit(64)
+' "$1" "${plugin_root}"

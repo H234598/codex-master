@@ -49,13 +49,13 @@ jobs:
               r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
               r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
           )
-          assert plugin["name"] == "codex-master"
+          assert plugin["name"] == "the-hive"
           assert semver.fullmatch(plugin["version"])
           assert plugin["skills"] == "./skills/"
           assert plugin["mcpServers"] == "./.mcp.json"
           assert plugin["apps"] == "./.app.json"
 
-          app_entry = app["apps"]["codex-master"]
+          app_entry = app["apps"]["the-hive"]
           assert app_entry["id"].startswith(("connector_", "asdk_app_"))
 
           server = mcp["mcpServers"]["the-hive-mcp"]
@@ -115,7 +115,7 @@ jobs:
         run: PYTHONPATH=src python -m pytest -q
 
       - name: Check CLI wrapper syntax
-        run: bash -n ./bin/the-hive-mcp ./bin/the-hive-mcp-stable
+        run: bash -n ./bin/the-hive-mcp ./bin/the-hive-mcp-stable ./bin/the-hive-plugin-hook-stable
 
       - name: Check agent pool installer
         run: |

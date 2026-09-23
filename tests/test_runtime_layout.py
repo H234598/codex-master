@@ -33,6 +33,9 @@ def materialize_runtime_image(
     _write_file(root / "bin" / "the-hive-mcp", "#!/bin/sh\nexit 0\n", 0o755)
     _write_file(root / "bin" / "the-hive-mcp-stable", "#!/bin/sh\nexit 0\n", 0o755)
     _write_file(
+        root / "bin" / "the-hive-plugin-hook-stable", "#!/bin/sh\nexit 0\n", 0o755
+    )
+    _write_file(
         root / "bin" / "the-hive-hive-hourly-probe",
         "#!/bin/sh\nexit 0\n",
         0o755,
@@ -76,6 +79,8 @@ def materialize_runtime_image(
         root / ".app.json", json.dumps({"apps": {"the-hive": {"id": "connector"}}})
     )
     _write_file(root / "hooks" / "hooks.json", json.dumps({"hooks": {}}))
+    _write_file(root / "hooks" / "native_bee_event.py", "# hook\n")
+    _write_file(root / "hooks" / "native_spawn_admission.py", "# hook\n")
     _write_file(
         root / "skills" / "the-hive-fleet" / "SKILL.md",
         "---\nname: the-hive-fleet\n---\n",
@@ -101,7 +106,9 @@ def materialize_runtime_image(
         "hive/principals.py",
         "selection.py",
         "selection_service.py",
+        "hook_abi_v1_core.py",
         "server.py",
+        "hook_session_pin_store.py",
     ):
         _write_file(
             root / "src" / "the_hive" / relative,
@@ -177,11 +184,16 @@ def test_runtime_layout_rejects_an_image_reached_through_a_linked_parent(
     "relative_path",
     (
         "bin/the-hive-mcp",
+        "bin/the-hive-plugin-hook-stable",
         "bin/the-hive-hive-hourly-probe",
         ".codex-plugin/plugin.json",
         ".mcp.json",
         ".app.json",
         "hooks/hooks.json",
+        "hooks/native_bee_event.py",
+        "hooks/native_spawn_admission.py",
+        "TheHivePluginBundleV1/release-binding.json",
+        "root-install-plan.json",
         "skills/the-hive-fleet/SKILL.md",
         "codex-hive.json",
         "codex-agent-classes.json",
@@ -318,6 +330,38 @@ def test_runtime_layout_rejects_a_replaced_generation_or_manifest_digest(
         module.RuntimeLayout.from_runtime_root(root)
 
 
+def test_runtime_layout_rejects_a_release_binding_not_exactly_attested_by_manifest(
+    tmp_path: Path,
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    descriptor = root / "TheHivePluginBundleV1" / "release-binding.json"
+    binding = json.loads(descriptor.read_text(encoding="utf-8"))
+    binding["hooks"]["native_bee_event"] = "sha256:" + "0" * 64
+    descriptor.write_text(json.dumps(binding), encoding="utf-8")
+    descriptor.chmod(0o644)
+
+    with pytest.raises(module.LayoutError):
+        module.RuntimeLayout.from_runtime_root(root)
+
+
+def test_runtime_layout_rejects_a_root_install_plan_not_bound_to_abi_source_bytes(
+    tmp_path: Path,
+) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    plan_path = root / "root-install-plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["companion"]["sha256"] = "sha256:" + "0" * 64
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    plan_path.chmod(0o644)
+
+    with pytest.raises(module.LayoutError):
+        module.RuntimeLayout.from_runtime_root(root)
+
+
 def test_runtime_image_repository_root_is_not_public_or_registry_compatible(
     tmp_path: Path,
 ) -> None:
@@ -406,7 +450,16 @@ def test_runtime_layout_rejects_legacy_plugin_skill_metadata_bindings(
             target = root / "skills" / "the-hive-fleet"
             target.rename(root / "skills" / "codex-master-fleet")
 
-    root = materialize_runtime_image(tmp_path, before_manifest=add_legacy_binding)
+    if legacy_binding == "skill_path":
+        root = materialize_runtime_image(tmp_path)
+        (root / "skills" / "the-hive-fleet").rename(
+            root / "skills" / "codex-master-fleet"
+        )
+        with pytest.raises(module.LayoutError):
+            module.RuntimeLayout.from_runtime_root(root)
+        return
+    else:
+        root = materialize_runtime_image(tmp_path, before_manifest=add_legacy_binding)
     manifest, digest = module._validated_manifest(root)
     assert manifest["schema_version"] == 2
     assert digest.startswith("sha256:")
@@ -510,7 +563,10 @@ def test_runtime_state_layout_exposes_only_the_canonical_systemd_factory(
 
     assert "RuntimeStateLayoutV1" not in namespace
     assert not hasattr(module.RuntimeStateLayoutV1, "from_environment")
-    assert module.RuntimeStateLayoutV1.from_systemd_state_directory().state_root == state_directory
+    assert (
+        module.RuntimeStateLayoutV1.from_systemd_state_directory().state_root
+        == state_directory
+    )
 
 
 def test_runtime_state_layout_selects_one_exact_systemd_entry_and_is_not_constructible(

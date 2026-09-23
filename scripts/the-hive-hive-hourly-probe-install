@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 
 
@@ -29,7 +30,15 @@ from the_hive.runtime_process import (  # noqa: E402
     run_bounded,
 )
 from the_hive.hive import hourly_probe  # noqa: E402
-from the_hive.runtime_layout import RuntimeLayout  # noqa: E402
+from the_hive.hook_session_pin_store import (  # noqa: E402
+    HookSessionPinStoreError,
+    HookSessionPinStoreV1,
+)
+from the_hive.runtime_layout import (  # noqa: E402
+    RuntimeLayout,
+    release_binding_bytes,
+    root_install_plan_bytes,
+)
 from the_hive.runtime_status import _mcp_surface, _probe_payload  # noqa: E402
 
 
@@ -38,12 +47,38 @@ _MAX_SOURCE_BYTES = 2 * 1024 * 1024
 _MAX_STAGE_DIAGNOSTIC_BYTES = 256 * 1024
 _MAX_MANIFEST_BYTES = 512 * 1024
 _MANIFEST_NAME = ".the-hive-runtime-manifest.json"
+_RELEASE_BINDING_NAME = "release-binding.json"
+_PLUGIN_BUNDLE_DIRECTORY = "TheHivePluginBundleV1"
+_ROOT_INSTALL_PLAN_NAME = "root-install-plan.json"
+_HOOK_ABI_V1_LAUNCHER = "/usr/local/libexec/the-hive/hook-abi/v1/launcher"
+_HOOK_ABI_V1_COMPANION = (
+    "/usr/local/libexec/the-hive/hook-abi/v1/hook_session_pin_store.py"
+)
+_HOOK_ABI_V1_CORE = "/usr/local/libexec/the-hive/hook-abi/v1/hook_abi_v1_core.py"
 _MANIFEST_SCHEMA_VERSION = 2
 _RELEASE_POINTERS_NAME = ".the-hive-release-pointers.json"
 _RELEASE_GENERATIONS_NAME = "generations"
 _PUBLISH_LOCK_NAME = ".the-hive-release-publish.lock"
 _STABLE_MCP_LAUNCHER_SOURCE = "bin/the-hive-mcp-stable"
 _STABLE_MCP_LAUNCHER_NAME = "the-hive-mcp"
+_STABLE_HOOK_LAUNCHER_SOURCE = "bin/the-hive-plugin-hook-stable"
+_STABLE_HOOK_LAUNCHER_NAME = "the-hive-plugin-hook-stable"
+_HOOK_ENTRYPOINTS = (
+    "hooks/native_bee_event.py",
+    "hooks/native_spawn_admission.py",
+)
+_PLUGIN_BUNDLE_FILES = (
+    (".codex-plugin/plugin.json", 0o644),
+    (".mcp.json", 0o644),
+    (".app.json", 0o644),
+    ("hooks/hooks.json", 0o644),
+    ("hooks/native_bee_event.py", 0o644),
+    ("hooks/native_spawn_admission.py", 0o644),
+)
+_PLUGIN_BUNDLE_TREES = (
+    ("skills/the-hive-fleet", "skills/the-hive-fleet"),
+    ("src/the_hive", "src/the_hive"),
+)
 _LEGACY_PROBE_LAUNCHER_SOURCE = "bin/codex-master-hive-hourly-probe"
 _LEGACY_PROBE_LAUNCHER_NAME = "codex_master_hive_hourly_probe.py"
 _R2_BASE_COMMIT = "5defcac83030e91b39188c8b055adb97d5f51e98"
@@ -91,6 +126,7 @@ _HOURLY_PROBE_RUNTIME_ROOT_BINDING = (
 _RUNTIME_IMAGE_FILES = (
     ("bin/the-hive-mcp", "bin/the-hive-mcp", 0o755),
     (_STABLE_MCP_LAUNCHER_SOURCE, _STABLE_MCP_LAUNCHER_SOURCE, 0o755),
+    (_STABLE_HOOK_LAUNCHER_SOURCE, _STABLE_HOOK_LAUNCHER_SOURCE, 0o755),
     (_LEGACY_PROBE_LAUNCHER_SOURCE, _LEGACY_PROBE_LAUNCHER_SOURCE, 0o755),
     ("bin/the-hive-resource-monitor", "bin/the-hive-resource-monitor", 0o755),
     ("bin/the-hive-hive-hourly-probe", "bin/the-hive-hive-hourly-probe", 0o755),
@@ -610,6 +646,13 @@ def _release_metadata(*, generation: str, commit: str) -> dict[str, object]:
                 "bin/the-hive-mcp",
                 "bin/the-hive-resource-monitor",
             ],
+            "hook_abi_source": _STABLE_HOOK_LAUNCHER_SOURCE,
+            "hook_abi": _HOOK_ABI_V1_LAUNCHER,
+            "hook_abi_companion": _HOOK_ABI_V1_COMPANION,
+            "hook_abi_core": _HOOK_ABI_V1_CORE,
+            "hook_entrypoints": list(_HOOK_ENTRYPOINTS),
+            "plugin_bundle": _PLUGIN_BUNDLE_DIRECTORY,
+            "root_install_plan": _ROOT_INSTALL_PLAN_NAME,
             "python_tree": "src/the_hive",
             "monitor_entrypoint": "bin/the-hive-resource-monitor",
             "h4_units": [
@@ -648,6 +691,14 @@ def _runtime_manifest_payload(
         for name in sorted(file_names):
             if name == _MANIFEST_NAME:
                 raise InstallError("install_target_untrusted")
+            # The nested descriptor binds this manifest's digest and therefore
+            # cannot itself be a member of the manifest hash inventory.
+            if (
+                (current / name).relative_to(root).as_posix()
+                == f"{_PLUGIN_BUNDLE_DIRECTORY}/{_RELEASE_BINDING_NAME}"
+                or name == _ROOT_INSTALL_PLAN_NAME
+            ):
+                continue
             raw = _source_bytes(current / name)
             item = (current / name).lstat()
             files[(current / name).relative_to(root).as_posix()] = {
@@ -670,9 +721,45 @@ def _runtime_manifest_payload(
     }
 
 
+def _plugin_bundle_source_files(*, root: Path) -> tuple[tuple[str, str, int], ...]:
+    """List each bundle artifact once from the sealed runtime source image."""
+
+    members = [(name, name, mode) for name, mode in _PLUGIN_BUNDLE_FILES]
+    for source_root, target_root in _PLUGIN_BUNDLE_TREES:
+        source = root / source_root
+        _source_directory(source)
+        for directory, child_directories, file_names in os.walk(source):
+            current = Path(directory)
+            _source_directory(current)
+            child_directories[:] = sorted(child_directories)
+            for name in child_directories:
+                _source_directory(current / name)
+            for name in sorted(file_names):
+                relative = (current / name).relative_to(source).as_posix()
+                item = (current / name).lstat()
+                mode = stat.S_IMODE(item.st_mode)
+                if mode & 0o022:
+                    raise InstallError("install_source_untrusted")
+                members.append(
+                    (
+                        (Path(source_root) / relative).as_posix(),
+                        (Path(target_root) / relative).as_posix(),
+                        mode,
+                    )
+                )
+    return tuple(members)
+
+
 def _write_runtime_image_manifest(
     *, root: Path, generation: str = _R2_BASE_COMMIT, commit: str = _R2_BASE_COMMIT
 ) -> None:
+    _remove_generated_plugin_bundle(root=root)
+    _remove_generated_regular(root=root, name=_ROOT_INSTALL_PLAN_NAME)
+    _remove_generated_regular(root=root, name=_RELEASE_BINDING_NAME)
+    # The complete native plugin payload, including its `src/the_hive` import
+    # tree, exists before the manifest is sealed.  Only the descriptor itself
+    # follows the seal because it binds the resulting manifest digest.
+    _materialize_plugin_bundle_payload(root=root)
     encoded = _canonical_json(
         _runtime_manifest_payload(root, generation=generation, commit=commit)
     )
@@ -698,6 +785,140 @@ def _write_runtime_image_manifest(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+    _write_root_install_plan(root=root)
+    _write_release_binding_descriptor(root=root)
+    _fsync_tree(root / _PLUGIN_BUNDLE_DIRECTORY)
+
+
+def _remove_generated_regular(*, root: Path, name: str) -> None:
+    target = root / name
+    try:
+        item = target.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise InstallError("install_target_untrusted") from exc
+    if (
+        stat.S_ISLNK(item.st_mode)
+        or not stat.S_ISREG(item.st_mode)
+        or item.st_uid != os.geteuid()
+        or item.st_nlink != 1
+        or stat.S_IMODE(item.st_mode) != 0o644
+    ):
+        raise InstallError("install_target_untrusted")
+    try:
+        _source_bytes(target)
+        target.unlink()
+        _fsync_directory(root)
+    except (InstallError, OSError) as exc:
+        raise InstallError("install_target_untrusted") from exc
+
+
+def _remove_generated_plugin_bundle(*, root: Path) -> None:
+    """Discard only a prior complete bundle while resealing an unpublished stage."""
+
+    bundle = root / _PLUGIN_BUNDLE_DIRECTORY
+    try:
+        bundle.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise InstallError("install_target_untrusted") from exc
+    try:
+        for directory, child_directories, file_names in os.walk(bundle, topdown=False):
+            current = Path(directory)
+            _source_directory(current)
+            for name in child_directories:
+                _source_directory(current / name)
+            for name in file_names:
+                _source_bytes(current / name)
+        shutil.rmtree(bundle)
+        _fsync_directory(root)
+    except (InstallError, OSError) as exc:
+        raise InstallError("install_target_untrusted") from exc
+
+
+def _write_generated_regular(*, directory: Path, name: str, content: bytes) -> None:
+    if not content or len(content) > _MAX_MANIFEST_BYTES:
+        raise InstallError("install_target_untrusted")
+    descriptor = -1
+    temporary = Path()
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=directory)
+        temporary = Path(temporary_name)
+        os.fchmod(descriptor, 0o644)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, directory / name)
+        temporary = Path()
+        _fsync_directory(directory)
+    except OSError as exc:
+        raise InstallError("install_target_untrusted") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary != Path():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def _write_release_binding_descriptor(*, root: Path) -> None:
+    """Atomically bind the native plugin bundle to its sealed image."""
+
+    try:
+        manifest_raw = _source_bytes(root / _MANIFEST_NAME)
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise InstallError("install_target_untrusted")
+        encoded = release_binding_bytes(
+            manifest,
+            "sha256:" + hashlib.sha256(manifest_raw).hexdigest(),
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise InstallError("install_target_untrusted") from exc
+    _write_generated_regular(
+        directory=root / _PLUGIN_BUNDLE_DIRECTORY,
+        name=_RELEASE_BINDING_NAME,
+        content=encoded,
+    )
+
+
+def _write_root_install_plan(*, root: Path) -> None:
+    """Emit bytes for a later RootInstallPlanV1 gate; never install them here."""
+
+    try:
+        manifest_raw = _source_bytes(root / _MANIFEST_NAME)
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise InstallError("install_target_untrusted")
+        encoded = root_install_plan_bytes(
+            manifest,
+            "sha256:" + hashlib.sha256(manifest_raw).hexdigest(),
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise InstallError("install_target_untrusted") from exc
+    _write_generated_regular(
+        directory=root, name=_ROOT_INSTALL_PLAN_NAME, content=encoded
+    )
+
+
+def _materialize_plugin_bundle_payload(*, root: Path) -> None:
+    """Materialize the complete plugin payload before manifest attestation."""
+
+    bundle = _child_directory(root, (_PLUGIN_BUNDLE_DIRECTORY,), mode=0o700)
+    for source_name, target_name, mode in _plugin_bundle_source_files(root=root):
+        target = bundle / target_name
+        _child_directory(
+            bundle, tuple(target.parent.relative_to(bundle).parts), mode=0o700
+        )
+        _install_regular(root / source_name, target, mode=mode)
+    _fsync_tree(bundle)
 
 
 def _release_pointer_entry(layout: RuntimeLayout) -> dict[str, str]:
@@ -766,6 +987,8 @@ def _restore_release_pointer_bytes(root: Path, previous: bytes | None) -> None:
     if previous is None:
         try:
             pointer.unlink()
+        except FileNotFoundError:
+            return
         except OSError as exc:
             raise InstallError("install_release_pointer_durability_unknown") from exc
     else:
@@ -790,6 +1013,22 @@ def _restore_release_pointer_bytes(root: Path, previous: bytes | None) -> None:
             if descriptor >= 0:
                 os.close(descriptor)
     _fsync_directory(root)
+
+
+def _release_pointer_bytes(root: Path) -> bytes | None:
+    """Snapshot an already parsed pointer without silently repairing it."""
+
+    target = root / _RELEASE_POINTERS_NAME
+    try:
+        return _source_bytes(target)
+    except InstallError:
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise InstallError("install_release_pointer_invalid") from exc
+        raise
 
 
 def _write_release_pointers(
@@ -840,15 +1079,18 @@ def _write_release_pointers(
             os.close(descriptor)
 
 
-def _materialize_stable_mcp_launcher(
-    *, layout: RuntimeLayout, release_root: Path
-) -> None:
-    """Install the generic MCP launcher from this exact attested generation."""
+def _attested_stable_mcp_launcher_bytes(layout: RuntimeLayout) -> bytes:
+    """Read generic MCP launcher bytes before any publication is visible."""
 
     try:
-        source = layout.read_attested_file(_STABLE_MCP_LAUNCHER_SOURCE)
+        return layout.read_attested_file(_STABLE_MCP_LAUNCHER_SOURCE)
     except ValueError as exc:
         raise InstallError("install_release_invalid") from exc
+
+
+def _materialize_stable_mcp_launcher(*, source: bytes, release_root: Path) -> None:
+    """Install only already-attested generic MCP launcher bytes."""
+
     _install_attested_bytes(
         release_root / _STABLE_MCP_LAUNCHER_NAME, source, mode=0o755
     )
@@ -868,45 +1110,43 @@ def _render_legacy_probe_launcher(
         or template.count("@MASTERJET_MANIFEST_DIGEST@") != 1
     ):
         raise InstallError("install_release_invalid")
-    rendered = (
-        template.replace("@MASTERJET_GENERATION@", generation).replace(
-            "@MASTERJET_MANIFEST_DIGEST@", manifest_digest
-        )
+    rendered = template.replace("@MASTERJET_GENERATION@", generation).replace(
+        "@MASTERJET_MANIFEST_DIGEST@", manifest_digest
     )
-    if (
-        "@MASTERJET_" in rendered
-    ):
+    if "@MASTERJET_" in rendered:
         raise InstallError("install_release_invalid")
     return rendered.encode("utf-8")
 
 
-def _materialize_legacy_probe_launcher(*, layout: RuntimeLayout, libexec: Path) -> None:
-    """Replace the owned historical public probe with an attested launcher."""
+def _attested_legacy_probe_launcher_bytes(layout: RuntimeLayout) -> bytes:
+    """Render the public probe from one staged generation before cutover."""
 
     try:
         source = layout.read_attested_file(_LEGACY_PROBE_LAUNCHER_SOURCE)
     except ValueError as exc:
         raise InstallError("install_release_invalid") from exc
-    source = _render_legacy_probe_launcher(
+    return _render_legacy_probe_launcher(
         source,
         generation=layout.root.name,
         manifest_digest=layout.manifest_digest,
     )
-    _install_attested_bytes(
-        libexec / _LEGACY_PROBE_LAUNCHER_NAME, source, mode=0o755
-    )
 
 
-def _stable_mcp_launcher_bytes(release_root: Path) -> bytes | None:
-    """Snapshot the private stable launcher before a paired pointer update."""
+def _materialize_legacy_probe_launcher(*, source: bytes, libexec: Path) -> None:
+    """Replace the owned historical public probe with already-attested bytes."""
 
-    target = release_root / _STABLE_MCP_LAUNCHER_NAME
+    _install_attested_bytes(libexec / _LEGACY_PROBE_LAUNCHER_NAME, source, mode=0o755)
+
+
+def _owned_launcher_bytes(target: Path) -> bytes | None:
+    """Snapshot one owned executable through a no-follow, single-link path."""
+
     try:
         item = target.lstat()
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise InstallError("install_release_pair_invalid") from exc
+        raise InstallError("install_release_triplet_invalid") from exc
     if (
         stat.S_ISLNK(item.st_mode)
         or not stat.S_ISREG(item.st_mode)
@@ -914,17 +1154,36 @@ def _stable_mcp_launcher_bytes(release_root: Path) -> bytes | None:
         or item.st_uid != os.geteuid()
         or stat.S_IMODE(item.st_mode) != 0o755
     ):
-        raise InstallError("install_release_pair_invalid")
+        raise InstallError("install_release_triplet_invalid")
     try:
         return _source_bytes(target)
     except InstallError as exc:
-        raise InstallError("install_release_pair_invalid") from exc
+        raise InstallError("install_release_triplet_invalid") from exc
 
 
-def _restore_stable_mcp_launcher(*, release_root: Path, previous: bytes | None) -> None:
-    """Durably restore the launcher half when its paired pointer write fails."""
+def _stable_launcher_bytes(release_root: Path, *, name: str) -> bytes | None:
+    """Snapshot one private stable launcher before a pointer update."""
 
-    target = release_root / _STABLE_MCP_LAUNCHER_NAME
+    return _owned_launcher_bytes(release_root / name)
+
+
+def _stable_mcp_launcher_bytes(release_root: Path) -> bytes | None:
+    return _stable_launcher_bytes(release_root, name=_STABLE_MCP_LAUNCHER_NAME)
+
+
+def _legacy_probe_launcher_bytes(libexec: Path) -> bytes | None:
+    """Snapshot the owned public probe before the release transaction alters it."""
+
+    try:
+        _source_directory(libexec)
+        return _owned_launcher_bytes(libexec / _LEGACY_PROBE_LAUNCHER_NAME)
+    except InstallError as exc:
+        raise InstallError("install_release_triplet_invalid") from exc
+
+
+def _restore_owned_launcher(*, target: Path, previous: bytes | None) -> None:
+    """Durably restore one owned launcher when the release transaction aborts."""
+
     try:
         if previous is None:
             try:
@@ -938,15 +1197,41 @@ def _restore_stable_mcp_launcher(*, release_root: Path, previous: bytes | None) 
                 or item.st_uid != os.geteuid()
                 or stat.S_IMODE(item.st_mode) != 0o755
             ):
-                raise InstallError("install_release_pair_durability_unknown")
+                raise InstallError("install_release_triplet_durability_unknown")
             target.unlink()
-            _fsync_directory(release_root)
+            _fsync_directory(target.parent)
         else:
             _install_attested_bytes(target, previous, mode=0o755)
     except InstallError:
         raise
     except OSError as exc:
-        raise InstallError("install_release_pair_durability_unknown") from exc
+        raise InstallError("install_release_triplet_durability_unknown") from exc
+
+
+def _restore_stable_launcher(
+    *, release_root: Path, name: str, previous: bytes | None
+) -> None:
+    """Durably restore one private stable launcher after an aborted transaction."""
+
+    _restore_owned_launcher(target=release_root / name, previous=previous)
+
+
+def _restore_stable_mcp_launcher(*, release_root: Path, previous: bytes | None) -> None:
+    _restore_stable_launcher(
+        release_root=release_root, name=_STABLE_MCP_LAUNCHER_NAME, previous=previous
+    )
+
+
+def _restore_legacy_probe_launcher(*, libexec: Path, previous: bytes | None) -> None:
+    """Restore the public probe within the same rollback boundary as Current."""
+
+    try:
+        _source_directory(libexec)
+        _restore_owned_launcher(
+            target=libexec / _LEGACY_PROBE_LAUNCHER_NAME, previous=previous
+        )
+    except InstallError as exc:
+        raise InstallError("install_release_triplet_durability_unknown") from exc
 
 
 def _render_hourly_probe_service(
@@ -1052,15 +1337,90 @@ def _discard_unpublished_generation(
         raise InstallError("install_release_pair_durability_unknown") from exc
 
 
-def _materialize_hourly_probe_units(
-    *, layout: RuntimeLayout, units: Path, generation: str
-) -> None:
-    """Install the pair exclusively from the release that is about to be Current."""
+def _remove_fresh_publish_artifacts(*, release_root: Path) -> None:
+    """Remove only an empty, publisher-created first-release root.
 
+    This is intentionally narrower than retention: it runs only after a root
+    that was absent before this publisher call has rolled back completely.
+    Any unexpected member, link, ownership/mode drift, or cleanup failure is
+    durability-unknown rather than permission to remove broader state.
+    """
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    parent_fd = -1
+    root_fd = -1
+    generation_fd = -1
     try:
-        _source_directory(units)
-    except InstallError as exc:
-        raise InstallError("install_release_retention_failed") from exc
+        parent_fd = os.open(release_root.parent, flags)
+        parent_info = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_info.st_mode) & 0o022
+        ):
+            raise InstallError("install_release_transaction_durability_unknown")
+        root_fd = os.open(release_root.name, flags, dir_fd=parent_fd)
+        root_info = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.geteuid()
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+        ):
+            raise InstallError("install_release_transaction_durability_unknown")
+        members = set(os.listdir(root_fd))
+        expected = {_RELEASE_GENERATIONS_NAME, _PUBLISH_LOCK_NAME}
+        if not members.issubset(expected):
+            raise InstallError("install_release_transaction_durability_unknown")
+        if _RELEASE_GENERATIONS_NAME in members:
+            generation_fd = os.open(_RELEASE_GENERATIONS_NAME, flags, dir_fd=root_fd)
+            generation_info = os.fstat(generation_fd)
+            if (
+                not stat.S_ISDIR(generation_info.st_mode)
+                or generation_info.st_uid != os.geteuid()
+                or stat.S_IMODE(generation_info.st_mode) != 0o700
+                or os.listdir(generation_fd)
+            ):
+                raise InstallError("install_release_transaction_durability_unknown")
+            os.close(generation_fd)
+            generation_fd = -1
+            os.rmdir(_RELEASE_GENERATIONS_NAME, dir_fd=root_fd)
+        if _PUBLISH_LOCK_NAME in members:
+            lock_info = os.stat(
+                _PUBLISH_LOCK_NAME, dir_fd=root_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(lock_info.st_mode)
+                or lock_info.st_uid != os.geteuid()
+                or lock_info.st_nlink != 1
+                or stat.S_IMODE(lock_info.st_mode) != 0o600
+            ):
+                raise InstallError("install_release_transaction_durability_unknown")
+            os.unlink(_PUBLISH_LOCK_NAME, dir_fd=root_fd)
+        if os.listdir(root_fd):
+            raise InstallError("install_release_transaction_durability_unknown")
+        os.fsync(root_fd)
+        os.close(root_fd)
+        root_fd = -1
+        os.rmdir(release_root.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError("install_release_transaction_durability_unknown") from exc
+    finally:
+        if generation_fd >= 0:
+            os.close(generation_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _staged_hourly_probe_unit_bytes(
+    *, layout: RuntimeLayout, generation: str
+) -> tuple[bytes, bytes]:
+    """Render all owned unit bytes before a publication becomes visible."""
+
     try:
         service_template = layout.read_attested_file(
             "systemd/user/the-hive-hive-hourly-probe.service"
@@ -1073,11 +1433,23 @@ def _materialize_hourly_probe_units(
     service = _render_hourly_probe_service(
         service_template, generation=generation, manifest_digest=layout.manifest_digest
     )
+    return service, timer
+
+
+def _materialize_hourly_probe_units(
+    *, units: Path, staged: tuple[bytes, bytes]
+) -> None:
+    """Install only the already-attested, pre-rendered complete unit pair."""
+
+    try:
+        _source_directory(units)
+    except InstallError as exc:
+        raise InstallError("install_release_retention_failed") from exc
     _install_attested_bytes(
-        units / "the-hive-hive-hourly-probe.service", service, mode=0o644
+        units / "the-hive-hive-hourly-probe.service", staged[0], mode=0o644
     )
     _install_attested_bytes(
-        units / "the-hive-hive-hourly-probe.timer", timer, mode=0o644
+        units / "the-hive-hive-hourly-probe.timer", staged[1], mode=0o644
     )
 
 
@@ -1195,12 +1567,14 @@ def _unit_bound_generation(*, release_root: Path, source: Path) -> str | None:
             or (
                 f"BindReadOnlyPaths={_RELEASE_GENERATION_MARKER}{generation}:"
                 f"{_RELEASE_GENERATION_MARKER}{generation}:norbind"
-            ) in text
+            )
+            in text
             or (
                 "ExecStart="
                 f"{_RELEASE_GENERATION_MARKER}{generation}/bin/the-hive-hive-hourly-probe "
                 f"%h/.local/lib/the-hive-runtime {generation} {layout.manifest_digest} --json"
-            ) not in text
+            )
+            not in text
         ):
             raise InstallError("install_release_retention_failed")
     else:
@@ -1232,12 +1606,94 @@ def _installed_live_generations(*, release_root: Path, units: Path | None) -> se
     return retained
 
 
+def _canonical_hook_session_pin_store(release_root: Path) -> HookSessionPinStoreV1:
+    """Open only the one D320 state-root derived from this release authority."""
+
+    try:
+        library = release_root.parent
+        local = library.parent
+        home = local.parent
+        if (
+            library.name != "lib"
+            or local.name != ".local"
+            or not home.is_absolute()
+            or release_root.name != _RUNTIME_ROOT_NAME
+        ):
+            raise InstallError("install_release_retention_failed")
+        return HookSessionPinStoreV1.open_at(
+            home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+        )
+    except (HookSessionPinStoreError, InstallError) as exc:
+        raise InstallError("install_release_retention_failed") from exc
+
+
+def _fresh_release_root_before_publish(release_root: Path) -> bool:
+    """Prove the sole-owner first-publish state before this function mutates it."""
+
+    try:
+        item = release_root.lstat()
+    except FileNotFoundError:
+        library = release_root.parent
+        local = library.parent
+        if (
+            release_root.name != _RUNTIME_ROOT_NAME
+            or library.name != "lib"
+            or local.name != ".local"
+        ):
+            raise InstallError("install_release_retention_failed")
+        _directory(library, mode=0o700, create=False)
+        return True
+    except OSError as exc:
+        raise InstallError("install_release_retention_failed") from exc
+    if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
+        raise InstallError("install_release_retention_failed")
+    return False
+
+
+def _attested_hook_session_pin_generations(
+    *, release_root: Path, fresh_release_root: bool
+) -> set[str]:
+    """Read the canonical locked pin store; unreadable state fails closed."""
+
+    # A missing release root observed before our first mutation proves there
+    # is no immutable generation from which a binding could exist.  It is the
+    # sole first-publish bootstrap; this function never creates a pin store.
+    if fresh_release_root:
+        return set()
+    try:
+        bindings = _canonical_hook_session_pin_store(release_root).retained_bindings(
+            now_unix_ns=time.time_ns()
+        )
+    except HookSessionPinStoreError as exc:
+        raise InstallError("install_release_retention_failed") from exc
+    retained: set[str] = set()
+    for pin in bindings.values():
+        generation = pin.get("generation")
+        manifest_digest = pin.get("runtime_manifest_digest")
+        if not isinstance(generation, str) or not isinstance(manifest_digest, str):
+            raise InstallError("install_release_retention_failed")
+        try:
+            _relative_name(generation)
+            layout = RuntimeLayout.from_runtime_root(
+                release_root / _RELEASE_GENERATIONS_NAME / generation
+            )
+        except (InstallError, ValueError) as exc:
+            raise InstallError("install_release_retention_failed") from exc
+        if _release_pointer_entry(layout) != {
+            "generation": generation,
+            "manifest_digest": manifest_digest,
+        }:
+            raise InstallError("install_release_retention_failed")
+        retained.add(generation)
+    return retained
+
+
 def _publish_runtime_generation(
     *,
     stage: Path,
     release_root: Path,
-    live_generations: tuple[str, ...] = (),
     live_unit_dir: Path | None = None,
+    live_libexec: Path | None = None,
 ) -> RuntimeLayout:
     """Publish exactly one manifest-attested generation under the sole image owner."""
 
@@ -1247,99 +1703,159 @@ def _publish_runtime_generation(
         or stage == release_root
     ):
         raise InstallError("install_stage_untrusted")
-    _directory(release_root, mode=0o700, create=True)
+    # Do not create even an empty release-root, generations directory, or
+    # publisher lock until every candidate artifact that can be checked from
+    # the immutable stage has passed.  In particular a failed first publish
+    # must not consume the no-prior-generation bootstrap state.
     try:
-        members = {item.name for item in release_root.iterdir()}
-    except OSError as exc:
-        raise InstallError("install_release_root_invalid") from exc
-    if not members.issubset(
-        {
-            _RELEASE_GENERATIONS_NAME,
-            _RELEASE_POINTERS_NAME,
-            _PUBLISH_LOCK_NAME,
-            _STABLE_MCP_LAUNCHER_NAME,
-        }
-    ):
-        raise InstallError("install_release_root_legacy")
-    generations = _child_directory(
-        release_root, (_RELEASE_GENERATIONS_NAME,), mode=0o700
-    )
-    for generation in live_generations:
-        _relative_name(generation)
-    with _release_publish_lock(release_root):
-        previous_hourly_units = (
-            _snapshot_hourly_probe_units(units=live_unit_dir)
+        staged_layout = RuntimeLayout.from_runtime_root(stage)
+        staged_mcp_launcher = _attested_stable_mcp_launcher_bytes(staged_layout)
+        entry = _release_pointer_entry(staged_layout)
+        staged_units = (
+            _staged_hourly_probe_unit_bytes(
+                layout=staged_layout, generation=entry["generation"]
+            )
             if live_unit_dir is not None
             else None
         )
-        try:
-            staged_layout = RuntimeLayout.from_runtime_root(stage)
-        except ValueError as exc:
-            raise InstallError("install_stage_validation_failed") from exc
-        entry = _release_pointer_entry(staged_layout)
-        target = generations / entry["generation"]
-        if target.exists() or target.is_symlink():
-            raise InstallError("install_release_generation_exists")
-        pointers = _read_release_pointers(release_root)
-        try:
-            os.rename(stage, target)
-        except OSError as exc:
-            raise InstallError("install_swap_failed") from exc
-        _fsync_directory(generations)
-        _fsync_directory(release_root)
-        try:
-            layout = RuntimeLayout.from_runtime_root(target)
-        except ValueError as exc:
-            raise InstallError("install_stage_validation_failed") from exc
-        if _release_pointer_entry(layout) != entry:
-            raise InstallError("install_release_invalid")
-        if live_unit_dir is not None:
-            try:
-                _materialize_hourly_probe_units(
-                    layout=layout,
-                    units=live_unit_dir,
-                    generation=entry["generation"],
-                )
-            except InstallError as exc:
-                try:
-                    _restore_hourly_probe_units(
-                        units=live_unit_dir, previous=previous_hourly_units
-                    )
-                    _discard_unpublished_generation(
-                        generations=generations, target=target, entry=entry
-                    )
-                except InstallError:
-                    raise InstallError("install_release_pair_durability_unknown") from exc
-                raise
-        discovered_live = _installed_live_generations(
-            release_root=release_root, units=live_unit_dir
+        staged_legacy_probe_launcher = (
+            _attested_legacy_probe_launcher_bytes(staged_layout)
+            if live_libexec is not None
+            else None
         )
-        # Prune before Current changes.  Keep both old pointer entries for
-        # this transition, which is conservative by one generation but means
-        # a retention error cannot leave a caller seeing a failed publish
-        # after the new pointer/launcher pair was already durable.
-        retain = {entry["generation"], *live_generations, *discovered_live}
-        if pointers["current"] is not None:
-            retain.add(pointers["current"]["generation"])
-        if pointers["previous"] is not None:
-            retain.add(pointers["previous"]["generation"])
-        _prune_release_generations(release_root, retain=retain)
-        previous_launcher = _stable_mcp_launcher_bytes(release_root)
-        try:
-            _materialize_stable_mcp_launcher(layout=layout, release_root=release_root)
-            _write_release_pointers(
-                release_root,
-                {"current": entry, "previous": pointers["current"]},
+        if live_libexec is not None:
+            _source_directory(live_libexec)
+    except (InstallError, ValueError) as exc:
+        raise InstallError("install_stage_validation_failed") from exc
+    fresh_release_root = _fresh_release_root_before_publish(release_root)
+    # A fresh root remains cleanup-eligible only while it contains the
+    # publisher's empty generations/lock artifacts.  A visible generation
+    # clears this marker until the inner rollback has fully restored the
+    # prepublish state.
+    fresh_cleanup_eligible = False
+    try:
+        _directory(release_root, mode=0o700, create=True)
+        fresh_cleanup_eligible = fresh_release_root
+        members = {item.name for item in release_root.iterdir()}
+        if not members.issubset(
+            {
+                _RELEASE_GENERATIONS_NAME,
+                _RELEASE_POINTERS_NAME,
+                _PUBLISH_LOCK_NAME,
+                _STABLE_MCP_LAUNCHER_NAME,
+            }
+        ):
+            raise InstallError("install_release_root_legacy")
+        generations = _child_directory(
+            release_root, (_RELEASE_GENERATIONS_NAME,), mode=0o700
+        )
+        with _release_publish_lock(release_root):
+            # Everything below this comment is attestable before the rename that
+            # first makes the staged generation visible to another reader.
+            _attested_hook_session_pin_generations(
+                release_root=release_root, fresh_release_root=fresh_release_root
             )
-        except InstallError as exc:
+            previous_hourly_units = (
+                _snapshot_hourly_probe_units(units=live_unit_dir)
+                if live_unit_dir is not None
+                else None
+            )
+            previous_legacy_probe_launcher = (
+                _legacy_probe_launcher_bytes(live_libexec)
+                if live_libexec is not None
+                else None
+            )
+            target = generations / entry["generation"]
+            if target.exists() or target.is_symlink():
+                raise InstallError("install_release_generation_exists")
+            pointers = _read_release_pointers(release_root)
+            previous_pointer = _release_pointer_bytes(release_root)
+            previous_mcp_launcher = _stable_mcp_launcher_bytes(release_root)
+
+            visible = False
             try:
-                _restore_stable_mcp_launcher(
-                    release_root=release_root, previous=previous_launcher
+                os.rename(stage, target)
+                visible = True
+                fresh_cleanup_eligible = False
+            except OSError as exc:
+                raise InstallError("install_swap_failed") from exc
+            try:
+                _fsync_directory(generations)
+                _fsync_directory(release_root)
+                layout = RuntimeLayout.from_runtime_root(target)
+                if _release_pointer_entry(layout) != entry:
+                    raise InstallError("install_release_invalid")
+                if live_unit_dir is not None and staged_units is not None:
+                    _materialize_hourly_probe_units(
+                        units=live_unit_dir,
+                        staged=staged_units,
+                    )
+                _materialize_stable_mcp_launcher(
+                    source=staged_mcp_launcher, release_root=release_root
                 )
+                if (
+                    live_libexec is not None
+                    and staged_legacy_probe_launcher is not None
+                ):
+                    _materialize_legacy_probe_launcher(
+                        source=staged_legacy_probe_launcher, libexec=live_libexec
+                    )
+                _write_release_pointers(
+                    release_root,
+                    {"current": entry, "previous": pointers["current"]},
+                )
+                if live_unit_dir is not None:
+                    if (
+                        _unit_bound_generation(
+                            release_root=release_root,
+                            source=live_unit_dir / "the-hive-hive-hourly-probe.service",
+                        )
+                        != entry["generation"]
+                    ):
+                        raise InstallError("install_release_retention_failed")
+                # D320 permits conservative retention.  Deleting an immutable
+                # generation after a visible cutover would be non-rollbackable,
+                # so this source publisher retains every generation.  A later
+                # authority may add deletion only with a fully reversible plan.
+                return layout
+            except (InstallError, ValueError) as exc:
+                try:
+                    _restore_release_pointer_bytes(release_root, previous_pointer)
+                    _restore_stable_mcp_launcher(
+                        release_root=release_root, previous=previous_mcp_launcher
+                    )
+                    if live_unit_dir is not None and previous_hourly_units is not None:
+                        _restore_hourly_probe_units(
+                            units=live_unit_dir, previous=previous_hourly_units
+                        )
+                    if live_libexec is not None:
+                        _restore_legacy_probe_launcher(
+                            libexec=live_libexec,
+                            previous=previous_legacy_probe_launcher,
+                        )
+                    if visible:
+                        _discard_unpublished_generation(
+                            generations=generations, target=target, entry=entry
+                        )
+                    fresh_cleanup_eligible = fresh_release_root
+                except InstallError:
+                    raise InstallError(
+                        "install_release_transaction_durability_unknown"
+                    ) from exc
+                if isinstance(exc, ValueError):
+                    raise InstallError("install_release_invalid") from exc
+                raise
+    except (InstallError, ValueError) as exc:
+        if fresh_release_root and fresh_cleanup_eligible:
+            try:
+                _remove_fresh_publish_artifacts(release_root=release_root)
             except InstallError:
-                raise InstallError("install_release_pair_durability_unknown") from exc
-            raise
-        return layout
+                raise InstallError(
+                    "install_release_transaction_durability_unknown"
+                ) from exc
+        if isinstance(exc, ValueError):
+            raise InstallError("install_release_invalid") from exc
+        raise
 
 
 def _ensure_probe_lock(state: Path) -> None:
@@ -1399,14 +1915,9 @@ def _install_attested_runtime(*, home: Path) -> dict[str, object]:
         stage=stage,
         release_root=library / _RUNTIME_ROOT_NAME,
         live_unit_dir=units,
+        live_libexec=libexec,
     )
-    _materialize_legacy_probe_launcher(layout=layout, libexec=libexec)
     generation = _release_pointer_entry(layout)["generation"]
-    if _unit_bound_generation(
-        release_root=library / _RUNTIME_ROOT_NAME,
-        source=units / "the-hive-hive-hourly-probe.service",
-    ) != generation:
-        raise InstallError("install_release_retention_failed")
     return {
         "status": "installed",
         "generation": generation,

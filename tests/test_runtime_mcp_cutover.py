@@ -16,6 +16,7 @@ import pytest
 
 from conftest import seal_runtime_image
 import the_hive.server as server
+from the_hive.hook_session_pin_store import HookSessionPinStoreV1
 from the_hive.runtime_layout import RuntimeLayout
 
 
@@ -31,6 +32,7 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     root.mkdir(mode=0o700)
     _write(root, "bin/the-hive-mcp", "#!/bin/sh\nexit 0\n", 0o755)
     _write(root, "bin/the-hive-mcp-stable", "#!/bin/sh\nexit 0\n", 0o755)
+    _write(root, "bin/the-hive-plugin-hook-stable", "#!/bin/sh\nexit 0\n", 0o755)
     _write(root, "bin/the-hive-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
     _write(root, "bin/the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
     _write(root, "systemd/user/the-hive-resource-monitor.service", "[Service]\n")
@@ -67,6 +69,28 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     )
     _write(root, ".app.json", json.dumps({"apps": {"the-hive": {}}}))
     _write(root, "hooks/hooks.json", json.dumps({"hooks": {}}))
+    _write(root, "hooks/native_bee_event.py", "# hook\n")
+    _write(root, "hooks/native_spawn_admission.py", "# hook\n")
+    _write(
+        root,
+        "src/the_hive/hook_session_pin_store.py",
+        (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "the_hive"
+            / "hook_session_pin_store.py"
+        ).read_text(encoding="utf-8"),
+    )
+    _write(
+        root,
+        "src/the_hive/hook_abi_v1_core.py",
+        (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "the_hive"
+            / "hook_abi_v1_core.py"
+        ).read_text(encoding="utf-8"),
+    )
     _write(root, "skills/the-hive-fleet/SKILL.md", "# Fleet\n")
     _write(root, "codex-hive.json", "{}")
     _write(root, "codex-agent-classes.json", "{}")
@@ -124,7 +148,7 @@ def test_interactive_registration_uses_the_validated_image_entrypoint(
         patch.object(server, "run_command") as run,
     ):
         run.return_value = subprocess.CompletedProcess([], 0, "", "")
-        result = server.install(register=True, sync_plugin_cache=False)
+        result = server.install(register=True)
 
     run.assert_called_once_with(
         [
@@ -293,7 +317,9 @@ def test_bound_mcp_health_reads_registration_and_config_through_one_no_create_bi
         patch.object(
             server, "_codex_mcp_binding", return_value=contextlib.nullcontext(binding)
         ) as bind,
-        patch.object(server, "check_mcp_registration", return_value=registration) as check,
+        patch.object(
+            server, "check_mcp_registration", return_value=registration
+        ) as check,
         patch.object(
             server, "codex_client_mcp_config_status", return_value=client_config
         ) as config_status,
@@ -345,7 +371,9 @@ def test_install_rejects_unavailable_binding_before_any_applet_or_registry_mutat
             side_effect=binding_error,
         ),
         patch.object(server, "install_lock") as lock,
-        patch.object(server, "assert_install_context_allows_master_registration") as context,
+        patch.object(
+            server, "assert_install_context_allows_master_registration"
+        ) as context,
         patch.object(server, "_runtime_layout", return_value=layout),
         patch.object(server, "enroll_current_teamleader") as enroll,
         patch.object(server, "ensure_applet_action_key") as ensure_key,
@@ -391,7 +419,9 @@ def test_uninstall_rejects_unavailable_binding_before_desktop_or_registry_mutati
         patch.object(server, "remove_fleet_desktop_entry") as desktop,
         patch.object(server, "revoke_current_teamleader") as revoke,
     ):
-        with pytest.raises(server.AgentError, match="canonical_codex_mcp_binding_unavailable"):
+        with pytest.raises(
+            server.AgentError, match="canonical_codex_mcp_binding_unavailable"
+        ):
             server.uninstall(unregister=unregister, remove_desktop=True)
 
     lock.assert_not_called()
@@ -431,7 +461,9 @@ def test_force_rollback_reuses_one_pinned_cli_and_client_home_after_add_failure(
             server, "enroll_current_teamleader", return_value={"changed": False}
         ),
         patch.object(server, "ensure_applet_action_key"),
-        patch.object(server, "mcp_command_startup_self_test", return_value={"ok": True}),
+        patch.object(
+            server, "mcp_command_startup_self_test", return_value={"ok": True}
+        ),
         patch.object(server, "check_mcp_registration", return_value=current) as check,
         patch.object(
             server,
@@ -449,7 +481,7 @@ def test_force_rollback_reuses_one_pinned_cli_and_client_home_after_add_failure(
         patch.object(server, "run_command", side_effect=completed) as run,
     ):
         with pytest.raises(server.AgentError, match="codex mcp add failed"):
-            server.install(register=True, force=True, sync_plugin_cache=False)
+            server.install(register=True, force=True)
 
     bind.assert_called_once_with()
     check.assert_called_once_with(
@@ -461,7 +493,9 @@ def test_force_rollback_reuses_one_pinned_cli_and_client_home_after_add_failure(
         str(binding.command_path),
     ]
     assert all(call.kwargs["env"] == binding.environment for call in run.call_args_list)
-    assert all(call.kwargs["pass_fds"] == binding.pass_fds for call in run.call_args_list)
+    assert all(
+        call.kwargs["pass_fds"] == binding.pass_fds for call in run.call_args_list
+    )
     assert binding.revalidate.call_count == 6
 
 
@@ -488,7 +522,7 @@ def test_install_rejects_missing_client_config_without_mutation(
         with pytest.raises(
             server.AgentError, match="canonical_codex_mcp_binding_unavailable"
         ):
-            server.install(register=False, sync_plugin_cache=False)
+            server.install(register=False)
 
     assert not (home / ".codex").exists()
     lock.assert_not_called()
@@ -529,9 +563,13 @@ def test_missing_config_race_never_deletes_a_foreign_replacement(
             server.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(home))
         ),
         patch.object(server, "_canonical_codex_cli_path", return_value=executable),
-        patch.object(server.os, "stat", side_effect=publish_foreign_then_report_missing),
+        patch.object(
+            server.os, "stat", side_effect=publish_foreign_then_report_missing
+        ),
     ):
-        with pytest.raises(server.AgentError, match="canonical_codex_mcp_binding_unavailable"):
+        with pytest.raises(
+            server.AgentError, match="canonical_codex_mcp_binding_unavailable"
+        ):
             with server._codex_mcp_binding():
                 pass
 
@@ -676,10 +714,14 @@ def test_binding_keeps_the_pinned_native_payload_across_a_name_replacement(
 
     assert completed.returncode == 0
     assert completed.stdout == "pinned-native"
-    assert native.read_text(encoding="utf-8") == "#!/bin/sh\nprintf 'replacement-native'\n"
+    assert (
+        native.read_text(encoding="utf-8") == "#!/bin/sh\nprintf 'replacement-native'\n"
+    )
 
 
-def test_binding_revalidation_rejects_a_closed_native_payload_fd(tmp_path: Path) -> None:
+def test_binding_revalidation_rejects_a_closed_native_payload_fd(
+    tmp_path: Path,
+) -> None:
     home = tmp_path / "main-home"
     config = home / ".codex"
     config.mkdir(mode=0o700, parents=True)
@@ -709,7 +751,7 @@ def test_force_rollback_keeps_the_pinned_dot_codex_after_a_swap(
     (config / "marker").write_text("pinned", encoding="utf-8")
     executable = tmp_path / "codex"
     executable.write_text(
-        "#!/bin/sh\nprintf '%s:' \"$2\"\ncat \"${CODEX_HOME:-/missing}/marker\" 2>/dev/null || true\n",
+        '#!/bin/sh\nprintf \'%s:\' "$2"\ncat "${CODEX_HOME:-/missing}/marker" 2>/dev/null || true\n',
         encoding="utf-8",
     )
     executable.chmod(0o700)
@@ -745,7 +787,9 @@ def test_force_rollback_keeps_the_pinned_dot_codex_after_a_swap(
         if len(completed) == 1:
             config.rename(moved_config)
             replacement_config.rename(config)
-        return subprocess.CompletedProcess(command, 1 if len(completed) == 2 else 0, actual.stdout, actual.stderr)
+        return subprocess.CompletedProcess(
+            command, 1 if len(completed) == 2 else 0, actual.stdout, actual.stderr
+        )
 
     with (
         patch.object(server.os, "geteuid", return_value=1000),
@@ -755,7 +799,9 @@ def test_force_rollback_keeps_the_pinned_dot_codex_after_a_swap(
         patch.object(server, "_canonical_codex_cli_path", return_value=executable),
         patch.object(server, "_runtime_mcp_entrypoint", return_value=entrypoint),
         patch.object(server, "ensure_applet_action_key"),
-        patch.object(server, "mcp_command_startup_self_test", return_value={"ok": True}),
+        patch.object(
+            server, "mcp_command_startup_self_test", return_value={"ok": True}
+        ),
         patch.object(server, "check_mcp_registration", return_value=current),
         patch.object(
             server,
@@ -773,12 +819,15 @@ def test_force_rollback_keeps_the_pinned_dot_codex_after_a_swap(
                 server._install_enrolled_unlocked(
                     register=True,
                     force=True,
-                    sync_plugin_cache=False,
                     binding=binding,
                 )
             pinned_config = Path(first_config_home).resolve()
 
-    assert [item.stdout for item in completed] == ["remove:pinned", "add:pinned", "add:pinned"]
+    assert [item.stdout for item in completed] == [
+        "remove:pinned",
+        "add:pinned",
+        "add:pinned",
+    ]
     assert pinned_config == moved_config
     assert (config / "marker").read_text(encoding="utf-8") == "replacement"
 
@@ -799,7 +848,9 @@ def test_binding_rejects_missing_client_config_without_creating_it(
         ),
         patch.object(server, "_canonical_codex_cli_path", return_value=executable),
     ):
-        with pytest.raises(server.AgentError, match="canonical_codex_mcp_binding_unavailable"):
+        with pytest.raises(
+            server.AgentError, match="canonical_codex_mcp_binding_unavailable"
+        ):
             with server._codex_mcp_binding():
                 pass
 
@@ -823,9 +874,7 @@ def test_registration_inspection_does_not_create_a_missing_client_config_directo
         patch.object(server, "_canonical_codex_cli_path", return_value=executable),
         patch.object(server, "run_command") as run,
     ):
-        result = server.check_mcp_registration(
-            Path("/runtime/bin/codex-master-mcp")
-        )
+        result = server.check_mcp_registration(Path("/runtime/bin/codex-master-mcp"))
 
     run.assert_not_called()
     assert result["lookup_status"] == "unavailable"
@@ -897,7 +946,9 @@ def test_doctor_client_binding_unavailable_keeps_safe_core_checks_without_state(
             return_value={"name": "codex_home_context", "ok": True},
         ) as home_context,
         patch.object(
-            server, "raw_log_retention_status", return_value={"raw_output": "not_returned"}
+            server,
+            "raw_log_retention_status",
+            return_value={"raw_output": "not_returned"},
         ) as raw_retention,
         patch.object(
             server, "native_hook_coverage_status", return_value={"ok": True}
@@ -906,7 +957,9 @@ def test_doctor_client_binding_unavailable_keeps_safe_core_checks_without_state(
         result = server.doctor()
 
     checks = {item["name"]: item for item in result["checks"]}
-    registration = next(item for item in result["checks"] if item["name"] == "mcp_registered")
+    registration = next(
+        item for item in result["checks"] if item["name"] == "mcp_registered"
+    )
     assert result["ok"] is False
     assert checks["canonical_codex_cli_available"]["ok"] is True
     assert registration["lookup_status"] == "unavailable"
@@ -977,7 +1030,9 @@ def test_doctor_canonical_cli_unavailable_keeps_core_checks_and_cause(
         patch.object(server, "LEASE_DIR", state_root / "leases"),
         patch.object(server, "_runtime_mcp_entrypoint", return_value=entrypoint),
         patch.object(
-            server, "current_agent_inventory", return_value=SimpleNamespace(agent_ids=())
+            server,
+            "current_agent_inventory",
+            return_value=SimpleNamespace(agent_ids=()),
         ) as inventory,
         patch.object(
             server, "mcp_command_startup_self_test", return_value={"ok": True}
@@ -988,7 +1043,9 @@ def test_doctor_canonical_cli_unavailable_keeps_core_checks_and_cause(
             return_value={"name": "codex_home_context", "ok": True},
         ) as home_context,
         patch.object(
-            server, "raw_log_retention_status", return_value={"raw_output": "not_returned"}
+            server,
+            "raw_log_retention_status",
+            return_value={"raw_output": "not_returned"},
         ) as raw_retention,
         patch.object(
             server, "native_hook_coverage_status", return_value={"ok": True}
@@ -1044,16 +1101,29 @@ def test_binding_rejects_a_symlinked_client_config_directory(tmp_path: Path) -> 
         ),
         patch.object(server, "_canonical_codex_cli_path", return_value=executable),
     ):
-        with pytest.raises(server.AgentError, match="canonical_codex_mcp_binding_unavailable"):
+        with pytest.raises(
+            server.AgentError, match="canonical_codex_mcp_binding_unavailable"
+        ):
             with server._codex_mcp_binding():
                 pass
 
 
-def test_canonical_codex_cli_binds_the_native_payload_from_the_attested_wrapper() -> None:
+def test_canonical_codex_cli_binds_the_native_payload_from_the_attested_wrapper() -> (
+    None
+):
     wrapper = Path("/opt/codex/node_modules/@openai/codex/bin/codex.js")
     package = "codex-linux-x64"
     target = "x86_64-unknown-linux-musl"
-    native = wrapper.parents[1] / "node_modules" / "@openai" / package / "vendor" / target / "bin" / "codex"
+    native = (
+        wrapper.parents[1]
+        / "node_modules"
+        / "@openai"
+        / package
+        / "vendor"
+        / target
+        / "bin"
+        / "codex"
+    )
 
     with (
         patch.object(server, "_canonical_codex_wrapper_path", return_value=wrapper),
@@ -1076,11 +1146,22 @@ def test_canonical_codex_cli_binds_the_native_payload_from_the_attested_wrapper(
     validate.assert_called_once_with(native)
 
 
-def test_canonical_codex_cli_uses_only_the_documented_wrapper_and_its_native_payload() -> None:
+def test_canonical_codex_cli_uses_only_the_documented_wrapper_and_its_native_payload() -> (
+    None
+):
     wrapper = Path("/opt/codex/node_modules/@openai/codex/bin/codex.js")
     package = "codex-linux-x64"
     target = "x86_64-unknown-linux-musl"
-    native = wrapper.parents[1] / "node_modules" / "@openai" / package / "vendor" / target / "bin" / "codex"
+    native = (
+        wrapper.parents[1]
+        / "node_modules"
+        / "@openai"
+        / package
+        / "vendor"
+        / target
+        / "bin"
+        / "codex"
+    )
 
     with (
         patch.object(
@@ -1088,7 +1169,9 @@ def test_canonical_codex_cli_uses_only_the_documented_wrapper_and_its_native_pay
             "_codex_native_install_descriptor",
             return_value=(package, target),
         ),
-        patch.object(server, "trusted_runner_executable", return_value=wrapper) as validate,
+        patch.object(
+            server, "trusted_runner_executable", return_value=wrapper
+        ) as validate,
         patch.object(
             server, "_attested_native_codex_payload_path", return_value=native
         ) as attest,
@@ -1127,7 +1210,16 @@ def test_canonical_codex_cli_rejects_a_native_payload_symlink_outside_the_packag
     wrapper = tmp_path / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
     package = "codex-linux-x64"
     target = "x86_64-unknown-linux-musl"
-    native = wrapper.parents[1] / "node_modules" / "@openai" / package / "vendor" / target / "bin" / "codex"
+    native = (
+        wrapper.parents[1]
+        / "node_modules"
+        / "@openai"
+        / package
+        / "vendor"
+        / target
+        / "bin"
+        / "codex"
+    )
     native.parent.mkdir(mode=0o700, parents=True)
     outside = tmp_path / "outside-package-native"
     outside.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -1160,7 +1252,9 @@ def test_attested_native_codex_payload_rejects_an_effective_user_owned_file(
         server._attested_native_codex_payload_path(native)
 
 
-def test_attested_native_codex_payload_rejects_a_hardlinked_file(tmp_path: Path) -> None:
+def test_attested_native_codex_payload_rejects_a_hardlinked_file(
+    tmp_path: Path,
+) -> None:
     native = tmp_path / "native-codex"
     native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     native.chmod(0o700)
@@ -1201,7 +1295,9 @@ def test_attested_native_codex_payload_rejects_an_untrusted_parent_chain(
     with (
         patch.object(server.os, "lstat", return_value=root_owned_regular),
         patch.object(server, "directory_chain_is_real_no_symlink", return_value=True),
-        patch.object(server, "executable_directory_chain_is_trusted", return_value=False),
+        patch.object(
+            server, "executable_directory_chain_is_trusted", return_value=False
+        ),
     ):
         with pytest.raises(server.AgentError, match="canonical_codex_cli_unavailable"):
             server._attested_native_codex_payload_path(native)
@@ -1222,7 +1318,9 @@ def test_binding_rejects_a_native_payload_swapped_to_a_symlink_before_open(
     real_open = server.os.open
     swapped = False
 
-    def swap_before_native_open(path: Path | str, flags: int, *args: object, **kwargs: object) -> int:
+    def swap_before_native_open(
+        path: Path | str, flags: int, *args: object, **kwargs: object
+    ) -> int:
         nonlocal swapped
         if path == native and not swapped:
             native.unlink()
@@ -1300,7 +1398,10 @@ def test_agent_pool_installer_uses_only_the_runtime_image_entrypoint() -> None:
     assert 'release_root="${HOME}/.local/lib/the-hive-runtime"' in source
     assert 'pointer="${release_root}/.the-hive-release-pointers.json"' in source
     assert 'mcp="${release_root}/generations/${generation}/bin/the-hive-mcp"' in source
-    assert 'exec "${mcp}" "${release_root}" "${generation}" "${manifest_digest}" pool install "$@"' in source
+    assert (
+        'exec "${mcp}" "${release_root}" "${generation}" "${manifest_digest}" pool install "$@"'
+        in source
+    )
     assert "codex-master-runtime" not in source
     assert "codex-master-mcp" not in source
     assert "repo_root" not in source
@@ -1333,7 +1434,9 @@ def test_agent_pool_installer_derives_the_current_pointer_triple_before_exec(
     pointer.chmod(0o644)
     wrapper = release_root / "generations" / generation / "bin" / "the-hive-mcp"
     wrapper.parent.mkdir(mode=0o700, parents=True)
-    wrapper.write_text('#!/usr/bin/bash\nprintf "%s\\n" "$@" > "${CAPTURE}"\n', encoding="utf-8")
+    wrapper.write_text(
+        '#!/usr/bin/bash\nprintf "%s\\n" "$@" > "${CAPTURE}"\n', encoding="utf-8"
+    )
     wrapper.chmod(0o755)
     capture = tmp_path / "wrapper-arguments"
 
@@ -1356,7 +1459,9 @@ def test_agent_pool_installer_derives_the_current_pointer_triple_before_exec(
         "pool.json",
     ]
 
-    pointer.write_text('{"schema_version": 1, "current": null, "previous": null}', encoding="utf-8")
+    pointer.write_text(
+        '{"schema_version": 1, "current": null, "previous": null}', encoding="utf-8"
+    )
     pointer.chmod(0o644)
     capture.unlink()
     rejected = subprocess.run(
@@ -1440,7 +1545,9 @@ def test_unauthorized_runtime_surface_stays_sterile_until_a_principal_is_verifie
     assert not state_root.exists()
     tools = next(response for response in responses if response.get("id") == 2)
     assert tools["result"] == {
-        "tools": [next(tool for tool in server.TOOLS if tool["name"] == "runtime_status")]
+        "tools": [
+            next(tool for tool in server.TOOLS if tool["name"] == "runtime_status")
+        ]
     }
     runtime = next(response for response in responses if response.get("id") == 3)
     assert runtime["result"]["isError"] is False
@@ -1459,7 +1566,11 @@ def test_unauthorized_stdio_runtime_status_creates_no_private_state(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     installer = runpy.run_path(
-        str(Path(__file__).resolve().parents[1] / "scripts" / "the-hive-hive-hourly-probe-install")
+        str(
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "the-hive-hive-hourly-probe-install"
+        )
     )
     generation = "stdio"
     stage = tmp_path / ".the-hive-runtime.stage.stdio"
@@ -1470,13 +1581,25 @@ def test_unauthorized_stdio_runtime_status_creates_no_private_state(
         generation=generation,
         commit="a" * 40,
     )
-    release_root = tmp_path / "the-hive-runtime"
+    (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
+    HookSessionPinStoreV1.create_at(
+        home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+    )
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
     installer["_publish_runtime_generation"](  # type: ignore[operator]
         stage=stage, release_root=release_root
     )
-    manifest_digest = "sha256:" + hashlib.sha256(
-        (release_root / "generations" / generation / ".the-hive-runtime-manifest.json").read_bytes()
-    ).hexdigest()
+    manifest_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            (
+                release_root
+                / "generations"
+                / generation
+                / ".the-hive-runtime-manifest.json"
+            ).read_bytes()
+        ).hexdigest()
+    )
     entrypoint = release_root / "generations" / generation / "bin" / "the-hive-mcp"
     requests = (
         {
@@ -1505,7 +1628,11 @@ def test_unauthorized_stdio_runtime_status_creates_no_private_state(
         },
     )
     base_command = [entrypoint, release_root, generation, manifest_digest]
-    for invalid in (base_command[:1], base_command[:-1], [*base_command[:-1], "sha256:" + "0" * 64]):
+    for invalid in (
+        base_command[:1],
+        base_command[:-1],
+        [*base_command[:-1], "sha256:" + "0" * 64],
+    ):
         rejected = subprocess.run(
             invalid,
             capture_output=True,

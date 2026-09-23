@@ -613,7 +613,6 @@ MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 MAX_POOL_SPEC_BYTES = 256 * 1024
 MAX_PLUGIN_CACHE_VERSIONS = 20
-MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
 MAX_SELECTOR_POLICY_BYTES = 4096
 MAX_TEAMLEADER_REGISTRY_BYTES = 16 * 1024
 MAX_TEAMLEADER_PRINCIPALS = 64
@@ -675,53 +674,6 @@ TEAMLEADER_TOOL_NAMES = frozenset(
 )
 HIVE_TEST_MUTATING_TOOL_NAMES = frozenset({"hive_test_run", "hive_test_invalidate"})
 MAX_PAGED_OFFSET = 10_000_000
-PLUGIN_CACHE_ALLOWED_FILES = (
-    ".app.json",
-    ".mcp.json",
-    "README.md",
-    "codex-agent-pool.json",
-    "codex-agent-classes.json",
-    "codex-hive.json",
-    "codex-model-policy.json",
-    "pyproject.toml",
-)
-PLUGIN_CACHE_ALLOWED_DIRS = (
-    ".codex-plugin",
-    "bin",
-    "docs",
-    "examples",
-    "hooks",
-    "schemas",
-    "scripts",
-    "skills",
-    "src",
-    "systemd",
-)
-PLUGIN_CACHE_OPTIONAL_FILES = (
-    "codex-agent-pool.json",
-    "codex-agent-classes.json",
-    "codex-hive.json",
-    "codex-model-policy.json",
-)
-PLUGIN_CACHE_OPTIONAL_DIRS = ("docs", "examples", "hooks", "schemas", "scripts")
-PLUGIN_CACHE_EXCLUDED_NAMES = (
-    ".git",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    "__pycache__",
-)
-PLUGIN_CACHE_EXCLUDED_SUFFIXES = (
-    ".pyc",
-    ".pyo",
-    ".swp",
-    ".swo",
-    ".tmp",
-    ".bak",
-    ".orig",
-    ".rej",
-    "~",
-)
 COMMAND_TIMEOUT_RETURN_CODE = 124
 COMMAND_UNAVAILABLE_RETURN_CODE = 127
 COMMAND_OUTPUT_LIMIT_RETURN_CODE = 125
@@ -2405,9 +2357,9 @@ class _CodexMcpBinding:
             raise _CodexClientBindingUnavailable(
                 "canonical_codex_mcp_binding_unavailable"
             ) from exc
-        if not source_identity_matches(home, self.home_stat) or not source_identity_matches(
-            config, self.config_stat
-        ):
+        if not source_identity_matches(
+            home, self.home_stat
+        ) or not source_identity_matches(config, self.config_stat):
             raise _CodexClientBindingUnavailable(
                 "canonical_codex_mcp_binding_unavailable"
             )
@@ -2443,9 +2395,7 @@ def _codex_mcp_binding() -> Iterator[_CodexMcpBinding]:
         executable_stat = executable.lstat()
         executable_fd = os.open(
             executable,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
         opened_executable = os.fstat(executable_fd)
         if not source_identity_with_snapshot_matches(
@@ -2525,9 +2475,7 @@ def _codex_mcp_binding() -> Iterator[_CodexMcpBinding]:
                     os.close(descriptor)
 
 
-def _codex_mcp_command(
-    binding: _CodexMcpBinding, *arguments: str
-) -> list[str]:
+def _codex_mcp_command(binding: _CodexMcpBinding, *arguments: str) -> list[str]:
     return [str(binding.command_path), "mcp", *arguments]
 
 
@@ -5650,9 +5598,6 @@ _NATIVE_AGENT_REGISTRY_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = (
 _SPAWN_ADMISSION_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = (
     contextvars.ContextVar("codex_master_spawn_admission_lock_stack", default=())
 )
-_PLUGIN_CACHE_LOCK_HELD: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "codex_master_plugin_cache_lock_held", default=False
-)
 _POOL_ROOT_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "codex_master_pool_root_lock_stack", default=()
 )
@@ -5770,30 +5715,6 @@ def assignment_log_lock() -> Any:
         except OSError as exc:
             raise AgentError("could not acquire assignment log lock") from exc
         finally:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-
-
-@contextlib.contextmanager
-def plugin_cache_lock() -> Any:
-    if _PLUGIN_CACHE_LOCK_HELD.get():
-        yield
-        return
-    ensure_private_dir(STATE_ROOT)
-    ensure_private_dir(LOCK_DIR)
-    lock_path = LOCK_DIR / "plugin-cache.lock"
-    with open_private_regular_update(lock_path) as fh:
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        except OSError as exc:
-            raise AgentError("could not acquire plugin cache lock") from exc
-        token = _PLUGIN_CACHE_LOCK_HELD.set(True)
-        try:
-            yield
-        finally:
-            _PLUGIN_CACHE_LOCK_HELD.reset(token)
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             except OSError:
@@ -10677,9 +10598,7 @@ def validate_codex_usage_routing_decision(
 
 _MODEL_INVOCABILITY_UNATTESTED = "provider.model_invocability_unattested"
 _MODEL_RUNNER_UNSUPPORTED = "provider.model_runner_unsupported"
-_MODEL_INVOCABILITY_STATUSES = frozenset(
-    {"complete", "unattested", "invalid", "stale"}
-)
+_MODEL_INVOCABILITY_STATUSES = frozenset({"complete", "unattested", "invalid", "stale"})
 _USAGE_EVIDENCE_STATUSES = frozenset(
     {"complete", "stale", "partial", "busy", "unavailable", "invalid"}
 )
@@ -10769,7 +10688,10 @@ def _model_runner_admission(
             local_admission = ollama_resource_status(agent)
         except (AgentError, OSError, RuntimeError, ValueError):
             local_admission = None
-        if isinstance(local_admission, Mapping) and local_admission.get("allowed") is True:
+        if (
+            isinstance(local_admission, Mapping)
+            and local_admission.get("allowed") is True
+        ):
             return _ModelRunnerAdmission(
                 True,
                 "allowed",
@@ -12018,8 +11940,7 @@ def _proc_has_exact_g5_home_evidence(
     if not same_path_text(codex_home, home):
         return False
     return not require_markers or (
-        values.get(b"THE_HIVE_MCP") == b"1"
-        and values.get(b"CODEX_AGENT_MCP") == b"1"
+        values.get(b"THE_HIVE_MCP") == b"1" and values.get(b"CODEX_AGENT_MCP") == b"1"
     )
 
 
@@ -13152,7 +13073,9 @@ def _start_agent_unlocked(
                 'THE_HIVE_MCP=1 CODEX_AGENT_MCP=1 "${THE_HIVE_RUNNER_EXEC_PATH:?}"'
             )
         else:
-            command = 'env THE_HIVE_MCP=1 CODEX_AGENT_MCP=1 "${THE_HIVE_RUNNER_EXEC_PATH:?}"'
+            command = (
+                'env THE_HIVE_MCP=1 CODEX_AGENT_MCP=1 "${THE_HIVE_RUNNER_EXEC_PATH:?}"'
+            )
         if argv:
             command += " " + shlex.join(argv)
         try:
@@ -20710,344 +20633,7 @@ def read_json_object_from_dir_fd(dir_fd: int, name: str, label: str) -> dict[str
     return payload
 
 
-def copy_regular_plugin_file_no_follow(
-    src: Path, dst: Path, expected_stat: os.stat_result
-) -> None:
-    source_flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        source_flags |= os.O_NOFOLLOW
-    src_fd = -1
-    dst_fd = -1
-    dst_created = False
-    dst_stat: os.stat_result | None = None
-    try:
-        src_fd = os.open(src, source_flags)
-        opened_stat = os.fstat(src_fd)
-        if (
-            not stat_module.S_ISREG(opened_stat.st_mode)
-            or getattr(opened_stat, "st_nlink", 1) > 1
-            or not source_identity_with_snapshot_matches(opened_stat, expected_stat)
-        ):
-            raise AgentError("plugin source changed during copy")
-        mode = stat_module.S_IMODE(opened_stat.st_mode)
-        target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            target_flags |= os.O_NOFOLLOW
-        dst_fd = os.open(dst, target_flags, mode)
-        dst_created = True
-        dst_stat = os.fstat(dst_fd)
-        while True:
-            chunk = os.read(src_fd, RAW_LOG_CHUNK_BYTES)
-            if not chunk:
-                break
-            offset = 0
-            while offset < len(chunk):
-                written = os.write(dst_fd, chunk[offset:])
-                if written <= 0:
-                    raise OSError("plugin cache copy made no progress")
-                offset += written
-        os.fchmod(dst_fd, mode)
-        os.utime(dst_fd, ns=(opened_stat.st_atime_ns, opened_stat.st_mtime_ns))
-        dst_created = False
-    except AgentError:
-        raise
-    except OSError as exc:
-        raise AgentError("could_not_sync_plugin_cache") from exc
-    finally:
-        if src_fd >= 0:
-            os.close(src_fd)
-        if dst_fd >= 0:
-            os.close(dst_fd)
-        if dst_created:
-            remove_created_plugin_file_if_same(dst, dst_stat)
-
-
-def remove_created_plugin_file_if_same(
-    path: Path, expected_stat: os.stat_result | None
-) -> None:
-    if expected_stat is None:
-        return
-    try:
-        current = path.lstat()
-    except OSError:
-        return
-    if not source_identity_matches(current, expected_stat):
-        return
-    with contextlib.suppress(OSError):
-        path.unlink()
-
-
-def open_plugin_source_dir_no_follow(src: Path, expected_stat: os.stat_result) -> int:
-    return open_directory_no_follow_matching(
-        src,
-        expected_stat,
-        error_text="could_not_sync_plugin_cache",
-        changed_text="plugin source changed during copy",
-    )
-
-
-@contextlib.contextmanager
-def plugin_source_root_operation(root: Path, expected_stat: os.stat_result) -> Any:
-    source_fd = -1
-    try:
-        source_fd = open_plugin_source_dir_no_follow(root, expected_stat)
-        yield Path(f"/proc/self/fd/{source_fd}")
-    finally:
-        if source_fd >= 0:
-            os.close(source_fd)
-
-
-def copy_regular_plugin_file_from_dir_no_follow(
-    src_dir_fd: int, name: str, dst: Path, expected_stat: os.stat_result
-) -> None:
-    source_flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        source_flags |= os.O_NOFOLLOW
-    src_fd = -1
-    dst_fd = -1
-    dst_created = False
-    dst_stat: os.stat_result | None = None
-    try:
-        src_fd = os.open(name, source_flags, dir_fd=src_dir_fd)
-        opened_stat = os.fstat(src_fd)
-        if (
-            not stat_module.S_ISREG(opened_stat.st_mode)
-            or getattr(opened_stat, "st_nlink", 1) > 1
-            or not source_identity_with_snapshot_matches(opened_stat, expected_stat)
-        ):
-            raise AgentError("plugin source changed during copy")
-        mode = stat_module.S_IMODE(opened_stat.st_mode)
-        target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            target_flags |= os.O_NOFOLLOW
-        dst_fd = os.open(dst, target_flags, mode)
-        dst_created = True
-        dst_stat = os.fstat(dst_fd)
-        while True:
-            chunk = os.read(src_fd, RAW_LOG_CHUNK_BYTES)
-            if not chunk:
-                break
-            offset = 0
-            while offset < len(chunk):
-                written = os.write(dst_fd, chunk[offset:])
-                if written <= 0:
-                    raise OSError("plugin cache copy made no progress")
-                offset += written
-        os.fchmod(dst_fd, mode)
-        os.utime(dst_fd, ns=(opened_stat.st_atime_ns, opened_stat.st_mtime_ns))
-        dst_created = False
-    except AgentError:
-        raise
-    except OSError as exc:
-        raise AgentError("could_not_sync_plugin_cache") from exc
-    finally:
-        if src_fd >= 0:
-            os.close(src_fd)
-        if dst_fd >= 0:
-            os.close(dst_fd)
-        if dst_created:
-            remove_created_plugin_file_if_same(dst, dst_stat)
-
-
-def open_plugin_destination_parent(path: Path) -> int:
-    try:
-        parent_stat = path.parent.lstat()
-    except OSError as exc:
-        raise AgentError("could_not_sync_plugin_cache") from exc
-    return open_directory_no_follow_matching(
-        path.parent,
-        parent_stat,
-        error_text="could_not_sync_plugin_cache",
-        changed_text="could_not_sync_plugin_cache",
-    )
-
-
-def open_plugin_destination_directory(path: Path, *, create: bool) -> int:
-    parent_fd = -1
-    directory_fd = -1
-    try:
-        parent_fd = open_plugin_destination_parent(path)
-        if create:
-            try:
-                os.mkdir(path.name, 0o755, dir_fd=parent_fd)
-            except OSError as exc:
-                raise AgentError("could_not_sync_plugin_cache") from exc
-        try:
-            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        except OSError as exc:
-            raise AgentError("could_not_sync_plugin_cache") from exc
-        if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(
-            current.st_mode
-        ):
-            raise AgentError("could_not_sync_plugin_cache")
-        directory_fd = open_directory_no_follow_matching(
-            path.name,
-            current,
-            error_text="could_not_sync_plugin_cache",
-            changed_text="could_not_sync_plugin_cache",
-            dir_fd=parent_fd,
-        )
-        result = directory_fd
-        directory_fd = -1
-        return result
-    finally:
-        if directory_fd >= 0:
-            os.close(directory_fd)
-        if parent_fd >= 0:
-            os.close(parent_fd)
-
-
-def open_plugin_destination_directory_at(parent_fd: int, name: str) -> int:
-    directory_fd = -1
-    try:
-        try:
-            os.mkdir(name, 0o755, dir_fd=parent_fd)
-            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except OSError as exc:
-            raise AgentError("could_not_sync_plugin_cache") from exc
-        if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(
-            current.st_mode
-        ):
-            raise AgentError("could_not_sync_plugin_cache")
-        directory_fd = open_directory_no_follow_matching(
-            name,
-            current,
-            error_text="could_not_sync_plugin_cache",
-            changed_text="could_not_sync_plugin_cache",
-            dir_fd=parent_fd,
-        )
-        result = directory_fd
-        directory_fd = -1
-        return result
-    finally:
-        if directory_fd >= 0:
-            os.close(directory_fd)
-
-
-def copy_plugin_cache_dir_fd(
-    src_fd: int, dst: Path, *, dst_fd: int | None = None
-) -> dict[str, int]:
-    owned_dst_fd = dst_fd is None
-    if dst_fd is None:
-        dst_fd = open_plugin_destination_directory(dst, create=False)
-    dst_view = Path(f"/proc/self/fd/{dst_fd}")
-    try:
-        entry_names = sorted(os.listdir(src_fd))
-    except OSError as exc:
-        if owned_dst_fd:
-            os.close(dst_fd)
-        raise AgentError("could_not_sync_plugin_cache") from exc
-    counts = {"files": 0, "directories": 0}
-    try:
-        for name in entry_names:
-            if plugin_cache_name_excluded(name):
-                continue
-            try:
-                entry_stat = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
-            except OSError as exc:
-                raise AgentError("could_not_sync_plugin_cache") from exc
-            if stat_module.S_ISLNK(entry_stat.st_mode):
-                raise AgentError("plugin source contains unsupported symlink")
-            child_dst = dst_view / name
-            if stat_module.S_ISDIR(entry_stat.st_mode):
-                child_fd = -1
-                try:
-                    child_fd = open_plugin_destination_directory_at(dst_fd, name)
-                    source_child_fd = -1
-                    try:
-                        source_child_fd = os.open(
-                            name,
-                            os.O_RDONLY
-                            | (os.O_DIRECTORY if hasattr(os, "O_DIRECTORY") else 0)
-                            | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0),
-                            dir_fd=src_fd,
-                        )
-                        opened_stat = os.fstat(source_child_fd)
-                        if not stat_module.S_ISDIR(
-                            opened_stat.st_mode
-                        ) or not source_identity_with_snapshot_matches(
-                            opened_stat, entry_stat
-                        ):
-                            raise AgentError("plugin source changed during copy")
-                        child_counts = copy_plugin_cache_dir_fd(
-                            source_child_fd,
-                            child_dst,
-                            dst_fd=child_fd,
-                        )
-                    finally:
-                        if source_child_fd >= 0:
-                            os.close(source_child_fd)
-                except AgentError:
-                    raise
-                except OSError as exc:
-                    raise AgentError("could_not_sync_plugin_cache") from exc
-                finally:
-                    if child_fd >= 0:
-                        os.close(child_fd)
-                counts["directories"] += 1 + child_counts["directories"]
-                counts["files"] += child_counts["files"]
-                continue
-            if stat_module.S_ISREG(entry_stat.st_mode):
-                if getattr(entry_stat, "st_nlink", 1) > 1:
-                    raise AgentError("plugin source contains unsupported hardlink")
-                copy_regular_plugin_file_from_dir_no_follow(
-                    src_fd, name, child_dst, entry_stat
-                )
-                counts["files"] += 1
-                continue
-            raise AgentError("plugin source contains unsupported file type")
-        return counts
-    finally:
-        if owned_dst_fd:
-            os.close(dst_fd)
-
-
-def copy_plugin_cache_path(src: Path, dst: Path) -> dict[str, int]:
-    try:
-        src_stat = src.lstat()
-    except OSError as exc:
-        raise AgentError("could_not_sync_plugin_cache") from exc
-    if stat_module.S_ISLNK(src_stat.st_mode):
-        raise AgentError("plugin source contains unsupported symlink")
-    if stat_module.S_ISDIR(src_stat.st_mode):
-        dst_fd = open_plugin_destination_directory(dst, create=True)
-        counts = {"files": 0, "directories": 1}
-        src_fd = -1
-        try:
-            src_fd = open_plugin_source_dir_no_follow(src, src_stat)
-            child_counts = copy_plugin_cache_dir_fd(src_fd, dst, dst_fd=dst_fd)
-        finally:
-            if src_fd >= 0:
-                os.close(src_fd)
-            os.close(dst_fd)
-        counts["files"] += child_counts["files"]
-        counts["directories"] += child_counts["directories"]
-        return counts
-    if stat_module.S_ISREG(src_stat.st_mode):
-        if getattr(src_stat, "st_nlink", 1) > 1:
-            raise AgentError("plugin source contains unsupported hardlink")
-        parent_fd = open_plugin_destination_parent(dst)
-        try:
-            copy_regular_plugin_file_no_follow(
-                src, Path(f"/proc/self/fd/{parent_fd}") / dst.name, src_stat
-            )
-        finally:
-            os.close(parent_fd)
-        return {"files": 1, "directories": 0}
-    raise AgentError("plugin source contains unsupported file type")
-
-
-def plugin_cache_name_excluded(name: str) -> bool:
-    return (
-        name in PLUGIN_CACHE_EXCLUDED_NAMES
-        or name.startswith(".")
-        or name.startswith("#")
-        or name.startswith(".#")
-        or name.endswith(PLUGIN_CACHE_EXCLUDED_SUFFIXES)
-    )
-
-
-def remove_real_plugin_cache_dir(path: Path) -> None:
+def remove_real_directory_no_follow(path: Path) -> None:
     path = path.expanduser()
     if not path.is_absolute():
         path = Path.cwd() / path
@@ -21057,18 +20643,18 @@ def remove_real_plugin_cache_dir(path: Path) -> None:
     except FileNotFoundError:
         return
     except OSError as exc:
-        raise AgentError("could_not_sync_plugin_cache") from exc
+        raise AgentError("could_not_remove_directory") from exc
     if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(current.st_mode):
-        raise AgentError("plugin cache entry is not a real directory")
+        raise AgentError("directory is not a real directory")
     if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
-        raise AgentError("safe plugin cache removal is unavailable")
+        raise AgentError("safe directory removal is unavailable")
     parent_fd = -1
     entry_fd = -1
     try:
         try:
             parent_stat = path.parent.lstat()
         except OSError as exc:
-            raise AgentError("plugin cache entry changed during removal") from exc
+            raise AgentError("directory changed during removal") from exc
         parent_parts = path.parent.parts
         if (
             len(parent_parts) == 5
@@ -21081,26 +20667,26 @@ def remove_real_plugin_cache_dir(path: Path) -> None:
             except OSError as exc:
                 if parent_fd >= 0:
                     os.close(parent_fd)
-                raise AgentError("plugin cache entry changed during removal") from exc
+                raise AgentError("directory changed during removal") from exc
             if not stat_module.S_ISDIR(opened_parent.st_mode):
-                raise AgentError("plugin cache entry changed during removal")
+                raise AgentError("directory changed during removal")
         else:
             parent_fd = open_directory_no_follow_matching(
                 path.parent,
                 parent_stat,
-                error_text="could_not_sync_plugin_cache",
-                changed_text="plugin cache entry changed during removal",
+                error_text="could_not_remove_directory",
+                changed_text="directory changed during removal",
             )
         latest = os.lstat(path.name, dir_fd=parent_fd)
         if not source_identity_matches(latest, current) or not stat_module.S_ISDIR(
             latest.st_mode
         ):
-            raise AgentError("plugin cache entry changed during removal")
+            raise AgentError("directory changed during removal")
         entry_fd = open_directory_no_follow_matching(
             path.name,
             current,
-            error_text="could_not_sync_plugin_cache",
-            changed_text="plugin cache entry changed during removal",
+            error_text="could_not_remove_directory",
+            changed_text="directory changed during removal",
             dir_fd=parent_fd,
         )
 
@@ -21114,364 +20700,19 @@ def remove_real_plugin_cache_dir(path: Path) -> None:
         if not source_identity_matches(latest, current) or not stat_module.S_ISDIR(
             latest.st_mode
         ):
-            raise AgentError("plugin cache entry changed during removal")
+            raise AgentError("directory changed during removal")
         os.rmdir(path.name, dir_fd=parent_fd)
     except AgentError:
         raise
+    except FileNotFoundError:
+        return
     except OSError as exc:
-        raise AgentError("could_not_sync_plugin_cache") from exc
+        raise AgentError("could_not_remove_directory") from exc
     finally:
         if entry_fd >= 0:
             os.close(entry_fd)
         if parent_fd >= 0:
             os.close(parent_fd)
-
-
-def valid_plugin_cache_entry_version(entry: Path) -> str | None:
-    try:
-        entry_stat = entry.lstat()
-    except OSError:
-        return None
-    if stat_module.S_ISLNK(entry_stat.st_mode) or not stat_module.S_ISDIR(
-        entry_stat.st_mode
-    ):
-        return None
-    entry_version = public_plugin_version(entry.name)
-    if not entry_version:
-        return None
-    plugin_dir = entry / ".codex-plugin"
-    try:
-        plugin_dir_stat = plugin_dir.lstat()
-    except OSError:
-        return None
-    if stat_module.S_ISLNK(plugin_dir_stat.st_mode) or not stat_module.S_ISDIR(
-        plugin_dir_stat.st_mode
-    ):
-        return None
-    try:
-        payload = read_repo_json_object(
-            plugin_dir / "plugin.json", "cached plugin manifest"
-        )
-    except AgentError:
-        return None
-    cached_version = public_plugin_version(payload.get("version"))
-    if payload.get("name") != APP_BRIDGE_NAME or cached_version != entry_version:
-        return None
-    return entry_version
-
-
-def _prune_plugin_cache_versions_unlocked(
-    cache_root: Path,
-    *,
-    keep_version: str,
-    max_versions: int = MAX_PLUGIN_CACHE_RETAINED_VERSIONS,
-) -> dict[str, Any]:
-    max_versions = normalize_int_field(
-        max_versions, field="max_versions", minimum=1, maximum=MAX_PLUGIN_CACHE_VERSIONS
-    )
-    try:
-        cache_stat = cache_root.lstat()
-    except OSError as exc:
-        raise AgentError("could_not_sync_plugin_cache") from exc
-    if stat_module.S_ISLNK(cache_stat.st_mode) or not stat_module.S_ISDIR(
-        cache_stat.st_mode
-    ):
-        raise AgentError("could_not_sync_plugin_cache")
-
-    cache_fd = -1
-    try:
-        cache_fd = open_directory_no_follow_matching(
-            cache_root,
-            cache_stat,
-            error_text="could_not_sync_plugin_cache",
-            changed_text="plugin cache root changed during retention",
-        )
-        cache_fd_path = Path(f"/proc/self/fd/{cache_fd}")
-        entries = [cache_fd_path / name for name in sorted(os.listdir(cache_fd))]
-        candidates: list[tuple[float, str, str]] = []
-        keep_entry = cache_fd_path / keep_version
-        current_version_retained = bool(valid_plugin_cache_entry_version(keep_entry))
-        for entry in entries:
-            version = valid_plugin_cache_entry_version(entry)
-            if not version or version == keep_version:
-                continue
-            try:
-                modified = entry.lstat().st_mtime
-            except OSError:
-                continue
-            candidates.append((modified, version, entry.name))
-        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        keep_slots = max(0, max_versions - 1)
-        to_prune = candidates[keep_slots:]
-        for _, _, entry_name in to_prune:
-            remove_real_plugin_cache_dir(cache_fd_path / entry_name)
-        retained_old_count = len(candidates) - len(to_prune)
-    except OSError as exc:
-        raise AgentError("could_not_sync_plugin_cache") from exc
-    finally:
-        if cache_fd >= 0:
-            os.close(cache_fd)
-    return {
-        "max_versions": max_versions,
-        "current_version_retained": current_version_retained,
-        "retained_old_version_count": retained_old_count,
-        "pruned_version_count": len(to_prune),
-        "raw_output": "not_returned",
-    }
-
-
-def prune_plugin_cache_versions(
-    cache_root: Path,
-    *,
-    keep_version: str,
-    max_versions: int = MAX_PLUGIN_CACHE_RETAINED_VERSIONS,
-) -> dict[str, Any]:
-    with plugin_cache_lock():
-        return _prune_plugin_cache_versions_unlocked(
-            cache_root,
-            keep_version=keep_version,
-            max_versions=max_versions,
-        )
-
-
-def _sync_plugin_cache_from_repo_unlocked(
-    root: Path | None = None,
-    cache_root: Path | None = None,
-    retained_versions: int = MAX_PLUGIN_CACHE_RETAINED_VERSIONS,
-) -> dict[str, Any]:
-    context = codex_home_context()
-    if not context.get("ok"):
-        raise AgentError(
-            "plugin cache install is not allowed from a managed Agentin home"
-        )
-
-    source_root = root or repo_root()
-    source_root = source_root.expanduser()
-    if not source_root.is_absolute():
-        source_root = Path.cwd() / source_root
-    source_root = source_root.absolute()
-    if not is_real_directory_no_symlink(source_root):
-        raise AgentError("plugin source root must be a real directory")
-
-    try:
-        source_stat = source_root.lstat()
-    except OSError as exc:
-        raise AgentError("plugin source root must be a real directory") from exc
-    with plugin_source_root_operation(source_root, source_stat) as source_view:
-        manifest = plugin_manifest_version(source_view)
-    if not manifest.get("ok"):
-        raise AgentError("plugin manifest name or version is invalid")
-    version = manifest["version"]
-    target_cache = normalize_plugin_cache_root(cache_root)
-    expected_parent_stat = ensure_real_parent(
-        target_cache,
-        "plugin cache parent directories must be real directories",
-    )
-    parent_fd = -1
-    cache_fd = -1
-    try:
-        parent_fd = open_directory_no_follow_matching(
-            target_cache.parent,
-            expected_parent_stat,
-            error_text="could_not_sync_plugin_cache",
-            changed_text="could_not_sync_plugin_cache",
-        )
-        try:
-            target_stat = os.stat(
-                target_cache.name, dir_fd=parent_fd, follow_symlinks=False
-            )
-        except FileNotFoundError:
-            try:
-                os.mkdir(target_cache.name, mode=0o755, dir_fd=parent_fd)
-                target_stat = os.stat(
-                    target_cache.name, dir_fd=parent_fd, follow_symlinks=False
-                )
-            except OSError as exc:
-                raise AgentError("could_not_sync_plugin_cache") from exc
-        except OSError as exc:
-            raise AgentError("could_not_sync_plugin_cache") from exc
-        if stat_module.S_ISLNK(target_stat.st_mode) or not stat_module.S_ISDIR(
-            target_stat.st_mode
-        ):
-            raise AgentError("plugin cache root must be a real directory")
-        cache_fd = open_directory_no_follow_matching(
-            target_cache.name,
-            target_stat,
-            error_text="could_not_sync_plugin_cache",
-            changed_text="plugin cache root changed during sync",
-            dir_fd=parent_fd,
-        )
-    finally:
-        if parent_fd >= 0:
-            os.close(parent_fd)
-
-    tmp_name = f".{version}.tmp.{now_id()}.{uuid.uuid4().hex}"
-    copied_files = 0
-    copied_directories = 0
-    tmp_entry_created = False
-    backup_entry_created = False
-    backup_name: str | None = None
-    source_entry_stats: dict[str, os.stat_result] = {}
-    try:
-        cache_fd_path = Path(f"/proc/self/fd/{cache_fd}")
-        tmp_entry = cache_fd_path / tmp_name
-        try:
-            os.mkdir(tmp_name, mode=0o755, dir_fd=cache_fd)
-        except OSError as exc:
-            raise AgentError("could_not_sync_plugin_cache") from exc
-        tmp_entry_created = True
-        copied_directories += 1
-        with plugin_source_root_operation(source_root, source_stat) as source_view:
-            for name in PLUGIN_CACHE_ALLOWED_FILES:
-                original_src = source_root / name
-                if not path_present_no_follow(original_src):
-                    if name in PLUGIN_CACHE_OPTIONAL_FILES:
-                        continue
-                    raise AgentError("plugin source is missing a required file")
-                try:
-                    source_entry_stats[name] = original_src.lstat()
-                except OSError as exc:
-                    raise AgentError("could_not_sync_plugin_cache") from exc
-                if stat_module.S_ISLNK(source_entry_stats[name].st_mode):
-                    raise AgentError("plugin source contains unsupported symlink")
-                src = source_view / name
-                try:
-                    current_stat = src.lstat()
-                except OSError as exc:
-                    raise AgentError("could_not_sync_plugin_cache") from exc
-                if not source_identity_with_snapshot_matches(
-                    current_stat, source_entry_stats[name]
-                ):
-                    raise AgentError("plugin source changed during copy")
-                counts = copy_plugin_cache_path(src, tmp_entry / name)
-                copied_files += counts["files"]
-                copied_directories += counts["directories"]
-            for name in PLUGIN_CACHE_ALLOWED_DIRS:
-                original_src = source_root / name
-                if not path_present_no_follow(original_src):
-                    if name in PLUGIN_CACHE_OPTIONAL_DIRS:
-                        continue
-                    raise AgentError("plugin source is missing a required directory")
-                try:
-                    source_entry_stats[name] = original_src.lstat()
-                except OSError as exc:
-                    raise AgentError("could_not_sync_plugin_cache") from exc
-                if stat_module.S_ISLNK(source_entry_stats[name].st_mode):
-                    raise AgentError("plugin source contains unsupported symlink")
-                src = source_view / name
-                try:
-                    current_stat = src.lstat()
-                except OSError as exc:
-                    raise AgentError("could_not_sync_plugin_cache") from exc
-                if not source_identity_with_snapshot_matches(
-                    current_stat, source_entry_stats[name]
-                ):
-                    raise AgentError("plugin source changed during copy")
-                counts = copy_plugin_cache_path(src, tmp_entry / name)
-                copied_files += counts["files"]
-                copied_directories += counts["directories"]
-            for name, expected_stat in source_entry_stats.items():
-                try:
-                    current_stat = (source_root / name).lstat()
-                except OSError as exc:
-                    raise AgentError("could_not_sync_plugin_cache") from exc
-                if not source_identity_with_snapshot_matches(
-                    current_stat, expected_stat
-                ):
-                    raise AgentError("plugin source changed during copy")
-
-        try:
-            existing_version_stat = os.lstat(version, dir_fd=cache_fd)
-        except FileNotFoundError:
-            existing_version_stat = None
-        except OSError as exc:
-            raise AgentError("could_not_sync_plugin_cache") from exc
-        if existing_version_stat is not None:
-            if stat_module.S_ISLNK(
-                existing_version_stat.st_mode
-            ) or not stat_module.S_ISDIR(existing_version_stat.st_mode):
-                raise AgentError("plugin cache entry is not a real directory")
-            if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
-                raise AgentError("safe plugin cache removal is unavailable")
-            try:
-                latest_version_stat = os.lstat(version, dir_fd=cache_fd)
-            except OSError as exc:
-                raise AgentError("plugin cache entry changed during sync") from exc
-            if not source_identity_matches(latest_version_stat, existing_version_stat):
-                raise AgentError("plugin cache entry changed during sync")
-            backup_name = f".{version}.backup.{now_id()}.{uuid.uuid4().hex}"
-            try:
-                os.rename(
-                    version, backup_name, src_dir_fd=cache_fd, dst_dir_fd=cache_fd
-                )
-            except OSError as exc:
-                raise AgentError("could_not_sync_plugin_cache") from exc
-            backup_entry_created = True
-        try:
-            os.replace(tmp_name, version, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
-            tmp_entry_created = False
-        except OSError as exc:
-            if backup_entry_created and backup_name is not None:
-                backup_entry_created = False
-                try:
-                    os.rename(
-                        backup_name, version, src_dir_fd=cache_fd, dst_dir_fd=cache_fd
-                    )
-                except OSError as restore_exc:
-                    raise AgentError("could_not_sync_plugin_cache") from restore_exc
-            raise AgentError("could_not_sync_plugin_cache") from exc
-        if backup_entry_created and backup_name is not None:
-            backup_entry_created = False
-            remove_real_plugin_cache_dir(cache_fd_path / backup_name)
-    except Exception:
-        if tmp_entry_created:
-            with contextlib.suppress(Exception):
-                remove_real_plugin_cache_dir(tmp_entry)
-        raise
-    finally:
-        if cache_fd >= 0:
-            os.close(cache_fd)
-
-    retention = prune_plugin_cache_versions(
-        target_cache, keep_version=version, max_versions=retained_versions
-    )
-    with plugin_source_root_operation(source_root, source_stat) as source_view:
-        status = plugin_cache_status(source_view, target_cache)
-    return {
-        "ok": bool(status.get("ok")),
-        "status": "synced" if status.get("ok") else "sync_incomplete",
-        "marketplace": "personal",
-        "plugin_name": APP_BRIDGE_NAME,
-        "version": version,
-        "cache_entry": PATH_NOT_RETURNED,
-        "cache_entry_state": "set",
-        "copied_files": copied_files,
-        "copied_directories": copied_directories,
-        "excluded_artifacts": [
-            "git",
-            "bytecode",
-            "test_cache",
-            "repo_tests",
-            "hidden_files",
-            "editor_swap",
-            "backup_artifacts",
-            "hardlinks_rejected",
-        ],
-        "retention": retention,
-        "plugin_cache": status,
-        "raw_output": "not_returned",
-    }
-
-
-def sync_plugin_cache_from_repo(
-    root: Path | None = None,
-    cache_root: Path | None = None,
-    retained_versions: int = MAX_PLUGIN_CACHE_RETAINED_VERSIONS,
-) -> dict[str, Any]:
-    with plugin_cache_lock():
-        return _sync_plugin_cache_from_repo_unlocked(
-            root, cache_root, retained_versions
-        )
 
 
 def app_id_kind(app_id: str) -> str:
@@ -22128,7 +21369,9 @@ def _resource_monitor_previous_release_layout(
 
     from the_hive.runtime_layout import LayoutError, RuntimeLayout
 
-    _current, release_root, _current_generation = _resource_monitor_current_release_layout()
+    _current, release_root, _current_generation = (
+        _resource_monitor_current_release_layout()
+    )
     try:
         previous = RuntimeLayout.from_previous_release(
             release_root, generation, manifest_digest
@@ -22257,7 +21500,9 @@ def _resource_monitor_read_release_sources() -> dict[str, dict[str, Any]]:
         generation=generation,
         manifest_digest=layout.manifest_digest,
     )
-    refreshed, refreshed_root, refreshed_generation = _resource_monitor_current_release_layout()
+    refreshed, refreshed_root, refreshed_generation = (
+        _resource_monitor_current_release_layout()
+    )
     if (
         refreshed.root != layout.root
         or refreshed.root_device != layout.root_device
@@ -22283,7 +21528,9 @@ def _resource_monitor_read_release_sources() -> dict[str, dict[str, Any]]:
     }
 
 
-def _resource_monitor_read_previous_release_sources() -> dict[str, dict[str, Any]] | None:
+def _resource_monitor_read_previous_release_sources() -> (
+    dict[str, dict[str, Any]] | None
+):
     """Attest rollback bytes from Previous; no unit snapshot is an authority."""
 
     from the_hive.runtime_layout import LayoutError, validate_runtime_metadata
@@ -22343,7 +21590,9 @@ def _resource_monitor_rollback_pair_kind(
 ) -> str:
     """Accept only an absent, Current, or fully attested Previous unit pair."""
 
-    present = {name: snapshots.get(name) is not None for name in RESOURCE_MONITOR_UNIT_NAMES}
+    present = {
+        name: snapshots.get(name) is not None for name in RESOURCE_MONITOR_UNIT_NAMES
+    }
     if not any(present.values()):
         return "absent"
     if not all(present.values()):
@@ -23804,9 +23053,7 @@ def master_watchdog_status(
 
 
 def master_timeout_policy() -> dict[str, Any]:
-    client_config = _read_bound_mcp_health(
-        _runtime_mcp_entrypoint()
-    ).client_config
+    client_config = _read_bound_mcp_health(_runtime_mcp_entrypoint()).client_config
     startup_timeout = {
         "scope": "codex_cli_mcp_server_startup",
         "configured_seconds": client_config.get("startup_timeout_sec"),
@@ -24812,7 +24059,6 @@ def restore_removed_fleet_desktop_entry(snapshot: dict[str, Any]) -> None:
 def _install_enrolled_unlocked(
     register: bool = True,
     force: bool = False,
-    sync_plugin_cache: bool = True,
     install_desktop: bool = False,
     binding: _CodexMcpBinding | None = None,
 ) -> dict[str, Any]:
@@ -24821,7 +24067,6 @@ def _install_enrolled_unlocked(
             return _install_enrolled_unlocked(
                 register=register,
                 force=force,
-                sync_plugin_cache=sync_plugin_cache,
                 install_desktop=install_desktop,
                 binding=pinned_binding,
             )
@@ -24841,11 +24086,6 @@ def _install_enrolled_unlocked(
             raise AgentError("runtime MCP entrypoint failed MCP startup self-test")
     ensure_applet_action_key()
 
-    plugin_cache_install: dict[str, Any] = {
-        "requested": False,
-        "status": "skipped",
-        "raw_output": "not_returned",
-    }
     registration: dict[str, Any] = {"requested": register, "status": "skipped"}
     previous_command: str | None = None
     registration_removed = False
@@ -24928,8 +24168,7 @@ def _install_enrolled_unlocked(
                 registration = {"requested": True, "status": "registered"}
             if not current.get("startup_timeout_ok"):
                 startup_timeout_config = ensure_mcp_startup_timeout_configured(
-                    binding.config_path,
-                    capture_snapshot=True
+                    binding.config_path, capture_snapshot=True
                 )
                 startup_timeout_snapshot = startup_timeout_config.pop(
                     "_config_snapshot", None
@@ -24942,8 +24181,7 @@ def _install_enrolled_unlocked(
                     "default_tools_approval_mode_ok"
                 ):
                     startup_timeout_config = ensure_mcp_startup_timeout_configured(
-                        binding.config_path,
-                        capture_snapshot=True
+                        binding.config_path, capture_snapshot=True
                     )
                     startup_timeout_snapshot = startup_timeout_config.pop(
                         "_config_snapshot", None
@@ -24957,10 +24195,6 @@ def _install_enrolled_unlocked(
                         "raw_output": "not_returned",
                     }
             registration["startup_timeout"] = startup_timeout_config
-        if sync_plugin_cache:
-            plugin_cache_install = sync_plugin_cache_from_repo()
-            if not plugin_cache_install.get("ok"):
-                raise AgentError("plugin cache sync incomplete")
     except BaseException:
         mcp_restore_error: Exception | None = None
         config_restore_error: Exception | None = None
@@ -25009,7 +24243,6 @@ def _install_enrolled_unlocked(
         "runtime_entrypoint_state": "set",
         "startup_self_test": startup_self_test,
         "mcp": registration,
-        "plugin_cache_install": plugin_cache_install,
         "desktop_entry": desktop_install,
         "raw_output": "not_returned",
     }
@@ -25018,7 +24251,6 @@ def _install_enrolled_unlocked(
 def _install_unlocked(
     register: bool = True,
     force: bool = False,
-    sync_plugin_cache: bool = True,
     install_desktop: bool = False,
     binding: _CodexMcpBinding | None = None,
 ) -> dict[str, Any]:
@@ -25027,7 +24259,6 @@ def _install_unlocked(
             return _install_unlocked(
                 register=register,
                 force=force,
-                sync_plugin_cache=sync_plugin_cache,
                 install_desktop=install_desktop,
                 binding=pinned_binding,
             )
@@ -25039,7 +24270,6 @@ def _install_unlocked(
         return _install_enrolled_unlocked(
             register=register,
             force=force,
-            sync_plugin_cache=sync_plugin_cache,
             install_desktop=install_desktop,
             binding=binding,
         )
@@ -25057,7 +24287,6 @@ def _install_unlocked(
 def install(
     register: bool = True,
     force: bool = False,
-    sync_plugin_cache: bool = True,
     install_desktop: bool = False,
 ) -> dict[str, Any]:
     binding_context: Any = _codex_mcp_binding()
@@ -25066,7 +24295,6 @@ def install(
             return _install_unlocked(
                 register=register,
                 force=force,
-                sync_plugin_cache=sync_plugin_cache,
                 install_desktop=install_desktop,
                 binding=binding,
             )
@@ -25450,9 +24678,7 @@ def send_agent(
         )
         or ""
     )
-    require_invocation_status(
-        agent, operation=operation, enforce_ollama_resource=False
-    )
+    require_invocation_status(agent, operation=operation, enforce_ollama_resource=False)
     cfg = agent_config(agent)
     session = cfg["session"]
     with agent_lifecycle_lock(agent):
@@ -26033,9 +25259,7 @@ def call_active_ollama_communication(
         result = fn(lease, binding)
     except Exception:
         if release_on_failure:
-            release_start_lease_if_safe(
-                agent, dict(lease), True, existing_session=True
-            )
+            release_start_lease_if_safe(agent, dict(lease), True, existing_session=True)
         raise
     result["auth_gate"] = {
         "authenticated": True,
@@ -26060,7 +25284,10 @@ def call_tool(
     if name in _MASTERJET_ADMIN_TOOL_ROUTES:
         return _masterjet_admin_tool_call(name, args)
     if name in {tool["name"] for tool in hive_tool_definitions()}:
-        if name in HIVE_TEST_MUTATING_TOOL_NAMES and authority_class not in HIVE_PRINCIPAL_CLASSES:
+        if (
+            name in HIVE_TEST_MUTATING_TOOL_NAMES
+            and authority_class not in HIVE_PRINCIPAL_CLASSES
+        ):
             raise AgentError("authority.scope_denied")
         return dict(call_hive_tool(name, args))
     if name == "fleet_overview":
@@ -26493,9 +25720,8 @@ def call_tool(
         selected_agent = single_agent_id(
             str(args.get("agent", "")), "agent_report_request"
         )
-        if (
-            _ollama_descriptor(selected_agent) is not None
-            and tmux_alive(agent_config(selected_agent)["session"])
+        if _ollama_descriptor(selected_agent) is not None and tmux_alive(
+            agent_config(selected_agent)["session"]
         ):
             return call_agent_lifecycle(
                 selected_agent,
@@ -26778,9 +26004,8 @@ def call_tool(
         text = args.get("text")
         if not isinstance(text, str) or text == "":
             raise AgentError("agent_send requires non-empty text")
-        if (
-            _ollama_descriptor(selected_agent) is not None
-            and tmux_alive(agent_config(selected_agent)["session"])
+        if _ollama_descriptor(selected_agent) is not None and tmux_alive(
+            agent_config(selected_agent)["session"]
         ):
             return call_agent_lifecycle(
                 selected_agent,
@@ -32720,11 +31945,10 @@ def fleet_series_apply(
                         clean = False
                     if not clean:
                         raise AgentError("fleet_create_rollback_diverged") from None
-                    if (
-                        active_tx is not None
-                        and active_tx.journal.phase
-                        in {RecoveryPhase.PREPARED, RecoveryPhase.MATERIALIZING}
-                    ):
+                    if active_tx is not None and active_tx.journal.phase in {
+                        RecoveryPhase.PREPARED,
+                        RecoveryPhase.MATERIALIZING,
+                    }:
                         _fleet_complete_rolled_back_transaction(
                             active_tx,
                             current.generation,
@@ -33135,11 +32359,11 @@ def remove_agent_pool_entry(path: Path) -> str:
         if not source_identity_matches(latest, current):
             return "skipped"
         try:
-            remove_real_plugin_cache_dir(path)
+            remove_real_directory_no_follow(path)
         except AgentError as exc:
             if str(exc) in {
-                "plugin cache entry changed during removal",
-                "plugin cache entry is not a real directory",
+                "directory changed during removal",
+                "directory is not a real directory",
             }:
                 return "skipped"
             raise AgentError("safe pool removal is unavailable") from exc
@@ -36023,9 +35247,10 @@ def _masterjet_admin_cli_call(args: argparse.Namespace) -> dict[str, Any]:
         generation = arguments.get("expected_generation")
         if type(host_ref) is not str or type(generation) is not int:
             raise AgentError("control.service_unavailable")
-        arguments["idempotency_key"] = "cli-probe-" + hashlib.sha256(
-            f"{host_ref}\0{generation}".encode("ascii")
-        ).hexdigest()
+        arguments["idempotency_key"] = (
+            "cli-probe-"
+            + hashlib.sha256(f"{host_ref}\0{generation}".encode("ascii")).hexdigest()
+        )
     return _masterjet_admin_operation_call(operation, arguments)
 
 
@@ -37750,7 +36975,9 @@ def handle_rpc(
                     if autonomous_runtime_surface:
                         raise AgentError("teamleader authorization required")
                     status = require_teamleader_tool_access()
-                    principal_class = require_principal_tool_access(requested_name, status)
+                    principal_class = require_principal_tool_access(
+                        requested_name, status
+                    )
             try:
                 name, args = validate_tool_call(
                     requested_name, params.get("arguments", {})
@@ -38456,7 +37683,8 @@ def _hive_metrics_local_admin(
         for item in native_agents:
             if (
                 not isinstance(item, dict)
-                or set(item) != {
+                or set(item)
+                != {
                     "native_observation_id",
                     "active",
                     "valid",
@@ -38467,9 +37695,8 @@ def _hive_metrics_local_admin(
                 is None
                 or type(item["active"]) is not bool
                 or type(item["valid"]) is not bool
-                or item["captured_at_utc"] != observation.created_at.astimezone(
-                    _dt.timezone.utc
-                ).isoformat()
+                or item["captured_at_utc"]
+                != observation.created_at.astimezone(_dt.timezone.utc).isoformat()
             ):
                 raise AgentError("native_observation_unavailable")
             if not item["valid"]:
@@ -38493,9 +37720,7 @@ def _hive_metrics_local_admin(
             registered_homes,
             observation.created_at,
         )
-        values = fleet_metric_values(
-            metric_snapshot, observed_at=selected_clock()
-        )
+        values = fleet_metric_values(metric_snapshot, observed_at=selected_clock())
         values.update(
             {
                 "the_hive_agent_observation_errors": observation_errors,
@@ -38505,9 +37730,7 @@ def _hive_metrics_local_admin(
                 "the_hive_process_scan_available": int(
                     observation.process_scan_available
                 ),
-                "the_hive_tmux_scan_available": int(
-                    observation.tmux_scan_available
-                ),
+                "the_hive_tmux_scan_available": int(observation.tmux_scan_available),
             }
         )
         return render_openmetrics(values)
@@ -38629,9 +37852,7 @@ def _resource_monitor_install_cli(argv: list[str]) -> int:
 
 
 def _resource_scope_gate_install_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
-        prog="the-hive-mcp install-resource-scope-gate"
-    )
+    parser = argparse.ArgumentParser(prog="the-hive-mcp install-resource-scope-gate")
     parser.parse_args(argv)
     try:
         result = install_resource_scope_gate()
@@ -39644,7 +38865,9 @@ def _main_cli_impl(argv: list[str]) -> int:
     sub.add_parser("timeout-policy")
     p_control_center = sub.add_parser("control-center")
     p_control_center.add_argument("--page", choices=("ollama",))
-    p_control_center_launch = sub.add_parser("control-center-launch", help=argparse.SUPPRESS)
+    p_control_center_launch = sub.add_parser(
+        "control-center-launch", help=argparse.SUPPRESS
+    )
     p_control_center_launch.add_argument("--page", choices=("ollama",))
     p_applet_status = sub.add_parser("applet-status")
     p_applet_status.add_argument("agents", nargs="*")
@@ -39703,7 +38926,6 @@ def _main_cli_impl(argv: list[str]) -> int:
 
     p_install = sub.add_parser("install")
     p_install.add_argument("--no-register", action="store_true")
-    p_install.add_argument("--no-plugin-cache", action="store_true")
     p_install.add_argument("--force", action="store_true")
 
     p_uninstall = sub.add_parser("uninstall")
@@ -40412,7 +39634,6 @@ def _main_cli_impl(argv: list[str]) -> int:
                 install(
                     register=not args.no_register,
                     force=args.force,
-                    sync_plugin_cache=not args.no_plugin_cache,
                     install_desktop=True,
                 )
             )
@@ -40766,9 +39987,9 @@ def build_server_lease_executor(
                 fresh_lease = read_lease(admission.resource.agent_id)
             except Exception as exc:
                 raise AgentError("lease_executor_unavailable") from exc
-            if not isinstance(fresh_lease, Mapping) or not _server_lease_binding_matches(
-                admission, fresh_lease
-            ):
+            if not isinstance(
+                fresh_lease, Mapping
+            ) or not _server_lease_binding_matches(admission, fresh_lease):
                 raise AgentError("lease_executor_conflict")
             with hive_capacity_probe_guard(operation):
                 result = callback(admission, MappingProxyType(dict(fresh_lease)))

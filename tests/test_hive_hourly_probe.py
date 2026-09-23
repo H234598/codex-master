@@ -16,6 +16,7 @@ import pytest
 
 from conftest import seal_runtime_image
 from the_hive.hive import hourly_probe as hourly_probe_module
+from the_hive.hook_session_pin_store import HookSessionPinStoreV1
 from the_hive.hive.hourly_probe import (
     DETERMINISTIC_PROBE_HOURS_UTC,
     MAX_PROBE_AGE_SECONDS,
@@ -52,6 +53,14 @@ def _write_authorized_queen_registry(home: Path) -> None:
         encoding="utf-8",
     )
     registry.chmod(0o600)
+
+
+def _create_hook_session_pin_store(home: Path) -> None:
+    """Seed only the canonical temporary launcher-owned pin store."""
+
+    HookSessionPinStoreV1.create_at(
+        home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+    )
 
 
 def test_runtime_image_probe_time_contract_composes_each_bounded_phase() -> None:
@@ -175,6 +184,7 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
 
     write("bin/the-hive-mcp", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-mcp-stable", "#!/bin/sh\nexit 0\n", 0o755)
+    write("bin/the-hive-plugin-hook-stable", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
     write("systemd/user/the-hive-resource-monitor.service", "[Service]\n")
@@ -209,6 +219,8 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     )
     write(".app.json", json.dumps({"apps": {"the-hive": {}}}))
     write("hooks/hooks.json", json.dumps({"hooks": {}}))
+    write("hooks/native_bee_event.py", "# hook\n")
+    write("hooks/native_spawn_admission.py", "# hook\n")
     write("skills/the-hive-fleet/SKILL.md", "---\nname: the-hive-fleet\n---\n")
     write(
         "codex-hive.json",
@@ -244,6 +256,8 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
         "hive/admission.py",
         "hive/dispatch.py",
         "hive/principals.py",
+        "hook_abi_v1_core.py",
+        "hook_session_pin_store.py",
         "selection.py",
         "selection_service.py",
         "server.py",
@@ -1118,6 +1132,7 @@ def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime
 ) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
     installer = runpy.run_path(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
@@ -1182,9 +1197,11 @@ def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime
         f"{generation} {installed['manifest_digest']} --json"
     ) in installed_service_text
     installed_cli = runtime_root / "bin" / "the-hive-mcp"
+    installed_hook_launcher = runtime_root / "bin" / "the-hive-plugin-hook-stable"
     installed_source = runtime_root / "src" / "the_hive" / "hive" / "hourly_probe.py"
     for path, mode in (
         (installed_cli, 0o755),
+        (installed_hook_launcher, 0o755),
         (installed_source, 0o644),
         (
             runtime_root / "src" / "the_hive" / "runtime_spawn_helper.c",
@@ -1198,6 +1215,8 @@ def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime
         (runtime_root / ".mcp.json", 0o644),
         (runtime_root / ".app.json", 0o644),
         (runtime_root / "hooks" / "hooks.json", 0o644),
+        (runtime_root / "hooks" / "native_bee_event.py", 0o644),
+        (runtime_root / "hooks" / "native_spawn_admission.py", 0o644),
         (runtime_root / "skills" / "the-hive-fleet" / "SKILL.md", 0o644),
         (runtime_root / "codex-hive.json", 0o644),
         (runtime_root / "codex-agent-classes.json", 0o644),
@@ -1291,6 +1310,7 @@ def test_probe_installer_upgrades_a_valid_83_generation_only_unit(
 
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
     installer = runpy.run_path(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
@@ -1356,6 +1376,7 @@ def test_internal_attested_runtime_api_rolls_back_unit_pair_after_timer_material
 
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
     installer = runpy.run_path(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
@@ -1417,6 +1438,7 @@ def test_legacy_probe_refuses_tampered_release_metadata_before_running_the_entry
 ) -> None:
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
     installer = runpy.run_path(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
@@ -1488,6 +1510,7 @@ def test_legacy_probe_never_imports_runtime_image_before_attestation(
 
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
     installer = runpy.run_path(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
@@ -1540,6 +1563,7 @@ def test_legacy_probe_rejects_preexisting_image_bytecode_fail_closed(
 
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
     installer = runpy.run_path(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
@@ -1582,6 +1606,7 @@ def test_legacy_probe_executes_the_attested_entry_by_pinned_descriptor(
 
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
     installer = runpy.run_path(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
@@ -1855,6 +1880,7 @@ def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen
     )
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
     _write_authorized_queen_registry(home)
     library = home / ".local" / "lib"
     library.mkdir(mode=0o700, parents=True)
@@ -2000,7 +2026,10 @@ def test_named_runtime_generation_publish_failure_keeps_the_attested_current_poi
     installer = runpy.run_path(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
-    release_root = tmp_path / "the-hive-runtime"
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
     first = tmp_path / ".the-hive-runtime.stage.first"
     first.mkdir(mode=0o700)
     installer["_build_runtime_image"](
