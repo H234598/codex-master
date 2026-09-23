@@ -29,9 +29,8 @@ def test_stable_launcher_loads_only_the_fixed_immutable_abi_core() -> None:
     assert "BASH_SOURCE" not in source
 
 
-def test_stable_launcher_rejects_a_non_allowlisted_hook_before_state_or_release_access() -> (
-    None
-):
+def test_stable_launcher_rejects_a_non_allowlisted_hook_before_state_or_release_access(
+) -> None:
     with tempfile.TemporaryDirectory() as temporary:
         copied_launcher = Path(temporary) / "launcher"
         shutil.copyfile(LAUNCHER_SOURCE, copied_launcher)

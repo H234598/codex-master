@@ -39,6 +39,18 @@ _CORE_TARGET = f"{_ABI_ROOT}/hook_abi_v1_core.py"
 _MAX_EVENT_BYTES = 64 * 1024
 _MAX_METADATA_BYTES = 512 * 1024
 _MAX_HOOK_BYTES = 2 * 1024 * 1024
+_MAX_ALLOWLIST_BYTES = 512 * 1024
+_ALLOWLIST_DIRECTORY = "allowlists"
+_ALLOWLIST_DIRECTORY_PARTS = (
+    "usr",
+    "local",
+    "libexec",
+    "the-hive",
+    "hook-abi",
+    "v1",
+    _ALLOWLIST_DIRECTORY,
+)
+_RUNTIME_LAYOUT_RELATIVE = f"{_BUNDLE_DIRECTORY}/src/the_hive/runtime_layout.py"
 _ALLOWED_HOOKS = frozenset({"native_bee_event", "native_spawn_admission"})
 _HOOK_EVENTS = {
     "native_bee_event": frozenset(
@@ -107,19 +119,53 @@ def _safe_absolute(path: Path) -> None:
         raise _invalid()
 
 
-def _open_checked_directory(path: Path, *, owner_uid: int) -> int:
+def _open_checked_directory(
+    path: Path,
+    *,
+    owner_uid: int,
+    owner_gid: int | None = None,
+    protected_parts: tuple[str, ...] = (),
+) -> int:
     """Return a held no-follow directory capability for an absolute path."""
 
     _safe_absolute(path)
+    if protected_parts and (
+        owner_gid is None
+        or tuple(path.parts[-len(protected_parts) :]) != protected_parts
+    ):
+        raise _invalid()
+    protected_anchor = bool(protected_parts) and path.parts == (
+        path.anchor,
+        *protected_parts,
+    )
+    protected_start = len(path.parts) - len(protected_parts)
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     descriptor = -1
     handed_off = False
     try:
         descriptor = os.open(path.anchor, flags)
-        for part in path.parts[1:]:
+        anchor_info = os.fstat(descriptor)
+        if protected_anchor and (
+            not stat.S_ISDIR(anchor_info.st_mode)
+            or anchor_info.st_uid != owner_uid
+            or anchor_info.st_gid != owner_gid
+            or stat.S_IMODE(anchor_info.st_mode) & 0o022
+        ):
+            raise _invalid()
+        for index, part in enumerate(path.parts[1:], start=1):
             child = os.open(part, flags, dir_fd=descriptor)
             child_info = os.fstat(child)
-            if not stat.S_ISDIR(child_info.st_mode):
+            if (
+                not stat.S_ISDIR(child_info.st_mode)
+                or (
+                    index >= protected_start
+                    and (
+                        child_info.st_uid != owner_uid
+                        or child_info.st_gid != owner_gid
+                        or stat.S_IMODE(child_info.st_mode) & 0o022
+                    )
+                )
+            ):
                 os.close(child)
                 raise _invalid()
             os.close(descriptor)
@@ -128,6 +174,7 @@ def _open_checked_directory(path: Path, *, owner_uid: int) -> int:
         if (
             not stat.S_ISDIR(item.st_mode)
             or item.st_uid != owner_uid
+            or (owner_gid is not None and item.st_gid != owner_gid)
             or stat.S_IMODE(item.st_mode) & 0o022
         ):
             raise _invalid()
@@ -155,12 +202,20 @@ def _read_regular(
     modes: set[int],
     maximum: int,
     owner_uid: int | None = None,
+    owner_gid: int | None = None,
+    directory_owner_gid: int | None = None,
+    directory_protected_parts: tuple[str, ...] = (),
 ) -> bytes:
     expected_owner = os.geteuid() if owner_uid is None else owner_uid
     directory = -1
     descriptor = -1
     try:
-        directory = _open_checked_directory(path.parent, owner_uid=expected_owner)
+        directory = _open_checked_directory(
+            path.parent,
+            owner_uid=expected_owner,
+            owner_gid=directory_owner_gid,
+            protected_parts=directory_protected_parts,
+        )
         try:
             descriptor = os.open(
                 path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory
@@ -171,6 +226,7 @@ def _read_regular(
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_uid != expected_owner
+            or (owner_gid is not None and before.st_gid != owner_gid)
             or before.st_nlink != 1
             or stat.S_IMODE(before.st_mode) not in modes
             or not 0 < before.st_size <= maximum
@@ -195,20 +251,25 @@ def _read_regular(
             os.close(descriptor)
         if directory >= 0:
             os.close(directory)
-    if len(raw) != before.st_size or (
-        before.st_dev,
-        before.st_ino,
-        before.st_mode,
-        before.st_uid,
-        before.st_nlink,
-        before.st_size,
-    ) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_uid,
-        after.st_nlink,
-        after.st_size,
+    if (
+        len(raw) != before.st_size
+        or (owner_gid is not None and after.st_gid != owner_gid)
+        or (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_uid,
+            before.st_nlink,
+            before.st_size,
+        )
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_nlink,
+            after.st_size,
+        )
     ):
         raise _invalid()
     return raw
@@ -353,8 +414,18 @@ def _attest_plan(
     manifest: dict[str, Any],
     abi_root: Path,
     abi_owner_uid: int,
-) -> bytes:
-    plan = _read_json(generation_root / _PLAN_NAME)
+) -> tuple[bytes, bytes]:
+    plan_raw = _read_regular(
+        generation_root / _PLAN_NAME, modes={0o644}, maximum=_MAX_METADATA_BYTES
+    )
+    try:
+        plan = json.loads(
+            plan_raw.decode("utf-8"), object_pairs_hook=_unique_object
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _invalid() from exc
+    if not isinstance(plan, dict):
+        raise _invalid()
     if (
         set(plan)
         != {
@@ -423,7 +494,7 @@ def _attest_plan(
         "core": expected_core[7:],
     }:
         raise _invalid()
-    return companion_raw
+    return companion_raw, plan_raw
 
 
 def _attest_release(
@@ -432,7 +503,7 @@ def _attest_release(
     descriptor: dict[str, object],
     abi_root: Path,
     abi_owner_uid: int,
-) -> tuple[Path, dict[str, Any], bytes]:
+) -> tuple[Path, dict[str, Any], bytes, bytes, bytes]:
     _checked_directory(release_root)
     generation = descriptor["generation"]
     assert isinstance(generation, str)
@@ -480,14 +551,14 @@ def _attest_release(
         )
         if "sha256:" + hashlib.sha256(raw).hexdigest() != descriptor["hooks"][name]:
             raise _invalid()
-    companion_raw = _attest_plan(
+    companion_raw, plan_raw = _attest_plan(
         generation_root=generation_root,
         descriptor=descriptor,
         manifest=manifest,
         abi_root=abi_root,
         abi_owner_uid=abi_owner_uid,
     )
-    return bundle_root, manifest, companion_raw
+    return bundle_root, manifest, companion_raw, release_descriptor_raw, plan_raw
 
 
 def _pin_store_api(companion_raw: bytes) -> tuple[type[object], type[ValueError]]:
@@ -530,6 +601,68 @@ def _plugin_descriptor(plugin_root: Path) -> tuple[dict[str, object], bytes]:
         ), raw
     except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise _invalid() from exc
+
+
+def _attest_dispatch_allowlist(
+    *,
+    abi_root: Path,
+    abi_owner_uid: int,
+    bundle_root: Path,
+    manifest: dict[str, Any],
+    descriptor: dict[str, object],
+    descriptor_raw: bytes,
+    root_install_plan: bytes,
+) -> None:
+    """Validate the root-owned S1 allowlist before any pin or hook FD escapes."""
+
+    if not isinstance(descriptor_raw, bytes) or not isinstance(
+        root_install_plan, bytes
+    ):
+        raise _invalid()
+    allowlist_name = f"{hashlib.sha256(descriptor_raw).hexdigest()}.json"
+    allowlist_raw = _read_regular(
+        abi_root / _ALLOWLIST_DIRECTORY / allowlist_name,
+        modes={0o644},
+        maximum=_MAX_ALLOWLIST_BYTES,
+        owner_uid=abi_owner_uid,
+        owner_gid=abi_owner_uid,
+        directory_owner_gid=abi_owner_uid,
+        directory_protected_parts=_ALLOWLIST_DIRECTORY_PARTS,
+    )
+    layout_raw = _read_regular(
+        bundle_root / "src" / "the_hive" / "runtime_layout.py",
+        modes={0o644},
+        maximum=_MAX_HOOK_BYTES,
+    )
+    if (
+        "sha256:" + hashlib.sha256(layout_raw).hexdigest()
+        != _manifest_hook_digest(manifest, _RUNTIME_LAYOUT_RELATIVE)
+    ):
+        raise _invalid()
+    module_name = (
+        f"_the_hive_dispatch_allowlist_v1_{hashlib.sha256(layout_raw).hexdigest()}"
+    )
+    module = types.ModuleType(module_name)
+    module.__file__ = f"{bundle_root}/src/the_hive/runtime_layout.py"
+    sys.modules[module_name] = module
+    try:
+        exec(compile(layout_raw, module.__file__, "exec"), module.__dict__)
+        validator = getattr(module, "_validate_dispatch_allowlist", None)
+        if not callable(validator):
+            raise _invalid()
+        validator(
+            allowlist_raw,
+            manifest,
+            descriptor["runtime_manifest_digest"],
+            descriptor_raw,
+            root_install_plan,
+        )
+    except HookAbiV1Error:
+        raise
+    except Exception as exc:
+        raise _invalid() from exc
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def _pointer_binding(value: object) -> dict[str, str] | None:
@@ -879,17 +1012,29 @@ def dispatch_hook_v1(
         raise _invalid()
     session_id, event_name = _event(stdin_bytes, hook_name=hook_name)
     descriptor, cache_descriptor_raw = _plugin_descriptor(plugin_root)
-    current_bundle, _manifest, companion_raw = _attest_release(
+    (
+        current_bundle,
+        current_manifest,
+        companion_raw,
+        current_descriptor_raw,
+        current_plan_raw,
+    ) = _attest_release(
         release_root=release_root,
         descriptor=descriptor,
         abi_root=abi_root,
         abi_owner_uid=abi_owner_uid,
     )
-    release_descriptor_raw = _read_regular(
-        current_bundle / _DESCRIPTOR_NAME, modes={0o644}, maximum=_MAX_METADATA_BYTES
-    )
-    if cache_descriptor_raw != release_descriptor_raw:
+    if cache_descriptor_raw != current_descriptor_raw:
         raise _invalid()
+    _attest_dispatch_allowlist(
+        abi_root=abi_root,
+        abi_owner_uid=abi_owner_uid,
+        bundle_root=current_bundle,
+        manifest=current_manifest,
+        descriptor=descriptor,
+        descriptor_raw=cache_descriptor_raw,
+        root_install_plan=current_plan_raw,
+    )
     try:
         store_type, _store_error = _pin_store_api(companion_raw)
         store = (
@@ -918,13 +1063,29 @@ def dispatch_hook_v1(
         except (AttributeError, TypeError, ValueError) as exc:
             raise _invalid() from exc
         selected_bundle = current_bundle
+        selected_manifest = current_manifest
     else:
         selected = _binding_descriptor(existing)
-        selected_bundle, _manifest, _selected_companion_raw = _attest_release(
+        (
+            selected_bundle,
+            selected_manifest,
+            _selected_companion_raw,
+            selected_descriptor_raw,
+            selected_plan_raw,
+        ) = _attest_release(
             release_root=release_root,
             descriptor=selected,
             abi_root=abi_root,
             abi_owner_uid=abi_owner_uid,
+        )
+        _attest_dispatch_allowlist(
+            abi_root=abi_root,
+            abi_owner_uid=abi_owner_uid,
+            bundle_root=selected_bundle,
+            manifest=selected_manifest,
+            descriptor=selected,
+            descriptor_raw=selected_descriptor_raw,
+            root_install_plan=selected_plan_raw,
         )
         try:
             if event_name == "SessionEnd":
@@ -954,7 +1115,7 @@ def dispatch_hook_v1(
     try:
         bundle_fd, hook_fd = _open_hook_capabilities(
             selected_bundle,
-            manifest=_manifest,
+            manifest=selected_manifest,
             hook_name=hook_name,
             digest=hooks[hook_name],
         )
