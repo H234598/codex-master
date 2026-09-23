@@ -8,6 +8,7 @@ from pathlib import Path
 import secrets
 import selectors
 import signal
+import stat
 import subprocess
 import time
 from types import SimpleNamespace
@@ -863,6 +864,39 @@ def test_bounded_runner_uses_an_explicit_minimal_environment(
         "path": "/usr/bin:/bin",
         "home": str(home),
     }
+
+
+def test_runtime_directory_contrasts_interactive_and_hardened_contexts_without_live_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An isolated visible runtime directory differs from a masked one."""
+
+    import the_hive.runtime_process as runtime_process
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    synthetic_runtime_root = tmp_path / "run-user"
+    synthetic_runtime_root.mkdir(mode=0o700)
+    interactive_runtime_directory = synthetic_runtime_root / str(os.geteuid())
+    interactive_runtime_directory.mkdir(mode=0o700)
+    assert interactive_runtime_directory.stat().st_uid == os.geteuid()
+    assert stat.S_IMODE(interactive_runtime_directory.stat().st_mode) == 0o700
+    monkeypatch.setattr(
+        runtime_process, "_RUNTIME_DIRECTORY_ROOT", synthetic_runtime_root
+    )
+
+    interactive_environment = runtime_process.minimal_environment(home=home)
+
+    assert interactive_environment["XDG_RUNTIME_DIR"] == str(
+        interactive_runtime_directory
+    )
+
+    interactive_runtime_directory.rmdir()
+
+    with pytest.raises(runtime_process.BoundedProcessError) as hardened_error:
+        runtime_process.minimal_environment(home=home)
+
+    assert hardened_error.value.code == "command_group_unavailable"
 
 
 @pytest.mark.parametrize("stream", ("stdout", "stderr"))

@@ -11,6 +11,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectHome=tmpfs
+BindReadOnlyPaths=%t:%t:norbind
 KeyringMode=private
 ProtectSystem=strict
 ProtectControlGroups=yes

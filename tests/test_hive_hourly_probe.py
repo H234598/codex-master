@@ -748,8 +748,15 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
     service = ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
     timer_text = timer.read_text(encoding="utf-8")
     service_text = service.read_text(encoding="utf-8")
+    service_lines = service_text.splitlines()
     assert "OnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00 UTC" in timer_text
     assert "RandomizedDelaySec" not in timer_text
+    assert [line for line in service_lines if line.startswith("ProtectHome=")] == [
+        "ProtectHome=tmpfs"
+    ]
+    assert [line for line in service_lines if "%t" in line] == [
+        "BindReadOnlyPaths=%t:%t:norbind"
+    ]
     assert "CODEX_MASTER_PROBE_REPOSITORY" not in service_text
     assert "%h/codex-master/src" not in service_text
     assert "%h/codex-master/bin/codex-master-mcp" not in service_text
@@ -1114,8 +1121,10 @@ def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime
     installer = runpy.run_path(
         str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
     )
-    installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = lambda _repository: (  # type: ignore[index]
-        "a" * 40
+    installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = (
+        lambda _repository: (  # type: ignore[index]
+            "a" * 40
+        )
     )
     installed = installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
     assert installed["status"] == "installed"
@@ -1862,8 +1871,10 @@ def test_image_only_install_publishes_a_validated_stage_with_an_authorized_queen
     legacy_bin.parent.mkdir(mode=0o700, parents=True)
     legacy_bin.symlink_to(foreign_bin_target)
 
-    installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = lambda _repository: (  # type: ignore[index]
-        "a" * 40
+    installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = (
+        lambda _repository: (  # type: ignore[index]
+            "a" * 40
+        )
     )
     result = installer["_install_attested_runtime"](home=home)
 
