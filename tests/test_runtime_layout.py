@@ -66,10 +66,16 @@ def materialize_runtime_image(
             {
                 "mcpServers": {
                     "the-hive-mcp": {
-                        "command": "/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp",
+                        "command": (
+                            "/home/teladi/.local/lib/the-hive-runtime/the-hive-mcp"
+                        ),
                         "args": [],
                         "startup_timeout_sec": 120,
-                        "note": "Local data-sparse Codex Masterjet MCP server. Controls the sleeping Agentinnen pool through tmux and does not return raw terminal output by default.",
+                        "note": (
+                            "Local data-sparse Codex Masterjet MCP server. "
+                            "Controls the sleeping Agentinnen pool through tmux "
+                            "and does not return raw terminal output by default."
+                        ),
                     }
                 }
             }
@@ -360,6 +366,244 @@ def test_runtime_layout_rejects_a_root_install_plan_not_bound_to_abi_source_byte
 
     with pytest.raises(module.LayoutError):
         module.RuntimeLayout.from_runtime_root(root)
+
+
+def _dispatch_allowlist_inputs(
+    tmp_path: Path,
+) -> tuple[object, dict[str, object], str, bytes, bytes]:
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    manifest, manifest_digest = module._validated_manifest(root)
+    descriptor = (
+        root / "TheHivePluginBundleV1" / "release-binding.json"
+    ).read_bytes()
+    root_install_plan = (root / "root-install-plan.json").read_bytes()
+    return module, manifest, manifest_digest, descriptor, root_install_plan
+
+
+def test_dispatch_allowlist_codec_is_canonical_and_has_the_exact_fieldset(
+    tmp_path: Path,
+) -> None:
+    module, manifest, manifest_digest, descriptor, root_install_plan = (
+        _dispatch_allowlist_inputs(tmp_path)
+    )
+
+    encoded = module.dispatch_allowlist_bytes(manifest, manifest_digest)
+    decoded = json.loads(encoded)
+
+    assert encoded == (
+        json.dumps(decoded, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+    assert set(decoded) == {
+        "schema",
+        "plugin_id",
+        "generation",
+        "runtime_manifest_digest",
+        "launcher_abi",
+        "descriptor_sha256",
+        "root_install_plan_sha256",
+        "hooks",
+    }
+    assert decoded["schema"] == "D320DispatchAllowlistV1"
+    assert decoded["plugin_id"] == "the-hive"
+    assert decoded["runtime_manifest_digest"] == manifest_digest
+    assert decoded["launcher_abi"] == (
+        "/usr/local/libexec/the-hive/hook-abi/v1/launcher"
+    )
+    assert set(decoded["hooks"]) == {
+        "native_bee_event",
+        "native_spawn_admission",
+    }
+    module._validate_dispatch_allowlist(
+        encoded, manifest, manifest_digest, descriptor, root_install_plan
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "0" * 64,
+        "sha256:" + "A" * 64,
+        "sha256:" + "0" * 63,
+        "sha512:" + "0" * 64,
+    ),
+)
+def test_dispatch_allowlist_rejects_noncanonical_sha256_grammar(value: str) -> None:
+    module = _runtime_layout_module()
+    assert module is not None
+
+    assert not module._is_sha256_digest(value)
+    assert module._is_sha256_digest("sha256:" + "0" * 64)
+
+
+@pytest.mark.parametrize("mutation", ("duplicate", "unknown", "missing"))
+def test_dispatch_allowlist_rejects_duplicate_unknown_and_missing_fields(
+    tmp_path: Path, mutation: str
+) -> None:
+    module, manifest, manifest_digest, descriptor, root_install_plan = (
+        _dispatch_allowlist_inputs(tmp_path)
+    )
+    encoded = module.dispatch_allowlist_bytes(manifest, manifest_digest)
+    if mutation == "duplicate":
+        candidate = (
+            encoded.rstrip(b"\n")[:-1]
+            + b',"schema":"D320DispatchAllowlistV1"}\n'
+        )
+    else:
+        decoded = json.loads(encoded)
+        if mutation == "unknown":
+            decoded["unexpected"] = "value"
+        else:
+            del decoded["descriptor_sha256"]
+        candidate = (
+            json.dumps(
+                decoded, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        ).encode("ascii")
+
+    with pytest.raises(module.LayoutError):
+        module._validate_dispatch_allowlist(
+            candidate, manifest, manifest_digest, descriptor, root_install_plan
+        )
+
+
+def test_dispatch_allowlist_rejects_malformed_json_as_layout_error(
+    tmp_path: Path,
+) -> None:
+    module, manifest, manifest_digest, descriptor, root_install_plan = (
+        _dispatch_allowlist_inputs(tmp_path)
+    )
+
+    with pytest.raises(module.LayoutError, match="^runtime_layout_invalid$"):
+        module._validate_dispatch_allowlist(
+            b'{"schema":',
+            manifest,
+            manifest_digest,
+            descriptor,
+            root_install_plan,
+        )
+
+
+def test_dispatch_allowlist_translates_json_recursion_error_to_layout_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, manifest, manifest_digest, descriptor, root_install_plan = (
+        _dispatch_allowlist_inputs(tmp_path)
+    )
+
+    def raise_recursion_error(*args: object, **kwargs: object) -> object:
+        raise RecursionError
+
+    monkeypatch.setattr(module.json, "loads", raise_recursion_error)
+
+    with pytest.raises(module.LayoutError, match="^runtime_layout_invalid$"):
+        module._validate_dispatch_allowlist(
+            b"{}", manifest, manifest_digest, descriptor, root_install_plan
+        )
+
+
+def test_dispatch_allowlist_rejects_deeply_nested_json_as_layout_error(
+    tmp_path: Path,
+) -> None:
+    module, manifest, manifest_digest, descriptor, root_install_plan = (
+        _dispatch_allowlist_inputs(tmp_path)
+    )
+    candidate = b'{"schema":' + b"[" * 2048 + b"0" + b"]" * 2048 + b"}"
+    assert len(candidate) <= module._MAX_METADATA_BYTES
+
+    with pytest.raises(module.LayoutError, match="^runtime_layout_invalid$"):
+        module._validate_dispatch_allowlist(
+            candidate, manifest, manifest_digest, descriptor, root_install_plan
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("runtime_manifest_digest", "descriptor_sha256", "root_install_plan_sha256"),
+)
+def test_dispatch_allowlist_rejects_invalid_top_level_digest_grammar(
+    tmp_path: Path, field: str
+) -> None:
+    module, manifest, manifest_digest, descriptor, root_install_plan = (
+        _dispatch_allowlist_inputs(tmp_path)
+    )
+    decoded = json.loads(module.dispatch_allowlist_bytes(manifest, manifest_digest))
+    decoded[field] = "sha256:" + "A" * 64
+    candidate = (
+        json.dumps(decoded, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+
+    with pytest.raises(module.LayoutError):
+        module._validate_dispatch_allowlist(
+            candidate, manifest, manifest_digest, descriptor, root_install_plan
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("plugin", "launcher", "hookset", "hook_digest"),
+)
+def test_dispatch_allowlist_rejects_constant_and_hookset_mismatches(
+    tmp_path: Path, mutation: str
+) -> None:
+    module, manifest, manifest_digest, descriptor, root_install_plan = (
+        _dispatch_allowlist_inputs(tmp_path)
+    )
+    decoded = json.loads(module.dispatch_allowlist_bytes(manifest, manifest_digest))
+    if mutation == "plugin":
+        decoded["plugin_id"] = "the-hive@personal"
+    elif mutation == "launcher":
+        decoded["launcher_abi"] = "/tmp/launcher"
+    elif mutation == "hookset":
+        decoded["hooks"] = {"native_bee_event": decoded["hooks"]["native_bee_event"]}
+    else:
+        decoded["hooks"]["native_bee_event"] = "sha256:" + "0" * 64
+    candidate = (
+        json.dumps(decoded, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+
+    with pytest.raises(module.LayoutError):
+        module._validate_dispatch_allowlist(
+            candidate, manifest, manifest_digest, descriptor, root_install_plan
+        )
+
+
+@pytest.mark.parametrize("mismatch", ("descriptor", "manifest", "plan", "hook"))
+def test_dispatch_allowlist_rejects_descriptor_manifest_plan_and_hook_mismatches(
+    tmp_path: Path, mismatch: str
+) -> None:
+    module, manifest, manifest_digest, descriptor, root_install_plan = (
+        _dispatch_allowlist_inputs(tmp_path)
+    )
+    encoded = module.dispatch_allowlist_bytes(manifest, manifest_digest)
+    if mismatch == "descriptor":
+        descriptor = descriptor + b" "
+    elif mismatch == "manifest":
+        manifest_digest = "sha256:" + "0" * 64
+    elif mismatch == "plan":
+        root_install_plan = root_install_plan + b" "
+    else:
+        changed_descriptor = json.loads(descriptor)
+        changed_descriptor["hooks"]["native_bee_event"] = "sha256:" + "0" * 64
+        descriptor = (
+            json.dumps(
+                changed_descriptor,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+
+    with pytest.raises(module.LayoutError):
+        module._validate_dispatch_allowlist(
+            encoded, manifest, manifest_digest, descriptor, root_install_plan
+        )
 
 
 def test_runtime_image_repository_root_is_not_public_or_registry_compatible(

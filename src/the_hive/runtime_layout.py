@@ -542,6 +542,120 @@ def root_install_plan_bytes(manifest: dict[str, object], manifest_digest: str) -
         raise _invalid() from exc
 
 
+def _is_sha256_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("sha256:")
+        and len(value) == 71
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def dispatch_allowlist_bytes(
+    manifest: dict[str, object], manifest_digest: str
+) -> bytes:
+    """Build the private, canonical D320 dispatch allowlist record."""
+
+    metadata = _release_metadata(manifest)
+    generation = metadata["generation"]
+    files = manifest.get("files")
+    if (
+        not isinstance(generation, str)
+        or not isinstance(files, dict)
+        or not _is_sha256_digest(manifest_digest)
+    ):
+        raise _invalid()
+    hook_digests: dict[str, str] = {}
+    for hook_name, entrypoint in _HOOK_BINDING_ENTRYPOINTS.items():
+        entry = files.get(f"{_PLUGIN_BUNDLE_DIRECTORY}/{entrypoint}")
+        digest = entry.get("sha256") if isinstance(entry, dict) else None
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise _invalid()
+        hook_digests[hook_name] = f"sha256:{digest}"
+    descriptor = release_binding_bytes(manifest, manifest_digest)
+    root_install_plan = root_install_plan_bytes(manifest, manifest_digest)
+    allowlist = {
+        "schema": "D320DispatchAllowlistV1",
+        "plugin_id": "the-hive",
+        "generation": generation,
+        "runtime_manifest_digest": manifest_digest,
+        "launcher_abi": _HOOK_ABI_V1_LAUNCHER,
+        "descriptor_sha256": _manifest_digest(descriptor),
+        "root_install_plan_sha256": _manifest_digest(root_install_plan),
+        "hooks": hook_digests,
+    }
+    try:
+        return (
+            json.dumps(
+                allowlist, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise _invalid() from exc
+
+
+def _validate_dispatch_allowlist(
+    raw: bytes,
+    manifest: dict[str, object],
+    manifest_digest: str,
+    descriptor: bytes,
+    root_install_plan: bytes,
+) -> None:
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= _MAX_METADATA_BYTES:
+        raise _invalid()
+    try:
+        allowlist = json.loads(
+            raw.decode("ascii"), object_pairs_hook=_unique_json_object
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise _invalid() from exc
+    if not isinstance(allowlist, dict) or set(allowlist) != {
+        "schema",
+        "plugin_id",
+        "generation",
+        "runtime_manifest_digest",
+        "launcher_abi",
+        "descriptor_sha256",
+        "root_install_plan_sha256",
+        "hooks",
+    }:
+        raise _invalid()
+    generation = allowlist.get("generation")
+    if (
+        allowlist.get("schema") != "D320DispatchAllowlistV1"
+        or allowlist.get("plugin_id") != "the-hive"
+        or not isinstance(generation, str)
+        or not generation
+        or "/" in generation
+        or generation in {".", ".."}
+        or not _is_sha256_digest(allowlist.get("runtime_manifest_digest"))
+        or not _is_sha256_digest(allowlist.get("descriptor_sha256"))
+        or not _is_sha256_digest(allowlist.get("root_install_plan_sha256"))
+        or allowlist.get("launcher_abi") != _HOOK_ABI_V1_LAUNCHER
+    ):
+        raise _invalid()
+    hooks = allowlist.get("hooks")
+    if (
+        not isinstance(hooks, dict)
+        or set(hooks) != set(_HOOK_BINDING_ENTRYPOINTS)
+        or any(not _is_sha256_digest(hooks.get(name)) for name in hooks)
+    ):
+        raise _invalid()
+    expected_descriptor = release_binding_bytes(manifest, manifest_digest)
+    expected_root_install_plan = root_install_plan_bytes(manifest, manifest_digest)
+    if (
+        descriptor != expected_descriptor
+        or root_install_plan != expected_root_install_plan
+        or raw != dispatch_allowlist_bytes(manifest, manifest_digest)
+    ):
+        raise _invalid()
+
+
 def _validate_release_binding(
     root: Path, manifest: dict[str, object], manifest_digest: str
 ) -> None:
@@ -876,7 +990,8 @@ class RuntimeStateLayoutV1:
             raise _state_invalid()
 
     def open_dirfd(self) -> int:
-        """Open and re-attest the exact final state directory without following links."""
+        """Open and re-attest the exact final state directory without following
+        links."""
 
         _require_state_layout_factory_provenance(self)
         expected = _validate_state_directory_path(self.state_root)
