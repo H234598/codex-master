@@ -105,6 +105,51 @@ _D321_INVENTORY_BINDING_FIELDS = frozenset(
 )
 _D321_EVIDENCE_CONSTRUCTION_TOKEN = object()
 
+_D327_SHA256_PREFIX = "sha256:"
+_D327_SHA256_LENGTH = len(_D327_SHA256_PREFIX) + 64
+_D327_EVIDENCE_KIND = "gemini_configured_quota_evidence.v1"
+_D327_EVIDENCE_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "inventory_authority_generation",
+        "inventory_content_fingerprint",
+        "inventory_binding_digest",
+        "source_kind",
+        "source_resource_digest",
+        "service",
+        "quota_id",
+        "metric",
+        "dimensions",
+        "effective_limit",
+        "refresh_interval",
+        "is_precise",
+        "rollout_ongoing",
+        "observed_at_utc",
+        "expires_at_utc",
+        "evidence_digest",
+    }
+)
+_D327_EVIDENCE_PREIMAGE_FIELDS = _D327_EVIDENCE_FIELDS - {"evidence_digest"}
+_D327_EVIDENCE_CONSTRUCTION_TOKEN = object()
+_D328_SERVICE = "generativelanguage.googleapis.com"
+_D328_SOURCE_PREIMAGE_KIND = "gemini_configured_quota_source_preimage.v1"
+_D328_SOURCE_PREIMAGE_FIELDS = frozenset(
+    {
+        "kind",
+        "source_kind",
+        "inventory_authority_generation",
+        "inventory_content_fingerprint",
+        "inventory_binding_digest",
+        "project_id",
+        "service",
+        "quota_id",
+        "metric",
+        "dimensions",
+    }
+)
+_D328_MAX_SOURCE_PREIMAGE_BYTES = 16384
+
 
 class _BillingGroupQuotaEvidenceStatusV1(str, Enum):
     BLOCKED = "blocked"
@@ -115,6 +160,10 @@ class _BillingGroupQuotaEvidenceReasonV1(str, Enum):
     BILLING_GROUP_QUOTA = "billing_group_quota"
     AUTHORITY_RESET = "authority_reset"
     AUTHORITY_REFRESH = "authority_refresh"
+
+
+class _ConfiguredQuotaEvidenceSourceKindV1(str, Enum):
+    CLOUD_QUOTAS_V1 = "cloud_quotas_v1"
 
 
 class _SecretLeaseV1:
@@ -739,6 +788,478 @@ class _BillingGroupQuotaEvidenceV1:
         raise TypeError("_BillingGroupQuotaEvidenceV1 is not serializable")
 
 
+def _d327_invalid() -> None:
+    raise GoogleAccountInventoryError("credential.configured_quota_evidence_invalid")
+
+
+def _valid_d327_digest(value: object) -> bool:
+    return (
+        _valid_d321_ascii_string(value)
+        and len(value) == _D327_SHA256_LENGTH
+        and value.startswith(_D327_SHA256_PREFIX)
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def _valid_d327_int64_string(value: object) -> bool:
+    if type(value) is not str or not value:
+        return False
+    if value == "0":
+        return True
+    if value[0] == "0" or not all("0" <= character <= "9" for character in value):
+        return False
+    if len(value) < 19:
+        return True
+    return len(value) == 19 and value <= "9223372036854775807"
+
+
+def _valid_d328_bounded_ascii(value: object, *, maximum_length: int) -> bool:
+    return (
+        _valid_d321_ascii_string(value)
+        and 1 <= len(value) <= maximum_length
+    )
+
+
+def _d328_refresh_interval_nanoseconds(value: object) -> int | None:
+    if (
+        not _valid_d321_ascii_string(value)
+        or not 2 <= len(value) <= 6
+        or not value.endswith("s")
+    ):
+        return None
+    seconds_text = value[:-1]
+    if (
+        seconds_text[0] == "0"
+        or not all("0" <= character <= "9" for character in seconds_text)
+    ):
+        return None
+    seconds = int(seconds_text)
+    if not 1 <= seconds <= 86400:
+        return None
+    return seconds * 1_000_000_000
+
+
+def _d327_validate_dimensions(value: object) -> dict[str, str]:
+    if type(value) is not dict:
+        _d327_invalid()
+    if len(value) > 32:
+        _d327_invalid()
+    dimensions: dict[str, str] = {}
+    for key, dimension_value in value.items():
+        if not _valid_d328_bounded_ascii(
+            key, maximum_length=128
+        ) or not _valid_d328_bounded_ascii(
+            dimension_value, maximum_length=256
+        ):
+            _d327_invalid()
+        dimensions[key] = dimension_value
+    return dict(sorted(dimensions.items()))
+
+
+def _d327_validate_payload_fields(
+    payload: object, *, expected_fields: frozenset[str]
+) -> dict[str, object]:
+    if type(payload) is not dict or set(payload) != expected_fields:
+        _d327_invalid()
+    for field_name in payload:
+        if type(field_name) is not str:
+            _d327_invalid()
+    return payload
+
+
+def _d327_validate_evidence_payload(
+    payload: object, *, has_evidence_digest: bool
+) -> None:
+    expected_fields = (
+        _D327_EVIDENCE_FIELDS
+        if has_evidence_digest
+        else _D327_EVIDENCE_PREIMAGE_FIELDS
+    )
+    payload = _d327_validate_payload_fields(
+        payload, expected_fields=expected_fields
+    )
+    if (
+        type(payload["kind"]) is not str
+        or payload["kind"] != _D327_EVIDENCE_KIND
+        or type(payload["schema_version"]) is not int
+        or payload["schema_version"] != 1
+        or not _valid_generation(payload["inventory_authority_generation"])
+        or not _valid_d327_digest(payload["inventory_content_fingerprint"])
+        or not _valid_d327_digest(payload["inventory_binding_digest"])
+        or type(payload["source_kind"]) is not str
+        or not _valid_d327_digest(payload["source_resource_digest"])
+        or payload["service"] != _D328_SERVICE
+        or not _valid_d328_bounded_ascii(payload["quota_id"], maximum_length=256)
+        or not _valid_d328_bounded_ascii(payload["metric"], maximum_length=512)
+        or not _valid_d327_int64_string(payload["effective_limit"])
+        or type(payload["is_precise"]) is not bool
+        or type(payload["rollout_ongoing"]) is not bool
+        or type(payload["observed_at_utc"]) is not str
+        or type(payload["expires_at_utc"]) is not str
+    ):
+        _d327_invalid()
+    try:
+        source_kind = _ConfiguredQuotaEvidenceSourceKindV1(payload["source_kind"])
+    except ValueError:
+        _d327_invalid()
+    if source_kind is not _ConfiguredQuotaEvidenceSourceKindV1.CLOUD_QUOTAS_V1:
+        _d327_invalid()
+    _d327_validate_dimensions(payload["dimensions"])
+    refresh_interval_nanoseconds = _d328_refresh_interval_nanoseconds(
+        payload["refresh_interval"]
+    )
+    if refresh_interval_nanoseconds is None:
+        _d327_invalid()
+    observed_seconds = _d327_timestamp_seconds(payload["observed_at_utc"])
+    expires_seconds = _d327_timestamp_seconds(payload["expires_at_utc"])
+    ttl_seconds = expires_seconds - observed_seconds
+    refresh_interval_seconds = refresh_interval_nanoseconds // 1_000_000_000
+    if ttl_seconds != min(900, refresh_interval_seconds):
+        _d327_invalid()
+    if has_evidence_digest and not _valid_d327_digest(payload["evidence_digest"]):
+        _d327_invalid()
+
+
+def _d327_timestamp_seconds(value: object) -> int:
+    if not _valid_d321_ascii_string(value) or not _valid_operator_timestamp(value):
+        _d327_invalid()
+    try:
+        return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+    except (OverflowError, ValueError):
+        _d327_invalid()
+    raise AssertionError("unreachable")
+
+
+def _d327_canonical_json_bytes(
+    payload: object, *, has_evidence_digest: bool
+) -> bytes:
+    _d327_validate_evidence_payload(
+        payload, has_evidence_digest=has_evidence_digest
+    )
+    try:
+        return json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        _d327_invalid()
+    raise AssertionError("unreachable")
+
+
+def _d327_sha256_digest(preimage: object) -> str:
+    if type(preimage) is not bytes:
+        _d327_invalid()
+    return _D327_SHA256_PREFIX + hashlib.sha256(preimage).hexdigest()
+
+
+def _d328_source_preimage(
+    *,
+    inventory_authority_generation: object,
+    inventory_content_fingerprint: object,
+    inventory_binding_digest: object,
+    source_kind: object,
+    project_id: object,
+    service: object,
+    quota_id: object,
+    metric: object,
+    dimensions: object,
+) -> bytes:
+    if (
+        not _valid_generation(inventory_authority_generation)
+        or not _valid_d327_digest(inventory_content_fingerprint)
+        or not _valid_d327_digest(inventory_binding_digest)
+        or type(source_kind) is not str
+        or source_kind != _ConfiguredQuotaEvidenceSourceKindV1.CLOUD_QUOTAS_V1.value
+        or not _valid_d321_ascii_string(project_id)
+        or type(service) is not str
+        or service != _D328_SERVICE
+        or not _valid_d328_bounded_ascii(quota_id, maximum_length=256)
+        or not _valid_d328_bounded_ascii(metric, maximum_length=512)
+    ):
+        _d327_invalid()
+    normalized_dimensions = _d327_validate_dimensions(dimensions)
+    payload = {
+        "kind": _D328_SOURCE_PREIMAGE_KIND,
+        "source_kind": _ConfiguredQuotaEvidenceSourceKindV1.CLOUD_QUOTAS_V1.value,
+        "inventory_authority_generation": inventory_authority_generation,
+        "inventory_content_fingerprint": inventory_content_fingerprint,
+        "inventory_binding_digest": inventory_binding_digest,
+        "project_id": project_id,
+        "service": service,
+        "quota_id": quota_id,
+        "metric": metric,
+        "dimensions": normalized_dimensions,
+    }
+    if set(payload) != _D328_SOURCE_PREIMAGE_FIELDS:
+        _d327_invalid()
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        _d327_invalid()
+    if len(encoded) > _D328_MAX_SOURCE_PREIMAGE_BYTES:
+        _d327_invalid()
+    return encoded
+
+
+class _D327JsonObjectPairs(list[tuple[object, object]]):
+    pass
+
+
+def _d327_reject_json_constant(value: str) -> None:
+    del value
+    _d327_invalid()
+
+
+def _d327_pairs_to_dimensions(value: object) -> dict[str, str]:
+    if type(value) is not _D327JsonObjectPairs:
+        _d327_invalid()
+    dimensions: dict[str, str] = {}
+    for pair in value:
+        if type(pair) is not tuple or len(pair) != 2:
+            _d327_invalid()
+        key, dimension_value = pair
+        if (
+            not _valid_d321_ascii_string(key)
+            or not _valid_d321_ascii_string(dimension_value)
+            or key in dimensions
+        ):
+            _d327_invalid()
+        dimensions[key] = dimension_value
+    return dict(sorted(dimensions.items()))
+
+
+def _d327_pairs_to_evidence_payload(
+    value: object, *, expected_fields: frozenset[str]
+) -> dict[str, object]:
+    if type(value) is not _D327JsonObjectPairs:
+        _d327_invalid()
+    payload: dict[str, object] = {}
+    for pair in value:
+        if type(pair) is not tuple or len(pair) != 2:
+            _d327_invalid()
+        key, field_value = pair
+        if type(key) is not str or key in payload or key not in expected_fields:
+            _d327_invalid()
+        payload[key] = field_value
+    if set(payload) != expected_fields:
+        _d327_invalid()
+    payload["dimensions"] = _d327_pairs_to_dimensions(payload["dimensions"])
+    return payload
+
+
+def _d327_decode_evidence_json(
+    raw: object, *, expected_fields: frozenset[str]
+) -> dict[str, object]:
+    if type(raw) is not bytes:
+        _d327_invalid()
+    try:
+        parsed = json.loads(
+            raw.decode("ascii"),
+            object_pairs_hook=_D327JsonObjectPairs,
+            parse_constant=_d327_reject_json_constant,
+        )
+        payload = _d327_pairs_to_evidence_payload(
+            parsed, expected_fields=expected_fields
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, GoogleAccountInventoryError):
+        _d327_invalid()
+    canonical = _d327_canonical_json_bytes(
+        payload, has_evidence_digest=expected_fields == _D327_EVIDENCE_FIELDS
+    )
+    if canonical != raw:
+        _d327_invalid()
+    return payload
+
+
+def _d327_evidence_preimage(
+    *,
+    inventory_authority_generation: object,
+    inventory_content_fingerprint: object,
+    inventory_binding_digest: object,
+    source_kind: object,
+    source_resource_digest: object,
+    service: object,
+    quota_id: object,
+    metric: object,
+    dimensions: object,
+    effective_limit: object,
+    refresh_interval: object,
+    is_precise: object,
+    rollout_ongoing: object,
+    observed_at_utc: object,
+    expires_at_utc: object,
+) -> bytes:
+    payload = {
+        "kind": _D327_EVIDENCE_KIND,
+        "schema_version": 1,
+        "inventory_authority_generation": inventory_authority_generation,
+        "inventory_content_fingerprint": inventory_content_fingerprint,
+        "inventory_binding_digest": inventory_binding_digest,
+        "source_kind": source_kind,
+        "source_resource_digest": source_resource_digest,
+        "service": service,
+        "quota_id": quota_id,
+        "metric": metric,
+        "dimensions": dimensions,
+        "effective_limit": effective_limit,
+        "refresh_interval": refresh_interval,
+        "is_precise": is_precise,
+        "rollout_ongoing": rollout_ongoing,
+        "observed_at_utc": observed_at_utc,
+        "expires_at_utc": expires_at_utc,
+    }
+    return _d327_canonical_json_bytes(payload, has_evidence_digest=False)
+
+
+class _ConfiguredQuotaEvidenceV1:
+    __slots__ = (
+        "kind",
+        "schema_version",
+        "inventory_authority_generation",
+        "inventory_content_fingerprint",
+        "inventory_binding_digest",
+        "source_kind",
+        "source_resource_digest",
+        "service",
+        "quota_id",
+        "metric",
+        "dimensions",
+        "effective_limit",
+        "refresh_interval",
+        "is_precise",
+        "rollout_ongoing",
+        "observed_at_utc",
+        "expires_at_utc",
+        "evidence_digest",
+    )
+
+    def __init__(self, payload: object, *, construction_token: object) -> None:
+        if construction_token is not _D327_EVIDENCE_CONSTRUCTION_TOKEN:
+            raise TypeError("_ConfiguredQuotaEvidenceV1 is private")
+        _d327_validate_evidence_payload(payload, has_evidence_digest=True)
+        self.kind = payload["kind"]
+        self.schema_version = payload["schema_version"]
+        self.inventory_authority_generation = payload[
+            "inventory_authority_generation"
+        ]
+        self.inventory_content_fingerprint = payload["inventory_content_fingerprint"]
+        self.inventory_binding_digest = payload["inventory_binding_digest"]
+        self.source_kind = _ConfiguredQuotaEvidenceSourceKindV1(
+            payload["source_kind"]
+        )
+        self.source_resource_digest = payload["source_resource_digest"]
+        self.service = payload["service"]
+        self.quota_id = payload["quota_id"]
+        self.metric = payload["metric"]
+        self.dimensions = MappingProxyType(
+            _d327_validate_dimensions(payload["dimensions"])
+        )
+        self.effective_limit = payload["effective_limit"]
+        self.refresh_interval = payload["refresh_interval"]
+        self.is_precise = payload["is_precise"]
+        self.rollout_ongoing = payload["rollout_ongoing"]
+        self.observed_at_utc = payload["observed_at_utc"]
+        self.expires_at_utc = payload["expires_at_utc"]
+        self.evidence_digest = payload["evidence_digest"]
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if hasattr(self, name):
+            raise AttributeError("_ConfiguredQuotaEvidenceV1 is immutable")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise AttributeError("_ConfiguredQuotaEvidenceV1 is immutable")
+
+    def _evidence_preimage(self) -> bytes:
+        return _d327_evidence_preimage(
+            inventory_authority_generation=self.inventory_authority_generation,
+            inventory_content_fingerprint=self.inventory_content_fingerprint,
+            inventory_binding_digest=self.inventory_binding_digest,
+            source_kind=self.source_kind.value,
+            source_resource_digest=self.source_resource_digest,
+            service=self.service,
+            quota_id=self.quota_id,
+            metric=self.metric,
+            dimensions=dict(self.dimensions),
+            effective_limit=self.effective_limit,
+            refresh_interval=self.refresh_interval,
+            is_precise=self.is_precise,
+            rollout_ongoing=self.rollout_ongoing,
+            observed_at_utc=self.observed_at_utc,
+            expires_at_utc=self.expires_at_utc,
+        )
+
+    def _canonical_json_bytes(self) -> bytes:
+        return _d327_canonical_json_bytes(
+            {
+                "kind": self.kind,
+                "schema_version": self.schema_version,
+                "inventory_authority_generation": self.inventory_authority_generation,
+                "inventory_content_fingerprint": self.inventory_content_fingerprint,
+                "inventory_binding_digest": self.inventory_binding_digest,
+                "source_kind": self.source_kind.value,
+                "source_resource_digest": self.source_resource_digest,
+                "service": self.service,
+                "quota_id": self.quota_id,
+                "metric": self.metric,
+                "dimensions": dict(self.dimensions),
+                "effective_limit": self.effective_limit,
+                "refresh_interval": self.refresh_interval,
+                "is_precise": self.is_precise,
+                "rollout_ongoing": self.rollout_ongoing,
+                "observed_at_utc": self.observed_at_utc,
+                "expires_at_utc": self.expires_at_utc,
+                "evidence_digest": self.evidence_digest,
+            },
+            has_evidence_digest=True,
+        )
+
+    @classmethod
+    def from_canonical_json_bytes(cls, raw: object) -> _ConfiguredQuotaEvidenceV1:
+        payload = _d327_decode_evidence_json(
+            raw, expected_fields=_D327_EVIDENCE_FIELDS
+        )
+        _d327_validate_evidence_payload(payload, has_evidence_digest=True)
+        preimage = _d327_evidence_preimage(
+            inventory_authority_generation=payload["inventory_authority_generation"],
+            inventory_content_fingerprint=payload["inventory_content_fingerprint"],
+            inventory_binding_digest=payload["inventory_binding_digest"],
+            source_kind=payload["source_kind"],
+            source_resource_digest=payload["source_resource_digest"],
+            service=payload["service"],
+            quota_id=payload["quota_id"],
+            metric=payload["metric"],
+            dimensions=payload["dimensions"],
+            effective_limit=payload["effective_limit"],
+            refresh_interval=payload["refresh_interval"],
+            is_precise=payload["is_precise"],
+            rollout_ongoing=payload["rollout_ongoing"],
+            observed_at_utc=payload["observed_at_utc"],
+            expires_at_utc=payload["expires_at_utc"],
+        )
+        if payload["evidence_digest"] != _d327_sha256_digest(preimage):
+            _d327_invalid()
+        return cls(payload, construction_token=_D327_EVIDENCE_CONSTRUCTION_TOKEN)
+
+    def __repr__(self) -> str:
+        return "_ConfiguredQuotaEvidenceV1()"
+
+    __str__ = __repr__
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise TypeError("_ConfiguredQuotaEvidenceV1 is not serializable")
+
+
 @dataclass(frozen=True, repr=False)
 class _GoogleAccountInventorySnapshotV1:
     generation: int
@@ -1303,6 +1824,142 @@ class GoogleAccountInventoryManager:
                 != inventory_binding_digest
             ):
                 _d321_invalid()
+            return evidence
+
+    def _reattest_configured_quota_evidence(
+        self,
+        evidence: _ConfiguredQuotaEvidenceV1,
+        *,
+        account_ref: str,
+        project_ref: str,
+        key_id: str,
+    ) -> _ConfiguredQuotaEvidenceV1:
+        """Rebind private D327 configuration evidence to a READY snapshot.
+
+        This is validation-only. It neither reads a provider nor derives a
+        quota verdict, billing authority, availability, reset, or remaining
+        capacity.
+        """
+
+        with self._lock:
+            if self._state is InventoryManagerStateV1.CLOSED:
+                raise GoogleAccountInventoryError("credential.inventory_manager_closed")
+            if (
+                self._state is not InventoryManagerStateV1.READY
+                or self._active is None
+            ):
+                raise GoogleAccountInventoryError(
+                    "credential.configured_quota_evidence_unavailable"
+                )
+            if type(evidence) is not _ConfiguredQuotaEvidenceV1:
+                _d327_invalid()
+            try:
+                canonical_evidence = (
+                    _ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(
+                        evidence._canonical_json_bytes()
+                    )
+                )
+            except GoogleAccountInventoryError:
+                _d327_invalid()
+            try:
+                now_seconds = _d327_timestamp_seconds(
+                    self._operator_timestamp_utc()
+                )
+            except (GoogleAccountInventoryError, RuntimeError):
+                _d327_invalid()
+            observed_seconds = _d327_timestamp_seconds(
+                canonical_evidence.observed_at_utc
+            )
+            expires_seconds = _d327_timestamp_seconds(
+                canonical_evidence.expires_at_utc
+            )
+            if observed_seconds > now_seconds or expires_seconds <= now_seconds:
+                _d327_invalid()
+            if (
+                not _valid_d321_ascii_string(account_ref)
+                or not _valid_d321_ascii_string(project_ref)
+                or not _valid_d321_ascii_string(key_id)
+            ):
+                _d327_invalid()
+            snapshot = self._active.snapshot
+            if (
+                canonical_evidence.inventory_authority_generation
+                != snapshot.generation
+                or canonical_evidence.inventory_content_fingerprint
+                != snapshot.content_fingerprint
+            ):
+                _d327_invalid()
+            try:
+                account = snapshot.by_account_ref[account_ref]
+                project = snapshot.by_project_ref[project_ref]
+            except KeyError:
+                _d327_invalid()
+            if (
+                not any(candidate is project for candidate in account.projects)
+                or type(project.status) is not str
+                or project.status != "active"
+                or type(project.purpose) is not str
+                or project.purpose != "hive"
+                or type(project.key_id) is not str
+                or project.key_id != key_id
+                or not _valid_d321_ascii_string(project.project_id)
+                or not _valid_d321_ascii_string(project.billing_account_ref)
+            ):
+                _d327_invalid()
+            try:
+                billing_account = snapshot.by_billing_ref[
+                    project.billing_account_ref
+                ]
+            except KeyError:
+                _d327_invalid()
+            if (
+                not any(
+                    candidate is billing_account
+                    for candidate in account.billing_accounts
+                )
+                or not _valid_d321_ascii_string(
+                    billing_account.billing_account_id
+                )
+            ):
+                _d327_invalid()
+            consumer_binding_digest = _d321_consumer_binding_digest(
+                inventory_authority_generation=snapshot.generation,
+                inventory_content_fingerprint=snapshot.content_fingerprint,
+                account_ref=account_ref,
+                project_ref=project_ref,
+                project_id=project.project_id,
+                key_id=key_id,
+            )
+            billing_group_digest = _d321_billing_group_digest(
+                billing_account_id=billing_account.billing_account_id
+            )
+            inventory_binding_digest = _d321_inventory_binding_digest(
+                inventory_authority_generation=snapshot.generation,
+                inventory_content_fingerprint=snapshot.content_fingerprint,
+                consumer_binding_digest=consumer_binding_digest,
+                billing_group_digest=billing_group_digest,
+            )
+            if (
+                canonical_evidence.inventory_binding_digest
+                != inventory_binding_digest
+            ):
+                _d327_invalid()
+            source_preimage = _d328_source_preimage(
+                inventory_authority_generation=snapshot.generation,
+                inventory_content_fingerprint=snapshot.content_fingerprint,
+                inventory_binding_digest=inventory_binding_digest,
+                source_kind=canonical_evidence.source_kind.value,
+                project_id=project.project_id,
+                service=canonical_evidence.service,
+                quota_id=canonical_evidence.quota_id,
+                metric=canonical_evidence.metric,
+                dimensions=dict(canonical_evidence.dimensions),
+            )
+            if (
+                canonical_evidence.source_resource_digest
+                != _d327_sha256_digest(source_preimage)
+            ):
+                _d327_invalid()
             return evidence
 
     def _read_monotonic(self) -> float:

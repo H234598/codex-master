@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from dataclasses import asdict, is_dataclass
 import gc
+import hashlib
 import inspect
 import json
 import math
@@ -2338,3 +2339,1092 @@ def test_d321_manager_reattest_does_not_swallow_outside_clock_exception(
             project_ref="the-hive-1",
             key_id="000654",
         )
+
+
+_D327_FINGERPRINT = "sha256:" + "e" * 64
+_D328_SERVICE = "generativelanguage.googleapis.com"
+_D327_DEFAULT_DIMENSIONS = object()
+_D327_DEFAULT_SOURCE_PROJECT = object()
+
+
+def _d327_evidence_for_test(
+    *,
+    inventory_authority_generation: object = 7,
+    inventory_content_fingerprint: object = _D327_FINGERPRINT,
+    inventory_binding_digest: object = _D321_INVENTORY_DIGEST,
+    source_kind: object = "cloud_quotas_v1",
+    project_id: object = "synthetic-project",
+    source_project_id: object = _D327_DEFAULT_SOURCE_PROJECT,
+    service: object = _D328_SERVICE,
+    quota_id: object = "generate-content-per-minute",
+    metric: object = "generativelanguage.googleapis.com/generate_content",
+    dimensions: object = _D327_DEFAULT_DIMENSIONS,
+    effective_limit: object = "42",
+    refresh_interval: object = "900s",
+    is_precise: object = True,
+    rollout_ongoing: object = False,
+    observed_at_utc: object = "2026-09-23T12:00:00Z",
+    expires_at_utc: object = "2026-09-23T12:15:00Z",
+) -> object:
+    if dimensions is _D327_DEFAULT_DIMENSIONS:
+        dimensions = {"model": "gemini-test", "region": "global"}
+    if source_project_id is _D327_DEFAULT_SOURCE_PROJECT:
+        source_project_id = project_id
+    source_preimage = manager_module._d328_source_preimage(
+        inventory_authority_generation=inventory_authority_generation,
+        inventory_content_fingerprint=inventory_content_fingerprint,
+        inventory_binding_digest=inventory_binding_digest,
+        source_kind=source_kind,
+        project_id=source_project_id,
+        service=service,
+        quota_id=quota_id,
+        metric=metric,
+        dimensions=dimensions,
+    )
+    payload = {
+        "kind": "gemini_configured_quota_evidence.v1",
+        "schema_version": 1,
+        "inventory_authority_generation": inventory_authority_generation,
+        "inventory_content_fingerprint": inventory_content_fingerprint,
+        "inventory_binding_digest": inventory_binding_digest,
+        "source_kind": source_kind,
+        "source_resource_digest": (
+            "sha256:" + hashlib.sha256(source_preimage).hexdigest()
+        ),
+        "service": service,
+        "quota_id": quota_id,
+        "metric": metric,
+        "dimensions": dimensions,
+        "effective_limit": effective_limit,
+        "refresh_interval": refresh_interval,
+        "is_precise": is_precise,
+        "rollout_ongoing": rollout_ongoing,
+        "observed_at_utc": observed_at_utc,
+        "expires_at_utc": expires_at_utc,
+    }
+    preimage = _d327_json_bytes(payload)
+    evidence_digest = "sha256:" + hashlib.sha256(preimage).hexdigest()
+    return manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(
+        _d327_json_bytes({**payload, "evidence_digest": evidence_digest})
+    )
+
+
+def _d327_json_bytes(payload: object) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def test_d327_configured_quota_codec_is_canonical_private_and_non_authorizing(
+) -> None:
+    raw_project_id = "synthetic-private-project-marker"
+    evidence = _d327_evidence_for_test(
+        project_id=raw_project_id,
+        dimensions={"region": "global", "model": "gemini-test"},
+        refresh_interval="60s",
+        expires_at_utc="2026-09-23T12:01:00Z",
+    )
+    raw = evidence._canonical_json_bytes()
+    decoded = manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(raw)
+
+    assert decoded._canonical_json_bytes() == raw
+    assert raw.index(b'"model":"gemini-test"') < raw.index(b'"region":"global"')
+    assert raw_project_id.encode("utf-8") not in raw
+    assert raw_project_id not in repr(decoded)
+    assert str(decoded) == "_ConfiguredQuotaEvidenceV1()"
+    assert not hasattr(decoded, "public_projection")
+    assert not hasattr(decoded, "source_resource_name")
+    assert not hasattr(decoded, "project_id")
+    assert not any(
+        hasattr(decoded, field)
+        for field in (
+            "remaining",
+            "reset",
+            "tier",
+            "credit",
+            "spend",
+            "cap",
+            "ready",
+            "blocked",
+            "cleared",
+        )
+    )
+    with pytest.raises(AttributeError, match="immutable"):
+        decoded.metric = "changed"
+    with pytest.raises(TypeError):
+        decoded.dimensions["model"] = "changed"  # type: ignore[index]
+    with pytest.raises(TypeError, match="not serializable"):
+        pickle.dumps(decoded)
+
+
+def test_d327_configured_quota_digest_preimage_binds_every_contract_field() -> None:
+    evidence = _d327_evidence_for_test()
+    preimage = evidence._evidence_preimage()
+
+    assert evidence.evidence_digest == "sha256:" + hashlib.sha256(preimage).hexdigest()
+    baseline_digest = evidence.evidence_digest
+    replacements = {
+        "inventory_authority_generation": 8,
+        "inventory_content_fingerprint": "sha256:" + "0" * 64,
+        "inventory_binding_digest": "sha256:" + "1" * 64,
+        "project_id": "other-project",
+        "quota_id": "other-quota",
+        "metric": "other/metric",
+        "dimensions": {"model": "other"},
+        "effective_limit": "43",
+        "is_precise": False,
+        "rollout_ongoing": True,
+    }
+    for field, value in replacements.items():
+        assert (
+            _d327_evidence_for_test(**{field: value}).evidence_digest
+            != baseline_digest
+        )
+
+    assert (
+        _d327_evidence_for_test(
+            refresh_interval="1s", expires_at_utc="2026-09-23T12:00:01Z"
+        ).evidence_digest
+        != baseline_digest
+    )
+    assert (
+        _d327_evidence_for_test(
+            observed_at_utc="2026-09-23T12:00:01Z",
+            expires_at_utc="2026-09-23T12:15:01Z",
+        ).evidence_digest
+        != baseline_digest
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b'{"kind":"gemini_configured_quota_evidence.v1",'
+        b'"kind":"gemini_configured_quota_evidence.v1"}',
+        b'{"dimensions":{"model":"a","model":"b"}}',
+        b" " + _d327_evidence_for_test()._canonical_json_bytes(),
+    ),
+)
+def test_d327_configured_quota_codec_rejects_duplicate_and_noncanonical_json(
+    raw: bytes,
+) -> None:
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(raw)
+
+
+def test_d327_configured_quota_codec_rejects_duplicate_dimension_before_digest(
+) -> None:
+    raw = _d327_evidence_for_test()._canonical_json_bytes()
+    duplicate_dimensions = raw.replace(
+        b'"dimensions":{"model":"gemini-test","region":"global"}',
+        b'"dimensions":{"model":"gemini-test","model":"duplicate",'
+        b'"region":"global"}',
+    )
+    assert duplicate_dimensions != raw
+
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(
+            duplicate_dimensions
+        )
+
+
+def test_d327_configured_quota_codec_rejects_missing_unknown_and_tampered_fields(
+) -> None:
+    payload = json.loads(_d327_evidence_for_test()._canonical_json_bytes())
+    variants = []
+    missing = dict(payload)
+    del missing["metric"]
+    variants.append(missing)
+    variants.append({**payload, "unexpected": "x"})
+    variants.append({**payload, "evidence_digest": "sha256:" + "0" * 64})
+    variants.append({**payload, "schema_version": True})
+    variants.append({**payload, "schema_version": 1.0})
+
+    for candidate in variants:
+        with pytest.raises(GoogleAccountInventoryError):
+            manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(
+                _d327_json_bytes(candidate)
+            )
+
+
+@pytest.mark.parametrize(
+    "effective_limit",
+    (
+        True,
+        1,
+        1.0,
+        "",
+        "-1",
+        "+1",
+        "01",
+        "1.0",
+        " 1",
+        "9223372036854775808",
+    ),
+)
+def test_d327_configured_quota_rejects_every_noncanonical_int64_limit(
+    effective_limit: object,
+) -> None:
+    with pytest.raises(GoogleAccountInventoryError):
+        _d327_evidence_for_test(effective_limit=effective_limit)
+
+
+def test_d328_int64_validator_rejects_string_subclass() -> None:
+    assert not manager_module._valid_d327_int64_string(StringSubclass("42"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_kind", "unknown"),
+        ("source_kind", "service_usage_v1beta1"),
+        ("source_kind", True),
+        ("service", ""),
+        ("service", "other.googleapis.com"),
+        ("quota_id", ""),
+        ("metric", ""),
+        ("dimensions", None),
+        ("dimensions", {"model": 1}),
+        ("dimensions", {1: "gemini-test"}),
+        ("refresh_interval", ""),
+        ("refresh_interval", None),
+        ("refresh_interval", False),
+        ("refresh_interval", 60),
+        ("refresh_interval", "sixty"),
+        ("refresh_interval", "60.1234567890s"),
+        ("is_precise", 1),
+        ("rollout_ongoing", 0),
+        ("observed_at_utc", "2026-09-23T12:00:00+00:00"),
+        ("expires_at_utc", "2026-09-23T12:00:00Z"),
+        ("expires_at_utc", "2026-09-23T12:15:01Z"),
+    ),
+)
+def test_d327_configured_quota_rejects_invalid_contract_types_and_ttl(
+    field: str, value: object
+) -> None:
+    with pytest.raises(GoogleAccountInventoryError):
+        _d327_evidence_for_test(**{field: value})
+
+
+def _d327_evidence_bound_to_fresh_manager(
+    manager: GoogleAccountInventoryManager,
+    *,
+    generation: int | None = None,
+    fingerprint: str | None = None,
+    account_ref: str = "synthetic-account-01",
+    project_ref: str = "the-hive-1",
+    project_id: str = "000789",
+    key_id: str = "000654",
+    billing_account_id: str = "000456",
+    observed_at_utc: object = "2026-08-23T11:55:00Z",
+    expires_at_utc: object = "2026-08-23T12:05:00Z",
+    refresh_interval: object = "600s",
+) -> object:
+    snapshot = manager._snapshot_for_internal_use()
+    authority_generation = snapshot.generation if generation is None else generation
+    content_fingerprint = (
+        snapshot.content_fingerprint if fingerprint is None else fingerprint
+    )
+    consumer_binding_digest = manager_module._d321_consumer_binding_digest(
+        inventory_authority_generation=authority_generation,
+        inventory_content_fingerprint=content_fingerprint,
+        account_ref=account_ref,
+        project_ref=project_ref,
+        project_id=project_id,
+        key_id=key_id,
+    )
+    billing_group_digest = manager_module._d321_billing_group_digest(
+        billing_account_id=billing_account_id
+    )
+    inventory_binding_digest = manager_module._d321_inventory_binding_digest(
+        inventory_authority_generation=authority_generation,
+        inventory_content_fingerprint=content_fingerprint,
+        consumer_binding_digest=consumer_binding_digest,
+        billing_group_digest=billing_group_digest,
+    )
+    return _d327_evidence_for_test(
+        inventory_authority_generation=authority_generation,
+        inventory_content_fingerprint=content_fingerprint,
+        inventory_binding_digest=inventory_binding_digest,
+        project_id=project_id,
+        observed_at_utc=observed_at_utc,
+        expires_at_utc=expires_at_utc,
+        refresh_interval=refresh_interval,
+    )
+
+
+def test_d327_manager_reattest_requires_current_ready_snapshot_and_binding(
+    tmp_path: Path,
+) -> None:
+    manager = test_manager(fresh_document(tmp_path))
+    manager.reload()
+    evidence = _d327_evidence_bound_to_fresh_manager(manager)
+
+    assert manager._reattest_configured_quota_evidence(
+        evidence,
+        account_ref="synthetic-account-01",
+        project_ref="the-hive-1",
+        key_id="000654",
+    ) is evidence
+
+    for stale_evidence, account_ref, project_ref, key_id in (
+        (
+            _d327_evidence_bound_to_fresh_manager(
+                manager, generation=manager.inventory_generation() + 1
+            ),
+            "synthetic-account-01",
+            "the-hive-1",
+            "000654",
+        ),
+        (
+            _d327_evidence_bound_to_fresh_manager(
+                manager, fingerprint="sha256:" + "0" * 64
+            ),
+            "synthetic-account-01",
+            "the-hive-1",
+            "000654",
+        ),
+        (evidence, "synthetic-account-02", "the-hive-1", "000654"),
+        (evidence, "synthetic-account-01", "other-project", "000654"),
+        (evidence, "synthetic-account-01", "the-hive-1", "000655"),
+    ):
+        with pytest.raises(GoogleAccountInventoryError):
+            manager._reattest_configured_quota_evidence(
+                stale_evidence,
+                account_ref=account_ref,
+                project_ref=project_ref,
+                key_id=key_id,
+            )
+
+
+def test_d327_manager_reattest_rejects_future_expired_blocked_and_closed_state(
+    tmp_path: Path,
+) -> None:
+    manager = test_manager(fresh_document(tmp_path))
+    manager.reload()
+    for evidence in (
+        _d327_evidence_bound_to_fresh_manager(
+                manager,
+                observed_at_utc="2026-08-23T12:01:00Z",
+                expires_at_utc="2026-08-23T12:01:01Z",
+                refresh_interval="1s",
+            ),
+        _d327_evidence_bound_to_fresh_manager(
+                manager,
+                observed_at_utc="2026-08-23T11:50:00Z",
+                expires_at_utc="2026-08-23T11:59:00Z",
+                refresh_interval="540s",
+            ),
+    ):
+        with pytest.raises(GoogleAccountInventoryError):
+            manager._reattest_configured_quota_evidence(
+                evidence,
+                account_ref="synthetic-account-01",
+                project_ref="the-hive-1",
+                key_id="000654",
+            )
+
+    blocked = test_manager(
+        fresh_document(tmp_path / "blocked"),
+        GoogleAccountInventoryError("credential.inventory_reload_failed"),
+    )
+    blocked.reload()
+    blocked_evidence = _d327_evidence_bound_to_fresh_manager(blocked)
+    with pytest.raises(GoogleAccountInventoryError):
+        blocked.reload()
+    with pytest.raises(GoogleAccountInventoryError):
+        blocked._reattest_configured_quota_evidence(
+            blocked_evidence,
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
+
+    manager.close()
+    with pytest.raises(GoogleAccountInventoryError):
+        manager._reattest_configured_quota_evidence(
+            _d327_evidence_for_test(),
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
+
+
+def test_d327_has_no_issue_port_or_public_or_verdict_surface() -> None:
+    evidence = _d327_evidence_for_test()
+
+    with pytest.raises(TypeError, match="private"):
+        manager_module._ConfiguredQuotaEvidenceV1({}, construction_token=object())
+    assert not hasattr(manager_module, "ConfiguredQuotaEvidenceV1")
+    assert not hasattr(manager_module, "_QuotaVerdictV1")
+    assert not hasattr(
+        GoogleAccountInventoryManager, "_issue_configured_quota_evidence"
+    )
+    assert set(json.loads(evidence._canonical_json_bytes())) == {
+        "kind",
+        "schema_version",
+        "inventory_authority_generation",
+        "inventory_content_fingerprint",
+        "inventory_binding_digest",
+        "source_kind",
+        "source_resource_digest",
+        "service",
+        "quota_id",
+        "metric",
+        "dimensions",
+        "effective_limit",
+        "refresh_interval",
+        "is_precise",
+        "rollout_ongoing",
+        "observed_at_utc",
+        "expires_at_utc",
+        "evidence_digest",
+    }
+    assert not hasattr(manager_module, "_d327_source_resource_digest")
+    assert not hasattr(manager_module._ConfiguredQuotaEvidenceV1, "_for_test")
+
+
+def _d328_source_preimage_for_test(
+    *,
+    project_id: object = "synthetic-project",
+    source_kind: object = "cloud_quotas_v1",
+    service: object = _D328_SERVICE,
+    quota_id: object = "generate-content-per-minute",
+    metric: object = "generativelanguage.googleapis.com/generate_content",
+    dimensions: object = _D327_DEFAULT_DIMENSIONS,
+) -> bytes:
+    if dimensions is _D327_DEFAULT_DIMENSIONS:
+        dimensions = {"model": "gemini-test", "region": "global"}
+    return manager_module._d328_source_preimage(
+        inventory_authority_generation=7,
+        inventory_content_fingerprint=_D327_FINGERPRINT,
+        inventory_binding_digest=_D321_INVENTORY_DIGEST,
+        source_kind=source_kind,
+        project_id=project_id,
+        service=service,
+        quota_id=quota_id,
+        metric=metric,
+        dimensions=dimensions,
+    )
+
+
+def test_d328_source_preimage_has_exact_fields_sorted_dimensions_and_bound_digest(
+) -> None:
+    first = _d328_source_preimage_for_test(
+        dimensions={"region": "global", "model": "gemini-test"}
+    )
+    second = _d328_source_preimage_for_test(
+        dimensions={"model": "gemini-test", "region": "global"}
+    )
+    payload = json.loads(first)
+
+    assert first == second
+    assert set(payload) == {
+        "kind",
+        "source_kind",
+        "inventory_authority_generation",
+        "inventory_content_fingerprint",
+        "inventory_binding_digest",
+        "project_id",
+        "service",
+        "quota_id",
+        "metric",
+        "dimensions",
+    }
+    assert payload["kind"] == "gemini_configured_quota_source_preimage.v1"
+    assert payload["source_kind"] == "cloud_quotas_v1"
+    assert first.index(b'"model":"gemini-test"') < first.index(
+        b'"region":"global"'
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "service"),
+    (
+        ("service_usage_v1beta1", _D328_SERVICE),
+        ("unknown", _D328_SERVICE),
+        ("cloud_quotas_v1", "other.googleapis.com"),
+    ),
+)
+def test_d328_source_preimage_rejects_removed_kind_and_nonexact_service(
+    source_kind: object, service: object
+) -> None:
+    with pytest.raises(GoogleAccountInventoryError):
+        _d328_source_preimage_for_test(source_kind=source_kind, service=service)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("quota_id", ""),
+        ("quota_id", "q" * 257),
+        ("quota_id", "quota\x1f"),
+        ("quota_id", "quota\x7f"),
+        ("metric", ""),
+        ("metric", "m" * 513),
+        ("metric", "metric\x1f"),
+        ("metric", "metric\x7f"),
+        ("dimensions", {"": "value"}),
+        ("dimensions", {"key\x1f": "value"}),
+        ("dimensions", {"key\x7f": "value"}),
+        ("dimensions", {"k" * 129: "value"}),
+        ("dimensions", {"key": ""}),
+        ("dimensions", {"key": "value\x1f"}),
+        ("dimensions", {"key": "value\x7f"}),
+        ("dimensions", {"key": "v" * 257}),
+        ("dimensions", {f"key-{index}": "value" for index in range(33)}),
+    ),
+)
+def test_d328_source_preimage_enforces_every_string_and_map_bound(
+    field: str, value: object
+) -> None:
+    with pytest.raises(GoogleAccountInventoryError):
+        _d328_source_preimage_for_test(**{field: value})
+
+
+def test_d328_source_preimage_accepts_exact_string_and_map_boundaries() -> None:
+    preimage = _d328_source_preimage_for_test(
+        quota_id="q" * 256,
+        metric="m" * 512,
+        dimensions={f"k{index}": "v" * 256 for index in range(32)},
+    )
+
+    assert len(preimage) <= 16384
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_nanoseconds"),
+    (
+        ("1s", 1_000_000_000),
+        ("86400s", 86_400_000_000_000),
+    ),
+)
+def test_d328_refresh_interval_accepts_canonical_whole_second_edges(
+    value: str, expected_nanoseconds: int
+) -> None:
+    assert manager_module._d328_refresh_interval_nanoseconds(value) == (
+        expected_nanoseconds
+    )
+
+
+def test_d328_refresh_interval_rejects_long_leading_zero_integer() -> None:
+    assert manager_module._d328_refresh_interval_nanoseconds("0" * 5000 + "1s") is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_nanoseconds"),
+    (
+        ("1s", 1_000_000_000),
+        ("60s", 60_000_000_000),
+        ("86400s", 86_400_000_000_000),
+    ),
+)
+def test_d329_d328_refresh_interval_nanoseconds_accepts_canonical_whole_seconds(
+    value: str, expected_nanoseconds: int
+) -> None:
+    assert manager_module._d328_refresh_interval_nanoseconds(value) == (
+        expected_nanoseconds
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "0s",
+        "00s",
+        "01s",
+        "00001s",
+        "0.1s",
+        "1.0s",
+        "1.000000000s",
+        " 1s",
+        "1s ",
+        "+1s",
+        "-1s",
+        "1",
+        "86401s",
+        "100000s",
+    ),
+)
+def test_d329_d328_refresh_interval_nanoseconds_rejects_every_noncanonical_form(
+    value: str,
+) -> None:
+    assert manager_module._d328_refresh_interval_nanoseconds(value) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        None,
+        True,
+        1,
+        1.0,
+        "",
+        "s",
+        "0s",
+        "0.000000000s",
+        "-1s",
+        "+1s",
+        "1.s",
+        "1",
+        "1.1234567890s",
+        "86400.000000001s",
+        "86401s",
+    ),
+)
+def test_d328_refresh_interval_rejects_every_invalid_duration_edge(
+    value: object,
+) -> None:
+    assert manager_module._d328_refresh_interval_nanoseconds(value) is None
+
+
+@pytest.mark.parametrize(
+    "effective_limit",
+    (
+        "0",
+        "1",
+        "9" * 18,
+        "9223372036854775807",
+    ),
+)
+def test_d328_int64_validator_accepts_exact_boundaries(effective_limit: str) -> None:
+    assert manager_module._valid_d327_int64_string(effective_limit)
+
+
+@pytest.mark.parametrize(
+    ("refresh_interval", "expires_at_utc", "allowed"),
+    (
+        ("1s", "2026-09-23T12:00:01Z", True),
+        ("1s", "2026-09-23T12:00:02Z", False),
+        ("900s", "2026-09-23T12:15:00Z", True),
+        ("900s", "2026-09-23T12:15:01Z", False),
+        ("86400s", "2026-09-23T12:15:00Z", True),
+        ("86400s", "2026-09-23T12:15:01Z", False),
+    ),
+)
+def test_d328_ttl_is_bounded_by_local_cap_and_refresh_interval(
+    refresh_interval: str, expires_at_utc: str, allowed: bool
+) -> None:
+    if allowed:
+        evidence = _d327_evidence_for_test(
+            refresh_interval=refresh_interval,
+            observed_at_utc="2026-09-23T12:00:00Z",
+            expires_at_utc=expires_at_utc,
+        )
+        assert evidence.refresh_interval == refresh_interval
+    else:
+        with pytest.raises(GoogleAccountInventoryError):
+            _d327_evidence_for_test(
+                refresh_interval=refresh_interval,
+                observed_at_utc="2026-09-23T12:00:00Z",
+                expires_at_utc=expires_at_utc,
+            )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("is_precise", 1),
+        ("is_precise", 1.0),
+        ("is_precise", "true"),
+        ("rollout_ongoing", 0),
+        ("rollout_ongoing", 0.0),
+        ("rollout_ongoing", "false"),
+    ),
+)
+def test_d328_flags_reject_bool_integer_float_and_string_confusion(
+    field: str, value: object
+) -> None:
+    with pytest.raises(GoogleAccountInventoryError):
+        _d327_evidence_for_test(**{field: value})
+
+
+def test_d328_source_preimage_enforces_exact_16384_byte_limit() -> None:
+    base = _d328_source_preimage_for_test(project_id="p")
+    project_length = 16384 - len(base) + 1
+    exact = _d328_source_preimage_for_test(project_id="p" * project_length)
+
+    assert len(exact) == 16384
+    with pytest.raises(GoogleAccountInventoryError):
+        _d328_source_preimage_for_test(project_id="p" * (project_length + 1))
+
+
+def test_d328_decoder_accepts_only_structural_digest_until_manager_reattests(
+    tmp_path: Path,
+) -> None:
+    manager = test_manager(fresh_document(tmp_path))
+    manager.reload()
+    evidence = _d327_evidence_bound_to_fresh_manager(manager)
+    payload = json.loads(evidence._canonical_json_bytes())
+    payload["source_resource_digest"] = "sha256:" + "0" * 64
+    preimage = dict(payload)
+    del preimage["evidence_digest"]
+    payload["evidence_digest"] = "sha256:" + hashlib.sha256(
+        _d327_json_bytes(preimage)
+    ).hexdigest()
+    decoded = manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(
+        _d327_json_bytes(payload)
+    )
+
+    with pytest.raises(GoogleAccountInventoryError) as caught:
+        manager._reattest_configured_quota_evidence(
+            decoded,
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
+    assert "000789" not in repr(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_kind", "service_usage_v1beta1"),
+        ("service", "other.googleapis.com"),
+        ("quota_id", "q" * 257),
+        ("metric", "m" * 513),
+        ("dimensions", {f"key-{index}": "value" for index in range(33)}),
+        ("effective_limit", "01"),
+        ("refresh_interval", "0s"),
+        ("refresh_interval", "01s"),
+        ("refresh_interval", "1.0s"),
+        ("refresh_interval", "86401s"),
+        ("is_precise", 1),
+        ("rollout_ongoing", 0.0),
+        ("expires_at_utc", "2026-09-23T12:15:01Z"),
+    ),
+)
+def test_d328_decoder_rejects_resealed_contract_bound_violations(
+    field: str, value: object
+) -> None:
+    payload = json.loads(_d327_evidence_for_test()._canonical_json_bytes())
+    payload[field] = value
+    preimage = dict(payload)
+    del preimage["evidence_digest"]
+    payload["evidence_digest"] = "sha256:" + hashlib.sha256(
+        _d327_json_bytes(preimage)
+    ).hexdigest()
+
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(
+            _d327_json_bytes(payload)
+        )
+
+
+def test_d328_manager_rejects_source_preimage_project_drift_without_leak(
+    tmp_path: Path,
+) -> None:
+    manager = test_manager(fresh_document(tmp_path))
+    manager.reload()
+    evidence = _d327_evidence_bound_to_fresh_manager(manager)
+    drifted = _d327_evidence_for_test(
+        inventory_authority_generation=evidence.inventory_authority_generation,
+        inventory_content_fingerprint=evidence.inventory_content_fingerprint,
+        inventory_binding_digest=evidence.inventory_binding_digest,
+        project_id="000789",
+        source_project_id="private-project-drift",
+        observed_at_utc="2026-08-23T11:55:00Z",
+        expires_at_utc="2026-08-23T12:05:00Z",
+        refresh_interval="600s",
+    )
+
+    with pytest.raises(GoogleAccountInventoryError) as caught:
+        manager._reattest_configured_quota_evidence(
+            drifted,
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
+    assert "private-project-drift" not in repr(caught.value)
+
+
+def test_d329_d327_invalid_raises_configured_quota_evidence_error() -> None:
+    with pytest.raises(GoogleAccountInventoryError) as caught:
+        manager_module._d327_invalid()
+
+    assert str(caught.value) == "credential.configured_quota_evidence_invalid"
+
+
+def test_d329_valid_d327_digest_accepts_only_lowercase_sha256_digest() -> None:
+    valid_digest = "sha256:" + "a" * 64
+
+    assert manager_module._valid_d327_digest(valid_digest)
+    assert not manager_module._valid_d327_digest("sha256:" + "A" * 64)
+    assert not manager_module._valid_d327_digest("sha256:" + "a" * 63)
+    assert not manager_module._valid_d327_digest(StringSubclass(valid_digest))
+
+
+def test_d329_valid_d328_bounded_ascii_enforces_exact_type_and_length() -> None:
+    assert manager_module._valid_d328_bounded_ascii("abc", maximum_length=3)
+    assert not manager_module._valid_d328_bounded_ascii("", maximum_length=3)
+    assert not manager_module._valid_d328_bounded_ascii("abcd", maximum_length=3)
+    assert not manager_module._valid_d328_bounded_ascii(
+        StringSubclass("abc"), maximum_length=3
+    )
+
+
+def test_d329_d327_validate_dimensions_sorts_and_rejects_unbounded_entries() -> None:
+    assert manager_module._d327_validate_dimensions(
+        {"region": "global", "model": "gemini-test"}
+    ) == {"model": "gemini-test", "region": "global"}
+
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._d327_validate_dimensions({"key": "v" * 257})
+
+
+def test_d329_d327_validate_payload_fields_requires_the_exact_field_set() -> None:
+    payload = {"field": "value"}
+
+    assert manager_module._d327_validate_payload_fields(
+        payload, expected_fields=frozenset({"field"})
+    ) is payload
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._d327_validate_payload_fields(
+            {"other": "value"}, expected_fields=frozenset({"field"})
+        )
+
+
+def test_d329_d327_validate_evidence_payload_enforces_d329_interval_contract() -> None:
+    payload = json.loads(_d327_evidence_for_test()._canonical_json_bytes())
+
+    assert (
+        manager_module._d327_validate_evidence_payload(
+            payload, has_evidence_digest=True
+        )
+        is None
+    )
+    payload["refresh_interval"] = "1.0s"
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._d327_validate_evidence_payload(
+            payload, has_evidence_digest=True
+        )
+
+
+def test_d329_d327_validate_evidence_payload_requires_exact_bounded_ttl() -> None:
+    payload = json.loads(_d327_evidence_for_test()._canonical_json_bytes())
+    payload["expires_at_utc"] = "2026-09-23T12:00:01Z"
+
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._d327_validate_evidence_payload(
+            payload, has_evidence_digest=True
+        )
+
+
+@pytest.mark.parametrize(
+    ("refresh_interval", "expires_at_utc"),
+    (
+        ("1s", "2026-09-23T12:00:01Z"),
+        ("900s", "2026-09-23T12:15:00Z"),
+        ("86400s", "2026-09-23T12:15:00Z"),
+    ),
+)
+def test_d329_d327_validate_evidence_payload_accepts_exact_bounded_ttl_edges(
+    refresh_interval: str, expires_at_utc: str
+) -> None:
+    payload = json.loads(_d327_evidence_for_test()._canonical_json_bytes())
+    payload["refresh_interval"] = refresh_interval
+    payload["expires_at_utc"] = expires_at_utc
+
+    assert (
+        manager_module._d327_validate_evidence_payload(
+            payload, has_evidence_digest=True
+        )
+        is None
+    )
+
+
+def test_d329_d327_timestamp_seconds_parses_canonical_utc_and_rejects_offset() -> None:
+    assert (
+        manager_module._d327_timestamp_seconds("2026-09-23T12:00:00Z")
+        == 1_790_164_800
+    )
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._d327_timestamp_seconds("2026-09-23T12:00:00+00:00")
+
+
+def test_d329_d327_canonical_json_bytes_returns_sorted_ascii_preimage() -> None:
+    payload = json.loads(_d327_evidence_for_test()._canonical_json_bytes())
+    del payload["evidence_digest"]
+
+    encoded = manager_module._d327_canonical_json_bytes(
+        payload, has_evidence_digest=False
+    )
+
+    assert encoded == json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def test_d329_d327_sha256_digest_hashes_bytes_and_rejects_text() -> None:
+    assert manager_module._d327_sha256_digest(b"abc") == (
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    )
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._d327_sha256_digest("abc")
+
+
+def test_d329_d328_source_preimage_directly_binds_its_project_input() -> None:
+    encoded = manager_module._d328_source_preimage(
+        inventory_authority_generation=7,
+        inventory_content_fingerprint=_D327_FINGERPRINT,
+        inventory_binding_digest=_D321_INVENTORY_DIGEST,
+        source_kind="cloud_quotas_v1",
+        project_id="synthetic-project",
+        service=_D328_SERVICE,
+        quota_id="generate-content-per-minute",
+        metric="generativelanguage.googleapis.com/generate_content",
+        dimensions={"region": "global", "model": "gemini-test"},
+    )
+
+    assert json.loads(encoded)["project_id"] == "synthetic-project"
+
+
+def test_d329_d327_reject_json_constant_always_fails_closed() -> None:
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._d327_reject_json_constant("NaN")
+
+
+def test_d329_d327_pairs_to_dimensions_sorts_and_rejects_duplicates() -> None:
+    pairs = manager_module._D327JsonObjectPairs(
+        [("region", "global"), ("model", "gemini-test")]
+    )
+
+    assert manager_module._d327_pairs_to_dimensions(pairs) == {
+        "model": "gemini-test",
+        "region": "global",
+    }
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._d327_pairs_to_dimensions(
+            manager_module._D327JsonObjectPairs(
+                [("model", "first"), ("model", "duplicate")]
+            )
+        )
+
+
+def test_d329_d327_pairs_to_evidence_payload_requires_all_unique_fields() -> None:
+    raw = _d327_evidence_for_test()._canonical_json_bytes()
+    pairs = json.loads(
+        raw.decode("ascii"), object_pairs_hook=manager_module._D327JsonObjectPairs
+    )
+
+    payload = manager_module._d327_pairs_to_evidence_payload(
+        pairs, expected_fields=manager_module._D327_EVIDENCE_FIELDS
+    )
+
+    assert payload["dimensions"] == {"model": "gemini-test", "region": "global"}
+    for malformed in (
+        manager_module._D327JsonObjectPairs(
+            pairs + [("kind", "gemini_configured_quota_evidence.v1")]
+        ),
+        manager_module._D327JsonObjectPairs(pairs[:-1]),
+        manager_module._D327JsonObjectPairs(pairs + [("unexpected", "value")]),
+    ):
+        with pytest.raises(GoogleAccountInventoryError):
+            manager_module._d327_pairs_to_evidence_payload(
+                malformed, expected_fields=manager_module._D327_EVIDENCE_FIELDS
+            )
+
+
+def test_d329_d327_decode_evidence_json_requires_canonical_bytes() -> None:
+    raw = _d327_evidence_for_test()._canonical_json_bytes()
+
+    payload = manager_module._d327_decode_evidence_json(
+        raw, expected_fields=manager_module._D327_EVIDENCE_FIELDS
+    )
+
+    assert payload["quota_id"] == "generate-content-per-minute"
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._d327_decode_evidence_json(
+            b" " + raw, expected_fields=manager_module._D327_EVIDENCE_FIELDS
+        )
+
+
+def test_d329_d327_evidence_preimage_contains_the_supplied_contract_values() -> None:
+    encoded = manager_module._d327_evidence_preimage(
+        inventory_authority_generation=7,
+        inventory_content_fingerprint=_D327_FINGERPRINT,
+        inventory_binding_digest=_D321_INVENTORY_DIGEST,
+        source_kind="cloud_quotas_v1",
+        source_resource_digest="sha256:" + "b" * 64,
+        service=_D328_SERVICE,
+        quota_id="generate-content-per-minute",
+        metric="generativelanguage.googleapis.com/generate_content",
+        dimensions={"model": "gemini-test", "region": "global"},
+        effective_limit="42",
+        refresh_interval="900s",
+        is_precise=True,
+        rollout_ongoing=False,
+        observed_at_utc="2026-09-23T12:00:00Z",
+        expires_at_utc="2026-09-23T12:15:00Z",
+    )
+
+    payload = json.loads(encoded)
+    assert payload["source_resource_digest"] == "sha256:" + "b" * 64
+    assert "evidence_digest" not in payload
+
+
+def test_d329_configured_quota_evidence_v1_init_constructs_private_value() -> None:
+    raw = _d327_evidence_for_test()._canonical_json_bytes()
+    payload = json.loads(raw)
+
+    evidence = manager_module._ConfiguredQuotaEvidenceV1(
+        payload, construction_token=manager_module._D327_EVIDENCE_CONSTRUCTION_TOKEN
+    )
+
+    assert evidence._canonical_json_bytes() == raw
+
+
+def test_d329_configured_quota_evidence_v1_setattr_rejects_mutation() -> None:
+    evidence = _d327_evidence_for_test()
+
+    with pytest.raises(AttributeError, match="immutable"):
+        evidence.metric = "other"  # type: ignore[attr-defined]
+
+
+def test_d329_configured_quota_evidence_v1_delattr_rejects_mutation() -> None:
+    evidence = _d327_evidence_for_test()
+
+    with pytest.raises(AttributeError, match="immutable"):
+        del evidence.metric
+
+
+def test_d329_configured_quota_evidence_v1_evidence_preimage_excludes_digest() -> None:
+    evidence = _d327_evidence_for_test()
+
+    assert "evidence_digest" not in json.loads(evidence._evidence_preimage())
+
+
+def test_d329_configured_quota_evidence_v1_canonical_json_bytes_includes_digest(
+) -> None:
+    evidence = _d327_evidence_for_test()
+
+    assert json.loads(evidence._canonical_json_bytes())["evidence_digest"] == (
+        evidence.evidence_digest
+    )
+
+
+def test_d329_configured_quota_evidence_v1_from_canonical_json_bytes_round_trips(
+) -> None:
+    raw = _d327_evidence_for_test()._canonical_json_bytes()
+
+    decoded = manager_module._ConfiguredQuotaEvidenceV1.from_canonical_json_bytes(raw)
+
+    assert type(decoded) is manager_module._ConfiguredQuotaEvidenceV1
+    assert decoded._canonical_json_bytes() == raw
+
+
+def test_d329_configured_quota_evidence_v1_repr_is_redacted() -> None:
+    assert repr(_d327_evidence_for_test()) == "_ConfiguredQuotaEvidenceV1()"
+
+
+def test_d329_configured_quota_evidence_v1_reduce_ex_rejects_serialization() -> None:
+    with pytest.raises(TypeError, match="not serializable"):
+        _d327_evidence_for_test().__reduce_ex__(4)
