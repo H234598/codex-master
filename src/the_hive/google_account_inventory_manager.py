@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
+import json
 import math
 import threading
 import time
@@ -50,6 +53,68 @@ DEFAULT_SECRET_LEASE_TTL_SECONDS = 30.0
 MAX_SECRET_LEASE_TTL_SECONDS = 60.0
 MAX_OUTSTANDING_SECRET_LEASES = 128
 MAX_INVENTORY_GENERATION = _inventory.MAX_AUTHORITY_GENERATION
+
+_D321_SHA256_PREFIX = "sha256:"
+_D321_SHA256_LENGTH = len(_D321_SHA256_PREFIX) + 64
+_D321_EVIDENCE_KIND = "billing_group_quota_evidence.v1"
+_D321_CONSUMER_BINDING_KIND = "gemini_consumer_binding.v1"
+_D321_BILLING_GROUP_KIND = "gemini_billing_group.v1"
+_D321_INVENTORY_BINDING_KIND = "gemini_inventory_billing_binding.v1"
+_D321_EVIDENCE_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "inventory_authority_generation",
+        "inventory_content_fingerprint",
+        "inventory_binding_digest",
+        "consumer_binding_digest",
+        "billing_group_digest",
+        "status",
+        "reason",
+        "issued_at_utc",
+        "expires_at_utc",
+        "supersedes_evidence_digest",
+        "evidence_digest",
+    }
+)
+_D321_EVIDENCE_PREIMAGE_FIELDS = _D321_EVIDENCE_FIELDS - {"evidence_digest"}
+_D321_CONSUMER_BINDING_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "inventory_authority_generation",
+        "inventory_content_fingerprint",
+        "account_ref",
+        "project_ref",
+        "project_id",
+        "key_id",
+    }
+)
+_D321_BILLING_GROUP_FIELDS = frozenset(
+    {"kind", "schema_version", "billing_account_id"}
+)
+_D321_INVENTORY_BINDING_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "inventory_authority_generation",
+        "inventory_content_fingerprint",
+        "consumer_binding_digest",
+        "billing_group_digest",
+    }
+)
+_D321_EVIDENCE_CONSTRUCTION_TOKEN = object()
+
+
+class _BillingGroupQuotaEvidenceStatusV1(str, Enum):
+    BLOCKED = "blocked"
+    CLEARED = "cleared"
+
+
+class _BillingGroupQuotaEvidenceReasonV1(str, Enum):
+    BILLING_GROUP_QUOTA = "billing_group_quota"
+    AUTHORITY_RESET = "authority_reset"
+    AUTHORITY_REFRESH = "authority_refresh"
 
 
 class _SecretLeaseV1:
@@ -224,6 +289,454 @@ def _valid_operator_timestamp(value: object) -> bool:
     except (OverflowError, ValueError):
         return False
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", parsed) == value
+
+
+def _d321_invalid() -> None:
+    raise GoogleAccountInventoryError("credential.billing_quota_evidence_invalid")
+
+
+def _valid_d321_ascii_string(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and value.isascii()
+        and all(0x20 <= ord(character) <= 0x7E for character in value)
+    )
+
+
+def _valid_d321_digest(value: object) -> bool:
+    return (
+        _valid_d321_ascii_string(value)
+        and len(value) == _D321_SHA256_LENGTH
+        and value.startswith(_D321_SHA256_PREFIX)
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def _d321_flat_json_bytes(
+    value: object, *, expected_fields: frozenset[str]
+) -> bytes:
+    if type(value) is not dict or set(value) != expected_fields:
+        _d321_invalid()
+    for field_name, field_value in value.items():
+        if type(field_name) is not str:
+            _d321_invalid()
+        if field_value is None:
+            continue
+        if type(field_value) is str:
+            if not _valid_d321_ascii_string(field_value):
+                _d321_invalid()
+            continue
+        if type(field_value) is int:
+            continue
+        _d321_invalid()
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        _d321_invalid()
+    raise AssertionError("unreachable")
+
+
+def _d321_pairs_to_flat_object(
+    pairs: list[tuple[object, object]], *, expected_fields: frozenset[str]
+) -> dict[str, object]:
+    seen: set[str] = set()
+    verified_pairs: list[tuple[str, object]] = []
+    for key, value in pairs:
+        if (
+            type(key) is not str
+            or key in seen
+            or key not in expected_fields
+        ):
+            _d321_invalid()
+        seen.add(key)
+        verified_pairs.append((key, value))
+    if seen != expected_fields:
+        _d321_invalid()
+    return dict(verified_pairs)
+
+
+def _d321_reject_json_constant(value: str) -> None:
+    del value
+    _d321_invalid()
+
+
+def _d321_decode_flat_json(
+    raw: object, *, expected_fields: frozenset[str]
+) -> dict[str, object]:
+    if type(raw) is not bytes:
+        _d321_invalid()
+    try:
+        decoded = json.loads(
+            raw.decode("ascii"),
+            object_pairs_hook=lambda pairs: _d321_pairs_to_flat_object(
+                pairs, expected_fields=expected_fields
+            ),
+            parse_constant=_d321_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, GoogleAccountInventoryError):
+        _d321_invalid()
+    if type(decoded) is not dict:
+        _d321_invalid()
+    canonical = _d321_flat_json_bytes(decoded, expected_fields=expected_fields)
+    if canonical != raw:
+        _d321_invalid()
+    return decoded
+
+
+def _d321_sha256_digest(preimage: object) -> str:
+    if type(preimage) is not bytes:
+        _d321_invalid()
+    return _D321_SHA256_PREFIX + hashlib.sha256(preimage).hexdigest()
+
+
+def _d321_consumer_binding_preimage(
+    *,
+    inventory_authority_generation: object,
+    inventory_content_fingerprint: object,
+    account_ref: object,
+    project_ref: object,
+    project_id: object,
+    key_id: object,
+) -> bytes:
+    if (
+        not _valid_generation(inventory_authority_generation)
+        or not _valid_d321_digest(inventory_content_fingerprint)
+        or not _valid_d321_ascii_string(account_ref)
+        or not _valid_d321_ascii_string(project_ref)
+        or not _valid_d321_ascii_string(project_id)
+        or not _valid_d321_ascii_string(key_id)
+    ):
+        _d321_invalid()
+    return _d321_flat_json_bytes(
+        {
+            "kind": _D321_CONSUMER_BINDING_KIND,
+            "schema_version": 1,
+            "inventory_authority_generation": inventory_authority_generation,
+            "inventory_content_fingerprint": inventory_content_fingerprint,
+            "account_ref": account_ref,
+            "project_ref": project_ref,
+            "project_id": project_id,
+            "key_id": key_id,
+        },
+        expected_fields=_D321_CONSUMER_BINDING_FIELDS,
+    )
+
+
+def _d321_consumer_binding_digest(**kwargs: object) -> str:
+    return _d321_sha256_digest(_d321_consumer_binding_preimage(**kwargs))
+
+
+def _d321_billing_group_preimage(*, billing_account_id: object) -> bytes:
+    if not _valid_d321_ascii_string(billing_account_id):
+        _d321_invalid()
+    return _d321_flat_json_bytes(
+        {
+            "kind": _D321_BILLING_GROUP_KIND,
+            "schema_version": 1,
+            "billing_account_id": billing_account_id,
+        },
+        expected_fields=_D321_BILLING_GROUP_FIELDS,
+    )
+
+
+def _d321_billing_group_digest(*, billing_account_id: object) -> str:
+    return _d321_sha256_digest(
+        _d321_billing_group_preimage(billing_account_id=billing_account_id)
+    )
+
+
+def _d321_inventory_binding_preimage(
+    *,
+    inventory_authority_generation: object,
+    inventory_content_fingerprint: object,
+    consumer_binding_digest: object,
+    billing_group_digest: object,
+) -> bytes:
+    if (
+        not _valid_generation(inventory_authority_generation)
+        or not _valid_d321_digest(inventory_content_fingerprint)
+        or not _valid_d321_digest(consumer_binding_digest)
+        or not _valid_d321_digest(billing_group_digest)
+    ):
+        _d321_invalid()
+    return _d321_flat_json_bytes(
+        {
+            "kind": _D321_INVENTORY_BINDING_KIND,
+            "schema_version": 1,
+            "inventory_authority_generation": inventory_authority_generation,
+            "inventory_content_fingerprint": inventory_content_fingerprint,
+            "consumer_binding_digest": consumer_binding_digest,
+            "billing_group_digest": billing_group_digest,
+        },
+        expected_fields=_D321_INVENTORY_BINDING_FIELDS,
+    )
+
+
+def _d321_inventory_binding_digest(**kwargs: object) -> str:
+    return _d321_sha256_digest(_d321_inventory_binding_preimage(**kwargs))
+
+
+def _d321_timestamp_seconds(value: object) -> int:
+    if not _valid_d321_ascii_string(value) or not _valid_operator_timestamp(value):
+        _d321_invalid()
+    try:
+        return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+    except (OverflowError, ValueError):
+        _d321_invalid()
+    raise AssertionError("unreachable")
+
+
+def _d321_evidence_preimage(
+    *,
+    inventory_authority_generation: object,
+    inventory_content_fingerprint: object,
+    inventory_binding_digest: object,
+    consumer_binding_digest: object,
+    billing_group_digest: object,
+    status: object,
+    reason: object,
+    issued_at_utc: object,
+    expires_at_utc: object,
+    supersedes_evidence_digest: object,
+) -> bytes:
+    payload = {
+        "kind": _D321_EVIDENCE_KIND,
+        "schema_version": 1,
+        "inventory_authority_generation": inventory_authority_generation,
+        "inventory_content_fingerprint": inventory_content_fingerprint,
+        "inventory_binding_digest": inventory_binding_digest,
+        "consumer_binding_digest": consumer_binding_digest,
+        "billing_group_digest": billing_group_digest,
+        "status": status,
+        "reason": reason,
+        "issued_at_utc": issued_at_utc,
+        "expires_at_utc": expires_at_utc,
+        "supersedes_evidence_digest": supersedes_evidence_digest,
+    }
+    _d321_validate_evidence_payload(payload, has_evidence_digest=False)
+    return _d321_flat_json_bytes(
+        payload, expected_fields=_D321_EVIDENCE_PREIMAGE_FIELDS
+    )
+
+
+def _d321_validate_evidence_payload(
+    payload: object, *, has_evidence_digest: bool
+) -> None:
+    expected_fields = (
+        _D321_EVIDENCE_FIELDS
+        if has_evidence_digest
+        else _D321_EVIDENCE_PREIMAGE_FIELDS
+    )
+    _d321_flat_json_bytes(payload, expected_fields=expected_fields)
+    if (
+        payload["kind"] != _D321_EVIDENCE_KIND
+        or payload["schema_version"] != 1
+        or not _valid_generation(payload["inventory_authority_generation"])
+        or not _valid_d321_digest(payload["inventory_content_fingerprint"])
+        or not _valid_d321_digest(payload["inventory_binding_digest"])
+        or not _valid_d321_digest(payload["consumer_binding_digest"])
+        or not _valid_d321_digest(payload["billing_group_digest"])
+        or type(payload["status"]) is not str
+        or type(payload["reason"]) is not str
+        or type(payload["issued_at_utc"]) is not str
+        or type(payload["expires_at_utc"]) is not str
+    ):
+        _d321_invalid()
+    try:
+        status = _BillingGroupQuotaEvidenceStatusV1(payload["status"])
+        reason = _BillingGroupQuotaEvidenceReasonV1(payload["reason"])
+    except ValueError:
+        _d321_invalid()
+    supersedes = payload["supersedes_evidence_digest"]
+    if supersedes is not None and not _valid_d321_digest(supersedes):
+        _d321_invalid()
+    if status is _BillingGroupQuotaEvidenceStatusV1.BLOCKED:
+        if (
+            reason is not _BillingGroupQuotaEvidenceReasonV1.BILLING_GROUP_QUOTA
+            or supersedes is not None
+        ):
+            _d321_invalid()
+    elif (
+        reason
+        not in {
+            _BillingGroupQuotaEvidenceReasonV1.AUTHORITY_RESET,
+            _BillingGroupQuotaEvidenceReasonV1.AUTHORITY_REFRESH,
+        }
+        or supersedes is None
+    ):
+        _d321_invalid()
+    issued_seconds = _d321_timestamp_seconds(payload["issued_at_utc"])
+    expires_seconds = _d321_timestamp_seconds(payload["expires_at_utc"])
+    if not 1 <= expires_seconds - issued_seconds <= 900:
+        _d321_invalid()
+    if has_evidence_digest and not _valid_d321_digest(payload["evidence_digest"]):
+        _d321_invalid()
+
+
+class _BillingGroupQuotaEvidenceV1:
+    __slots__ = (
+        "kind",
+        "schema_version",
+        "inventory_authority_generation",
+        "inventory_content_fingerprint",
+        "inventory_binding_digest",
+        "consumer_binding_digest",
+        "billing_group_digest",
+        "status",
+        "reason",
+        "issued_at_utc",
+        "expires_at_utc",
+        "supersedes_evidence_digest",
+        "evidence_digest",
+    )
+
+    def __init__(self, payload: object, *, construction_token: object) -> None:
+        if construction_token is not _D321_EVIDENCE_CONSTRUCTION_TOKEN:
+            raise TypeError("_BillingGroupQuotaEvidenceV1 is private")
+        _d321_validate_evidence_payload(payload, has_evidence_digest=True)
+        self.kind = payload["kind"]
+        self.schema_version = payload["schema_version"]
+        self.inventory_authority_generation = payload[
+            "inventory_authority_generation"
+        ]
+        self.inventory_content_fingerprint = payload["inventory_content_fingerprint"]
+        self.inventory_binding_digest = payload["inventory_binding_digest"]
+        self.consumer_binding_digest = payload["consumer_binding_digest"]
+        self.billing_group_digest = payload["billing_group_digest"]
+        self.status = _BillingGroupQuotaEvidenceStatusV1(payload["status"])
+        self.reason = _BillingGroupQuotaEvidenceReasonV1(payload["reason"])
+        self.issued_at_utc = payload["issued_at_utc"]
+        self.expires_at_utc = payload["expires_at_utc"]
+        self.supersedes_evidence_digest = payload["supersedes_evidence_digest"]
+        self.evidence_digest = payload["evidence_digest"]
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if hasattr(self, name):
+            raise AttributeError("_BillingGroupQuotaEvidenceV1 is immutable")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise AttributeError("_BillingGroupQuotaEvidenceV1 is immutable")
+
+    @classmethod
+    def _for_test(
+        cls,
+        *,
+        inventory_authority_generation: object,
+        inventory_content_fingerprint: object,
+        inventory_binding_digest: object,
+        consumer_binding_digest: object,
+        billing_group_digest: object,
+        status: object,
+        reason: object,
+        issued_at_utc: object,
+        expires_at_utc: object,
+        supersedes_evidence_digest: object,
+    ) -> _BillingGroupQuotaEvidenceV1:
+        preimage = _d321_evidence_preimage(
+            inventory_authority_generation=inventory_authority_generation,
+            inventory_content_fingerprint=inventory_content_fingerprint,
+            inventory_binding_digest=inventory_binding_digest,
+            consumer_binding_digest=consumer_binding_digest,
+            billing_group_digest=billing_group_digest,
+            status=status,
+            reason=reason,
+            issued_at_utc=issued_at_utc,
+            expires_at_utc=expires_at_utc,
+            supersedes_evidence_digest=supersedes_evidence_digest,
+        )
+        return cls(
+            {
+                "kind": _D321_EVIDENCE_KIND,
+                "schema_version": 1,
+                "inventory_authority_generation": inventory_authority_generation,
+                "inventory_content_fingerprint": inventory_content_fingerprint,
+                "inventory_binding_digest": inventory_binding_digest,
+                "consumer_binding_digest": consumer_binding_digest,
+                "billing_group_digest": billing_group_digest,
+                "status": status,
+                "reason": reason,
+                "issued_at_utc": issued_at_utc,
+                "expires_at_utc": expires_at_utc,
+                "supersedes_evidence_digest": supersedes_evidence_digest,
+                "evidence_digest": _d321_sha256_digest(preimage),
+            },
+            construction_token=_D321_EVIDENCE_CONSTRUCTION_TOKEN,
+        )
+
+    def _evidence_preimage(self) -> bytes:
+        return _d321_evidence_preimage(
+            inventory_authority_generation=self.inventory_authority_generation,
+            inventory_content_fingerprint=self.inventory_content_fingerprint,
+            inventory_binding_digest=self.inventory_binding_digest,
+            consumer_binding_digest=self.consumer_binding_digest,
+            billing_group_digest=self.billing_group_digest,
+            status=self.status.value,
+            reason=self.reason.value,
+            issued_at_utc=self.issued_at_utc,
+            expires_at_utc=self.expires_at_utc,
+            supersedes_evidence_digest=self.supersedes_evidence_digest,
+        )
+
+    def _canonical_json_bytes(self) -> bytes:
+        return _d321_flat_json_bytes(
+            {
+                "kind": self.kind,
+                "schema_version": self.schema_version,
+                "inventory_authority_generation": self.inventory_authority_generation,
+                "inventory_content_fingerprint": self.inventory_content_fingerprint,
+                "inventory_binding_digest": self.inventory_binding_digest,
+                "consumer_binding_digest": self.consumer_binding_digest,
+                "billing_group_digest": self.billing_group_digest,
+                "status": self.status.value,
+                "reason": self.reason.value,
+                "issued_at_utc": self.issued_at_utc,
+                "expires_at_utc": self.expires_at_utc,
+                "supersedes_evidence_digest": self.supersedes_evidence_digest,
+                "evidence_digest": self.evidence_digest,
+            },
+            expected_fields=_D321_EVIDENCE_FIELDS,
+        )
+
+    @classmethod
+    def from_canonical_json_bytes(
+        cls, raw: object
+    ) -> _BillingGroupQuotaEvidenceV1:
+        payload = _d321_decode_flat_json(raw, expected_fields=_D321_EVIDENCE_FIELDS)
+        _d321_validate_evidence_payload(payload, has_evidence_digest=True)
+        preimage = _d321_evidence_preimage(
+            inventory_authority_generation=payload[
+                "inventory_authority_generation"
+            ],
+            inventory_content_fingerprint=payload["inventory_content_fingerprint"],
+            inventory_binding_digest=payload["inventory_binding_digest"],
+            consumer_binding_digest=payload["consumer_binding_digest"],
+            billing_group_digest=payload["billing_group_digest"],
+            status=payload["status"],
+            reason=payload["reason"],
+            issued_at_utc=payload["issued_at_utc"],
+            expires_at_utc=payload["expires_at_utc"],
+            supersedes_evidence_digest=payload["supersedes_evidence_digest"],
+        )
+        if payload["evidence_digest"] != _d321_sha256_digest(preimage):
+            _d321_invalid()
+        return cls(payload, construction_token=_D321_EVIDENCE_CONSTRUCTION_TOKEN)
+
+    def __repr__(self) -> str:
+        return "_BillingGroupQuotaEvidenceV1()"
+
+    __str__ = __repr__
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise TypeError("_BillingGroupQuotaEvidenceV1 is not serializable")
 
 
 @dataclass(frozen=True, repr=False)
@@ -671,6 +1184,126 @@ class GoogleAccountInventoryManager:
 
     def inventory_generation(self) -> int:
         return self._snapshot_for_internal_use().generation
+
+    def _reattest_billing_group_quota_evidence(
+        self,
+        evidence: _BillingGroupQuotaEvidenceV1,
+        *,
+        account_ref: str,
+        project_ref: str,
+        key_id: str,
+    ) -> _BillingGroupQuotaEvidenceV1:
+        """Rebind a private D321 value to the current READY inventory snapshot.
+
+        This is deliberately validation-only: P0 has no structured quota port
+        and therefore no production evidence issuance path.
+        """
+
+        with self._lock:
+            if self._state is InventoryManagerStateV1.CLOSED:
+                raise GoogleAccountInventoryError("credential.inventory_manager_closed")
+            if (
+                self._state is not InventoryManagerStateV1.READY
+                or self._active is None
+            ):
+                raise GoogleAccountInventoryError(
+                    "credential.billing_quota_evidence_unavailable"
+                )
+            if type(evidence) is not _BillingGroupQuotaEvidenceV1:
+                _d321_invalid()
+            try:
+                canonical_evidence = (
+                    _BillingGroupQuotaEvidenceV1.from_canonical_json_bytes(
+                        evidence._canonical_json_bytes()
+                    )
+                )
+            except GoogleAccountInventoryError:
+                _d321_invalid()
+            try:
+                now_seconds = _d321_timestamp_seconds(
+                    self._operator_timestamp_utc()
+                )
+            except (GoogleAccountInventoryError, RuntimeError):
+                _d321_invalid()
+            issued_seconds = _d321_timestamp_seconds(canonical_evidence.issued_at_utc)
+            expires_seconds = _d321_timestamp_seconds(
+                canonical_evidence.expires_at_utc
+            )
+            if issued_seconds > now_seconds or expires_seconds <= now_seconds:
+                _d321_invalid()
+            if (
+                not _valid_d321_ascii_string(account_ref)
+                or not _valid_d321_ascii_string(project_ref)
+                or not _valid_d321_ascii_string(key_id)
+            ):
+                _d321_invalid()
+            snapshot = self._active.snapshot
+            if (
+                canonical_evidence.inventory_authority_generation
+                != snapshot.generation
+                or canonical_evidence.inventory_content_fingerprint
+                != snapshot.content_fingerprint
+            ):
+                _d321_invalid()
+            try:
+                account = snapshot.by_account_ref[account_ref]
+                project = snapshot.by_project_ref[project_ref]
+            except KeyError:
+                _d321_invalid()
+            if (
+                not any(candidate is project for candidate in account.projects)
+                or type(project.status) is not str
+                or project.status != "active"
+                or type(project.purpose) is not str
+                or project.purpose != "hive"
+                or type(project.key_id) is not str
+                or project.key_id != key_id
+                or not _valid_d321_ascii_string(project.project_id)
+                or not _valid_d321_ascii_string(project.billing_account_ref)
+            ):
+                _d321_invalid()
+            try:
+                billing_account = snapshot.by_billing_ref[
+                    project.billing_account_ref
+                ]
+            except KeyError:
+                _d321_invalid()
+            if (
+                not any(
+                    candidate is billing_account
+                    for candidate in account.billing_accounts
+                )
+                or not _valid_d321_ascii_string(
+                    billing_account.billing_account_id
+                )
+            ):
+                _d321_invalid()
+            consumer_binding_digest = _d321_consumer_binding_digest(
+                inventory_authority_generation=snapshot.generation,
+                inventory_content_fingerprint=snapshot.content_fingerprint,
+                account_ref=account_ref,
+                project_ref=project_ref,
+                project_id=project.project_id,
+                key_id=key_id,
+            )
+            billing_group_digest = _d321_billing_group_digest(
+                billing_account_id=billing_account.billing_account_id
+            )
+            inventory_binding_digest = _d321_inventory_binding_digest(
+                inventory_authority_generation=snapshot.generation,
+                inventory_content_fingerprint=snapshot.content_fingerprint,
+                consumer_binding_digest=consumer_binding_digest,
+                billing_group_digest=billing_group_digest,
+            )
+            if (
+                canonical_evidence.consumer_binding_digest
+                != consumer_binding_digest
+                or canonical_evidence.billing_group_digest != billing_group_digest
+                or canonical_evidence.inventory_binding_digest
+                != inventory_binding_digest
+            ):
+                _d321_invalid()
+            return evidence
 
     def _read_monotonic(self) -> float:
         try:

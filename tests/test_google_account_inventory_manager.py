@@ -4,6 +4,7 @@ import ast
 from dataclasses import asdict, is_dataclass
 import gc
 import inspect
+import json
 import math
 from pathlib import Path
 import pickle
@@ -129,7 +130,9 @@ def projection_document(
                 "billing_accounts": [
                     {
                         "ref": f"synthetic-billing-{number:02d}",
-                        "billing_account_id": f"{private_marker}-synthetic-billing-{number}",
+                        "billing_account_id": (
+                            f"{private_marker}-synthetic-billing-{number}"
+                        ),
                         "label": f"Billing {number}",
                     }
                 ],
@@ -1745,3 +1748,593 @@ def test_review_parallel_issue_consume_close_and_gc_stay_bounded(
     assert len(manager._lease_records) <= 128
     assert SYNTHETIC_SECRET not in repr(manager)
     assert all(SYNTHETIC_SECRET not in repr(lease) for lease in leases)
+
+
+_D321_FINGERPRINT = "sha256:" + "f" * 64
+_D321_CONSUMER_PREIMAGE = (
+    b'{"account_ref":"account-A","inventory_authority_generation":7,'
+    b'"inventory_content_fingerprint":"sha256:ffffffffffffffffffffffffffffffff'
+    b'ffffffffffffffffffffffffffffffff","key_id":"key-A",'
+    b'"kind":"gemini_consumer_binding.v1","project_id":"project-A",'
+    b'"project_ref":"hive-project-A","schema_version":1}'
+)
+_D321_CONSUMER_DIGEST = (
+    "sha256:2e81c71b212b67fde50070560ebb925af87de40289eb0ed1cbc81e079c2afe24"
+)
+_D321_GROUP_PREIMAGE = (
+    b'{"billing_account_id":"billing-A","kind":"gemini_billing_group.v1",'
+    b'"schema_version":1}'
+)
+_D321_GROUP_DIGEST = (
+    "sha256:5f3891da67bcf03c9d3acd9bdf5b3eb30238f9dc7f231fd79e952a1980bc3c59"
+)
+_D321_INVENTORY_PREIMAGE = (
+    b'{"billing_group_digest":"sha256:5f3891da67bcf03c9d3acd9bdf5b3eb30238f9dc7f231fd79e952a1980bc3c59",'
+    b'"consumer_binding_digest":"sha256:2e81c71b212b67fde50070560ebb925af87de40289eb0ed1cbc81e079c2afe24",'
+    b'"inventory_authority_generation":7,"inventory_content_fingerprint":'
+    b'"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",'
+    b'"kind":"gemini_inventory_billing_binding.v1","schema_version":1}'
+)
+_D321_INVENTORY_DIGEST = (
+    "sha256:9e072a3c09512f0dc75f6b84e2ee355990551fb677157163268d258790028f1e"
+)
+_D321_EVIDENCE_PREIMAGE = (
+    b'{"billing_group_digest":"sha256:5f3891da67bcf03c9d3acd9bdf5b3eb30238f9dc7f231fd79e952a1980bc3c59",'
+    b'"consumer_binding_digest":"sha256:2e81c71b212b67fde50070560ebb925af87de40289eb0ed1cbc81e079c2afe24",'
+    b'"expires_at_utc":"2026-09-23T12:15:00Z",'
+    b'"inventory_authority_generation":7,'
+    b'"inventory_binding_digest":"sha256:9e072a3c09512f0dc75f6b84e2ee355990551fb677157163268d258790028f1e",'
+    b'"inventory_content_fingerprint":"sha256:ffffffffffffffffffffffffffffffff'
+    b'ffffffffffffffffffffffffffffffff","issued_at_utc":"2026-09-23T12:00:00Z",'
+    b'"kind":"billing_group_quota_evidence.v1","reason":"billing_group_quota",'
+    b'"schema_version":1,"status":"blocked","supersedes_evidence_digest":null}'
+)
+_D321_EVIDENCE_DIGEST = (
+    "sha256:8b68af06ae9a708dae4832d6a4ba0129a43a81a00df1f48be93305dcea38739e"
+)
+_D321_EVIDENCE_BYTES = (
+    b'{"billing_group_digest":"sha256:5f3891da67bcf03c9d3acd9bdf5b3eb30238f9dc7f231fd79e952a1980bc3c59",'
+    b'"consumer_binding_digest":"sha256:2e81c71b212b67fde50070560ebb925af87de40289eb0ed1cbc81e079c2afe24",'
+    b'"evidence_digest":"sha256:8b68af06ae9a708dae4832d6a4ba0129a43a81a00df1f48be93305dcea38739e",'
+    b'"expires_at_utc":"2026-09-23T12:15:00Z",'
+    b'"inventory_authority_generation":7,'
+    b'"inventory_binding_digest":"sha256:9e072a3c09512f0dc75f6b84e2ee355990551fb677157163268d258790028f1e",'
+    b'"inventory_content_fingerprint":"sha256:ffffffffffffffffffffffffffffffff'
+    b'ffffffffffffffffffffffffffffffff","issued_at_utc":"2026-09-23T12:00:00Z",'
+    b'"kind":"billing_group_quota_evidence.v1","reason":"billing_group_quota",'
+    b'"schema_version":1,"status":"blocked","supersedes_evidence_digest":null}'
+)
+
+
+def _d321_evidence_for_test(
+    *,
+    inventory_authority_generation: int = 7,
+    inventory_content_fingerprint: str = _D321_FINGERPRINT,
+    inventory_binding_digest: str = _D321_INVENTORY_DIGEST,
+    consumer_binding_digest: str = _D321_CONSUMER_DIGEST,
+    billing_group_digest: str = _D321_GROUP_DIGEST,
+    status: object = "blocked",
+    reason: object = "billing_group_quota",
+    issued_at_utc: object = "2026-09-23T12:00:00Z",
+    expires_at_utc: object = "2026-09-23T12:15:00Z",
+    supersedes_evidence_digest: object = None,
+) -> object:
+    return manager_module._BillingGroupQuotaEvidenceV1._for_test(
+        inventory_authority_generation=inventory_authority_generation,
+        inventory_content_fingerprint=inventory_content_fingerprint,
+        inventory_binding_digest=inventory_binding_digest,
+        consumer_binding_digest=consumer_binding_digest,
+        billing_group_digest=billing_group_digest,
+        status=status,
+        reason=reason,
+        issued_at_utc=issued_at_utc,
+        expires_at_utc=expires_at_utc,
+        supersedes_evidence_digest=supersedes_evidence_digest,
+    )
+
+
+def _d321_json_bytes(payload: object) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _d321_evidence_bound_to_fresh_manager(
+    manager: GoogleAccountInventoryManager,
+    *,
+    generation: int | None = None,
+    fingerprint: str | None = None,
+    account_ref: str = "synthetic-account-01",
+    project_ref: str = "the-hive-1",
+    project_id: str = "000789",
+    key_id: str = "000654",
+    billing_account_id: str = "000456",
+    issued_at_utc: object = "2026-08-23T11:55:00Z",
+    expires_at_utc: object = "2026-08-23T12:05:00Z",
+) -> object:
+    snapshot = manager._snapshot_for_internal_use()
+    authority_generation = (
+        snapshot.generation if generation is None else generation
+    )
+    content_fingerprint = (
+        snapshot.content_fingerprint if fingerprint is None else fingerprint
+    )
+    consumer_binding_digest = manager_module._d321_consumer_binding_digest(
+        inventory_authority_generation=authority_generation,
+        inventory_content_fingerprint=content_fingerprint,
+        account_ref=account_ref,
+        project_ref=project_ref,
+        project_id=project_id,
+        key_id=key_id,
+    )
+    billing_group_digest = manager_module._d321_billing_group_digest(
+        billing_account_id=billing_account_id
+    )
+    inventory_binding_digest = manager_module._d321_inventory_binding_digest(
+        inventory_authority_generation=authority_generation,
+        inventory_content_fingerprint=content_fingerprint,
+        consumer_binding_digest=consumer_binding_digest,
+        billing_group_digest=billing_group_digest,
+    )
+    return manager_module._BillingGroupQuotaEvidenceV1._for_test(
+        inventory_authority_generation=authority_generation,
+        inventory_content_fingerprint=content_fingerprint,
+        inventory_binding_digest=inventory_binding_digest,
+        consumer_binding_digest=consumer_binding_digest,
+        billing_group_digest=billing_group_digest,
+        status="blocked",
+        reason="billing_group_quota",
+        issued_at_utc=issued_at_utc,
+        expires_at_utc=expires_at_utc,
+        supersedes_evidence_digest=None,
+    )
+
+
+def test_d321_digest_preimages_have_exact_gold_bytes_and_sha256() -> None:
+    consumer_preimage = manager_module._d321_consumer_binding_preimage(
+        inventory_authority_generation=7,
+        inventory_content_fingerprint=_D321_FINGERPRINT,
+        account_ref="account-A",
+        project_ref="hive-project-A",
+        project_id="project-A",
+        key_id="key-A",
+    )
+    group_preimage = manager_module._d321_billing_group_preimage(
+        billing_account_id="billing-A"
+    )
+    inventory_preimage = manager_module._d321_inventory_binding_preimage(
+        inventory_authority_generation=7,
+        inventory_content_fingerprint=_D321_FINGERPRINT,
+        consumer_binding_digest=_D321_CONSUMER_DIGEST,
+        billing_group_digest=_D321_GROUP_DIGEST,
+    )
+    evidence = _d321_evidence_for_test()
+
+    assert consumer_preimage == _D321_CONSUMER_PREIMAGE
+    assert manager_module._d321_consumer_binding_digest(
+        inventory_authority_generation=7,
+        inventory_content_fingerprint=_D321_FINGERPRINT,
+        account_ref="account-A",
+        project_ref="hive-project-A",
+        project_id="project-A",
+        key_id="key-A",
+    ) == _D321_CONSUMER_DIGEST
+    assert group_preimage == _D321_GROUP_PREIMAGE
+    assert manager_module._d321_billing_group_digest(
+        billing_account_id="billing-A"
+    ) == _D321_GROUP_DIGEST
+    assert inventory_preimage == _D321_INVENTORY_PREIMAGE
+    assert manager_module._d321_inventory_binding_digest(
+        inventory_authority_generation=7,
+        inventory_content_fingerprint=_D321_FINGERPRINT,
+        consumer_binding_digest=_D321_CONSUMER_DIGEST,
+        billing_group_digest=_D321_GROUP_DIGEST,
+    ) == _D321_INVENTORY_DIGEST
+    assert evidence._evidence_preimage() == _D321_EVIDENCE_PREIMAGE
+    assert evidence.evidence_digest == _D321_EVIDENCE_DIGEST
+
+
+def test_d321_evidence_codec_accepts_only_exact_canonical_13_field_value() -> None:
+    evidence = _d321_evidence_for_test()
+    raw = evidence._canonical_json_bytes()
+    decoded = manager_module._BillingGroupQuotaEvidenceV1.from_canonical_json_bytes(
+        raw
+    )
+
+    assert raw == _D321_EVIDENCE_BYTES
+    assert decoded._canonical_json_bytes() == raw
+    assert decoded.evidence_digest == _D321_EVIDENCE_DIGEST
+    assert repr(decoded) == "_BillingGroupQuotaEvidenceV1()"
+    assert not hasattr(decoded, "public_projection")
+    with pytest.raises(AttributeError, match="immutable"):
+        decoded.evidence_digest = _D321_CONSUMER_DIGEST
+    with pytest.raises(TypeError, match="not serializable"):
+        pickle.dumps(decoded)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b'{"kind":"billing_group_quota_evidence.v1",'
+        b'"kind":"billing_group_quota_evidence.v1"}',
+        _d321_json_bytes(
+            {
+                key: value
+                for key, value in json.loads(
+                    _d321_evidence_for_test()._canonical_json_bytes()
+                ).items()
+                if key != "reason"
+            }
+        ),
+        _d321_json_bytes(
+            {
+                **json.loads(_d321_evidence_for_test()._canonical_json_bytes()),
+                "unexpected": "x",
+            }
+        ),
+        _d321_json_bytes(
+            {
+                **json.loads(_d321_evidence_for_test()._canonical_json_bytes()),
+                "schema_version": True,
+            }
+        ),
+        _d321_json_bytes(
+            {
+                **json.loads(_d321_evidence_for_test()._canonical_json_bytes()),
+                "schema_version": 1.0,
+            }
+        ),
+        _d321_json_bytes(
+            {
+                **json.loads(_d321_evidence_for_test()._canonical_json_bytes()),
+                "status": ["blocked"],
+            }
+        ),
+        _d321_json_bytes(
+            {
+                **json.loads(_d321_evidence_for_test()._canonical_json_bytes()),
+                "reason": {"value": "billing_group_quota"},
+            }
+        ),
+        _d321_evidence_for_test()
+        ._canonical_json_bytes()
+        .replace(b'"blocked"', b'"bl\\u006fcked"'),
+        b" " + _d321_evidence_for_test()._canonical_json_bytes(),
+    ),
+)
+def test_d321_evidence_codec_rejects_non_contract_input(raw: bytes) -> None:
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._BillingGroupQuotaEvidenceV1.from_canonical_json_bytes(raw)
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "supersedes_evidence_digest"),
+    (
+        ("blocked", "authority_reset", None),
+        ("blocked", "billing_group_quota", _D321_EVIDENCE_DIGEST),
+        ("cleared", "billing_group_quota", _D321_EVIDENCE_DIGEST),
+        ("cleared", "authority_refresh", None),
+        ("open", "billing_group_quota", None),
+        ("cleared", "unknown", _D321_EVIDENCE_DIGEST),
+    ),
+)
+def test_d321_evidence_rejects_closed_status_reason_and_supersede_breaks(
+    status: object, reason: object, supersedes_evidence_digest: object
+) -> None:
+    with pytest.raises(GoogleAccountInventoryError):
+        _d321_evidence_for_test(
+            status=status,
+            reason=reason,
+            supersedes_evidence_digest=supersedes_evidence_digest,
+        )
+
+
+@pytest.mark.parametrize(
+    ("issued_at_utc", "expires_at_utc"),
+    (
+        ("2026-09-23T12:00:00Z", "2026-09-23T12:00:00Z"),
+        ("2026-09-23T12:00:00Z", "2026-09-23T12:15:01Z"),
+        ("2026-09-23T12:00:00Z", "2026-09-23T12:00:00+00:00"),
+        ("2026-09-23T12:00:00Z", "2026-09-23T12:00:00\x01"),
+    ),
+)
+def test_d321_evidence_rejects_non_strict_or_out_of_bound_ttl(
+    issued_at_utc: object, expires_at_utc: object
+) -> None:
+    with pytest.raises(GoogleAccountInventoryError):
+        _d321_evidence_for_test(
+            issued_at_utc=issued_at_utc,
+            expires_at_utc=expires_at_utc,
+        )
+
+
+def test_d321_manager_reattests_only_current_ready_snapshot_and_binding(
+    tmp_path: Path,
+) -> None:
+    manager = test_manager(fresh_document(tmp_path))
+    manager.reload()
+    evidence = _d321_evidence_bound_to_fresh_manager(manager)
+
+    assert manager._reattest_billing_group_quota_evidence(
+        evidence,
+        account_ref="synthetic-account-01",
+        project_ref="the-hive-1",
+        key_id="000654",
+    ) is evidence
+
+    for stale_evidence, account_ref, project_ref, key_id in (
+        (
+            _d321_evidence_bound_to_fresh_manager(
+                manager, generation=manager.inventory_generation() + 1
+            ),
+            "synthetic-account-01",
+            "the-hive-1",
+            "000654",
+        ),
+        (
+            _d321_evidence_bound_to_fresh_manager(
+                manager,
+                fingerprint="sha256:" + "0" * 64,
+            ),
+            "synthetic-account-01",
+            "the-hive-1",
+            "000654",
+        ),
+        (
+            evidence,
+            "synthetic-account-02",
+            "the-hive-1",
+            "000654",
+        ),
+        (
+            evidence,
+            "synthetic-account-01",
+            "the-hive-1",
+            "000655",
+        ),
+    ):
+        with pytest.raises(GoogleAccountInventoryError):
+            manager._reattest_billing_group_quota_evidence(
+                stale_evidence,
+                account_ref=account_ref,
+                project_ref=project_ref,
+                key_id=key_id,
+            )
+
+
+def test_d321_manager_reattest_rejects_future_or_expired_evidence_and_no_issue_port(
+    tmp_path: Path,
+) -> None:
+    manager = test_manager(fresh_document(tmp_path))
+    manager.reload()
+
+    for evidence in (
+        _d321_evidence_bound_to_fresh_manager(
+            manager,
+            issued_at_utc="2026-08-23T12:01:00Z",
+            expires_at_utc="2026-08-23T12:02:00Z",
+        ),
+        _d321_evidence_bound_to_fresh_manager(
+            manager,
+            issued_at_utc="2026-08-23T11:50:00Z",
+            expires_at_utc="2026-08-23T11:59:00Z",
+        ),
+    ):
+        with pytest.raises(GoogleAccountInventoryError):
+            manager._reattest_billing_group_quota_evidence(
+                evidence,
+                account_ref="synthetic-account-01",
+                project_ref="the-hive-1",
+                key_id="000654",
+            )
+
+    assert not hasattr(manager_module, "_QuotaVerdictV1")
+    assert not hasattr(
+        GoogleAccountInventoryManager, "_issue_billing_group_quota_evidence"
+    )
+
+
+def test_d321_pair_decoder_rejects_unknown_and_missing_before_map_materialization(
+) -> None:
+    expected_fields = frozenset({"first", "second"})
+
+    assert manager_module._d321_pairs_to_flat_object(
+        [("first", 1), ("second", "value")], expected_fields=expected_fields
+    ) == {"first": 1, "second": "value"}
+    for pairs in (
+        [("first", 1), ("unexpected", "value")],
+        [("first", 1)],
+        [("first", 1), ("first", 2)],
+    ):
+        with pytest.raises(GoogleAccountInventoryError):
+            manager_module._d321_pairs_to_flat_object(
+                pairs, expected_fields=expected_fields
+            )
+
+
+@pytest.mark.parametrize("reason", ("authority_reset", "authority_refresh"))
+def test_d321_clear_evidence_round_trips_for_each_allowed_reason(
+    reason: str,
+) -> None:
+    evidence = _d321_evidence_for_test(
+        status="cleared",
+        reason=reason,
+        supersedes_evidence_digest=_D321_EVIDENCE_DIGEST,
+    )
+
+    decoded = manager_module._BillingGroupQuotaEvidenceV1.from_canonical_json_bytes(
+        evidence._canonical_json_bytes()
+    )
+
+    assert decoded.status.value == "cleared"
+    assert decoded.reason.value == reason
+    assert decoded.supersedes_evidence_digest == _D321_EVIDENCE_DIGEST
+    assert decoded._canonical_json_bytes() == evidence._canonical_json_bytes()
+
+
+def test_d321_each_binding_raw_component_changes_its_digest() -> None:
+    consumer_arguments = {
+        "inventory_authority_generation": 7,
+        "inventory_content_fingerprint": _D321_FINGERPRINT,
+        "account_ref": "account-A",
+        "project_ref": "hive-project-A",
+        "project_id": "project-A",
+        "key_id": "key-A",
+    }
+    baseline_consumer = manager_module._d321_consumer_binding_digest(
+        **consumer_arguments
+    )
+    for field, replacement in (
+        ("inventory_authority_generation", 8),
+        ("inventory_content_fingerprint", "sha256:" + "0" * 64),
+        ("account_ref", "account-B"),
+        ("project_ref", "hive-project-B"),
+        ("project_id", "project-B"),
+        ("key_id", "key-B"),
+    ):
+        changed_arguments = {**consumer_arguments, field: replacement}
+        assert (
+            manager_module._d321_consumer_binding_digest(**changed_arguments)
+            != baseline_consumer
+        )
+
+    assert manager_module._d321_billing_group_digest(
+        billing_account_id="billing-B"
+    ) != manager_module._d321_billing_group_digest(billing_account_id="billing-A")
+
+
+def test_d321_codec_rejects_tampered_value_without_recomputed_evidence_digest() -> None:
+    payload = json.loads(_d321_evidence_for_test()._canonical_json_bytes())
+    payload["inventory_content_fingerprint"] = "sha256:" + "0" * 64
+
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._BillingGroupQuotaEvidenceV1.from_canonical_json_bytes(
+            _d321_json_bytes(payload)
+        )
+
+
+@pytest.mark.parametrize("token", (b"NaN", b"Infinity", b"-Infinity"))
+def test_d321_codec_rejects_json_nonfinite_tokens(token: bytes) -> None:
+    raw = _d321_evidence_for_test()._canonical_json_bytes().replace(
+        b'"schema_version":1', b'"schema_version":' + token
+    )
+
+    with pytest.raises(GoogleAccountInventoryError):
+        manager_module._BillingGroupQuotaEvidenceV1.from_canonical_json_bytes(raw)
+
+
+def test_d321_manager_reattest_rejects_replaced_blocked_or_closed_snapshot(
+    tmp_path: Path,
+) -> None:
+    first = fresh_document(tmp_path / "first")
+    replacement = fresh_document(
+        tmp_path / "replacement", key_id="000655", generation=2
+    )
+    manager = test_manager(first, replacement)
+    manager.reload()
+    evidence = _d321_evidence_bound_to_fresh_manager(manager)
+    manager.reload(expected_generation=1)
+
+    with pytest.raises(GoogleAccountInventoryError):
+        manager._reattest_billing_group_quota_evidence(
+            evidence,
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
+
+    blocked_manager = test_manager(
+        fresh_document(tmp_path / "blocked"),
+        GoogleAccountInventoryError("credential.inventory_reload_failed"),
+    )
+    blocked_manager.reload()
+    blocked_evidence = _d321_evidence_bound_to_fresh_manager(blocked_manager)
+    with pytest.raises(GoogleAccountInventoryError):
+        blocked_manager.reload()
+    with pytest.raises(GoogleAccountInventoryError):
+        blocked_manager._reattest_billing_group_quota_evidence(
+            blocked_evidence,
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
+
+    closed_manager = test_manager(fresh_document(tmp_path / "closed"))
+    closed_manager.reload()
+    closed_evidence = _d321_evidence_bound_to_fresh_manager(closed_manager)
+    closed_manager.close()
+    with pytest.raises(GoogleAccountInventoryError):
+        closed_manager._reattest_billing_group_quota_evidence(
+            closed_evidence,
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
+
+
+def test_d321_manager_reattest_converts_unknown_operator_clock_to_invalid(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def operator_timestamp_utc() -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "2026-08-23T12:00:00Z"
+        raise RuntimeError("synthetic clock unavailable")
+
+    manager = GoogleAccountInventoryManager._for_test_loader(
+        sequence_loader(fresh_document(tmp_path)),
+        monotonic_clock=FakeMonotonic(),
+        operator_timestamp_utc=operator_timestamp_utc,
+    )
+    manager.reload()
+    evidence = _d321_evidence_bound_to_fresh_manager(manager)
+
+    with pytest.raises(
+        GoogleAccountInventoryError,
+        match="credential.billing_quota_evidence_invalid",
+    ):
+        manager._reattest_billing_group_quota_evidence(
+            evidence,
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
+
+
+def test_d321_manager_reattest_does_not_swallow_outside_clock_exception(
+    tmp_path: Path,
+) -> None:
+    class OutsideClockFailure(Exception):
+        pass
+
+    calls = 0
+
+    def operator_timestamp_utc() -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "2026-08-23T12:00:00Z"
+        raise OutsideClockFailure("synthetic outside clock failure")
+
+    manager = GoogleAccountInventoryManager._for_test_loader(
+        sequence_loader(fresh_document(tmp_path)),
+        monotonic_clock=FakeMonotonic(),
+        operator_timestamp_utc=operator_timestamp_utc,
+    )
+    manager.reload()
+    evidence = _d321_evidence_bound_to_fresh_manager(manager)
+
+    with pytest.raises(OutsideClockFailure):
+        manager._reattest_billing_group_quota_evidence(
+            evidence,
+            account_ref="synthetic-account-01",
+            project_ref="the-hive-1",
+            key_id="000654",
+        )
