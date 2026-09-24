@@ -8,18 +8,21 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 from datetime import UTC, datetime
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import posixpath
 import stat
 import subprocess
 import runpy
 import shutil
 import tempfile
-from collections.abc import Callable, Mapping
+import unicodedata
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
@@ -53,6 +56,1828 @@ class RuntimeLifecycleError(ValueError):
 
 def _error(code: str) -> RuntimeLifecycleError:
     return RuntimeLifecycleError(code)
+
+
+class D320CutoverJournalError(ValueError):
+    """D332's pure, fail-closed journal contract violation."""
+
+
+_D320_SCHEMA = "D320CutoverJournalV1"
+_D320_MAX_ENVELOPE_BYTES = 4_194_304
+_D320_MAX_BLOB_BYTES = 1_048_576
+_D320_MAX_AGGREGATE_BYTES = 3 * 1_048_576
+_D320_MAX_U63 = (1 << 63) - 1
+_D320_MAX_CONTAINER_DEPTH = 64
+_D320_MAX_CONTAINER_NODES = 65_536
+_D320_MAX_JSON_ENTRIES = 65_536
+_D320_ENVELOPE_FIXED_BYTES = len(
+    b'{"content_sha256":"' + b"0" * 64 + b'","payload":' + b"}\n"
+)
+_D320_SNAPSHOT_NAMES = (
+    "pointer",
+    "mcp_launcher",
+    "user_launcher",
+    "legacy_launcher",
+    "service",
+    "timer",
+    "config_binding",
+)
+_D320_ARTIFACT_NAMES = (*_D320_SNAPSHOT_NAMES, "unit_status")
+_D320_ABORT_BLOCK_REASONS = {
+    "unreadable": "UNREADABLE_BLOCKED",
+    "mixed_without_complete_inverse": "MIXED_BLOCKED",
+    "noninvertible": "NONINVERTIBLE_BLOCKED",
+}
+_D320_STATES = (
+    "ABSENT",
+    "PREFLIGHTED",
+    "ROOT_ABI_VERIFIED",
+    "NATIVE_PREPARED_DISABLED",
+    "NATIVE_TRUST_VERIFIED_DISABLED",
+    "NATIVE_COMMITTED_DISABLED",
+    "USER_CUTOVER_IN_PROGRESS",
+    "USER_CUTOVER_VERIFIED",
+    "ISOLATED_HOOK_PROBE_VERIFIED",
+    "MCP_HANDSHAKE_VERIFIED",
+    "LIVE_GRANTED",
+    "ABORTING",
+    "ROLLED_BACK",
+    "BLOCKED",
+)
+_D320_NORMAL_STATES = (
+    "ABSENT",
+    "PREFLIGHTED",
+    "ROOT_ABI_VERIFIED",
+    "NATIVE_PREPARED_DISABLED",
+    "NATIVE_TRUST_VERIFIED_DISABLED",
+    "NATIVE_COMMITTED_DISABLED",
+    "USER_CUTOVER_IN_PROGRESS",
+    "USER_CUTOVER_VERIFIED",
+    "ISOLATED_HOOK_PROBE_VERIFIED",
+    "MCP_HANDSHAKE_VERIFIED",
+    "LIVE_GRANTED",
+)
+_D320_TERMINAL_STATES = frozenset(("LIVE_GRANTED", "ROLLED_BACK", "BLOCKED"))
+D324_LOCK_ORDER = (
+    "D324-Journallock",
+    "Lifecycle-Lock",
+    "Rootexecutor-Lock",
+    "Adapter-Lock",
+    "Release-Publishlock",
+    "Pin-Store-Lock",
+)
+
+
+def _d320_fail(code: str) -> None:
+    raise D320CutoverJournalError(code)
+
+
+@dataclass(slots=True)
+class _D320JsonTraversalBudget:
+    entries: int = 0
+    nodes: int = 0
+
+
+def _d320_visit_json_entry(budget: _D320JsonTraversalBudget) -> None:
+    budget.entries += 1
+    if budget.entries > _D320_MAX_JSON_ENTRIES:
+        _d320_fail("d320_json_entries_invalid")
+
+
+def _d320_visit_json_node(budget: _D320JsonTraversalBudget) -> None:
+    budget.nodes += 1
+    if budget.nodes > _D320_MAX_CONTAINER_NODES:
+        _d320_fail("d320_json_nodes_invalid")
+
+
+def _d320_budget_error(error: D320CutoverJournalError) -> bool:
+    return str(error) in ("d320_json_entries_invalid", "d320_json_nodes_invalid")
+
+
+def _d320_bytes_copy(value: object, *, code: str) -> bytes:
+    if not isinstance(value, bytes):
+        _d320_fail(code)
+    if type(value) is bytes:
+        return value
+    try:
+        return memoryview(value).tobytes()
+    except MemoryError as exc:
+        raise D320CutoverJournalError(code) from exc
+    except Exception as exc:
+        raise D320CutoverJournalError(code) from exc
+
+
+def _d320_carrier_bytes(value: object, *, code: str) -> bytes:
+    return _d320_bytes_copy(value, code=code)
+
+
+def _d320_validate_envelope_payload_size(payload_bytes: object) -> bytes:
+    payload_bytes = _d320_bytes_copy(
+        payload_bytes, code="d320_envelope_too_large"
+    )
+    if (
+        len(payload_bytes) + _D320_ENVELOPE_FIXED_BYTES
+        > _D320_MAX_ENVELOPE_BYTES
+    ):
+        _d320_fail("d320_envelope_too_large")
+    return payload_bytes
+
+
+def _d320_int(value: object, *, minimum: int = 0, maximum: int = _D320_MAX_U63) -> int:
+    if type(value) is not int:
+        _d320_fail("d320_integer_required")
+    if value < minimum or value > maximum:
+        _d320_fail("d320_integer_out_of_bounds")
+    return value
+
+
+def _d320_text(
+    value: object,
+    *,
+    minimum: int = 1,
+    maximum: int = 4096,
+    ascii_only: bool = False,
+) -> str:
+    if type(value) is not str:
+        _d320_fail("d320_text_invalid")
+    try:
+        byte_length = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise D320CutoverJournalError("d320_text_invalid") from exc
+    if not minimum <= byte_length <= maximum:
+        _d320_fail("d320_text_invalid")
+    if unicodedata.normalize("NFC", value) != value:
+        _d320_fail("d320_text_not_nfc")
+    for character in value:
+        point = ord(character)
+        if 0xD800 <= point <= 0xDFFF or point <= 0x1F or 0x7F <= point <= 0x9F:
+            _d320_fail("d320_text_forbidden_codepoint")
+        if ascii_only and point > 0x7F:
+            _d320_fail("d320_text_not_ascii")
+    return value
+
+
+def _d320_sha256(value: object) -> str:
+    text = _d320_text(value, minimum=64, maximum=64, ascii_only=True)
+    if any(character not in "0123456789abcdef" for character in text):
+        _d320_fail("d320_sha256_invalid")
+    return text
+
+
+def _d320_git_hex(value: object) -> str:
+    text = _d320_text(value, minimum=40, maximum=64, ascii_only=True)
+    if len(text) not in (40, 64) or any(
+        character not in "0123456789abcdef" for character in text
+    ):
+        _d320_fail("d320_git_hex_invalid")
+    return text
+
+
+def _d320_object(
+    value: object, keys: Sequence[str], *, code: str
+) -> Mapping[str, object]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != set(keys)
+        or len(value) != len(keys)
+    ):
+        _d320_fail(code)
+    for key in value:
+        _d320_text(key, ascii_only=True)
+    return value
+
+
+def _d320_json_value(
+    value: object,
+    *,
+    semantic: bool = True,
+    budget: _D320JsonTraversalBudget | None = None,
+) -> None:
+    """Bound every public JSON-shaped input before using its structure."""
+
+    traversal_budget = budget or _D320JsonTraversalBudget()
+    active: set[int] = set()
+    stack: list[tuple[object, ...]] = [("value", value, 1)]
+    try:
+        while stack:
+            action, *parts = stack.pop()
+            if action == "leave":
+                active.remove(int(parts[0]))
+                continue
+            if action == "mapping":
+                iterator, depth = parts
+                try:
+                    key, child = next(iterator)
+                except StopIteration:
+                    continue
+                _d320_visit_json_entry(traversal_budget)
+                if semantic:
+                    _d320_text(key, minimum=0, ascii_only=False)
+                elif not isinstance(key, str):
+                    _d320_fail("d320_json_type_forbidden")
+                stack.append(("mapping", iterator, depth))
+                stack.append(("value", child, int(depth) + 1))
+                continue
+            if action == "list":
+                iterator, depth = parts
+                try:
+                    child = next(iterator)
+                except StopIteration:
+                    continue
+                _d320_visit_json_entry(traversal_budget)
+                stack.append(("list", iterator, depth))
+                stack.append(("value", child, int(depth) + 1))
+                continue
+            item, depth = parts
+            if item is None or isinstance(item, bool) or isinstance(item, int):
+                continue
+            if isinstance(item, float):
+                if semantic:
+                    _d320_fail("d320_float_forbidden")
+                continue
+            if isinstance(item, str):
+                if semantic:
+                    _d320_text(item, minimum=0)
+                continue
+            if not isinstance(item, (list, Mapping)):
+                _d320_fail("d320_json_type_forbidden")
+            if int(depth) > _D320_MAX_CONTAINER_DEPTH:
+                _d320_fail("d320_json_depth_invalid")
+            identifier = id(item)
+            if identifier in active:
+                _d320_fail("d320_json_cycle_invalid")
+            _d320_visit_json_node(traversal_budget)
+            active.add(identifier)
+            stack.append(("leave", identifier))
+            if isinstance(item, list):
+                stack.append(("list", iter(item), int(depth)))
+            else:
+                stack.append(("mapping", iter(item.items()), int(depth)))
+    except D320CutoverJournalError:
+        raise
+    except MemoryError as exc:
+        raise D320CutoverJournalError("d320_json_input_invalid") from exc
+    except Exception as exc:
+        raise D320CutoverJournalError("d320_json_input_invalid") from exc
+
+
+def _d320_normalize_json_value(
+    value: object,
+    *,
+    budget: _D320JsonTraversalBudget,
+) -> object:
+    """Copy one untrusted JSON graph while applying its cumulative bounds."""
+
+    active: set[int] = set()
+
+    def normalize(item: object, depth: int) -> object:
+        if item is None or isinstance(item, bool) or isinstance(item, int):
+            return item
+        if isinstance(item, float):
+            _d320_fail("d320_float_forbidden")
+        if isinstance(item, str):
+            return _d320_text(item, minimum=0)
+        if not isinstance(item, (list, Mapping)):
+            _d320_fail("d320_json_type_forbidden")
+        if depth > _D320_MAX_CONTAINER_DEPTH:
+            _d320_fail("d320_json_depth_invalid")
+        identifier = id(item)
+        if identifier in active:
+            _d320_fail("d320_json_cycle_invalid")
+        _d320_visit_json_node(budget)
+        active.add(identifier)
+        try:
+            if isinstance(item, list):
+                result: list[object] = []
+                iterator = iter(item)
+                while True:
+                    try:
+                        child = next(iterator)
+                    except StopIteration:
+                        break
+                    _d320_visit_json_entry(budget)
+                    result.append(normalize(child, depth + 1))
+                return result
+            result = {}
+            iterator = iter(item.items())
+            while True:
+                try:
+                    key, child = next(iterator)
+                except StopIteration:
+                    break
+                _d320_visit_json_entry(budget)
+                key = _d320_text(key, minimum=0)
+                if key in result:
+                    _d320_fail("d320_duplicate_json_key")
+                result[key] = normalize(child, depth + 1)
+            return result
+        finally:
+            active.remove(identifier)
+
+    try:
+        return normalize(value, 1)
+    except D320CutoverJournalError:
+        raise
+    except MemoryError as exc:
+        raise D320CutoverJournalError("d320_json_input_invalid") from exc
+    except Exception as exc:
+        raise D320CutoverJournalError("d320_json_input_invalid") from exc
+
+
+def _d320_canonical_json(
+    value: object, *, budget: _D320JsonTraversalBudget | None = None
+) -> bytes:
+    traversal_budget = budget or _D320JsonTraversalBudget()
+    normalized = _d320_normalize_json_value(value, budget=traversal_budget)
+    try:
+        return json.dumps(
+            normalized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError) as exc:
+        raise D320CutoverJournalError("d320_canonical_json_invalid") from exc
+
+
+def _d320_syntax_json(
+    value: object, *, budget: _D320JsonTraversalBudget | None = None
+) -> bytes:
+    _d320_json_value(value, semantic=False, budget=budget)
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8", errors="backslashreplace")
+    except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError) as exc:
+        raise D320CutoverJournalError("d320_canonical_json_invalid") from exc
+
+
+def _d320_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            _d320_fail("d320_duplicate_json_key")
+        result[key] = value
+    return result
+
+
+def _d320_parse_json(raw: object) -> object:
+    raw = _d320_bytes_copy(raw, code="d320_json_invalid")
+    try:
+        text = raw.decode("utf-8")
+        return json.loads(
+            text,
+            object_pairs_hook=_d320_pairs,
+            parse_constant=lambda _value: _d320_fail("d320_nonfinite_forbidden"),
+        )
+    except (
+        MemoryError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise D320CutoverJournalError("d320_json_invalid") from exc
+
+
+def _d320_immutable_mapping(
+    payload_bytes: object,
+    validator: Callable[[object], Mapping[str, object]],
+) -> dict[str, object]:
+    payload_bytes = _d320_bytes_copy(
+        payload_bytes, code="d320_wrapper_bytes_invalid"
+    )
+    if len(payload_bytes) > _D320_MAX_ENVELOPE_BYTES:
+        _d320_fail("d320_wrapper_bytes_invalid")
+    parsed = _d320_parse_json(payload_bytes)
+    if not isinstance(parsed, dict):
+        _d320_fail("d320_wrapper_mapping_invalid")
+    _d320_json_value(parsed)
+    validator(parsed)
+    if _d320_canonical_json(parsed) != payload_bytes:
+        _d320_fail("d320_wrapper_not_canonical")
+    return parsed
+
+
+def _d320_sequence_copy(
+    value: object,
+    *,
+    maximum: int,
+    code: str,
+    budget: _D320JsonTraversalBudget | None = None,
+) -> list[object]:
+    traversal_budget = budget or _D320JsonTraversalBudget()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        _d320_fail(code)
+    try:
+        length = len(value)
+        if length > maximum:
+            _d320_fail(code)
+        iterator = iter(value)
+        result: list[object] = []
+        for index in range(length + 1):
+            try:
+                item = next(iterator)
+            except StopIteration:
+                if index != length:
+                    _d320_fail(code)
+                break
+            _d320_visit_json_entry(traversal_budget)
+            if index == length:
+                _d320_fail(code)
+            result.append(
+                _d320_normalize_json_value(item, budget=traversal_budget)
+            )
+    except D320CutoverJournalError:
+        raise
+    except MemoryError as exc:
+        raise D320CutoverJournalError(code) from exc
+    except Exception as exc:
+        raise D320CutoverJournalError(code) from exc
+    return result
+
+
+def _d320_base64(
+    value: object,
+    *,
+    size: int,
+    maximum_size: int = _D320_MAX_BLOB_BYTES,
+) -> str:
+    if not isinstance(value, str):
+        _d320_fail("d320_base64_invalid")
+    _d320_text(
+        value,
+        minimum=0,
+        maximum=4 * ((maximum_size + 2) // 3),
+        ascii_only=True,
+    )
+    try:
+        decoded = base64.b64decode(value.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise D320CutoverJournalError("d320_base64_invalid") from exc
+    if base64.b64encode(decoded).decode("ascii") != value or len(decoded) != size:
+        _d320_fail("d320_base64_noncanonical")
+    return value
+
+
+def _d320_validate_evidence(
+    value: object, *, aggregate: list[int] | None = None
+) -> Mapping[str, object]:
+    evidence = _d320_object(
+        value,
+        ("kind", "format", "bytes_b64", "sha256", "size"),
+        code="d320_evidence_fields_invalid",
+    )
+    _d320_text(evidence["kind"], maximum=64, ascii_only=True)
+    _d320_text(evidence["format"], maximum=64, ascii_only=True)
+    size = _d320_int(evidence["size"], maximum=_D320_MAX_BLOB_BYTES)
+    encoded = _d320_base64(evidence["bytes_b64"], size=size)
+    decoded = base64.b64decode(encoded.encode("ascii"), validate=True)
+    if hashlib.sha256(decoded).hexdigest() != _d320_sha256(evidence["sha256"]):
+        _d320_fail("d320_evidence_digest_invalid")
+    if aggregate is not None:
+        aggregate[0] += size
+        if aggregate[0] > _D320_MAX_AGGREGATE_BYTES:
+            _d320_fail("d320_evidence_aggregate_too_large")
+    return evidence
+
+
+def _d320_validate_absolute_path(value: object) -> str:
+    path = _d320_text(value, maximum=4096)
+    if not path.startswith("/") or "\x00" in path:
+        _d320_fail("d320_snapshot_path_invalid")
+    if posixpath.normpath(path) != path or any(
+        part in ("", ".", "..") for part in path.split("/")[1:]
+    ):
+        _d320_fail("d320_snapshot_path_not_normal")
+    return path
+
+
+def _d320_validate_snapshot(
+    value: object, *, aggregate: list[int] | None = None
+) -> Mapping[str, object]:
+    snapshot = _d320_object(
+        value,
+        (
+            "name",
+            "path",
+            "present",
+            "bytes_b64",
+            "sha256",
+            "dev",
+            "ino",
+            "uid",
+            "gid",
+            "mode",
+            "nlink",
+            "size",
+        ),
+        code="d320_snapshot_fields_invalid",
+    )
+    _d320_text(snapshot["name"], maximum=128, ascii_only=True)
+    _d320_validate_absolute_path(snapshot["path"])
+    if not isinstance(snapshot["present"], bool):
+        _d320_fail("d320_snapshot_present_invalid")
+    data_fields = (
+        "bytes_b64",
+        "sha256",
+        "dev",
+        "ino",
+        "uid",
+        "gid",
+        "mode",
+        "nlink",
+        "size",
+    )
+    if not snapshot["present"]:
+        if any(snapshot[field] is not None for field in data_fields):
+            _d320_fail("d320_absent_snapshot_has_data")
+        return snapshot
+    if any(snapshot[field] is None for field in data_fields):
+        _d320_fail("d320_present_snapshot_missing_data")
+    size = _d320_int(snapshot["size"], maximum=_D320_MAX_AGGREGATE_BYTES)
+    encoded = _d320_base64(
+        snapshot["bytes_b64"],
+        size=size,
+        maximum_size=_D320_MAX_AGGREGATE_BYTES,
+    )
+    decoded = base64.b64decode(encoded.encode("ascii"), validate=True)
+    if hashlib.sha256(decoded).hexdigest() != _d320_sha256(snapshot["sha256"]):
+        _d320_fail("d320_snapshot_digest_invalid")
+    _d320_int(snapshot["dev"])
+    _d320_int(snapshot["ino"])
+    _d320_int(snapshot["uid"])
+    _d320_int(snapshot["gid"])
+    _d320_int(snapshot["mode"], maximum=0o7777)
+    _d320_int(snapshot["nlink"], minimum=1)
+    if aggregate is not None:
+        aggregate[0] += size
+        if aggregate[0] > _D320_MAX_AGGREGATE_BYTES:
+            _d320_fail("d320_evidence_aggregate_too_large")
+    return snapshot
+
+
+class EvidenceBlobV1(bytes):
+    """A validated, immutable evidence payload carried by the bytes value itself."""
+
+    __slots__ = ()
+
+    def __new__(cls, payload_bytes: object) -> EvidenceBlobV1:
+        payload_bytes = _d320_bytes_copy(
+            payload_bytes, code="d320_wrapper_bytes_invalid"
+        )
+        _d320_immutable_mapping(payload_bytes, _d320_validate_evidence)
+        return bytes.__new__(cls, payload_bytes)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> EvidenceBlobV1:
+        if cls is not EvidenceBlobV1:
+            _d320_fail("d320_wrapper_factory_type_invalid")
+        parsed = _d320_parse_json(_d320_canonical_json(value))
+        _d320_validate_evidence(parsed)
+        return EvidenceBlobV1(_d320_canonical_json(parsed))
+
+    def to_mapping(self) -> dict[str, object]:
+        return _d320_immutable_mapping(
+            _d320_carrier_bytes(self, code="d320_wrapper_bytes_invalid"),
+            _d320_validate_evidence,
+        )
+
+
+class ByteSnapshotV1(bytes):
+    """A validated, immutable snapshot payload carried by the bytes value itself."""
+
+    __slots__ = ()
+
+    def __new__(cls, payload_bytes: object) -> ByteSnapshotV1:
+        payload_bytes = _d320_bytes_copy(
+            payload_bytes, code="d320_wrapper_bytes_invalid"
+        )
+        _d320_immutable_mapping(payload_bytes, _d320_validate_snapshot)
+        return bytes.__new__(cls, payload_bytes)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> ByteSnapshotV1:
+        if cls is not ByteSnapshotV1:
+            _d320_fail("d320_wrapper_factory_type_invalid")
+        parsed = _d320_parse_json(_d320_canonical_json(value))
+        _d320_validate_snapshot(parsed)
+        return ByteSnapshotV1(_d320_canonical_json(parsed))
+
+    @property
+    def present(self) -> bool:
+        return (
+            _d320_immutable_mapping(
+                _d320_carrier_bytes(self, code="d320_wrapper_bytes_invalid"),
+                _d320_validate_snapshot,
+            )["present"]
+            is True
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return _d320_immutable_mapping(
+            _d320_carrier_bytes(self, code="d320_wrapper_bytes_invalid"),
+            _d320_validate_snapshot,
+        )
+
+
+def _d320_transition_allowed(before: str, after: str) -> bool:
+    if before in _D320_TERMINAL_STATES:
+        return False
+    if before == "ABORTING":
+        return after in ("ROLLED_BACK", "BLOCKED")
+    normal_index = _D320_NORMAL_STATES.index(before)
+    return after in (
+        _D320_NORMAL_STATES[normal_index + 1]
+        if normal_index + 1 < len(_D320_NORMAL_STATES)
+        else "",
+        "ABORTING",
+        "BLOCKED",
+    )
+
+
+def _d320_validate_transition(value: object) -> Mapping[str, object]:
+    transition = _d320_object(
+        value,
+        ("sequence", "from", "to", "at_unix_ms", "reason_code"),
+        code="d320_transition_fields_invalid",
+    )
+    _d320_int(transition["sequence"])
+    before = _d320_text(transition["from"], maximum=64, ascii_only=True)
+    after = _d320_text(transition["to"], maximum=64, ascii_only=True)
+    if before not in _D320_STATES or after not in _D320_STATES:
+        _d320_fail("d320_transition_state_invalid")
+    reason = _d320_text(transition["reason_code"], maximum=128, ascii_only=True)
+    if not _d320_transition_allowed(before, after):
+        _d320_fail("d320_transition_graph_invalid")
+    if after == "BLOCKED":
+        if reason not in _D320_ABORT_BLOCK_REASONS:
+            _d320_fail("d320_abort_block_reason_invalid")
+    _d320_int(transition["at_unix_ms"])
+    return transition
+
+
+class TransitionV1(bytes):
+    """A validated, immutable transition carried by the bytes value itself."""
+
+    __slots__ = ()
+
+    def __new__(cls, payload_bytes: object) -> TransitionV1:
+        payload_bytes = _d320_bytes_copy(
+            payload_bytes, code="d320_wrapper_bytes_invalid"
+        )
+        _d320_immutable_mapping(payload_bytes, _d320_validate_transition)
+        return bytes.__new__(cls, payload_bytes)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> TransitionV1:
+        if cls is not TransitionV1:
+            _d320_fail("d320_wrapper_factory_type_invalid")
+        parsed = _d320_parse_json(_d320_canonical_json(value))
+        _d320_validate_transition(parsed)
+        return TransitionV1(_d320_canonical_json(parsed))
+
+    def to_mapping(self) -> dict[str, object]:
+        return _d320_immutable_mapping(
+            _d320_carrier_bytes(self, code="d320_wrapper_bytes_invalid"),
+            _d320_validate_transition,
+        )
+
+
+def _d320_optional_evidence(
+    value: object, *, aggregate: list[int] | None = None
+) -> None:
+    if value is not None:
+        _d320_validate_evidence(value, aggregate=aggregate)
+
+
+def _d320_validate_step(
+    value: object,
+    *,
+    aggregate: list[int] | None = None,
+    maximum_unix_ms: int | None = None,
+) -> Mapping[str, object]:
+    step = _d320_object(
+        value,
+        (
+            "index",
+            "operation",
+            "status",
+            "preconditions",
+            "intent_unix_ms",
+            "effect_started_unix_ms",
+            "effect_ended_unix_ms",
+            "readback",
+            "file_fsync",
+            "parent_fsync",
+            "adapter_receipt",
+            "inverse",
+        ),
+        code="d320_step_fields_invalid",
+    )
+    _d320_int(step["index"])
+    _d320_text(step["operation"], maximum=128, ascii_only=True)
+    status = _d320_text(step["status"], maximum=32, ascii_only=True)
+    if status not in (
+        "INTENT",
+        "EFFECT_STARTED",
+        "VERIFIED",
+        "INVERSE_INTENT",
+        "INVERSE_VERIFIED",
+    ):
+        _d320_fail("d320_step_status_invalid")
+    _d320_validate_evidence(step["preconditions"], aggregate=aggregate)
+    intent_value = _d320_int(step["intent_unix_ms"])
+    if maximum_unix_ms is not None and intent_value > maximum_unix_ms:
+        _d320_fail("d320_step_time_exceeds_updated")
+    started = step["effect_started_unix_ms"]
+    ended = step["effect_ended_unix_ms"]
+    completed = status in ("VERIFIED", "INVERSE_INTENT", "INVERSE_VERIFIED")
+    requires_started = status in (
+        "EFFECT_STARTED",
+        "VERIFIED",
+        "INVERSE_INTENT",
+        "INVERSE_VERIFIED",
+    )
+    if requires_started:
+        started_value = _d320_int(started)
+        if started_value < intent_value:
+            _d320_fail("d320_step_time_invalid")
+        if maximum_unix_ms is not None and started_value > maximum_unix_ms:
+            _d320_fail("d320_step_time_exceeds_updated")
+    elif started is not None:
+        _d320_fail("d320_step_start_phase_invalid")
+    if completed:
+        ended_value = _d320_int(ended)
+        if ended_value < started_value:
+            _d320_fail("d320_step_time_invalid")
+        if maximum_unix_ms is not None and ended_value > maximum_unix_ms:
+            _d320_fail("d320_step_time_exceeds_updated")
+        if step["file_fsync"] is not True or step["parent_fsync"] is not True:
+            _d320_fail("d320_step_fsync_invalid")
+        _d320_validate_evidence(step["readback"], aggregate=aggregate)
+        _d320_validate_evidence(step["adapter_receipt"], aggregate=aggregate)
+    elif any(
+        item is not None
+        for item in (
+            ended,
+            step["readback"],
+            step["file_fsync"],
+            step["parent_fsync"],
+            step["adapter_receipt"],
+        )
+    ):
+        _d320_fail("d320_step_completion_phase_invalid")
+    inverse = step["inverse"]
+    if status in ("INVERSE_INTENT", "INVERSE_VERIFIED") and inverse is None:
+        _d320_fail("d320_step_inverse_missing")
+    _d320_optional_evidence(inverse, aggregate=aggregate)
+    return step
+
+
+class StepV1(bytes):
+    """A validated, immutable step carried by the bytes value itself."""
+
+    __slots__ = ()
+
+    def __new__(cls, payload_bytes: object) -> StepV1:
+        payload_bytes = _d320_bytes_copy(
+            payload_bytes, code="d320_wrapper_bytes_invalid"
+        )
+        _d320_immutable_mapping(payload_bytes, _d320_validate_step)
+        return bytes.__new__(cls, payload_bytes)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> StepV1:
+        if cls is not StepV1:
+            _d320_fail("d320_wrapper_factory_type_invalid")
+        parsed = _d320_parse_json(_d320_canonical_json(value))
+        _d320_validate_step(parsed)
+        return StepV1(_d320_canonical_json(parsed))
+
+    @property
+    def status(self) -> str:
+        return _d320_text(
+            _d320_immutable_mapping(
+                _d320_carrier_bytes(self, code="d320_wrapper_bytes_invalid"),
+                _d320_validate_step,
+            )["status"],
+            maximum=32,
+            ascii_only=True,
+        )
+
+    @property
+    def index(self) -> int:
+        return _d320_int(
+            _d320_immutable_mapping(
+                _d320_carrier_bytes(self, code="d320_wrapper_bytes_invalid"),
+                _d320_validate_step,
+            )["index"]
+        )
+
+    @property
+    def has_inverse(self) -> bool:
+        return (
+            _d320_immutable_mapping(
+                _d320_carrier_bytes(self, code="d320_wrapper_bytes_invalid"),
+                _d320_validate_step,
+            )["inverse"]
+            is not None
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return _d320_immutable_mapping(
+            _d320_carrier_bytes(self, code="d320_wrapper_bytes_invalid"),
+            _d320_validate_step,
+        )
+
+
+def _d320_validate_source(value: object) -> Mapping[str, object]:
+    source = _d320_object(
+        value,
+        ("commit", "tree", "plan_sha256", "decision_sha256", "generation"),
+        code="d320_source_fields_invalid",
+    )
+    _d320_git_hex(source["commit"])
+    _d320_git_hex(source["tree"])
+    _d320_sha256(source["plan_sha256"])
+    _d320_sha256(source["decision_sha256"])
+    _d320_text(source["generation"], maximum=128, ascii_only=True)
+    return source
+
+
+def _d320_validate_digests(value: object) -> Mapping[str, object]:
+    digests = _d320_object(
+        value,
+        (
+            "runtime_manifest_sha256",
+            "descriptor_sha256",
+            "root_install_plan_sha256",
+            "dispatch_allowlist_sha256",
+            "hooks",
+        ),
+        code="d320_digest_fields_invalid",
+    )
+    for field in (
+        "runtime_manifest_sha256",
+        "descriptor_sha256",
+        "root_install_plan_sha256",
+        "dispatch_allowlist_sha256",
+    ):
+        _d320_sha256(digests[field])
+    hooks = _d320_object(
+        digests["hooks"],
+        ("native_bee_event", "native_spawn_admission"),
+        code="d320_hook_digest_fields_invalid",
+    )
+    _d320_sha256(hooks["native_bee_event"])
+    _d320_sha256(hooks["native_spawn_admission"])
+    return digests
+
+
+def _d320_validate_parent_attestation(value: object) -> Mapping[str, object]:
+    attestation = _d320_object(
+        value,
+        ("path", "dev", "ino", "uid", "gid", "mode", "nlink"),
+        code="d320_parent_attestation_fields_invalid",
+    )
+    _d320_validate_absolute_path(attestation["path"])
+    for field in ("dev", "ino", "uid", "gid"):
+        _d320_int(attestation[field])
+    _d320_int(attestation["mode"], maximum=0o7777)
+    _d320_int(attestation["nlink"], minimum=1)
+    return attestation
+
+
+def _d320_validate_abi(value: object) -> Mapping[str, object]:
+    abi = _d320_object(
+        value,
+        ("version", "expected_mode", "root_receipt"),
+        code="d320_abi_fields_invalid",
+    )
+    if _d320_int(abi["version"]) != 1:
+        _d320_fail("d320_abi_version_invalid")
+    _d320_int(abi["expected_mode"], maximum=0o7777)
+    receipt = _d320_object(
+        abi["root_receipt"],
+        (
+            "dev",
+            "ino",
+            "uid",
+            "gid",
+            "mode",
+            "nlink",
+            "size",
+            "sha256",
+            "parent_chain",
+            "file_fsync",
+            "parent_fsync",
+        ),
+        code="d320_root_receipt_fields_invalid",
+    )
+    for field in ("dev", "ino", "uid", "gid", "size"):
+        _d320_int(receipt[field])
+    _d320_int(receipt["mode"], maximum=0o7777)
+    if _d320_int(receipt["nlink"], minimum=1) != 1:
+        _d320_fail("d320_root_receipt_nlink_invalid")
+    _d320_sha256(receipt["sha256"])
+    parents = receipt["parent_chain"]
+    if not isinstance(parents, list) or not 1 <= len(parents) <= 32:
+        _d320_fail("d320_parent_chain_invalid")
+    for parent in parents:
+        _d320_validate_parent_attestation(parent)
+    if receipt["file_fsync"] is not True or receipt["parent_fsync"] is not True:
+        _d320_fail("d320_root_receipt_fsync_invalid")
+    return abi
+
+
+def _d320_validate_native(
+    value: object, *, aggregate: list[int]
+) -> Mapping[str, object]:
+    native = _d320_object(
+        value,
+        (
+            "marketplace",
+            "plugin",
+            "cache",
+            "hook_definition",
+            "trust",
+            "adapter_version",
+            "request_id",
+            "receipt_sha256",
+            "disabled",
+            "inverse",
+        ),
+        code="d320_native_fields_invalid",
+    )
+    for field in (
+        "marketplace",
+        "plugin",
+        "cache",
+        "hook_definition",
+        "trust",
+        "inverse",
+    ):
+        _d320_validate_evidence(native[field], aggregate=aggregate)
+    _d320_text(native["adapter_version"], maximum=128, ascii_only=True)
+    _d320_text(native["request_id"], maximum=128, ascii_only=True)
+    _d320_sha256(native["receipt_sha256"])
+    if not isinstance(native["disabled"], bool):
+        _d320_fail("d320_native_disabled_invalid")
+    return native
+
+
+def _d320_validate_cutover(
+    value: object, *, aggregate: list[int]
+) -> Mapping[str, object]:
+    cutover = _d320_object(
+        value,
+        (*_D320_SNAPSHOT_NAMES, "unit_status"),
+        code="d320_cutover_fields_invalid",
+    )
+    for name in _D320_SNAPSHOT_NAMES:
+        snapshot = _d320_validate_snapshot(cutover[name], aggregate=aggregate)
+        if snapshot["name"] != name:
+            _d320_fail("d320_snapshot_name_mismatch")
+    _d320_validate_evidence(cutover["unit_status"], aggregate=aggregate)
+    return cutover
+
+
+def _d320_validate_lock_trace(
+    value: object,
+    *,
+    state: str,
+    sequence: int,
+    history: Sequence[Mapping[str, object]],
+) -> None:
+    if not isinstance(value, list):
+        _d320_fail("d320_lock_trace_invalid")
+    held: list[str] = []
+    acquired: set[str] = set()
+    sublock_release_started = False
+    journal_acquired = False
+    journal_released = False
+    prior_sequence: int | None = None
+    for index, item in enumerate(value):
+        entry = _d320_object(
+            item,
+            ("event", "lock", "state", "sequence"),
+            code="d320_lock_event_fields_invalid",
+        )
+        event = _d320_text(entry["event"], maximum=16, ascii_only=True)
+        lock = _d320_text(entry["lock"], maximum=64, ascii_only=True)
+        event_state = _d320_text(entry["state"], maximum=64, ascii_only=True)
+        event_sequence = _d320_int(entry["sequence"])
+        if event not in ("ACQUIRE", "RELEASE") or lock not in D324_LOCK_ORDER:
+            _d320_fail("d320_lock_event_invalid")
+        if (
+            event_state not in _D320_STATES
+            or event_sequence > sequence
+            or (prior_sequence is not None and event_sequence < prior_sequence)
+        ):
+            _d320_fail("d320_lock_event_binding_invalid")
+        derived_state = "ABSENT"
+        for transition in history:
+            transition_sequence = _d320_int(transition["sequence"])
+            if transition_sequence > event_sequence:
+                break
+            derived_state = str(transition["to"])
+        if event_state != derived_state:
+            _d320_fail("d320_lock_event_binding_invalid")
+        prior_sequence = event_sequence
+        if event == "ACQUIRE":
+            if lock in acquired or journal_released:
+                _d320_fail("d320_lock_reacquire_invalid")
+            if lock != D324_LOCK_ORDER[0] and sublock_release_started:
+                _d320_fail("d320_lock_order_invalid")
+            if lock == D324_LOCK_ORDER[0]:
+                if index != 0 or journal_acquired or event_state != "PREFLIGHTED":
+                    _d320_fail("d320_journal_lock_acquire_invalid")
+                journal_acquired = True
+            elif not journal_acquired or not held:
+                _d320_fail("d320_lock_order_invalid")
+            elif D324_LOCK_ORDER.index(lock) <= D324_LOCK_ORDER.index(held[-1]):
+                _d320_fail("d320_lock_order_invalid")
+            held.append(lock)
+            acquired.add(lock)
+        else:
+            if not held or held[-1] != lock:
+                _d320_fail("d320_lock_release_invalid")
+            if lock == D324_LOCK_ORDER[0]:
+                if (
+                    event_state != state
+                    or event_sequence != sequence
+                    or event_state not in _D320_TERMINAL_STATES
+                ):
+                    _d320_fail("d320_journal_lock_release_invalid")
+                journal_released = True
+            else:
+                sublock_release_started = True
+            held.pop()
+    if state == "ABSENT":
+        if value:
+            _d320_fail("d320_absent_lock_trace_invalid")
+    elif state in _D320_TERMINAL_STATES:
+        direct_absent_block = (
+            state == "BLOCKED"
+            and len(history) == 1
+            and history[0]["from"] == "ABSENT"
+            and history[0]["to"] == "BLOCKED"
+        )
+        if direct_absent_block and not value:
+            return
+        if not journal_acquired or not journal_released or held:
+            _d320_fail("d320_terminal_lock_trace_invalid")
+    elif not journal_acquired or journal_released or D324_LOCK_ORDER[0] not in held:
+        _d320_fail("d320_journal_lock_not_held")
+
+
+def _d320_validate_pins(value: object) -> Mapping[str, object]:
+    pins = _d320_object(
+        value,
+        ("current", "previous", "retained"),
+        code="d320_pin_fields_invalid",
+    )
+    for field in ("current", "previous", "retained"):
+        generations = pins[field]
+        if not isinstance(generations, list) or len(generations) > 1024:
+            _d320_fail("d320_pin_list_invalid")
+        for generation in generations:
+            _d320_text(generation, maximum=128, ascii_only=True)
+        if (
+            generations != sorted(generations)
+            or len(generations) != len(set(generations))
+        ):
+            _d320_fail("d320_pin_list_not_canonical")
+    return pins
+
+
+def _d320_validate_history(
+    value: object,
+    *,
+    state: str,
+    sequence: int,
+    maximum_unix_ms: int | None = None,
+) -> None:
+    if not isinstance(value, list) or len(value) > 256:
+        _d320_fail("d320_history_invalid")
+    if state == "ABSENT":
+        if value:
+            _d320_fail("d320_absent_history_invalid")
+        return
+    if not value:
+        _d320_fail("d320_history_missing")
+    previous = "ABSENT"
+    previous_sequence: int | None = None
+    previous_at: int | None = None
+    for item in value:
+        transition = _d320_validate_transition(item)
+        transition_sequence = _d320_int(transition["sequence"])
+        if transition["from"] != previous:
+            _d320_fail("d320_history_not_continuous")
+        if (
+            transition_sequence < 1
+            or (
+                previous_sequence is not None
+                and transition_sequence <= previous_sequence
+            )
+            or transition_sequence > sequence
+        ):
+            _d320_fail("d320_history_exceeds_record_sequence")
+        at_unix_ms = _d320_int(transition["at_unix_ms"])
+        if maximum_unix_ms is not None and at_unix_ms > maximum_unix_ms:
+            _d320_fail("d320_history_time_exceeds_updated")
+        if previous_at is not None and at_unix_ms < previous_at:
+            _d320_fail("d320_history_time_invalid")
+        previous = str(transition["to"])
+        previous_sequence = transition_sequence
+        previous_at = at_unix_ms
+    if previous != state:
+        _d320_fail("d320_history_state_mismatch")
+
+
+def _d320_validate_steps(
+    value: object, *, aggregate: list[int], state: str, maximum_unix_ms: int
+) -> None:
+    if not isinstance(value, list) or len(value) > 256:
+        _d320_fail("d320_steps_invalid")
+    statuses: list[str] = []
+    for index, item in enumerate(value):
+        step = _d320_validate_step(
+            item, aggregate=aggregate, maximum_unix_ms=maximum_unix_ms
+        )
+        if step["index"] != index:
+            _d320_fail("d320_step_index_invalid")
+        statuses.append(str(step["status"]))
+    inverse_statuses = {"INVERSE_INTENT", "INVERSE_VERIFIED"}
+    if state in _D320_NORMAL_STATES:
+        if any(status in inverse_statuses for status in statuses):
+            _d320_fail("d320_normal_state_inverse_step_invalid")
+        if any(status != "VERIFIED" for status in statuses[:-1]):
+            _d320_fail("d320_step_predecessor_not_terminal")
+        return
+    if state == "ROLLED_BACK":
+        if any(status != "INVERSE_VERIFIED" for status in statuses):
+            _d320_fail("d320_rolled_back_steps_invalid")
+        return
+    if state not in ("ABORTING", "BLOCKED"):
+        return
+    rollback_phase = "VERIFIED"
+    for status in statuses:
+        if rollback_phase == "VERIFIED" and status == "VERIFIED":
+            continue
+        if status == "INVERSE_INTENT" and rollback_phase == "VERIFIED":
+            rollback_phase = "INVERSE_INTENT"
+            continue
+        if status == "INVERSE_VERIFIED" and rollback_phase in (
+            "VERIFIED",
+            "INVERSE_INTENT",
+            "INVERSE_VERIFIED",
+        ):
+            rollback_phase = "INVERSE_VERIFIED"
+            continue
+        if status == "INVERSE_INTENT":
+            if rollback_phase != "VERIFIED":
+                _d320_fail("d320_rollback_step_form_invalid")
+        _d320_fail("d320_rollback_step_form_invalid")
+
+
+def _d320_validate_payload(
+    value: object, *, budget: _D320JsonTraversalBudget | None = None
+) -> Mapping[str, object]:
+    _d320_json_value(value, budget=budget)
+    payload = _d320_object(
+        value,
+        (
+            "schema",
+            "journal_id",
+            "sequence",
+            "state",
+            "controller",
+            "created_unix_ms",
+            "updated_unix_ms",
+            "recovery_count",
+            "source",
+            "digests",
+            "abi",
+            "native",
+            "precutover",
+            "postcutover",
+            "pins",
+            "history",
+            "steps",
+            "lock_trace",
+        ),
+        code="d320_payload_fields_invalid",
+    )
+    if payload["schema"] != _D320_SCHEMA:
+        _d320_fail("d320_schema_invalid")
+    _d320_text(payload["journal_id"], maximum=128, ascii_only=True)
+    sequence = _d320_int(payload["sequence"])
+    state = _d320_text(payload["state"], maximum=64, ascii_only=True)
+    if state not in _D320_STATES:
+        _d320_fail("d320_state_invalid")
+    _d320_text(payload["controller"], maximum=128, ascii_only=True)
+    created = _d320_int(payload["created_unix_ms"])
+    updated = _d320_int(payload["updated_unix_ms"])
+    if updated < created:
+        _d320_fail("d320_updated_before_created")
+    _d320_int(payload["recovery_count"], maximum=1024)
+    _d320_validate_source(payload["source"])
+    _d320_validate_digests(payload["digests"])
+    _d320_validate_abi(payload["abi"])
+    aggregate = [0]
+    _d320_validate_native(payload["native"], aggregate=aggregate)
+    precutover = _d320_validate_cutover(payload["precutover"], aggregate=aggregate)
+    postcutover = _d320_validate_cutover(payload["postcutover"], aggregate=aggregate)
+    if all(
+        precutover[name] == postcutover[name] for name in _D320_ARTIFACT_NAMES
+    ):
+        _d320_fail("d320_cutover_artifacts_ambiguous")
+    _d320_validate_history(
+        payload["history"],
+        state=state,
+        sequence=sequence,
+        maximum_unix_ms=updated,
+    )
+    _d320_validate_steps(
+        payload["steps"],
+        aggregate=aggregate,
+        state=state,
+        maximum_unix_ms=updated,
+    )
+    _d320_validate_pins(payload["pins"])
+    _d320_validate_lock_trace(
+        payload["lock_trace"],
+        state=state,
+        sequence=sequence,
+        history=payload["history"],
+    )
+    if state in (
+        "USER_CUTOVER_VERIFIED",
+        "ISOLATED_HOOK_PROBE_VERIFIED",
+        "MCP_HANDSHAKE_VERIFIED",
+        "LIVE_GRANTED",
+    ) and (
+        not payload["steps"]
+        or any(step["status"] != "VERIFIED" for step in payload["steps"])
+    ):
+        _d320_fail("d320_user_cutover_steps_invalid")
+    return payload
+
+
+def _d320_journal_payload_from_carrier(
+    value: object, *, budget: _D320JsonTraversalBudget | None = None
+) -> tuple[bytes, dict[str, object]]:
+    traversal_budget = budget or _D320JsonTraversalBudget()
+    payload_bytes = _d320_validate_envelope_payload_size(
+        _d320_carrier_bytes(value, code="d320_payload_bytes_invalid")
+    )
+    parsed = _d320_parse_json(payload_bytes)
+    if not isinstance(parsed, dict):
+        _d320_fail("d320_payload_mapping_invalid")
+    _d320_validate_payload(parsed, budget=traversal_budget)
+    if _d320_canonical_json(parsed, budget=traversal_budget) != payload_bytes:
+        _d320_fail("d320_payload_not_canonical")
+    return payload_bytes, parsed
+
+
+def _d320_journal_envelope(payload_bytes: bytes) -> bytes:
+    digest = hashlib.sha256(payload_bytes).hexdigest().encode("ascii")
+    return (
+        b'{"content_sha256":"'
+        + digest
+        + b'","payload":'
+        + payload_bytes
+        + b"}\n"
+    )
+
+
+class D320CutoverJournalV1(bytes):
+    """A validated, immutable journal payload carried by the bytes value itself."""
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        payload_bytes: object,
+        *,
+        budget: _D320JsonTraversalBudget | None = None,
+    ) -> D320CutoverJournalV1:
+        traversal_budget = budget or _D320JsonTraversalBudget()
+        payload_bytes = _d320_validate_envelope_payload_size(payload_bytes)
+        parsed = _d320_parse_json(payload_bytes)
+        _d320_validate_payload(parsed, budget=traversal_budget)
+        if _d320_canonical_json(parsed, budget=traversal_budget) != payload_bytes:
+            _d320_fail("d320_payload_not_canonical")
+        return bytes.__new__(cls, payload_bytes)
+
+    @classmethod
+    def from_payload(
+        cls,
+        value: Mapping[str, object],
+        *,
+        budget: _D320JsonTraversalBudget | None = None,
+    ) -> D320CutoverJournalV1:
+        if cls is not D320CutoverJournalV1:
+            _d320_fail("d320_journal_factory_type_invalid")
+        traversal_budget = budget or _D320JsonTraversalBudget()
+        payload_bytes = _d320_canonical_json(value, budget=traversal_budget)
+        _d320_validate_envelope_payload_size(payload_bytes)
+        parsed = _d320_parse_json(payload_bytes)
+        _d320_validate_payload(parsed, budget=traversal_budget)
+        if len(_d320_journal_envelope(payload_bytes)) > _D320_MAX_ENVELOPE_BYTES:
+            _d320_fail("d320_envelope_too_large")
+        return D320CutoverJournalV1(payload_bytes, budget=traversal_budget)
+
+    @classmethod
+    def from_bytes(
+        cls,
+        raw: bytes,
+        *,
+        budget: _D320JsonTraversalBudget | None = None,
+    ) -> D320CutoverJournalV1:
+        if cls is not D320CutoverJournalV1:
+            _d320_fail("d320_journal_factory_type_invalid")
+        traversal_budget = budget or _D320JsonTraversalBudget()
+        raw = _d320_bytes_copy(raw, code="d320_envelope_size_invalid")
+        if len(raw) > _D320_MAX_ENVELOPE_BYTES:
+            _d320_fail("d320_envelope_size_invalid")
+        if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+            _d320_fail("d320_envelope_lf_invalid")
+        envelope = _d320_parse_json(raw[:-1])
+        _d320_json_value(envelope, semantic=False, budget=traversal_budget)
+        if not isinstance(envelope, dict) or set(envelope) != {
+            "content_sha256",
+            "payload",
+        }:
+            _d320_fail("d320_envelope_fields_invalid")
+        payload = envelope["payload"]
+        payload_bytes = _d320_syntax_json(payload, budget=traversal_budget)
+        if envelope["content_sha256"] != hashlib.sha256(payload_bytes).hexdigest():
+            _d320_fail("d320_envelope_digest_invalid")
+        payload_bytes = _d320_canonical_json(payload, budget=traversal_budget)
+        journal = D320CutoverJournalV1(payload_bytes, budget=traversal_budget)
+        if raw != _d320_journal_envelope(payload_bytes):
+            _d320_fail("d320_envelope_not_canonical")
+        return journal
+
+    @property
+    def payload_bytes(self) -> bytes:
+        payload_bytes, _ = _d320_journal_payload_from_carrier(self)
+        return payload_bytes
+
+    @property
+    def payload(self) -> dict[str, object]:
+        _, parsed = _d320_journal_payload_from_carrier(self)
+        return parsed
+
+    def to_bytes(self) -> bytes:
+        payload_bytes, _ = _d320_journal_payload_from_carrier(self)
+        return _d320_journal_envelope(payload_bytes)
+
+
+def validate_d320_journal_successor(
+    previous: D320CutoverJournalV1,
+    successor: D320CutoverJournalV1,
+    *,
+    recovery_entry: bool = False,
+    observed: Mapping[str, object] | None = None,
+) -> None:
+    if not isinstance(previous, D320CutoverJournalV1) or not isinstance(
+        successor, D320CutoverJournalV1
+    ):
+        _d320_fail("d320_successor_type_invalid")
+    if type(recovery_entry) is not bool:
+        _d320_fail("d320_recovery_entry_invalid")
+    try:
+        previous = D320CutoverJournalV1(memoryview(previous).tobytes())
+        successor = D320CutoverJournalV1(memoryview(successor).tobytes())
+    except (D320CutoverJournalError, MemoryError, TypeError) as exc:
+        raise D320CutoverJournalError("d320_successor_revalidation_invalid") from exc
+    before = D320CutoverJournalV1.payload.fget(previous)
+    after = D320CutoverJournalV1.payload.fget(successor)
+    if (
+        after["journal_id"] != before["journal_id"]
+        or after["controller"] != before["controller"]
+    ):
+        _d320_fail("d320_successor_identity_changed")
+    if any(
+        after[field] != before[field]
+        for field in (
+            "created_unix_ms",
+            "source",
+            "digests",
+            "abi",
+            "native",
+            "precutover",
+            "postcutover",
+            "pins",
+        )
+    ):
+        _d320_fail("d320_successor_static_binding_changed")
+    if int(after["sequence"]) != int(before["sequence"]) + 1:
+        _d320_fail("d320_successor_sequence_invalid")
+    if int(after["updated_unix_ms"]) < int(before["updated_unix_ms"]):
+        _d320_fail("d320_successor_time_invalid")
+    before_recovery = int(before["recovery_count"])
+    after_recovery = int(after["recovery_count"])
+    if recovery_entry:
+        if after_recovery != before_recovery + 1:
+            _d320_fail("d320_recovery_counter_invalid")
+    elif after_recovery != before_recovery:
+        _d320_fail("d320_recovery_counter_invalid")
+    before_history = before["history"]
+    after_history = after["history"]
+    before_steps = before["steps"]
+    after_steps = after["steps"]
+    before_trace = before["lock_trace"]
+    after_trace = after["lock_trace"]
+    assert isinstance(before_history, list) and isinstance(after_history, list)
+    assert isinstance(before_steps, list) and isinstance(after_steps, list)
+    assert isinstance(before_trace, list) and isinstance(after_trace, list)
+    if after_history[: len(before_history)] != before_history:
+        _d320_fail("d320_history_rewrite_invalid")
+    if after_trace[: len(before_trace)] != before_trace:
+        _d320_fail("d320_lock_trace_rewrite_invalid")
+    if any(
+        int(event["sequence"]) != int(after["sequence"])
+        for event in after_trace[len(before_trace) :]
+    ):
+        _d320_fail("d320_lock_event_generation_invalid")
+    state_changed = after["state"] != before["state"]
+    steps_changed = after_steps != before_steps
+    if state_changed:
+        if steps_changed or len(after_history) != len(before_history) + 1:
+            _d320_fail("d320_successor_transition_invalid")
+        transition = after_history[-1]
+        if (
+            transition["from"] != before["state"]
+            or transition["to"] != after["state"]
+            or int(transition["sequence"]) != int(after["sequence"])
+            or not _d320_transition_allowed(str(before["state"]), str(after["state"]))
+        ):
+            _d320_fail("d320_successor_transition_invalid")
+        if before_steps and any(
+            step["status"] not in ("VERIFIED", "INVERSE_VERIFIED")
+            for step in before_steps
+        ):
+            _d320_fail("d320_state_before_step_terminal")
+        if after["state"] == "ROLLED_BACK" and any(
+            step["status"] != "INVERSE_VERIFIED" for step in before_steps
+        ):
+            _d320_fail("d320_rollback_steps_not_inverted")
+    elif after_history != before_history:
+        _d320_fail("d320_history_append_invalid")
+    if steps_changed:
+        if state_changed:
+            _d320_fail("d320_step_state_change_invalid")
+        if len(after_steps) == len(before_steps) + 1:
+            new_step = after_steps[-1]
+            if (
+                before["state"] == "ABORTING"
+                or after_steps[: len(before_steps)] != before_steps
+                or new_step["status"] != "INTENT"
+                or any(
+                    step["status"] not in ("VERIFIED", "INVERSE_VERIFIED")
+                    for step in before_steps
+                )
+            ):
+                _d320_fail("d320_step_append_invalid")
+        elif len(after_steps) == len(before_steps) and before_steps:
+            changed = [
+                index
+                for index, (before_step, after_step) in enumerate(
+                    zip(before_steps, after_steps)
+                )
+                if before_step != after_step
+            ]
+            if len(changed) != 1:
+                _d320_fail("d320_step_rewrite_invalid")
+            index = changed[0]
+            before_step = before_steps[index]
+            after_step = after_steps[index]
+            fill_fields = {
+                ("INTENT", "EFFECT_STARTED"): {"effect_started_unix_ms"},
+                ("EFFECT_STARTED", "VERIFIED"): {
+                    "effect_ended_unix_ms",
+                    "readback",
+                    "file_fsync",
+                    "parent_fsync",
+                    "adapter_receipt",
+                },
+                ("VERIFIED", "INVERSE_INTENT"): {"inverse"},
+            }.get((before_step["status"], after_step["status"]), set())
+            for field, before_value in before_step.items():
+                if field == "status":
+                    continue
+                after_value = after_step[field]
+                if before_value is not None and after_value != before_value:
+                    _d320_fail("d320_step_rewrite_invalid")
+                if before_value is None and (
+                    after_value is not None and field not in fill_fields
+                ):
+                    _d320_fail("d320_step_rewrite_invalid")
+            if before["state"] == "ABORTING":
+                unresolved = [
+                    item_index
+                    for item_index, step in enumerate(before_steps)
+                    if step["status"] != "INVERSE_VERIFIED"
+                ]
+                if not unresolved or index != unresolved[-1] or any(
+                    before_steps[item_index]["status"] != "VERIFIED"
+                    for item_index in unresolved[:-1]
+                ):
+                    _d320_fail("d320_inverse_order_invalid")
+                allowed = {
+                    "VERIFIED": "INVERSE_INTENT",
+                    "INVERSE_INTENT": "INVERSE_VERIFIED",
+                }
+            else:
+                if index != len(before_steps) - 1:
+                    _d320_fail("d320_step_phase_invalid")
+                allowed = {
+                    "INTENT": "EFFECT_STARTED",
+                    "EFFECT_STARTED": "VERIFIED",
+                }
+            if allowed.get(before_step["status"]) != after_step["status"]:
+                _d320_fail("d320_step_phase_invalid")
+        else:
+            _d320_fail("d320_step_append_invalid")
+    elif len(after_steps) < len(before_steps) or len(after_steps) > len(before_steps):
+        _d320_fail("d320_step_rewrite_invalid")
+    if state_changed and after["state"] == "BLOCKED":
+        budget = _D320JsonTraversalBudget()
+        stable_observed = _d320_normalize_observed_artifact_input(
+            observed, budget=budget
+        )
+        classification = _d320_classify_d320_recovery(
+            successor,
+            observed=stable_observed,
+            budget=budget,
+            strict_budget=True,
+        )
+        reason = after_history[-1]["reason_code"]
+        if _D320_ABORT_BLOCK_REASONS.get(reason) != classification.kind:
+            _d320_fail("d320_block_recovery_mismatch")
+    elif observed is not None:
+        _d320_fail("d320_successor_observed_unexpected")
+
+
+def validate_d324_lock_order(
+    trace: Sequence[Mapping[str, object]],
+    *,
+    state: str,
+    sequence: int,
+    history: Sequence[Mapping[str, object]],
+) -> None:
+    state_text = _d320_text(state, maximum=64, ascii_only=True)
+    if state_text not in _D320_STATES:
+        _d320_fail("d320_state_invalid")
+    sequence_value = _d320_int(sequence)
+    traversal_budget = _D320JsonTraversalBudget()
+    history_value = _d320_sequence_copy(
+        history,
+        maximum=256,
+        code="d320_history_invalid",
+        budget=traversal_budget,
+    )
+    trace_value = _d320_sequence_copy(
+        trace,
+        maximum=2 * len(D324_LOCK_ORDER),
+        code="d320_lock_trace_invalid",
+        budget=traversal_budget,
+    )
+    _d320_validate_history(
+        history_value, state=state_text, sequence=sequence_value
+    )
+    _d320_validate_lock_trace(
+        trace_value,
+        state=state_text,
+        sequence=sequence_value,
+        history=history_value,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryClassificationV1:
+    kind: str
+    state: str
+    inverse_step_indexes: tuple[int, ...]
+
+
+def _d320_artifact_mapping(
+    value: object,
+    *,
+    budget: _D320JsonTraversalBudget | None = None,
+    strict_budget: bool = False,
+) -> dict[str, object] | None:
+    try:
+        if not _d320_artifact_shape(value, budget=budget):
+            return None
+        result: dict[str, object] = {}
+        for name in _D320_SNAPSHOT_NAMES:
+            snapshot = value[name]
+            if isinstance(snapshot, ByteSnapshotV1):
+                mapping = ByteSnapshotV1.to_mapping(snapshot)
+            elif isinstance(snapshot, Mapping):
+                parsed = _d320_parse_json(
+                    _d320_canonical_json(snapshot, budget=budget)
+                )
+                if not isinstance(parsed, dict):
+                    return None
+                mapping = parsed
+            else:
+                return None
+            if isinstance(snapshot, ByteSnapshotV1):
+                _d320_json_value(mapping, budget=budget)
+            result[name] = ByteSnapshotV1.from_mapping(mapping)
+        unit_status = value["unit_status"]
+        if isinstance(unit_status, EvidenceBlobV1):
+            mapping = EvidenceBlobV1.to_mapping(unit_status)
+        elif isinstance(unit_status, Mapping):
+            parsed = _d320_parse_json(
+                _d320_canonical_json(unit_status, budget=budget)
+            )
+            if not isinstance(parsed, dict):
+                return None
+            mapping = parsed
+        else:
+            return None
+        if isinstance(unit_status, EvidenceBlobV1):
+            _d320_json_value(mapping, budget=budget)
+        result["unit_status"] = EvidenceBlobV1.from_mapping(mapping)
+    except D320CutoverJournalError as exc:
+        if strict_budget and _d320_budget_error(exc):
+            raise
+        return None
+    except (AttributeError, KeyError, MemoryError):
+        return None
+    except Exception:
+        return None
+    return result
+
+
+def _d320_normalize_observed_artifact_input(
+    value: object, *, budget: _D320JsonTraversalBudget
+) -> dict[str, object]:
+    """Take one bounded, stable copy of observed artifacts for recovery."""
+
+    if not isinstance(value, Mapping):
+        _d320_fail("d320_block_observed_required")
+    try:
+        if not _d320_artifact_shape(value, budget=budget):
+            _d320_fail("d320_block_observed_required")
+        raw = {name: value[name] for name in _D320_ARTIFACT_NAMES}
+        stable: dict[str, object] = {}
+        for name in _D320_SNAPSHOT_NAMES:
+            snapshot = raw[name]
+            if isinstance(snapshot, ByteSnapshotV1):
+                snapshot = ByteSnapshotV1.to_mapping(snapshot)
+            if isinstance(snapshot, Mapping):
+                snapshot = _d320_normalize_json_value(snapshot, budget=budget)
+            stable[name] = snapshot
+        unit_status = raw["unit_status"]
+        if isinstance(unit_status, EvidenceBlobV1):
+            unit_status = EvidenceBlobV1.to_mapping(unit_status)
+        if isinstance(unit_status, Mapping):
+            unit_status = _d320_normalize_json_value(unit_status, budget=budget)
+        stable["unit_status"] = unit_status
+        return stable
+    except D320CutoverJournalError:
+        raise
+    except MemoryError as exc:
+        raise D320CutoverJournalError("d320_block_observed_required") from exc
+    except Exception as exc:
+        raise D320CutoverJournalError("d320_block_observed_required") from exc
+
+
+def _d320_artifact_shape(
+    value: object, *, budget: _D320JsonTraversalBudget | None = None
+) -> bool:
+    try:
+        if not isinstance(value, Mapping) or len(value) != len(_D320_ARTIFACT_NAMES):
+            return False
+        keys: set[str] = set()
+        iterator = iter(value)
+        for _index in range(len(_D320_ARTIFACT_NAMES) + 1):
+            try:
+                key = next(iterator)
+            except StopIteration:
+                break
+            if budget is not None:
+                _d320_visit_json_entry(budget)
+            if _index == len(_D320_ARTIFACT_NAMES):
+                return False
+            if not isinstance(key, str) or key not in _D320_ARTIFACT_NAMES:
+                return False
+            keys.add(key)
+        return len(keys) == len(_D320_ARTIFACT_NAMES)
+    except D320CutoverJournalError:
+        raise
+    except MemoryError:
+        return False
+    except Exception:
+        return False
+
+
+def _d320_classify_d320_recovery(
+    journal: D320CutoverJournalV1 | bytes,
+    *,
+    observed: Mapping[str, object],
+    budget: _D320JsonTraversalBudget | None = None,
+    strict_budget: bool = False,
+) -> RecoveryClassificationV1:
+    try:
+        if isinstance(journal, D320CutoverJournalV1):
+            journal_bytes, _ = _d320_journal_payload_from_carrier(journal)
+            journal = _d320_journal_envelope(journal_bytes)
+        model = D320CutoverJournalV1.from_bytes(journal)
+        if not isinstance(model, D320CutoverJournalV1):
+            raise D320CutoverJournalError("d320_recovery_journal_invalid")
+        payload = D320CutoverJournalV1.payload.fget(model)
+        seen = _d320_artifact_mapping(
+            observed, budget=budget, strict_budget=strict_budget
+        )
+        old = _d320_artifact_mapping(payload["precutover"])
+        new = _d320_artifact_mapping(payload["postcutover"])
+        if old is None or seen is None or new is None:
+            raise D320CutoverJournalError("d320_recovery_snapshots_invalid")
+    except D320CutoverJournalError as exc:
+        if strict_budget and _d320_budget_error(exc):
+            raise
+        return RecoveryClassificationV1("UNREADABLE_BLOCKED", "BLOCKED", ())
+    except (AttributeError, KeyError, MemoryError):
+        return RecoveryClassificationV1("UNREADABLE_BLOCKED", "BLOCKED", ())
+    except Exception:
+        return RecoveryClassificationV1("UNREADABLE_BLOCKED", "BLOCKED", ())
+
+    if all(seen[name] == old[name] for name in _D320_ARTIFACT_NAMES):
+        return RecoveryClassificationV1("ALL_OLD_VERIFIED", "ROLLED_BACK", ())
+    steps = payload["steps"]
+    assert isinstance(steps, list)
+    if all(seen[name] == new[name] for name in _D320_ARTIFACT_NAMES) and (
+        payload["state"]
+        in (
+            "USER_CUTOVER_VERIFIED",
+            "ISOLATED_HOOK_PROBE_VERIFIED",
+            "MCP_HANDSHAKE_VERIFIED",
+            "LIVE_GRANTED",
+        )
+        and bool(steps)
+        and all(
+            isinstance(step, Mapping) and step["status"] == "VERIFIED"
+            for step in steps
+        )
+    ):
+        return RecoveryClassificationV1(
+            "ALL_NEW_VERIFIED", "USER_CUTOVER_VERIFIED", ()
+        )
+    if any(
+        seen[name] != old[name] and seen[name] != new[name]
+        for name in _D320_ARTIFACT_NAMES
+    ):
+        return RecoveryClassificationV1("MIXED_BLOCKED", "BLOCKED", ())
+    if not steps or any(
+        not isinstance(step, Mapping)
+        or step["status"] not in ("VERIFIED", "INVERSE_VERIFIED")
+        or step["inverse"] is None
+        for step in steps
+    ):
+        return RecoveryClassificationV1("NONINVERTIBLE_BLOCKED", "BLOCKED", ())
+    inverse_indexes = tuple(
+        int(step["index"])
+        for step in reversed(steps)
+        if step["status"] == "VERIFIED"
+    )
+    if not inverse_indexes:
+        return RecoveryClassificationV1("NONINVERTIBLE_BLOCKED", "BLOCKED", ())
+    return RecoveryClassificationV1("MIXED_INVERTIBLE", "ABORTING", inverse_indexes)
+
+
+def classify_d320_recovery(
+    journal: D320CutoverJournalV1 | bytes,
+    *,
+    observed: Mapping[str, object],
+) -> RecoveryClassificationV1:
+    try:
+        budget = _D320JsonTraversalBudget()
+        stable_observed = _d320_normalize_observed_artifact_input(
+            observed, budget=budget
+        )
+    except (AttributeError, D320CutoverJournalError, KeyError, MemoryError):
+        return RecoveryClassificationV1("UNREADABLE_BLOCKED", "BLOCKED", ())
+    except Exception:
+        return RecoveryClassificationV1("UNREADABLE_BLOCKED", "BLOCKED", ())
+    return _d320_classify_d320_recovery(
+        journal, observed=stable_observed, budget=budget
+    )
 
 
 @dataclass(frozen=True, slots=True)
