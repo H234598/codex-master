@@ -204,22 +204,22 @@ def _home_service_tier(
     catalog = _cache_for_config(config, catalogs)
     model_id = _configured_model(config)
     if not catalog or not catalog.get("fresh"):
-        return "auto", "model_cache_missing_or_stale"
+        return "flex", "model_cache_missing_or_stale"
     entries = catalog.get("models", [])
     model = next(
         (entry for entry in entries if isinstance(entry, dict) and entry.get("id") == model_id),
         None,
     )
     if not model:
-        return "auto", "model_missing_from_home_cache"
+        return "flex", "model_missing_from_home_cache"
     tiers = model.get("service_tiers", [])
     if model_id in eligible_flex:
         return "flex", "documented_flex_evidence"
     if isinstance(tiers, list) and "flex" in tiers:
-        return "auto", "home_cache_flex_without_documented_evidence"
+        return "flex", "home_cache_flex_without_documented_evidence"
     if isinstance(tiers, list) and tiers:
-        return "auto", "home_cache_denies_flex"
-    return "auto", "home_cache_has_no_service_tier"
+        return "flex", "home_cache_denies_flex"
+    return "flex", "home_cache_has_no_service_tier"
 
 
 def _update_codex_configs(

@@ -26182,7 +26182,7 @@ google_accounts:
                 refreshed_config["model_catalog_json"],
                 str(root / "effective-codex-model-catalog.json"),
             )
-            self.assertEqual(refreshed_config["service_tier"], "auto")
+            self.assertEqual(refreshed_config["service_tier"], "flex")
             self.assertEqual(refreshed_config["model"], "gpt-5.6-luna")
             self.assertEqual(refreshed_config["model_reasoning_effort"], "xhigh")
             self.assertFalse(refreshed_config["tui"]["animations"])
@@ -27578,6 +27578,37 @@ google_accounts:
             scope=["src"],
             allow_unauthenticated=True,
         )
+
+    def test_agent_base_args_flex_tier_invariant(self) -> None:
+        args_auto = server_module.agent_base_args("gpt-5.6-sol", "xhigh", service_tier="auto")
+        self.assertIn('service_tier="flex"', args_auto)
+
+        with patch.object(server_module, "_fast_or_emergency_mode_active", return_value=False):
+            with self.assertRaises(server_module.AgentError):
+                server_module.agent_base_args("gpt-5.6-sol", "xhigh", service_tier="priority")
+
+        with patch.object(server_module, "_fast_or_emergency_mode_active", return_value=True):
+            args_priority = server_module.agent_base_args("gpt-5.6-sol", "xhigh", service_tier="priority")
+            self.assertIn('service_tier="priority"', args_priority)
+
+    def test_home_refresh_config_flex_tier_invariant(self) -> None:
+        home = Path("/tmp/fake-home")
+        refreshed = server_module._home_refresh_config(
+            home,
+            b'service_tier = "auto"\n',
+            model="gpt-5.6-sol",
+            reasoning_effort="high",
+        )
+        self.assertIn(b'service_tier = "flex"', refreshed)
+
+        with patch.object(server_module, "_fast_or_emergency_mode_active", return_value=False):
+            with self.assertRaises(server_module.AgentError):
+                server_module._home_refresh_config(
+                    home,
+                    b'service_tier = "priority"\n',
+                    model="gpt-5.6-sol",
+                    reasoning_effort="high",
+                )
 
     @patch("the_hive.server._request_agent_report_unlocked", return_value={"status": "report_requested"})
     @patch("the_hive.server.agent_lifecycle_lock")

@@ -388,6 +388,27 @@ MAX_HEADLESS_ROLLBACK_RECORD_BYTES = 16 * 1024
 HEADLESS_ROLLBACK_RECORD_RE = re.compile(r"^rollback-[0-9TZ-]+-[0-9a-f]{32}\.json$")
 
 
+def _fast_or_emergency_mode_active() -> bool:
+    try:
+        from the_hive import fast_mode
+
+        snap = fast_mode.snapshot()
+        if isinstance(snap, dict) and snap.get("modes"):
+            return True
+    except Exception:
+        pass
+    try:
+        status = emergency_queen_status()
+        if isinstance(status, dict) and (
+            status.get("state") in ("requested", "running")
+            or status.get("emergency_active") is True
+        ):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def agent_base_args(
     model: str,
     reasoning_effort: str,
@@ -395,6 +416,14 @@ def agent_base_args(
     agent_class: str | None = None,
     service_tier: str = "flex",
 ) -> list[str]:
+    if service_tier == "auto" or not service_tier:
+        service_tier = "flex"
+    elif service_tier == "priority":
+        if not _fast_or_emergency_mode_active():
+            raise AgentError("priority_tier_unauthorized")
+    elif service_tier != "flex":
+        raise AgentError("unsupported_service_tier")
+
     model_registry = load_model_policy(repo_root() / "codex-model-policy.json")
     definition = model_registry.get_exact(model)
     if (
@@ -9428,10 +9457,14 @@ def _home_refresh_config(
         if not Path(catalog).is_absolute():
             raise AgentError("agent_class_materialization_invalid")
     tier = document.get("service_tier")
-    if tier is not None and (
-        not isinstance(tier, str)
-        or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", tier) is None
-    ):
+    if tier is None or tier == "auto":
+        tier = "flex"
+    elif not isinstance(tier, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", tier) is None:
+        raise AgentError("agent_class_materialization_invalid")
+    elif tier == "priority":
+        if not _fast_or_emergency_mode_active():
+            raise AgentError("agent_class_materialization_invalid")
+    elif tier != "flex":
         raise AgentError("agent_class_materialization_invalid")
     for field, maximum in (
         ("model", 128),
