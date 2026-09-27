@@ -2645,6 +2645,7 @@ def _unit_bytes(units: Path, name: str) -> bytes | None:
 def _systemctl_default(arguments: tuple[str, ...]) -> Mapping[str, str]:
     """Use the same UID's user manager with a bounded, data-sparse protocol."""
 
+    runtime_directory = f"/run/user/{os.geteuid()}"
     try:
         completed = subprocess.run(
             ["/usr/bin/systemctl", "--user", "--no-pager", *arguments],
@@ -2653,7 +2654,12 @@ def _systemctl_default(arguments: tuple[str, ...]) -> Mapping[str, str]:
             capture_output=True,
             text=True,
             timeout=15,
-            env={"LANG": "C", "PATH": "/usr/bin:/bin"},
+            env={
+                "LANG": "C",
+                "PATH": "/usr/bin:/bin",
+                "XDG_RUNTIME_DIR": runtime_directory,
+                "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_directory}/bus",
+            },
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise _error("runtime_lifecycle_systemd_unavailable") from exc

@@ -183,6 +183,80 @@ def test_legacy_installer_cli_rejects_a_second_mutating_operator_route(
     assert not (tmp_path / "home").exists()
 
 
+def test_systemctl_default_uses_only_the_canonical_uid_user_manager_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """User-manager routing is UID-derived, bounded, and caller-independent."""
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    arguments = (
+        "show",
+        "the-hive-hive-hourly-probe.service",
+        "--property=LoadState,UnitFileState,ActiveState,Result,ExecMainStatus",
+    )
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/hostile/bus")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/hostile/runtime")
+    monkeypatch.setenv("PATH", "/hostile/bin")
+    monkeypatch.setattr(runtime_lifecycle.os, "geteuid", lambda: 4242)
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((argv, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "LoadState=loaded\n"
+                "UnitFileState=disabled\n"
+                "ActiveState=inactive\n"
+                "Result=success\n"
+                "ExecMainStatus=0\n"
+            ),
+        )
+
+    monkeypatch.setattr(runtime_lifecycle.subprocess, "run", fake_run)
+
+    assert runtime_lifecycle._systemctl_default(arguments) == {
+        "LoadState": "loaded",
+        "UnitFileState": "disabled",
+        "ActiveState": "inactive",
+        "Result": "success",
+        "ExecMainStatus": "0",
+    }
+    assert calls == [
+        (
+            ["/usr/bin/systemctl", "--user", "--no-pager", *arguments],
+            {
+                "check": False,
+                "stdin": subprocess.DEVNULL,
+                "capture_output": True,
+                "text": True,
+                "timeout": 15,
+                "env": {
+                    "LANG": "C",
+                    "PATH": "/usr/bin:/bin",
+                    "XDG_RUNTIME_DIR": "/run/user/4242",
+                    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/4242/bus",
+                },
+            },
+        )
+    ]
+
+
+def test_systemctl_default_keeps_a_nonzero_systemctl_result_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime_lifecycle.subprocess,
+        "run",
+        lambda *_arguments, **_kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="^runtime_lifecycle_systemd_failed$",
+    ):
+        runtime_lifecycle._systemctl_default(("show", "missing.service"))
+
+
 def test_d300_consumer_producer_contract_accepts_only_named_06542_identity() -> None:
     """Catches a runtime image that retains the retired .541 pin or a fallback."""
 

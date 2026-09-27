@@ -64,7 +64,10 @@ and the timer target remain part of that exact contract.
 - `bin/the-hive-openai-pricing-inventory-stable` (new)
 - `scripts/the-hive-hive-hourly-probe-install`
 - `src/the_hive/runtime_layout.py`
+- `src/the_hive/runtime_lifecycle.py` (canonical user-manager environment
+  follow-up)
 - `tests/test_hive_hourly_probe.py`
+- `tests/test_runtime_lifecycle_service.py`
 - `tests/test_runtime_layout.py`
 - `pyproject.toml` and `tests/test_pricing_inventory.py` (remove the
   conflicting package console-script change)
@@ -111,6 +114,30 @@ git diff --check
 # passed
 ```
 
+## User-manager preflight follow-up
+
+`runtime_lifecycle._systemctl_default` now invokes the bounded user-manager
+protocol with only `LANG=C`, `PATH=/usr/bin:/bin`, and canonical,
+effective-UID-derived `XDG_RUNTIME_DIR=/run/user/<euid>` plus
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<euid>/bus`. It does not inherit
+caller-supplied bus, runtime directory, or path values. This repairs the
+otherwise fail-closed preflight path under a sanitized environment without
+changing the existing nonzero-systemctl failure code.
+
+```
+PYTHONPATH=src pytest -q \
+  tests/test_runtime_lifecycle_service.py::test_systemctl_default_uses_only_the_canonical_uid_user_manager_environment \
+  tests/test_runtime_lifecycle_service.py::test_systemctl_default_keeps_a_nonzero_systemctl_result_fail_closed
+# 2 passed in 0.42s
+
+python3 -m py_compile src/the_hive/runtime_lifecycle.py \
+  tests/test_runtime_lifecycle_service.py
+# passed
+```
+
+The tests mock `subprocess.run`; no live `systemctl` retry, user-runtime
+installation, daemon reload, unit action, or inventory execution occurred.
+
 The materialization node proves manifest inclusion, modes/content,
 neutral-working-directory launch despite hostile `PYTHONPATH` and Codex
 environment, pointer-digest rejection, upgrade materialization, and
@@ -152,6 +179,8 @@ state was not independently queried, so it remains unknown.
   enable/start, old-unit removal, or inventory run occurred. Live health,
   catalog, unit state, redaction, and ordinary-restart Flex capability are
   unverified.
+- The repaired user-manager environment has not been exercised against the
+  live user bus in this task; the live cutover preflight remains unverified.
 - The subscription-path 400 versus direct `openai-flex` 200 boundary was not
   re-executed. No secret was persisted or placed in source, command arguments,
   output, or this handoff.
