@@ -1,202 +1,120 @@
-# D378-B – Flex-Preiswatchdog: Review-Fix 5 Re-Review Handoff
+# D378-B – canonical pricing runtime materialization handoff
 
-Stand: 2026-09-27 (Europe/Berlin)
+Status: `REVIEW_REQUIRED`
+Date: 2026-09-28 (Europe/Berlin)
 Branch: `d378b-flex-watchdog`
-Ausgangs-HEAD: `5de430caa4a8b95d272d3dfb1223cd3b26a9954a`
-Abgelehnter Re-Review-Kandidat: `ee59dfc8d0e00da3bf2147785f28997cab29264d`
-Review-Fix-5-Re-Review-Änderung: direkte Lead-Session; keine Workerinnen-
-Session wurde auf ausdrückliche Anweisung gestartet.
 
-## Ergebnis
+## Review scope
 
-Der Inventarlauf nutzt jetzt den kanonischen State-Root
-`~/.local/state/the-hive/openai-pricing` und führt genau einen Erstversuch
-und höchstens einen Retry aus. Die Pause ist über `run(..., pause=...,
-retry_delay_seconds=...)` injizierbar. Bei zwei Fehlschlägen schreibt der
-Lauf einen Alert-State und beendet sich mit Exit-Status 1; die Service-Unit
-hat keine `Restart=`-Direktive.
+This handoff covers the unreviewed source range beginning at the reviewed Flex
+watchdog parent `8c620cd96a76d20d9d8d9b23fc62feae02853d11`.
 
-`update()` bereitet die neue Generation im Staging vor und stellt bei einem
-Fehler nach der Katalog-/Home-Config-Aktualisierung den vorherigen Katalog,
-die vorhandenen Config-Dateien, `current` und die bereits veröffentlichte
-Generation wieder her. Der Health-State ist davon ausdrücklich ausgenommen:
-er dokumentiert den endgültigen Fehler.
+The range contains the earlier unreviewed package-entrypoint commit
+`4c64686298b43ed94e2f4f609b77bbf490a99c64`. Its console-script declaration
+and isolated-wheel test are deliberately removed by this follow-up change: the
+console script would own the canonical name but cannot materialize the required
+user units or attest a generation. The commit remains in ancestry; no history
+was rewritten and no foreign work was discarded.
 
-Review-Fix 1 ergänzt vier Härtungen:
+## Product result awaiting review
 
-- `current` wird über eine private eindeutige Tempdatei mit Flush, Datei-Fsync,
-  `os.replace()` und anschließendem Fsync der Parent-Directory publiziert.
-- Die neu publizierte aktive Generation wird bei der Retention explizit
-  übersprungen. Insgesamt werden höchstens 50 Generationen einschließlich
-  dieser aktiven Generation behalten, auch wenn die Uhr zurückgestellt ist.
-- Der gesamte `run()`-Lauf besitzt einen exklusiven nicht wartenden
-  `fcntl.flock`-Lock. Ein Gegenlauf beendet sich mit dem stabilen Code
-  `inventory_in_progress`, bevor `update()` oder Artefakte berührt werden.
-  Alle Katalog-, Config- und Rollback-Temporärdateien werden eindeutig
-  erstellt.
-- Beim Lesen der Health-Historie werden nur echte Generationsnamen,
-  kanonische timezone-aware ISO-Zeitstempel und bekannte stabile Fehlercodes
-  übernommen; untrusted Exception-/Secrettexte werden verworfen.
+The existing single-owner attested runtime lifecycle now includes these
+manifested artifacts in every generation:
 
-Review-Fix 2 schließt die verbliebenen Crash-Konsistenzlücken:
-
-- Die Generationsdateien `pricing.html`, `models.html` und `inventory.json`
-  werden über die bestehende atomare Hilfsfunktion geschrieben und damit vor
-  dem Directory-Rename dateigesynct. Vor dem Rename wird Staging gesynct,
-  danach die Root-Directory und erst anschließend `current` dauerhaft
-  publiziert.
-- Der stabile Katalog ist vor dem Cross-Directory-Rename bereits dateigesynct.
-  Nach dem Rename werden Root als Zieldirectory und Staging als Quelldirectory
-  gesynct, bevor eine Home-Konfiguration auf den Katalog oder `current` auf
-  die neue Generation verweisen kann.
-
-Review-Fix 3 ergänzt eine dauerhafte, wiederholbare Crash-Recovery:
-
-- Vor dem ersten Katalog-/Home-Config-Mutationsschritt wird das private,
-  atomar und dateisynct veröffentlichte Journal `.transaction.json` (Schema 1,
-  Modus `0600`) angelegt. Es enthält nur eine definierte Phase, neue/alte
-  Generationsnamen, Katalog-Existenz und die zwei verwalteten Config-Felder.
-  Es enthält weder Geheimnisse noch Rohantworten.
-- Ein vorhandener Katalog wird ausschließlich in die private, ebenfalls
-  atomar geschriebene `0600`-Backup-Datei gesichert. Nach deren dauerhafter
-  Veröffentlichung wird die Journalphase `backup_ready`, erst dann folgen
-  Katalog- und Home-Config-Mutationen.
-- Jeder Start von `update()` führt die Recovery vor neuen Mutationen aus. Sie
-  stellt `current`, Katalog und nur die verwalteten Config-Felder her, entfernt
-  neue Generation/Staging und entfernt Journal erst durable nach vollständiger
-  Wiederherstellung. Wiederholung ist idempotent. Die genaue Finalisierungs-
-  und Backup-Entfernungsreihenfolge ist unter Review-Fix 4 dokumentiert.
-- Das Cleanup-Ziel der neuen Generation wird direkt nach erfolgreichem
-  `staging.rename()` und vor dem Root-Fsync registriert. Ein Fsync-Fehler an
-  dieser Stelle räumt die noch nicht publizierte Generation wieder auf.
-
-Review-Fix 4 schließt Transaktionsfinalisierung und Config-Journal weiter:
-
-- Die Transaktion wird nach dauerhafter `current`-Publikation zuerst mit
-  `committed` atomar markiert. Ihr Backup wird durable entfernt und das Journal
-  erst anschließend, ebenfalls durable, entfernt. Erst danach beginnt die
-  destruktive Retention. Damit kann kein Retention-Abbruch eine noch für
-  Recovery benötigte vorherige Current-Generation löschen.
-- Eine unterbrochene Rücknahme markiert nach vollständiger Wiederherstellung
-  `rolled_back`; sowohl diese als auch eine `committed`-Transaktion entfernt
-  bei jedem Start erst Backup und zuletzt Journal. Cleanup-Fehler bleiben
-  sichtbar und ein weiterer Start wiederholt nur den idempotenten Cleanup,
-  ohne einen erfolgreich committeten Zustand zurückzudrehen.
-- Das Journal enthält keine Rohzeilen aus Home-Konfigurationen mehr, sondern
-  nur normalisierte semantische Objekte `{index, key, value}`. Erlaubt sind
-  nur die im Repository belegten Tiers `auto`, `flex`, `priority` sowie ein
-  lokaler absoluter `model_catalog_json`-Pfad ohne Steuerzeichen, Kommentar
-  oder zusätzliche TOML-Tokens. Ungültige oder mehrdeutige Homes werden vor
-  Mutation übersprungen und erscheinen weder im Journal noch im Inventar.
-
-Review-Fix 5 härtet `model_catalog_json` als Journalwert weiter:
-
-- Akzeptiert werden ausschließlich bereits normalisierte lokale absolute
-  Dateisystempfade. Lexische Traversal-/Punktkomponenten, doppelte
-  Wurzelpräfixe, Steuerzeichen, Backslashes sowie Query-/Fragment-Zeichen
-  werden verworfen.
-- Verworfen werden ausschließlich strukturelle Credential-Zuweisungen: ein
-  abgegrenzter Credential-Feldname (zum Beispiel API-Key oder Token), direkt
-  gefolgt von `=` oder `:` und einem nichtleeren Wert. Bloße Feldnamen und
-  normale Pfadkomponenten wie `author`, `authentication` oder
-  `secret-catalog` bleiben gültig. Der abgelehnte Wert erscheint weder im
-  wertfreien Parserfehler noch in Journal oder Inventar; die Update-Planung
-  überspringt das betreffende Home.
-- Jeder bereits existierende Pfadbestandteil wird mit `lstat` geprüft.
-  Symlinks oder nicht prüfbare Bestandteile führen zur Verwerfung; der finale
-  Katalog darf für den ersten Lauf weiterhin noch nicht existieren.
-
-## Health-State
-
-Pfad: `~/.local/state/the-hive/openai-pricing/health.json`.
-
-Das JSON enthält nur `schema_version`, `status` (`healthy` oder `alert`),
-`updated_at`, `attempts` sowie – soweit vorhanden –
-`last_successful_generation`, `last_successful_at`, `last_error_at` und
-`last_error_code`. Fehler werden als stabile Codes (`invalid_response`,
-`io_error`, `inventory_failed`, `inventory_in_progress`) abgelegt. Weder
-Geheimnisse, Rohantworten noch Exception-Texte werden serialisiert.
-
-Der State wird in derselben Directory in eine exklusiv erzeugte temporäre
-Datei mit Modus `0600` geschrieben, geflusht, dateigesynct und mit
-`os.replace()` atomar veröffentlicht; danach wird die Parent-Directory
-gesynct. Der Root wird auf `0700` gesetzt. Ein erfolgreicher Lauf setzt
-`healthy` und übernimmt vorhandene letzte Fehlerzeit/-codes.
-
-## Units und Entrypoint
-
-- Service: `the-hive-openai-pricing.service`, `Type=oneshot`, The-Hive-
-  Entrypoint und `ReadWritePaths=%h/.local/state/the-hive/openai-pricing`.
-- Timer: täglich (`OnCalendar=daily`), persistent und an dieselbe The-Hive-
-  Service-Unit gebunden.
-- Der Service besitzt weiterhin `ProtectHome=no`, weil der bestehende
-  Inventarvertrag bei Erfolg vorhandene Codex-Home-Konfigurationen und
-  -Kataloge aktualisiert. Dies wurde nicht zur Laufzeit mit einem
-  installierten systemd-Manager geprüft.
-
-## Geänderte Dateien
-
+- `bin/the-hive-openai-pricing-inventory` (generation entrypoint, `0755`)
+- `bin/the-hive-openai-pricing-inventory-stable` (stable launcher source, `0755`)
+- `systemd/user/the-hive-openai-pricing.service` and
+  `systemd/user/the-hive-openai-pricing.timer` (`0644`)
 - `src/the_hive/pricing_inventory.py`
-- `tests/test_pricing_inventory.py`
-- `systemd/user/the-hive-openai-pricing.service`
-- `systemd/user/the-hive-openai-pricing.timer`
-- dieser Handoff
 
-Die vorgefundene unversionierte Datei `uv.lock` wurde entfernt. Der Entrypoint
-`bin/the-hive-openai-pricing-inventory` wurde geprüft und benötigt keine
-Änderung.
+The installer writes only manifest-attested bytes to the canonical
+`~/.local/bin/the-hive-openai-pricing-inventory` launcher and the two
+`~/.config/systemd/user/the-hive-openai-pricing.*` units.
 
-## Nachweise
+The public launcher uses existing release-pointer/manifest ownership checks,
+validates its own digest and bytes plus the generation entrypoint through
+no-follow descriptors, then executes the pinned descriptor. The generation
+entrypoint validates `RuntimeLayout.from_current_release(...)` and invokes
+the inventory with `python3 -I`, not checkout-relative `PYTHONPATH`.
 
-Vor der Bearbeitung: Branch `d378b-flex-watchdog`, Ausgangs-HEAD wie oben,
-keine versionierten Diff-Änderungen; ausschließlich `uv.lock` war
-unversioniert vorhanden.
+The existing publish transaction snapshots the launcher and both units,
+publishes them before moving the release pointer, and restores all three on a
+failure. Existing owner, regular-file, link-count, mode, and no-follow
+conventions reject symlink, non-owned, and unsafe targets. Existing
+`current`/`previous` semantics remain intact.
 
-Die Lead-Session hat nach Integration selbst erfolgreich ausgeführt:
+Staging checks that the service has exactly
+`ExecStart=%h/.local/bin/the-hive-openai-pricing-inventory`, uses the
+canonical pricing state root, and contains no legacy `codex-master` name.
+The timer must target `the-hive-openai-pricing.service`.
+
+## Changed source files
+
+- `bin/the-hive-openai-pricing-inventory`
+- `bin/the-hive-openai-pricing-inventory-stable` (new)
+- `scripts/the-hive-hive-hourly-probe-install`
+- `src/the_hive/runtime_layout.py`
+- `tests/test_hive_hourly_probe.py`
+- `tests/test_runtime_layout.py`
+- `pyproject.toml` and `tests/test_pricing_inventory.py` (remove the
+  conflicting package console-script change)
+
+The pre-existing untracked prompt files
+`.local/d378b-flex-watchdog-openai-fix5.prompt.md` and
+`.local/d378b-flex-watchdog-openai-review-fix4.prompt.md` are not part of
+this change and must remain unstaged.
+
+## Focused evidence
+
+Passed:
 
 ```
-PYTHONPATH=src python3 -m pytest -q tests/test_pricing_inventory.py
-# 31 passed in 1.36s
-python3 -m py_compile src/the_hive/pricing_inventory.py
-git diff --check HEAD^ HEAD
+PYTHONPATH=src python3 -m pytest -q tests/test_runtime_layout.py tests/test_pricing_inventory.py
+# 131 passed in 7.53s
+
+python3 -m py_compile src/the_hive/pricing_inventory.py \
+  src/the_hive/runtime_layout.py scripts/the-hive-hive-hourly-probe-install
+# passed
+
+bash -n bin/the-hive-openai-pricing-inventory \
+  bin/the-hive-openai-pricing-inventory-stable
+# passed
+
+git diff --check
+# passed
 ```
 
-Die Regressionsfälle umfassen den Datei- und Directory-Fsync bei `current`,
-50 lexikographisch neuere Generationen bei zurückgestellter Uhr, einen
-Gegenlauf ohne Artefaktänderung, eindeutige Config-/Rollback-Temps sowie
-valide und ungültige Health-Historie. Review-Fix 2 ergänzt fokussierte
-Ereignisfolgen für Generationsdatei-Fsync → Staging-Fsync → Rename →
-Root-Fsync → `current` sowie Katalogdatei-Fsync → Cross-Directory-Rename →
-Ziel-/Quell-Directory-Fsync → Home-Config/`current`.
+The dedicated pricing materialization node passed earlier in this session. It
+proves manifest inclusion, modes/content, neutral-working-directory launch
+despite hostile `PYTHONPATH` and Codex environment, pointer-digest rejection,
+upgrade materialization, and `current`/`previous` preservation. The three
+unsafe replacement cases (launcher symlink, service symlink, timer unsafe mode)
+passed individually. The pricing-unit-pair rollback-on-timer-write-failure
+case also passed.
 
-Review-Fix 3 ergänzt simulierte Prozessabbrüche nach Config- und nach
-`current`-Mutation, jeweils mit zweimaliger Start-Recovery; der Journalinhalt
-wird dabei auf Abwesenheit eines Config-Secrets und einer Rohantwort geprüft.
-Ein separater Fall injiziert den Root-Fsync-Fehler unmittelbar nach dem
-Generationsrename und belegt das Cleanup ohne Staging-/Target-Rest.
+A later combined re-run of those four installer nodes was intentionally
+terminated without a result after the pre-existing test path started temporary
+`systemd-run --user` subprocesses for its test-only `/tmp/pytest-.../home`
+image. No `systemctl` command ran, no canonical user unit was installed or
+activated, and no live inventory ran. Lasting transient-manager state was not
+independently queried, so it remains unknown.
 
-Review-Fix 4 ergänzt einen harten Retention-Abbruch mit lexikografisch
-ältester vorheriger Current-Generation bei mehr als 50 Generationen,
-bösartige TOML-Zeilen ohne Journal-/Inventar-Leak sowie fehlgeschlagenes
-Backup-Cleanup mit erfolgreichem zweiten Lauf.
+## Residual unknowns / blockers
 
-Review-Fix 5 ergänzt fokussierte Tests für Traversal, einen existierenden
-Parent-Symlink, Query-/Secret- und Steuerzeichenwerte, einen gültigen noch
-nicht existierenden Erstlaufpfad sowie die Abwesenheit des verworfenen Werts
-aus Journal, Inventar und Fehlertext. Der Re-Review ergänzt legitime
-normalisierte Pfade mit `author`, `authentication`, `secret-catalog` und
-einem Credential-Feldnamen ohne Wert, neben einer tatsächlich strukturierten
-Credential-Zuweisung mit `=` oder `:`.
-
-Kein Volltestlauf, keine Installation, kein Push und kein MCP-Aufruf wurden
-ausgeführt. Remote-OpenAI-Antworten und die Aktivierung durch einen realen
-systemd-User-Manager wurden bewusst nicht geprüft; hierfür liegt keine
-Ausführungsevidenz vor.
-
-## Integration
-
-Die direkte Review-Fix-5-Änderung und dieser Handoff werden per
-`git commit --amend` in genau einem sauberen Branch-Commit integriert. Die
-endgültige Commit-ID ist im Abschlussprotokoll der Lead-Session per
-`git rev-parse HEAD` ausgewiesen; sie kann nicht sinnvoll selbstreferenziell
-in den Inhalt dieses Commits aufgenommen werden.
+- Independent review is required before integration, push, installation, or
+  activation.
+- The pre-existing
+  `test_internal_attested_runtime_api_materializes_one_complete_regular_runtime_image`
+  was observed failing during inspection with
+  `hive_hourly_probe_error code=legacy_probe_attestation_failed`. Its
+  baseline status and causality are unverified.
+- No fetch was performed during this materialization-only task. The supplied
+  earlier `origin/main` was
+  `5de430caa4a8b95d272d3dfb1223cd3b26a9954a`; current remote state is unknown.
+- No canonical real-home runtime was installed and no daemon reload, unit
+  enable/start, old-unit removal, or inventory run occurred. Live health,
+  catalog, unit state, redaction, and ordinary-restart Flex capability are
+  unverified.
+- The subscription-path 400 versus direct `openai-flex` 200 boundary was not
+  re-executed. No secret was persisted or placed in source, command arguments,
+  output, or this handoff.

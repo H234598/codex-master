@@ -63,6 +63,15 @@ _STABLE_MCP_LAUNCHER_SOURCE = "bin/the-hive-mcp-stable"
 _STABLE_MCP_LAUNCHER_NAME = "the-hive-mcp"
 _STABLE_HOOK_LAUNCHER_SOURCE = "bin/the-hive-plugin-hook-stable"
 _STABLE_HOOK_LAUNCHER_NAME = "the-hive-plugin-hook-stable"
+_PRICING_INVENTORY_ENTRYPOINT_SOURCE = "bin/the-hive-openai-pricing-inventory"
+_PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE = (
+    "bin/the-hive-openai-pricing-inventory-stable"
+)
+_PRICING_INVENTORY_LAUNCHER_NAME = "the-hive-openai-pricing-inventory"
+_PRICING_INVENTORY_UNIT_NAMES = (
+    "the-hive-openai-pricing.service",
+    "the-hive-openai-pricing.timer",
+)
 _HOOK_ENTRYPOINTS = (
     "hooks/native_bee_event.py",
     "hooks/native_spawn_admission.py",
@@ -127,6 +136,16 @@ _RUNTIME_IMAGE_FILES = (
     ("bin/the-hive-mcp", "bin/the-hive-mcp", 0o755),
     (_STABLE_MCP_LAUNCHER_SOURCE, _STABLE_MCP_LAUNCHER_SOURCE, 0o755),
     (_STABLE_HOOK_LAUNCHER_SOURCE, _STABLE_HOOK_LAUNCHER_SOURCE, 0o755),
+    (
+        _PRICING_INVENTORY_ENTRYPOINT_SOURCE,
+        _PRICING_INVENTORY_ENTRYPOINT_SOURCE,
+        0o755,
+    ),
+    (
+        _PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE,
+        _PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE,
+        0o755,
+    ),
     (_LEGACY_PROBE_LAUNCHER_SOURCE, _LEGACY_PROBE_LAUNCHER_SOURCE, 0o755),
     ("bin/the-hive-resource-monitor", "bin/the-hive-resource-monitor", 0o755),
     ("bin/the-hive-hive-hourly-probe", "bin/the-hive-hive-hourly-probe", 0o755),
@@ -151,6 +170,16 @@ _RUNTIME_IMAGE_FILES = (
     (
         "systemd/user/the-hive-hive-hourly-probe.timer",
         "systemd/user/the-hive-hive-hourly-probe.timer",
+        0o644,
+    ),
+    (
+        "systemd/user/the-hive-openai-pricing.service",
+        "systemd/user/the-hive-openai-pricing.service",
+        0o644,
+    ),
+    (
+        "systemd/user/the-hive-openai-pricing.timer",
+        "systemd/user/the-hive-openai-pricing.timer",
         0o644,
     ),
 )
@@ -645,6 +674,7 @@ def _release_metadata(*, generation: str, commit: str) -> dict[str, object]:
                 _STABLE_MCP_LAUNCHER_SOURCE,
                 "bin/the-hive-mcp",
                 "bin/the-hive-resource-monitor",
+                _PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE,
             ],
             "hook_abi_source": _STABLE_HOOK_LAUNCHER_SOURCE,
             "hook_abi": _HOOK_ABI_V1_LAUNCHER,
@@ -1096,6 +1126,23 @@ def _materialize_stable_mcp_launcher(*, source: bytes, release_root: Path) -> No
     )
 
 
+def _attested_pricing_inventory_launcher_bytes(layout: RuntimeLayout) -> bytes:
+    """Read the stable public pricing launcher from one attested image."""
+
+    try:
+        return layout.read_attested_file(_PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE)
+    except ValueError as exc:
+        raise InstallError("install_release_invalid") from exc
+
+
+def _materialize_pricing_inventory_launcher(*, source: bytes, bindir: Path) -> None:
+    """Install only the manifest-attested public pricing launcher bytes."""
+
+    _install_attested_bytes(
+        bindir / _PRICING_INVENTORY_LAUNCHER_NAME, source, mode=0o755
+    )
+
+
 def _render_legacy_probe_launcher(
     source: bytes, *, generation: str, manifest_digest: str
 ) -> bytes:
@@ -1181,6 +1228,16 @@ def _legacy_probe_launcher_bytes(libexec: Path) -> bytes | None:
         raise InstallError("install_release_triplet_invalid") from exc
 
 
+def _pricing_inventory_launcher_bytes(bindir: Path) -> bytes | None:
+    """Snapshot the owned public pricing launcher before replacing it."""
+
+    try:
+        _source_directory(bindir)
+        return _owned_launcher_bytes(bindir / _PRICING_INVENTORY_LAUNCHER_NAME)
+    except InstallError as exc:
+        raise InstallError("install_release_triplet_invalid") from exc
+
+
 def _restore_owned_launcher(*, target: Path, previous: bytes | None) -> None:
     """Durably restore one owned launcher when the release transaction aborts."""
 
@@ -1229,6 +1286,18 @@ def _restore_legacy_probe_launcher(*, libexec: Path, previous: bytes | None) -> 
         _source_directory(libexec)
         _restore_owned_launcher(
             target=libexec / _LEGACY_PROBE_LAUNCHER_NAME, previous=previous
+        )
+    except InstallError as exc:
+        raise InstallError("install_release_triplet_durability_unknown") from exc
+
+
+def _restore_pricing_inventory_launcher(*, bindir: Path, previous: bytes | None) -> None:
+    """Restore the public pricing launcher within the publish rollback boundary."""
+
+    try:
+        _source_directory(bindir)
+        _restore_owned_launcher(
+            target=bindir / _PRICING_INVENTORY_LAUNCHER_NAME, previous=previous
         )
     except InstallError as exc:
         raise InstallError("install_release_triplet_durability_unknown") from exc
@@ -1451,6 +1520,110 @@ def _materialize_hourly_probe_units(
     _install_attested_bytes(
         units / "the-hive-hive-hourly-probe.timer", staged[1], mode=0o644
     )
+
+
+def _pricing_inventory_unit_bytes(target: Path) -> bytes | None:
+    """Read one private installed pricing unit, if it is present."""
+
+    try:
+        item = target.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise InstallError("install_target_untrusted") from exc
+    if (
+        stat.S_ISLNK(item.st_mode)
+        or not stat.S_ISREG(item.st_mode)
+        or item.st_nlink != 1
+        or item.st_uid != os.geteuid()
+        or stat.S_IMODE(item.st_mode) != 0o644
+    ):
+        raise InstallError("install_target_untrusted")
+    return _source_bytes(target)
+
+
+def _snapshot_pricing_inventory_units(
+    *, units: Path
+) -> tuple[bytes | None, bytes | None]:
+    """Capture the complete private pricing-unit pair before replacing either."""
+
+    try:
+        _source_directory(units)
+        service_name, timer_name = _PRICING_INVENTORY_UNIT_NAMES
+        return (
+            _pricing_inventory_unit_bytes(units / service_name),
+            _pricing_inventory_unit_bytes(units / timer_name),
+        )
+    except InstallError as exc:
+        raise InstallError("install_release_retention_failed") from exc
+
+
+def _restore_pricing_inventory_units(
+    *, units: Path, previous: tuple[bytes | None, bytes | None]
+) -> None:
+    """Restore the pricing-unit pair after an unpublished replacement fails."""
+
+    try:
+        _source_directory(units)
+        for name, content in zip(_PRICING_INVENTORY_UNIT_NAMES, previous, strict=True):
+            target = units / name
+            current = _pricing_inventory_unit_bytes(target)
+            if content is None:
+                if current is not None:
+                    target.unlink()
+            elif current != content:
+                _install_attested_bytes(target, content, mode=0o644)
+        _fsync_directory(units)
+    except InstallError as exc:
+        raise InstallError("install_release_pair_durability_unknown") from exc
+    except OSError as exc:
+        raise InstallError("install_release_pair_durability_unknown") from exc
+
+
+def _staged_pricing_inventory_unit_bytes(
+    *, layout: RuntimeLayout
+) -> tuple[bytes, bytes]:
+    """Read and validate the canonical pricing pair from one attested image."""
+
+    try:
+        service = layout.read_attested_file(
+            "systemd/user/the-hive-openai-pricing.service"
+        )
+        timer = layout.read_attested_file(
+            "systemd/user/the-hive-openai-pricing.timer"
+        )
+        service_text = service.decode("utf-8")
+        timer_text = timer.decode("utf-8")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise InstallError("install_release_invalid") from exc
+    if (
+        service_text.count(
+            "ExecStart=%h/.local/bin/the-hive-openai-pricing-inventory"
+        )
+        != 1
+        or "ReadWritePaths=%h/.local/state/the-hive/openai-pricing"
+        not in service_text
+        or "codex-master" in service_text
+        or "codex-master" in timer_text
+        or "@MASTERJET_" in service_text
+        or "@MASTERJET_" in timer_text
+        or "Unit=the-hive-openai-pricing.service" not in timer_text
+    ):
+        raise InstallError("install_release_template_invalid")
+    return service, timer
+
+
+def _materialize_pricing_inventory_units(
+    *, units: Path, staged: tuple[bytes, bytes]
+) -> None:
+    """Install only the complete canonical pricing-unit pair from one image."""
+
+    try:
+        _source_directory(units)
+    except InstallError as exc:
+        raise InstallError("install_release_retention_failed") from exc
+    for name, content in zip(_PRICING_INVENTORY_UNIT_NAMES, staged, strict=True):
+        _install_attested_bytes(units / name, content, mode=0o644)
 
 
 @contextmanager
@@ -1694,6 +1867,7 @@ def _publish_runtime_generation(
     release_root: Path,
     live_unit_dir: Path | None = None,
     live_libexec: Path | None = None,
+    live_bin: Path | None = None,
 ) -> RuntimeLayout:
     """Publish exactly one manifest-attested generation under the sole image owner."""
 
@@ -1708,6 +1882,8 @@ def _publish_runtime_generation(
     # the immutable stage has passed.  In particular a failed first publish
     # must not consume the no-prior-generation bootstrap state.
     try:
+        if (live_unit_dir is None) != (live_bin is None):
+            raise InstallError("install_stage_validation_failed")
         staged_layout = RuntimeLayout.from_runtime_root(stage)
         staged_mcp_launcher = _attested_stable_mcp_launcher_bytes(staged_layout)
         entry = _release_pointer_entry(staged_layout)
@@ -1718,11 +1894,25 @@ def _publish_runtime_generation(
             if live_unit_dir is not None
             else None
         )
+        staged_pricing_units = (
+            _staged_pricing_inventory_unit_bytes(layout=staged_layout)
+            if live_unit_dir is not None
+            else None
+        )
+        staged_pricing_launcher = (
+            _attested_pricing_inventory_launcher_bytes(staged_layout)
+            if live_bin is not None
+            else None
+        )
         staged_legacy_probe_launcher = (
             _attested_legacy_probe_launcher_bytes(staged_layout)
             if live_libexec is not None
             else None
         )
+        if live_unit_dir is not None:
+            _source_directory(live_unit_dir)
+        if live_bin is not None:
+            _source_directory(live_bin)
         if live_libexec is not None:
             _source_directory(live_libexec)
     except (InstallError, ValueError) as exc:
@@ -1760,6 +1950,16 @@ def _publish_runtime_generation(
                 if live_unit_dir is not None
                 else None
             )
+            previous_pricing_units = (
+                _snapshot_pricing_inventory_units(units=live_unit_dir)
+                if live_unit_dir is not None
+                else None
+            )
+            previous_pricing_launcher = (
+                _pricing_inventory_launcher_bytes(live_bin)
+                if live_bin is not None
+                else None
+            )
             previous_legacy_probe_launcher = (
                 _legacy_probe_launcher_bytes(live_libexec)
                 if live_libexec is not None
@@ -1790,9 +1990,19 @@ def _publish_runtime_generation(
                         units=live_unit_dir,
                         staged=staged_units,
                     )
+                if live_unit_dir is not None and staged_pricing_units is not None:
+                    _materialize_pricing_inventory_units(
+                        units=live_unit_dir,
+                        staged=staged_pricing_units,
+                    )
                 _materialize_stable_mcp_launcher(
                     source=staged_mcp_launcher, release_root=release_root
                 )
+                if live_bin is not None and staged_pricing_launcher is not None:
+                    _materialize_pricing_inventory_launcher(
+                        source=staged_pricing_launcher,
+                        bindir=live_bin,
+                    )
                 if (
                     live_libexec is not None
                     and staged_legacy_probe_launcher is not None
@@ -1824,6 +2034,19 @@ def _publish_runtime_generation(
                     _restore_stable_mcp_launcher(
                         release_root=release_root, previous=previous_mcp_launcher
                     )
+                    if live_bin is not None:
+                        _restore_pricing_inventory_launcher(
+                            bindir=live_bin,
+                            previous=previous_pricing_launcher,
+                        )
+                    if (
+                        live_unit_dir is not None
+                        and previous_pricing_units is not None
+                    ):
+                        _restore_pricing_inventory_units(
+                            units=live_unit_dir,
+                            previous=previous_pricing_units,
+                        )
                     if live_unit_dir is not None and previous_hourly_units is not None:
                         _restore_hourly_probe_units(
                             units=live_unit_dir, previous=previous_hourly_units
@@ -1897,6 +2120,10 @@ def _install_attested_runtime(*, home: Path) -> dict[str, object]:
     repository = Path(__file__).resolve().parents[1]
     commit = _verified_release_commit(repository)
     library = _child_directory(home, (".local", "lib"), mode=0o700)
+    local = home / ".local"
+    _directory(local, mode=0o700, create=False)
+    bindir = local / "bin"
+    _directory(bindir, mode=0o700, create=True)
     libexec = _child_directory(home, (".local", "libexec"), mode=0o700)
     state = _child_directory(home, (".local", "state", "codex-master-mcp"), mode=0o700)
     units = _child_directory(home, (".config", "systemd", "user"), mode=0o700)
@@ -1916,6 +2143,7 @@ def _install_attested_runtime(*, home: Path) -> dict[str, object]:
         release_root=library / _RUNTIME_ROOT_NAME,
         live_unit_dir=units,
         live_libexec=libexec,
+        live_bin=bindir,
     )
     generation = _release_pointer_entry(layout)["generation"]
     return {

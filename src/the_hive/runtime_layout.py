@@ -80,6 +80,9 @@ _HISTORICAL_LINEAGE = {
 }
 _STABLE_MCP_LAUNCHER_SOURCE = "bin/the-hive-mcp-stable"
 _STABLE_HOOK_LAUNCHER_SOURCE = "bin/the-hive-plugin-hook-stable"
+_PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE = (
+    "bin/the-hive-openai-pricing-inventory-stable"
+)
 _HOOK_BINDING_ENTRYPOINTS = {
     "native_bee_event": "hooks/native_bee_event.py",
     "native_spawn_admission": "hooks/native_spawn_admission.py",
@@ -102,6 +105,8 @@ _REQUIRED_FILES: tuple[tuple[str, int], ...] = (
     ("bin/the-hive-mcp", 0o755),
     (_STABLE_MCP_LAUNCHER_SOURCE, 0o755),
     (_STABLE_HOOK_LAUNCHER_SOURCE, 0o755),
+    ("bin/the-hive-openai-pricing-inventory", 0o755),
+    (_PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE, 0o755),
     ("bin/the-hive-resource-monitor", 0o755),
     ("bin/the-hive-hive-hourly-probe", 0o755),
     (".codex-plugin/plugin.json", 0o644),
@@ -115,6 +120,9 @@ _REQUIRED_FILES: tuple[tuple[str, int], ...] = (
     ("codex-agent-classes.json", 0o644),
     ("systemd/user/the-hive-resource-monitor.service", 0o644),
     ("systemd/user/the-hive.slice", 0o644),
+    ("systemd/user/the-hive-openai-pricing.service", 0o644),
+    ("systemd/user/the-hive-openai-pricing.timer", 0o644),
+    ("src/the_hive/pricing_inventory.py", 0o644),
     (_RUNTIME_SPAWN_HELPER, 0o755),
     (_MANIFEST_NAME, 0o644),
 )
@@ -399,6 +407,7 @@ def _release_metadata(manifest: dict[str, object]) -> dict[str, object]:
             _STABLE_MCP_LAUNCHER_SOURCE,
             "bin/the-hive-mcp",
             "bin/the-hive-resource-monitor",
+            _PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE,
         ],
         "hook_abi_source": _STABLE_HOOK_LAUNCHER_SOURCE,
         "hook_abi": _HOOK_ABI_V1_LAUNCHER,

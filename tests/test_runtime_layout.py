@@ -40,6 +40,16 @@ def materialize_runtime_image(
         root / "bin" / "the-hive-plugin-hook-stable", "#!/bin/sh\nexit 0\n", 0o755
     )
     _write_file(
+        root / "bin" / "the-hive-openai-pricing-inventory",
+        "#!/bin/sh\nexit 0\n",
+        0o755,
+    )
+    _write_file(
+        root / "bin" / "the-hive-openai-pricing-inventory-stable",
+        "#!/bin/sh\nexit 0\n",
+        0o755,
+    )
+    _write_file(
         root / "bin" / "the-hive-hive-hourly-probe",
         "#!/bin/sh\nexit 0\n",
         0o755,
@@ -51,6 +61,8 @@ def materialize_runtime_image(
         root / "systemd" / "user" / "the-hive-resource-monitor.service", "[Service]\n"
     )
     _write_file(root / "systemd" / "user" / "the-hive.slice", "[Slice]\n")
+    _write_file(root / "systemd" / "user" / "the-hive-openai-pricing.service", "[Service]\n")
+    _write_file(root / "systemd" / "user" / "the-hive-openai-pricing.timer", "[Timer]\n")
     _write_file(
         root / ".codex-plugin" / "plugin.json",
         json.dumps(
@@ -114,6 +126,7 @@ def materialize_runtime_image(
         "hive/admission.py",
         "hive/dispatch.py",
         "hive/principals.py",
+        "pricing_inventory.py",
         "selection.py",
         "selection_service.py",
         "hook_abi_v1_core.py",
@@ -810,6 +823,8 @@ def test_runtime_layout_rejects_an_image_reached_through_a_linked_parent(
     (
         "bin/the-hive-mcp",
         "bin/the-hive-plugin-hook-stable",
+        "bin/the-hive-openai-pricing-inventory",
+        "bin/the-hive-openai-pricing-inventory-stable",
         "bin/the-hive-hive-hourly-probe",
         ".codex-plugin/plugin.json",
         ".mcp.json",
@@ -817,11 +832,14 @@ def test_runtime_layout_rejects_an_image_reached_through_a_linked_parent(
         "hooks/hooks.json",
         "hooks/native_bee_event.py",
         "hooks/native_spawn_admission.py",
+        "systemd/user/the-hive-openai-pricing.service",
+        "systemd/user/the-hive-openai-pricing.timer",
         "TheHivePluginBundleV1/release-binding.json",
         "root-install-plan.json",
         "skills/the-hive-fleet/SKILL.md",
         "codex-hive.json",
         "codex-agent-classes.json",
+        "src/the_hive/pricing_inventory.py",
         "src/the_hive/_runtime_spawn_helper.so",
         ".the-hive-runtime-manifest.json",
     ),

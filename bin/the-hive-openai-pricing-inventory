@@ -1,7 +1,53 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 set -euo pipefail
 
-script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
-repo_root="$(cd -- "$(dirname -- "${script_path}")/.." && pwd)"
-export PYTHONPATH="${repo_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
-exec python3 -m the_hive.pricing_inventory "$@"
+if (( $# < 3 )); then
+    exit 64
+fi
+release_root="$1"
+generation="$2"
+manifest_digest="$3"
+for variable in "${!CODEX_@}"; do unset "${variable}"; done
+unset PYTHONHOME PYTHONPATH
+export PATH=/usr/bin:/bin
+exec /usr/bin/python3 -I -B -c '
+import runpy
+import sys
+from pathlib import Path
+
+
+def fail():
+    raise SystemExit(64)
+
+
+root = Path(sys.argv[1])
+generation = sys.argv[2]
+manifest_digest = sys.argv[3]
+if (
+    not root.is_absolute()
+    or not generation
+    or "/" in generation
+    or generation in {".", ".."}
+    or not manifest_digest.startswith("sha256:")
+    or len(manifest_digest) != 71
+    or any(character not in "0123456789abcdef" for character in manifest_digest[7:])
+):
+    fail()
+candidate = root / "generations" / generation / "src"
+try:
+    sys.path.insert(0, str(candidate))
+    from the_hive.runtime_layout import RuntimeLayout
+
+    layout = RuntimeLayout.from_current_release(root, generation, manifest_digest)
+except Exception:
+    fail()
+if layout.root / "src" != candidate:
+    fail()
+sys.argv = [str(layout.root / "bin" / "the-hive-openai-pricing-inventory"), *sys.argv[4:]]
+try:
+    runpy.run_module("the_hive.pricing_inventory", run_name="__main__", alter_sys=True)
+except SystemExit:
+    raise
+except Exception:
+    fail()
+' "$release_root" "$generation" "$manifest_digest" "${@:4}"

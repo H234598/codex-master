@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import stat
-import subprocess
-import venv
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1149,65 +1146,3 @@ def test_pricing_units_use_the_canonical_the_hive_state_path() -> None:
     assert "OnCalendar=daily" in timer
     assert "Persistent=true" in timer
     assert "Unit=the-hive-openai-pricing.service" in timer
-
-
-def test_packaged_pricing_entrypoint_imports_outside_the_repository(
-    tmp_path: Path,
-) -> None:
-    """The canonical user entrypoint must not depend on checkout-relative imports."""
-    install_root = tmp_path / "installed-pricing"
-    source = install_root / "source"
-    source.mkdir(parents=True, mode=0o700)
-    repository = Path(__file__).resolve().parents[1]
-    shutil.copy2(repository / "pyproject.toml", source / "pyproject.toml")
-    shutil.copytree(repository / "src", source / "src")
-    shutil.copytree(repository / "systemd", source / "systemd")
-    (source / "scripts").mkdir()
-    shutil.copy2(repository / "scripts" / "install-host-agent", source / "scripts")
-
-    environment = {
-        key: value for key, value in os.environ.items() if key != "PYTHONPATH"
-    }
-    environment["PIP_CACHE_DIR"] = os.fspath(install_root / "pip-cache")
-    venv.EnvBuilder(with_pip=True, system_site_packages=True).create(install_root)
-    interpreter = install_root / "bin" / "python"
-    installed = subprocess.run(
-        [
-            os.fspath(interpreter),
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--no-deps",
-            "--no-build-isolation",
-            "--no-cache-dir",
-            os.fspath(source),
-        ],
-        cwd=install_root,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert installed.returncode == 0, installed.stderr
-
-    entrypoint = install_root / "bin" / "the-hive-openai-pricing-inventory"
-    neutral = install_root / "neutral"
-    neutral.mkdir(mode=0o700)
-    completed = subprocess.run(
-        [os.fspath(entrypoint), "--help"],
-        cwd=neutral,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-
-    assert entrypoint.is_file()
-    assert os.access(entrypoint, os.X_OK)
-    assert completed.returncode == 0, completed.stderr
-    assert "usage:" in completed.stdout

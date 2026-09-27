@@ -185,10 +185,18 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     write("bin/the-hive-mcp", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-mcp-stable", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-plugin-hook-stable", "#!/bin/sh\nexit 0\n", 0o755)
+    write("bin/the-hive-openai-pricing-inventory", "#!/bin/sh\nexit 0\n", 0o755)
+    write(
+        "bin/the-hive-openai-pricing-inventory-stable",
+        "#!/bin/sh\nexit 0\n",
+        0o755,
+    )
     write("bin/the-hive-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
     write("bin/the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
     write("systemd/user/the-hive-resource-monitor.service", "[Service]\n")
     write("systemd/user/the-hive.slice", "[Slice]\n")
+    write("systemd/user/the-hive-openai-pricing.service", "[Service]\n")
+    write("systemd/user/the-hive-openai-pricing.timer", "[Timer]\n")
     write(
         ".codex-plugin/plugin.json",
         json.dumps(
@@ -258,6 +266,7 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
         "hive/principals.py",
         "hook_abi_v1_core.py",
         "hook_session_pin_store.py",
+        "pricing_inventory.py",
         "selection.py",
         "selection_service.py",
         "server.py",
@@ -1301,6 +1310,251 @@ def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime
     else:
         assert legacy_completed.stderr == ""
     assert not list(runtime_root.rglob("__pycache__"))
+
+
+def test_pricing_inventory_runtime_materialization_is_attested_and_upgrade_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    release_commit = {"value": "a" * 40}
+    monkeypatch.setitem(
+        installer["_install_attested_runtime"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: release_commit["value"],
+    )
+
+    first = installer["_install_attested_runtime"](home=home)
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    units = home / ".config" / "systemd" / "user"
+    bindir = home / ".local" / "bin"
+    first_generation = first["generation"]
+    assert first_generation == "a" * 40
+    assert isinstance(first["manifest_digest"], str)
+    first_runtime = release_root / "generations" / first_generation
+    launcher = bindir / "the-hive-openai-pricing-inventory"
+    service = units / "the-hive-openai-pricing.service"
+    timer = units / "the-hive-openai-pricing.timer"
+    generation_paths = (
+        (first_runtime / "bin" / "the-hive-openai-pricing-inventory", 0o755),
+        (
+            first_runtime / "bin" / "the-hive-openai-pricing-inventory-stable",
+            0o755,
+        ),
+        (first_runtime / "systemd" / "user" / service.name, 0o644),
+        (first_runtime / "systemd" / "user" / timer.name, 0o644),
+    )
+    for path, mode in generation_paths:
+        item = path.lstat()
+        assert stat.S_ISREG(item.st_mode)
+        assert item.st_nlink == 1
+        assert stat.S_IMODE(item.st_mode) == mode
+    assert launcher.read_bytes() == (
+        first_runtime / "bin" / "the-hive-openai-pricing-inventory-stable"
+    ).read_bytes()
+    assert service.read_bytes() == (
+        first_runtime / "systemd" / "user" / service.name
+    ).read_bytes()
+    assert timer.read_bytes() == (
+        first_runtime / "systemd" / "user" / timer.name
+    ).read_bytes()
+    assert stat.S_IMODE(launcher.lstat().st_mode) == 0o755
+    assert stat.S_IMODE(service.lstat().st_mode) == 0o644
+    assert stat.S_IMODE(timer.lstat().st_mode) == 0o644
+    assert "ExecStart=%h/.local/bin/the-hive-openai-pricing-inventory" in (
+        service.read_text(encoding="utf-8")
+    )
+    assert "ReadWritePaths=%h/.local/state/the-hive/openai-pricing" in (
+        service.read_text(encoding="utf-8")
+    )
+    assert "codex-master" not in service.read_text(encoding="utf-8")
+    assert "Unit=the-hive-openai-pricing.service" in timer.read_text(encoding="utf-8")
+
+    manifest = json.loads(
+        (first_runtime / ".the-hive-runtime-manifest.json").read_text(encoding="utf-8")
+    )
+    assert {
+        "bin/the-hive-openai-pricing-inventory",
+        "bin/the-hive-openai-pricing-inventory-stable",
+        "systemd/user/the-hive-openai-pricing.service",
+        "systemd/user/the-hive-openai-pricing.timer",
+    } <= set(manifest["files"])
+
+    attacker_python = tmp_path / "attacker-python"
+    (attacker_python / "the_hive").mkdir(parents=True)
+    (attacker_python / "the_hive" / "pricing_inventory.py").write_text(
+        "raise RuntimeError('attacker module executed')\n", encoding="utf-8"
+    )
+    neutral = tmp_path / "neutral"
+    neutral.mkdir(mode=0o700)
+    environment = {
+        "HOME": str(home),
+        "PATH": "/attacker/bin",
+        "PYTHONPATH": str(attacker_python),
+        "CODEX_HOME": str(tmp_path / "attacker-codex-home"),
+    }
+    launched = subprocess.run(
+        [launcher, "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=neutral,
+    )
+    assert launched.returncode == 0, launched.stderr
+    assert "usage:" in launched.stdout
+
+    pointer = release_root / ".the-hive-release-pointers.json"
+    pointer_original = pointer.read_bytes()
+    pointer_payload = json.loads(pointer_original)
+    pointer_payload["current"]["manifest_digest"] = "sha256:" + "0" * 64
+    pointer.write_text(json.dumps(pointer_payload), encoding="utf-8")
+    pointer.chmod(0o644)
+    rejected = subprocess.run(
+        [launcher, "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=neutral,
+    )
+    assert rejected.returncode == 64
+    assert rejected.stdout == ""
+    pointer.write_bytes(pointer_original)
+    pointer.chmod(0o644)
+
+    release_commit["value"] = "b" * 40
+    upgraded = installer["_install_attested_runtime"](home=home)
+    assert upgraded["generation"] == "b" * 40
+    pointers = json.loads(pointer.read_text(encoding="utf-8"))
+    assert pointers["current"]["generation"] == "b" * 40
+    assert pointers["previous"]["generation"] == first_generation
+    upgraded_runtime = release_root / "generations" / ("b" * 40)
+    assert launcher.read_bytes() == (
+        upgraded_runtime / "bin" / "the-hive-openai-pricing-inventory-stable"
+    ).read_bytes()
+    assert service.read_bytes() == (
+        upgraded_runtime / "systemd" / "user" / service.name
+    ).read_bytes()
+    assert timer.read_bytes() == (
+        upgraded_runtime / "systemd" / "user" / timer.name
+    ).read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("name", "unsafe"),
+    (
+        ("the-hive-openai-pricing-inventory", "symlink"),
+        ("the-hive-openai-pricing.service", "symlink"),
+        ("the-hive-openai-pricing.timer", "unsafe_mode"),
+    ),
+)
+def test_pricing_runtime_replacement_rejects_unsafe_owned_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    unsafe: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    release_commit = {"value": "a" * 40}
+    monkeypatch.setitem(
+        installer["_install_attested_runtime"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: release_commit["value"],
+    )
+    installer["_install_attested_runtime"](home=home)
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    pointer = release_root / ".the-hive-release-pointers.json"
+    pointer_before = pointer.read_bytes()
+    target = (
+        home / ".local" / "bin" / name
+        if name == "the-hive-openai-pricing-inventory"
+        else home / ".config" / "systemd" / "user" / name
+    )
+    if unsafe == "symlink":
+        foreign = tmp_path / f"foreign-{name}"
+        foreign.write_text("foreign\n", encoding="utf-8")
+        target.unlink()
+        target.symlink_to(foreign)
+    else:
+        target.chmod(0o600)
+
+    release_commit["value"] = "b" * 40
+    with pytest.raises(
+        installer["InstallError"],
+        match="install_release_(triplet_invalid|retention_failed)",
+    ):
+        installer["_install_attested_runtime"](home=home)
+
+    assert pointer.read_bytes() == pointer_before
+    assert not (release_root / "generations" / ("b" * 40)).exists()
+    if unsafe == "symlink":
+        assert target.is_symlink()
+    else:
+        assert stat.S_IMODE(target.lstat().st_mode) == 0o600
+
+
+def test_pricing_runtime_rolls_back_the_complete_pair_on_timer_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    release_commit = {"value": "a" * 40}
+    monkeypatch.setitem(
+        installer["_install_attested_runtime"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: release_commit["value"],
+    )
+    installer["_install_attested_runtime"](home=home)
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    units = home / ".config" / "systemd" / "user"
+    launcher = home / ".local" / "bin" / "the-hive-openai-pricing-inventory"
+    service = units / "the-hive-openai-pricing.service"
+    timer = units / "the-hive-openai-pricing.timer"
+    pointer = release_root / ".the-hive-release-pointers.json"
+    previous = {
+        "launcher": launcher.read_bytes(),
+        "service": service.read_bytes(),
+        "timer": timer.read_bytes(),
+        "pointer": pointer.read_bytes(),
+    }
+    install_attested_bytes = installer["_install_attested_bytes"]
+    failed = {"value": False}
+
+    def fail_pricing_timer_once(target: Path, content: bytes, *, mode: int) -> None:
+        if target == timer and not failed["value"]:
+            failed["value"] = True
+            raise installer["InstallError"]("install_target_untrusted")
+        install_attested_bytes(target, content, mode=mode)
+
+    release_commit["value"] = "b" * 40
+    monkeypatch.setitem(
+        installer["_materialize_pricing_inventory_units"].__globals__,
+        "_install_attested_bytes",
+        fail_pricing_timer_once,
+    )
+    with pytest.raises(installer["InstallError"], match="install_target_untrusted"):
+        installer["_install_attested_runtime"](home=home)
+
+    assert failed["value"] is True
+    assert launcher.read_bytes() == previous["launcher"]
+    assert service.read_bytes() == previous["service"]
+    assert timer.read_bytes() == previous["timer"]
+    assert pointer.read_bytes() == previous["pointer"]
+    assert not (release_root / "generations" / ("b" * 40)).exists()
 
 
 def test_probe_installer_upgrades_a_valid_83_generation_only_unit(
