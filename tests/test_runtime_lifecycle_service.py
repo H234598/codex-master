@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import runpy
 import subprocess
 import sys
 import fcntl
@@ -54,6 +55,7 @@ def _bound_failure_fixture(
     units = home / ".config" / "systemd" / "user"
     state = home / ".local" / "state" / "codex-master-mcp"
     launcher = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
+    pricing_launcher = home / ".local" / "bin" / "the-hive-openai-pricing-inventory"
     for directory in (
         home / ".local",
         home / ".local" / "lib",
@@ -64,6 +66,7 @@ def _bound_failure_fixture(
         home / ".local" / "state",
         state,
         home / ".local" / "libexec",
+        home / ".local" / "bin",
     ):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
@@ -71,9 +74,12 @@ def _bound_failure_fixture(
         (release / ".the-hive-release-pointers.json", b'{"old":true}\n', 0o644),
         (release / "the-hive-mcp", b"old-mcp\n", 0o755),
         (launcher, b"old-launcher\n", 0o755),
+        (pricing_launcher, b"old-pricing-launcher\n", 0o755),
         (state / "runtime-lifecycle-probe-observation.json", b'{"old":true}\n', 0o600),
         (units / "the-hive-hive-hourly-probe.service", b"new-service\n", 0o644),
         (units / "the-hive-hive-hourly-probe.timer", b"new-timer\n", 0o644),
+        (units / "the-hive-openai-pricing.service", b"old-pricing-service\n", 0o644),
+        (units / "the-hive-openai-pricing.timer", b"old-pricing-timer\n", 0o644),
         (units / "codex-master-hive-hourly-probe.service", b"legacy-service\n", 0o644),
         (units / "codex-master-hive-hourly-probe.timer", b"legacy-timer\n", 0o644),
     )
@@ -145,6 +151,102 @@ def _allow_postinstall_attestation(monkeypatch) -> None:
     monkeypatch.setattr(
         runtime_lifecycle, "_revalidate_post_install", lambda _bound, _home: None
     )
+
+
+def _cutover_input_home(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Create the private ancestors needed to bind live pricing artifacts."""
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    release = home / ".local" / "lib" / "the-hive-runtime"
+    units = home / ".config" / "systemd" / "user"
+    bindir = home / ".local" / "bin"
+    for directory in (
+        home / ".local",
+        home / ".local" / "lib",
+        release,
+        bindir,
+        home / ".config",
+        home / ".config" / "systemd",
+        units,
+    ):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+    return home, units, bindir
+
+
+def test_bind_cutover_inputs_snapshots_pricing_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pricing artifacts are part of the same rollback witness as Hourly."""
+
+    home, units, bindir = _cutover_input_home(tmp_path)
+    launcher = bindir / "the-hive-openai-pricing-inventory"
+    service = units / "the-hive-openai-pricing.service"
+    timer = units / "the-hive-openai-pricing.timer"
+    expected = {
+        launcher: (b"old-pricing-launcher\n", 0o755),
+        service: (b"old-pricing-service\n", 0o644),
+        timer: (b"old-pricing-timer\n", 0o644),
+    }
+    for path, (content, mode) in expected.items():
+        path.write_bytes(content)
+        path.chmod(mode)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_source_tree_binding", lambda _repository: ("a" * 40, "b" * 64)
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
+
+    bound = runtime_lifecycle._bind_cutover_inputs(home)
+
+    snapshots = {path: (content, mode) for path, content, mode in bound.files}
+    assert {path: snapshots[path] for path in expected} == expected
+
+
+@pytest.mark.parametrize(
+    ("relative", "mode", "link"),
+    [
+        (".local/bin/the-hive-openai-pricing-inventory", 0o755, "symlink"),
+        (
+            ".config/systemd/user/the-hive-openai-pricing.service",
+            0o644,
+            "hardlink",
+        ),
+        (
+            ".config/systemd/user/the-hive-openai-pricing.timer",
+            0o644,
+            "symlink",
+        ),
+    ],
+)
+def test_bind_cutover_inputs_rejects_unsafe_pricing_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+    mode: int,
+    link: str,
+) -> None:
+    """A pricing target must be absent or an owned single-link regular file."""
+
+    home, _units, _bindir = _cutover_input_home(tmp_path)
+    source = tmp_path / "untrusted-pricing-source"
+    source.write_bytes(b"untrusted\n")
+    source.chmod(mode)
+    target = home / relative
+    if link == "symlink":
+        target.symlink_to(source)
+    else:
+        target.hardlink_to(source)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_source_tree_binding", lambda _repository: ("a" * 40, "b" * 64)
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_source_digest", lambda _path: "c" * 64)
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="^runtime_lifecycle_binding_invalid$",
+    ):
+        runtime_lifecycle._bind_cutover_inputs(home)
 
 
 def test_public_runtime_lifecycle_surface_exposes_only_cutover_status_and_verify() -> (
@@ -1561,6 +1663,99 @@ def test_cutover_each_user_manager_phase_failure_restores_bound_state(
     assert injected is True
     assert result["status"] == "runtime_lifecycle_systemd_failed"
     _assert_bound_files_restored(bound)
+
+
+@pytest.mark.parametrize("preexisting", [True, False], ids=("present", "absent"))
+def test_cutover_postinstall_failure_restores_pricing_and_discards_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preexisting: bool
+) -> None:
+    """Pricing publication rolls back with Hourly before its image is discarded."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+    pricing_paths = {
+        bound.home / ".local" / "bin" / "the-hive-openai-pricing-inventory",
+        bound.units / "the-hive-openai-pricing.service",
+        bound.units / "the-hive-openai-pricing.timer",
+    }
+    expected = {
+        path: content for path, content, _mode in bound.files if path in pricing_paths
+    }
+    if not preexisting:
+        for path in pricing_paths:
+            path.unlink()
+        bound = runtime_lifecycle.replace(
+            bound,
+            files=tuple(
+                (path, None if path in pricing_paths else content, mode)
+                for path, content, mode in bound.files
+            ),
+        )
+    generation = "b" * 40
+    bound = runtime_lifecycle.replace(
+        bound,
+        source_commit=generation,
+        generations_before=frozenset({"a" * 40}),
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
+    monkeypatch.setattr(
+        runtime_lifecycle, "verify", lambda **_kwargs: {"status": "runtime_lifecycle_red"}
+    )
+
+    def install(_home: Path) -> None:
+        candidate = bound.release_root / "generations" / generation
+        candidate.parent.mkdir(mode=0o700)
+        candidate.mkdir(mode=0o700)
+        installer = runpy.run_path(str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install"))
+        installer["_build_runtime_image"](  # type: ignore[operator]
+            repository=ROOT, stage=candidate, generation=generation, commit=generation
+        )
+        for path, _content, mode in bound.files:
+            if path in pricing_paths:
+                path.write_bytes(b"new-pricing-state\n")
+                path.chmod(mode)
+
+    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", install)
+    _allow_postinstall_attestation(monkeypatch)
+    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: False)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
+    )
+    discard = runtime_lifecycle._discard_new_generation
+
+    def discard_after_pricing_restore(received: runtime_lifecycle._BoundCutover) -> None:
+        for path in pricing_paths:
+            if preexisting:
+                assert path.read_bytes() == expected[path]
+            else:
+                assert not path.exists()
+        discard(received)
+
+    monkeypatch.setattr(
+        runtime_lifecycle, "_discard_new_generation", discard_after_pricing_restore
+    )
+    failed = {"value": False}
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        if arguments == ("daemon-reload",) and not failed["value"]:
+            failed["value"] = True
+            raise runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_systemd_failed")
+        return {}
+
+    result = runtime_lifecycle.cutover(home=bound.home, systemctl=systemctl)
+
+    assert result["status"] == "runtime_lifecycle_systemd_failed"
+    assert not (bound.release_root / "generations" / generation).exists()
+    for path in pricing_paths:
+        if preexisting:
+            assert path.read_bytes() == expected[path]
+        else:
+            assert not path.exists()
 
 
 def test_cutover_bounded_probe_failure_restores_bound_state(tmp_path: Path, monkeypatch) -> None:

@@ -33,6 +33,11 @@ _NEW_SERVICE = "the-hive-hive-hourly-probe.service"
 _NEW_TIMER = "the-hive-hive-hourly-probe.timer"
 _LEGACY_SERVICE = "codex-master-hive-hourly-probe.service"
 _LEGACY_TIMER = "codex-master-hive-hourly-probe.timer"
+_PRICING_LAUNCHER = "the-hive-openai-pricing-inventory"
+_PRICING_UNITS = (
+    "the-hive-openai-pricing.service",
+    "the-hive-openai-pricing.timer",
+)
 _EIGHT_UTC_TERMS = "OnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00 UTC"
 _MAX_UNIT_BYTES = 128 * 1024
 _MAX_HEALTH_BYTES = 256 * 1024
@@ -2178,6 +2183,8 @@ def _bind_cutover_inputs(home: Path) -> _BoundCutover:
     """Bind exactly the source, pre-runtime and unit state before mutation."""
 
     release_root, units, state_root, legacy_launcher = _home_paths(home)
+    pricing_launcher = home / ".local" / "bin" / _PRICING_LAUNCHER
+    pricing_units = tuple(units / name for name in _PRICING_UNITS)
     try:
         home_info = home.lstat()
     except OSError as exc:
@@ -2189,7 +2196,14 @@ def _bind_cutover_inputs(home: Path) -> _BoundCutover:
         or stat.S_IMODE(home_info.st_mode) & 0o022
     ):
         raise _error("runtime_lifecycle_home_invalid")
-    for path in (release_root, units, state_root, legacy_launcher):
+    for path in (
+        release_root,
+        units,
+        state_root,
+        legacy_launcher,
+        pricing_launcher,
+        *pricing_units,
+    ):
         _bound_path_from_home(home, path)
     repository = Path(__file__).resolve().parents[2]
     sources = (
@@ -2234,6 +2248,11 @@ def _bind_cutover_inputs(home: Path) -> _BoundCutover:
             0o755,
         ),
         (
+            pricing_launcher,
+            _regular_bytes(pricing_launcher, maximum=_MAX_UNIT_BYTES, mode=0o755),
+            0o755,
+        ),
+        (
             state_root / _OBSERVATION_NAME,
             _regular_bytes(
                 state_root / _OBSERVATION_NAME,
@@ -2246,6 +2265,7 @@ def _bind_cutover_inputs(home: Path) -> _BoundCutover:
             (units / name, _unit_bytes(units, name), 0o644)
             for name in (_NEW_SERVICE, _NEW_TIMER, _LEGACY_SERVICE, _LEGACY_TIMER)
         ),
+        *((path, _unit_bytes(units, path.name), 0o644) for path in pricing_units),
     )
     return _BoundCutover(
         home=home,
