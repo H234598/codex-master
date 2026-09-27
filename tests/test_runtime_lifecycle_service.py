@@ -1840,6 +1840,64 @@ def test_cutover_installer_failure_restores_the_bound_preexisting_state(
     _assert_bound_files_restored(bound)
 
 
+def test_cutover_new_service_start_failure_reports_bounded_primary_phase_after_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restored manager failure exposes only its fixed primary phase fields."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
+    monkeypatch.setattr(
+        runtime_lifecycle, "verify", lambda **_kwargs: {"status": "runtime_lifecycle_red"}
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", lambda _home: None)
+    _allow_postinstall_attestation(monkeypatch)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
+    )
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments == ("start", "the-hive-hive-hourly-probe.service"):
+            raise OSError("untrusted-command-detail")
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    result = runtime_lifecycle.cutover(home=bound.home, systemctl=systemctl)
+
+    assert result == {
+        "status": "runtime_lifecycle_systemd_failed",
+        "raw_output": "not_returned",
+        "failure_phase": "new_service_start",
+        "failure_error": "systemd_mutation_failed",
+    }
+    assert "untrusted-command-detail" not in repr(result)
+    _assert_bound_files_restored(bound)
+
+
+def test_cutover_mutation_failure_result_rejects_unbounded_telemetry() -> None:
+    """Unexpected carrier data fails closed without publishing exception text."""
+
+    result = runtime_lifecycle._cutover_mutation_failure_result(
+        runtime_lifecycle._CutoverMutationError(
+            phase="untrusted-phase",
+            error=runtime_lifecycle.RuntimeLifecycleError("untrusted-error-detail"),
+        )
+    )
+
+    assert result == {
+        "status": "runtime_lifecycle_systemd_failed",
+        "raw_output": "not_returned",
+        "failure_phase": "telemetry_invalid",
+        "failure_error": "telemetry_invalid",
+    }
+    assert "untrusted" not in repr(result)
+
+
 @pytest.mark.parametrize(
     ("stage", "failing_call"),
     (
@@ -1908,7 +1966,12 @@ def test_cutover_each_user_manager_phase_failure_restores_bound_state(
     result = runtime_lifecycle.cutover(home=bound.home, systemctl=systemctl)
 
     assert injected is True
-    assert result["status"] == "runtime_lifecycle_systemd_failed"
+    assert result == {
+        "status": "runtime_lifecycle_systemd_failed",
+        "raw_output": "not_returned",
+        "failure_phase": stage,
+        "failure_error": "systemd_mutation_failed",
+    }
     _assert_bound_files_restored(bound)
 
 
@@ -3085,6 +3148,7 @@ def test_d332_model_never_calls_existing_mutators(monkeypatch) -> None:
         "cutover",
         "_install_attested_runtime",
         "_systemctl_mutate",
+        "_cutover_systemctl_mutate",
         "_restore_bound_state",
         "_restore_bound_state_result",
         "_discard_new_generation",

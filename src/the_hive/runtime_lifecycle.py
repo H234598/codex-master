@@ -80,6 +80,25 @@ _ROLLBACK_FAILURE_CODES = frozenset(
         "telemetry_invalid",
     )
 )
+_CUTOVER_MUTATION_PHASES = frozenset(
+    (
+        "before_activation_reload",
+        "legacy_service_stop",
+        "legacy_timer_disable",
+        "new_timer_enable",
+        "new_service_start",
+        "after_unit_removal_reload",
+    )
+)
+_CUTOVER_MUTATION_STATUSES = frozenset(
+    (
+        "runtime_lifecycle_systemd_failed",
+        "runtime_lifecycle_systemd_invalid",
+        "runtime_lifecycle_systemd_unavailable",
+    )
+)
+_CUTOVER_MUTATION_ERROR = "systemd_mutation_failed"
+_CUTOVER_TELEMETRY_INVALID = "telemetry_invalid"
 _PRODUCER_CONSUMER_CONTRACT = {
     "_PRODUCER_VERSION": "0.6.542",
     "_PRODUCER_SOURCE_MANIFEST_SHA256": "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0",
@@ -91,6 +110,19 @@ Systemctl = Callable[[tuple[str, ...]], Mapping[str, str]]
 
 class RuntimeLifecycleError(ValueError):
     """A stable, data-sparse lifecycle failure code."""
+
+
+class _CutoverMutationError(RuntimeLifecycleError):
+    """Carry one bounded manager phase through a successful rollback only."""
+
+    def __init__(self, *, phase: str, error: RuntimeLifecycleError) -> None:
+        status = str(error)
+        super().__init__(
+            status
+            if status in _CUTOVER_MUTATION_STATUSES
+            else "runtime_lifecycle_systemd_failed"
+        )
+        self.phase = phase
 
 
 def _error(code: str) -> RuntimeLifecycleError:
@@ -2502,6 +2534,17 @@ def _systemctl_mutate(systemctl: Systemctl, arguments: tuple[str, ...]) -> None:
         raise _error("runtime_lifecycle_systemd_invalid")
 
 
+def _cutover_systemctl_mutate(
+    systemctl: Systemctl, arguments: tuple[str, ...], *, phase: str
+) -> None:
+    """Run one named cutover mutation without exposing manager error detail."""
+
+    try:
+        _systemctl_mutate(systemctl, arguments)
+    except RuntimeLifecycleError as exc:
+        raise _CutoverMutationError(phase=phase, error=exc) from exc
+
+
 def _atomic_restore(path: Path, content: bytes, mode: int) -> None:
     descriptor = -1
     temporary = Path()
@@ -2701,6 +2744,25 @@ def _rollback_failure_result(
         "raw_output": "not_returned",
         "rollback_phase": rollback.phase,
         "rollback_error": rollback.error_code,
+    }
+
+
+def _cutover_mutation_failure_result(
+    failure: _CutoverMutationError,
+) -> dict[str, object]:
+    """Publish only the fixed phase/error pair after a complete rollback."""
+
+    if failure.phase not in _CUTOVER_MUTATION_PHASES:
+        phase = _CUTOVER_TELEMETRY_INVALID
+        error = _CUTOVER_TELEMETRY_INVALID
+    else:
+        phase = failure.phase
+        error = _CUTOVER_MUTATION_ERROR
+    return {
+        "status": str(failure),
+        "raw_output": "not_returned",
+        "failure_phase": phase,
+        "failure_error": error,
     }
 
 
@@ -3469,28 +3531,52 @@ def cutover(
                 if _legacy_requires_migration(bound):
                     _revalidate_legacy_units(bound)
                 _revalidate_post_install(post_install, home)
-                _systemctl_mutate(systemctl, ("daemon-reload",))
+                _cutover_systemctl_mutate(
+                    systemctl,
+                    ("daemon-reload",),
+                    phase="before_activation_reload",
+                )
                 if _legacy_requires_migration(bound):
                     _revalidate_legacy_units(bound)
                     _revalidate_post_install(post_install, home)
-                    _systemctl_mutate(systemctl, ("stop", _LEGACY_SERVICE))
+                    _cutover_systemctl_mutate(
+                        systemctl,
+                        ("stop", _LEGACY_SERVICE),
+                        phase="legacy_service_stop",
+                    )
                     _revalidate_legacy_units(bound)
                     _revalidate_post_install(post_install, home)
-                    _systemctl_mutate(systemctl, ("disable", "--now", _LEGACY_TIMER))
+                    _cutover_systemctl_mutate(
+                        systemctl,
+                        ("disable", "--now", _LEGACY_TIMER),
+                        phase="legacy_timer_disable",
+                    )
                 _revalidate_post_install(post_install, home)
-                _systemctl_mutate(systemctl, ("enable", "--now", _NEW_TIMER))
+                _cutover_systemctl_mutate(
+                    systemctl,
+                    ("enable", "--now", _NEW_TIMER),
+                    phase="new_timer_enable",
+                )
                 _revalidate_post_install(post_install, home)
-                _systemctl_mutate(systemctl, ("start", _NEW_SERVICE))
+                _cutover_systemctl_mutate(
+                    systemctl,
+                    ("start", _NEW_SERVICE),
+                    phase="new_service_start",
+                )
                 _revalidate_post_install(post_install, home)
                 _observe_argumentless_installed_probe(home)
                 _remove_legacy_hourly_units(bound)
                 _revalidate_post_install(post_install, home)
-                _systemctl_mutate(systemctl, ("daemon-reload",))
+                _cutover_systemctl_mutate(
+                    systemctl,
+                    ("daemon-reload",),
+                    phase="after_unit_removal_reload",
+                )
                 result = verify(home=home, systemctl=systemctl)
                 if result.get("status") != "runtime_lifecycle_green":
                     raise _error("runtime_lifecycle_postconditions_failed")
                 return result
-            except RuntimeLifecycleError:
+            except RuntimeLifecycleError as exc:
                 rollback = _restore_bound_state_result(bound, systemctl)
                 if not rollback.restored:
                     if not _publish_rollback_failure(bound):
@@ -3501,6 +3587,8 @@ def cutover(
                     return _rollback_failure_result(
                         status="runtime_lifecycle_rollback_failed", rollback=rollback
                     )
+                if isinstance(exc, _CutoverMutationError):
+                    return _cutover_mutation_failure_result(exc)
                 raise
     except RuntimeLifecycleError as exc:
         return {"status": str(exc), "raw_output": "not_returned"}
