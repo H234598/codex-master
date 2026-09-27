@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
 import json
@@ -37,6 +38,9 @@ _STATE_DIRECTORY_MODE = 0o700
 _STATE_LAYOUT_FACTORY_PROVENANCE: dict[
     int, weakref.ReferenceType[RuntimeStateLayoutV1]
 ] = {}
+_RUNTIME_LAYOUT_VALIDATION: ContextVar[bytes | None] = ContextVar(
+    "runtime_layout_validation", default=None
+)
 _RESERVED_STATE_PARENTS = frozenset(
     {
         "admin",
@@ -809,21 +813,9 @@ def _runtime_manifest_payload(
     return {"schema_version": 2, **metadata, "directories": directories, "files": files}
 
 
-def _validated_manifest(
-    root: Path, *, expected_digest: str | None = None
-) -> tuple[dict[str, object], str]:
-    raw = _read_regular_bytes(root, _MANIFEST_NAME, max_bytes=_MAX_METADATA_BYTES)
-    digest = _manifest_digest(raw)
-    if expected_digest is not None and digest != expected_digest:
-        raise _invalid()
-    try:
-        manifest = json.loads(
-            raw.decode("utf-8"), object_pairs_hook=_unique_json_object
-        )
-    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
-        raise _invalid() from exc
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
-        raise _invalid()
+def _validate_attested_manifest_payload(
+    root: Path, manifest: dict[str, object], manifest_digest: str
+) -> dict[str, object]:
     metadata = _release_metadata(manifest)
     expected = _runtime_manifest_payload(root, metadata)
     if manifest != expected:
@@ -835,8 +827,58 @@ def _validated_manifest(
         or witness.get("sha256") != _SUCCESSOR_WITNESS_SHA256
     ):
         raise _invalid()
-    _validate_root_install_plan(root, manifest, digest)
-    _validate_plugin_bundle(root, manifest, digest)
+    _validate_root_install_plan(root, manifest, manifest_digest)
+    _validate_plugin_bundle(root, manifest, manifest_digest)
+    return metadata
+
+
+def _validated_manifest_from_bytes(
+    root: Path, raw: bytes, *, expected_digest: str | None = None
+) -> tuple[dict[str, object], str]:
+    manifest, digest, _metadata, _spawn_digest = _manifest_data_from_bytes(
+        raw, expected_digest=expected_digest
+    )
+    _validate_attested_manifest_payload(root, manifest, digest)
+    return manifest, digest
+
+
+def _manifest_data_from_bytes(
+    raw: bytes, *, expected_digest: str | None = None
+) -> tuple[dict[str, object], str, dict[str, object], str]:
+    """Parse one manifest byte string without consulting the filesystem."""
+
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= _MAX_METADATA_BYTES:
+        raise _invalid()
+    digest = _manifest_digest(raw)
+    if expected_digest is not None and digest != expected_digest:
+        raise _invalid()
+    try:
+        manifest = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_json_object
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _invalid() from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
+        raise _invalid()
+    return manifest, digest, _release_metadata(manifest), _spawn_helper_digest(manifest)
+
+
+def _validated_manifest_bytes(
+    root: Path, *, expected_digest: str | None = None
+) -> tuple[dict[str, object], str, bytes]:
+    raw = _read_regular_bytes(root, _MANIFEST_NAME, max_bytes=_MAX_METADATA_BYTES)
+    manifest, digest = _validated_manifest_from_bytes(
+        root, raw, expected_digest=expected_digest
+    )
+    return manifest, digest, raw
+
+
+def _validated_manifest(
+    root: Path, *, expected_digest: str | None = None
+) -> tuple[dict[str, object], str]:
+    manifest, digest, _raw = _validated_manifest_bytes(
+        root, expected_digest=expected_digest
+    )
     return manifest, digest
 
 
@@ -867,7 +909,9 @@ def _validate_layout_values(
     root_device: int,
     root_inode: int,
     manifest_digest: str,
-) -> None:
+    *,
+    manifest_bytes: bytes | None = None,
+) -> tuple[int, int]:
     _validate_root(root)
     root_stat = _lstat(root)
     if (
@@ -893,14 +937,29 @@ def _validate_layout_values(
     for relative_path, mode in _REQUIRED_FILES:
         _validate_regular(root, relative_path, mode)
     _validate_metadata(root)
-    manifest, actual_manifest_digest = _validated_manifest(
-        root, expected_digest=manifest_digest
-    )
+    if manifest_bytes is None:
+        manifest, actual_manifest_digest = _validated_manifest(
+            root, expected_digest=manifest_digest
+        )
+    else:
+        manifest, actual_manifest_digest = _validated_manifest_from_bytes(
+            root, manifest_bytes, expected_digest=manifest_digest
+        )
     if (
         actual_manifest_digest != manifest_digest
         or spawn_helper_digest != _spawn_helper_digest(manifest)
     ):
         raise _invalid()
+    if manifest_bytes is not None:
+        final_root_stat = _lstat(root)
+        if (final_root_stat.st_dev, final_root_stat.st_ino) != (
+            root_device,
+            root_inode,
+        ):
+            raise _invalid()
+    else:
+        final_root_stat = root_stat
+    return final_root_stat.st_dev, final_root_stat.st_ino
 
 
 @dataclass(frozen=True, slots=True, init=False, weakref_slot=True)
@@ -1051,6 +1110,7 @@ class RuntimeLayout:
     manifest_digest: str
 
     def __post_init__(self) -> None:
+        manifest_bytes = _RUNTIME_LAYOUT_VALIDATION.get()
         _validate_layout_values(
             self.root,
             self.mcp_entrypoint,
@@ -1061,25 +1121,16 @@ class RuntimeLayout:
             self.root_device,
             self.root_inode,
             self.manifest_digest,
+            manifest_bytes=manifest_bytes,
         )
 
     @classmethod
     def from_runtime_root(cls, root: Path) -> RuntimeLayout:
-        if not isinstance(root, Path) or not root.is_absolute():
+        attestation = _attest_runtime_root(root, layout_type=cls)
+        if type(attestation) is not _RuntimeLayoutAttestation:
             raise _invalid()
-        _validate_root(root)
-        root_stat = _lstat(root)
-        manifest, manifest_digest = _validated_manifest(root)
-        return cls(
-            root=root,
-            mcp_entrypoint=root / "bin" / "the-hive-mcp",
-            probe_entrypoint=root / "bin" / "the-hive-hive-hourly-probe",
-            metadata_root=root,
-            spawn_helper=root / _RUNTIME_SPAWN_HELPER,
-            spawn_helper_digest=_spawn_helper_digest(manifest),
-            root_device=root_stat.st_dev,
-            root_inode=root_stat.st_ino,
-            manifest_digest=manifest_digest,
+        return _RuntimeLayoutAttestation.layout.__get__(
+            attestation, _RuntimeLayoutAttestation
         )
 
     @classmethod
@@ -1217,6 +1268,244 @@ class RuntimeLayout:
             raise _invalid()
         validate_runtime_metadata(self)
         return raw
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeLayoutAttestation:
+    """Private, in-memory witness for one completed target attestation."""
+
+    target: Path
+    target_device: int
+    target_inode: int
+    layout: RuntimeLayout
+    manifest_bytes: bytes
+    manifest_digest: str
+    commit: str
+    generation: str
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("runtime_layout_invalid")
+
+
+def _runtime_layout_slot_values(
+    layout: RuntimeLayout,
+) -> tuple[Path, Path, Path, Path, Path, str, int, int, str]:
+    if not isinstance(layout, RuntimeLayout):
+        raise _invalid()
+    try:
+        return (
+            RuntimeLayout.root.__get__(layout, RuntimeLayout),
+            RuntimeLayout.mcp_entrypoint.__get__(layout, RuntimeLayout),
+            RuntimeLayout.probe_entrypoint.__get__(layout, RuntimeLayout),
+            RuntimeLayout.metadata_root.__get__(layout, RuntimeLayout),
+            RuntimeLayout.spawn_helper.__get__(layout, RuntimeLayout),
+            RuntimeLayout.spawn_helper_digest.__get__(layout, RuntimeLayout),
+            RuntimeLayout.root_device.__get__(layout, RuntimeLayout),
+            RuntimeLayout.root_inode.__get__(layout, RuntimeLayout),
+            RuntimeLayout.manifest_digest.__get__(layout, RuntimeLayout),
+        )
+    except AttributeError as exc:
+        raise _invalid() from exc
+
+
+def _normalized_runtime_layout_values(
+    layout: RuntimeLayout,
+) -> tuple[Path, Path, Path, Path, Path, str, int, int, str]:
+    """Copy all public layout slots to non-overridable local primitives."""
+
+    (
+        root,
+        mcp_entrypoint,
+        probe_entrypoint,
+        metadata_root,
+        spawn_helper,
+        spawn_helper_digest,
+        root_device,
+        root_inode,
+        manifest_digest,
+    ) = _runtime_layout_slot_values(layout)
+    if not all(
+        isinstance(value, Path)
+        for value in (
+            root,
+            mcp_entrypoint,
+            probe_entrypoint,
+            metadata_root,
+            spawn_helper,
+        )
+    ):
+        raise _invalid()
+    if not isinstance(spawn_helper_digest, str) or not isinstance(
+        manifest_digest, str
+    ):
+        raise _invalid()
+    try:
+        spawn_helper_digest = str(spawn_helper_digest)
+        manifest_digest = str(manifest_digest)
+    except Exception as exc:
+        raise _invalid() from exc
+    if type(spawn_helper_digest) is not str or type(manifest_digest) is not str:
+        raise _invalid()
+    return (
+        Path(str(root)),
+        Path(str(mcp_entrypoint)),
+        Path(str(probe_entrypoint)),
+        Path(str(metadata_root)),
+        Path(str(spawn_helper)),
+        spawn_helper_digest,
+        root_device,
+        root_inode,
+        manifest_digest,
+    )
+
+
+def _final_runtime_layout_validation(
+    manifest_bytes: bytes,
+    *,
+    target: Path,
+    mcp_entrypoint: Path,
+    probe_entrypoint: Path,
+    metadata_root: Path,
+    spawn_helper: Path,
+    path_bindings_match: bool,
+    spawn_helper_digest: str,
+    target_device: int,
+    target_inode: int,
+    observed_target_device: int,
+    observed_target_inode: int,
+    manifest_digest: str,
+    commit: str,
+    generation: str,
+) -> None:
+    """Make the final, filesystem-free comparison against local manifest bytes."""
+
+    _manifest, actual_digest, metadata, actual_spawn_digest = _manifest_data_from_bytes(
+        manifest_bytes, expected_digest=manifest_digest
+    )
+    if (
+        not isinstance(target, Path)
+        or not isinstance(mcp_entrypoint, Path)
+        or not isinstance(probe_entrypoint, Path)
+        or not isinstance(metadata_root, Path)
+        or not isinstance(spawn_helper, Path)
+        or type(path_bindings_match) is not bool
+        or type(target_device) is not int
+        or type(target_inode) is not int
+        or type(observed_target_device) is not int
+        or type(observed_target_inode) is not int
+        or type(spawn_helper_digest) is not str
+        or type(manifest_digest) is not str
+        or type(commit) is not str
+        or type(generation) is not str
+        or actual_digest != manifest_digest
+        or (target_device, target_inode)
+        != (observed_target_device, observed_target_inode)
+        or not path_bindings_match
+        or spawn_helper_digest != actual_spawn_digest
+        or metadata.get("commit") != commit
+        or metadata.get("generation") != generation
+    ):
+        raise _invalid()
+
+
+def _attest_runtime_root(
+    root: Path, *, layout_type: type[RuntimeLayout] = RuntimeLayout
+) -> _RuntimeLayoutAttestation:
+    """Validate one target once and retain its exact manifest bytes in RAM."""
+
+    if (
+        not isinstance(root, Path)
+        or not root.is_absolute()
+        or not isinstance(layout_type, type)
+        or not issubclass(layout_type, RuntimeLayout)
+    ):
+        raise _invalid()
+    _validate_root(root)
+    root_stat = _lstat(root)
+    manifest, manifest_digest, manifest_bytes = _validated_manifest_bytes(root)
+    token = _RUNTIME_LAYOUT_VALIDATION.set(manifest_bytes)
+    try:
+        layout = layout_type(
+            root=root,
+            mcp_entrypoint=root / "bin" / "the-hive-mcp",
+            probe_entrypoint=root / "bin" / "the-hive-hive-hourly-probe",
+            metadata_root=root,
+            spawn_helper=root / _RUNTIME_SPAWN_HELPER,
+            spawn_helper_digest=_spawn_helper_digest(manifest),
+            root_device=root_stat.st_dev,
+            root_inode=root_stat.st_ino,
+            manifest_digest=manifest_digest,
+        )
+    finally:
+        _RUNTIME_LAYOUT_VALIDATION.reset(token)
+    (
+        layout_root,
+        mcp_entrypoint,
+        probe_entrypoint,
+        metadata_root,
+        spawn_helper,
+        spawn_helper_digest,
+        root_device,
+        root_inode,
+        layout_manifest_digest,
+    ) = _normalized_runtime_layout_values(layout)
+    path_bindings_match = (
+        layout_root == root
+        and mcp_entrypoint == layout_root / "bin" / "the-hive-mcp"
+        and probe_entrypoint == layout_root / "bin" / "the-hive-hive-hourly-probe"
+        and metadata_root == layout_root
+        and spawn_helper == layout_root / _RUNTIME_SPAWN_HELPER
+    )
+    if not path_bindings_match:
+        raise _invalid()
+    _manifest, parsed_manifest_digest, metadata, _parsed_spawn_digest = (
+        _manifest_data_from_bytes(manifest_bytes, expected_digest=manifest_digest)
+    )
+    commit = metadata.get("commit")
+    generation = metadata.get("generation")
+    if not isinstance(commit, str) or not isinstance(generation, str):
+        raise _invalid()
+    attestation = _RuntimeLayoutAttestation(
+        target=root,
+        target_device=root_device,
+        target_inode=root_inode,
+        layout=layout,
+        manifest_bytes=manifest_bytes,
+        manifest_digest=parsed_manifest_digest,
+        commit=commit,
+        generation=generation,
+    )
+    observed_target_device, observed_target_inode = _validate_layout_values(
+        layout_root,
+        mcp_entrypoint,
+        probe_entrypoint,
+        metadata_root,
+        spawn_helper,
+        spawn_helper_digest,
+        root_device,
+        root_inode,
+        layout_manifest_digest,
+        manifest_bytes=manifest_bytes,
+    )
+    _final_runtime_layout_validation(
+        manifest_bytes,
+        target=layout_root,
+        mcp_entrypoint=mcp_entrypoint,
+        probe_entrypoint=probe_entrypoint,
+        metadata_root=metadata_root,
+        spawn_helper=spawn_helper,
+        path_bindings_match=path_bindings_match,
+        spawn_helper_digest=spawn_helper_digest,
+        target_device=root_device,
+        target_inode=root_inode,
+        observed_target_device=observed_target_device,
+        observed_target_inode=observed_target_inode,
+        manifest_digest=layout_manifest_digest,
+        commit=commit,
+        generation=generation,
+    )
+    return attestation
 
 
 def validate_runtime_metadata(layout: RuntimeLayout) -> None:

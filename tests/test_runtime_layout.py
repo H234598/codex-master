@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
+import hashlib
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
+import pickle
 import runpy
+import weakref
 
 import pytest
 
@@ -156,6 +160,621 @@ def test_runtime_layout_is_immutable_and_derived_only_from_a_valid_image(
     assert layout.manifest_digest.startswith("sha256:")
     with pytest.raises(FrozenInstanceError):
         layout.root = root.parent  # type: ignore[misc]
+
+
+def test_runtime_layout_same_run_attestation_carries_one_manifest_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second manifest read or rebuilding the layout would break this proof."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    manifest_path = root / ".the-hive-runtime-manifest.json"
+    original_read = module._read_regular_bytes
+    manifest_reads: list[bytes] = []
+
+    def record_manifest_read(
+        read_root: Path, relative_path: str, *, max_bytes: int
+    ) -> bytes:
+        raw = original_read(read_root, relative_path, max_bytes=max_bytes)
+        if relative_path == ".the-hive-runtime-manifest.json":
+            manifest_reads.append(raw)
+        return raw
+
+    monkeypatch.setattr(module, "_read_regular_bytes", record_manifest_read)
+    attestation = module._attest_runtime_root(root)
+
+    manifest = json.loads(manifest_path.read_bytes())
+    assert len(manifest_reads) == 1
+    assert attestation.manifest_bytes is manifest_reads[0]
+    assert attestation.manifest_bytes == manifest_path.read_bytes()
+    assert attestation.manifest_digest == (
+        "sha256:" + hashlib.sha256(attestation.manifest_bytes).hexdigest()
+    )
+    assert attestation.layout.manifest_digest == attestation.manifest_digest
+    assert attestation.commit == manifest["commit"]
+    assert attestation.generation == manifest["generation"]
+    assert attestation.target is root
+    assert attestation.target == attestation.layout.root
+    assert attestation.layout.root == root
+
+
+def test_runtime_layout_public_factory_returns_the_same_run_attested_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Returning a reconstructed layout instead of the carrier's is a contract break."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    attest = module._attest_runtime_root
+    attested: list[object] = []
+
+    class DerivedRuntimeLayout(module.RuntimeLayout):
+        pass
+
+    def record_attestation(target: Path, **_kwargs: object) -> object:
+        value = attest(target, **_kwargs)
+        attested.append(value)
+        return value
+
+    monkeypatch.setattr(module, "_attest_runtime_root", record_attestation)
+
+    layout = DerivedRuntimeLayout.from_runtime_root(root)
+
+    assert len(attested) == 1
+    carried = module._RuntimeLayoutAttestation.layout.__get__(
+        attested[0], module._RuntimeLayoutAttestation
+    )
+    assert layout is carried
+    assert type(layout) is DerivedRuntimeLayout
+
+
+def test_runtime_layout_final_validator_uses_raw_bytes_not_a_mutable_manifest_map(
+    tmp_path: Path,
+) -> None:
+    """Mutating a caller-held decoded map cannot replace final byte authority."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    layout = module.RuntimeLayout.from_runtime_root(root)
+    manifest_bytes = (root / ".the-hive-runtime-manifest.json").read_bytes()
+    caller_map = json.loads(manifest_bytes)
+    caller_map["commit"] = "0" * 40
+
+    module._final_runtime_layout_validation(
+        manifest_bytes,
+        target=Path(str(root)),
+        mcp_entrypoint=Path(str(layout.mcp_entrypoint)),
+        probe_entrypoint=Path(str(layout.probe_entrypoint)),
+        metadata_root=Path(str(layout.metadata_root)),
+        spawn_helper=Path(str(layout.spawn_helper)),
+        path_bindings_match=True,
+        spawn_helper_digest=layout.spawn_helper_digest,
+        target_device=layout.root_device,
+        target_inode=layout.root_inode,
+        observed_target_device=layout.root_device,
+        observed_target_inode=layout.root_inode,
+        manifest_digest=layout.manifest_digest,
+        commit=json.loads(manifest_bytes)["commit"],
+        generation=json.loads(manifest_bytes)["generation"],
+    )
+
+
+def test_runtime_layout_manifest_bytes_parser_derives_local_facts(
+    tmp_path: Path,
+) -> None:
+    """The final parser derives digest and metadata from raw bytes, not a map."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    manifest_bytes = (root / ".the-hive-runtime-manifest.json").read_bytes()
+
+    manifest, digest, metadata, spawn_digest = module._manifest_data_from_bytes(
+        manifest_bytes
+    )
+
+    assert digest == "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+    assert metadata["commit"] == manifest["commit"]
+    assert metadata["generation"] == manifest["generation"]
+    assert spawn_digest == manifest["files"]["src/the_hive/_runtime_spawn_helper.so"][
+        "sha256"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("manifest_digest", "sha256:" + "0" * 64),
+        ("commit", "0" * 40),
+        ("generation", "different-generation"),
+        ("path_bindings_match", False),
+    ),
+)
+def test_runtime_layout_final_validator_rejects_local_binding_drift(
+    tmp_path: Path, field: str, replacement: object
+) -> None:
+    """Digest, commit, generation, and target-path facts remain byte-bound."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    layout = module.RuntimeLayout.from_runtime_root(root)
+    manifest_bytes = (root / ".the-hive-runtime-manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    arguments: dict[str, object] = {
+        "target": Path(str(root)),
+        "mcp_entrypoint": Path(str(layout.mcp_entrypoint)),
+        "probe_entrypoint": Path(str(layout.probe_entrypoint)),
+        "metadata_root": Path(str(layout.metadata_root)),
+        "spawn_helper": Path(str(layout.spawn_helper)),
+        "path_bindings_match": True,
+        "spawn_helper_digest": layout.spawn_helper_digest,
+        "target_device": layout.root_device,
+        "target_inode": layout.root_inode,
+        "observed_target_device": layout.root_device,
+        "observed_target_inode": layout.root_inode,
+        "manifest_digest": layout.manifest_digest,
+        "commit": manifest["commit"],
+        "generation": manifest["generation"],
+    }
+    arguments[field] = replacement
+
+    with pytest.raises(module.LayoutError, match="runtime_layout_invalid"):
+        module._final_runtime_layout_validation(manifest_bytes, **arguments)
+
+
+def test_runtime_layout_final_validator_does_not_run_a_path_hook(
+    tmp_path: Path,
+) -> None:
+    """The pure final validator receives normalized paths and never stats them."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    layout = module.RuntimeLayout.from_runtime_root(root)
+    manifest_bytes = (root / ".the-hive-runtime-manifest.json").read_bytes()
+
+    class HookedPath(type(root)):
+        def lstat(self) -> os.stat_result:
+            raise AssertionError("post-final path hook")
+
+        def __truediv__(self, other: object) -> Path:
+            del other
+            raise AssertionError("post-final path join")
+
+    hooked = HookedPath(str(root))
+    module._final_runtime_layout_validation(
+        manifest_bytes,
+        target=hooked,
+        mcp_entrypoint=Path(str(layout.mcp_entrypoint)),
+        probe_entrypoint=Path(str(layout.probe_entrypoint)),
+        metadata_root=Path(str(layout.metadata_root)),
+        spawn_helper=Path(str(layout.spawn_helper)),
+        path_bindings_match=True,
+        spawn_helper_digest=layout.spawn_helper_digest,
+        target_device=layout.root_device,
+        target_inode=layout.root_inode,
+        observed_target_device=layout.root_device,
+        observed_target_inode=layout.root_inode,
+        manifest_digest=layout.manifest_digest,
+        commit=json.loads(manifest_bytes)["commit"],
+        generation=json.loads(manifest_bytes)["generation"],
+    )
+
+
+def test_runtime_layout_validates_an_attested_manifest_payload_directly(
+    tmp_path: Path,
+) -> None:
+    """The payload validator must return release metadata from a valid image."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    manifest, digest = module._validated_manifest(root)
+
+    metadata = module._validate_attested_manifest_payload(root, manifest, digest)
+
+    assert metadata["commit"] == manifest["commit"]
+    assert metadata["generation"] == manifest["generation"]
+
+
+def test_runtime_layout_validates_manifest_bytes_directly(tmp_path: Path) -> None:
+    """The byte validator must preserve the one supplied manifest payload."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    raw = (root / ".the-hive-runtime-manifest.json").read_bytes()
+
+    manifest, digest = module._validated_manifest_from_bytes(root, raw)
+
+    assert digest == "sha256:" + hashlib.sha256(raw).hexdigest()
+    assert manifest["generation"] == json.loads(raw)["generation"]
+
+
+def test_runtime_layout_reads_validated_manifest_bytes_directly(tmp_path: Path) -> None:
+    """The manifest-byte reader returns the exact successfully checked bytes."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+
+    manifest, digest, raw = module._validated_manifest_bytes(root)
+
+    assert raw == (root / ".the-hive-runtime-manifest.json").read_bytes()
+    assert digest == "sha256:" + hashlib.sha256(raw).hexdigest()
+    assert manifest["commit"] == "a" * 40
+
+
+def test_runtime_layout_reads_base_slots_directly(tmp_path: Path) -> None:
+    """Slot extraction must retain the factory layout's canonical values."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    layout = module.RuntimeLayout.from_runtime_root(materialize_runtime_image(tmp_path))
+
+    values = module._runtime_layout_slot_values(layout)
+
+    assert values == (
+        layout.root,
+        layout.mcp_entrypoint,
+        layout.probe_entrypoint,
+        layout.metadata_root,
+        layout.spawn_helper,
+        layout.spawn_helper_digest,
+        layout.root_device,
+        layout.root_inode,
+        layout.manifest_digest,
+    )
+
+
+def test_runtime_layout_normalizes_hookable_digest_subclasses_before_final(
+    tmp_path: Path,
+) -> None:
+    """Digest subclasses must become local built-in strings before final checks."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    canonical = module.RuntimeLayout.from_runtime_root(root)
+
+    class HookedDigest(str):
+        hook_calls = 0
+
+        def __str__(self) -> str:
+            type(self).hook_calls += 1
+            return super().__str__()
+
+    layout = module.RuntimeLayout(
+        root=canonical.root,
+        mcp_entrypoint=canonical.mcp_entrypoint,
+        probe_entrypoint=canonical.probe_entrypoint,
+        metadata_root=canonical.metadata_root,
+        spawn_helper=canonical.spawn_helper,
+        spawn_helper_digest=HookedDigest(canonical.spawn_helper_digest),
+        root_device=canonical.root_device,
+        root_inode=canonical.root_inode,
+        manifest_digest=HookedDigest(canonical.manifest_digest),
+    )
+
+    values = module._normalized_runtime_layout_values(layout)
+
+    assert HookedDigest.hook_calls == 2
+    assert type(values[5]) is str
+    assert type(values[8]) is str
+    manifest_bytes = (root / ".the-hive-runtime-manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    module._final_runtime_layout_validation(
+        manifest_bytes,
+        target=values[0],
+        mcp_entrypoint=values[1],
+        probe_entrypoint=values[2],
+        metadata_root=values[3],
+        spawn_helper=values[4],
+        path_bindings_match=True,
+        spawn_helper_digest=values[5],
+        target_device=values[6],
+        target_inode=values[7],
+        observed_target_device=values[6],
+        observed_target_inode=values[7],
+        manifest_digest=values[8],
+        commit=manifest["commit"],
+        generation=manifest["generation"],
+    )
+
+
+def test_runtime_layout_final_validator_rejects_digest_subclasses(
+    tmp_path: Path,
+) -> None:
+    """A hookable digest subclass is not an accepted final primitive value."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    layout = module.RuntimeLayout.from_runtime_root(root)
+    manifest_bytes = (root / ".the-hive-runtime-manifest.json").read_bytes()
+
+    class HookedDigest(str):
+        def __eq__(self, other: object) -> bool:
+            del other
+            raise AssertionError("post-final digest equality hook")
+
+    with pytest.raises(module.LayoutError, match="runtime_layout_invalid"):
+        module._final_runtime_layout_validation(
+            manifest_bytes,
+            target=Path(str(root)),
+            mcp_entrypoint=Path(str(layout.mcp_entrypoint)),
+            probe_entrypoint=Path(str(layout.probe_entrypoint)),
+            metadata_root=Path(str(layout.metadata_root)),
+            spawn_helper=Path(str(layout.spawn_helper)),
+            path_bindings_match=True,
+            spawn_helper_digest=HookedDigest(layout.spawn_helper_digest),
+            target_device=layout.root_device,
+            target_inode=layout.root_inode,
+            observed_target_device=layout.root_device,
+            observed_target_inode=layout.root_inode,
+            manifest_digest=HookedDigest(layout.manifest_digest),
+            commit=json.loads(manifest_bytes)["commit"],
+            generation=json.loads(manifest_bytes)["generation"],
+        )
+
+
+def test_runtime_layout_validates_local_manifest_bytes_without_a_second_read(
+    tmp_path: Path,
+) -> None:
+    """The manifest-bytes path validates local bytes and returns final root facts."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    layout = module.RuntimeLayout.from_runtime_root(root)
+    manifest_bytes = (root / ".the-hive-runtime-manifest.json").read_bytes()
+
+    observed = module._validate_layout_values(
+        layout.root,
+        layout.mcp_entrypoint,
+        layout.probe_entrypoint,
+        layout.metadata_root,
+        layout.spawn_helper,
+        layout.spawn_helper_digest,
+        layout.root_device,
+        layout.root_inode,
+        layout.manifest_digest,
+        manifest_bytes=manifest_bytes,
+    )
+
+    assert observed == (layout.root_device, layout.root_inode)
+
+
+def test_runtime_layout_subclass_preserves_public_factory_semantics(
+    tmp_path: Path,
+) -> None:
+    """Rejecting a valid subclass would change public factory semantics."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+
+    class DerivedRuntimeLayout(module.RuntimeLayout):
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            object.__setattr__(self, "public_factory_init", True)
+
+    layout = DerivedRuntimeLayout.from_runtime_root(root)
+
+    assert type(layout) is DerivedRuntimeLayout
+    assert layout.public_factory_init is True
+    assert layout.root == root
+
+
+def test_runtime_layout_does_not_add_a_public_weakref_slot(tmp_path: Path) -> None:
+    """A weakref slot would be a new public RuntimeLayout surface."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    layout = module.RuntimeLayout.from_runtime_root(materialize_runtime_image(tmp_path))
+
+    with pytest.raises(TypeError):
+        weakref.ref(layout)
+
+
+def test_runtime_layout_subclass_cannot_replace_the_local_manifest_authority(
+    tmp_path: Path,
+) -> None:
+    """Subclass code must not turn ContextVar data into manifest authority."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    payload = root / "bin" / "the-hive-mcp"
+
+    class ContextReplacingRuntimeLayout(module.RuntimeLayout):
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            payload.write_bytes(b"#!/bin/sh\nexit 1\n")
+            payload.chmod(0o755)
+            context_value = module._RUNTIME_LAYOUT_VALIDATION.get()
+            if isinstance(context_value, dict):
+                files = context_value["files"]
+                assert isinstance(files, dict)
+                entry = files["bin/the-hive-mcp"]
+                assert isinstance(entry, dict)
+                entry["size"] = len(payload.read_bytes())
+                entry["sha256"] = hashlib.sha256(payload.read_bytes()).hexdigest()
+            else:
+                module._RUNTIME_LAYOUT_VALIDATION.set(b"replacement")
+
+    with pytest.raises(module.LayoutError, match="runtime_layout_invalid"):
+        ContextReplacingRuntimeLayout.from_runtime_root(root)
+
+
+def test_runtime_layout_rechecks_payload_swapped_after_first_layout_check(
+    tmp_path: Path,
+) -> None:
+    """A payload swap after a successful subclass layout check must fail closed."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    payload = root / "src" / "the_hive" / "dynamic_pool.py"
+
+    class PayloadSwappingRuntimeLayout(module.RuntimeLayout):
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            payload.write_bytes(b"swapped after the first layout check\n")
+            payload.chmod(0o644)
+
+    with pytest.raises(module.LayoutError, match="runtime_layout_invalid"):
+        PayloadSwappingRuntimeLayout.from_runtime_root(root)
+
+
+def test_runtime_layout_finishes_layout_hook_access_before_final_validation(
+    tmp_path: Path,
+) -> None:
+    """Carrier construction must not make dynamic layout accesses after slots copy."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    payload = root / "bin" / "the-hive-mcp"
+
+    class CarrierAccessSwappingRuntimeLayout(module.RuntimeLayout):
+        def __getattribute__(self, name: str) -> object:
+            caller = inspect.currentframe()
+            caller = caller.f_back if caller is not None else None
+            try:
+                if (
+                    name == "root"
+                    and caller is not None
+                    and isinstance(
+                        caller.f_locals.get("self"),
+                        module._RuntimeLayoutAttestation,
+                    )
+                ):
+                    payload.write_bytes(b"#!/bin/sh\nexit 1\n")
+                    payload.chmod(0o755)
+            finally:
+                del caller
+            return super().__getattribute__(name)
+
+    layout = CarrierAccessSwappingRuntimeLayout.from_runtime_root(root)
+
+    assert layout.root == root
+    assert payload.read_bytes() == b"#!/bin/sh\nexit 0\n"
+
+
+def test_runtime_layout_same_run_attestation_preserves_manifest_size_bound(
+    tmp_path: Path,
+) -> None:
+    """Holding bytes in RAM must not weaken the established metadata bound."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    manifest = root / ".the-hive-runtime-manifest.json"
+    manifest.write_bytes(b"x" * (module._MAX_METADATA_BYTES + 1))
+    manifest.chmod(0o644)
+
+    with pytest.raises(module.LayoutError, match="runtime_layout_invalid"):
+        module.RuntimeLayout.from_runtime_root(root)
+
+
+def test_runtime_layout_same_run_attestation_rechecks_swapped_payload_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A payload swap after the first manifest check must fail before output."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    payload = root / "src" / "the_hive" / "dynamic_pool.py"
+    validate_layout_values = module._validate_layout_values
+
+    def swap_then_validate(*args: object, **kwargs: object) -> None:
+        payload.write_bytes(b"swapped after the first manifest check\n")
+        payload.chmod(0o644)
+        validate_layout_values(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_validate_layout_values", swap_then_validate)
+
+    with pytest.raises(module.LayoutError, match="runtime_layout_invalid"):
+        module.RuntimeLayout.from_runtime_root(root)
+
+
+def test_runtime_layout_same_run_attestation_remains_frozen_ram_only_after_swap(
+    tmp_path: Path,
+) -> None:
+    """A mutable carrier could be replaced after its target is attested."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    attestation = module._attest_runtime_root(root)
+    layout = attestation.layout
+    manifest_bytes = attestation.manifest_bytes
+    manifest_path = root / ".the-hive-runtime-manifest.json"
+
+    manifest_path.write_bytes(b"{}")
+
+    assert attestation.layout is layout
+    assert attestation.manifest_bytes is manifest_bytes
+    assert attestation.manifest_bytes == manifest_bytes
+    with pytest.raises(FrozenInstanceError):
+        attestation.manifest_bytes = b"replacement"  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        attestation.manifest_bytes[0] = 0  # type: ignore[index]
+    with pytest.raises(TypeError):
+        pickle.dumps(attestation)
+
+@pytest.mark.parametrize("breakage", ("untrusted_root", "missing", "malformed"))
+def test_runtime_layout_same_run_attestation_rejects_invalid_target(
+    tmp_path: Path, breakage: str
+) -> None:
+    """An attestation must fail at its target rather than take a fallback path."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+    manifest_path = root / ".the-hive-runtime-manifest.json"
+    if breakage == "untrusted_root":
+        root.chmod(0o755)
+    elif breakage == "missing":
+        manifest_path.unlink()
+    else:
+        manifest_path.write_bytes(b"{")
+
+    with pytest.raises(module.LayoutError, match="runtime_layout_invalid"):
+        module._attest_runtime_root(root)
+
+
+def test_runtime_layout_same_run_attestation_never_uses_release_or_module_fallbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any stage, pointer, or resolver fallback is outside direct target attestation."""
+
+    module = _runtime_layout_module()
+    assert module is not None
+    root = materialize_runtime_image(tmp_path)
+
+    def unexpected_fallback(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unexpected release or module fallback")
+
+    monkeypatch.setattr(
+        module.RuntimeLayout, "from_current_release", unexpected_fallback
+    )
+    monkeypatch.setattr(
+        module.RuntimeLayout, "from_previous_release", unexpected_fallback
+    )
+    monkeypatch.setattr(module.RuntimeLayout, "from_module_path", unexpected_fallback)
+    monkeypatch.setattr(
+        module.RuntimeLayout, "_from_release_pointer", unexpected_fallback
+    )
+
+    assert module._attest_runtime_root(root).layout.root == root
 
 
 def test_runtime_layout_rejects_relative_and_nonprivate_roots(
