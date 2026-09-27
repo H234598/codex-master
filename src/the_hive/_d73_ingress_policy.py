@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
+import stat
 
 
 _EXPECTED_FIELDS = frozenset(
@@ -143,3 +145,149 @@ def _decode_d73_ingress_policy_v1(raw: bytes) -> D73IngressPolicyV1:
     if raw != canonical:
         raise D73IngressPolicyError("D73_POLICY_E_CANONICAL")
     return policy
+
+
+def _load_d73_ingress_policy_v1() -> D73IngressPolicyV1:
+    """Load one stable D73 policy-v1 value from its fixed trusted descriptor."""
+    try:
+        no_follow = os.O_NOFOLLOW
+    except AttributeError:
+        raise D73IngressPolicyError("D73_POLICY_E_NO_NOFOLLOW") from None
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | no_follow
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | no_follow
+    root_fd: int | None = None
+    policy_directory_fd: int | None = None
+    policy_file_fd: int | None = None
+
+    try:
+        try:
+            root_fd = os.open("/etc", directory_flags)
+        except OSError:
+            raise D73IngressPolicyError("D73_POLICY_E_OPEN_ROOT") from None
+
+        try:
+            root_stat = os.fstat(root_fd)
+        except OSError:
+            raise D73IngressPolicyError("D73_POLICY_E_DIR_STAT") from None
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid != 0
+            or root_stat.st_mode & 0o022
+        ):
+            raise D73IngressPolicyError("D73_POLICY_E_DIR_TRUST")
+
+        try:
+            policy_directory_fd = os.open(
+                "the-hive", directory_flags, dir_fd=root_fd
+            )
+        except OSError:
+            raise D73IngressPolicyError("D73_POLICY_E_OPEN_DIR") from None
+
+        try:
+            policy_directory_stat = os.fstat(policy_directory_fd)
+        except OSError:
+            raise D73IngressPolicyError("D73_POLICY_E_DIR_STAT") from None
+        if (
+            not stat.S_ISDIR(policy_directory_stat.st_mode)
+            or policy_directory_stat.st_uid != 0
+            or policy_directory_stat.st_gid != 0
+            or stat.S_IMODE(policy_directory_stat.st_mode) != 0o755
+            or policy_directory_stat.st_nlink < 2
+        ):
+            raise D73IngressPolicyError("D73_POLICY_E_DIR_TRUST")
+
+        try:
+            policy_file_fd = os.open(
+                "d73-ingress-policy-v1.json", file_flags, dir_fd=policy_directory_fd
+            )
+        except OSError:
+            raise D73IngressPolicyError("D73_POLICY_E_OPEN_FILE") from None
+
+        try:
+            policy_file_stat = os.fstat(policy_file_fd)
+        except OSError:
+            raise D73IngressPolicyError("D73_POLICY_E_FILE_STAT") from None
+        if not stat.S_ISREG(policy_file_stat.st_mode):
+            raise D73IngressPolicyError("D73_POLICY_E_FILE_TYPE")
+        if policy_file_stat.st_uid != 0:
+            raise D73IngressPolicyError("D73_POLICY_E_FILE_OWNER")
+        if policy_file_stat.st_gid != 0:
+            raise D73IngressPolicyError("D73_POLICY_E_FILE_GROUP")
+        if stat.S_IMODE(policy_file_stat.st_mode) != 0o644:
+            raise D73IngressPolicyError("D73_POLICY_E_FILE_MODE")
+        if policy_file_stat.st_nlink != 1:
+            raise D73IngressPolicyError("D73_POLICY_E_FILE_NLINK")
+        if not 1 <= policy_file_stat.st_size <= 8192:
+            raise D73IngressPolicyError("D73_POLICY_E_FILE_SIZE")
+
+        snapshot0 = (
+            stat.S_IFMT(policy_file_stat.st_mode),
+            stat.S_IMODE(policy_file_stat.st_mode),
+            policy_file_stat.st_nlink,
+            policy_file_stat.st_uid,
+            policy_file_stat.st_gid,
+            policy_file_stat.st_dev,
+            policy_file_stat.st_ino,
+            policy_file_stat.st_size,
+        )
+        try:
+            first_read = os.pread(policy_file_fd, snapshot0[7], 0)
+        except OSError:
+            raise D73IngressPolicyError("D73_POLICY_E_READ") from None
+        if len(first_read) != snapshot0[7]:
+            raise D73IngressPolicyError("D73_POLICY_E_SHORT_READ")
+
+        try:
+            first_read_stat = os.fstat(policy_file_fd)
+        except OSError:
+            raise D73IngressPolicyError("D73_POLICY_E_FILE_STAT") from None
+        snapshot1 = (
+            stat.S_IFMT(first_read_stat.st_mode),
+            stat.S_IMODE(first_read_stat.st_mode),
+            first_read_stat.st_nlink,
+            first_read_stat.st_uid,
+            first_read_stat.st_gid,
+            first_read_stat.st_dev,
+            first_read_stat.st_ino,
+            first_read_stat.st_size,
+        )
+        if snapshot1 != snapshot0:
+            raise D73IngressPolicyError("D73_POLICY_E_DESCRIPTOR_DRIFT")
+
+        try:
+            second_read = os.pread(policy_file_fd, snapshot0[7], 0)
+        except OSError:
+            raise D73IngressPolicyError("D73_POLICY_E_READ") from None
+        if len(second_read) != snapshot0[7]:
+            raise D73IngressPolicyError("D73_POLICY_E_SHORT_READ")
+
+        try:
+            second_read_stat = os.fstat(policy_file_fd)
+        except OSError:
+            raise D73IngressPolicyError("D73_POLICY_E_FILE_STAT") from None
+        snapshot2 = (
+            stat.S_IFMT(second_read_stat.st_mode),
+            stat.S_IMODE(second_read_stat.st_mode),
+            second_read_stat.st_nlink,
+            second_read_stat.st_uid,
+            second_read_stat.st_gid,
+            second_read_stat.st_dev,
+            second_read_stat.st_ino,
+            second_read_stat.st_size,
+        )
+        if snapshot2 != snapshot0:
+            raise D73IngressPolicyError("D73_POLICY_E_DESCRIPTOR_DRIFT")
+        if second_read != first_read:
+            raise D73IngressPolicyError("D73_POLICY_E_READBACK_DRIFT")
+        return _decode_d73_ingress_policy_v1(first_read)
+    finally:
+        close_failed = False
+        for fd in (policy_file_fd, policy_directory_fd, root_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    close_failed = True
+        if close_failed:
+            raise D73IngressPolicyError("D73_POLICY_E_CLOSE") from None
