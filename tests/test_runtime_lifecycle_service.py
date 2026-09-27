@@ -153,6 +153,10 @@ def _allow_postinstall_attestation(monkeypatch) -> None:
     )
 
 
+def _rollback_restored() -> runtime_lifecycle._RollbackResult:
+    return runtime_lifecycle._RollbackResult(True, "complete", "none")
+
+
 def _cutover_input_home(tmp_path: Path) -> tuple[Path, Path, Path]:
     """Create the private ancestors needed to bind live pricing artifacts."""
 
@@ -748,7 +752,9 @@ def test_cutover_records_only_a_zero_exit_argumentless_probe_observation(
     )
     restored: list[object] = []
     monkeypatch.setattr(
-        runtime_lifecycle, "_restore_bound_state", lambda received, _systemctl: restored.append(received) or True
+        runtime_lifecycle,
+        "_restore_bound_state_result",
+        lambda received, _systemctl: restored.append(received) or _rollback_restored(),
     )
 
     result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
@@ -1060,7 +1066,7 @@ def test_cutover_rebind_before_installer_fails_without_systemd_or_rollback_mutat
     )
     monkeypatch.setattr(
         runtime_lifecycle,
-        "_restore_bound_state",
+        "_restore_bound_state_result",
         lambda _snapshot, _systemctl: (_ for _ in ()).throw(
             AssertionError("rollback must not run")
         ),
@@ -1141,8 +1147,8 @@ def test_cutover_postinstall_rebind_fails_before_any_user_manager_mutation(
     restored: list[object] = []
     monkeypatch.setattr(
         runtime_lifecycle,
-        "_restore_bound_state",
-        lambda received, _systemctl: restored.append(received) or True,
+        "_restore_bound_state_result",
+        lambda received, _systemctl: restored.append(received) or _rollback_restored(),
     )
     calls: list[tuple[str, ...]] = []
 
@@ -1180,7 +1186,9 @@ def test_cutover_legacy_rebind_fails_before_any_user_manager_mutation(
             runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_legacy_changed")
         ),
     )
-    monkeypatch.setattr(runtime_lifecycle, "_restore_bound_state", lambda *_args: True)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_restore_bound_state_result", lambda *_args: _rollback_restored()
+    )
     calls: list[tuple[str, ...]] = []
 
     result = runtime_lifecycle.cutover(
@@ -1258,7 +1266,11 @@ def test_failed_cutover_restores_bound_state_and_reports_rollback_failure(
         ),
     )
     monkeypatch.setattr(
-        runtime_lifecycle, "_restore_bound_state", lambda _snapshot, _systemctl: False
+        runtime_lifecycle,
+        "_restore_bound_state_result",
+        lambda _snapshot, _systemctl: runtime_lifecycle._RollbackResult(
+            False, "new_service_verify", "unit_verify_mismatch"
+        ),
     )
     published: list[object] = []
     monkeypatch.setattr(
@@ -1272,6 +1284,8 @@ def test_failed_cutover_restores_bound_state_and_reports_rollback_failure(
     assert result == {
         "status": "runtime_lifecycle_rollback_failed",
         "raw_output": "not_returned",
+        "rollback_phase": "new_service_verify",
+        "rollback_error": "unit_verify_mismatch",
     }
     assert published == [snapshot]
 
@@ -1296,7 +1310,13 @@ def test_rollback_alarm_publication_failure_is_never_silently_swallowed(
             runtime_lifecycle.RuntimeLifecycleError("runtime_lifecycle_install_failed")
         ),
     )
-    monkeypatch.setattr(runtime_lifecycle, "_restore_bound_state", lambda *_args: False)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_restore_bound_state_result",
+        lambda *_args: runtime_lifecycle._RollbackResult(
+            False, "new_service_verify", "unit_verify_mismatch"
+        ),
+    )
     monkeypatch.setattr(runtime_lifecycle, "_publish_rollback_failure", lambda _bound: False)
 
     result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
@@ -1304,6 +1324,8 @@ def test_rollback_alarm_publication_failure_is_never_silently_swallowed(
     assert result == {
         "status": "runtime_lifecycle_rollback_alarm_failed",
         "raw_output": "not_returned",
+        "rollback_phase": "new_service_verify",
+        "rollback_error": "unit_verify_mismatch",
     }
 
 
@@ -1527,10 +1549,15 @@ def test_restore_does_not_operate_on_units_bound_as_not_found(tmp_path: Path) ->
     ]
 
 
-def test_restore_bound_failed_service_requires_the_exact_quiescent_inverse(
+def test_restore_bound_failed_oneshot_resets_the_manager_failed_state_before_verify(
     tmp_path: Path,
 ) -> None:
-    """A prior failed service is restored by stop, never accepted as arbitrary."""
+    """A prior failed oneshot has no process to stop, only failed state to clear.
+
+    ``systemctl stop`` may leave the manager's recorded failed state in place.
+    The lifecycle must use the bounded ``reset-failed`` inverse and then demand
+    the exact quiescent state; accepting ``failed`` would hide a broken restore.
+    """
 
     bound, states = _bound_failure_fixture(tmp_path)
     service = "the-hive-hive-hourly-probe.service"
@@ -1541,29 +1568,150 @@ def test_restore_bound_failed_service_requires_the_exact_quiescent_inverse(
     }
     bound = runtime_lifecycle.replace(bound, states=tuple(states.items()))
     calls: list[tuple[str, ...]] = []
-    stop_leaves_failed = {"value": False}
-
     def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
         calls.append(arguments)
-        if arguments == ("stop", service):
-            if not stop_leaves_failed["value"]:
-                states[service] = {
-                    "LoadState": "loaded",
-                    "UnitFileState": "static",
-                    "ActiveState": "inactive",
-                }
+        if arguments == ("reset-failed", service):
+            states[service] = {
+                "LoadState": "loaded",
+                "UnitFileState": "static",
+                "ActiveState": "inactive",
+            }
             return {}
         if arguments[0] == "show":
             return states[arguments[1]]
         return {}
 
     assert runtime_lifecycle._restore_bound_state(bound, systemctl) is True
-    assert ("stop", service) in calls
+    assert ("reset-failed", service) in calls
+    assert ("stop", service) not in calls
     assert states[service]["ActiveState"] == "inactive"
 
-    states[service]["ActiveState"] = "failed"
-    stop_leaves_failed["value"] = True
-    assert runtime_lifecycle._restore_bound_state(bound, systemctl) is False
+
+@pytest.mark.parametrize(
+    ("failing_call", "phase"),
+    (
+        (("daemon-reload",), "restore_daemon_reload"),
+        (("disable", "--now", "the-hive-hive-hourly-probe.timer"), "new_timer_action"),
+        (("stop", "the-hive-hive-hourly-probe.service"), "new_service_action"),
+        (("enable", "--now", "codex-master-hive-hourly-probe.timer"), "legacy_timer_action"),
+        (("start", "codex-master-hive-hourly-probe.service"), "legacy_service_action"),
+    ),
+)
+def test_restore_bound_state_result_reports_each_manager_action_phase(
+    tmp_path: Path, failing_call: tuple[str, ...], phase: str
+) -> None:
+    """Rollback diagnostics identify the bounded manager operation that failed."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments == failing_call:
+            raise runtime_lifecycle.RuntimeLifecycleError("untrusted-manager-detail")
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    result = runtime_lifecycle._restore_bound_state_result(bound, systemctl)
+
+    assert result == runtime_lifecycle._RollbackResult(
+        False, phase, "manager_action_failed"
+    )
+    assert "untrusted-manager-detail" not in (result.phase, result.error_code)
+
+
+def test_restore_bound_state_result_reports_file_and_generation_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """File and generation failures remain distinct fixed rollback outcomes."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+    path = bound.files[0][0]
+    path.unlink()
+    path.symlink_to(tmp_path / "untrusted")
+
+    file_result = runtime_lifecycle._restore_bound_state_result(
+        bound, lambda arguments: states[arguments[1]] if arguments[0] == "show" else {}
+    )
+
+    assert file_result == runtime_lifecycle._RollbackResult(
+        False, "file_restore", "file_restore_failed"
+    )
+
+    generation_root = tmp_path / "generation"
+    generation_root.mkdir()
+    bound, states = _bound_failure_fixture(generation_root)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_discard_new_generation",
+        lambda _bound: (_ for _ in ()).throw(
+            runtime_lifecycle.RuntimeLifecycleError("untrusted-generation-detail")
+        ),
+    )
+    generation_result = runtime_lifecycle._restore_bound_state_result(
+        bound, lambda arguments: states[arguments[1]] if arguments[0] == "show" else {}
+    )
+
+    assert generation_result == runtime_lifecycle._RollbackResult(
+        False, "generation_discard", "generation_discard_failed"
+    )
+
+
+@pytest.mark.parametrize(
+    "unit",
+    (
+        "the-hive-hive-hourly-probe.timer",
+        "the-hive-hive-hourly-probe.service",
+        "codex-master-hive-hourly-probe.timer",
+        "codex-master-hive-hourly-probe.service",
+    ),
+)
+def test_restore_bound_state_result_reports_each_unit_verification_mismatch(
+    tmp_path: Path, unit: str
+) -> None:
+    """The public-safe phase identifies exactly which restored unit mismatched."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments[0] != "show":
+            return {}
+        actual = dict(states[arguments[1]])
+        if arguments[1] == unit:
+            actual["ActiveState"] = (
+                "inactive" if actual["ActiveState"] != "inactive" else "failed"
+            )
+        return actual
+
+    result = runtime_lifecycle._restore_bound_state_result(bound, systemctl)
+
+    assert result == runtime_lifecycle._RollbackResult(
+        False,
+        {
+            "the-hive-hive-hourly-probe.timer": "new_timer_verify",
+            "the-hive-hive-hourly-probe.service": "new_service_verify",
+            "codex-master-hive-hourly-probe.timer": "legacy_timer_verify",
+            "codex-master-hive-hourly-probe.service": "legacy_service_verify",
+        }[unit],
+        "unit_verify_mismatch",
+    )
+
+
+def test_rollback_failure_result_rejects_unbounded_telemetry() -> None:
+    """No exception text can reach the public cutover result through telemetry."""
+
+    result = runtime_lifecycle._rollback_failure_result(
+        status="runtime_lifecycle_rollback_failed",
+        rollback=runtime_lifecycle._RollbackResult(
+            False, "untrusted-phase", "secret-or-exception-text"
+        ),
+    )
+
+    assert result == {
+        "status": "runtime_lifecycle_rollback_failed",
+        "raw_output": "not_returned",
+        "rollback_phase": "telemetry_invalid",
+        "rollback_error": "telemetry_invalid",
+    }
 
 
 def test_cutover_installer_failure_restores_the_bound_preexisting_state(
@@ -2839,6 +2987,7 @@ def test_d332_model_never_calls_existing_mutators(monkeypatch) -> None:
         "_install_attested_runtime",
         "_systemctl_mutate",
         "_restore_bound_state",
+        "_restore_bound_state_result",
         "_discard_new_generation",
         "_write_observation",
         "_publish_rollback_failure",

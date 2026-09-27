@@ -46,6 +46,40 @@ _OBSERVATION_NAME = "runtime-lifecycle-probe-observation.json"
 _MAX_OBSERVATION_BYTES = 4096
 _PROBE_OBSERVATION_SECONDS = 120.0
 _PROBE_OUTPUT_BYTES = 16 * 1024
+_ROLLBACK_PHASE_FILE_RESTORE = "file_restore"
+_ROLLBACK_PHASE_GENERATION_DISCARD = "generation_discard"
+_ROLLBACK_PHASE_DAEMON_RELOAD = "restore_daemon_reload"
+_ROLLBACK_PHASE_ACTIONS = {
+    _NEW_TIMER: "new_timer_action",
+    _NEW_SERVICE: "new_service_action",
+    _LEGACY_TIMER: "legacy_timer_action",
+    _LEGACY_SERVICE: "legacy_service_action",
+}
+_ROLLBACK_PHASE_VERIFICATIONS = {
+    _NEW_TIMER: "new_timer_verify",
+    _NEW_SERVICE: "new_service_verify",
+    _LEGACY_TIMER: "legacy_timer_verify",
+    _LEGACY_SERVICE: "legacy_service_verify",
+}
+_ROLLBACK_FAILURE_PHASES = frozenset(
+    (
+        _ROLLBACK_PHASE_FILE_RESTORE,
+        _ROLLBACK_PHASE_GENERATION_DISCARD,
+        _ROLLBACK_PHASE_DAEMON_RELOAD,
+        *_ROLLBACK_PHASE_ACTIONS.values(),
+        *_ROLLBACK_PHASE_VERIFICATIONS.values(),
+    )
+)
+_ROLLBACK_FAILURE_CODES = frozenset(
+    (
+        "file_restore_failed",
+        "generation_discard_failed",
+        "manager_action_failed",
+        "unit_verify_failed",
+        "unit_verify_mismatch",
+        "telemetry_invalid",
+    )
+)
 _PRODUCER_CONSUMER_CONTRACT = {
     "_PRODUCER_VERSION": "0.6.542",
     "_PRODUCER_SOURCE_MANIFEST_SHA256": "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0",
@@ -1901,6 +1935,15 @@ class _BoundCutover:
 
 
 @dataclass(frozen=True, slots=True)
+class _RollbackResult:
+    """A fixed, data-sparse outcome for the compensating transaction."""
+
+    restored: bool
+    phase: str
+    error_code: str
+
+
+@dataclass(frozen=True, slots=True)
 class _ProbeObservationBinding:
     """The installed, argumentless launcher and its current attested image."""
 
@@ -2560,8 +2603,10 @@ def _discard_new_generation(bound: _BoundCutover) -> None:
         raise _error("runtime_lifecycle_rollback_failed") from exc
 
 
-def _restore_bound_state(bound: _BoundCutover, systemctl: Systemctl) -> bool:
-    """Restore every bound file before returning a failed transaction result."""
+def _restore_bound_state_result(
+    bound: _BoundCutover, systemctl: Systemctl
+) -> _RollbackResult:
+    """Restore the bound transaction state with fixed, public-safe diagnostics."""
 
     try:
         for path, content, mode in bound.files:
@@ -2582,33 +2627,83 @@ def _restore_bound_state(bound: _BoundCutover, systemctl: Systemctl) -> bool:
                 _atomic_restore(path, content, mode)
             if _regular_bytes(path, maximum=maximum, mode=mode) != content:
                 raise _error("runtime_lifecycle_rollback_failed")
+    except (RuntimeLifecycleError, OSError):
+        return _RollbackResult(
+            False, _ROLLBACK_PHASE_FILE_RESTORE, "file_restore_failed"
+        )
+
+    try:
         _discard_new_generation(bound)
+    except RuntimeLifecycleError:
+        return _RollbackResult(
+            False, _ROLLBACK_PHASE_GENERATION_DISCARD, "generation_discard_failed"
+        )
+
+    try:
         _systemctl_mutate(systemctl, ("daemon-reload",))
-        previous = dict(bound.states)
-        # Quiesce the newly activated namespace before restoring an old active
-        # one, so rollback also never creates a second running probe timer.
-        for unit in (_NEW_TIMER, _NEW_SERVICE):
+    except RuntimeLifecycleError:
+        return _RollbackResult(
+            False, _ROLLBACK_PHASE_DAEMON_RELOAD, "manager_action_failed"
+        )
+
+    previous = dict(bound.states)
+    # Quiesce the newly activated namespace before restoring an old active
+    # one, so rollback also never creates a second running probe timer.
+    for unit in (_NEW_TIMER, _NEW_SERVICE, _LEGACY_TIMER, _LEGACY_SERVICE):
+        try:
             state = previous.get(unit)
             operation = _restore_operation(unit, state)
             if operation is None:
                 continue
             _systemctl_mutate(systemctl, operation)
-        for unit in (_LEGACY_TIMER, _LEGACY_SERVICE):
-            state = previous.get(unit)
-            operation = _restore_operation(unit, state)
-            if operation is None:
-                continue
-            _systemctl_mutate(systemctl, operation)
-        for unit, expected in previous.items():
+        except RuntimeLifecycleError:
+            return _RollbackResult(
+                False, _ROLLBACK_PHASE_ACTIONS[unit], "manager_action_failed"
+            )
+
+    for unit, expected in previous.items():
+        try:
             actual = _show(systemctl, unit)
             target = _restored_state_target(unit, expected)
-            if not _state_exactly_matches(actual, target):
-                return False
-    except RuntimeLifecycleError:
-        return False
-    except OSError:
-        return False
-    return True
+        except RuntimeLifecycleError:
+            return _RollbackResult(
+                False, _ROLLBACK_PHASE_VERIFICATIONS[unit], "unit_verify_failed"
+            )
+        if not _state_exactly_matches(actual, target):
+            return _RollbackResult(
+                False, _ROLLBACK_PHASE_VERIFICATIONS[unit], "unit_verify_mismatch"
+            )
+    return _RollbackResult(True, "complete", "none")
+
+
+def _restore_bound_state(bound: _BoundCutover, systemctl: Systemctl) -> bool:
+    """Compatibility predicate for internal callers needing only restoration."""
+
+    return _restore_bound_state_result(bound, systemctl).restored
+
+
+def _rollback_failure_result(
+    *, status: str, rollback: _RollbackResult
+) -> dict[str, object]:
+    """Return only fixed rollback telemetry, never exception or command data."""
+
+    if (
+        rollback.restored
+        or rollback.phase not in _ROLLBACK_FAILURE_PHASES
+        or rollback.error_code not in _ROLLBACK_FAILURE_CODES
+    ):
+        return {
+            "status": status,
+            "raw_output": "not_returned",
+            "rollback_phase": "telemetry_invalid",
+            "rollback_error": "telemetry_invalid",
+        }
+    return {
+        "status": status,
+        "raw_output": "not_returned",
+        "rollback_phase": rollback.phase,
+        "rollback_error": rollback.error_code,
+    }
 
 
 def _publish_rollback_failure(bound: _BoundCutover) -> bool:
@@ -2762,6 +2857,11 @@ def _restore_operation(
             if _state_is_enabled(state)
             else ("disable", "--now", unit)
         )
+    if state.get("ActiveState") == "failed":
+        # A failed oneshot has no running process to stop.  ``reset-failed``
+        # clears only the manager's recorded failure so the exact quiescent
+        # inverse below can be verified without executing the service again.
+        return ("reset-failed", unit)
     return ("start", unit) if _state_is_active(state) else ("stop", unit)
 
 
@@ -3386,16 +3486,16 @@ def cutover(
                     raise _error("runtime_lifecycle_postconditions_failed")
                 return result
             except RuntimeLifecycleError:
-                if not _restore_bound_state(bound, systemctl):
+                rollback = _restore_bound_state_result(bound, systemctl)
+                if not rollback.restored:
                     if not _publish_rollback_failure(bound):
-                        return {
-                            "status": "runtime_lifecycle_rollback_alarm_failed",
-                            "raw_output": "not_returned",
-                        }
-                    return {
-                        "status": "runtime_lifecycle_rollback_failed",
-                        "raw_output": "not_returned",
-                    }
+                        return _rollback_failure_result(
+                            status="runtime_lifecycle_rollback_alarm_failed",
+                            rollback=rollback,
+                        )
+                    return _rollback_failure_result(
+                        status="runtime_lifecycle_rollback_failed", rollback=rollback
+                    )
                 raise
     except RuntimeLifecycleError as exc:
         return {"status": str(exc), "raw_output": "not_returned"}
