@@ -30,6 +30,7 @@ the-hive-mcp = "the_hive.server:main"
 the-hive-admin = "the_hive.admin_daemon:main"
 the-hive-agent-api = "the_hive.agent_daemon:main"
 the-hive-host-agent = "the_hive.host_agent:main"
+the-hive-openai-pricing-inventory = "the_hive.pricing_inventory:main"
 google-account-manager = "the_hive.google_account_manager_cli:main"
 
 [tool.setuptools.packages.find]
