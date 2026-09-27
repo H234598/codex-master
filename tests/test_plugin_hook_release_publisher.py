@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import runpy
 import shutil
+import stat
 
 import pytest
 
@@ -95,6 +96,8 @@ def _materialize_pre_pricing_legacy_release(
 ) -> tuple[Path, bytes]:
     """Install the sole observed pre-pricing pointer pair privately."""
 
+    home.chmod(0o700)
+    (home / ".local").chmod(0o700)
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     generations = release_root / "generations"
     generations.mkdir(parents=True, mode=0o700)
@@ -489,11 +492,15 @@ def test_pre_pricing_legacy_release_without_pin_store_upgrades_to_current_runtim
 
     installer = _installer()
     home = tmp_path / "home"
-    (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
+    home.mkdir(mode=0o755)
+    (home / ".local").mkdir(mode=0o755)
+    (home / ".local" / "lib").mkdir(mode=0o700)
     generation = "c7efc03f00eee1933f86808902d109f81bad446e"
     release_root, old_pointer = _materialize_pre_pricing_legacy_release(
         installer, home, monkeypatch
     )
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    assert stat.S_IMODE((home / ".local").stat().st_mode) == 0o700
     old_runtime = release_root / "generations" / generation
     with pytest.raises(ValueError):
         RuntimeLayout.from_runtime_root(old_runtime)
