@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenAI Modell- und Preisbestand täglich aktualisieren
+Description=The-Hive OpenAI Modell- und Preisbestand täglich aktualisieren
 
 [Timer]
 OnCalendar=daily
