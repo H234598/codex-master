@@ -16,6 +16,8 @@ import threading
 import pytest
 
 from the_hive import _d73_q1_record as record
+from the_hive import runtime_layout
+from the_hive._d73_ingress_policy import D73IngressPolicyV1
 
 
 COMMIT = b"0123456789abcdef0123456789abcdef01234567"
@@ -1830,3 +1832,394 @@ def test_cleanup_error_fails_closed_after_the_only_close(
     assert closes == 1
     with pytest.raises(OSError):
         os.fstat(fd)
+
+
+def _s4_policy() -> D73IngressPolicyV1:
+    return D73IngressPolicyV1(
+        account_name="synthetic-control",
+        bus_name=BUS_NAME.decode("ascii"),
+        expected_uid=2001,
+        polkit_action=POLKIT_ACTION.decode("ascii"),
+        schema_version=1,
+        selinux_context=SELINUX_CONTEXT.decode("ascii"),
+    )
+
+
+def _s4_attestation() -> runtime_layout._RuntimeLayoutAttestation:
+    return runtime_layout._RuntimeLayoutAttestation(
+        target=None,  # type: ignore[arg-type]
+        target_device=0,
+        target_inode=0,
+        layout=None,  # type: ignore[arg-type]
+        manifest_bytes=MANIFEST,
+        manifest_digest="0" * 64,
+        commit=COMMIT.decode("ascii"),
+        generation=GENERATION.decode("ascii"),
+    )
+
+
+def test_s4_materializer_exists_and_returns_the_existing_capability() -> None:
+    """Catches a missing S4 producer seam rather than a usable capability."""
+
+    materialize = getattr(record, "_materialize_q1_capability", None)
+    assert materialize is not None
+    capability = materialize(_s4_policy(), _s4_attestation())
+    assert type(capability) is record.D73Q1Capability
+    decoded = record._decode_capability(capability)
+    assert decoded.manifest == MANIFEST
+
+
+def test_s4_materializer_requires_the_exact_private_input_types() -> None:
+    """Catches accepting a substitute policy or target carrier as authority."""
+
+    with pytest.raises(record._Reject):
+        record._materialize_q1_capability(object(), _s4_attestation())  # type: ignore[arg-type]
+    with pytest.raises(record._Reject):
+        record._materialize_q1_capability(_s4_policy(), object())  # type: ignore[arg-type]
+
+
+def test_s4_materializer_uses_one_encoder_and_the_required_fd_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches changed flags, mode, descriptor binding, seals, or re-encoding."""
+
+    original_memfd_create = record.os.memfd_create
+    original_fchmod = record.os.fchmod
+    original_fstat = record.os.fstat
+    original_write = record.os.write
+    original_fcntl = record.fcntl.fcntl
+    original_encode = record._encode_record
+    memfd_calls: list[tuple[str, int]] = []
+    chmod_calls: list[tuple[int, int]] = []
+    encoder_descriptors: list[record._DescriptorIdentity] = []
+    seal_calls: list[tuple[int, int, int]] = []
+    events: list[str] = []
+
+    def tracking_memfd_create(name: str, flags: int) -> int:
+        events.append("memfd")
+        memfd_calls.append((name, flags))
+        return original_memfd_create(name, flags)
+
+    def tracking_fchmod(descriptor: int, mode: int) -> None:
+        events.append("fchmod")
+        chmod_calls.append((descriptor, mode))
+        original_fchmod(descriptor, mode)
+
+    def tracking_fstat(descriptor: int) -> os.stat_result:
+        events.append("fstat")
+        return original_fstat(descriptor)
+
+    def tracking_fcntl(descriptor: int, command: int, *args: int) -> int:
+        if command == fcntl.F_ADD_SEALS:
+            assert len(args) == 1
+            events.append("seals")
+            seal_calls.append((descriptor, command, args[0]))
+        return original_fcntl(descriptor, command, *args)
+
+    def tracking_encode(**kwargs: object) -> bytes:
+        events.append("encoder")
+        descriptor = kwargs["descriptor"]
+        assert type(descriptor) is record._DescriptorIdentity
+        encoder_descriptors.append(descriptor)
+        return original_encode(**kwargs)
+
+    def tracking_write(descriptor: int, payload: bytes) -> int:
+        events.append("write")
+        return original_write(descriptor, payload)
+
+    def forbid_lseek(*_: object) -> None:
+        pytest.fail("the materializer must not establish an offset contract")
+
+    monkeypatch.setattr(record.os, "memfd_create", tracking_memfd_create)
+    monkeypatch.setattr(record.os, "fchmod", tracking_fchmod)
+    monkeypatch.setattr(record.os, "fstat", tracking_fstat)
+    monkeypatch.setattr(record.os, "write", tracking_write)
+    monkeypatch.setattr(record.fcntl, "fcntl", tracking_fcntl)
+    monkeypatch.setattr(record, "_encode_record", tracking_encode)
+    monkeypatch.setattr(record.os, "lseek", forbid_lseek)
+
+    capability = record._materialize_q1_capability(_s4_policy(), _s4_attestation())
+    descriptor = capability._fd
+    final_stat = original_fstat(descriptor)
+    final_state = record._fd_state(descriptor)
+
+    assert memfd_calls == [
+        ("the-hive-d73-q1", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
+    ]
+    assert chmod_calls == [(descriptor, 0o600)]
+    assert events[:7] == [
+        "memfd", "fchmod", "fstat", "encoder", "write", "seals", "fstat"
+    ]
+    assert encoder_descriptors == [
+        record._DescriptorIdentity(
+            uid=final_stat.st_uid,
+            gid=final_stat.st_gid,
+            device=final_stat.st_dev,
+            inode=final_stat.st_ino,
+            size=0,
+        )
+    ]
+    assert seal_calls == [(descriptor, fcntl.F_ADD_SEALS, record._REQUIRED_SEALS)]
+    assert final_state.mode == 0o600
+    assert final_state.nlink == 0
+    assert final_state.seals == record._REQUIRED_SEALS
+    assert final_state.fd_flags == fcntl.FD_CLOEXEC
+    decoded = record._decode_capability(capability)
+    assert decoded.commit == COMMIT
+
+
+def test_s4_materializer_completes_short_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches treating a successful short write as a complete record write."""
+
+    original_write = record.os.write
+    writes: list[bytes] = []
+
+    def short_write(descriptor: int, payload: bytes) -> int:
+        writes.append(payload)
+        return original_write(descriptor, payload[:1])
+
+    monkeypatch.setattr(record.os, "write", short_write)
+    capability = record._materialize_q1_capability(_s4_policy(), _s4_attestation())
+    assert len(writes) > 1
+    assert record._decode_capability(capability).manifest == MANIFEST
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("fchmod", "fstat", "encoder", "write", "seals", "postwrite", "transfer"),
+)
+def test_s4_materializer_closes_the_owned_fd_on_every_pretransfer_failure(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches any pre-transfer failure path that leaves the producer FD open."""
+
+    original_memfd_create = record.os.memfd_create
+    original_close = record.os.close
+    original_fstat = record.os.fstat
+    original_fcntl = record.fcntl.fcntl
+    created: list[int] = []
+    closed: list[int] = []
+
+    def capture_memfd_create(name: str, flags: int) -> int:
+        descriptor = original_memfd_create(name, flags)
+        created.append(descriptor)
+        return descriptor
+
+    def tracking_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(record.os, "memfd_create", capture_memfd_create)
+    monkeypatch.setattr(record.os, "close", tracking_close)
+
+    if failure == "fchmod":
+        monkeypatch.setattr(
+            record.os,
+            "fchmod",
+            lambda *_: (_ for _ in ()).throw(OSError("synthetic fchmod failure")),
+        )
+    elif failure == "fstat":
+        monkeypatch.setattr(
+            record.os,
+            "fstat",
+            lambda *_: (_ for _ in ()).throw(OSError("synthetic fstat failure")),
+        )
+    elif failure == "encoder":
+        monkeypatch.setattr(
+            record,
+            "_encode_record",
+            lambda **_: (_ for _ in ()).throw(record._Reject()),
+        )
+    elif failure == "write":
+        monkeypatch.setattr(
+            record.os,
+            "write",
+            lambda *_: (_ for _ in ()).throw(OSError("synthetic write failure")),
+        )
+    elif failure == "seals":
+        def fail_add_seals(descriptor: int, command: int, *args: int) -> int:
+            if command == fcntl.F_ADD_SEALS:
+                raise OSError("synthetic seal failure")
+            return original_fcntl(descriptor, command, *args)
+
+        monkeypatch.setattr(record.fcntl, "fcntl", fail_add_seals)
+    elif failure == "postwrite":
+        monkeypatch.setattr(
+            record,
+            "_fd_state",
+            lambda _: (_ for _ in ()).throw(record._Reject()),
+        )
+    elif failure == "transfer":
+        monkeypatch.setattr(
+            record,
+            "_capability_from_fd",
+            lambda _: (_ for _ in ()).throw(record._Reject()),
+        )
+    else:
+        raise AssertionError(failure)
+
+    with pytest.raises(record._Reject):
+        record._materialize_q1_capability(_s4_policy(), _s4_attestation())
+    assert len(created) == 1
+    assert closed == created
+    with pytest.raises(OSError):
+        original_fstat(created[0])
+
+
+def test_s4_materializer_rejects_zero_write_and_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches accepting a null write or swallowing the sole cleanup failure."""
+
+    original_memfd_create = record.os.memfd_create
+    original_close = record.os.close
+    original_fstat = record.os.fstat
+    created: list[int] = []
+    closed: list[int] = []
+
+    def capture_memfd_create(name: str, flags: int) -> int:
+        descriptor = original_memfd_create(name, flags)
+        created.append(descriptor)
+        return descriptor
+
+    def close_then_fail(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+        raise OSError("synthetic close failure")
+
+    monkeypatch.setattr(record.os, "memfd_create", capture_memfd_create)
+    monkeypatch.setattr(record.os, "write", lambda *_: 0)
+    monkeypatch.setattr(record.os, "close", close_then_fail)
+
+    with pytest.raises(record._Reject):
+        record._materialize_q1_capability(_s4_policy(), _s4_attestation())
+    assert closed == created
+    with pytest.raises(OSError):
+        original_fstat(created[0])
+
+
+@pytest.mark.parametrize("field", ("inode", "seals", "fd_flags"))
+def test_s4_materializer_rejects_postwrite_identity_seal_and_cloexec_drift(
+    field: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches transfer after post-write identity, seal, or CLOEXEC drift."""
+
+    original_state = record._fd_state
+    original_close = record.os.close
+    original_memfd_create = record.os.memfd_create
+    original_fstat = record.os.fstat
+    created: list[int] = []
+    closed: list[int] = []
+
+    def capture_memfd_create(name: str, flags: int) -> int:
+        descriptor = original_memfd_create(name, flags)
+        created.append(descriptor)
+        return descriptor
+
+    def tracking_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    def drifting_state(descriptor: int) -> record._FDState:
+        current = original_state(descriptor)
+        replacements = {
+            "inode": current.inode + 1,
+            "seals": current.seals ^ fcntl.F_SEAL_WRITE,
+            "fd_flags": current.fd_flags ^ fcntl.FD_CLOEXEC,
+        }
+        return replace(current, **{field: replacements[field]})
+
+    monkeypatch.setattr(record.os, "memfd_create", capture_memfd_create)
+    monkeypatch.setattr(record.os, "close", tracking_close)
+    monkeypatch.setattr(record, "_fd_state", drifting_state)
+
+    with pytest.raises(record._Reject):
+        record._materialize_q1_capability(_s4_policy(), _s4_attestation())
+    assert closed == created
+    with pytest.raises(OSError):
+        original_fstat(created[0])
+
+
+def test_s4_materializer_allows_two_fresh_capabilities_for_equal_inputs() -> None:
+    """Catches an invented target-, commit-, or generation-wide issue cache."""
+
+    policy = _s4_policy()
+    attestation = _s4_attestation()
+    first = record._materialize_q1_capability(policy, attestation)
+    second = record._materialize_q1_capability(policy, attestation)
+    first_key = record._descriptor_key(first._fd)
+    second_key = record._descriptor_key(second._fd)
+
+    assert first is not second
+    assert first._fd != second._fd
+    assert first_key != second_key
+    record._discard_capability(first)
+    record._discard_capability(second)
+
+
+def test_s4_discard_takes_only_a_registered_capability_and_closes_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches double-close, unconsumed-FD leaks, or closing a forged foreign FD."""
+
+    original_close = record.os.close
+    closed: list[int] = []
+
+    def tracking_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(record.os, "close", tracking_close)
+    discarded = record._materialize_q1_capability(_s4_policy(), _s4_attestation())
+    discarded_fd = discarded._fd
+    record._discard_capability(discarded)
+    assert closed == [discarded_fd]
+    with pytest.raises(record._Reject):
+        record._discard_capability(discarded)
+    assert closed == [discarded_fd]
+
+    consumed = record._materialize_q1_capability(_s4_policy(), _s4_attestation())
+    consumed_fd = consumed._fd
+    assert record._decode_capability(consumed).manifest == MANIFEST
+    assert closed == [discarded_fd, consumed_fd]
+    with pytest.raises(record._Reject):
+        record._discard_capability(consumed)
+    assert closed == [discarded_fd, consumed_fd]
+
+    foreign_fd = os.memfd_create("d73-q1-foreign", os.MFD_CLOEXEC)
+    forged = object.__new__(record.D73Q1Capability)
+    forged._fd = foreign_fd
+    forged._consumed = False
+    with pytest.raises(record._Reject):
+        record._discard_capability(forged)
+    os.fstat(foreign_fd)
+    original_close(foreign_fd)
+
+
+def test_s4_discard_close_failure_is_fail_closed_after_one_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches swallowed discard cleanup errors or a cleanup retry."""
+
+    capability = record._materialize_q1_capability(_s4_policy(), _s4_attestation())
+    descriptor = capability._fd
+    original_close = record.os.close
+    closes = 0
+
+    def close_then_fail(fd: int) -> None:
+        nonlocal closes
+        closes += 1
+        original_close(fd)
+        raise OSError("synthetic discard close failure")
+
+    monkeypatch.setattr(record.os, "close", close_then_fail)
+    with pytest.raises(record._Reject):
+        record._discard_capability(capability)
+    assert closes == 1
+    with pytest.raises(record._Reject):
+        record._discard_capability(capability)
+    assert closes == 1
+    with pytest.raises(OSError):
+        os.fstat(descriptor)

@@ -18,6 +18,9 @@ import threading
 from typing import Any
 import weakref
 
+from ._d73_ingress_policy import D73IngressPolicyV1
+from .runtime_layout import _RuntimeLayoutAttestation
+
 
 _MAGIC = b"THD73Q1\0"
 _TUPLE_MAGIC = b"THD73T1\0"
@@ -828,6 +831,93 @@ def _capability_from_fd(fd: object) -> D73Q1Capability:
         _ISSUED_DESCRIPTOR_IDENTITIES.add(key)
         _register_capability(capability)
         return capability
+
+
+def _materialize_q1_capability(
+    policy: D73IngressPolicyV1,
+    attestation: _RuntimeLayoutAttestation,
+) -> D73Q1Capability:
+    """Materialize one private, descriptor-local Q1 capability."""
+
+    if (
+        type(policy) is not D73IngressPolicyV1
+        or type(attestation) is not _RuntimeLayoutAttestation
+        or type(policy.expected_uid) is not int
+        or type(policy.bus_name) is not str
+        or type(policy.selinux_context) is not str
+        or type(policy.polkit_action) is not str
+        or type(attestation.commit) is not str
+        or type(attestation.generation) is not str
+        or type(attestation.manifest_bytes) is not bytes
+    ):
+        raise _Reject()
+    try:
+        commit = attestation.commit.encode("ascii")
+        generation = attestation.generation.encode("ascii")
+        bus_name = policy.bus_name.encode("ascii")
+        selinux_context = policy.selinux_context.encode("ascii")
+        polkit_action = policy.polkit_action.encode("ascii")
+        flags = os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC
+        fd = _unsigned(os.memfd_create("the-hive-d73-q1", flags), 31)
+    except Exception as exc:
+        raise _Reject() from exc
+    try:
+        os.fchmod(fd, 0o600)
+        info = os.fstat(fd)
+        descriptor = _DescriptorIdentity(
+            uid=info.st_uid,
+            gid=info.st_gid,
+            device=info.st_dev,
+            inode=info.st_ino,
+            size=info.st_size,
+        )
+        record = _encode_record(
+            commit=commit,
+            descriptor=descriptor,
+            expected_uid=policy.expected_uid,
+            generation=generation,
+            bus_name=bus_name,
+            selinux_context=selinux_context,
+            polkit_action=polkit_action,
+            manifest=attestation.manifest_bytes,
+        )
+        offset = 0
+        while offset < len(record):
+            written = os.write(fd, record[offset:])
+            if type(written) is not int or not 0 < written <= len(record) - offset:
+                raise _Reject()
+            offset += written
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, _REQUIRED_SEALS)
+        state = _validate_fd_state(_fd_state(fd))
+        expected_identity = _DescriptorIdentity(
+            uid=descriptor.uid,
+            gid=descriptor.gid,
+            device=descriptor.device,
+            inode=descriptor.inode,
+            size=len(record),
+        )
+        if state.identity() != expected_identity:
+            raise _Reject()
+        capability = _capability_from_fd(fd)
+    except Exception as exc:
+        try:
+            os.close(fd)
+        except Exception as close_exc:
+            raise _Reject() from close_exc
+        if isinstance(exc, _Reject):
+            raise exc
+        raise _Reject() from exc
+    return capability
+
+
+def _discard_capability(capability: object) -> None:
+    """Consume and close one still-owned capability without decoding it."""
+
+    fd = _take_capability(capability)
+    try:
+        os.close(fd)
+    except Exception as exc:
+        raise _Reject() from exc
 
 
 def _decode_capability(capability: object) -> _DecodedRecord:
