@@ -11,7 +11,10 @@ for variable in "${!CODEX_@}"; do unset "${variable}"; done
 unset PYTHONHOME PYTHONPATH
 export PATH=/usr/bin:/bin
 exec /usr/bin/python3 -I -B -c '
+import fcntl
+import os
 import runpy
+import stat
 import sys
 from pathlib import Path
 
@@ -43,6 +46,31 @@ except Exception:
     fail()
 if layout.root / "src" != candidate:
     fail()
+lock_descriptor = os.environ.pop("THE_HIVE_RUNTIME_PUBLISH_LOCK_FD", None)
+if lock_descriptor is not None:
+    try:
+        if not lock_descriptor.isdecimal():
+            fail()
+        descriptor = int(lock_descriptor)
+        if descriptor < 0:
+            fail()
+        held_lock = os.fstat(descriptor)
+        live_lock = os.stat(
+            root / ".the-hive-release-publish.lock", follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(held_lock.st_mode)
+            or held_lock.st_nlink != 1
+            or held_lock.st_uid != os.geteuid()
+            or stat.S_IMODE(held_lock.st_mode) != 0o600
+            or (held_lock.st_dev, held_lock.st_ino)
+            != (live_lock.st_dev, live_lock.st_ino)
+        ):
+            fail()
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+    except (OSError, ValueError):
+        fail()
 sys.argv = [str(layout.root / "bin" / "the-hive-openai-pricing-inventory"), *sys.argv[4:]]
 try:
     runpy.run_module("the_hive.pricing_inventory", run_name="__main__", alter_sys=True)

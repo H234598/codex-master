@@ -4,6 +4,7 @@ import json
 import math
 import runpy
 import errno
+import fcntl
 import hashlib
 import os
 from datetime import UTC, datetime
@@ -11,6 +12,7 @@ from pathlib import Path
 import stat
 import subprocess
 import threading
+import time
 
 import pytest
 
@@ -1443,6 +1445,149 @@ def test_pricing_inventory_runtime_materialization_is_attested_and_upgrade_safe(
     assert timer.read_bytes() == (
         upgraded_runtime / "systemd" / "user" / timer.name
     ).read_bytes()
+
+    pointer_original = pointer.read_bytes()
+    pointer_payload = json.loads(pointer_original)
+    pointer_payload["previous"]["manifest_digest"] = "sha256:" + "0" * 64
+    pointer.write_text(json.dumps(pointer_payload), encoding="utf-8")
+    pointer.chmod(0o644)
+    rejected_previous = subprocess.run(
+        [launcher, "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=neutral,
+    )
+    assert rejected_previous.returncode == 64
+    assert rejected_previous.stdout == ""
+    pointer.write_bytes(pointer_original)
+    pointer.chmod(0o644)
+
+
+def test_pricing_runtime_rejects_noncanonical_launcher_and_unit_directives() -> None:
+    """The lifecycle rejects attested artifacts that violate its exact contract."""
+
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    install_error = installer["InstallError"]
+    launcher_path = "bin/the-hive-openai-pricing-inventory-stable"
+    service_path = "systemd/user/the-hive-openai-pricing.service"
+    timer_path = "systemd/user/the-hive-openai-pricing.timer"
+    canonical = {
+        launcher_path: (ROOT / launcher_path).read_bytes(),
+        service_path: (ROOT / service_path).read_bytes(),
+        timer_path: (ROOT / timer_path).read_bytes(),
+    }
+
+    class AttestedImage:
+        def __init__(self, artifacts: dict[str, bytes]) -> None:
+            self.artifacts = artifacts
+
+        def read_attested_file(self, relative: str) -> bytes:
+            return self.artifacts[relative]
+
+    with pytest.raises(install_error, match="install_release_template_invalid"):
+        installer["_attested_pricing_inventory_launcher_bytes"](
+            AttestedImage(
+                {
+                    **canonical,
+                    launcher_path: canonical[launcher_path] + b"\nexit 0\n",
+                }
+            )
+        )
+
+    invalid_pairs = (
+        {
+            **canonical,
+            service_path: canonical[service_path] + b"ExecStart=/usr/bin/false\n",
+        },
+        {
+            **canonical,
+            service_path: canonical[service_path] + b"ReadWritePaths=/tmp/foreign\n",
+        },
+        {
+            **canonical,
+            service_path: canonical[service_path]
+            + b"\n[Unit]\nConditionPathExists=/tmp/foreign\n",
+        },
+        {
+            **canonical,
+            timer_path: canonical[timer_path].replace(
+                b"\n[Install]\n",
+                b"\nUnit=foreign.service\n\n[Install]\n",
+            ),
+        },
+    )
+    for artifacts in invalid_pairs:
+        with pytest.raises(install_error, match="install_release_template_invalid"):
+            installer["_staged_pricing_inventory_unit_bytes"](
+                layout=AttestedImage(artifacts)
+            )
+
+
+def test_pricing_stable_launcher_waits_for_the_runtime_publish_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held publisher lock blocks the public launcher before pointer binding."""
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    monkeypatch.setitem(
+        installer["_install_attested_runtime"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: "a" * 40,
+    )
+    installer["_install_attested_runtime"](home=home)
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    launcher = home / ".local" / "bin" / "the-hive-openai-pricing-inventory"
+    lock_path = release_root / ".the-hive-release-publish.lock"
+    lock_stat = lock_path.stat()
+    descriptor = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    process: subprocess.Popen[str] | None = None
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        process = subprocess.Popen(
+            [launcher, "--help"],
+            cwd=tmp_path,
+            env={"HOME": str(home), "LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                pytest.fail("pricing launcher exited while the publish lock was held")
+            for fd_name in (Path("/proc") / str(process.pid) / "fd").iterdir():
+                try:
+                    observed = fd_name.stat()
+                except FileNotFoundError:
+                    continue
+                if (observed.st_dev, observed.st_ino) == (
+                    lock_stat.st_dev,
+                    lock_stat.st_ino,
+                ):
+                    break
+            else:
+                time.sleep(0.01)
+                continue
+            break
+        else:
+            pytest.fail("pricing launcher did not open the publisher lock")
+        assert process.poll() is None
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+    assert process is not None
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, stderr
+    assert "usage:" in stdout
 
 
 @pytest.mark.parametrize(

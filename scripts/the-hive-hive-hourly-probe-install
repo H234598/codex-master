@@ -68,6 +68,8 @@ _PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE = (
     "bin/the-hive-openai-pricing-inventory-stable"
 )
 _PRICING_INVENTORY_LAUNCHER_NAME = "the-hive-openai-pricing-inventory"
+_PRICING_INVENTORY_SERVICE_SOURCE = "systemd/user/the-hive-openai-pricing.service"
+_PRICING_INVENTORY_TIMER_SOURCE = "systemd/user/the-hive-openai-pricing.timer"
 _PRICING_INVENTORY_UNIT_NAMES = (
     "the-hive-openai-pricing.service",
     "the-hive-openai-pricing.timer",
@@ -1127,12 +1129,25 @@ def _materialize_stable_mcp_launcher(*, source: bytes, release_root: Path) -> No
 
 
 def _attested_pricing_inventory_launcher_bytes(layout: RuntimeLayout) -> bytes:
-    """Read the stable public pricing launcher from one attested image."""
+    """Read the exact canonical stable launcher from one attested image.
+
+    The manifest proves image membership, but cannot by itself define the
+    public runtime-authority contract. The installer is the sole lifecycle
+    owner, so its owned source is the canonical contract for the public
+    launcher it materializes.
+    """
 
     try:
-        return layout.read_attested_file(_PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE)
-    except ValueError as exc:
+        source = layout.read_attested_file(_PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE)
+        canonical = _source_bytes(
+            Path(__file__).resolve().parents[1]
+            / _PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE
+        )
+    except (InstallError, ValueError) as exc:
         raise InstallError("install_release_invalid") from exc
+    if source != canonical:
+        raise InstallError("install_release_template_invalid")
+    return source
 
 
 def _materialize_pricing_inventory_launcher(*, source: bytes, bindir: Path) -> None:
@@ -1583,32 +1598,28 @@ def _restore_pricing_inventory_units(
 def _staged_pricing_inventory_unit_bytes(
     *, layout: RuntimeLayout
 ) -> tuple[bytes, bytes]:
-    """Read and validate the canonical pricing pair from one attested image."""
+    """Read the exact canonical pricing pair from one attested image.
+
+    Unit semantics permit repeated and overriding directives. Therefore the
+    lifecycle accepts only byte-for-byte copies of its canonical owned service
+    and timer sources, rather than trying to allowlist a few substrings.
+    """
 
     try:
         service = layout.read_attested_file(
-            "systemd/user/the-hive-openai-pricing.service"
+            _PRICING_INVENTORY_SERVICE_SOURCE
         )
         timer = layout.read_attested_file(
-            "systemd/user/the-hive-openai-pricing.timer"
+            _PRICING_INVENTORY_TIMER_SOURCE
         )
-        service_text = service.decode("utf-8")
-        timer_text = timer.decode("utf-8")
-    except (UnicodeDecodeError, ValueError) as exc:
+        repository = Path(__file__).resolve().parents[1]
+        canonical_service = _source_bytes(
+            repository / _PRICING_INVENTORY_SERVICE_SOURCE
+        )
+        canonical_timer = _source_bytes(repository / _PRICING_INVENTORY_TIMER_SOURCE)
+    except (InstallError, ValueError) as exc:
         raise InstallError("install_release_invalid") from exc
-    if (
-        service_text.count(
-            "ExecStart=%h/.local/bin/the-hive-openai-pricing-inventory"
-        )
-        != 1
-        or "ReadWritePaths=%h/.local/state/the-hive/openai-pricing"
-        not in service_text
-        or "codex-master" in service_text
-        or "codex-master" in timer_text
-        or "@MASTERJET_" in service_text
-        or "@MASTERJET_" in timer_text
-        or "Unit=the-hive-openai-pricing.service" not in timer_text
-    ):
+    if service != canonical_service or timer != canonical_timer:
         raise InstallError("install_release_template_invalid")
     return service, timer
 
