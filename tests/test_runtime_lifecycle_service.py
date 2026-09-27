@@ -1898,6 +1898,53 @@ def test_cutover_mutation_failure_result_rejects_unbounded_telemetry() -> None:
     assert "untrusted" not in repr(result)
 
 
+def test_cutover_mutation_failure_result_rejects_unknown_status_for_valid_phase() -> None:
+    """A known phase cannot make an unknown underlying failure telemetricly valid."""
+
+    result = runtime_lifecycle._cutover_mutation_failure_result(
+        runtime_lifecycle._CutoverMutationError(
+            phase="new_service_start",
+            error=runtime_lifecycle.RuntimeLifecycleError("untrusted-error-detail"),
+        )
+    )
+
+    assert result == {
+        "status": "runtime_lifecycle_systemd_failed",
+        "raw_output": "not_returned",
+        "failure_phase": "telemetry_invalid",
+        "failure_error": "telemetry_invalid",
+    }
+    assert "untrusted" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        "runtime_lifecycle_systemd_failed",
+        "runtime_lifecycle_systemd_invalid",
+        "runtime_lifecycle_systemd_unavailable",
+    ),
+)
+def test_cutover_mutation_failure_result_accepts_each_whitelisted_status(
+    status: str,
+) -> None:
+    """Every documented manager status keeps the bounded primary phase."""
+
+    result = runtime_lifecycle._cutover_mutation_failure_result(
+        runtime_lifecycle._CutoverMutationError(
+            phase="new_service_start",
+            error=runtime_lifecycle.RuntimeLifecycleError(status),
+        )
+    )
+
+    assert result == {
+        "status": status,
+        "raw_output": "not_returned",
+        "failure_phase": "new_service_start",
+        "failure_error": "systemd_mutation_failed",
+    }
+
+
 @pytest.mark.parametrize(
     ("stage", "failing_call"),
     (

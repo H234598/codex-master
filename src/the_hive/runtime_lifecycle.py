@@ -117,9 +117,10 @@ class _CutoverMutationError(RuntimeLifecycleError):
 
     def __init__(self, *, phase: str, error: RuntimeLifecycleError) -> None:
         status = str(error)
+        self.status_whitelisted = status in _CUTOVER_MUTATION_STATUSES
         super().__init__(
             status
-            if status in _CUTOVER_MUTATION_STATUSES
+            if self.status_whitelisted
             else "runtime_lifecycle_systemd_failed"
         )
         self.phase = phase
@@ -2752,7 +2753,10 @@ def _cutover_mutation_failure_result(
 ) -> dict[str, object]:
     """Publish only the fixed phase/error pair after a complete rollback."""
 
-    if failure.phase not in _CUTOVER_MUTATION_PHASES:
+    if (
+        failure.phase not in _CUTOVER_MUTATION_PHASES
+        or not failure.status_whitelisted
+    ):
         phase = _CUTOVER_TELEMETRY_INVALID
         error = _CUTOVER_TELEMETRY_INVALID
     else:
