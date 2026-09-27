@@ -28,6 +28,17 @@ def _write_private_unit(path: Path, content: bytes) -> None:
     path.chmod(0o644)
 
 
+def _legacy_alias_path(home: Path) -> Path:
+    return home / ".local" / "bin" / "codex-master-mcp"
+
+
+def _install_legacy_alias(home: Path) -> Path:
+    alias = _legacy_alias_path(home)
+    alias.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    alias.symlink_to(home / "codex-master" / "bin" / "codex-master-mcp")
+    return alias
+
+
 def _setup_legacy_tree(tmp_path: Path) -> tuple[Path, Path, dict[str, bytes]]:
     """Build the real user-unit files; systemd itself remains faked below."""
 
@@ -50,6 +61,7 @@ def _setup_legacy_tree(tmp_path: Path) -> tuple[Path, Path, dict[str, bytes]]:
         wants = units / "timers.target.wants"
         wants.mkdir(mode=0o700, exist_ok=True)
         (wants / name).symlink_to(units / name)
+    _install_legacy_alias(home)
     return home, units, old
 
 
@@ -228,11 +240,199 @@ def test_cutover_replaces_the_legacy_fleet_supervisor_without_a_parallel_timer(
     assert not any((units / name).exists() for name in OLD_UNITS)
     assert not any((units / "timers.target.wants" / name).exists() for name in OLD_UNITS)
     assert not any((units / "timers.target.wants" / name).is_symlink() for name in OLD_UNITS)
+    assert not _legacy_alias_path(home).is_symlink()
     service = (units / "the-hive-watchdog.service").read_text(encoding="utf-8")
     assert "--manage-unclaimed" in service
     assert "--action stop" in service
     assert "--report-grace-seconds 15" in service
     assert stat.S_IMODE((units / "the-hive-watchdog.timer").stat().st_mode) == 0o644
+
+
+def test_legacy_alias_target_is_derived_from_the_bound_home_for_a_distinct_home(
+    tmp_path: Path,
+) -> None:
+    """Break caught: the legacy executable target contains a host-global home path."""
+
+    module = _script()
+    home = tmp_path / "distinct-authorized-home"
+
+    assert module["_legacy_alias_target"](home) == os.fspath(
+        home / "codex-master" / "bin" / "codex-master-mcp"
+    )
+
+
+def test_bind_legacy_alias_reads_the_exact_owned_link_through_its_bound_parent(
+    tmp_path: Path,
+) -> None:
+    """Break caught: alias binding follows or accepts an unbound launcher-parent leaf."""
+
+    module = _script()
+    home = tmp_path / "distinct-authorized-home"
+    alias_path = _install_legacy_alias(home)
+
+    alias, parent = module["_bind_legacy_alias"](home)
+
+    assert alias.path == alias_path
+    assert alias.target == os.fspath(home / "codex-master" / "bin" / "codex-master-mcp")
+    assert alias.identity == module["_maybe_link"](alias_path).identity
+    assert parent.path == alias_path.parent
+
+
+def test_cutover_rejects_a_missing_legacy_alias_before_any_systemd_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: migration accepts a missing executable leaf as if it had been removed safely."""
+
+    module = _script()
+    home, units, legacy = _setup_legacy_tree(tmp_path)
+    _legacy_alias_path(home).unlink()
+    systemd = _FakeSystemd()
+    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
+    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+
+    with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_untrusted"):
+        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+
+    assert systemd.calls == []
+    assert {name: (units / name).read_bytes() for name in OLD_UNITS} == legacy
+    assert not _legacy_alias_path(home).exists()
+
+
+@pytest.mark.parametrize("replacement", ("wrong-target", "regular-file"))
+def test_cutover_rejects_a_nonexact_legacy_alias_before_any_systemd_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    """Break caught: migration removes a foreign or non-link launcher under the legacy name."""
+
+    module = _script()
+    home, units, legacy = _setup_legacy_tree(tmp_path)
+    alias = _legacy_alias_path(home)
+    alias.unlink()
+    if replacement == "wrong-target":
+        alias.symlink_to("/foreign/codex-master-mcp")
+    else:
+        _write_private_unit(alias, b"foreign regular launcher\n")
+    systemd = _FakeSystemd()
+    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
+    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+
+    with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_untrusted"):
+        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+
+    assert systemd.calls == []
+    assert {name: (units / name).read_bytes() for name in OLD_UNITS} == legacy
+    if replacement == "wrong-target":
+        assert os.readlink(alias) == "/foreign/codex-master-mcp"
+    else:
+        assert alias.read_bytes() == b"foreign regular launcher\n"
+
+
+def test_cutover_rejects_a_legacy_alias_parent_rebind_before_any_systemd_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: a rebound ~/.local/bin escapes the alias binding after validation."""
+
+    module = _script()
+    home, _units, _legacy = _setup_legacy_tree(tmp_path)
+    alias_parent = _legacy_alias_path(home).parent
+    systemd = _FakeSystemd()
+    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
+    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    original_create = module["_create_backup_directory"]
+
+    def rebind_alias_parent(directory: object) -> object:
+        os.replace(alias_parent, alias_parent.with_name("bound-bin"))
+        alias_parent.mkdir(mode=0o700)
+        return original_create(directory)
+
+    monkeypatch.setitem(module["cutover"].__globals__, "_create_backup_directory", rebind_alias_parent)
+
+    with pytest.raises(module["CutoverError"], match="watchdog_cutover_input_changed"):
+        module["cutover"](home=home, systemctl=systemd, observe=lambda _command: None, state=systemd.state)
+
+    assert systemd.calls == []
+    assert not list(alias_parent.iterdir())
+
+
+def test_cutover_never_removes_a_legacy_alias_rebound_after_successor_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: alias cleanup unlinks a replacement after the successor has been observed."""
+
+    module = _script()
+    home, _units, _legacy = _setup_legacy_tree(tmp_path)
+    alias = _legacy_alias_path(home)
+    systemd = _FakeSystemd()
+    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
+    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+
+    def rebind_after_observation(_command: tuple[str, ...]) -> None:
+        alias.unlink()
+        alias.symlink_to("/foreign/rebound-codex-master-mcp")
+
+    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rollback_failed"):
+        module["cutover"](home=home, systemctl=systemd, observe=rebind_after_observation, state=systemd.state)
+
+    assert os.readlink(alias) == "/foreign/rebound-codex-master-mcp"
+
+
+def test_cutover_restores_the_exact_legacy_alias_when_observation_fails_before_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: an observer failure loses or recreates the still-bound legacy executable leaf."""
+
+    module = _script()
+    home, _units, _legacy = _setup_legacy_tree(tmp_path)
+    alias = _legacy_alias_path(home)
+    before = _link_identity(alias)
+    systemd = _FakeSystemd()
+    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
+    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+
+    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
+        module["cutover"](
+            home=home,
+            systemctl=systemd,
+            observe=lambda _command: (_ for _ in ()).throw(RuntimeError("observer failed")),
+            state=systemd.state,
+        )
+
+    assert _link_identity(alias) == before
+
+
+def test_cutover_restores_the_exact_legacy_alias_after_postremoval_reload_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: a post-removal failure strands the old launcher or restores only equivalent bytes."""
+
+    module = _script()
+    home, _units, _legacy = _setup_legacy_tree(tmp_path)
+    alias = _legacy_alias_path(home)
+    before = _link_identity(alias)
+    systemd = _FakeSystemd()
+    monkeypatch.setitem(module["cutover"].__globals__, "_bind_runtime", lambda _home: _bound_runtime())
+    monkeypatch.setitem(module["cutover"].__globals__, "_source_units", _successor_units)
+    original = systemd
+    observed: list[tuple[str, ...]] = []
+    alias_absent_after_observation = False
+
+    def fail_postremoval_reload(*arguments: str) -> None:
+        nonlocal alias_absent_after_observation
+        if arguments == ("daemon-reload",) and original.calls.count(arguments) == 1:
+            alias_absent_after_observation = bool(observed) and not alias.is_symlink()
+            original.fail_once_on = arguments
+        original(*arguments)
+
+    with pytest.raises(module["CutoverError"], match="watchdog_cutover_rolled_back"):
+        module["cutover"](
+            home=home,
+            systemctl=fail_postremoval_reload,
+            observe=observed.append,
+            state=systemd.state,
+        )
+
+    assert alias_absent_after_observation
+    assert _link_identity(alias) == before
 
 
 def test_cutover_accepts_and_binds_the_successor_want_created_by_systemd_enable(
@@ -795,6 +995,7 @@ def test_cutover_is_idempotent_for_an_already_exclusive_green_successor(
     module = _script()
     home = tmp_path / "home"
     (home / ".local" / "state" / "codex-master-mcp").mkdir(mode=0o700, parents=True)
+    _legacy_alias_path(home).parent.mkdir(mode=0o700, parents=True)
     units = home / ".config" / "systemd" / "user"
     units.mkdir(mode=0o700, parents=True)
     for name, content in _successor_units().items():
@@ -813,6 +1014,7 @@ def test_cutover_is_idempotent_for_an_already_exclusive_green_successor(
     assert result["status"] == "cutover_complete"
     assert observed
     assert systemd.calls == []
+    assert not _legacy_alias_path(home).is_symlink()
 
 
 def test_status_with_a_missing_unit_directory_never_creates_a_namespace_or_changes_modes(

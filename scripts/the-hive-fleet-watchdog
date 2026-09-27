@@ -38,6 +38,7 @@ _CANONICAL_TIMER_DIRECTIVES = (
 _LOCK_NAME = ".the-hive-watchdog-cutover.lock"
 _LOCK_GUARD_NAME = ".the-hive-watchdog-cutover.namespace.lock"
 _LOCK_ANCHOR_NAME = ".the-hive-watchdog-cutover.anchor.lock"
+_LEGACY_ALIAS_NAME = "codex-master-mcp"
 
 
 class CutoverError(RuntimeError):
@@ -97,6 +98,8 @@ class _Binding:
     wants: tuple[_Link, ...]
     want_directories: dict[Path, _Directory]
     states: dict[str, tuple[bool, bool]]
+    legacy_alias: _Link | None
+    legacy_alias_parent: _Directory | None
 
 
 def _private_directory(path: Path, *, create: bool = False) -> None:
@@ -388,6 +391,73 @@ def _maybe_link(path: Path) -> _Link:
     return _Link(path, target, (item.st_dev, item.st_ino, item.st_uid, item.st_nlink, item.st_size))
 
 
+def _legacy_alias_target(home: Path) -> str:
+    """Derive the one authorized old executable leaf from the bound home."""
+
+    if not home.is_absolute():
+        raise CutoverError("watchdog_cutover_input_untrusted")
+    return os.fspath(home / "codex-master" / "bin" / _LEGACY_ALIAS_NAME)
+
+
+def _read_bound_link(directory: _Directory, name: str) -> _Link:
+    """Read one no-follow link by name through its already bound parent FD."""
+
+    descriptor = _open_bound_directory(directory)
+    path = directory.path / name
+    try:
+        try:
+            item = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return _Link(path, None, None)
+        if not stat.S_ISLNK(item.st_mode) or item.st_uid != os.geteuid() or item.st_nlink != 1:
+            raise CutoverError("watchdog_cutover_input_untrusted")
+        try:
+            target = os.readlink(name, dir_fd=descriptor)
+        except OSError as exc:
+            raise CutoverError("watchdog_cutover_input_untrusted") from exc
+        result = _Link(
+            path, target, (item.st_dev, item.st_ino, item.st_uid, item.st_nlink, item.st_size),
+        )
+        if not _fd_entry_matches_link(descriptor, name, result):
+            raise CutoverError("watchdog_cutover_input_changed")
+        return result
+    except CutoverError:
+        raise
+    except OSError as exc:
+        raise CutoverError("watchdog_cutover_input_untrusted") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _bind_legacy_alias(home: Path) -> tuple[_Link, _Directory]:
+    """Bind the exact legacy executable leaf and its no-follow parent."""
+
+    parent = _bind_directory(home / ".local" / "bin")
+    alias = _read_bound_link(parent, _LEGACY_ALIAS_NAME)
+    if alias.target is not None and alias.target != _legacy_alias_target(home):
+        raise CutoverError("watchdog_cutover_input_untrusted")
+    return alias, parent
+
+
+def _revalidate_legacy_alias(binding: _Binding, expected: _Link) -> None:
+    """Reject a changed alias parent, type, identity, or exact target before mutation."""
+
+    if (
+        binding.legacy_alias is None
+        or binding.legacy_alias_parent is None
+        or expected.path != binding.legacy_alias.path
+    ):
+        raise CutoverError("watchdog_cutover_input_changed")
+    try:
+        current = _read_bound_link(binding.legacy_alias_parent, expected.path.name)
+    except CutoverError as exc:
+        if str(exc) == "watchdog_cutover_input_untrusted":
+            raise CutoverError("watchdog_cutover_input_changed") from exc
+        raise
+    if current != expected:
+        raise CutoverError("watchdog_cutover_input_changed")
+
+
 def _is_direct_unit_want(link: _Link, unit: Path) -> bool:
     if link.target is None:
         return False
@@ -518,7 +588,11 @@ def _default_observe(command: tuple[str, ...]) -> None:
 
 
 def _bind(
-    home: Path, state: Callable[[str], tuple[bool, bool]], *, create_unit_dir: bool
+    home: Path,
+    state: Callable[[str], tuple[bool, bool]],
+    *,
+    create_unit_dir: bool,
+    bind_legacy_alias: bool = False,
 ) -> _Binding:
     if not home.is_absolute():
         raise CutoverError("watchdog_cutover_input_untrusted")
@@ -547,8 +621,13 @@ def _bind(
         if item.target is not None
     }
     states = {name: state(name) for name in (*OLD, *NEW)}
+    legacy_alias: _Link | None = None
+    legacy_alias_parent: _Directory | None = None
+    if bind_legacy_alias:
+        legacy_alias, legacy_alias_parent = _bind_legacy_alias(home)
     return _Binding(
         home, unit_dir, unit_directory, _bind_runtime(home), files, wants, want_directories, states,
+        legacy_alias, legacy_alias_parent,
     )
 
 
@@ -570,6 +649,8 @@ def _revalidate_bound_inputs(binding: _Binding, source_units: dict[str, bytes] |
         current = _maybe_link(item.path)
         if current.target != item.target or current.identity != item.identity:
             raise CutoverError("watchdog_cutover_input_changed")
+    if binding.legacy_alias is not None:
+        _revalidate_legacy_alias(binding, binding.legacy_alias)
     current_runtime = _bind_runtime(binding.home)
     if current_runtime != binding.runtime:
         raise CutoverError("watchdog_cutover_input_changed")
@@ -584,6 +665,7 @@ def _revalidate_phase(
     state: Callable[[str], tuple[bool, bool]],
     expected_states: dict[str, tuple[bool, bool]],
     expected_wants: dict[Path, _Link] | None = None,
+    expected_legacy_alias: _Link | None = None,
 ) -> None:
     """Rebind every still-live input immediately before one mutation phase."""
 
@@ -604,6 +686,11 @@ def _revalidate_phase(
         current = _maybe_link(item.path)
         if current.target != item.target or current.identity != item.identity:
             raise CutoverError("watchdog_cutover_input_changed")
+    if binding.legacy_alias is not None:
+        _revalidate_legacy_alias(
+            binding,
+            expected_legacy_alias if expected_legacy_alias is not None else binding.legacy_alias,
+        )
     if {name: state(name) for name in (*OLD, *NEW)} != expected_states:
         raise CutoverError("watchdog_cutover_state_changed")
 
@@ -792,6 +879,7 @@ def _restore_backups(
     binding: _Binding,
     staged: dict[str, _File],
     expected_wants: dict[Path, _Link],
+    expected_legacy_alias: _Link,
     backup_directory: _Directory,
 ) -> None:
     for target, item in backups.items():
@@ -806,12 +894,27 @@ def _restore_backups(
             original = next(item for item in binding.files if item.path == target)
             is_link = False
         else:
-            expected_want = expected_wants[target]
-            if _maybe_link(target) != expected_want:
-                raise CutoverError("watchdog_cutover_rollback_verification_failed")
-            target_directory = binding.want_directories.get(target.parent)
-            original = next(item for item in binding.wants if item.path == target)
-            expected = expected_want
+            if binding.legacy_alias is not None and target == binding.legacy_alias.path:
+                if binding.legacy_alias_parent is None:
+                    raise CutoverError("watchdog_cutover_rollback_verification_failed")
+                try:
+                    current_alias = _read_bound_link(
+                        binding.legacy_alias_parent, target.name,
+                    )
+                except CutoverError as exc:
+                    raise CutoverError("watchdog_cutover_rollback_verification_failed") from exc
+                if current_alias != expected_legacy_alias:
+                    raise CutoverError("watchdog_cutover_rollback_verification_failed")
+                target_directory = binding.legacy_alias_parent
+                original = binding.legacy_alias
+                expected = expected_legacy_alias
+            else:
+                expected_want = expected_wants[target]
+                if _maybe_link(target) != expected_want:
+                    raise CutoverError("watchdog_cutover_rollback_verification_failed")
+                target_directory = binding.want_directories.get(target.parent)
+                original = next(item for item in binding.wants if item.path == target)
+                expected = expected_want
             is_link = True
         if target_directory is None:
             raise CutoverError("watchdog_cutover_rollback_verification_failed")
@@ -949,6 +1052,11 @@ def _verify_rollback(binding: _Binding, state: Callable[[str], tuple[bool, bool]
         current = _maybe_link(item.path)
         if current.target != item.target or current.identity != item.identity:
             raise CutoverError("watchdog_cutover_rollback_verification_failed")
+    if binding.legacy_alias is not None:
+        try:
+            _revalidate_legacy_alias(binding, binding.legacy_alias)
+        except CutoverError as exc:
+            raise CutoverError("watchdog_cutover_rollback_verification_failed") from exc
     if {name: state(name) for name in (*OLD, *NEW)} != binding.states:
         raise CutoverError("watchdog_cutover_rollback_verification_failed")
 
@@ -958,6 +1066,7 @@ def _verify_complete_cutover(
     source_units: dict[str, bytes],
     staged: dict[str, _File],
     expected_wants: dict[Path, _Link],
+    expected_legacy_alias: _Link,
     state: Callable[[str], tuple[bool, bool]],
 ) -> None:
     """Read the committed namespace independently before declaring the one-way cutover."""
@@ -979,6 +1088,10 @@ def _verify_complete_cutover(
         current = _maybe_link(path)
         if current.target != expected.target or current.identity != expected.identity:
             raise CutoverError("watchdog_cutover_postcondition_failed")
+    try:
+        _revalidate_legacy_alias(binding, expected_legacy_alias)
+    except CutoverError as exc:
+        raise CutoverError("watchdog_cutover_postcondition_failed") from exc
     _require_exclusive_target_state(state)
 
 
@@ -1006,6 +1119,8 @@ def _already_green(binding: _Binding, source_units: dict[str, bytes]) -> bool:
         all(files[name] is None for name in OLD)
         and all(not enabled and not active for enabled, active in (binding.states[name] for name in OLD))
         and all(item.target is None for item in binding.wants if item.path.name in OLD)
+        and binding.legacy_alias is not None
+        and binding.legacy_alias.target is None
         and all(files[name] == source_units[name] for name in NEW)
         and binding.states[NEW[1]] == (True, True)
     )
@@ -1168,17 +1283,21 @@ def cutover(
     lock = _acquire_lifecycle_lock(home)
     try:
         _revalidate_lifecycle_lock_root(lock)
-        binding = _bind(home, state, create_unit_dir=True)
+        binding = _bind(home, state, create_unit_dir=True, bind_legacy_alias=True)
         source_units = _source_units()
         staged: dict[str, _File] = {}
         backups: dict[Path, _Backup] = {}
         expected_states = dict(binding.states)
         expected_wants = {item.path: item for item in binding.wants}
+        if binding.legacy_alias is None:
+            raise CutoverError("watchdog_cutover_input_changed")
+        expected_legacy_alias = binding.legacy_alias
 
         def revalidate_phase() -> None:
             _revalidate_lifecycle_lock_root(lock)
             _revalidate_phase(
                 binding, source_units, staged, state, expected_states, expected_wants,
+                expected_legacy_alias,
             )
 
         def systemd_phase(*arguments: str) -> None:
@@ -1214,6 +1333,8 @@ def cutover(
         if _already_green(binding, source_units):
             observe_phase()
             return {"status": "cutover_complete", "raw_output": "not_returned"}
+        if expected_legacy_alias.target is None or expected_legacy_alias.identity is None:
+            raise CutoverError("watchdog_cutover_input_untrusted")
         revalidate_phase()
         if binding.unit_directory is None:
             raise CutoverError("watchdog_cutover_input_changed")
@@ -1294,8 +1415,23 @@ def cutover(
                     )
                     expected_wants[old_want.path] = _Link(old_want.path, None, None)
             revalidate_phase()
+            if binding.legacy_alias_parent is None:
+                raise CutoverError("watchdog_cutover_input_changed")
+            _backup_link(
+                expected_legacy_alias.path,
+                expected_legacy_alias,
+                backup_root,
+                backups,
+                before_mutation=before_mutation,
+                source_directory=binding.legacy_alias_parent,
+                backup_directory=backup_directory,
+            )
+            expected_legacy_alias = _Link(expected_legacy_alias.path, None, None)
+            revalidate_phase()
             systemd_phase("daemon-reload")
-            _verify_complete_cutover(binding, source_units, staged, expected_wants, state)
+            _verify_complete_cutover(
+                binding, source_units, staged, expected_wants, expected_legacy_alias, state,
+            )
             _revalidate_lifecycle_lock_root(lock)
             _discard_committed_backups(backups, backup_directory, binding.unit_directory)
             return {"status": "cutover_complete", "raw_output": "not_returned"}
@@ -1322,12 +1458,13 @@ def cutover(
             try:
                 _revalidate_lifecycle_lock_root(lock)
                 _restore_backups(
-                    backups, binding, staged, expected_wants, backup_directory,
+                    backups, binding, staged, expected_wants, expected_legacy_alias, backup_directory,
                 )
                 bound_want_paths = {item.path for item in binding.wants}
                 for target in backups:
                     if target in bound_want_paths:
                         expected_wants[target] = _maybe_link(target)
+                expected_legacy_alias = binding.legacy_alias
                 _revalidate_lifecycle_lock_root(lock)
                 _restore_files(binding, staged)
                 staged = {item.path.name: item for item in binding.files}
