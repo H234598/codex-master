@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import runpy
 import stat
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -100,6 +101,171 @@ class _FakeSystemd:
 
     def state(self, unit: str) -> tuple[bool, bool]:
         return unit in self.enabled, unit in self.active
+
+
+def _patch_readonly_load_state_adapter(
+    monkeypatch: pytest.MonkeyPatch, state: dict[str, str] | BaseException
+) -> list[tuple[object, str]]:
+    """Bind the existing read-only systemd-show adapter without using systemd."""
+
+    monkeypatch.syspath_prepend(str(ROOT / "src"))
+    from the_hive import runtime_lifecycle
+
+    calls: list[tuple[object, str]] = []
+    sentinel = object()
+
+    def show(adapter: object, unit: str) -> dict[str, str]:
+        calls.append((adapter, unit))
+        if isinstance(state, BaseException):
+            raise state
+        return state
+
+    monkeypatch.setattr(runtime_lifecycle, "_systemctl_default", sentinel)
+    monkeypatch.setattr(runtime_lifecycle, "_show", show)
+    return calls
+
+
+@pytest.mark.parametrize("unit", NEW_UNITS)
+def test_default_state_normalizes_only_a_both_exit_four_successor_absence_attested_by_load_state(
+    unit: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: an absent successor cannot enter the D373 transaction from its real prestate."""
+
+    module = _script()
+    calls: list[tuple[str, ...]] = []
+
+    def run(arguments: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(tuple(arguments))
+        return SimpleNamespace(returncode=4)
+
+    monkeypatch.setattr(module["subprocess"], "run", run)
+    adapter_calls = _patch_readonly_load_state_adapter(
+        monkeypatch,
+        {
+            "LoadState": "not-found",
+            "UnitFileState": "disabled",
+            "ActiveState": "inactive",
+        },
+    )
+
+    assert module["_default_state"](unit) == (False, False)
+    assert calls == [
+        ("/usr/bin/systemctl", "--user", "is-enabled", "--quiet", unit),
+        ("/usr/bin/systemctl", "--user", "is-active", "--quiet", unit),
+    ]
+    assert [received_unit for _adapter, received_unit in adapter_calls] == [unit]
+
+
+def test_default_state_preserves_the_existing_disabled_inactive_and_enabled_active_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: normal installed-unit truth values are changed by the absent-state repair."""
+
+    module = _script()
+    responses = iter((1, 3, 0, 0))
+
+    def run(_arguments: list[str], **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=next(responses))
+
+    monkeypatch.setattr(module["subprocess"], "run", run)
+
+    assert module["_default_state"](NEW_UNITS[0]) == (False, False)
+    assert module["_default_state"](NEW_UNITS[1]) == (True, True)
+
+
+@pytest.mark.parametrize(
+    ("responses", "load_state"),
+    (
+        ((4, 0), {"LoadState": "not-found", "UnitFileState": "disabled", "ActiveState": "inactive"}),
+        ((0, 4), {"LoadState": "not-found", "UnitFileState": "disabled", "ActiveState": "inactive"}),
+        ((4, 4), {"LoadState": "loaded", "UnitFileState": "disabled", "ActiveState": "inactive"}),
+        ((4, 4), {"LoadState": "unknown", "UnitFileState": "disabled", "ActiveState": "inactive"}),
+        ((4, 4), {"LoadState": "not-found", "UnitFileState": "enabled", "ActiveState": "inactive"}),
+    ),
+)
+def test_default_state_rejects_mixed_or_unattested_exit_four_responses(
+    responses: tuple[int, int],
+    load_state: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: a bare or mixed exit 4 is mistaken for an absent unit."""
+
+    module = _script()
+    returncodes = iter(responses)
+
+    def run(_arguments: list[str], **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=next(returncodes))
+
+    monkeypatch.setattr(module["subprocess"], "run", run)
+    _patch_readonly_load_state_adapter(monkeypatch, load_state)
+
+    with pytest.raises(module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"):
+        module["_default_state"](NEW_UNITS[1])
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        subprocess.TimeoutExpired(("/usr/bin/systemctl",), 15),
+        OSError("unavailable"),
+    ),
+)
+def test_default_state_fails_closed_for_readonly_systemd_timeout_or_oserror(
+    failure: BaseException, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: unavailable read-only state becomes an invented scheduler state."""
+
+    module = _script()
+
+    def run(_arguments: list[str], **_kwargs: object) -> SimpleNamespace:
+        raise failure
+
+    monkeypatch.setattr(module["subprocess"], "run", run)
+
+    with pytest.raises(module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"):
+        module["_default_state"](NEW_UNITS[0])
+
+
+def test_default_state_fails_closed_when_the_validated_absent_state_adapter_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: an unavailable attestation adapter invents successor absence."""
+
+    module = _script()
+    calls: list[tuple[str, ...]] = []
+
+    def run(arguments: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(tuple(arguments))
+        return SimpleNamespace(returncode=4)
+
+    monkeypatch.setattr(module["subprocess"], "run", run)
+    adapter_calls = _patch_readonly_load_state_adapter(monkeypatch, OSError("unavailable"))
+
+    with pytest.raises(module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"):
+        module["_default_state"](NEW_UNITS[0])
+
+    assert calls == [
+        ("/usr/bin/systemctl", "--user", "is-enabled", "--quiet", NEW_UNITS[0]),
+        ("/usr/bin/systemctl", "--user", "is-active", "--quiet", NEW_UNITS[0]),
+    ]
+    assert [received_unit for _adapter, received_unit in adapter_calls] == [NEW_UNITS[0]]
+
+
+@pytest.mark.parametrize("returncode", (2, 5, 255))
+def test_default_state_rejects_unknown_systemd_returncodes(
+    returncode: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Break caught: a non-contract return code silently weakens the cutover gate."""
+
+    module = _script()
+
+    def run(_arguments: list[str], **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=returncode)
+
+    monkeypatch.setattr(module["subprocess"], "run", run)
+
+    with pytest.raises(module["CutoverError"], match="watchdog_cutover_systemd_state_unknown"):
+        module["_default_state"](NEW_UNITS[0])
 
 
 def _bound_runtime() -> dict[str, object]:

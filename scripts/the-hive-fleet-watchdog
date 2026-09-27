@@ -565,16 +565,40 @@ def _default_systemctl(*arguments: str) -> None:
 
 
 def _default_state(unit: str) -> tuple[bool, bool]:
-    def check(command: str) -> bool:
-        completed = subprocess.run(
-            ["/usr/bin/systemctl", "--user", command, "--quiet", unit], check=False,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=15,
+    try:
+        returncodes = tuple(
+            subprocess.run(
+                ["/usr/bin/systemctl", "--user", command, "--quiet", unit], check=False,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=15,
+            ).returncode
+            for command in ("is-enabled", "is-active")
         )
-        if completed.returncode not in {0, 1, 3}:
-            raise CutoverError("watchdog_cutover_systemd_state_unknown")
-        return completed.returncode == 0
-    return check("is-enabled"), check("is-active")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CutoverError("watchdog_cutover_systemd_state_unknown") from exc
+    if returncodes == (4, 4):
+        source = Path(__file__).resolve().parents[1] / "src"
+        import sys
+        source_text = os.fspath(source)
+        prior_dont_write_bytecode = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, source_text)
+        try:
+            from the_hive.runtime_lifecycle import (
+                _show, _systemctl_default, _valid_bound_unit_state,
+            )
+            shown = _show(_systemctl_default, unit)
+        except Exception as exc:
+            raise CutoverError("watchdog_cutover_systemd_state_unknown") from exc
+        finally:
+            sys.dont_write_bytecode = prior_dont_write_bytecode
+            if sys.path and sys.path[0] == source_text:
+                sys.path.pop(0)
+        if shown.get("LoadState") == "not-found" and _valid_bound_unit_state(shown):
+            return False, False
+    if any(returncode not in {0, 1, 3} for returncode in returncodes):
+        raise CutoverError("watchdog_cutover_systemd_state_unknown")
+    return returncodes[0] == 0, returncodes[1] == 0
 
 
 def _default_observe(command: tuple[str, ...]) -> None:
