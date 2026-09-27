@@ -1552,11 +1552,11 @@ def test_restore_does_not_operate_on_units_bound_as_not_found(tmp_path: Path) ->
 def test_restore_bound_failed_oneshot_resets_the_manager_failed_state_before_verify(
     tmp_path: Path,
 ) -> None:
-    """A prior failed oneshot has no process to stop, only failed state to clear.
+    """A quiescent failed oneshot still receives the full safe inverse.
 
-    ``systemctl stop`` may leave the manager's recorded failed state in place.
-    The lifecycle must use the bounded ``reset-failed`` inverse and then demand
-    the exact quiescent state; accepting ``failed`` would hide a broken restore.
+    Stop remains the central quiescing guard even when the manager has already
+    recorded failure; ``reset-failed`` then clears that record before the exact
+    quiescent verification. Accepting ``failed`` would hide a broken restore.
     """
 
     bound, states = _bound_failure_fixture(tmp_path)
@@ -1582,9 +1582,108 @@ def test_restore_bound_failed_oneshot_resets_the_manager_failed_state_before_ver
         return {}
 
     assert runtime_lifecycle._restore_bound_state(bound, systemctl) is True
-    assert ("reset-failed", service) in calls
-    assert ("stop", service) not in calls
+    assert calls.index(("stop", service)) < calls.index(("reset-failed", service))
     assert states[service]["ActiveState"] == "inactive"
+
+
+def test_restore_bound_failed_oneshot_quiesces_an_active_cutover_service_before_reset(
+    tmp_path: Path,
+) -> None:
+    """A failed pre-cutover oneshot cannot leave a cutover-started service active."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+    service = "the-hive-hive-hourly-probe.service"
+    states[service] = {
+        "LoadState": "loaded",
+        "UnitFileState": "static",
+        "ActiveState": "failed",
+    }
+    bound = runtime_lifecycle.replace(bound, states=tuple(states.items()))
+    states[service] = {
+        "LoadState": "loaded",
+        "UnitFileState": "static",
+        "ActiveState": "active",
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        calls.append(arguments)
+        if arguments == ("stop", service):
+            states[service]["ActiveState"] = "inactive"
+            return {}
+        if arguments == ("reset-failed", service):
+            return {}
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    assert runtime_lifecycle._restore_bound_state(bound, systemctl) is True
+    stop = ("stop", service)
+    reset = ("reset-failed", service)
+    show = (
+        "show",
+        service,
+        "--property=LoadState,UnitFileState,ActiveState,Result,ExecMainStatus",
+    )
+    assert calls.index(stop) < calls.index(reset) < calls.index(show)
+    assert states[service]["ActiveState"] == "inactive"
+
+
+@pytest.mark.parametrize(
+    ("service", "phase", "failing_operation"),
+    (
+        (
+            "the-hive-hive-hourly-probe.service",
+            "new_service_action",
+            ("stop", "the-hive-hive-hourly-probe.service"),
+        ),
+        (
+            "the-hive-hive-hourly-probe.service",
+            "new_service_action",
+            ("reset-failed", "the-hive-hive-hourly-probe.service"),
+        ),
+        (
+            "codex-master-hive-hourly-probe.service",
+            "legacy_service_action",
+            ("stop", "codex-master-hive-hourly-probe.service"),
+        ),
+        (
+            "codex-master-hive-hourly-probe.service",
+            "legacy_service_action",
+            ("reset-failed", "codex-master-hive-hourly-probe.service"),
+        ),
+    ),
+)
+def test_restore_bound_failed_service_sequence_reports_each_failed_suboperation(
+    tmp_path: Path, service: str, phase: str, failing_operation: tuple[str, ...]
+) -> None:
+    """Each failed-service inverse operation keeps its unit's fixed phase code."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+    states[service] = {
+        "LoadState": "loaded",
+        "UnitFileState": "static",
+        "ActiveState": "failed",
+    }
+    bound = runtime_lifecycle.replace(bound, states=tuple(states.items()))
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments == failing_operation:
+            raise runtime_lifecycle.RuntimeLifecycleError("untrusted-manager-detail")
+        if arguments == ("stop", service):
+            states[service]["ActiveState"] = "inactive"
+            return {}
+        if arguments == ("reset-failed", service):
+            return {}
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    result = runtime_lifecycle._restore_bound_state_result(bound, systemctl)
+
+    assert result == runtime_lifecycle._RollbackResult(
+        False, phase, "manager_action_failed"
+    )
 
 
 @pytest.mark.parametrize(

@@ -2652,10 +2652,8 @@ def _restore_bound_state_result(
     for unit in (_NEW_TIMER, _NEW_SERVICE, _LEGACY_TIMER, _LEGACY_SERVICE):
         try:
             state = previous.get(unit)
-            operation = _restore_operation(unit, state)
-            if operation is None:
-                continue
-            _systemctl_mutate(systemctl, operation)
+            for operation in _restore_operations(unit, state):
+                _systemctl_mutate(systemctl, operation)
         except RuntimeLifecycleError:
             return _RollbackResult(
                 False, _ROLLBACK_PHASE_ACTIONS[unit], "manager_action_failed"
@@ -2842,27 +2840,33 @@ def _valid_bound_unit_state(state: Mapping[str, str]) -> bool:
     )
 
 
-def _restore_operation(
+def _restore_operations(
     unit: str, state: Mapping[str, str] | None
-) -> tuple[str, ...] | None:
+) -> tuple[tuple[str, ...], ...]:
+    """Return the complete, ordered manager inverse for one bound unit.
+
+    A service bound as failed may have been started by the failed cutover.  It
+    must therefore be quiesced before its historical failure record is reset;
+    both operations remain under the caller's one fail-closed phase boundary.
+    """
+
     if state is None:
-        return None
+        return ()
     if not _valid_bound_unit_state(state):
         raise _error("runtime_lifecycle_systemd_state_invalid")
     if state.get("LoadState") == "not-found":
-        return None
+        return ()
     if unit.endswith(".timer"):
         return (
-            ("enable", "--now", unit)
-            if _state_is_enabled(state)
-            else ("disable", "--now", unit)
+            (
+                ("enable", "--now", unit)
+                if _state_is_enabled(state)
+                else ("disable", "--now", unit)
+            ),
         )
     if state.get("ActiveState") == "failed":
-        # A failed oneshot has no running process to stop.  ``reset-failed``
-        # clears only the manager's recorded failure so the exact quiescent
-        # inverse below can be verified without executing the service again.
-        return ("reset-failed", unit)
-    return ("start", unit) if _state_is_active(state) else ("stop", unit)
+        return (("stop", unit), ("reset-failed", unit))
+    return (("start", unit),) if _state_is_active(state) else (("stop", unit),)
 
 
 def _restored_state_target(
@@ -2871,10 +2875,11 @@ def _restored_state_target(
     """Name the exact manager state a safe inverse operation can recreate.
 
     systemd has no non-executing operation that recreates a historical
-    ``failed`` service state. Its safe inverse is ``stop``, whose durable
-    contract is the same loaded/unit-file state with the service quiescent.
-    This normalization is deliberately limited to services that were already
-    failed before cutover; timers and every other state remain exact.
+    ``failed`` service state. Its safe inverse first quiesces the service and
+    then resets that historical record, whose durable contract is the same
+    loaded/unit-file state with the service quiescent. This normalization is
+    deliberately limited to services that were already failed before cutover;
+    timers and every other state remain exact.
     """
 
     if unit.endswith(".service") and state.get("ActiveState") == "failed":
