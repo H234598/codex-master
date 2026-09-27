@@ -130,9 +130,7 @@ def _authorized_transaction(
 ]:
     selected_policy = policy or _policy()
     selected_attestation = attestation or _attestation()
-    transaction = authority.D73IngressTransactionV1(
-        selected_policy, selected_attestation
-    )
+    transaction = authority.D73IngressTransactionV1(selected_policy)
     transaction.verify_a(_peer(), _owner(selected_policy))
     transaction.authorize()
     return transaction, selected_policy, selected_attestation
@@ -144,7 +142,7 @@ def _decoded_transaction() -> tuple[
     runtime_layout._RuntimeLayoutAttestation,
 ]:
     transaction, policy, attestation = _authorized_transaction()
-    transaction.move_capability(_capability(policy, attestation))
+    transaction.move_capability(attestation, _capability(policy, attestation))
     transaction.decode()
     return transaction, policy, attestation
 
@@ -158,7 +156,7 @@ def _transaction_at(
 ]:
     policy = _policy()
     attestation = _attestation()
-    transaction = authority.D73IngressTransactionV1(policy, attestation)
+    transaction = authority.D73IngressTransactionV1(policy)
     if state is authority.D73IngressTransactionStateV1.NEW:
         return transaction, policy, attestation
     transaction.verify_a(_peer(), _owner(policy))
@@ -167,16 +165,16 @@ def _transaction_at(
     transaction.authorize()
     if state is authority.D73IngressTransactionStateV1.AUTHORIZED:
         return transaction, policy, attestation
-    transaction.move_capability(_capability(policy, attestation))
+    transaction.move_capability(attestation, _capability(policy, attestation))
     if state is authority.D73IngressTransactionStateV1.CAPABILITY_MOVED:
         return transaction, policy, attestation
     transaction.decode()
     if state is authority.D73IngressTransactionStateV1.DECODED_BOUND:
         return transaction, policy, attestation
-    transaction.verify_b(_peer(), _owner(policy), attestation)
+    transaction.verify_b(_peer(), _owner(policy))
     if state is authority.D73IngressTransactionStateV1.B_VERIFIED:
         return transaction, policy, attestation
-    transaction.verify_c(_peer(), _owner(policy), attestation)
+    transaction.verify_c(_peer(), _owner(policy))
     if state is authority.D73IngressTransactionStateV1.C_VERIFIED:
         return transaction, policy, attestation
     transaction.close()
@@ -349,12 +347,15 @@ def test_s5a_transaction_requires_exact_existing_policy_and_attestation_types() 
                 policy.polkit_action,
                 policy.schema_version,
                 policy.selinux_context,
-            ),
-            attestation,
+            )
         )
     with pytest.raises(authority.D73AuthorityRejected):
-        authority.D73IngressTransactionV1(
-            policy,
+        authority.D73IngressTransactionV1(object())  # type: ignore[arg-type]
+    transaction = authority.D73IngressTransactionV1(policy)
+    transaction.verify_a(_peer(), _owner(policy))
+    transaction.authorize()
+    with pytest.raises(authority.D73AuthorityRejected):
+        transaction.move_capability(
             AttestationSubclass(
                 attestation.target,
                 attestation.target_device,
@@ -365,11 +366,8 @@ def test_s5a_transaction_requires_exact_existing_policy_and_attestation_types() 
                 attestation.commit,
                 attestation.generation,
             ),
+            _capability(policy, attestation),
         )
-    with pytest.raises(authority.D73AuthorityRejected):
-        authority.D73IngressTransactionV1(object(), _attestation())  # type: ignore[arg-type]
-    with pytest.raises(authority.D73AuthorityRejected):
-        authority.D73IngressTransactionV1(_policy(), object())  # type: ignore[arg-type]
 
 
 def test_s5a_transaction_follows_the_only_successful_state_sequence() -> None:
@@ -382,10 +380,10 @@ def test_s5a_transaction_follows_the_only_successful_state_sequence() -> None:
     assert not hasattr(authorization, "__dict__")
     with pytest.raises(authority.D73AuthorityRejected):
         authority._D73AuthorizationV1(policy.polkit_action, True)
-    transaction.move_capability(_capability(policy, attestation))
+    transaction.move_capability(attestation, _capability(policy, attestation))
     transaction.decode()
-    transaction.verify_b(_peer(), _owner(policy), attestation)
-    transaction.verify_c(_peer(), _owner(policy), attestation)
+    transaction.verify_b(_peer(), _owner(policy))
+    transaction.verify_c(_peer(), _owner(policy))
     transaction.close()
     assert transaction.state is authority.D73IngressTransactionStateV1.CLOSED
 
@@ -395,14 +393,14 @@ def test_s5a_transaction_follows_the_only_successful_state_sequence() -> None:
     (
         lambda transaction, policy, attestation: transaction.authorize(),
         lambda transaction, policy, attestation: transaction.move_capability(
-            _capability(policy, attestation)
+            attestation, _capability(policy, attestation)
         ),
         lambda transaction, policy, attestation: transaction.decode(),
         lambda transaction, policy, attestation: transaction.verify_b(
-            _peer(), _owner(policy), attestation
+            _peer(), _owner(policy)
         ),
         lambda transaction, policy, attestation: transaction.verify_c(
-            _peer(), _owner(policy), attestation
+            _peer(), _owner(policy)
         ),
         lambda transaction, policy, attestation: transaction.close(),
     ),
@@ -410,7 +408,7 @@ def test_s5a_transaction_follows_the_only_successful_state_sequence() -> None:
 def test_s5a_skipped_or_out_of_order_transition_is_terminal(
     operation: object,
 ) -> None:
-    transaction = authority.D73IngressTransactionV1(_policy(), _attestation())
+    transaction = authority.D73IngressTransactionV1(_policy())
     with pytest.raises(authority.D73AuthorityRejected):
         operation(transaction, _policy(), _attestation())  # type: ignore[operator]
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
@@ -420,7 +418,7 @@ def test_s5a_skipped_or_out_of_order_transition_is_terminal(
 
 
 def test_s5a_a_rejects_owner_sender_drift_terminally() -> None:
-    transaction = authority.D73IngressTransactionV1(_policy(), _attestation())
+    transaction = authority.D73IngressTransactionV1(_policy())
     with pytest.raises(authority.D73AuthorityRejected):
         transaction.verify_a(_peer(), _owner(_policy(), unique_sender=":1.24"))
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
@@ -428,7 +426,7 @@ def test_s5a_a_rejects_owner_sender_drift_terminally() -> None:
 
 def test_s5a_a_rejects_peer_uid_that_differs_from_policy_terminally() -> None:
     policy = _policy()
-    transaction = authority.D73IngressTransactionV1(policy, _attestation())
+    transaction = authority.D73IngressTransactionV1(policy)
     with pytest.raises(authority.D73AuthorityRejected):
         transaction.verify_a(_peer(uid=policy.expected_uid + 1), _owner(policy))
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
@@ -436,7 +434,7 @@ def test_s5a_a_rejects_peer_uid_that_differs_from_policy_terminally() -> None:
 
 def test_s5a_a_rejects_peer_selinux_that_differs_from_policy_terminally() -> None:
     policy = _policy()
-    transaction = authority.D73IngressTransactionV1(policy, _attestation())
+    transaction = authority.D73IngressTransactionV1(policy)
     with pytest.raises(authority.D73AuthorityRejected):
         transaction.verify_a(
             _peer(selinux_context=b"other_u:other_r:other_t:s0"), _owner(policy)
@@ -448,9 +446,9 @@ def test_s5a_second_move_aborts_and_discards_the_first_capability() -> None:
     transaction, policy, attestation = _authorized_transaction()
     capability = _capability(policy, attestation)
     descriptor = capability._fd
-    transaction.move_capability(capability)
+    transaction.move_capability(attestation, capability)
     with pytest.raises(authority.D73AuthorityRejected):
-        transaction.move_capability(capability)
+        transaction.move_capability(attestation, capability)
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
     with pytest.raises(OSError):
         os.fstat(descriptor)
@@ -478,9 +476,9 @@ def test_s5a_abort_discards_a_moved_capability_once(
         original_discard(value)
 
     monkeypatch.setattr(record, "_discard_capability", tracking_discard)
-    transaction.move_capability(capability)
+    transaction.move_capability(attestation, capability)
     with pytest.raises(authority.D73AuthorityRejected):
-        transaction.verify_b(_peer(), _owner(policy), attestation)
+        transaction.verify_b(_peer(), _owner(policy))
     assert discarded == [capability]
     with pytest.raises(OSError):
         os.fstat(descriptor)
@@ -503,7 +501,7 @@ def test_s5a_decode_uses_the_q1_decoder_once_and_the_decoder_closes_the_fd(
         return original_decode(value)
 
     monkeypatch.setattr(record, "_decode_capability", tracking_decode)
-    transaction.move_capability(capability)
+    transaction.move_capability(attestation, capability)
     transaction.decode()
     assert decoded == [capability]
     with pytest.raises(OSError):
@@ -524,7 +522,7 @@ def test_s5a_reentry_is_terminal_and_never_resumes(
         return original_decode(value)
 
     monkeypatch.setattr(record, "_decode_capability", reentrant_decode)
-    transaction.move_capability(capability)
+    transaction.move_capability(attestation, capability)
     with pytest.raises(authority.D73AuthorityRejected):
         transaction.decode()
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
@@ -545,7 +543,7 @@ def test_s5a_decode_rejects_each_q1_policy_leaf_drift(field: str) -> None:
         "polkit_action": "org.example.d73.other",
     }
     drifting_policy = replace(policy, **{field: replacements[field]})
-    transaction.move_capability(_capability(drifting_policy, attestation))
+    transaction.move_capability(attestation, _capability(drifting_policy, attestation))
     with pytest.raises(authority.D73AuthorityRejected):
         transaction.decode()
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
@@ -565,10 +563,10 @@ def test_s5a_decode_rejects_each_attestation_binding_drift(
 ) -> None:
     policy = _policy()
     attestation = _attestation()
-    transaction, _unused_policy, _unused_attestation = _authorized_transaction(
+    transaction, _unused_policy, held_attestation = _authorized_transaction(
         policy, replace(attestation, **{field: value})
     )
-    transaction.move_capability(_capability(policy, attestation))
+    transaction.move_capability(held_attestation, _capability(policy, attestation))
     with pytest.raises(authority.D73AuthorityRejected):
         transaction.decode()
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
@@ -592,19 +590,20 @@ def test_s5a_b_and_c_reject_every_peer_drift(
 ) -> None:
     transaction, policy, attestation = _decoded_transaction()
     if stage == "c":
-        transaction.verify_b(_peer(), _owner(policy), attestation)
+        transaction.verify_b(_peer(), _owner(policy))
     verifier = transaction.verify_b if stage == "b" else transaction.verify_c
     with pytest.raises(authority.D73AuthorityRejected):
-        verifier(_peer(**changes), _owner(policy), attestation)
+        verifier(_peer(**changes), _owner(policy))
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
 
 
-def test_s5a_b_rejects_target_or_owner_drift() -> None:
+def test_s5a_b_rejects_owner_drift_and_has_no_target_argument() -> None:
     transaction, policy, attestation = _decoded_transaction()
+    with pytest.raises(TypeError):
+        transaction.verify_b(_peer(), _owner(policy), attestation)  # type: ignore[call-arg]
+    assert transaction.state is authority.D73IngressTransactionStateV1.DECODED_BOUND
     with pytest.raises(authority.D73AuthorityRejected):
-        transaction.verify_b(
-            _peer(), _owner(policy), replace(attestation, target=object())
-        )
+        transaction.verify_b(_peer(), _owner(policy, unique_sender=":1.24"))
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
 
 
@@ -645,7 +644,7 @@ def test_s5a_each_available_and_requested_required_bit_is_individually_required(
 def test_s5a_direct_pidfd_adapter_value_is_positive_and_inert() -> None:
     policy = _policy()
     peer = _peer(has_direct_pidfd=True)
-    transaction = authority.D73IngressTransactionV1(policy, _attestation())
+    transaction = authority.D73IngressTransactionV1(policy)
     transaction.verify_a(peer, _owner(policy))
     assert transaction.state is authority.D73IngressTransactionStateV1.A_VERIFIED
     transaction.authorize()
@@ -692,7 +691,7 @@ def test_s5a_authorization_rejects_nonpositive_or_nonboolean_values(
 def test_s5a_reachable_authorized_state_rejects_wrong_capability_type() -> None:
     transaction, _policy_value, _attestation_value = _authorized_transaction()
     with pytest.raises(authority.D73AuthorityRejected):
-        transaction.move_capability(object())
+        transaction.move_capability(_attestation(), object())
     assert transaction._capability is None
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
 
@@ -710,7 +709,7 @@ def test_s5a_decoder_wrong_type_aborts_after_the_q1_decoder_closed_the_fd(
         return object()
 
     monkeypatch.setattr(record, "_decode_capability", decode_then_return_wrong_type)
-    transaction.move_capability(capability)
+    transaction.move_capability(attestation, capability)
     with pytest.raises(authority.D73AuthorityRejected):
         transaction.decode()
     assert transaction._capability is None
@@ -732,7 +731,7 @@ def test_s5a_decoder_exception_aborts_after_the_q1_decoder_closed_the_fd(
         raise RuntimeError("synthetic decoder failure")
 
     monkeypatch.setattr(record, "_decode_capability", decode_then_raise)
-    transaction.move_capability(capability)
+    transaction.move_capability(attestation, capability)
     with pytest.raises(authority.D73AuthorityRejected):
         transaction.decode()
     assert transaction._capability is None
@@ -742,27 +741,34 @@ def test_s5a_decoder_exception_aborts_after_the_q1_decoder_closed_the_fd(
 
 
 @pytest.mark.parametrize("stage", ("b", "c"))
-@pytest.mark.parametrize(
-    "kind", ("owner_sender", "owner_bus", "foreign_attestation")
-)
-def test_s5a_b_and_c_reject_owner_and_attestation_drift(
+@pytest.mark.parametrize("kind", ("owner_sender", "owner_bus"))
+def test_s5a_b_and_c_reject_owner_drift(
     stage: str, kind: str
 ) -> None:
-    transaction, policy, attestation = _decoded_transaction()
+    transaction, policy, _attestation_value = _decoded_transaction()
     if stage == "c":
-        transaction.verify_b(_peer(), _owner(policy), attestation)
+        transaction.verify_b(_peer(), _owner(policy))
     owner = _owner(policy)
-    candidate_attestation = attestation
     if kind == "owner_sender":
         owner = _owner(policy, unique_sender=":1.24")
-    elif kind == "owner_bus":
-        owner = _owner(policy, bus_name="org.example.OtherPolicy")
     else:
-        candidate_attestation = replace(attestation, target=object())
+        owner = _owner(policy, bus_name="org.example.OtherPolicy")
     verifier = transaction.verify_b if stage == "b" else transaction.verify_c
     with pytest.raises(authority.D73AuthorityRejected):
-        verifier(_peer(), owner, candidate_attestation)
+        verifier(_peer(), owner)
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
+
+
+@pytest.mark.parametrize("stage", ("b", "c"))
+def test_d359_b_and_c_revalidate_without_caller_attestation(stage: str) -> None:
+    transaction, policy, _attestation_value = _decoded_transaction()
+    if stage == "c":
+        transaction.verify_b(_peer(), _owner(policy))
+        transaction.verify_c(_peer(), _owner(policy))
+        assert transaction.state is authority.D73IngressTransactionStateV1.C_VERIFIED
+    else:
+        transaction.verify_b(_peer(), _owner(policy))
+        assert transaction.state is authority.D73IngressTransactionStateV1.B_VERIFIED
 
 
 @pytest.mark.parametrize(
@@ -781,7 +787,7 @@ def test_s5a_b_and_c_reject_owner_and_attestation_drift(
         (
             authority.D73IngressTransactionStateV1.CAPABILITY_MOVED,
             lambda transaction, policy, attestation: transaction.move_capability(
-                object()
+                attestation, object()
             ),
         ),
         (
@@ -791,13 +797,13 @@ def test_s5a_b_and_c_reject_owner_and_attestation_drift(
         (
             authority.D73IngressTransactionStateV1.B_VERIFIED,
             lambda transaction, policy, attestation: transaction.verify_b(
-                _peer(), _owner(policy), attestation
+                _peer(), _owner(policy)
             ),
         ),
         (
             authority.D73IngressTransactionStateV1.C_VERIFIED,
             lambda transaction, policy, attestation: transaction.verify_c(
-                _peer(), _owner(policy), attestation
+                _peer(), _owner(policy)
             ),
         ),
         (
@@ -825,7 +831,7 @@ def test_s5a_repeated_expected_transition_is_terminal(
         (
             authority.D73IngressTransactionStateV1.AUTHORIZED,
             lambda transaction, policy, attestation: transaction.verify_c(
-                _peer(), _owner(policy), attestation
+                _peer(), _owner(policy)
             ),
         ),
         (
@@ -839,7 +845,7 @@ def test_s5a_repeated_expected_transition_is_terminal(
         (
             authority.D73IngressTransactionStateV1.B_VERIFIED,
             lambda transaction, policy, attestation: transaction.move_capability(
-                object()
+                attestation, object()
             ),
         ),
         (
@@ -900,7 +906,7 @@ def test_s5a_discard_exception_is_terminal_and_attempts_discard_once(
         raise OSError("synthetic discard failure before close")
 
     monkeypatch.setattr(record, "_discard_capability", discard_then_raise)
-    transaction.move_capability(capability)
+    transaction.move_capability(attestation, capability)
     transaction.abort()
     assert discarded == [capability]
     assert transaction._capability is None
@@ -913,7 +919,7 @@ def test_s5a_peer_and_decoded_record_are_held_through_c_and_cleared_on_close(
     policy = _policy()
     attestation = _attestation()
     peer = _peer()
-    transaction = authority.D73IngressTransactionV1(policy, attestation)
+    transaction = authority.D73IngressTransactionV1(policy)
     transaction.verify_a(peer, _owner(policy))
     transaction.authorize()
     original_decode = record._decode_capability
@@ -925,15 +931,16 @@ def test_s5a_peer_and_decoded_record_are_held_through_c_and_cleared_on_close(
         return result
 
     monkeypatch.setattr(record, "_decode_capability", tracking_decode)
-    transaction.move_capability(_capability(policy, attestation))
+    transaction.move_capability(attestation, _capability(policy, attestation))
     transaction.decode()
     assert transaction._peer is peer
     assert transaction._decoded_record is decoded[0]
-    transaction.verify_b(peer, _owner(policy), attestation)
-    transaction.verify_c(peer, _owner(policy), attestation)
+    transaction.verify_b(peer, _owner(policy))
+    transaction.verify_c(peer, _owner(policy))
     assert transaction._peer is peer
     assert transaction._decoded_record is decoded[0]
     transaction.close()
+    assert transaction._attestation is None
     assert transaction._peer is None
     assert transaction._decoded_record is None
 
@@ -944,7 +951,7 @@ def test_s5a_peer_and_decoded_record_are_cleared_on_abort(
     policy = _policy()
     attestation = _attestation()
     peer = _peer()
-    transaction = authority.D73IngressTransactionV1(policy, attestation)
+    transaction = authority.D73IngressTransactionV1(policy)
     transaction.verify_a(peer, _owner(policy))
     transaction.authorize()
     original_decode = record._decode_capability
@@ -956,11 +963,12 @@ def test_s5a_peer_and_decoded_record_are_cleared_on_abort(
         return result
 
     monkeypatch.setattr(record, "_decode_capability", tracking_decode)
-    transaction.move_capability(_capability(policy, attestation))
+    transaction.move_capability(attestation, _capability(policy, attestation))
     transaction.decode()
     assert transaction._peer is peer
     assert transaction._decoded_record is decoded[0]
     transaction.abort()
+    assert transaction._attestation is None
     assert transaction._peer is None
     assert transaction._decoded_record is None
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
@@ -969,7 +977,7 @@ def test_s5a_peer_and_decoded_record_are_cleared_on_abort(
 def test_s5a_peer_is_cleared_when_a_verified_transaction_aborts() -> None:
     policy = _policy()
     peer = _peer()
-    transaction = authority.D73IngressTransactionV1(policy, _attestation())
+    transaction = authority.D73IngressTransactionV1(policy)
     transaction.verify_a(peer, _owner(policy))
     assert transaction._peer is peer
     transaction.abort()
@@ -987,7 +995,7 @@ def test_s5a_copy_operations_after_move_abort_and_discard_the_capability(
     transaction, policy, attestation = _authorized_transaction()
     capability = _capability(policy, attestation)
     descriptor = capability._fd
-    transaction.move_capability(capability)
+    transaction.move_capability(attestation, capability)
     with pytest.raises(authority.D73AuthorityRejected):
         operation(transaction)  # type: ignore[operator]
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
@@ -1001,7 +1009,7 @@ def test_s5a_negative_q1_leaf_binding_closes_the_capability_fd() -> None:
         replace(policy, expected_uid=policy.expected_uid + 1), attestation
     )
     descriptor = capability._fd
-    transaction.move_capability(capability)
+    transaction.move_capability(attestation, capability)
     with pytest.raises(authority.D73AuthorityRejected):
         transaction.decode()
     with pytest.raises(OSError):
@@ -1011,12 +1019,12 @@ def test_s5a_negative_q1_leaf_binding_closes_the_capability_fd() -> None:
 def test_s5a_negative_q1_manifest_binding_closes_the_capability_fd() -> None:
     policy = _policy()
     attestation = _attestation()
-    transaction, _unused_policy, _unused_attestation = _authorized_transaction(
+    transaction, _unused_policy, held_attestation = _authorized_transaction(
         policy, replace(attestation, manifest_digest="f" * 64)
     )
     capability = _capability(policy, attestation)
     descriptor = capability._fd
-    transaction.move_capability(capability)
+    transaction.move_capability(held_attestation, capability)
     with pytest.raises(authority.D73AuthorityRejected):
         transaction.decode()
     with pytest.raises(OSError):
@@ -1024,9 +1032,113 @@ def test_s5a_negative_q1_manifest_binding_closes_the_capability_fd() -> None:
 
 
 def test_s5a_rejected_transition_uses_the_fixed_external_error_contract() -> None:
-    transaction = authority.D73IngressTransactionV1(_policy(), _attestation())
+    transaction = authority.D73IngressTransactionV1(_policy())
     with pytest.raises(authority.D73AuthorityRejected) as caught:
         transaction.authorize()
     assert caught.value.error_name == authority.D73_AUTHORITY_REJECTED_ERROR_NAME
     assert str(caught.value) == authority.D73_AUTHORITY_REJECTED_ERROR_TEXT
     assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
+
+
+def test_d359_constructor_binds_only_policy_before_gate_a() -> None:
+    transaction = authority.D73IngressTransactionV1(_policy())
+    assert transaction.state is authority.D73IngressTransactionStateV1.NEW
+    assert transaction._attestation is None
+    assert transaction._capability is None
+
+
+def test_d359_attestation_is_absent_through_authorization() -> None:
+    policy = _policy()
+    transaction = authority.D73IngressTransactionV1(policy)
+    transaction.verify_a(_peer(), _owner(policy))
+    assert transaction._attestation is None
+    transaction.authorize()
+    assert transaction._attestation is None
+    assert transaction._capability is None
+
+
+def test_d359_capability_before_authorization_is_discarded() -> None:
+    policy = _policy()
+    attestation = _attestation()
+    capability = _capability(policy, attestation)
+    descriptor = capability._fd
+    transaction = authority.D73IngressTransactionV1(policy)
+    with pytest.raises(authority.D73AuthorityRejected):
+        transaction.move_capability(attestation, capability)
+    assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_d359_move_binds_exact_attestation_and_discards_on_invalid_handoff() -> None:
+    policy = _policy()
+    attestation = _attestation()
+    transaction = authority.D73IngressTransactionV1(policy)
+    transaction.verify_a(_peer(), _owner(policy))
+    transaction.authorize()
+    capability = _capability(policy, attestation)
+    descriptor = capability._fd
+    with pytest.raises(authority.D73AuthorityRejected):
+        transaction.move_capability(object(), capability)
+    assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
+    assert transaction._attestation is None
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_d359_decode_uses_the_attestation_held_by_move() -> None:
+    policy = _policy()
+    attestation = _attestation()
+    transaction = authority.D73IngressTransactionV1(policy)
+    peer = _peer()
+    transaction.verify_a(peer, _owner(policy))
+    transaction.authorize()
+    transaction.move_capability(attestation, _capability(policy, attestation))
+    assert transaction._attestation is attestation
+    transaction.decode()
+    transaction.verify_b(peer, _owner(policy))
+    transaction.verify_c(peer, _owner(policy))
+    assert transaction.state is authority.D73IngressTransactionStateV1.C_VERIFIED
+
+
+def test_d359_second_move_discards_the_new_capability_and_clears_attestation() -> None:
+    policy = _policy()
+    attestation = _attestation()
+    transaction = authority.D73IngressTransactionV1(policy)
+    transaction.verify_a(_peer(), _owner(policy))
+    transaction.authorize()
+    first = _capability(policy, attestation)
+    second_attestation = _attestation()
+    second = _capability(policy, attestation)
+    first_descriptor = first._fd
+    second_descriptor = second._fd
+    transaction.move_capability(attestation, first)
+    with pytest.raises(authority.D73AuthorityRejected):
+        transaction.move_capability(second_attestation, second)
+    assert transaction.state is authority.D73IngressTransactionStateV1.ABORTED
+    assert transaction._attestation is None
+    with pytest.raises(OSError):
+        os.fstat(first_descriptor)
+    with pytest.raises(OSError):
+        os.fstat(second_descriptor)
+
+
+def test_d359_terminal_transitions_clear_the_held_attestation() -> None:
+    policy = _policy()
+    attestation = _attestation()
+    transaction = authority.D73IngressTransactionV1(policy)
+    transaction.verify_a(_peer(), _owner(policy))
+    transaction.authorize()
+    transaction.move_capability(attestation, _capability(policy, attestation))
+    transaction.abort()
+    assert transaction._attestation is None
+
+    closed = authority.D73IngressTransactionV1(policy)
+    closed.verify_a(_peer(), _owner(policy))
+    closed.authorize()
+    closed.move_capability(attestation, _capability(policy, attestation))
+    closed.decode()
+    closed.verify_b(_peer(), _owner(policy))
+    closed.verify_c(_peer(), _owner(policy))
+    closed.close()
+    assert closed._attestation is None

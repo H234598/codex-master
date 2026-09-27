@@ -299,11 +299,10 @@ class D73IngressTransactionV1:
         "_state",
     )
 
-    def __init__(self, policy: object, attestation: object) -> None:
+    def __init__(self, policy: object) -> None:
         _policy_values(policy)
-        _attestation_values(attestation)
         self._active = False
-        self._attestation = attestation
+        self._attestation: _RuntimeLayoutAttestation | None = None
         self._authorization: _D73AuthorizationV1 | None = None
         self._capability: _d73_q1_record.D73Q1Capability | None = None
         self._decoded_record: _d73_q1_record._DecodedRecord | None = None
@@ -336,6 +335,7 @@ class D73IngressTransactionV1:
     def _abort(self) -> None:
         capability = self._capability
         self._capability = None
+        self._attestation = None
         self._decoded_record = None
         self._peer = None
         self._state = D73IngressTransactionStateV1.ABORTED
@@ -391,14 +391,28 @@ class D73IngressTransactionV1:
         finally:
             self._active = False
 
-    def move_capability(self, capability: object) -> None:
-        self._begin(D73IngressTransactionStateV1.AUTHORIZED)
+    def move_capability(self, attestation: object, capability: object) -> None:
+        if self._active or self._state is not D73IngressTransactionStateV1.AUTHORIZED:
+            held_capability = self._capability
+            self._abort()
+            if (
+                type(capability) is _d73_q1_record.D73Q1Capability
+                and capability is not held_capability
+            ):
+                try:
+                    _d73_q1_record._discard_capability(capability)
+                except Exception:
+                    pass
+            _reject()
+        self._active = True
         try:
             if type(capability) is not _d73_q1_record.D73Q1Capability:
                 self._failure()
             self._capability = capability
+            _attestation_values(attestation)
             if self._state is not D73IngressTransactionStateV1.AUTHORIZED:
                 self._failure()
+            self._attestation = attestation
             self._state = D73IngressTransactionStateV1.CAPABILITY_MOVED
         except Exception:
             self._failure()
@@ -455,13 +469,9 @@ class D73IngressTransactionV1:
         successor: D73IngressTransactionStateV1,
         peer: object,
         owner: object,
-        attestation: object,
     ) -> None:
         self._begin(expected)
         try:
-            if attestation is not self._attestation:
-                self._failure()
-            _attestation_values(attestation)
             if self._peer is None:
                 self._failure()
             _verify_peer_continuity_v1(self._peer, peer, owner, self._policy)
@@ -473,27 +483,26 @@ class D73IngressTransactionV1:
         finally:
             self._active = False
 
-    def verify_b(self, peer: object, owner: object, attestation: object) -> None:
+    def verify_b(self, peer: object, owner: object) -> None:
         self._verify_later(
             D73IngressTransactionStateV1.DECODED_BOUND,
             D73IngressTransactionStateV1.B_VERIFIED,
             peer,
             owner,
-            attestation,
         )
 
-    def verify_c(self, peer: object, owner: object, attestation: object) -> None:
+    def verify_c(self, peer: object, owner: object) -> None:
         self._verify_later(
             D73IngressTransactionStateV1.B_VERIFIED,
             D73IngressTransactionStateV1.C_VERIFIED,
             peer,
             owner,
-            attestation,
         )
 
     def close(self) -> None:
         self._begin(D73IngressTransactionStateV1.C_VERIFIED)
         try:
+            self._attestation = None
             self._decoded_record = None
             self._peer = None
             self._state = D73IngressTransactionStateV1.CLOSED
