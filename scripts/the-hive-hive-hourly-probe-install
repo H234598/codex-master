@@ -60,6 +60,20 @@ _MANIFEST_SCHEMA_VERSION = 2
 _RELEASE_POINTERS_NAME = ".the-hive-release-pointers.json"
 _RELEASE_GENERATIONS_NAME = "generations"
 _PUBLISH_LOCK_NAME = ".the-hive-release-publish.lock"
+_PRE_PRICING_LEGACY_POINTER_PAIR = {
+    "current": {
+        "generation": "c7efc03f00eee1933f86808902d109f81bad446e",
+        "manifest_digest": (
+            "sha256:6c475417cd646586c985294db01bd500dadf7f334a49e50c356af09315bfad69"
+        ),
+    },
+    "previous": {
+        "generation": "83abaae0ee21959b17cec1fe18002c4d80776296",
+        "manifest_digest": (
+            "sha256:d3f947baac20a21aa1432caad9787e69ce551de46195efb67d5282a4e7a343ed"
+        ),
+    },
+}
 _STABLE_MCP_LAUNCHER_SOURCE = "bin/the-hive-mcp-stable"
 _STABLE_MCP_LAUNCHER_NAME = "the-hive-mcp"
 _STABLE_HOOK_LAUNCHER_SOURCE = "bin/the-hive-plugin-hook-stable"
@@ -987,45 +1001,28 @@ def _attested_release_pointer(root: Path, value: object) -> dict[str, str] | Non
 def _attested_pre_pricing_legacy_pointers(
     root: Path, value: dict[str, object]
 ) -> dict[str, dict[str, str] | None] | None:
-    """Recognize only the complete predecessor image, never a mixed pointer.
+    """Recognize only the one observed predecessor pair, never a mixed pointer.
 
     This compatibility branch is intentionally one-way: its normalized empty
     pair prevents a post-upgrade current layout from naming an image that no
     longer satisfies the current RuntimeLayout contract.
     """
 
-    current = value.get("current")
-    if not isinstance(current, dict):
+    if (
+        value.get("current") != _PRE_PRICING_LEGACY_POINTER_PAIR["current"]
+        or value.get("previous") != _PRE_PRICING_LEGACY_POINTER_PAIR["previous"]
+    ):
         return None
     try:
-        generation = current.get("generation")
-        manifest_digest = current.get("manifest_digest")
-        if not isinstance(generation, str) or not isinstance(manifest_digest, str):
-            return None
-        _relative_name(generation)
-        current_entry = attest_pre_pricing_legacy_runtime(
-            root / _RELEASE_GENERATIONS_NAME / generation,
-            expected_digest=manifest_digest,
-        )
-        if current_entry != current:
-            return None
-        previous = value.get("previous")
-        if previous is not None:
-            if not isinstance(previous, dict):
-                return None
-            previous_generation = previous.get("generation")
-            previous_digest = previous.get("manifest_digest")
-            if (
-                not isinstance(previous_generation, str)
-                or not isinstance(previous_digest, str)
-            ):
-                return None
-            _relative_name(previous_generation)
-            previous_entry = attest_pre_pricing_legacy_runtime(
-                root / _RELEASE_GENERATIONS_NAME / previous_generation,
-                expected_digest=previous_digest,
+        for entry in _PRE_PRICING_LEGACY_POINTER_PAIR.values():
+            generation = entry["generation"]
+            manifest_digest = entry["manifest_digest"]
+            _relative_name(generation)
+            attested = attest_pre_pricing_legacy_runtime(
+                root / _RELEASE_GENERATIONS_NAME / generation,
+                expected_digest=manifest_digest,
             )
-            if previous_entry != previous:
+            if attested != entry:
                 return None
     except (InstallError, ValueError):
         return None

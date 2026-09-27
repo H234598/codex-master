@@ -91,37 +91,45 @@ def _pre_pricing_legacy_stage(
 def _materialize_pre_pricing_legacy_release(
     installer: dict[str, object],
     home: Path,
-    generation: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Path, bytes]:
-    """Install a private pre-pricing pointer pair without using a new publisher."""
+    """Install the sole observed pre-pricing pointer pair privately."""
 
-    stage, digest = _pre_pricing_legacy_stage(installer, home.parent, generation)
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     generations = release_root / "generations"
     generations.mkdir(parents=True, mode=0o700)
     release_root.chmod(0o700)
     generations.chmod(0o700)
-    runtime = generations / generation
-    stage.rename(runtime)
-    monkeypatch.setitem(
-        runtime_layout._PRE_PRICING_LEGACY_DIGESTS, generation, digest
-    )
-    assert attest_pre_pricing_legacy_runtime(runtime, expected_digest=digest) == {
-        "generation": generation,
-        "manifest_digest": digest,
+    entries: dict[str, dict[str, str]] = {}
+    for name in (
+        "c7efc03f00eee1933f86808902d109f81bad446e",
+        "83abaae0ee21959b17cec1fe18002c4d80776296",
+    ):
+        stage, digest = _pre_pricing_legacy_stage(installer, home.parent, name)
+        runtime = generations / name
+        stage.rename(runtime)
+        monkeypatch.setitem(runtime_layout._PRE_PRICING_LEGACY_DIGESTS, name, digest)
+        assert attest_pre_pricing_legacy_runtime(runtime, expected_digest=digest) == {
+            "generation": name,
+            "manifest_digest": digest,
+        }
+        entries[name] = {"generation": name, "manifest_digest": digest}
+    pair = {
+        "current": entries["c7efc03f00eee1933f86808902d109f81bad446e"],
+        "previous": entries["83abaae0ee21959b17cec1fe18002c4d80776296"],
     }
+    monkeypatch.setitem(
+        installer["_attested_pre_pricing_legacy_pointers"].__globals__,  # type: ignore[index]
+        "_PRE_PRICING_LEGACY_POINTER_PAIR",
+        pair,
+    )
     pointer = release_root / ".the-hive-release-pointers.json"
     pointer.write_bytes(
         (
             json.dumps(
                 {
                     "schema_version": 1,
-                    "current": {
-                        "generation": generation,
-                        "manifest_digest": digest,
-                    },
-                    "previous": None,
+                    **pair,
                 },
                 ensure_ascii=True,
                 sort_keys=True,
@@ -484,7 +492,7 @@ def test_pre_pricing_legacy_release_without_pin_store_upgrades_to_current_runtim
     (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
     generation = "c7efc03f00eee1933f86808902d109f81bad446e"
     release_root, old_pointer = _materialize_pre_pricing_legacy_release(
-        installer, home, generation, monkeypatch
+        installer, home, monkeypatch
     )
     old_runtime = release_root / "generations" / generation
     with pytest.raises(ValueError):
@@ -529,6 +537,52 @@ def test_pre_pricing_legacy_release_without_pin_store_upgrades_to_current_runtim
         subsequent_pointer["previous"]["generation"],
         subsequent_pointer["previous"]["manifest_digest"],
     ).root == (release_root / "generations" / ("b" * 40))
+
+
+@pytest.mark.parametrize("variant", ["missing", "reversed", "mixed"])
+def test_pre_pricing_legacy_upgrade_rejects_any_nonobserved_pointer_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """The one-way exception admits neither a subset nor another ordering."""
+
+    installer = _installer()
+    home = tmp_path / "home"
+    (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
+    release_root, _old_pointer = _materialize_pre_pricing_legacy_release(
+        installer, home, monkeypatch
+    )
+    pointer = release_root / ".the-hive-release-pointers.json"
+    invalid = json.loads(pointer.read_text(encoding="utf-8"))
+    if variant == "missing":
+        invalid["previous"] = None
+    elif variant == "reversed":
+        invalid["current"], invalid["previous"] = (
+            invalid["previous"],
+            invalid["current"],
+        )
+    else:
+        invalid["previous"] = invalid["current"]
+    invalid_bytes = (
+        json.dumps(
+            invalid, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        + "\n"
+    ).encode("ascii")
+    pointer.write_bytes(invalid_bytes)
+    pointer.chmod(0o644)
+    monkeypatch.setitem(
+        installer["_install_attested_runtime"].__globals__,  # type: ignore[index]
+        "_verified_release_commit",
+        lambda _repository: "b" * 40,
+    )
+
+    with pytest.raises(
+        installer["InstallError"], match="install_release_pointer_invalid"  # type: ignore[index]
+    ):
+        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+
+    assert pointer.read_bytes() == invalid_bytes
+    assert not (release_root / "generations" / ("b" * 40)).exists()
 
 
 def test_pre_pricing_legacy_attestation_binds_generation_to_known_digest(
@@ -589,7 +643,7 @@ def test_pre_pricing_legacy_upgrade_rejects_untrusted_generation_pre_visible(
     (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
     generation = "c7efc03f00eee1933f86808902d109f81bad446e"
     release_root, old_pointer = _materialize_pre_pricing_legacy_release(
-        installer, home, generation, monkeypatch
+        installer, home, monkeypatch
     )
     old_runtime = release_root / "generations" / generation
     target = old_runtime / "bin" / "the-hive-mcp"
@@ -631,7 +685,7 @@ def test_pre_pricing_legacy_upgrade_rejects_physical_current_era_artifact(
     (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
     generation = "c7efc03f00eee1933f86808902d109f81bad446e"
     release_root, old_pointer = _materialize_pre_pricing_legacy_release(
-        installer, home, generation, monkeypatch
+        installer, home, monkeypatch
     )
     old_runtime = release_root / "generations" / generation
     artifact = old_runtime / relative_path
@@ -667,7 +721,7 @@ def test_pre_pricing_legacy_upgrade_rolls_back_postrename_failure(
     (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
     generation = "c7efc03f00eee1933f86808902d109f81bad446e"
     release_root, old_pointer = _materialize_pre_pricing_legacy_release(
-        installer, home, generation, monkeypatch
+        installer, home, monkeypatch
     )
     monkeypatch.setitem(
         installer["_install_attested_runtime"].__globals__,  # type: ignore[index]
