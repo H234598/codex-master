@@ -778,9 +778,7 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
     assert [line for line in service_lines if line.startswith("ProtectHome=")] == [
         "ProtectHome=tmpfs"
     ]
-    assert [line for line in service_lines if "%t" in line] == [
-        "BindReadOnlyPaths=%t:%t:norbind"
-    ]
+    assert [line for line in service_lines if "%t" in line] == []
     assert "CODEX_MASTER_PROBE_REPOSITORY" not in service_text
     assert "%h/codex-master/src" not in service_text
     assert "%h/codex-master/bin/codex-master-mcp" not in service_text
@@ -805,6 +803,47 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
     )
     assert "libexec" not in service_text
     assert "codex-master-hive-probe" not in service_text
+
+
+def test_hourly_probe_unit_never_self_binds_the_user_runtime_directory() -> None:
+    """The delivered unit must not recreate the known invalid namespace bind."""
+
+    service = ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
+
+    assert "BindReadOnlyPaths=%t:%t:norbind" not in service.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_attested_runtime_materializes_hourly_without_runtime_directory_self_bind(
+    tmp_path: Path,
+) -> None:
+    """The runtime image carries the repaired Hourly sandbox into its live unit."""
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    installer["_install_attested_runtime"].__globals__["_verified_release_commit"] = (
+        lambda _repository: "a" * 40  # type: ignore[index]
+    )
+
+    installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+
+    installed_service = (
+        home / ".config" / "systemd" / "user" / "the-hive-hive-hourly-probe.service"
+    ).read_text(encoding="utf-8")
+    assert "BindReadOnlyPaths=%t:%t:norbind" not in installed_service
+    assert (
+        "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:"
+        "%h/.local/lib/the-hive-runtime:norbind"
+    ) in installed_service
+    assert (
+        "BindPaths=%h/.local/state/codex-master-mcp:"
+        "%h/.local/state/codex-master-mcp:norbind"
+    ) in installed_service
 
 
 def test_hourly_probe_service_renderer_rejects_a_generation_only_sandbox() -> None:
