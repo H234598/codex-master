@@ -4,10 +4,16 @@ import hashlib
 import json
 from pathlib import Path
 import runpy
+import shutil
 
 import pytest
 
+import the_hive.runtime_layout as runtime_layout
 from the_hive.hook_session_pin_store import HookSessionPinStoreV1
+from the_hive.runtime_layout import (
+    RuntimeLayout,
+    attest_pre_pricing_legacy_runtime,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +34,104 @@ def _stage(installer: dict[str, object], root: Path, generation: str) -> Path:
         commit=TEST_MANIFEST_COMMIT,
     )
     return stage
+
+
+def _pre_pricing_legacy_stage(
+    installer: dict[str, object], root: Path, generation: str
+) -> tuple[Path, str]:
+    """Build the exact predecessor layout from the complete current fixture."""
+
+    stage = root / f".the-hive-runtime.stage.{generation}"
+    stage.mkdir(mode=0o700)
+    installer["_build_runtime_image"](  # type: ignore[operator]
+        repository=ROOT, stage=stage, generation=generation, commit=generation
+    )
+    for relative in (
+        "bin/the-hive-plugin-hook-stable",
+        "bin/the-hive-openai-pricing-inventory",
+        "bin/the-hive-openai-pricing-inventory-stable",
+        "systemd/user/the-hive-openai-pricing.service",
+        "systemd/user/the-hive-openai-pricing.timer",
+        ".the-hive-runtime-manifest.json",
+        "root-install-plan.json",
+    ):
+        (stage / relative).unlink()
+    shutil.rmtree(stage / "TheHivePluginBundleV1")
+    manifest = installer["_runtime_manifest_payload"](  # type: ignore[operator]
+        stage, generation=generation, commit=generation
+    )
+    manifest["release"] = {
+        "stable_launchers": [
+            "bin/the-hive-mcp-stable",
+            "bin/the-hive-mcp",
+            "bin/the-hive-resource-monitor",
+        ],
+        "python_tree": "src/the_hive",
+        "monitor_entrypoint": "bin/the-hive-resource-monitor",
+        "h4_units": [
+            "systemd/user/the-hive-resource-monitor.service",
+            "systemd/user/the-hive.slice",
+        ],
+        "bind_sources": [
+            "bin/the-hive-resource-monitor",
+            "src/the_hive",
+            "codex-agent-classes.json",
+            "codex-hive.json",
+            "%h/.local/state/codex-master-mcp/hive",
+        ],
+    }
+    manifest_raw = installer["_canonical_json"](manifest)  # type: ignore[operator]
+    manifest_path = stage / ".the-hive-runtime-manifest.json"
+    manifest_path.write_bytes(manifest_raw)
+    manifest_path.chmod(0o644)
+    digest = "sha256:" + hashlib.sha256(manifest_raw).hexdigest()
+    return stage, digest
+
+
+def _materialize_pre_pricing_legacy_release(
+    installer: dict[str, object],
+    home: Path,
+    generation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, bytes]:
+    """Install a private pre-pricing pointer pair without using a new publisher."""
+
+    stage, digest = _pre_pricing_legacy_stage(installer, home.parent, generation)
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    generations = release_root / "generations"
+    generations.mkdir(parents=True, mode=0o700)
+    release_root.chmod(0o700)
+    generations.chmod(0o700)
+    runtime = generations / generation
+    stage.rename(runtime)
+    monkeypatch.setitem(
+        runtime_layout._PRE_PRICING_LEGACY_DIGESTS, generation, digest
+    )
+    assert attest_pre_pricing_legacy_runtime(runtime, expected_digest=digest) == {
+        "generation": generation,
+        "manifest_digest": digest,
+    }
+    pointer = release_root / ".the-hive-release-pointers.json"
+    pointer.write_bytes(
+        (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "current": {
+                        "generation": generation,
+                        "manifest_digest": digest,
+                    },
+                    "previous": None,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+    )
+    pointer.chmod(0o644)
+    return release_root, pointer.read_bytes()
 
 
 def _rewrite_manifest(
@@ -368,6 +472,230 @@ def test_existing_release_root_without_canonical_pin_store_fails_pre_visible(
     assert stage.exists()
     assert not (release_root / "generations" / "missing-store").exists()
     assert not (release_root / ".the-hive-release-pointers.json").exists()
+
+
+def test_pre_pricing_legacy_release_without_pin_store_upgrades_to_current_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only an attested predecessor may consume the absent-store upgrade path."""
+
+    installer = _installer()
+    home = tmp_path / "home"
+    (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
+    generation = "c7efc03f00eee1933f86808902d109f81bad446e"
+    release_root, old_pointer = _materialize_pre_pricing_legacy_release(
+        installer, home, generation, monkeypatch
+    )
+    old_runtime = release_root / "generations" / generation
+    with pytest.raises(ValueError):
+        RuntimeLayout.from_runtime_root(old_runtime)
+
+    release_commit = {"value": "b" * 40}
+    monkeypatch.setitem(
+        installer["_install_attested_runtime"].__globals__,  # type: ignore[index]
+        "_verified_release_commit",
+        lambda _repository: release_commit["value"],
+    )
+    upgraded = installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+    assert upgraded["generation"] == "b" * 40
+    pointer = release_root / ".the-hive-release-pointers.json"
+    upgraded_pointer = json.loads(pointer.read_text(encoding="utf-8"))
+    assert upgraded_pointer["current"]["generation"] == "b" * 40
+    assert upgraded_pointer["previous"] is None
+    assert pointer.read_bytes() != old_pointer
+    assert (home / ".local" / "bin" / "the-hive-openai-pricing-inventory").is_file()
+    for name in (
+        "the-hive-openai-pricing.service",
+        "the-hive-openai-pricing.timer",
+    ):
+        assert (home / ".config" / "systemd" / "user" / name).is_file()
+    assert RuntimeLayout.from_current_release(
+        release_root,
+        upgraded_pointer["current"]["generation"],
+        upgraded_pointer["current"]["manifest_digest"],
+    ).root == (release_root / "generations" / ("b" * 40))
+
+    HookSessionPinStoreV1.create_at(
+        home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+    )
+    release_commit["value"] = "c" * 40
+    subsequent = installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+    assert subsequent["generation"] == "c" * 40
+    subsequent_pointer = json.loads(pointer.read_text(encoding="utf-8"))
+    assert subsequent_pointer["current"]["generation"] == "c" * 40
+    assert subsequent_pointer["previous"] == upgraded_pointer["current"]
+    assert RuntimeLayout.from_previous_release(
+        release_root,
+        subsequent_pointer["previous"]["generation"],
+        subsequent_pointer["previous"]["manifest_digest"],
+    ).root == (release_root / "generations" / ("b" * 40))
+
+
+def test_pre_pricing_legacy_attestation_binds_generation_to_known_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A complete lookalike must not substitute for the observed predecessor."""
+
+    installer = _installer()
+    generation = "c7efc03f00eee1933f86808902d109f81bad446e"
+    stage, original_digest = _pre_pricing_legacy_stage(
+        installer, tmp_path, generation
+    )
+    runtime = tmp_path / "generations" / generation
+    runtime.parent.mkdir(mode=0o700)
+    stage.rename(runtime)
+    monkeypatch.setitem(
+        runtime_layout._PRE_PRICING_LEGACY_DIGESTS, generation, original_digest
+    )
+    assert attest_pre_pricing_legacy_runtime(
+        runtime, expected_digest=original_digest
+    ) == {"generation": generation, "manifest_digest": original_digest}
+
+    extra = runtime / "src" / "the_hive" / "legacy-compat-lookalike.py"
+    extra.write_text("marker = 'not the observed image'\n", encoding="ascii")
+    extra.chmod(0o644)
+    manifest_path = runtime / ".the-hive-runtime-manifest.json"
+    old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_path.unlink()
+    altered_manifest = installer["_runtime_manifest_payload"](  # type: ignore[operator]
+        runtime, generation=generation, commit=generation
+    )
+    altered_manifest["release"] = old_manifest["release"]
+    altered_raw = installer["_canonical_json"](  # type: ignore[operator]
+        altered_manifest
+    )
+    manifest_path.write_bytes(altered_raw)
+    manifest_path.chmod(0o644)
+    altered_digest = "sha256:" + hashlib.sha256(altered_raw).hexdigest()
+
+    with pytest.raises(ValueError):
+        attest_pre_pricing_legacy_runtime(runtime, expected_digest=altered_digest)
+
+    monkeypatch.setitem(
+        runtime_layout._PRE_PRICING_LEGACY_DIGESTS, generation, altered_digest
+    )
+    assert attest_pre_pricing_legacy_runtime(
+        runtime, expected_digest=altered_digest
+    ) == {"generation": generation, "manifest_digest": altered_digest}
+
+
+def test_pre_pricing_legacy_upgrade_rejects_untrusted_generation_pre_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy compatibility claim never bypasses regular-file attestation."""
+
+    installer = _installer()
+    home = tmp_path / "home"
+    (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
+    generation = "c7efc03f00eee1933f86808902d109f81bad446e"
+    release_root, old_pointer = _materialize_pre_pricing_legacy_release(
+        installer, home, generation, monkeypatch
+    )
+    old_runtime = release_root / "generations" / generation
+    target = old_runtime / "bin" / "the-hive-mcp"
+    target.chmod(0o777)
+    monkeypatch.setitem(
+        installer["_install_attested_runtime"].__globals__,  # type: ignore[index]
+        "_verified_release_commit",
+        lambda _repository: "b" * 40,
+    )
+
+    with pytest.raises(
+        installer["InstallError"], match="install_release_pointer_invalid"  # type: ignore[index]
+    ):
+        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+
+    assert (
+        release_root / ".the-hive-release-pointers.json"
+    ).read_bytes() == old_pointer
+    assert not (release_root / "generations" / ("b" * 40)).exists()
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "kind"),
+    [
+        ("root-install-plan.json", "file"),
+        ("TheHivePluginBundleV1", "directory"),
+    ],
+)
+def test_pre_pricing_legacy_upgrade_rejects_physical_current_era_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+    kind: str,
+) -> None:
+    """Manifest-exempt files and directories cannot pass the legacy branch."""
+
+    installer = _installer()
+    home = tmp_path / "home"
+    (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
+    generation = "c7efc03f00eee1933f86808902d109f81bad446e"
+    release_root, old_pointer = _materialize_pre_pricing_legacy_release(
+        installer, home, generation, monkeypatch
+    )
+    old_runtime = release_root / "generations" / generation
+    artifact = old_runtime / relative_path
+    if kind == "file":
+        artifact.write_text("unexpected\n", encoding="ascii")
+        artifact.chmod(0o644)
+    else:
+        artifact.mkdir(mode=0o700)
+    monkeypatch.setitem(
+        installer["_install_attested_runtime"].__globals__,  # type: ignore[index]
+        "_verified_release_commit",
+        lambda _repository: "b" * 40,
+    )
+
+    with pytest.raises(
+        installer["InstallError"], match="install_release_pointer_invalid"  # type: ignore[index]
+    ):
+        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+
+    assert (
+        release_root / ".the-hive-release-pointers.json"
+    ).read_bytes() == old_pointer
+    assert not (release_root / "generations" / ("b" * 40)).exists()
+
+
+def test_pre_pricing_legacy_upgrade_rolls_back_postrename_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed compatibility upgrade restores its original legacy pointer."""
+
+    installer = _installer()
+    home = tmp_path / "home"
+    (home / ".local" / "lib").mkdir(mode=0o700, parents=True)
+    generation = "c7efc03f00eee1933f86808902d109f81bad446e"
+    release_root, old_pointer = _materialize_pre_pricing_legacy_release(
+        installer, home, generation, monkeypatch
+    )
+    monkeypatch.setitem(
+        installer["_install_attested_runtime"].__globals__,  # type: ignore[index]
+        "_verified_release_commit",
+        lambda _repository: "b" * 40,
+    )
+
+    def fail_pointer(
+        _root: Path, _pointers: dict[str, dict[str, str] | None]
+    ) -> None:
+        raise installer["InstallError"]("injected_pointer_failure")  # type: ignore[index]
+
+    monkeypatch.setitem(
+        installer["_publish_runtime_generation"].__globals__,  # type: ignore[index]
+        "_write_release_pointers",
+        fail_pointer,
+    )
+    with pytest.raises(installer["InstallError"], match="injected_pointer_failure"):  # type: ignore[index]
+        installer["_install_attested_runtime"](home=home)  # type: ignore[operator]
+
+    assert (
+        release_root / ".the-hive-release-pointers.json"
+    ).read_bytes() == old_pointer
+    assert not (release_root / "generations" / ("b" * 40)).exists()
+    assert not (home / ".local" / "bin" / "the-hive-openai-pricing-inventory").exists()
+    assert not (
+        home / ".config" / "systemd" / "user" / "the-hive-openai-pricing.service"
+    ).exists()
 
 
 def test_prune_fault_cannot_run_after_cutover_because_publisher_retains_all(

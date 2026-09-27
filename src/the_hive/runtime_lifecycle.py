@@ -2581,7 +2581,8 @@ def _restore_bound_state(bound: _BoundCutover, systemctl: Systemctl) -> bool:
             _systemctl_mutate(systemctl, operation)
         for unit, expected in previous.items():
             actual = _show(systemctl, unit)
-            if not _state_exactly_matches(actual, expected):
+            target = _restored_state_target(unit, expected)
+            if not _state_exactly_matches(actual, target):
                 return False
     except RuntimeLifecycleError:
         return False
@@ -2742,6 +2743,23 @@ def _restore_operation(
             else ("disable", "--now", unit)
         )
     return ("start", unit) if _state_is_active(state) else ("stop", unit)
+
+
+def _restored_state_target(
+    unit: str, state: Mapping[str, str]
+) -> Mapping[str, str]:
+    """Name the exact manager state a safe inverse operation can recreate.
+
+    systemd has no non-executing operation that recreates a historical
+    ``failed`` service state. Its safe inverse is ``stop``, whose durable
+    contract is the same loaded/unit-file state with the service quiescent.
+    This normalization is deliberately limited to services that were already
+    failed before cutover; timers and every other state remain exact.
+    """
+
+    if unit.endswith(".service") and state.get("ActiveState") == "failed":
+        return {**state, "ActiveState": "inactive"}
+    return state
 
 
 def _state_exactly_matches(

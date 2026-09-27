@@ -83,6 +83,19 @@ _STABLE_HOOK_LAUNCHER_SOURCE = "bin/the-hive-plugin-hook-stable"
 _PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE = (
     "bin/the-hive-openai-pricing-inventory-stable"
 )
+_PRE_PRICING_LEGACY_STABLE_LAUNCHERS = (
+    _STABLE_MCP_LAUNCHER_SOURCE,
+    "bin/the-hive-mcp",
+    "bin/the-hive-resource-monitor",
+)
+_PRE_PRICING_LEGACY_DIGESTS = {
+    "83abaae0ee21959b17cec1fe18002c4d80776296": (
+        "sha256:d3f947baac20a21aa1432caad9787e69ce551de46195efb67d5282a4e7a343ed"
+    ),
+    "c7efc03f00eee1933f86808902d109f81bad446e": (
+        "sha256:6c475417cd646586c985294db01bd500dadf7f334a49e50c356af09315bfad69"
+    ),
+}
 _HOOK_BINDING_ENTRYPOINTS = {
     "native_bee_event": "hooks/native_bee_event.py",
     "native_spawn_admission": "hooks/native_spawn_admission.py",
@@ -125,6 +138,34 @@ _REQUIRED_FILES: tuple[tuple[str, int], ...] = (
     ("src/the_hive/pricing_inventory.py", 0o644),
     (_RUNTIME_SPAWN_HELPER, 0o755),
     (_MANIFEST_NAME, 0o644),
+)
+_PRE_PRICING_LEGACY_REQUIRED_FILES: tuple[tuple[str, int], ...] = (
+    ("bin/the-hive-mcp", 0o755),
+    (_STABLE_MCP_LAUNCHER_SOURCE, 0o755),
+    ("bin/the-hive-resource-monitor", 0o755),
+    ("bin/the-hive-hive-hourly-probe", 0o755),
+    (".codex-plugin/plugin.json", 0o644),
+    (".mcp.json", 0o644),
+    (".app.json", 0o644),
+    ("hooks/hooks.json", 0o644),
+    ("skills/the-hive-fleet/SKILL.md", 0o644),
+    ("codex-hive.json", 0o644),
+    ("codex-agent-classes.json", 0o644),
+    ("systemd/user/the-hive-resource-monitor.service", 0o644),
+    ("systemd/user/the-hive.slice", 0o644),
+    (_RUNTIME_SPAWN_HELPER, 0o755),
+    (_MANIFEST_NAME, 0o644),
+)
+_PRE_PRICING_LEGACY_ABSENT_FILES = frozenset(
+    {
+        _STABLE_HOOK_LAUNCHER_SOURCE,
+        "bin/the-hive-openai-pricing-inventory",
+        _PRICING_INVENTORY_STABLE_LAUNCHER_SOURCE,
+        "systemd/user/the-hive-openai-pricing.service",
+        "systemd/user/the-hive-openai-pricing.timer",
+        _ROOT_INSTALL_PLAN_NAME,
+        _PLUGIN_BUNDLE_DIRECTORY,
+    }
 )
 
 
@@ -268,6 +309,32 @@ def _validate_regular(root: Path, relative_path: str, mode: int) -> Path:
     ):
         raise _invalid()
     return path
+
+
+def _validate_absent(root: Path, relative_path: str) -> None:
+    """Prove an obsolete image artifact is absent without following links."""
+
+    current = root
+    parts = _relative_parts(relative_path)
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise _invalid() from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise _invalid()
+        if index < len(parts) - 1:
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != _ROOT_MODE
+            ):
+                raise _invalid()
+            continue
+        raise _invalid()
 
 
 def _read_regular_bytes(root: Path, relative_path: str, *, max_bytes: int) -> bytes:
@@ -877,7 +944,9 @@ def _validated_manifest_bytes(
 ) -> tuple[dict[str, object], str, bytes]:
     raw = _read_regular_bytes(root, _MANIFEST_NAME, max_bytes=_MAX_METADATA_BYTES)
     manifest, digest = _validated_manifest_from_bytes(
-        root, raw, expected_digest=expected_digest
+        root,
+        raw,
+        expected_digest=expected_digest,
     )
     return manifest, digest, raw
 
@@ -886,9 +955,99 @@ def _validated_manifest(
     root: Path, *, expected_digest: str | None = None
 ) -> tuple[dict[str, object], str]:
     manifest, digest, _raw = _validated_manifest_bytes(
-        root, expected_digest=expected_digest
+        root,
+        expected_digest=expected_digest,
     )
     return manifest, digest
+
+
+def attest_pre_pricing_legacy_runtime(
+    root: Path, *, expected_digest: str
+) -> dict[str, str]:
+    """Attest the exact pre-pricing image only for an atomic one-way upgrade.
+
+    The compatibility image is never returned as a ``RuntimeLayout`` and
+    therefore cannot authorize a current runtime consumer.  It exists solely
+    to prove that an owned release pointer names the complete predecessor of
+    the pricing image before the publisher replaces that pointer atomically.
+    """
+
+    if (
+        not isinstance(root, Path)
+        or not root.is_absolute()
+        or not isinstance(expected_digest, str)
+        or not expected_digest.startswith("sha256:")
+        or len(expected_digest) != 71
+        or any(character not in "0123456789abcdef" for character in expected_digest[7:])
+    ):
+        raise _invalid()
+    _validate_root(root)
+    for relative_path, mode in _PRE_PRICING_LEGACY_REQUIRED_FILES:
+        _validate_regular(root, relative_path, mode)
+    for relative_path in _PRE_PRICING_LEGACY_ABSENT_FILES:
+        _validate_absent(root, relative_path)
+    _validate_metadata(root)
+    raw = _read_regular_bytes(root, _MANIFEST_NAME, max_bytes=_MAX_METADATA_BYTES)
+    manifest_digest = _manifest_digest(raw)
+    if manifest_digest != expected_digest:
+        raise _invalid()
+    try:
+        manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _invalid() from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
+        raise _invalid()
+    expected_release = {
+        "stable_launchers": [*_PRE_PRICING_LEGACY_STABLE_LAUNCHERS],
+        "python_tree": "src/the_hive",
+        "monitor_entrypoint": "bin/the-hive-resource-monitor",
+        "h4_units": [
+            "systemd/user/the-hive-resource-monitor.service",
+            "systemd/user/the-hive.slice",
+        ],
+        "bind_sources": [
+            "bin/the-hive-resource-monitor",
+            "src/the_hive",
+            "codex-agent-classes.json",
+            "codex-hive.json",
+            "%h/.local/state/codex-master-mcp/hive",
+        ],
+    }
+    generation = manifest.get("generation")
+    commit = manifest.get("commit")
+    if (
+        not isinstance(generation, str)
+        or _PRE_PRICING_LEGACY_DIGESTS.get(generation) != expected_digest
+        or commit != generation
+        or manifest.get("release") != expected_release
+    ):
+        raise _invalid()
+    metadata = {
+        "commit": commit,
+        "generation": generation,
+        "r2_base": {"commit": _R2_BASE_COMMIT, "tree": _R2_BASE_TREE},
+        "historical_lineage": _HISTORICAL_LINEAGE,
+        "successor_witness": {
+            "path": _SUCCESSOR_WITNESS_PATH,
+            "sha256": _SUCCESSOR_WITNESS_SHA256,
+        },
+        "release": expected_release,
+    }
+    if (
+        manifest.get("r2_base") != metadata["r2_base"]
+        or manifest.get("historical_lineage") != metadata["historical_lineage"]
+        or manifest.get("successor_witness") != metadata["successor_witness"]
+        or manifest != _runtime_manifest_payload(root, metadata)
+    ):
+        raise _invalid()
+    files = manifest.get("files")
+    if (
+        not isinstance(files, dict)
+        or any(path in files for path in _PRE_PRICING_LEGACY_ABSENT_FILES)
+        or root.name != generation
+    ):
+        raise _invalid()
+    return {"generation": generation, "manifest_digest": manifest_digest}
 
 
 def _spawn_helper_digest(manifest: dict[str, object]) -> str:

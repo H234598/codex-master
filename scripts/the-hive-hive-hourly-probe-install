@@ -36,6 +36,7 @@ from the_hive.hook_session_pin_store import (  # noqa: E402
 )
 from the_hive.runtime_layout import (  # noqa: E402
     RuntimeLayout,
+    attest_pre_pricing_legacy_runtime,
     release_binding_bytes,
     root_install_plan_bytes,
 )
@@ -983,12 +984,62 @@ def _attested_release_pointer(root: Path, value: object) -> dict[str, str] | Non
     return {"generation": generation, "manifest_digest": digest}
 
 
-def _read_release_pointers(root: Path) -> dict[str, dict[str, str] | None]:
+def _attested_pre_pricing_legacy_pointers(
+    root: Path, value: dict[str, object]
+) -> dict[str, dict[str, str] | None] | None:
+    """Recognize only the complete predecessor image, never a mixed pointer.
+
+    This compatibility branch is intentionally one-way: its normalized empty
+    pair prevents a post-upgrade current layout from naming an image that no
+    longer satisfies the current RuntimeLayout contract.
+    """
+
+    current = value.get("current")
+    if not isinstance(current, dict):
+        return None
+    try:
+        generation = current.get("generation")
+        manifest_digest = current.get("manifest_digest")
+        if not isinstance(generation, str) or not isinstance(manifest_digest, str):
+            return None
+        _relative_name(generation)
+        current_entry = attest_pre_pricing_legacy_runtime(
+            root / _RELEASE_GENERATIONS_NAME / generation,
+            expected_digest=manifest_digest,
+        )
+        if current_entry != current:
+            return None
+        previous = value.get("previous")
+        if previous is not None:
+            if not isinstance(previous, dict):
+                return None
+            previous_generation = previous.get("generation")
+            previous_digest = previous.get("manifest_digest")
+            if (
+                not isinstance(previous_generation, str)
+                or not isinstance(previous_digest, str)
+            ):
+                return None
+            _relative_name(previous_generation)
+            previous_entry = attest_pre_pricing_legacy_runtime(
+                root / _RELEASE_GENERATIONS_NAME / previous_generation,
+                expected_digest=previous_digest,
+            )
+            if previous_entry != previous:
+                return None
+    except (InstallError, ValueError):
+        return None
+    return {"current": None, "previous": None}
+
+
+def _read_release_pointers(
+    root: Path,
+) -> tuple[dict[str, dict[str, str] | None], bool]:
     pointer = root / _RELEASE_POINTERS_NAME
     try:
         item = pointer.lstat()
     except FileNotFoundError:
-        return {"current": None, "previous": None}
+        return {"current": None, "previous": None}, False
     except OSError as exc:
         raise InstallError("install_release_pointer_invalid") from exc
     if (
@@ -1008,10 +1059,19 @@ def _read_release_pointers(root: Path) -> dict[str, dict[str, str] | None]:
         or value.get("schema_version") != 1
     ):
         raise InstallError("install_release_pointer_invalid")
-    return {
-        "current": _attested_release_pointer(root, value["current"]),
-        "previous": _attested_release_pointer(root, value["previous"]),
-    }
+    try:
+        return (
+            {
+                "current": _attested_release_pointer(root, value["current"]),
+                "previous": _attested_release_pointer(root, value["previous"]),
+            },
+            False,
+        )
+    except InstallError as current_error:
+        legacy = _attested_pre_pricing_legacy_pointers(root, value)
+        if legacy is None:
+            raise current_error
+        return legacy, True
 
 
 def _restore_release_pointer_bytes(root: Path, previous: bytes | None) -> None:
@@ -1790,25 +1850,64 @@ def _installed_live_generations(*, release_root: Path, units: Path | None) -> se
     return retained
 
 
+def _canonical_hook_session_pin_store_path(release_root: Path) -> Path:
+    """Derive the only hook-pin authority that may retain a generation."""
+
+    library = release_root.parent
+    local = library.parent
+    home = local.parent
+    if (
+        library.name != "lib"
+        or local.name != ".local"
+        or not home.is_absolute()
+        or release_root.name != _RUNTIME_ROOT_NAME
+    ):
+        raise InstallError("install_release_retention_failed")
+    return home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+
+
 def _canonical_hook_session_pin_store(release_root: Path) -> HookSessionPinStoreV1:
     """Open only the one D320 state-root derived from this release authority."""
 
     try:
-        library = release_root.parent
-        local = library.parent
-        home = local.parent
-        if (
-            library.name != "lib"
-            or local.name != ".local"
-            or not home.is_absolute()
-            or release_root.name != _RUNTIME_ROOT_NAME
-        ):
-            raise InstallError("install_release_retention_failed")
         return HookSessionPinStoreV1.open_at(
-            home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+            _canonical_hook_session_pin_store_path(release_root)
         )
     except (HookSessionPinStoreError, InstallError) as exc:
         raise InstallError("install_release_retention_failed") from exc
+
+
+def _canonical_hook_session_pin_store_is_absent(release_root: Path) -> bool:
+    """Prove absence without accepting links or writable path components."""
+
+    try:
+        store = _canonical_hook_session_pin_store_path(release_root)
+        home = release_root.parents[2]
+        home_item = home.lstat()
+        if (
+            stat.S_ISLNK(home_item.st_mode)
+            or not stat.S_ISDIR(home_item.st_mode)
+            or home_item.st_uid != os.geteuid()
+            or stat.S_IMODE(home_item.st_mode) & 0o022
+        ):
+            return False
+        current = home
+        for part in store.relative_to(home).parts:
+            current /= part
+            try:
+                item = current.lstat()
+            except FileNotFoundError:
+                return True
+            if (
+                stat.S_ISLNK(item.st_mode)
+                or not stat.S_ISDIR(item.st_mode)
+                or item.st_uid != os.geteuid()
+                or stat.S_IMODE(item.st_mode) & 0o022
+            ):
+                return False
+    except (InstallError, OSError):
+        return False
+    return False
 
 
 def _fresh_release_root_before_publish(release_root: Path) -> bool:
@@ -1835,7 +1934,10 @@ def _fresh_release_root_before_publish(release_root: Path) -> bool:
 
 
 def _attested_hook_session_pin_generations(
-    *, release_root: Path, fresh_release_root: bool
+    *,
+    release_root: Path,
+    fresh_release_root: bool,
+    pre_pricing_legacy_upgrade: bool = False,
 ) -> set[str]:
     """Read the canonical locked pin store; unreadable state fails closed."""
 
@@ -1848,7 +1950,12 @@ def _attested_hook_session_pin_generations(
         bindings = _canonical_hook_session_pin_store(release_root).retained_bindings(
             now_unix_ns=time.time_ns()
         )
-    except HookSessionPinStoreError as exc:
+    except (HookSessionPinStoreError, InstallError) as exc:
+        if (
+            pre_pricing_legacy_upgrade
+            and _canonical_hook_session_pin_store_is_absent(release_root)
+        ):
+            return set()
         raise InstallError("install_release_retention_failed") from exc
     retained: set[str] = set()
     for pin in bindings.values():
@@ -1953,8 +2060,13 @@ def _publish_runtime_generation(
         with _release_publish_lock(release_root):
             # Everything below this comment is attestable before the rename that
             # first makes the staged generation visible to another reader.
+            pointers, pre_pricing_legacy_upgrade = _read_release_pointers(
+                release_root
+            )
             _attested_hook_session_pin_generations(
-                release_root=release_root, fresh_release_root=fresh_release_root
+                release_root=release_root,
+                fresh_release_root=fresh_release_root,
+                pre_pricing_legacy_upgrade=pre_pricing_legacy_upgrade,
             )
             previous_hourly_units = (
                 _snapshot_hourly_probe_units(units=live_unit_dir)
@@ -1979,7 +2091,6 @@ def _publish_runtime_generation(
             target = generations / entry["generation"]
             if target.exists() or target.is_symlink():
                 raise InstallError("install_release_generation_exists")
-            pointers = _read_release_pointers(release_root)
             previous_pointer = _release_pointer_bytes(release_root)
             previous_mcp_launcher = _stable_mcp_launcher_bytes(release_root)
 

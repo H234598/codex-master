@@ -1425,6 +1425,45 @@ def test_restore_does_not_operate_on_units_bound_as_not_found(tmp_path: Path) ->
     ]
 
 
+def test_restore_bound_failed_service_requires_the_exact_quiescent_inverse(
+    tmp_path: Path,
+) -> None:
+    """A prior failed service is restored by stop, never accepted as arbitrary."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+    service = "the-hive-hive-hourly-probe.service"
+    states[service] = {
+        "LoadState": "loaded",
+        "UnitFileState": "static",
+        "ActiveState": "failed",
+    }
+    bound = runtime_lifecycle.replace(bound, states=tuple(states.items()))
+    calls: list[tuple[str, ...]] = []
+    stop_leaves_failed = {"value": False}
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        calls.append(arguments)
+        if arguments == ("stop", service):
+            if not stop_leaves_failed["value"]:
+                states[service] = {
+                    "LoadState": "loaded",
+                    "UnitFileState": "static",
+                    "ActiveState": "inactive",
+                }
+            return {}
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    assert runtime_lifecycle._restore_bound_state(bound, systemctl) is True
+    assert ("stop", service) in calls
+    assert states[service]["ActiveState"] == "inactive"
+
+    states[service]["ActiveState"] = "failed"
+    stop_leaves_failed["value"] = True
+    assert runtime_lifecycle._restore_bound_state(bound, systemctl) is False
+
+
 def test_cutover_installer_failure_restores_the_bound_preexisting_state(
     tmp_path: Path, monkeypatch
 ) -> None:
