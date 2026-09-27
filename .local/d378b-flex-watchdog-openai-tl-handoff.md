@@ -92,6 +92,11 @@ PYTHONPATH=src pytest -q -x \
 # 2 passed in 8.58s
 
 PYTHONPATH=src pytest -q \
+  tests/test_hive_hourly_probe.py::test_pricing_stable_launcher_waits_for_the_runtime_publish_lock
+# 1 passed in 8.74s (after replacing the `/proc` observation with the
+# deterministic absent-pointer lock proof)
+
+PYTHONPATH=src pytest -q \
   tests/test_hive_hourly_probe.py::test_pricing_runtime_rolls_back_the_complete_pair_on_timer_failure
 # 1 passed in 15.57s
 
@@ -113,15 +118,16 @@ environment, pointer-digest rejection, upgrade materialization, and
 `previous` binding fails the public launcher. The new negative-contract node
 rejects a manipulated stable launcher and appended/overriding service
 `ExecStart`, service `ReadWritePaths`, service `[Unit]`, and timer `Unit`
-directives. The lock node holds the real publish lock with `LOCK_EX`, observes
-the launcher open that exact inode without completing, releases it, and then
-observes a successful neutral-cwd launch. The existing unsafe replacement
-cases and rollback node were exercised during this follow-up; only the
-rollback command's complete result is reproduced above. The parameterized
-unsafe-replacement command returned incremental progress before the tool
-yielded; after it exited, its exit status was not independently recoverable,
-so its final aggregate result is unknown despite no corresponding pytest
-`lastfailed` entry.
+directives. The lock node holds the real publish lock with `LOCK_EX`, removes
+the release pointer, and proves that the launcher cannot complete while the
+exclusive lock remains held. Only after unlock does it reach the deliberately
+absent pointer and fail closed with exit status `64`; this does not depend on
+`/proc` observation. The existing unsafe replacement cases and rollback node
+were exercised during this follow-up; only the rollback command's complete
+result is reproduced above. The parameterized unsafe-replacement command
+returned incremental progress before the tool yielded; after it exited, its
+exit status was not independently recoverable, so its final aggregate result
+is unknown despite no corresponding pytest `lastfailed` entry.
 
 The existing installer stage validator did create temporary
 `systemd-run --user` child processes against test-only `/tmp/pytest-.../home`

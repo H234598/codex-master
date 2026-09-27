@@ -12,7 +12,6 @@ from pathlib import Path
 import stat
 import subprocess
 import threading
-import time
 
 import pytest
 
@@ -1530,7 +1529,7 @@ def test_pricing_runtime_rejects_noncanonical_launcher_and_unit_directives() -> 
 def test_pricing_stable_launcher_waits_for_the_runtime_publish_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A held publisher lock blocks the public launcher before pointer binding."""
+    """A held publisher lock blocks pointer binding until its release."""
 
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
@@ -1547,11 +1546,15 @@ def test_pricing_stable_launcher_waits_for_the_runtime_publish_lock(
     release_root = home / ".local" / "lib" / "the-hive-runtime"
     launcher = home / ".local" / "bin" / "the-hive-openai-pricing-inventory"
     lock_path = release_root / ".the-hive-release-publish.lock"
-    lock_stat = lock_path.stat()
+    pointer = release_root / ".the-hive-release-pointers.json"
     descriptor = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     process: subprocess.Popen[str] | None = None
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        # A launcher that validates the pointer before acquiring the matching
+        # shared lock exits immediately. The authority contract instead blocks
+        # here and reaches this deliberately absent pointer only after unlock.
+        pointer.unlink()
         process = subprocess.Popen(
             [launcher, "--help"],
             cwd=tmp_path,
@@ -1560,34 +1563,16 @@ def test_pricing_stable_launcher_waits_for_the_runtime_publish_lock(
             stderr=subprocess.PIPE,
             text=True,
         )
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                pytest.fail("pricing launcher exited while the publish lock was held")
-            for fd_name in (Path("/proc") / str(process.pid) / "fd").iterdir():
-                try:
-                    observed = fd_name.stat()
-                except FileNotFoundError:
-                    continue
-                if (observed.st_dev, observed.st_ino) == (
-                    lock_stat.st_dev,
-                    lock_stat.st_ino,
-                ):
-                    break
-            else:
-                time.sleep(0.01)
-                continue
-            break
-        else:
-            pytest.fail("pricing launcher did not open the publisher lock")
-        assert process.poll() is None
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
     assert process is not None
     stdout, stderr = process.communicate(timeout=10)
-    assert process.returncode == 0, stderr
-    assert "usage:" in stdout
+    assert process.returncode == 64
+    assert stdout == ""
+    assert stderr == ""
 
 
 @pytest.mark.parametrize(
