@@ -3086,6 +3086,14 @@ def _restore_bound_state_result(
             state = previous.get(unit)
             for operation in _restore_operations(unit, state):
                 _systemctl_mutate(systemctl, operation)
+            if (
+                state is not None
+                and unit.endswith(".service")
+                and state.get("LoadState") != "not-found"
+                and not _state_is_active(state)
+                and _show(systemctl, unit).get("ActiveState") == "failed"
+            ):
+                _systemctl_mutate(systemctl, ("reset-failed", unit))
         except RuntimeLifecycleError:
             return _RollbackResult(
                 False, _ROLLBACK_PHASE_ACTIONS[unit], "manager_action_failed"
@@ -3618,10 +3626,10 @@ def _restore_operations(
 ) -> tuple[tuple[str, ...], ...]:
     """Return the complete, ordered manager inverse for one bound unit.
 
-    Every service not bound as active may have acquired a failed record while
-    the cutover candidate was running. It must therefore be quiesced before
-    that record is reset; both operations remain under the caller's one
-    fail-closed phase boundary.
+    Every service not bound as active is quiesced. The caller then observes
+    the manager and resets only a failure record that actually exists; an
+    unconditional reset fails for valid inactive units absent from manager
+    memory.
     """
 
     if state is None:
@@ -3639,7 +3647,7 @@ def _restore_operations(
             ),
         )
     if unit.endswith(".service") and not _state_is_active(state):
-        return (("stop", unit), ("reset-failed", unit))
+        return (("stop", unit),)
     return (("start", unit),) if _state_is_active(state) else (("stop", unit),)
 
 

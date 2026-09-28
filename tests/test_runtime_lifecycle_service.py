@@ -2881,7 +2881,11 @@ def test_restore_bound_inactive_oneshot_resets_a_cutover_created_failed_record(
         service,
         "--property=LoadState,UnitFileState,ActiveState,Result,ExecMainStatus",
     )
-    assert calls.index(stop) < calls.index(reset) < calls.index(show)
+    stop_index = calls.index(stop)
+    probe_index = calls.index(show, stop_index + 1)
+    reset_index = calls.index(reset, probe_index + 1)
+    assert stop_index < probe_index < reset_index
+    assert show in calls[reset_index + 1 :]
     assert states[service] == {
         "LoadState": "loaded",
         "UnitFileState": "static",
@@ -2889,7 +2893,7 @@ def test_restore_bound_inactive_oneshot_resets_a_cutover_created_failed_record(
     }
 
 
-def test_restore_bound_failed_oneshot_quiesces_an_active_cutover_service_before_reset(
+def test_restore_bound_failed_oneshot_skips_reset_after_stop_quiesces_service(
     tmp_path: Path,
 ) -> None:
     """A failed pre-cutover oneshot cannot leave a cutover-started service active."""
@@ -2922,14 +2926,42 @@ def test_restore_bound_failed_oneshot_quiesces_an_active_cutover_service_before_
 
     assert runtime_lifecycle._restore_bound_state(bound, systemctl) is True
     stop = ("stop", service)
-    reset = ("reset-failed", service)
     show = (
         "show",
         service,
         "--property=LoadState,UnitFileState,ActiveState,Result,ExecMainStatus",
     )
-    assert calls.index(stop) < calls.index(reset) < calls.index(show)
+    assert calls.index(stop) < calls.index(show)
+    assert ("reset-failed", service) not in calls
     assert states[service]["ActiveState"] == "inactive"
+
+
+def test_restore_bound_inactive_service_skips_absent_manager_failure_record(
+    tmp_path: Path,
+) -> None:
+    """Valid inactive Legacy units must not receive failing reset-failed calls."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+    service = "codex-master-hive-hourly-probe.service"
+    states[service] = {
+        "LoadState": "loaded",
+        "UnitFileState": "static",
+        "ActiveState": "inactive",
+    }
+    bound = runtime_lifecycle.replace(bound, states=tuple(states.items()))
+    calls: list[tuple[str, ...]] = []
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        calls.append(arguments)
+        if arguments == ("reset-failed", service):
+            raise runtime_lifecycle.RuntimeLifecycleError("unit-not-loaded")
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    assert runtime_lifecycle._restore_bound_state(bound, systemctl) is True
+    assert ("stop", service) in calls
+    assert ("reset-failed", service) not in calls
 
 
 @pytest.mark.parametrize(
@@ -2974,7 +3006,8 @@ def test_restore_bound_failed_service_sequence_reports_each_failed_suboperation(
         if arguments == failing_operation:
             raise runtime_lifecycle.RuntimeLifecycleError("untrusted-manager-detail")
         if arguments == ("stop", service):
-            states[service]["ActiveState"] = "inactive"
+            if failing_operation[0] != "reset-failed":
+                states[service]["ActiveState"] = "inactive"
             return {}
         if arguments == ("reset-failed", service):
             return {}
