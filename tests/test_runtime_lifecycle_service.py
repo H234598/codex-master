@@ -40,6 +40,7 @@ def _identity(path: Path) -> tuple[int, int, int, int, int, bytes]:
             b"BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind",
         ),
         (b"RuntimeDirectory=the-hive-hourly-runtime\n", b""),
+        (b"RuntimeDirectoryMode=0700\n", b"RuntimeDirectoryMode=0755\n"),
         (b"--protected-home-runtime --json", b"--json"),
     ),
 )

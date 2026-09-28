@@ -900,6 +900,7 @@ def test_hourly_probe_service_renderer_rejects_a_generation_only_sandbox() -> No
             b"BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind",
         ),
         (b"RuntimeDirectory=the-hive-hourly-runtime\n", b""),
+        (b"RuntimeDirectoryMode=0700\n", b"RuntimeDirectoryMode=0755\n"),
         (
             b"--protected-home-runtime --json",
             b"--json",
