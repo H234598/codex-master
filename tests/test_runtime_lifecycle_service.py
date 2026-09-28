@@ -24,6 +24,9 @@ from the_hive import runtime_lifecycle  # noqa: E402
 
 _CANARY_GENERATION = "a" * 40
 _CANARY_DIGEST = "sha256:" + "b" * 64
+_LIVE_CANARY_FIXTURE = (
+    ROOT / "tests" / "fixtures" / "runtime_lifecycle" / "live-canary-v1.json"
+)
 _CANARY_STAGE_CODES = (
     "command_runtime_directory_unavailable",
     "command_spawn_helper_unavailable",
@@ -336,6 +339,44 @@ def test_canary_image_is_source_and_manifest_bound(
     ).replace(b"@MASTERJET_GENERATION@", commit.encode()).replace(
         b"@MASTERJET_MANIFEST_DIGEST@", image.manifest_digest.encode()
     )
+
+
+def test_live_canary_fixture_is_digest_bound_and_secret_free() -> None:
+    raw = _LIVE_CANARY_FIXTURE.read_bytes()
+    assert all(
+        marker not in raw
+        for marker in (b"/home/", b"teladi", b"Bearer ", b'"api_key"', b'"access_token"')
+    )
+    payload = json.loads(raw)
+    digest = payload.pop("fixture_digest")
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+    assert digest == "sha256:" + hashlib.sha256(encoded).hexdigest()
+    assert payload["format"] == "the-hive-runtime-live-canary-v1"
+    assert payload["consumer_e2e"] == {
+        "canonical_artifacts_mutated": False,
+        "cleanup_quiescent": True,
+        "entrypoint": "scripts/the-hive-runtime-service canary",
+        "exit_code": 0,
+        "layers": [
+            "manager_syntax_transport",
+            "namespace_sandbox",
+            "helper",
+            "product_logic",
+        ],
+        "result": {
+            "error_code": None,
+            "raw_output": "not_returned",
+            "status": "runtime_canary_green",
+        },
+    }
+    assert payload["redaction"] == {
+        "allowlisted_fields": True,
+        "contains_absolute_paths": False,
+        "contains_account_ids": False,
+        "contains_credentials": False,
+        "raw_output": "not_returned",
+    }
 
 
 def test_canary_source_binding_rejects_untracked_input(tmp_path: Path) -> None:

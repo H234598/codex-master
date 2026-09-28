@@ -1,0 +1,39 @@
+{
+  "captured_at": "2026-09-28T02:57:06Z",
+  "consumer_e2e": {
+    "canonical_artifacts_mutated": false,
+    "cleanup_quiescent": true,
+    "entrypoint": "scripts/the-hive-runtime-service canary",
+    "exit_code": 0,
+    "layers": [
+      "manager_syntax_transport",
+      "namespace_sandbox",
+      "helper",
+      "product_logic"
+    ],
+    "result": {
+      "error_code": null,
+      "raw_output": "not_returned",
+      "status": "runtime_canary_green"
+    }
+  },
+  "fixture_digest": "sha256:a2acde09a060b84520a9d8c4390b5915a63931d26360b8f782e11cf8ccbf5e18",
+  "format": "the-hive-runtime-live-canary-v1",
+  "host_compatibility": {
+    "kernel": "7.2.5-200.fc44.x86_64",
+    "python": "3.14.7",
+    "scope": "user",
+    "shell": "GNU bash 5.3.9",
+    "systemd": "259",
+    "systemd_build": "259.9-1.fc44"
+  },
+  "observed_manifest_digest": "sha256:e6b3799586e0856884cbd6aaa03a2fcfb41acca8a80ee3e57be4277d0000d72f",
+  "observed_source_generation": "7ba3607d21e1a3602e313cb620997b1f545f1f22",
+  "redaction": {
+    "allowlisted_fields": true,
+    "contains_absolute_paths": false,
+    "contains_account_ids": false,
+    "contains_credentials": false,
+    "raw_output": "not_returned"
+  }
+}
