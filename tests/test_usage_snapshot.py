@@ -20,7 +20,7 @@ PRODUCER_NOW = datetime(2026, 8, 31, 12, 1, tzinfo=UTC)
 PRODUCER_ROOT = Path(
     os.environ.get("THE_HIVE_TEST_CODEX_USAGE_ROOT", "/home/teladi/codex-usage")
 )
-PRODUCER_COMMIT = "df2c2b3cdd48b0fdd0f020eedbd7055343ad6b6a"
+PRODUCER_COMMIT = "f495de4fdae9e99d474a65129028984efb8b555d"
 PRODUCER_SOURCE_FILES = (
     "pyproject.toml",
     "src/codex_usage/__init__.py",
@@ -225,17 +225,91 @@ def test_d300_pinned_producer_06542_golden_generation_is_complete(
 
     assert result.generation_id == pointer["current_generation_id"]
     assert active["version"] == "0.6.542"
-    assert active["release_id"] == "0.6.542-8da41af5293cf481"
+    assert active["release_id"] == "0.6.542-d08706fbbc4e7b99"
     assert (
         active["source_manifest_sha256"]
-        == "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0"
+        == "d08706fbbc4e7b99c769787e42dd4c4ef4b956b1e3ec8fb0175acb8c58c566b6"
     )
     assert binding["usage_binding"]["producer_version"] == "0.6.542"
-    assert binding["usage_binding"]["release_id"] == "0.6.542-8da41af5293cf481"
+    assert binding["usage_binding"]["release_id"] == "0.6.542-d08706fbbc4e7b99"
     assert (
         binding["usage_binding"]["source_manifest_sha256"]
-        == "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0"
+        == "d08706fbbc4e7b99c769787e42dd4c4ef4b956b1e3ec8fb0175acb8c58c566b6"
     )
+
+
+def test_d300_reader_accepts_submillisecond_history_quantization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    payload = _payload_with_complete_evidence(paths)
+    account = payload["accounts"][0]
+    account["freshness"] = {
+        "captured_at": "2026-08-31T11:59:59.915872Z",
+        "fresh_until": "2026-08-31T12:14:59.915872Z",
+        "stale": False,
+    }
+    for evidence in account["tracker_evidence"]:
+        evidence["last_sample_at"] = "2026-08-31T11:59:59.916000Z"
+    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))[
+        "authorities"
+    ]
+    _rebind_payload_and_authority(paths, payload, authorities)
+
+    assert read_golden(state_home).status == "complete"
+
+
+def test_d300_reader_rejects_history_sample_one_millisecond_after_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    payload = _payload_with_complete_evidence(paths)
+    account = payload["accounts"][0]
+    account["freshness"] = {
+        "captured_at": "2026-08-31T11:59:59.915872Z",
+        "fresh_until": "2026-08-31T12:14:59.915872Z",
+        "stale": False,
+    }
+    for evidence in account["tracker_evidence"]:
+        evidence["last_sample_at"] = "2026-08-31T11:59:59.916872Z"
+    authorities = json.loads(paths["authority"].read_text(encoding="utf-8"))[
+        "authorities"
+    ]
+    _rebind_payload_and_authority(paths, payload, authorities)
+
+    assert read_golden(state_home).status == "invalid"
+
+
+@pytest.mark.parametrize(
+    ("size_bytes", "expected_status"),
+    (
+        (128 * 1024 * 1024, "complete"),
+        (128 * 1024 * 1024 + 1, "invalid"),
+    ),
+)
+def test_d300_reader_uses_history_capture_limit_for_source_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    size_bytes: int,
+    expected_status: str,
+) -> None:
+    state_home, paths = write_producer_golden(tmp_path, monkeypatch)
+    source_inputs = json.loads(paths["source_inputs"].read_text(encoding="utf-8"))
+    source_inputs["history"]["database"] = {
+        "ctime_ns": 1,
+        "device": 1,
+        "gid": 0,
+        "inode": 1,
+        "mode": 0o600,
+        "mtime_ns": 1,
+        "sha256": "0" * 64,
+        "size_bytes": size_bytes,
+        "uid": 0,
+    }
+    _write_json(paths["source_inputs"], source_inputs)
+    refresh_current_binding(paths)
+
+    assert read_golden(state_home).status == expected_status
 
 
 def _write_json(path: Path, value: object, *, newline: bool = False) -> None:

@@ -1615,14 +1615,14 @@ def test_d300_consumer_producer_contract_accepts_only_named_06542_identity() -> 
 
     valid = (
         b'_PRODUCER_VERSION = "0.6.542"\n'
-        b'_PRODUCER_SOURCE_MANIFEST_SHA256 = "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0"\n'
-        b'_PRODUCER_RELEASE_ID = "0.6.542-8da41af5293cf481"\n'
+        b'_PRODUCER_SOURCE_MANIFEST_SHA256 = "d08706fbbc4e7b99c769787e42dd4c4ef4b956b1e3ec8fb0175acb8c58c566b6"\n'
+        b'_PRODUCER_RELEASE_ID = "0.6.542-d08706fbbc4e7b99"\n'
         b'if python_directory[2] != "python3.14":\n    raise ValueError()\n'
     )
     retired = valid.replace(b'"0.6.542"', b'"0.6.541"')
     other_version = valid.replace(b'"0.6.542"', b'"0.6.543"')
     other_manifest = valid.replace(
-        b"8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0",
+        b"d08706fbbc4e7b99c769787e42dd4c4ef4b956b1e3ec8fb0175acb8c58c566b6",
         b"0" * 64,
     )
     heuristic_only = b"# " + valid

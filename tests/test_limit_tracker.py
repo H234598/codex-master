@@ -26,7 +26,7 @@ from the_hive.usage_snapshot import (
 
 NOW = datetime(2026, 8, 26, 18, 0, tzinfo=UTC)
 GENERATION = "1" * 32
-SOURCE_DIGEST = "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0"
+SOURCE_DIGEST = "d08706fbbc4e7b99c769787e42dd4c4ef4b956b1e3ec8fb0175acb8c58c566b6"
 RESET = "2026-08-27T00:00:00Z"
 
 

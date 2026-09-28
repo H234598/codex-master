@@ -25,6 +25,7 @@ _MAX_BINDING_BYTES = 32768
 _MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 _MAX_POOL_AUTHORITY_BYTES = 256 * 1024
 _MAX_SOURCE_INPUT_BYTES = 512 * 1024
+_MAX_HISTORY_SOURCE_BYTES = 128 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 128 * 1024
 _MAX_LOCK_BYTES = 4096
 _MAX_ACCOUNTS = 100
@@ -37,6 +38,7 @@ _MAX_ATTESTATION_FILE_BYTES = 4 * 1024 * 1024
 _MAX_RELEASE_TREE_ENTRIES = 4096
 _MAX_RELEASE_TREE_BYTES = 128 * 1024 * 1024
 _MAX_HISTORY_SAMPLES = 500_000
+_HISTORY_TIMESTAMP_RESOLUTION = timedelta(milliseconds=1)
 _WINDOWS = frozenset({18000, 604800, 2592000})
 _GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
 _ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -45,10 +47,10 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _PRODUCER_VERSION = "0.6.542"
 _PRODUCER_SOURCE_MANIFEST_SHA256 = (
-    "8da41af5293cf4816a04db5443b14c718d496756c666ea8854f8b053021f14f0"
+    "d08706fbbc4e7b99c769787e42dd4c4ef4b956b1e3ec8fb0175acb8c58c566b6"
 )
-_PRODUCER_RELEASE_ID = "0.6.542-8da41af5293cf481"
-_RELEASE_RE = re.compile(r"^0\.6\.542-8da41af5293cf481$")
+_PRODUCER_RELEASE_ID = "0.6.542-d08706fbbc4e7b99"
+_RELEASE_RE = re.compile(r"^0\.6\.542-d08706fbbc4e7b99$")
 _RETIRED_SPARK_SOURCE_POOL = "gpt-5.3-codex-spark"
 _AUTHORITY_POOL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -777,7 +779,11 @@ def _nonnegative_int(value: object) -> int:
     return value
 
 
-def _source_file_binding(value: object) -> dict[str, int | str]:
+def _source_file_binding(
+    value: object,
+    *,
+    maximum: int,
+) -> dict[str, int | str]:
     if type(value) is not dict:
         raise _Invalid()
     _exact(
@@ -808,7 +814,7 @@ def _source_file_binding(value: object) -> dict[str, int | str]:
         }
     }
     result["sha256"] = _hex(value["sha256"])
-    if result["mode"] != 0o600 or result["size_bytes"] > _MAX_SOURCE_INPUT_BYTES:
+    if result["mode"] != 0o600 or result["size_bytes"] > maximum:
         raise _Invalid()
     return result
 
@@ -841,7 +847,7 @@ def _source_inputs_v2(payload: bytes) -> None:
     if value["source_input_binding_schema_version"] != 1:
         raise _Invalid()
     _source_directory_binding(value["current_directory"])
-    _source_file_binding(value["owner_source"])
+    _source_file_binding(value["owner_source"], maximum=_MAX_SOURCE_INPUT_BYTES)
 
     records = value["records"]
     if type(records) is not list or len(records) > _MAX_ACCOUNTS:
@@ -863,11 +869,11 @@ def _source_inputs_v2(payload: bytes) -> None:
         if type(account_id) is not str or _ACCOUNT_RE.fullmatch(account_id) is None:
             raise _Invalid()
         record_ids.append(account_id)
-        _source_file_binding(record["current_file"])
+        _source_file_binding(record["current_file"], maximum=_MAX_SOURCE_INPUT_BYTES)
         _nonnegative_int(record["state_generation"])
         sidecar = record["state_generation_file"]
         if sidecar is not None:
-            _source_file_binding(sidecar)
+            _source_file_binding(sidecar, maximum=_MAX_SOURCE_INPUT_BYTES)
     if record_ids != sorted(record_ids) or len(record_ids) != len(set(record_ids)):
         raise _Invalid()
 
@@ -877,7 +883,7 @@ def _source_inputs_v2(payload: bytes) -> None:
     _exact(history, {"consumed_rows", "database", "shm", "wal"})
     for name in ("database", "shm", "wal"):
         if history[name] is not None:
-            _source_file_binding(history[name])
+            _source_file_binding(history[name], maximum=_MAX_HISTORY_SOURCE_BYTES)
     rows = history["consumed_rows"]
     if type(rows) is not list or len(rows) > _MAX_TOTAL_TRENDS:
         raise _Invalid()
@@ -2324,7 +2330,7 @@ def _serialize_payload_v2(value: object) -> bytes:
             identity = (item["pool"], item["limit_window_seconds"])
             sample_age = generated_time - last_sample_time
             if (
-                last_sample_time > captured_time
+                last_sample_time >= captured_time + _HISTORY_TIMESTAMP_RESOLUTION
                 or limits_with_reset[identity] <= last_sample_time
                 or limits_with_reset[identity] <= generated_time
                 or (
@@ -2501,7 +2507,7 @@ def _payload_v2(
                 or (samples > 1 and first_sample >= last_sample)
                 or (pool, window) not in limits
                 or limits[(pool, window)][2] is None
-                or last_sample > captured_at
+                or last_sample >= captured_at + _HISTORY_TIMESTAMP_RESOLUTION
                 or limits[(pool, window)][2] <= last_sample
                 or limits[(pool, window)][2] <= generated_at
                 or (
