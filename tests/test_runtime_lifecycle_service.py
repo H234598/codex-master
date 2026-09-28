@@ -747,12 +747,42 @@ def test_canary_accepts_exact_fail_closed_empty_private_state(
     assert manager.reset is True
 
 
-def test_canary_rejects_noncanonical_empty_private_state_reason(tmp_path: Path) -> None:
+def test_canary_accepts_a_valid_fail_closed_live_usage_state(tmp_path: Path) -> None:
     invocation = tmp_path / "invocation"
     invocation.mkdir(mode=0o700)
     image = _fake_canary_image(invocation, _CANARY_STAGE_CODES[0])
     payload = json.loads(_canary_isolated_health())
-    payload["global_pilot_readiness"]["reason_codes"] = ["usage_missing"]
+    payload["global_pilot_readiness"] = {
+        "schema_version": 1,
+        "pilot": "blocked",
+        "generation_id": "1" * 32,
+        "freshness": "stale",
+        "candidate_count": 0,
+        "reason_codes": ["usage_stale"],
+        "raw_output": "not_returned",
+    }
+    health = image.state_root / "hive-hourly-health.json"
+    health.write_bytes(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+    health.chmod(0o600)
+
+    assert runtime_lifecycle._canary_evidence_result(
+        image=image,
+        manager_state={
+            "ActiveState": "failed",
+            "Result": "exit-code",
+            "ExecMainStatus": "1",
+        },
+    ) == ("runtime_canary_green", None)
+
+
+def test_canary_rejects_a_malformed_fail_closed_readiness_reason(tmp_path: Path) -> None:
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    image = _fake_canary_image(invocation, _CANARY_STAGE_CODES[0])
+    payload = json.loads(_canary_isolated_health())
+    payload["global_pilot_readiness"]["reason_codes"] = ["not-a-valid-reason"]
     health = image.state_root / "hive-hourly-health.json"
     health.write_bytes(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
