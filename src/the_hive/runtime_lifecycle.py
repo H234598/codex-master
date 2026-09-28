@@ -3011,6 +3011,12 @@ def _discard_new_generation(bound: _BoundCutover) -> None:
         return
     candidate = bound.release_root / "generations" / bound.source_commit
     try:
+        candidate.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise _error("runtime_lifecycle_rollback_failed") from exc
+    try:
         from the_hive.runtime_layout import RuntimeLayout
 
         layout = RuntimeLayout.from_runtime_root(candidate)
@@ -3031,6 +3037,12 @@ def _discard_new_generation(bound: _BoundCutover) -> None:
     except RuntimeLifecycleError:
         raise
     except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            pass
         raise _error("runtime_lifecycle_rollback_failed") from exc
 
 

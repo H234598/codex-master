@@ -3743,6 +3743,18 @@ def test_cutover_postinstall_failure_restores_pricing_and_discards_generation(
             assert not path.exists()
 
 
+def test_generation_discard_accepts_installer_self_cleanup(tmp_path: Path) -> None:
+    release_root = tmp_path / "the-hive-runtime"
+    (release_root / "generations").mkdir(mode=0o700, parents=True)
+    bound = SimpleNamespace(
+        source_commit="b" * 40,
+        generations_before=frozenset({"a" * 40}),
+        release_root=release_root,
+    )
+
+    runtime_lifecycle._discard_new_generation(bound)
+
+
 def test_cutover_bounded_probe_failure_restores_bound_state(tmp_path: Path, monkeypatch) -> None:
     bound, states = _bound_failure_fixture(tmp_path)
     monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
