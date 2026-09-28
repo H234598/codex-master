@@ -57,6 +57,38 @@ _PUBLIC_DOCUMENTATION_OPSEC_CATEGORIES = (
     "private network addresses and local absolute paths",
     "raw logs, stack traces, or screenshots",
 )
+_RUNTIME_MIGRATION_POLICY_SOURCE = (
+    b"src/the_hive/markdown/runtime-migration-policy-v1.json"
+)
+_RUNTIME_MIGRATION_POLICY_BEGIN = b"<!-- hive-runtime-migration-policy-v1:begin "
+_TEAMLEAD_RUNTIME_MIGRATION_MARKERS = (
+    b"Keep a small feature change separate from a runtime or installation "
+    b"migration.",
+    b"scope/budget gate",
+    b"separate prerequisite work package",
+    b"read-only live preflight before development and before a requested "
+    b"cutover.",
+    b"focused tests before a final independent review",
+    b"real consumer E2E contract",
+    b"bound dry run, CAS/fencing, journal, rollback/HOLD, secrecy, and "
+    b"bounded telemetry",
+    b"no Install, Activate, Reload, or Cutover authority.",
+    b"explicitly named, attested predecessor input",
+)
+_QUEEN_RUNTIME_MIGRATION_MARKERS = (
+    b"runtime-migration-policy-v1.json",
+    b"no live lifecycle authority: do not Install, Activate, Reload, or "
+    b"Cutover.",
+    b"only read-only, attested evidence",
+    b"do not infer a live authority or a compatibility fallback.",
+)
+_WORKER_RUNTIME_MIGRATION_MARKERS = (
+    b"Do not activate an unbound runtime migration or an unbound cutover.",
+    b"no Install, Activate, Reload, or Cutover authority.",
+    b"only its explicitly named, attested predecessor input",
+    b"never a legacy or fallback runtime path.",
+    b"redacted, secret-free, and bounded.",
+)
 
 
 def _agent(
@@ -251,6 +283,49 @@ def test_visual_companion_rule_is_absent_from_worker_and_queen_profiles() -> Non
                 _VISUAL_COMPANION_RULE
                 not in projection.artifacts[projection.metadata.class_artifact_name]
             )
+
+
+def test_runtime_migration_policy_materializes_to_role_homes() -> None:
+    """Managed role homes retain the named migration gate without live authority."""
+    contract = load_common_policy()
+    class_markers = {
+        "koenigin": _QUEEN_RUNTIME_MIGRATION_MARKERS,
+        "teamleiterin": _TEAMLEAD_RUNTIME_MIGRATION_MARKERS,
+        "worker": _WORKER_RUNTIME_MIGRATION_MARKERS,
+    }
+
+    source_path = _MARKDOWN_ROOT / "runtime-migration-policy-v1.json"
+    source_digest = hashlib.sha256(source_path.read_bytes()).hexdigest().encode(
+        "ascii"
+    )
+    assert _RUNTIME_MIGRATION_POLICY_BEGIN in contract.common_bytes
+    assert b'"source_digest":"sha256:' + source_digest + b'"' in contract.common_bytes
+    for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+        for profile, markers in class_markers.items():
+            projection = fleet_markdown.fleet_markdown_projection(
+                _agent(runner, profile)
+            )
+            primary = projection.artifacts[projection.metadata.provider_artifact_name]
+            class_artifact = projection.artifacts[
+                projection.metadata.class_artifact_name
+            ]
+            normalized_class = b" ".join(class_artifact.split())
+
+            assert primary.startswith(contract.common_bytes)
+            assert _RUNTIME_MIGRATION_POLICY_BEGIN in primary
+            assert _RUNTIME_MIGRATION_POLICY_SOURCE in class_artifact
+            for marker in markers:
+                assert marker in normalized_class
+
+
+def test_both_teamlead_role_profiles_share_runtime_migration_contract() -> None:
+    """Keep the direct and persistent team-lead profiles equally bounded."""
+    for profile in ("teamlead", "teamleiterin"):
+        body = (_MARKDOWN_ROOT / "classes" / f"{profile}.md").read_bytes()
+        normalized_body = b" ".join(body.split())
+
+        for marker in _TEAMLEAD_RUNTIME_MIGRATION_MARKERS:
+            assert marker in normalized_body
 
 
 def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:

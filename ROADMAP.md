@@ -74,3 +74,22 @@ und [CourseGuard](docs/courseguard.md).
 Der planbelegte Endzustand umfasst geprüfte und freigegebene Fachpfade,
 bereinigte Altpfade sowie stabilisierte veröffentlichte Anleitungen. Er ist
 geplant und kein Nachweis einer bereits erfolgten Umstellung.
+
+## Querschnitt: Release-/Runtime-Migrationspolicy (geplant)
+
+Die [kanonische maschinenlesbare Policy](src/the_hive/markdown/runtime-migration-policy-v1.json),
+ihre [digestgebundene Common-Policy-Projektion](src/the_hive/markdown/common.md)
+und die [fokussierten Policytests](tests/test_runtime_migration_policy.py)
+regeln die sichere, technologie-neutrale Migration über die Meilensteine 3 bis
+9 hinweg. Status ist `POLICY_MATERIALIZATION_OPEN`: Die Policy ist ein
+Voraussetzungspaket für konkrete Release-/Runtime-Migrationen, aber kein
+Nachweis von Installation, Aktivierung, Cutover oder Laufzeitverfügbarkeit.
+Jeder solche Schritt bleibt von seinem eigenen read-only Preflight,
+getrennten Migrationspaket, fokussierten Tests und unabhängiger Review
+abhängig.
+
+Die Gate-Reihenfolge ist verbindlich: (1) getrenntes Voraussetzungspaket,
+(2) read-only Preflight, (3) deterministischer Dry-run mit Cutover-CAS/Fencing
+und Journal, (4) mindestens ein echter Consumer-E2E-Vertrag, (5) fokussierte
+Tests und unabhängige Review, (6) deterministisches `HOLD` bei Gate- oder
+Beobachtungsfehler.

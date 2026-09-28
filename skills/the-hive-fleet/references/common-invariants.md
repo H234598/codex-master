@@ -14,6 +14,22 @@ Queen und TL attestieren Masterjet, MCP, Plugin, Manifest, Approval und Cache
 spätestens stündlich sowie vor jedem Spawn-Retry. Fehlende, widersprüchliche
 oder abgelaufene Evidenz ist ein fail-closed Blocker.
 
+## Runtime-Migrationsvertrag
+
+Die [Runtime-Migrationspolicy v1](../../../src/the_hive/markdown/runtime-migration-policy-v1.json)
+ist die alleinige verbindliche Quelle für Runtime- und
+Installationsmigrationen. Der Fleet-Skill und sein MCP-Koordinationspfad
+sammeln nur read-only Evidenz und erteilen keine Live-Autorität: kein Install,
+kein Activate, kein Reload und kein Cutover. Der Vertrag fordert einen
+gebundenen deterministischen Dry-run, CAS/Fencing, ein redigiertes
+Transaktionsjournal mit Rollback oder HOLD sowie secret-freie, begrenzte
+Telemetrie. Eine grüne interne Probe genügt nicht; die Evidenz enthält
+mindestens einen echten Consumer-E2E-Vertrag.
+
+Kompatibilität ist ausschließlich der genau benannte, attestierte
+Vorgängerversion-Input der Policy. Ein ungebundener Legacy-,
+Kompatibilitäts- oder Fallback-Laufzeitpfad bleibt gesperrt.
+
 ## Admission und Kommunikation
 
 Keine numerische globale, Serien- oder Provider-Flottenobergrenze. Admission

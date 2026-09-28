@@ -12,6 +12,17 @@ Legacyfallback.
 Laufzeit, Schweigen oder ein langer Test sind kein Grund zum Abbruch.
 Abbruch nur bei konkreter begründeter Fehlerannahme.
 
+## Runtime-Migrationsdiagnose
+
+Die [Runtime-Migrationspolicy v1](../../../src/the_hive/markdown/runtime-migration-policy-v1.json)
+gilt auch für Diagnoseberichte. Der Fleet-Skill und MCP-Koordinationspfad
+erheben nur read-only, redigierte Evidenz; sie führen weder Install noch
+Activate noch Reload noch Cutover aus oder erlauben dies. Ein Bericht bindet
+Dry-run-Inputs und -Digests, Transaktions-ID/Fence, Phase, Fehlerklasse,
+Rollback- oder HOLD-Zustand und finale Identität, ohne Secrets oder
+unbegrenzte Felder aufzunehmen. Zwei identische Live-Fehlschläge sperren den
+dritten Versuch bis neue Ursachenevidenz und ein Regressionstest vorliegen.
+
 ## Enge Berichtsausnahme und Resume
 
 `agent_assignment_report` ist nur nach `agent_wait` oder

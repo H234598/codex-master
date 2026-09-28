@@ -222,3 +222,82 @@ Fehlt für die direkt beantwortete Annotation das passende Sidecar, wird die
 Quelldatei nicht geändert. Die Regeln für `color1` bis `color6`,
 `data-annotation-note` als User-Notiz und `data-annotation-id` als eindeutige
 Marker-ID bleiben bindend; Marker und ihre Notizen werden erhalten.
+
+<!-- hive-runtime-migration-policy-v1:begin {"source_digest":"sha256:af4787b94465832624ec19560e84aa340776b36549a3e2f19fb03ec17fdf501e","version":1} -->
+## Hive Runtime- und Release-Migrationspolicy v1
+
+Diese versionierte Policy ist technologie-neutral. `enforcement: machine` kennzeichnet einen verbindlichen, maschinenprüfbaren Laufzeit- oder Releasevertrag. Dieser Policy-Compiler erzwingt derzeit ausschließlich die kanonische Quelle, die normierten Maschinenverträge und ihre vollständige Projektion; ein Runtime-Executor für die operative Ausführung ist unbekannt und nicht implementiert. `enforcement: governance` kennzeichnet einen verbindlichen menschlichen Prozess-Gate.
+
+Kanonische Quelle: `src/the_hive/markdown/runtime-migration-policy-v1.json`.
+
+### delivery-and-preflight
+
+Getrennte Liefergegenstände und beobachtbare Vorprüfungen verhindern, dass Produktänderungen unter Zeitdruck zu unkontrollierten Runtime-Eingriffen werden.
+
+Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `{"cutover_preflight":"read_only_live","development_preflight":"read_only_live","feature_delivery":"separate","migration_budget":"separate_prerequisite","migration_delivery":"separate_prerequisite","scope_gate":"explicit"}`
+
+- `separate-feature-and-migration-deliverables` (enforcement: governance): Eine kleine Feature-Änderung und eine Runtime- oder Installationsmigration werden als getrennte Liefergegenstände geplant, geprüft und freigegeben.
+- `read-only-live-preflight-before-development-and-cutover` (enforcement: governance): Vor Entwicklungsbeginn und unmittelbar vor dem Cutover wird ein ausschließlich lesender Live-Preflight mit attestierter Ausgangslage durchgeführt; fehlende oder widersprüchliche Evidenz blockiert.
+- `migration-budget-gate` (enforcement: governance): Eine unerwartete Migration wird ein eigenes Voraussetzungspaket; das ursprüngliche Feature darf seinen Umfang nicht still erweitern.
+- `scope-multiplication-gate` (enforcement: governance): Jede Ausweitung auf weitere Hosts, Consumer, Datenklassen oder Migrationsschritte benötigt ein explizites Scope-Gate und darf nicht implizit vervielfacht werden.
+
+### versioning-and-deterministic-execution
+
+Explizite Versionen, gebundene Eingaben und reproduzierbare Abläufe machen Migrationen prüfbar und begrenzen TOCTOU- sowie Kompatibilitätsrisiken.
+
+Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `{"bundle":{"implicit_path_dependency":"deny","interactive_shell_dependency":"deny","worktree_dependency":"deny"},"compatibility":{"attested_predecessor_count":1,"current_version_required":true,"support_window_versions":2,"unbounded_legacy":"deny"},"downlevel":{"mode":"reject","offline_staged_path":"required"},"dry_run":{"actions":true,"bound_inputs":true,"cutover_rebind":"cas_fencing","digests":true,"rollback":true,"target_identity":true},"idempotence":"required","lifecycle_phases":["install","migrate","activate","rollback"],"migrator_edge":"runtime-vN-to-vN-plus-1","provenance":"attested_before_publish"}`
+
+- `explicit-versioned-stepwise-migrators` (enforcement: machine): Jeder Online-Migrationsschritt ist explizit als runtime-vN→vN+1 versioniert; implizite Sprünge sind verboten.
+- `bounded-compatibility-window` (enforcement: machine): Das Kompatibilitätsfenster enthält nur die aktuelle und genau eine genau benannte, attestierte Vorgängerversion; unbeschränkte oder implizite Legacy-Kompatibilität ist verboten.
+- `downlevel-refusal-and-offline-staged-path` (enforcement: machine): Nicht unterstützte Downlevel-Versionen werden abgewiesen, außer ein dokumentierter Offline-Stufenpfad mit expliziten Zwischenschritten vorliegt; eine endlose Migratorenkette ist verboten.
+- `deterministic-dry-run-and-cutover-rebind` (enforcement: machine): Der Dry-run bindet Eingaben, Digests, Aktionen, Rollback und erwartete Zielidentität deterministisch; am Cutover werden dieselben Eingaben mittels Compare-and-Swap und Fencing erneut gebunden.
+- `idempotent-lifecycle-phases` (enforcement: machine): Install, Migrate, Activate und Rollback sind jeweils idempotent und liefern bei Wiederholung dieselbe attestierbare Zielwirkung oder HOLD.
+- `staged-provenance-before-publish` (enforcement: machine): Vor der Publikation werden Herkunft, Integrität und erwartete Identität der gestagten Generation attestiert; nicht attestierte Artefakte dürfen nicht publiziert werden.
+- `self-contained-release-bundle` (enforcement: machine): Das Release-Bundle ist selbstenthalten und darf weder vom Worktree noch von einer interaktiven Shell oder einem impliziten PATH abhängen.
+
+### transaction-publication-and-recovery
+
+Ein dauerhafter, gefenceter Transaktionsablauf verhindert Teilzustände, fremde Überschreibungen und unkontrollierte Wiederholungen bei Fehlern oder Abstürzen.
+
+Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `{"crash_recovery":"durable_resume_or_hold","install_activate":"separate","journal":{"allowlist":true,"durability":"fsync","max_bytes":8388608,"redaction_test":true,"rollback_guard":"cas_fencing","rollback_order":"inverse","snapshot_kinds":["pointer","file","service_unit","state"],"storage_failure":"block_publish"},"lock":{"fencing":true,"owner":"single","transaction_id":"monotone"},"operator_abort":{"after":"hold","auto_rollback_max":1},"owner_mode_drift":"revalidate_before_mutation_and_publish","publish_before_activate":true,"replay":{"plan_digest":true,"transaction_fence":true}}`
+
+- `complete-snapshot-journal-and-inverse-fenced-rollback` (enforcement: machine): Das Transaktionsjournal snapshotet alle betroffenen Pointer, Dateien, deklarierte Service-Units und Zustände; Rollback läuft in umgekehrter Reihenfolge und verwendet Compare-and-Swap sowie Fencing, damit fremde Änderungen nicht überschrieben werden.
+- `atomic-publication-before-consumer-activation` (enforcement: machine): Manager- oder Consumer-Aktivierung erfolgt erst nach vollständig atomarer Publikation der attestierten Generation.
+- `install-separate-from-activate` (enforcement: machine): Installation und Aktivierung sind getrennte, einzeln attestierbare Schritte.
+- `single-owner-monotone-transaction-fencing` (enforcement: machine): Ein Single-Owner-Lock sowie monotone Transaktions-IDs und Fencing verhindern Parallelstarts, stale writer und ABA.
+- `replay-fence-and-plan-digest` (enforcement: machine): Alte oder wiederholte Transaktionen werden durch Transaktions-Fence und Plan-Digest abgewiesen.
+- `durable-crash-resume-or-hold` (enforcement: machine): Reboot oder Prozesscrash mitten im Cutover werden aus einem dauerhaften Journal deterministisch als Resume oder HOLD behandelt; ein unjournalisierter Weiterlauf ist verboten.
+- `operator-abort-one-rollback-then-hold` (enforcement: machine): Ein Operator-Abbruch löst höchstens einen automatischen, gefenceten Rollback aus; danach ist HOLD erforderlich.
+- `storage-fsync-failure-blocks-publish` (enforcement: machine): Disk-full-, Journal- oder fsync-Fehler werden als Speicherfehler klassifiziert und blockieren die Publikation.
+- `owner-and-mode-drift-revalidation` (enforcement: machine): Owner-, Berechtigungs- oder Modusdrift wird vor Mutation und Publikation erneut validiert und führt bei Abweichung zu HOLD.
+
+### failure-observation-and-retention
+
+Begrenzte Versuche, zeitgebundene Beobachtung und kontrollierte Bereinigung verhindern Pingpong, festhängende Rollouts und das Fortleben gefährlicher Generationen.
+
+Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `{"after_auto_rollback":"hold","attested_lease":"monotone_or_attested","identical_live_failure_limit":2,"irreversible":{"mode":"forward_only","pre_snapshot":true,"tested_roll_forward":true},"new_cause_evidence":true,"observation_timeout_seconds":3600,"regression_test":true,"remote_partition":"bounded_retry_or_hold","retention":{"gc_after":"confirmed_consumer_switch_and_observation","security_denylist":"immediate_exception"}}`
+
+- `two-identical-live-failures-require-new-evidence` (enforcement: machine): Nach zwei identischen Live-Fehlschlägen ist ein dritter Versuch bis zu neuer Ursachenevidenz und einem Regressionstest gesperrt.
+- `bounded-observation-one-auto-rollback-then-hold` (enforcement: machine): Vor Commit gilt ein begrenztes Beobachtungsfenster mit hartem Timeout; bei Fehlschlag ist maximal ein automatischer Rollback erlaubt, danach HOLD ohne Rollback-Pingpong.
+- `irreversible-forward-only-roll-forward` (enforcement: machine): Irreversible Migrationen sind forward-only, besitzen einen Pre-Snapshot und einen getesteten Roll-forward statt eines vorgetäuschten Rollbacks.
+- `deferred-gc-with-security-denylist-exception` (enforcement: machine): Garbage Collection erfolgt erst nach bestätigtem Consumer-Wechsel und Beobachtungsfenster; eine explizite Security-Denylist oder Notfallausnahme darf eine gefährliche alte Generation sofort entfernen.
+- `bounded-remote-partition-handling` (enforcement: machine): Teilnetz- oder Remote-Hive-Unterbrechungen erhalten nur begrenzte Retries und enden deterministisch in HOLD statt in unendlichem Warten.
+- `monotone-time-and-attested-lease` (enforcement: machine): Lease-Ablauf und Zeitentscheidungen verwenden monotone Zeit oder eine attestierte Lease, damit Clock-Skew nicht zu paralleler Autorität führt.
+- `attested-host-version-preflight` (enforcement: machine): Divergente Hostversionen werden im Preflight attestiert; nicht unterstützte Mischstände blockieren den Cutover.
+
+### evidence-contracts-and-telemetry
+
+Redigierte Evidenz, echte Consumer-Verträge und begrenzte Telemetrie machen reale Auswirkungen sichtbar, ohne Secrets oder unkontrollierte Datenmengen zu erzeugen.
+
+Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `{"compiler":{"artifact_digest":true,"canonical_source":true,"staleness_test":true},"consumer_contracts":{"classes":["launcher","hook","protocol_endpoint","service_unit","stable_name"],"real_e2e_minimum":1},"crash_faultpoint":"after_each_mutating_phase","error_classes":{"deterministic":"policy_or_schema","retry_mode":"bounded","retryable":"infrastructure"},"fixture":{"digest":true,"periodic_structure_compare":true,"source":"redacted_real_live"},"snapshot":{"allowlist":true,"max_bytes":8388608,"redaction_test":true,"secret_free":true},"telemetry":{"bounded_fields":true,"fields":["duration","phase","transaction_id","failure_class","rollback","final_identity"],"fixed_schema":true,"retention_seconds":2592000,"secret_free":true}}`
+
+- `redacted-live-fixture-digest-and-periodic-structure-compare` (enforcement: machine): Eine redaktierte Real-Live-Fixture ist ein Regressionstest; Fixture-Digest und periodischer redaktierter Vergleich mit der Live-Struktur erkennen Drift ohne Secrets.
+- `snapshot-allowlist-redaction-and-size-limit` (enforcement: machine): Snapshots verwenden eine Allowlist, einen Redaktionstest und ein Größenlimit; Secrets dürfen weder im Journal noch in Fixtures oder Telemetrie erscheinen.
+- `crash-faultpoint-after-each-mutating-phase` (enforcement: machine): Nach jeder mutierenden Phase prüft ein Crash-Injection-Faultpoint Recovery, Resume oder HOLD.
+- `consumer-contracts-with-real-end-to-end` (enforcement: machine): Consumer-Vertragstests decken Launcher, Hooks, konfigurierte Protokollendpunkte einschließlich MCP soweit vorhanden, deklarierte Service-Units und stabile Namen ab; mindestens ein echter Consumer-End-to-End-Vertrag ist erforderlich.
+- `focused-tests-before-independent-review` (enforcement: governance): Fokussierte Tests laufen vor einer finalen unabhängigen Review; externe Review ist optional und zusätzlich und darf nicht dauerhaft blockieren.
+- `bounded-secret-free-migration-telemetry` (enforcement: machine): Migrations-Telemetrie enthält Dauer, Phase, Transaktions-ID, Fehlerklasse, Rollback und finale Identität, aber keine Secrets; feste Schemata, begrenzte Felder und Retention verhindern Kardinalitäts- oder Speicherexplosion.
+- `failure-classification-retry-policy-schema` (enforcement: machine): Fehler werden mindestens in retrybare Infrastrukturfehler und deterministische Policy- oder Schemafehler klassifiziert; nur die erste Klasse darf begrenzt retried werden.
+- `canonical-policy-source-artifact-digest-staleness` (enforcement: machine): Eine kanonische Policy-Quelle erzeugt Artefakte mit Digest; ein Staleness-Test blockiert abweichende oder veraltete Projektionen.
+
+<!-- hive-runtime-migration-policy-v1:end -->

@@ -8,6 +8,11 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from the_hive.runtime_migration_policy import (
+    RuntimeMigrationPolicyError,
+    validate_runtime_migration_policy_materialization,
+)
+
 
 COMMON_POLICY_PATH = Path(__file__).with_name("markdown") / "common.md"
 MAX_COMMON_POLICY_BYTES = 64 * 1024
@@ -210,12 +215,22 @@ def apply_annotation_response_fixture(
 def load_common_policy(path: str | Path = COMMON_POLICY_PATH) -> CommonPolicyContract:
     """Load the sole canonical policy with strict, bounded validation."""
 
-    content = _read_bounded(Path(path))
+    policy_path = Path(path)
+    content = _read_bounded(policy_path)
     schema_version, generation = _parse_header(content)
     try:
         content.decode("utf-8")
     except UnicodeDecodeError:
         raise CommonPolicyError("common_policy_encoding_invalid") from None
+    try:
+        is_canonical_common_policy = policy_path.resolve() == COMMON_POLICY_PATH.resolve()
+    except OSError as exc:
+        raise CommonPolicyError("common_policy_unavailable") from exc
+    if is_canonical_common_policy:
+        try:
+            validate_runtime_migration_policy_materialization(content)
+        except RuntimeMigrationPolicyError as exc:
+            raise CommonPolicyError(str(exc)) from None
     return CommonPolicyContract(
         schema_version=schema_version,
         generation=generation,

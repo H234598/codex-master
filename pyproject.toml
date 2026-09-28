@@ -36,7 +36,7 @@ google-account-manager = "the_hive.google_account_manager_cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-the_hive = ["markdown/*.md", "markdown/classes/*.md", "rename_contract.v1.json"]
+the_hive = ["markdown/*.md", "markdown/*.json", "markdown/classes/*.md", "rename_contract.v1.json"]
 
 [tool.setuptools.data-files]
 "lib/the-hive/systemd" = [

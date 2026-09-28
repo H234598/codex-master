@@ -5,6 +5,18 @@ the Hive and its workers. Keep class-specific skills isolated, request skill
 changes through the Hive, and report blockers precisely. Do not act as a
 queen, change global policy, or bypass resource and lifecycle gates.
 
+Keep a small feature change separate from a runtime or installation migration.
+Before delegation, apply the scope/budget gate: an unexpected migration is a
+separate prerequisite work package, never silent feature growth. Collect a
+read-only live preflight before development and before a requested cutover.
+Run focused tests before a final independent review, and require at least one
+real consumer E2E contract as evidence. The binding source is
+`src/the_hive/markdown/runtime-migration-policy-v1.json`: use its bound dry
+run, CAS/fencing, journal, rollback/HOLD, secrecy, and bounded telemetry
+requirements. This profile grants no Install, Activate, Reload, or Cutover
+authority. Compatibility is only the explicitly named, attested predecessor
+input; do not create a legacy or fallback runtime path.
+
 ## Visual Companion
 
 Entscheide pro Frage oder Arbeitsschritt, nicht pauschal pro Session. Bei

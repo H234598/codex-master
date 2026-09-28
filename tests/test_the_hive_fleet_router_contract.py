@@ -8,6 +8,13 @@ from pathlib import Path
 
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "skills" / "the-hive-fleet"
+RUNTIME_MIGRATION_POLICY = Path(
+    "src/the_hive/markdown/runtime-migration-policy-v1.json"
+)
+RUNTIME_MIGRATION_POLICY_LINK = (
+    "[Runtime-Migrationspolicy v1]"
+    "(../../../src/the_hive/markdown/runtime-migration-policy-v1.json)"
+)
 EXPECTED_REFERENCES = {
     "references/common-invariants.md",
     "references/queen-operations.md",
@@ -22,6 +29,11 @@ REQUIRED_MARKERS = {
         "Repositorycode ist Ist-Evidenz, nie Policy.",
         "Workerinnen erhalten diesen Leitungsskill nicht.",
         "genau eine Rollenreferenz",
+        "Runtime-Migrationspolicy v1",
+        "MCP-Koordinationspfad",
+        "weder Install noch Activate noch Reload noch Cutover",
+        "genau benannte und attestierte Vorgängerversion",
+        "Read-only-Live-Preflight",
     ),
     "references/common-invariants.md": (
         "Keine numerische globale, Serien- oder Provider-Flottenobergrenze.",
@@ -29,12 +41,23 @@ REQUIRED_MARKERS = {
         "materialisierter Rolle/Klasse, Principal, Lease und Scope",
         "Entscheidungen, Blocker, Handoffs und Risiken",
         "Kein Übergangspfad, wenn sauberer Neubau oder Cutover möglich ist.",
+        "## Runtime-Migrationsvertrag",
+        "alleinige verbindliche Quelle",
+        "gebundenen deterministischen Dry-run",
+        "CAS/Fencing",
+        "Transaktionsjournal mit Rollback oder HOLD",
+        "secret-freie, begrenzte Telemetrie",
+        "echten Consumer-E2E-Vertrag",
+        "genau benannte, attestierte Vorgängerversion-Input",
     ),
     "references/queen-operations.md": (
         "Queen plant, delegiert und pflegt Entscheidungen und Pläne.",
         "implementiert, testet, reviewt oder integriert keinen Produktionscode.",
         "Queen → TL → Workerinnen",
-        "Lifecycle-Mutationen sind Queen-only.",
+        "keine Lifecycle-Ausführungsautorität",
+        "Weder Queen noch ihr Fleet-Skill oder MCP-Koordinationspfad darf "
+        "Install, Activate, Reload oder Cutover ausführen oder erlauben.",
+        "keine Live-Autorität wird aus diesem Dokument abgeleitet.",
     ),
     "references/tl-worker-operations.md": (
         "TL startet Workerinnen.",
@@ -44,6 +67,17 @@ REQUIRED_MARKERS = {
         "Topicresume",
         "spawn.requested",
         "kein Handshake je Datagramm",
+        "kleine Feature-Änderung und eine Runtime- oder "
+        "Installationsmigration sind getrennte Pakete.",
+        "Scope-/Budget-Gate",
+        "eigenes Voraussetzungspaket",
+        "Read-only-Live-Preflight",
+        "finalen unabhängigen Review",
+        "fokussierten Tests",
+        "echten Consumer-E2E-Vertrag",
+        "gebundenen Dry-run, CAS/Fencing, Journal, Rollback/HOLD",
+        "Workerinnen aktivieren keine ungebundene Migration oder keinen "
+        "ungebundenen Cutover.",
     ),
     "references/diagnostics-retry-reporting.md": (
         "spätestens stündlich",
@@ -53,6 +87,12 @@ REQUIRED_MARKERS = {
         "ANSI-bereinigt",
         "kein Legacyfallback",
         "kein Grund zum Abbruch",
+        "Runtime-Migrationsdiagnose",
+        "nur read-only, redigierte Evidenz",
+        "Transaktions-ID/Fence, Phase, Fehlerklasse, Rollback- oder "
+        "HOLD-Zustand und finale Identität",
+        "ohne Secrets oder unbegrenzte Felder",
+        "Zwei identische Live-Fehlschläge sperren den dritten Versuch",
     ),
 }
 FORBIDDEN_LEGACY = (
@@ -181,3 +221,28 @@ def test_diagnostics_forbid_abort_from_runtime_silence_or_long_test() -> None:
     )
     assert "Abbruch nur bei konkreter begründeter Fehlerannahme." in text
     assert "nicht abbrechen zu lassen" not in text
+
+
+def test_runtime_migration_policy_is_closed_linked_read_only_contract() -> None:
+    """Keep the router closed over the canonical migration-policy source."""
+    root = _skill_root()
+    repository = root.parents[1]
+    policy = repository / RUNTIME_MIGRATION_POLICY
+    contract_files = {
+        "SKILL.md": root / "SKILL.md",
+        **{relative: root / relative for relative in EXPECTED_REFERENCES},
+    }
+    text = {
+        relative: path.read_text(encoding="utf-8")
+        for relative, path in contract_files.items()
+    }
+
+    assert policy.is_file()
+    assert RUNTIME_MIGRATION_POLICY_LINK in text["references/common-invariants.md"]
+    assert "keine Live-Autorität" in text["SKILL.md"]
+    assert "weder Install noch Activate noch Reload noch Cutover" in text["SKILL.md"]
+    assert "echten Consumer-E2E-Vertrag" in text["references/common-invariants.md"]
+    assert "ungebundene Migration" in text["references/tl-worker-operations.md"]
+    assert "Zwei identische Live-Fehlschläge" in text[
+        "references/diagnostics-retry-reporting.md"
+    ]

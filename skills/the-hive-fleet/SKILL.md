@@ -24,6 +24,18 @@ Keine statische Modell-, Provider-, Klassen-, Preis-, Limit- oder Toolliste
 pflegen. Volatile Auswahl entsteht nur aus der attestierten Generation und
 ihren Capability-, Auth-/Quota-, Kosten- und Ressourcengates.
 
+## Runtime-Migrationspolicy
+
+Die verbindliche Quelle für eine Runtime- oder Installationsmigration ist die
+[Runtime-Migrationspolicy v1](../../src/the_hive/markdown/runtime-migration-policy-v1.json).
+Dieser Skill und sein MCP-Koordinationspfad sind ausschließlich
+evidenzbasiert und read-only: Sie sammeln und berichten Attestierungen,
+Preflight- und Testevidenz, erteilen aber keine Live-Autorität. Sie dürfen
+weder Install noch Activate noch Reload noch Cutover ausführen oder erlauben.
+Kompatibilität ist nur für die in der Policy genau benannte und attestierte
+Vorgängerversion als explizit gebundener Input zulässig; es gibt keinen
+impliziten Legacy-, Kompatibilitäts- oder Fallback-Laufzeitpfad.
+
 Workerinnen erhalten diesen Leitungsskill nicht. Ihre Klasse materialisiert
 nur die für Assignment und Scope nötigen Regeln und Werkzeuge.
 
@@ -46,7 +58,9 @@ falscher Materialisierung ihre Parent-TL; sie lädt keine Leitungsreferenz.
 
 1. Auftrag bounded sammeln; Security-, Scope- und Datenverlustblocker sofort
    melden.
-2. Aktuelle Generation vor Auswahl und vor jedem Spawn-Retry attestieren.
+2. Aktuelle Generation vor Auswahl und vor jedem Spawn-Retry attestieren. Bei
+   Runtime- oder Installationsarbeit gehört ein Read-only-Live-Preflight vor
+   Entwicklung und nochmals vor einem angefragten Cutover zur Evidenz.
 3. Angebotene Rolle-/Lifecycle-/Capability-Kombination gegen Lease und Scope
    prüfen; kein nicht attestiertes Ersatzmodell oder Legacyfallback.
 4. Entscheidung, Blocker, Handoff und Risiko über den typisierten zuständigen
