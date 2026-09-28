@@ -611,12 +611,22 @@ def _openai_key_from_file(path: Path = DEFAULT_TOKEN_FILE) -> str | None:
     return None
 
 
+def _agent_home_files(name: str) -> list[Path]:
+    agents = Path.home() / ".codex-agents"
+    if not agents.is_dir():
+        return []
+    ignored = {"plugins", ".tmp", ".device-login-staging"}
+    return sorted(
+        path
+        for path in agents.rglob(name)
+        if ignored.isdisjoint(path.relative_to(agents).parts[:-1])
+    )
+
+
 def _catalog_paths() -> list[Path]:
     configured = os.environ.get("CODEX_MODEL_CATALOG")
     paths = [Path(configured)] if configured else [Path.home() / ".codex/models_cache.json"]
-    agents = Path.home() / ".codex-agents"
-    if agents.is_dir():
-        paths.extend(sorted(agents.glob("*/models_cache.json")))
+    paths.extend(_agent_home_files("models_cache.json"))
     # codex-usage owns the canonical homes for provisioned accounts.  They are
     # real Codex homes too and must participate in the three-way reconciliation.
     profiles = Path.home() / ".local/share/codex-usage/profiles"
@@ -704,9 +714,7 @@ def _write_effective_catalog(root: Path, eligible_flex: set[str]) -> Path | None
 
 def _codex_config_paths() -> list[Path]:
     paths = [Path.home() / ".codex/config.toml"]
-    agents = Path.home() / ".codex-agents"
-    if agents.is_dir():
-        paths.extend(sorted(agents.glob("*/config.toml")))
+    paths.extend(_agent_home_files("config.toml"))
     profiles = Path.home() / ".local/share/codex-usage/profiles"
     if profiles.is_dir():
         paths.extend(sorted(profiles.glob("*/codex-home/config.toml")))

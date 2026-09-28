@@ -174,6 +174,7 @@ def test_all_discovered_home_configs_receive_same_stable_catalog_and_resolved_ti
     configs = [_write_home(home, tiers=["priority"])]
     for relative in (
         Path(".codex-agents") / "agent-a",
+        Path(".codex-agents") / "Native" / "agent-b",
         Path(".local/share/codex-usage/profiles/profile-a/codex-home"),
         Path(".codex-test"),
     ):
