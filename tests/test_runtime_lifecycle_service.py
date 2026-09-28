@@ -1637,6 +1637,62 @@ def test_restore_bound_failed_oneshot_resets_the_manager_failed_state_before_ver
     assert states[service]["ActiveState"] == "inactive"
 
 
+def test_restore_bound_inactive_oneshot_resets_a_cutover_created_failed_record(
+    tmp_path: Path,
+) -> None:
+    """Stop alone cannot restore an inactive oneshot after a failed cutover."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+    service = "the-hive-hive-hourly-probe.service"
+    states[service] = {
+        "LoadState": "loaded",
+        "UnitFileState": "static",
+        "ActiveState": "inactive",
+    }
+    bound = runtime_lifecycle.replace(bound, states=tuple(states.items()))
+    # This is the manager state left by the failed candidate service. A stop
+    # operation is deliberately a no-op for the failed record; only
+    # reset-failed restores the exact inactive rollback target.
+    states[service] = {
+        "LoadState": "loaded",
+        "UnitFileState": "static",
+        "ActiveState": "failed",
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        calls.append(arguments)
+        if arguments == ("stop", service):
+            return {}
+        if arguments == ("reset-failed", service):
+            states[service] = {
+                "LoadState": "loaded",
+                "UnitFileState": "static",
+                "ActiveState": "inactive",
+            }
+            return {}
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    result = runtime_lifecycle._restore_bound_state_result(bound, systemctl)
+
+    assert result == runtime_lifecycle._RollbackResult(True, "complete", "none")
+    stop = ("stop", service)
+    reset = ("reset-failed", service)
+    show = (
+        "show",
+        service,
+        "--property=LoadState,UnitFileState,ActiveState,Result,ExecMainStatus",
+    )
+    assert calls.index(stop) < calls.index(reset) < calls.index(show)
+    assert states[service] == {
+        "LoadState": "loaded",
+        "UnitFileState": "static",
+        "ActiveState": "inactive",
+    }
+
+
 def test_restore_bound_failed_oneshot_quiesces_an_active_cutover_service_before_reset(
     tmp_path: Path,
 ) -> None:
@@ -1734,6 +1790,53 @@ def test_restore_bound_failed_service_sequence_reports_each_failed_suboperation(
 
     assert result == runtime_lifecycle._RollbackResult(
         False, phase, "manager_action_failed"
+    )
+
+
+@pytest.mark.parametrize(
+    "failing_operation",
+    (
+        ("stop", "the-hive-hive-hourly-probe.service"),
+        ("reset-failed", "the-hive-hive-hourly-probe.service"),
+    ),
+)
+def test_restore_bound_inactive_service_keeps_its_action_phase_on_failure(
+    tmp_path: Path, failing_operation: tuple[str, str]
+) -> None:
+    """New inactive-service normalization retains the service action phase."""
+
+    bound, states = _bound_failure_fixture(tmp_path)
+    service = "the-hive-hive-hourly-probe.service"
+    states[service] = {
+        "LoadState": "loaded",
+        "UnitFileState": "static",
+        "ActiveState": "inactive",
+    }
+    bound = runtime_lifecycle.replace(bound, states=tuple(states.items()))
+    states[service] = {
+        "LoadState": "loaded",
+        "UnitFileState": "static",
+        "ActiveState": "failed",
+    }
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments == failing_operation:
+            raise runtime_lifecycle.RuntimeLifecycleError("untrusted-manager-detail")
+        if arguments == ("reset-failed", service):
+            states[service] = {
+                "LoadState": "loaded",
+                "UnitFileState": "static",
+                "ActiveState": "inactive",
+            }
+            return {}
+        if arguments[0] == "show":
+            return states[arguments[1]]
+        return {}
+
+    assert runtime_lifecycle._restore_bound_state_result(
+        bound, systemctl
+    ) == runtime_lifecycle._RollbackResult(
+        False, "new_service_action", "manager_action_failed"
     )
 
 

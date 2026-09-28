@@ -2948,9 +2948,10 @@ def _restore_operations(
 ) -> tuple[tuple[str, ...], ...]:
     """Return the complete, ordered manager inverse for one bound unit.
 
-    A service bound as failed may have been started by the failed cutover.  It
-    must therefore be quiesced before its historical failure record is reset;
-    both operations remain under the caller's one fail-closed phase boundary.
+    Every service not bound as active may have acquired a failed record while
+    the cutover candidate was running. It must therefore be quiesced before
+    that record is reset; both operations remain under the caller's one
+    fail-closed phase boundary.
     """
 
     if state is None:
@@ -2967,7 +2968,7 @@ def _restore_operations(
                 else ("disable", "--now", unit)
             ),
         )
-    if state.get("ActiveState") == "failed":
+    if unit.endswith(".service") and not _state_is_active(state):
         return (("stop", unit), ("reset-failed", unit))
     return (("start", unit),) if _state_is_active(state) else (("stop", unit),)
 
