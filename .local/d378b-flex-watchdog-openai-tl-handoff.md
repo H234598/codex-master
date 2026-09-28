@@ -27,15 +27,15 @@ The one separately authorized live Canary from generation
 
 - `status=runtime_canary_failed`;
 - `error_code=runtime_canary_manager_failed`;
-- manifest digest reported as the bounded prefix `sha256:f152…` (the full
-  digest was not supplied to this follow-up and remains unknown); and
+- `manifest_digest=sha256:f152d43b836b703ab277a62c7a48646286a89dbb3e2e26fca92d18b5af5f158a`;
 - `raw_output=not_returned`.
 
 Post-run evidence found zero Canary run roots, zero Canary units, zero jobs,
 and only the coordination `.canary.lock`. No Canary/systemd-run journal
-metadata survived. The previous adapter collapsed every synchronous nonzero
-`systemd-run` result and discarded stderr, so the exact manager subpath cannot
-be reconstructed. The product root cause therefore remains unknown.
+metadata survived, and no historical stderr line was observed. The previous
+adapter collapsed every synchronous nonzero `systemd-run` result and discarded
+stderr, so the exact manager subpath cannot be reconstructed. The product root
+cause therefore remains unknown.
 
 Tracked files in this handoff:
 
@@ -101,13 +101,15 @@ authority:
    the complete invocation root. Any manager or filesystem cleanup uncertainty
    replaces the diagnosis with `runtime_canary_cleanup_unverified`.
 10. A synchronous `systemd-run` exit is classified only when exit status is
-    exactly 1, stdout is empty, and stderr is one exact installed systemd-259.9
-    `LANG=C` full line. The fixed classes distinguish transient-service
-    `Invalid argument`, user-bus absence/refusal, and manager `Access denied`.
-    Extra, multiple, oversized, dynamic, or unknown output remains
-    `runtime_canary_manager_failed`; OSError and timeout remain
-    `runtime_canary_manager_unavailable`. No raw text enters an exception or
-    public result, and the adapter still performs exactly one start attempt.
+    exactly 1, stdout is empty, and stderr is one exact expected `LANG=C` full
+    line derived from the installed systemd-259.9 `Failed to …: %s` formats.
+    These allowlisted lines are not claimed as historical observations. The
+    fixed classes distinguish transient-service `Invalid argument`, user-bus
+    absence/refusal, and manager `Access denied`. Extra, multiple, oversized,
+    dynamic, or unknown output remains `runtime_canary_manager_failed`;
+    OSError and timeout remain `runtime_canary_manager_unavailable`. No raw
+    text enters an exception or public result, and the adapter still performs
+    exactly one start attempt.
 
 The coordination root and its private lock may persist under the UID runtime
 directory. No generation, state record, process, or transient unit is retained.
@@ -213,7 +215,8 @@ The focused evidence covers:
 - concurrent invocation rejection;
 - foreign-unit rejection without mutation; and
 - caller-environment exclusion and raw-output redaction;
-- exact installed manager-error classification with one start attempt;
+- exact format-derived expected manager-error classification with one start
+  attempt;
 - collapse of secret-bearing, multi-line, contradictory, oversized, or
   unexpected-exit output to the generic fixed code;
 - unchanged OSError/timeout unavailability without a foreign exception cause
