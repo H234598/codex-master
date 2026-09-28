@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 import contextlib
 import ctypes
 from dataclasses import dataclass
@@ -38,6 +38,16 @@ _PROTECTED_HOME_RUNTIME_DIRECTORY = (
     _RUNTIME_DIRECTORY_ROOT / str(os.geteuid()) / "the-hive-hourly-runtime"
 )
 BOUNDED_PROCESS_CLEANUP_SECONDS = 0.5
+_PREEXEC_STAGE_CODES = frozenset(
+    {
+        "command_runtime_directory_unavailable",
+        "command_spawn_helper_unavailable",
+        "command_cgroup_preflight_unavailable",
+        "command_manager_preflight_unavailable",
+        "command_native_spawn_unavailable",
+        "command_cgroup_bind_unavailable",
+    }
+)
 
 
 class BoundedProcessError(RuntimeError):
@@ -46,6 +56,20 @@ class BoundedProcessError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+@contextlib.contextmanager
+def _preexec_stage(code: str) -> Iterator[None]:
+    """Replace only the legacy group collapse with one fixed stage code."""
+
+    if code not in _PREEXEC_STAGE_CODES:
+        raise BoundedProcessError("command_group_unavailable")
+    try:
+        yield
+    except BoundedProcessError as exc:
+        if exc.code != "command_group_unavailable":
+            raise
+        raise BoundedProcessError(code) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,10 +276,11 @@ def _verify_runner_capability(*, environment: dict[str, str], deadline: float) -
     try:
         controllers = (_CGROUP_ROOT / "cgroup.controllers").read_bytes()
     except OSError as exc:
-        raise BoundedProcessError("command_group_unavailable") from exc
+        raise BoundedProcessError("command_cgroup_preflight_unavailable") from exc
     if not controllers or not hasattr(os, "P_PIDFD") or not hasattr(os, "pipe2"):
-        raise BoundedProcessError("command_group_unavailable")
-    _systemctl(("show-environment",), environment=environment, deadline=deadline)
+        raise BoundedProcessError("command_cgroup_preflight_unavailable")
+    with _preexec_stage("command_manager_preflight_unavailable"):
+        _systemctl(("show-environment",), environment=environment, deadline=deadline)
 
 
 def _unit_name() -> str:
@@ -688,10 +713,12 @@ def run_bounded(
         )
     except LayoutError as exc:
         raise BoundedProcessError("command_group_unavailable") from exc
-    environment = minimal_environment(
-        home=home, bound_runtime_directory=bound_runtime_directory
-    )
-    helper = _load_runtime_spawn_helper(layout)
+    with _preexec_stage("command_runtime_directory_unavailable"):
+        environment = minimal_environment(
+            home=home, bound_runtime_directory=bound_runtime_directory
+        )
+    with _preexec_stage("command_spawn_helper_unavailable"):
+        helper = _load_runtime_spawn_helper(layout)
     _verify_runner_capability(environment=environment, deadline=deadline)
     unit = _unit_name()
     command = _systemd_run_arguments(
@@ -705,10 +732,12 @@ def run_bounded(
     selector: selectors.BaseSelector | None = None
     outputs = {"stdout": bytearray(), "stderr": bytearray()}
     try:
-        process = _spawn_with_pidfd(
-            command, cwd=cwd, environment=environment, helper=helper, unit=unit
-        )
-        _bind_cgroup(process, environment=environment, deadline=deadline)
+        with _preexec_stage("command_native_spawn_unavailable"):
+            process = _spawn_with_pidfd(
+                command, cwd=cwd, environment=environment, helper=helper, unit=unit
+            )
+        with _preexec_stage("command_cgroup_bind_unavailable"):
+            _bind_cgroup(process, environment=environment, deadline=deadline)
         selector = selectors.DefaultSelector()
         streams = {
             process.stdout_fd: ("stdout", stdout_limit),

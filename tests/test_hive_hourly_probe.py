@@ -678,9 +678,11 @@ def test_bounded_hive_diagnostic_names_the_timed_out_phase(
 
     monkeypatch.setattr(hourly_probe_module, "run_bounded", timed_out)
 
-    assert hourly_probe_module._run_json(
+    result = hourly_probe_module._run_json(
         layout, layout.mcp_entrypoint, "hive", "doctor", phase="hive_doctor"
-    ) == (
+    )
+
+    assert result == (
         {},
         False,
         {
@@ -693,9 +695,80 @@ def test_bounded_hive_diagnostic_names_the_timed_out_phase(
             },
         },
     )
+    assert hourly_probe_module._valid_diagnostic(
+        result[2], command_ready=False
+    ) is True
     assert capsys.readouterr().err == (
         "runtime_image_probe_phase_timeout phase=hive_doctor limit_seconds=45\n"
     )
+
+
+@pytest.mark.parametrize(
+    "code",
+    (
+        "command_runtime_directory_unavailable",
+        "command_spawn_helper_unavailable",
+        "command_cgroup_preflight_unavailable",
+        "command_manager_preflight_unavailable",
+        "command_native_spawn_unavailable",
+        "command_cgroup_bind_unavailable",
+    ),
+)
+def test_bounded_hive_diagnostic_publishes_only_fixed_preexec_stage_codes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    """No exception, path, environment, errno, or child output crosses the record."""
+
+    layout = runtime_layout(tmp_path)
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise BoundedProcessError(code)
+
+    monkeypatch.setattr(hourly_probe_module, "run_bounded", unavailable)
+
+    assert hourly_probe_module._run_json(
+        layout, layout.mcp_entrypoint, "hive", "doctor", phase="hive_doctor"
+    ) == (
+        {},
+        False,
+        {
+            "code": code,
+            "exit_code": None,
+            "stderr": {
+                "state": "not_returned",
+                "excerpt": "",
+                "redaction_applied": False,
+            },
+        },
+    )
+
+
+def test_bounded_hive_diagnostic_rejects_an_unlisted_failure_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An arbitrary exception code cannot become persisted diagnostic data."""
+
+    layout = runtime_layout(tmp_path)
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise BoundedProcessError("untrusted-path-or-errno-detail")
+
+    monkeypatch.setattr(hourly_probe_module, "run_bounded", unavailable)
+
+    _value, ready, diagnostic = hourly_probe_module._run_json(
+        layout, layout.mcp_entrypoint, "hive", "doctor", phase="hive_doctor"
+    )
+
+    assert ready is False
+    assert diagnostic == {
+        "code": "command_failed",
+        "exit_code": None,
+        "stderr": {
+            "state": "not_returned",
+            "excerpt": "",
+            "redaction_applied": False,
+        },
+    }
 
 
 @pytest.mark.parametrize(

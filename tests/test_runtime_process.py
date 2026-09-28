@@ -1000,6 +1000,35 @@ def test_bounded_runner_forwards_only_the_fixed_protected_home_runtime_directory
     }
 
 
+def test_bounded_runner_names_the_fixed_runtime_directory_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hardened-path preflight reports a code, never an exception detail."""
+
+    import the_hive.runtime_process as runtime_process
+
+    def unavailable(**_kwargs: object) -> dict[str, str]:
+        raise runtime_process.BoundedProcessError("command_group_unavailable")
+
+    monkeypatch.setattr(runtime_process, "minimal_environment", unavailable)
+
+    with pytest.raises(runtime_process.BoundedProcessError) as failure:
+        runtime_process.run_bounded(
+            ["/bin/true"],
+            cwd=tmp_path,
+            home=tmp_path,
+            timeout_seconds=1,
+            runtime_layout=object(),  # type: ignore[arg-type]
+        )
+
+    assert failure.value.code == "command_runtime_directory_unavailable"
+
+    with pytest.raises(runtime_process.BoundedProcessError) as invalid_stage:
+        with runtime_process._preexec_stage("untrusted-stage-detail"):
+            pass
+    assert invalid_stage.value.code == "command_group_unavailable"
+
+
 @pytest.mark.parametrize("stream", ("stdout", "stderr"))
 def test_bounded_runner_rejects_each_output_overflow(
     tmp_path: Path, stream: str
@@ -1218,15 +1247,72 @@ def test_bounded_runner_fails_before_opening_fds_when_native_spawn_is_unavailabl
         runtime_process, "_load_runtime_spawn_helper", unavailable, raising=False
     )
 
-    with pytest.raises(
-        runtime_process.BoundedProcessError, match="command_group_unavailable"
-    ):
+    with pytest.raises(runtime_process.BoundedProcessError) as failure:
         runtime_process.run_bounded(
             [str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=1
         )
 
+    assert failure.value.code == "command_spawn_helper_unavailable"
     assert not marker.exists()
     assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
+
+
+def test_bounded_runner_names_native_spawn_and_cgroup_bind_stages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime_image
+) -> None:
+    """Pre-exec failures retain only their fixed stage classification."""
+
+    import the_hive.runtime_process as runtime_process
+
+    monkeypatch.setattr(
+        runtime_process, "_verify_runner_capability", lambda **_kwargs: None
+    )
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise runtime_process.BoundedProcessError("command_group_unavailable")
+
+    monkeypatch.setattr(runtime_process, "_spawn_with_pidfd", unavailable)
+    with pytest.raises(runtime_process.BoundedProcessError) as native_failure:
+        runtime_process.run_bounded(
+            ["/bin/true"],
+            cwd=tmp_path,
+            home=tmp_path,
+            timeout_seconds=1,
+            runtime_layout=runtime_image,
+        )
+    assert native_failure.value.code == "command_native_spawn_unavailable"
+
+    process = runtime_process._SpawnedProcess("fixed.service", -1, -1, -1, -1)
+    monkeypatch.setattr(
+        runtime_process,
+        "_spawn_with_pidfd",
+        lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(runtime_process, "_bind_cgroup", unavailable)
+    monkeypatch.setattr(runtime_process, "_reap_process", lambda *_args: None)
+    with pytest.raises(runtime_process.BoundedProcessError) as cgroup_failure:
+        runtime_process.run_bounded(
+            ["/bin/true"],
+            cwd=tmp_path,
+            home=tmp_path,
+            timeout_seconds=1,
+            runtime_layout=runtime_image,
+        )
+    assert cgroup_failure.value.code == "command_cgroup_bind_unavailable"
+
+    def arguments_invalid(*_args: object, **_kwargs: object) -> object:
+        raise runtime_process.BoundedProcessError("command_arguments_invalid")
+
+    monkeypatch.setattr(runtime_process, "_spawn_with_pidfd", arguments_invalid)
+    with pytest.raises(runtime_process.BoundedProcessError) as preserved_failure:
+        runtime_process.run_bounded(
+            ["/bin/true"],
+            cwd=tmp_path,
+            home=tmp_path,
+            timeout_seconds=1,
+            runtime_layout=runtime_image,
+        )
+    assert preserved_failure.value.code == "command_arguments_invalid"
 
 
 def test_bounded_runner_handles_partial_stdin_and_epipe(
@@ -1344,20 +1430,17 @@ def test_bounded_runner_fails_before_execution_when_cgroup_capability_is_unavail
     )
     descriptors_before = len(list(Path("/proc/self/fd").iterdir()))
 
-    def unavailable(*_args: object, **_kwargs: object) -> object:
+    def unavailable(*_args: object, **_kwargs: object) -> bytes:
         raise runtime_process.BoundedProcessError("command_group_unavailable")
 
-    monkeypatch.setattr(
-        runtime_process, "_verify_runner_capability", unavailable, raising=False
-    )
+    monkeypatch.setattr(runtime_process, "_systemctl", unavailable)
 
-    with pytest.raises(
-        runtime_process.BoundedProcessError, match="command_group_unavailable"
-    ):
+    with pytest.raises(runtime_process.BoundedProcessError) as failure:
         runtime_process.run_bounded(
             [str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=1
         )
 
+    assert failure.value.code == "command_manager_preflight_unavailable"
     assert not marker.exists()
     assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
 
@@ -1375,13 +1458,12 @@ def test_bounded_runner_fails_before_execution_when_pidfd_primitive_is_unavailab
 
     monkeypatch.delattr(runtime_process.os, "P_PIDFD", raising=False)
 
-    with pytest.raises(
-        runtime_process.BoundedProcessError, match="command_group_unavailable"
-    ):
+    with pytest.raises(runtime_process.BoundedProcessError) as failure:
         runtime_process.run_bounded(
             [str(child)], cwd=tmp_path, home=tmp_path, timeout_seconds=1
         )
 
+    assert failure.value.code == "command_cgroup_preflight_unavailable"
     assert not marker.exists()
 
 
