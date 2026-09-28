@@ -22,6 +22,7 @@ SCRIPT = ROOT / "scripts" / "the-hive-runtime-service"
 sys.path.insert(0, str(ROOT / "src"))
 
 from the_hive import runtime_lifecycle, usage_snapshot  # noqa: E402
+from the_hive.hook_session_pin_store import HookSessionPinStoreV1  # noqa: E402
 
 
 _CANARY_GENERATION = "a" * 40
@@ -2526,6 +2527,97 @@ def test_cutover_updates_a_green_but_stale_runtime(
 
     assert result is current_green
     assert installs == [home]
+
+
+def test_cutover_provisions_hook_pin_authority_before_runtime_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _lifecycle_state(home)
+    source_commit = "b" * 40
+    bound = SimpleNamespace(source_commit=source_commit)
+    stale_green = {
+        "status": "runtime_lifecycle_green",
+        "runtime_identity": {"generation": "a" * 40},
+    }
+    current_green = {
+        "status": "runtime_lifecycle_green",
+        "runtime_identity": {"generation": source_commit},
+    }
+    verification = iter((stale_green, current_green))
+    pin_root = home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+    installs: list[Path] = []
+
+    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
+    )
+    monkeypatch.setattr(runtime_lifecycle, "verify", lambda **_kwargs: next(verification))
+    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
+
+    def install(received: Path) -> None:
+        HookSessionPinStoreV1.open_at(pin_root)
+        installs.append(received)
+
+    monkeypatch.setattr(runtime_lifecycle, "_install_attested_runtime", install)
+    post_install = object()
+    monkeypatch.setattr(runtime_lifecycle, "_bind_post_install", lambda _home: post_install)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_revalidate_post_install", lambda _binding, _home: None
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: False)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle, "_remove_legacy_hourly_units", lambda _bound: None
+    )
+
+    result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
+
+    assert result is current_green
+    assert installs == [home]
+    assert (pin_root / ".hook-session-pins-v1.lock").stat().st_mode & 0o777 == 0o600
+
+
+def test_cutover_never_repairs_a_preexisting_invalid_hook_pin_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _lifecycle_state(home)
+    pin_root = home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+    pin_root.mkdir(parents=True, mode=0o700)
+    pin_root.chmod(0o700)
+    bound = SimpleNamespace(source_commit="b" * 40)
+
+    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "verify",
+        lambda **_kwargs: {
+            "status": "runtime_lifecycle_green",
+            "runtime_identity": {"generation": "a" * 40},
+        },
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_install_attested_runtime",
+        lambda _home: (_ for _ in ()).throw(AssertionError("installer must not run")),
+    )
+
+    result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
+
+    assert result == {
+        "status": "runtime_lifecycle_hook_pin_authority_invalid",
+        "raw_output": "not_returned",
+    }
+    assert not (pin_root / ".hook-session-pins-v1.lock").exists()
 
 
 def test_cutover_rebind_before_installer_fails_without_systemd_or_rollback_mutation(

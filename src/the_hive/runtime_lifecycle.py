@@ -29,6 +29,10 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
+from the_hive.hook_session_pin_store import (
+    HookSessionPinStoreError,
+    HookSessionPinStoreV1,
+)
 from the_hive.runtime_process import BoundedProcessError, run_bounded
 
 
@@ -2799,6 +2803,30 @@ def _install_attested_runtime(home: Path) -> None:
         raise _error("runtime_lifecycle_install_failed")
 
 
+def _provision_hook_session_pin_authority(home: Path) -> None:
+    """Create only an absent canonical hook authority; never repair one."""
+
+    state_root = home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+    _bound_path_from_home(home, state_root)
+    try:
+        state_root.lstat()
+    except FileNotFoundError:
+        create = True
+    except OSError as exc:
+        raise _error("runtime_lifecycle_hook_pin_authority_invalid") from exc
+    else:
+        create = False
+    try:
+        store = (
+            HookSessionPinStoreV1.create_at(state_root)
+            if create
+            else HookSessionPinStoreV1.open_at(state_root)
+        )
+        store.retained_bindings(now_unix_ns=time.time_ns())
+    except HookSessionPinStoreError as exc:
+        raise _error("runtime_lifecycle_hook_pin_authority_invalid") from exc
+
+
 def _bind_post_install(home: Path) -> _PostInstallBinding:
     """Attest the newly published image and exact new unit pair before use."""
 
@@ -4560,9 +4588,13 @@ def cutover(
                 and runtime_identity.get("generation") == bound.source_commit
             ):
                 return already_green
-            # This final rebind check deliberately remains outside the mutation
-            # handler: a hostile replacement before installer entry must not
-            # even cause a compensating manager reload.
+            # Provision the independent launcher authority before the final
+            # source rebind.  Invalid existing authority is never repaired and
+            # cannot cause a compensating manager reload.
+            _provision_hook_session_pin_authority(home)
+            # This final rebind check deliberately remains outside the runtime
+            # mutation handler: a hostile replacement before installer entry
+            # must not cause a compensating manager reload.
             _revalidate_cutover_inputs(bound)
             try:
                 # The preceding statement is immediately before crossing the
