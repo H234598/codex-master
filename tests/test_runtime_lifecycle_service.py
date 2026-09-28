@@ -10,6 +10,8 @@ import subprocess
 import sys
 import fcntl
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "the-hive-runtime-service"
 sys.path.insert(0, str(ROOT / "src"))
 
-from the_hive import runtime_lifecycle  # noqa: E402
+from the_hive import runtime_lifecycle, usage_snapshot  # noqa: E402
 
 
 _CANARY_GENERATION = "a" * 40
@@ -1634,6 +1636,53 @@ def test_d300_consumer_producer_contract_accepts_only_named_06542_identity() -> 
     assert runtime_lifecycle._consumer_producer_contract(heuristic_only) is False
 
 
+def test_d296_accepts_attested_mixed_availability_without_granting_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accounts = (
+        "BW_Nufker",
+        "BW_Privat",
+        "BW_Work",
+        "Birthe_Privat",
+        "GPT1",
+        "RH_Privat",
+    )
+    authorities = tuple(
+        usage_snapshot.PoolAuthorityV2(
+            account_id=account,
+            pool_id="openai",
+            provider="openai",
+            allowed_lifecycles=("ephemeral", "persistent", "session"),
+            allowed_model_families=("luna", "sol", "terra"),
+            hive_available=index != 1,
+            persistent_leadership_eligible=index != 1,
+            long_running_leadership_eligible=index != 1,
+            reasoning_minimum="low",
+            reasoning_maximum="max",
+        )
+        for index, account in enumerate(accounts)
+    )
+    evidence = usage_snapshot.UsageEvidenceV2(
+        (), "stale", None, None, authorities
+    )
+    monkeypatch.setattr(usage_snapshot, "read_usage_evidence_v2", lambda: evidence)
+
+    assert runtime_lifecycle._d296_and_v2_accepted() is True
+
+    inconsistent = list(authorities)
+    inconsistent[1] = replace(
+        inconsistent[1], persistent_leadership_eligible=True
+    )
+    monkeypatch.setattr(
+        usage_snapshot,
+        "read_usage_evidence_v2",
+        lambda: usage_snapshot.UsageEvidenceV2(
+            (), "stale", None, None, tuple(inconsistent)
+        ),
+    )
+    assert runtime_lifecycle._d296_and_v2_accepted() is False
+
+
 def test_verify_is_read_only_and_reports_separate_timer_states(tmp_path: Path) -> None:
     home = tmp_path / "home"
     units = home / ".config" / "systemd" / "user"
@@ -1806,7 +1855,9 @@ def test_verify_rejects_units_not_exactly_derived_from_attested_runtime(
         ),
     )
     monkeypatch.setattr(runtime_lifecycle, "_d296_and_v2_accepted", lambda: True)
-    monkeypatch.setattr(runtime_lifecycle, "_parse_health", lambda _root: (True, True))
+    monkeypatch.setattr(
+        runtime_lifecycle, "_parse_health", lambda _root: (True, True, True)
+    )
     monkeypatch.setattr(runtime_lifecycle, "_probe_gate_allowed", lambda _root: True)
     monkeypatch.setattr(runtime_lifecycle, "_observation_matches", lambda **_kwargs: True)
     calls: list[tuple[str, ...]] = []
@@ -1935,7 +1986,9 @@ def test_verify_never_derives_observation_from_systemd_health_or_gate(
         },
     )
     monkeypatch.setattr(runtime_lifecycle, "_d296_and_v2_accepted", lambda: True)
-    monkeypatch.setattr(runtime_lifecycle, "_parse_health", lambda _root: (True, True))
+    monkeypatch.setattr(
+        runtime_lifecycle, "_parse_health", lambda _root: (True, True, True)
+    )
     monkeypatch.setattr(runtime_lifecycle, "_probe_gate_allowed", lambda _root: True)
     monkeypatch.setattr(runtime_lifecycle, "_observation_matches", lambda **_kwargs: False)
 
@@ -1964,7 +2017,66 @@ def test_verify_never_derives_observation_from_systemd_health_or_gate(
     assert result["status"] == "runtime_lifecycle_red"
 
 
-def test_cutover_records_only_a_zero_exit_argumentless_probe_observation(
+def test_verify_separates_green_runtime_from_blocked_product_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    units = home / ".config" / "systemd" / "user"
+    units.mkdir(parents=True, mode=0o700)
+    service = b"[Service]\nExecStart=/attested\n"
+    timer = b"[Timer]\nOnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00 UTC\n"
+    for name, content in (
+        ("the-hive-hive-hourly-probe.service", service),
+        ("the-hive-hive-hourly-probe.timer", timer),
+    ):
+        path = units / name
+        path.write_bytes(content)
+        path.chmod(0o644)
+    identity = {
+        "generation": "a" * 40,
+        "manifest_digest": "sha256:" + "b" * 64,
+        "consumer_pin": True,
+    }
+    monkeypatch.setattr(runtime_lifecycle, "_runtime_identity", lambda _root: identity)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_attested_hourly_unit_bytes",
+        lambda **_kwargs: (service, timer),
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_d296_and_v2_accepted", lambda: True)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_parse_health", lambda _root: (True, False, False)
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_probe_gate_allowed", lambda _root: False)
+    monkeypatch.setattr(runtime_lifecycle, "_observation_matches", lambda **_kwargs: True)
+
+    def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
+        if arguments[1].startswith("codex-master-"):
+            return {
+                "LoadState": "not-found",
+                "UnitFileState": "disabled",
+                "ActiveState": "inactive",
+            }
+        return {
+            "LoadState": "loaded",
+            "UnitFileState": "enabled",
+            "ActiveState": "active",
+        }
+
+    result = runtime_lifecycle.verify(home=home, systemctl=systemctl)
+
+    assert result["status"] == "runtime_lifecycle_green"
+    assert result["error_code"] is None
+    assert result["checks"]["health_v3_valid"] is True
+    assert result["product_status"] == "blocked"
+    assert result["product_checks"] == {
+        "health_v3_green": False,
+        "queen_alarm_cleared": False,
+        "probe_gate_allowed": False,
+    }
+
+
+def test_cutover_rolls_back_when_argumentless_probe_observation_is_invalid(
     tmp_path: Path, monkeypatch
 ) -> None:
     home = tmp_path / "home"
@@ -2013,7 +2125,7 @@ def test_cutover_records_only_a_zero_exit_argumentless_probe_observation(
     assert restored == [snapshot]
 
 
-def test_observation_receipt_requires_a_real_zero_exit_argumentless_launcher_run(
+def test_observation_receipt_accepts_only_a_fresh_consistent_launcher_result(
     tmp_path: Path, monkeypatch
 ) -> None:
     home = tmp_path / "home"
@@ -2046,36 +2158,42 @@ def test_observation_receipt_requires_a_real_zero_exit_argumentless_launcher_run
         is False
     )
     calls: list[tuple[str, ...]] = []
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "run_bounded",
-        lambda arguments, **_kwargs: calls.append(tuple(arguments))
-        or SimpleNamespace(returncode=1, stdout="", stderr=""),
-    )
-    try:
-        runtime_lifecycle._observe_argumentless_installed_probe(home)
-    except runtime_lifecycle.RuntimeLifecycleError as exc:
-        assert str(exc) == "runtime_lifecycle_probe_failed"
-    else:
-        raise AssertionError("a non-zero launcher must fail closed")
-    assert calls == [(str(binding.launcher),)]
-    assert not (state_root / "runtime-lifecycle-probe-observation.json").exists()
 
-    monkeypatch.setattr(
-        runtime_lifecycle,
-        "run_bounded",
-        lambda arguments, **_kwargs: calls.append(tuple(arguments))
-        or SimpleNamespace(returncode=0, stdout="{}", stderr=""),
-    )
+    def run_red(arguments, **_kwargs):
+        calls.append(tuple(arguments))
+        payload = json.loads(_canary_isolated_health())
+        payload["checked_at"] = datetime.now(UTC).isoformat()
+        health = state_root / "hive-hourly-health.json"
+        health.write_text(json.dumps(payload), encoding="utf-8")
+        health.chmod(0o600)
+        return SimpleNamespace(returncode=1, stdout="{}", stderr="")
+
+    monkeypatch.setattr(runtime_lifecycle, "run_bounded", run_red)
     runtime_lifecycle._observe_argumentless_installed_probe(home)
 
-    assert calls == [(str(binding.launcher),), (str(binding.launcher),)]
+    assert calls == [(str(binding.launcher),)]
     assert (
         runtime_lifecycle._observation_matches(
             home=home, state_root=state_root, identity=identity
         )
         is True
     )
+
+    def run_inconsistent(arguments, **_kwargs):
+        calls.append(tuple(arguments))
+        payload = json.loads(_canary_green_health())
+        payload["checked_at"] = datetime.now(UTC).isoformat()
+        health = state_root / "hive-hourly-health.json"
+        health.write_text(json.dumps(payload), encoding="utf-8")
+        health.chmod(0o600)
+        return SimpleNamespace(returncode=1, stdout="{}", stderr="")
+
+    monkeypatch.setattr(runtime_lifecycle, "run_bounded", run_inconsistent)
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="^runtime_lifecycle_probe_result_invalid$",
+    ):
+        runtime_lifecycle._observe_argumentless_installed_probe(home)
 
 
 def test_observation_does_not_write_a_receipt_when_the_bounded_launcher_fails(
@@ -2121,6 +2239,45 @@ def test_observation_does_not_write_a_receipt_when_the_bounded_launcher_fails(
     else:
         raise AssertionError("a bounded launcher failure must fail closed")
     assert not (state_root / "runtime-lifecycle-probe-observation.json").exists()
+
+
+def test_observation_receipt_remains_valid_for_its_unchanged_runtime_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    state_root = home / ".local" / "state" / "codex-master-mcp"
+    state_root.mkdir(parents=True, mode=0o700)
+    for directory in (home / ".local", home / ".local" / "state", state_root):
+        directory.chmod(0o700)
+    binding = runtime_lifecycle._ProbeObservationBinding(
+        generation="a" * 40,
+        manifest_digest="sha256:" + "b" * 64,
+        launcher_sha256="c" * 64,
+        launcher=home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py",
+        runtime_layout=object(),
+    )
+    identity = {
+        "generation": binding.generation,
+        "manifest_digest": binding.manifest_digest,
+        "consumer_pin": True,
+    }
+    monkeypatch.setattr(
+        runtime_lifecycle, "_probe_observation_binding", lambda **_kwargs: binding
+    )
+    receipt = state_root / "runtime-lifecycle-probe-observation.json"
+    receipt.write_bytes(
+        runtime_lifecycle._observation_payload(
+            binding,
+            observed_at=datetime(2025, 1, 1, tzinfo=UTC),
+            returncode=1,
+        )
+    )
+    receipt.chmod(0o600)
+
+    assert runtime_lifecycle._observation_matches(
+        home=home, state_root=state_root, identity=identity
+    ) is True
 
 
 def test_status_and_verify_are_read_only_even_when_all_postconditions_are_red(
@@ -2233,10 +2390,9 @@ def test_cutover_uses_one_bound_transaction_and_never_touches_foreign_units(
         ("stop", "codex-master-hive-hourly-probe.service"),
         ("disable", "--now", "codex-master-hive-hourly-probe.timer"),
         ("enable", "--now", "the-hive-hive-hourly-probe.timer"),
-        ("start", "the-hive-hive-hourly-probe.service"),
         ("daemon-reload",),
     ]
-    # Six user-manager mutations plus the bounded probe observation are each
+    # Five user-manager mutations plus the bounded probe observation are each
     # preceded by a fresh binding check of the post-installer Runtime/unit pair.
     assert revalidations == [post_install] * (len(calls) + 1)
     assert all("codex-usage" not in call and "watchdog" not in call for call in calls)
@@ -3223,7 +3379,7 @@ def test_cutover_installer_failure_restores_the_bound_preexisting_state(
     _assert_bound_files_restored(bound)
 
 
-def test_cutover_new_service_start_failure_reports_bounded_primary_phase_after_restore(
+def test_cutover_new_timer_enable_failure_reports_bounded_primary_phase_after_restore(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A restored manager failure exposes only its fixed primary phase fields."""
@@ -3244,7 +3400,7 @@ def test_cutover_new_service_start_failure_reports_bounded_primary_phase_after_r
     )
 
     def systemctl(arguments: tuple[str, ...]) -> dict[str, str]:
-        if arguments == ("start", "the-hive-hive-hourly-probe.service"):
+        if arguments == ("enable", "--now", "the-hive-hive-hourly-probe.timer"):
             raise OSError("untrusted-command-detail")
         if arguments[0] == "show":
             return states[arguments[1]]
@@ -3255,7 +3411,7 @@ def test_cutover_new_service_start_failure_reports_bounded_primary_phase_after_r
     assert result == {
         "status": "runtime_lifecycle_systemd_failed",
         "raw_output": "not_returned",
-        "failure_phase": "new_service_start",
+        "failure_phase": "new_timer_enable",
         "failure_error": "systemd_mutation_failed",
     }
     assert "untrusted-command-detail" not in repr(result)
@@ -3286,7 +3442,7 @@ def test_cutover_mutation_failure_result_rejects_unknown_status_for_valid_phase(
 
     result = runtime_lifecycle._cutover_mutation_failure_result(
         runtime_lifecycle._CutoverMutationError(
-            phase="new_service_start",
+            phase="new_timer_enable",
             error=runtime_lifecycle.RuntimeLifecycleError("untrusted-error-detail"),
         )
     )
@@ -3315,7 +3471,7 @@ def test_cutover_mutation_failure_result_accepts_each_whitelisted_status(
 
     result = runtime_lifecycle._cutover_mutation_failure_result(
         runtime_lifecycle._CutoverMutationError(
-            phase="new_service_start",
+            phase="new_timer_enable",
             error=runtime_lifecycle.RuntimeLifecycleError(status),
         )
     )
@@ -3323,7 +3479,7 @@ def test_cutover_mutation_failure_result_accepts_each_whitelisted_status(
     assert result == {
         "status": status,
         "raw_output": "not_returned",
-        "failure_phase": "new_service_start",
+        "failure_phase": "new_timer_enable",
         "failure_error": "systemd_mutation_failed",
     }
 
@@ -3338,7 +3494,6 @@ def test_cutover_mutation_failure_result_accepts_each_whitelisted_status(
             ("disable", "--now", "codex-master-hive-hourly-probe.timer"),
         ),
         ("new_timer_enable", ("enable", "--now", "the-hive-hive-hourly-probe.timer")),
-        ("new_service_start", ("start", "the-hive-hive-hourly-probe.service")),
         ("after_unit_removal_reload", ("daemon-reload",)),
     ),
     ids=(
@@ -3346,7 +3501,6 @@ def test_cutover_mutation_failure_result_accepts_each_whitelisted_status(
         "legacy-service-stop",
         "legacy-timer-disable",
         "new-timer-enable",
-        "new-service-start",
         "after-unit-removal-reload",
     ),
 )

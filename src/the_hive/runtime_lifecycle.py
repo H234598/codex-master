@@ -147,7 +147,6 @@ _CUTOVER_MUTATION_PHASES = frozenset(
         "legacy_service_stop",
         "legacy_timer_disable",
         "new_timer_enable",
-        "new_service_start",
         "after_unit_removal_reload",
     )
 )
@@ -3678,8 +3677,8 @@ def _state_exactly_matches(
     )
 
 
-def _parse_health(state_root: Path) -> tuple[bool, bool]:
-    """Return (health-v3-green, queen-alarm-cleared) without repairing anything."""
+def _parse_health(state_root: Path) -> tuple[bool, bool, bool]:
+    """Return (valid-v3, product-green, queen-alarm-cleared) read-only."""
 
     try:
         raw = _regular_bytes(
@@ -3688,12 +3687,16 @@ def _parse_health(state_root: Path) -> tuple[bool, bool]:
             mode=0o600,
         )
         if raw is None:
-            return False, False
+            return False, False, False
         value = json.loads(raw.decode("utf-8"))
     except (RuntimeLifecycleError, UnicodeDecodeError, json.JSONDecodeError):
-        return False, False
-    if not isinstance(value, dict) or value.get("schema_version") != 3:
-        return False, False
+        return False, False, False
+    try:
+        from the_hive.hive.hourly_probe import valid_probe_record
+    except Exception:
+        return False, False, False
+    if not valid_probe_record(value):
+        return False, False, False
     checks = value.get("checks")
     alarm = value.get("alarm")
     health = isinstance(checks, dict) and checks == {
@@ -3707,7 +3710,7 @@ def _parse_health(state_root: Path) -> tuple[bool, bool]:
         and alarm.get("status") == "cleared"
         and alarm.get("reason_codes") == []
     )
-    return health, cleared
+    return True, health, cleared
 
 
 def _runtime_identity(release_root: Path) -> dict[str, object] | None:
@@ -3822,7 +3825,7 @@ def _probe_observation_binding(
 
 
 def _observation_payload(
-    binding: _ProbeObservationBinding, *, observed_at: datetime
+    binding: _ProbeObservationBinding, *, observed_at: datetime, returncode: int
 ) -> bytes:
     return (
         json.dumps(
@@ -3833,7 +3836,7 @@ def _observation_payload(
                 "observed_at": observed_at.astimezone(UTC)
                 .isoformat()
                 .replace("+00:00", "Z"),
-                "returncode": 0,
+                "returncode": returncode,
                 "schema_version": 1,
             },
             sort_keys=True,
@@ -3843,8 +3846,10 @@ def _observation_payload(
     )
 
 
-def _write_observation(state_root: Path, binding: _ProbeObservationBinding) -> None:
-    """Atomically record only a successful bounded launcher invocation."""
+def _write_observation(
+    state_root: Path, binding: _ProbeObservationBinding, *, returncode: int
+) -> None:
+    """Atomically record one structurally valid bounded launcher invocation."""
 
     _regular_bytes(
         state_root / _OBSERVATION_NAME,
@@ -3853,7 +3858,9 @@ def _write_observation(state_root: Path, binding: _ProbeObservationBinding) -> N
     )
     _atomic_restore(
         state_root / _OBSERVATION_NAME,
-        _observation_payload(binding, observed_at=datetime.now(UTC)),
+        _observation_payload(
+            binding, observed_at=datetime.now(UTC), returncode=returncode
+        ),
         0o600,
     )
 
@@ -3898,8 +3905,8 @@ def _observation_matches(
             and value.get("generation") == binding.generation
             and value.get("manifest_digest") == binding.manifest_digest
             and value.get("launcher_sha256") == binding.launcher_sha256
-            and value.get("returncode") == 0
-            and 0 <= age <= 4 * 60 * 60
+            and value.get("returncode") in {0, 1}
+            and age >= 0
         )
     except (
         RuntimeLifecycleError,
@@ -3920,6 +3927,7 @@ def _observe_argumentless_installed_probe(home: Path) -> None:
     binding = _probe_observation_binding(
         home=home, release_root=release_root, identity=identity
     )
+    started_at = datetime.now(UTC)
     try:
         result = run_bounded(
             (os.fspath(binding.launcher),),
@@ -3932,8 +3940,49 @@ def _observe_argumentless_installed_probe(home: Path) -> None:
         )
     except BoundedProcessError as exc:
         raise _error("runtime_lifecycle_probe_observation_failed") from exc
-    if result.returncode != 0:
+    finished_at = datetime.now(UTC)
+    if result.returncode not in {0, 1}:
         raise _error("runtime_lifecycle_probe_failed")
+    try:
+        from the_hive.hive.hourly_probe import valid_probe_record
+
+        health_raw = _regular_bytes(
+            state_root / "hive-hourly-health.json",
+            maximum=_MAX_HEALTH_BYTES,
+            mode=0o600,
+        )
+        health = (
+            json.loads(health_raw.decode("utf-8"))
+            if health_raw is not None
+            else None
+        )
+        checked_at_raw = (
+            health.get("checked_at") if isinstance(health, Mapping) else None
+        )
+        checked_at = (
+            datetime.fromisoformat(checked_at_raw.replace("Z", "+00:00"))
+            if isinstance(checked_at_raw, str)
+            else None
+        )
+        checks = health.get("checks") if isinstance(health, Mapping) else None
+        expected_returncode = (
+            0
+            if isinstance(checks, Mapping)
+            and all(value is True for value in checks.values())
+            else 1
+        )
+        if (
+            not valid_probe_record(health)
+            or checked_at is None
+            or checked_at.tzinfo is None
+            or checked_at.utcoffset() is None
+            or checked_at.astimezone(UTC) < started_at
+            or checked_at.astimezone(UTC) > finished_at
+            or result.returncode != expected_returncode
+        ):
+            raise _error("runtime_lifecycle_probe_result_invalid")
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise _error("runtime_lifecycle_probe_result_invalid") from exc
     current = _runtime_identity(release_root)
     if current is None or current.get("consumer_pin") is not True:
         raise _error("runtime_lifecycle_probe_binding_changed")
@@ -3942,7 +3991,7 @@ def _observe_argumentless_installed_probe(home: Path) -> None:
     )
     if rebound != binding:
         raise _error("runtime_lifecycle_probe_binding_changed")
-    _write_observation(state_root, rebound)
+    _write_observation(state_root, rebound, returncode=result.returncode)
 
 
 def _d296_and_v2_accepted() -> bool:
@@ -3963,8 +4012,10 @@ def _d296_and_v2_accepted() -> bool:
         "RH_Privat",
     )
     authorities = getattr(evidence, "pool_authorities", ())
-    if getattr(evidence, "status", None) != "complete" or len(authorities) != len(
-        expected
+    if (
+        getattr(evidence, "status", None)
+        not in {"complete", "partial", "stale"}
+        or len(authorities) != len(expected)
     ):
         return False
     observed = [
@@ -3972,13 +4023,10 @@ def _d296_and_v2_accepted() -> bool:
             getattr(item, "account_id", None),
             getattr(item, "pool_id", None),
             getattr(item, "provider", None),
-            getattr(item, "hive_available", None),
             tuple(getattr(item, "allowed_model_families", ())),
             getattr(item, "reasoning_minimum", None),
             getattr(item, "reasoning_maximum", None),
             tuple(getattr(item, "allowed_lifecycles", ())),
-            getattr(item, "persistent_leadership_eligible", None),
-            getattr(item, "long_running_leadership_eligible", None),
         )
         for item in authorities
     ]
@@ -3987,17 +4035,29 @@ def _d296_and_v2_accepted() -> bool:
             account,
             "openai",
             "openai",
-            True,
             ("luna", "sol", "terra"),
             "low",
             "max",
             ("ephemeral", "persistent", "session"),
-            True,
-            True,
         )
         for account in expected
     ]
-    return sorted(observed) == sorted(expected_records)
+    if sorted(observed) != sorted(expected_records):
+        return False
+    for item in authorities:
+        available = getattr(item, "hive_available", None)
+        persistent = getattr(item, "persistent_leadership_eligible", None)
+        long_running = getattr(item, "long_running_leadership_eligible", None)
+        if any(
+            type(value) is not bool
+            for value in (available, persistent, long_running)
+        ):
+            return False
+        if (persistent or long_running) and not available:
+            return False
+        if long_running and not persistent:
+            return False
+    return True
 
 
 def _probe_gate_allowed(state_root: Path) -> bool:
@@ -4035,10 +4095,14 @@ def _verify_failure(code: str) -> dict[str, object]:
             "eight_utc_terms": False,
             "no_legacy_or_duplicate_timer": False,
             "v2_generation_and_d296_parity": False,
+            "health_v3_valid": False,
+            "argumentless_probe_observed": False,
+        },
+        "product_status": "blocked",
+        "product_checks": {
             "health_v3_green": False,
             "queen_alarm_cleared": False,
             "probe_gate_allowed": False,
-            "argumentless_probe_observed": False,
         },
         "raw_output": "not_returned",
     }
@@ -4053,9 +4117,7 @@ def _verify_error_code(
         ("eight_utc_terms", "runtime_lifecycle_timer_terms_invalid"),
         ("no_legacy_or_duplicate_timer", "runtime_lifecycle_legacy_timer_present"),
         ("v2_generation_and_d296_parity", "runtime_lifecycle_v2_parity_invalid"),
-        ("health_v3_green", "runtime_lifecycle_health_red"),
-        ("queen_alarm_cleared", "runtime_lifecycle_queen_alarm_active"),
-        ("probe_gate_allowed", "runtime_lifecycle_probe_gate_red"),
+        ("health_v3_valid", "runtime_lifecycle_health_invalid"),
         ("argumentless_probe_observed", "runtime_lifecycle_probe_unobserved"),
     ):
         if checks[check] is not True:
@@ -4129,7 +4191,7 @@ def verify(
         and not _state_is_active(old_timer_state)
         and not _state_is_active(old_service_state)
     )
-    health, alarm_cleared = _parse_health(state_root)
+    health_valid, health, alarm_cleared = _parse_health(state_root)
     v2 = _d296_and_v2_accepted()
     gate_allowed = _probe_gate_allowed(state_root)
     enabled, active = _state_is_enabled(timer_state), _state_is_active(timer_state)
@@ -4140,10 +4202,13 @@ def verify(
         "eight_utc_terms": eight,
         "no_legacy_or_duplicate_timer": no_old,
         "v2_generation_and_d296_parity": v2,
+        "health_v3_valid": health_valid,
+        "argumentless_probe_observed": observed,
+    }
+    product_checks = {
         "health_v3_green": health,
         "queen_alarm_cleared": alarm_cleared,
         "probe_gate_allowed": gate_allowed,
-        "argumentless_probe_observed": observed,
     }
     all_green = all(checks.values()) and enabled and active and observed
     return {
@@ -4158,6 +4223,8 @@ def verify(
         "runtime_identity": identity
         or {"generation": None, "manifest_digest": None, "consumer_pin": False},
         "checks": checks,
+        "product_status": "ready" if all(product_checks.values()) else "blocked",
+        "product_checks": product_checks,
         "raw_output": "not_returned",
     }
 
@@ -4532,19 +4599,13 @@ def cutover(
                         phase="legacy_timer_disable",
                     )
                 _revalidate_post_install(post_install, home)
+                _observe_argumentless_installed_probe(home)
+                _revalidate_post_install(post_install, home)
                 _cutover_systemctl_mutate(
                     systemctl,
                     ("enable", "--now", _NEW_TIMER),
                     phase="new_timer_enable",
                 )
-                _revalidate_post_install(post_install, home)
-                _cutover_systemctl_mutate(
-                    systemctl,
-                    ("start", _NEW_SERVICE),
-                    phase="new_service_start",
-                )
-                _revalidate_post_install(post_install, home)
-                _observe_argumentless_installed_probe(home)
                 _remove_legacy_hourly_units(bound)
                 _revalidate_post_install(post_install, home)
                 _cutover_systemctl_mutate(

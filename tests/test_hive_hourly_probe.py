@@ -25,6 +25,7 @@ from the_hive.hive.hourly_probe import (
     probe_spawn_gate,
     read_probe_gate,
     run_probe,
+    valid_probe_record,
 )
 from the_hive.runtime_layout import RuntimeLayout
 from the_hive.runtime_process import BoundedProcessError, BoundedProcessResult
@@ -397,6 +398,26 @@ def test_spawn_gate_accepts_only_a_fresh_complete_green_v3_record() -> None:
     stale = NOW.replace(hour=0).isoformat()
     assert probe_spawn_gate(green_probe(stale), now=NOW)["reason_code"] == "probe_stale"
     assert MAX_PROBE_AGE_SECONDS == 4 * 60 * 60
+
+
+def test_probe_record_validation_accepts_consistent_green_and_red_records() -> None:
+    green = green_probe(NOW.isoformat())
+    red = dict(green)
+    red["checks"] = {
+        "runtime_layout": True,
+        "hive_runtime": False,
+        "hive_doctor": False,
+    }
+    red["alarm"] = {
+        **green["alarm"],
+        "status": "active",
+        "reason_codes": ["hive_doctor", "hive_runtime"],
+    }
+
+    assert valid_probe_record(green) is True
+    assert valid_probe_record(red) is True
+    assert valid_probe_record({**red, "alarm": green["alarm"]}) is False
+    assert valid_probe_record({**red, "checked_at": "not-a-time"}) is False
 
 
 def test_spawn_gate_reads_only_private_state_and_never_creates_missing_state(

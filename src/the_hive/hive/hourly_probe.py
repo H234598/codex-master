@@ -334,6 +334,45 @@ def _valid_alarm(value: object, checks: Mapping[str, object]) -> bool:
         and reasons == expected_reasons
         and (owner is None or _valid_alarm_owner(owner))
     )
+
+
+def valid_probe_record(payload: object) -> bool:
+    """Validate one complete v3 record without granting spawn authority."""
+
+    if not isinstance(payload, Mapping) or frozenset(payload) != _PROBE_RECORD_KEYS:
+        return False
+    checks = payload.get("checks")
+    commands = payload.get("commands")
+    diagnostics = payload.get("diagnostics")
+    checked_at = payload.get("checked_at")
+    if (
+        payload.get("schema_version") != 3
+        or not isinstance(checked_at, str)
+        or not 1 <= len(checked_at) <= 40
+        or not isinstance(checks, Mapping)
+        or frozenset(checks) != _PROBE_CHECK_KEYS
+        or any(type(value) is not bool for value in checks.values())
+        or not isinstance(commands, Mapping)
+        or frozenset(commands) != _PROBE_COMMAND_KEYS
+        or any(type(value) is not bool for value in commands.values())
+        or not isinstance(diagnostics, Mapping)
+        or frozenset(diagnostics) != _PROBE_DIAGNOSTIC_KEYS
+        or any(
+            not _valid_diagnostic(diagnostics[key], command_ready=commands[key] is True)
+            for key in _PROBE_COMMAND_KEYS
+        )
+        or not _valid_alarm(payload.get("alarm"), checks)
+        or payload.get("global_pilot_readiness")
+        != _bounded_global_pilot_readiness(payload.get("global_pilot_readiness"))
+    ):
+        return False
+    try:
+        observed = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return observed.tzinfo is not None and observed.utcoffset() is not None
+
+
 def probe_spawn_gate(
     payload: Mapping[str, Any],
     *,
@@ -349,24 +388,10 @@ def probe_spawn_gate(
         }
     checks = payload.get("checks")
     commands = payload.get("commands")
-    diagnostics = payload.get("diagnostics")
     if (
-        payload.get("schema_version") != 3
-        or not isinstance(checks, Mapping)
-        or frozenset(checks) != _PROBE_CHECK_KEYS
+        not valid_probe_record(payload)
         or any(value is not True for value in checks.values())
-        or not isinstance(commands, Mapping)
-        or frozenset(commands) != _PROBE_COMMAND_KEYS
         or any(value is not True for value in commands.values())
-        or not isinstance(diagnostics, Mapping)
-        or frozenset(diagnostics) != _PROBE_DIAGNOSTIC_KEYS
-        or any(
-            not _valid_diagnostic(diagnostics[key], command_ready=commands[key] is True)
-            for key in _PROBE_COMMAND_KEYS
-        )
-        or not _valid_alarm(payload.get("alarm"), checks)
-        or payload.get("global_pilot_readiness")
-        != _bounded_global_pilot_readiness(payload.get("global_pilot_readiness"))
     ):
         return {
             "allowed": False,
@@ -1226,6 +1251,7 @@ __all__ = [
     "publish_lifecycle_failure",
     "read_probe_gate",
     "run_probe",
+    "valid_probe_record",
 ]
 
 
