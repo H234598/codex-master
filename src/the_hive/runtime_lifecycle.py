@@ -4541,7 +4541,12 @@ def cutover(
             # A completely verified target is a no-op; it must not re-install
             # an image or perturb the user manager merely to prove idempotence.
             already_green = verify(home=home, systemctl=systemctl)
-            if already_green.get("status") == "runtime_lifecycle_green":
+            runtime_identity = already_green.get("runtime_identity")
+            if (
+                already_green.get("status") == "runtime_lifecycle_green"
+                and isinstance(runtime_identity, Mapping)
+                and runtime_identity.get("generation") == bound.source_commit
+            ):
                 return already_green
             # This final rebind check deliberately remains outside the mutation
             # handler: a hostile replacement before installer entry must not

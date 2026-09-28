@@ -2446,13 +2446,15 @@ def test_cutover_is_idempotent_when_verify_is_already_green(
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     _lifecycle_state(home)
-    snapshot = object()
+    source_commit = "a" * 40
+    snapshot = SimpleNamespace(source_commit=source_commit)
     green = {
         "status": "runtime_lifecycle_green",
         "installed": True,
         "enabled": True,
         "active": True,
         "observed": True,
+        "runtime_identity": {"generation": source_commit},
         "checks": {},
         "raw_output": "not_returned",
     }
@@ -2477,6 +2479,53 @@ def test_cutover_is_idempotent_when_verify_is_already_green(
     )
 
     assert result is green
+
+
+def test_cutover_updates_a_green_but_stale_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _lifecycle_state(home)
+    source_commit = "b" * 40
+    bound = SimpleNamespace(source_commit=source_commit)
+    stale_green = {
+        "status": "runtime_lifecycle_green",
+        "runtime_identity": {"generation": "a" * 40},
+    }
+    current_green = {
+        "status": "runtime_lifecycle_green",
+        "runtime_identity": {"generation": source_commit},
+    }
+    verification = iter((stale_green, current_green))
+    installs: list[Path] = []
+
+    monkeypatch.setattr(runtime_lifecycle, "_bind_cutover_inputs", lambda _home: bound)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_bind_systemd_states", lambda received, _systemctl: received
+    )
+    monkeypatch.setattr(runtime_lifecycle, "verify", lambda **_kwargs: next(verification))
+    monkeypatch.setattr(runtime_lifecycle, "_revalidate_cutover_inputs", lambda _bound: None)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_install_attested_runtime", lambda received: installs.append(received)
+    )
+    post_install = object()
+    monkeypatch.setattr(runtime_lifecycle, "_bind_post_install", lambda _home: post_install)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_revalidate_post_install", lambda _binding, _home: None
+    )
+    monkeypatch.setattr(runtime_lifecycle, "_legacy_requires_migration", lambda _bound: False)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_observe_argumentless_installed_probe", lambda _home: None
+    )
+    monkeypatch.setattr(
+        runtime_lifecycle, "_remove_legacy_hourly_units", lambda _bound: None
+    )
+
+    result = runtime_lifecycle.cutover(home=home, systemctl=lambda _arguments: {})
+
+    assert result is current_green
+    assert installs == [home]
 
 
 def test_cutover_rebind_before_installer_fails_without_systemd_or_rollback_mutation(
