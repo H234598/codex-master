@@ -1454,7 +1454,8 @@ def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime
         "ExecStart=%h/.local/lib/the-hive-runtime/generations/"
         f"{generation}/bin/the-hive-hive-hourly-probe "
         "%h/.local/lib/the-hive-runtime "
-        f"{generation} {installed['manifest_digest']} --json"
+        f"{generation} {installed['manifest_digest']} "
+        "--protected-home-runtime --json"
     ) in installed_service_text
     installed_cli = runtime_root / "bin" / "the-hive-mcp"
     installed_hook_launcher = runtime_root / "bin" / "the-hive-plugin-hook-stable"
@@ -1553,7 +1554,10 @@ def test_internal_attested_runtime_api_materializes_one_complete_regular_runtime
         cwd=tmp_path,
     )
     assert legacy_completed.returncode in {0, 1}, legacy_completed.stderr
-    assert set(json.loads(legacy_completed.stdout)) == {"checks"}
+    assert set(json.loads(legacy_completed.stdout)) == {
+        "checks",
+        "global_pilot_readiness",
+    }
     if legacy_completed.returncode == 1:
         assert legacy_completed.stderr.startswith(
             "hive_hourly_probe_red failed_checks="
@@ -2135,6 +2139,53 @@ def test_legacy_probe_refuses_tampered_release_metadata_before_running_the_entry
 
     entrypoint.write_bytes(entrypoint_original)
     entrypoint.chmod(0o755)
+
+
+def test_legacy_probe_rejects_tampered_digest_derived_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _create_hook_session_pin_store(home)
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    monkeypatch.setitem(
+        installer["_install_attested_runtime"].__globals__,
+        "_verified_release_commit",
+        lambda _repository: "a" * 40,
+    )
+    installed = installer["_install_attested_runtime"](home=home)
+    generation = installed["generation"]
+    assert isinstance(generation, str)
+    runtime_root = (
+        home / ".local" / "lib" / "the-hive-runtime" / "generations" / generation
+    )
+    launcher = home / ".local" / "libexec" / "codex_master_hive_hourly_probe.py"
+    environment = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+
+    for relative in (
+        "TheHivePluginBundleV1/release-binding.json",
+        "root-install-plan.json",
+    ):
+        target = runtime_root / relative
+        original = target.read_bytes()
+        target.write_bytes(b"{}\n")
+        target.chmod(0o644)
+        completed = subprocess.run(
+            [launcher],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert completed.stderr == (
+            "hive_hourly_probe_error code=legacy_probe_attestation_failed\n"
+        )
+        target.write_bytes(original)
+        target.chmod(0o644)
 
 
 def test_legacy_probe_never_imports_runtime_image_before_attestation(

@@ -1256,11 +1256,12 @@ def _attested_legacy_probe_launcher_bytes(layout: RuntimeLayout) -> bytes:
 
     try:
         source = layout.read_attested_file(_LEGACY_PROBE_LAUNCHER_SOURCE)
+        generation = _release_pointer_entry(layout)["generation"]
     except ValueError as exc:
         raise InstallError("install_release_invalid") from exc
     return _render_legacy_probe_launcher(
         source,
-        generation=layout.root.name,
+        generation=generation,
         manifest_digest=layout.manifest_digest,
     )
 
