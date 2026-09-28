@@ -867,7 +867,8 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
         line for line in service_lines if line.startswith("RuntimeDirectoryMode=")
     ] == ["RuntimeDirectoryMode=0700"]
     assert [line for line in service_lines if "%t" in line] == [
-        "BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind"
+        "BindReadOnlyPaths=%t/bus:%t/bus:norbind",
+        "BindReadOnlyPaths=%t/systemd/private:%t/systemd/private:norbind",
     ]
     assert "/tmp/the-hive-hourly-runtime" not in service_text
     assert "CODEX_MASTER_PROBE_REPOSITORY" not in service_text
@@ -928,7 +929,11 @@ def test_attested_runtime_materializes_hourly_without_runtime_directory_self_bin
     ).read_text(encoding="utf-8")
     assert "BindReadOnlyPaths=%t:%t:norbind" not in installed_service
     assert (
-        "BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind"
+        "BindReadOnlyPaths=%t/bus:%t/bus:norbind"
+        in installed_service
+    )
+    assert (
+        "BindReadOnlyPaths=%t/systemd/private:%t/systemd/private:norbind"
         in installed_service
     )
     assert (
@@ -969,8 +974,12 @@ def test_hourly_probe_service_renderer_rejects_a_generation_only_sandbox() -> No
     "replacement",
     (
         (
-            b"BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind",
+            b"BindReadOnlyPaths=%t/bus:%t/bus:norbind",
             b"BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind",
+        ),
+        (
+            b"BindReadOnlyPaths=%t/systemd/private:%t/systemd/private:norbind",
+            b"BindReadOnlyPaths=%t/systemd/private:/tmp/private:norbind",
         ),
         (b"RuntimeDirectory=the-hive-hourly-runtime\n", b""),
         (b"RuntimeDirectoryMode=0700\n", b"RuntimeDirectoryMode=0755\n"),

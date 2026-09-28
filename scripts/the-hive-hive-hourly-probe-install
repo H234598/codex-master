@@ -149,8 +149,11 @@ _HOURLY_PROBE_RUNTIME_ROOT_BINDING = (
 )
 _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY = "RuntimeDirectory=the-hive-hourly-runtime"
 _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY_MODE = "RuntimeDirectoryMode=0700"
-_HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING = (
-    "BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind"
+_HOURLY_PROBE_PROTECTED_HOME_BUS_BINDING = (
+    "BindReadOnlyPaths=%t/bus:%t/bus:norbind"
+)
+_HOURLY_PROBE_PROTECTED_HOME_MANAGER_BINDING = (
+    "BindReadOnlyPaths=%t/systemd/private:%t/systemd/private:norbind"
 )
 _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_ARGUMENT = "--protected-home-runtime"
 _HOURLY_PROBE_STATE_BINDING = (
@@ -1410,7 +1413,8 @@ def _render_hourly_probe_service(
         or [line for line in lines if line.startswith("BindReadOnlyPaths=")]
         != [
             _HOURLY_PROBE_RUNTIME_ROOT_BINDING,
-            _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING,
+            _HOURLY_PROBE_PROTECTED_HOME_BUS_BINDING,
+            _HOURLY_PROBE_PROTECTED_HOME_MANAGER_BINDING,
         ]
         or [line for line in lines if line.startswith("BindPaths=")]
         != [_HOURLY_PROBE_STATE_BINDING]
@@ -1853,7 +1857,8 @@ def _unit_bound_generation(*, release_root: Path, source: Path) -> str | None:
             or [line for line in lines if line.startswith("BindReadOnlyPaths=")]
             != [
                 _HOURLY_PROBE_RUNTIME_ROOT_BINDING,
-                _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING,
+                _HOURLY_PROBE_PROTECTED_HOME_BUS_BINDING,
+                _HOURLY_PROBE_PROTECTED_HOME_MANAGER_BINDING,
             ]
             or [line for line in lines if line.startswith("BindPaths=")]
             != [_HOURLY_PROBE_STATE_BINDING]

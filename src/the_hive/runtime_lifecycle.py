@@ -48,8 +48,11 @@ _HOURLY_PROBE_RUNTIME_ROOT_BINDING = (
 )
 _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY = "RuntimeDirectory=the-hive-hourly-runtime"
 _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY_MODE = "RuntimeDirectoryMode=0700"
-_HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING = (
-    "BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind"
+_HOURLY_PROBE_PROTECTED_HOME_BUS_BINDING = (
+    "BindReadOnlyPaths=%t/bus:%t/bus:norbind"
+)
+_HOURLY_PROBE_PROTECTED_HOME_MANAGER_BINDING = (
+    "BindReadOnlyPaths=%t/systemd/private:%t/systemd/private:norbind"
 )
 _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_ARGUMENT = "--protected-home-runtime"
 _HOURLY_PROBE_STATE_BINDING = (
@@ -2542,7 +2545,6 @@ def _canary_unit_binding(
     canonical_release_text = _canary_path_text(canonical_release)
     canonical_state_text = _canary_path_text(canonical_state)
     user_runtime_text = _canary_path_text(_user_runtime_directory())
-    protected_runtime_text = f"{user_runtime_text}/the-hive-hourly-runtime"
     replacements = {
         _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY: f"RuntimeDirectory={unit_stem}",
         _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY_MODE: (
@@ -2551,9 +2553,14 @@ def _canary_unit_binding(
         _HOURLY_PROBE_RUNTIME_ROOT_BINDING: (
             f"BindReadOnlyPaths={release}:{canonical_release_text}:norbind"
         ),
-        _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING: (
+        _HOURLY_PROBE_PROTECTED_HOME_BUS_BINDING: (
             "BindReadOnlyPaths="
-            f"{user_runtime_text}/bus:{protected_runtime_text}/bus:norbind"
+            f"{user_runtime_text}/bus:{user_runtime_text}/bus:norbind"
+        ),
+        _HOURLY_PROBE_PROTECTED_HOME_MANAGER_BINDING: (
+            "BindReadOnlyPaths="
+            f"{user_runtime_text}/systemd/private:"
+            f"{user_runtime_text}/systemd/private:norbind"
         ),
         _HOURLY_PROBE_STATE_BINDING: (
             f"BindPaths={state}:{canonical_state_text}:norbind"
@@ -2587,12 +2594,6 @@ def _canary_unit_binding(
                 raise _error("runtime_canary_sandbox_invalid")
             seen.add(directive)
             properties.append(replacement)
-            if directive == _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY:
-                properties.append(
-                    "BindReadOnlyPaths="
-                    f"{user_runtime_text}/{unit_stem}:"
-                    f"{protected_runtime_text}:norbind"
-                )
         else:
             properties.append(directive)
     if not type_seen or not exec_seen or seen != set(replacements):
@@ -2870,7 +2871,8 @@ def _attested_hourly_unit_bytes(
         or [line for line in template_lines if line.startswith("BindReadOnlyPaths=")]
         != [
             _HOURLY_PROBE_RUNTIME_ROOT_BINDING,
-            _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING,
+            _HOURLY_PROBE_PROTECTED_HOME_BUS_BINDING,
+            _HOURLY_PROBE_PROTECTED_HOME_MANAGER_BINDING,
         ]
         or [line for line in template_lines if line.startswith("BindPaths=")]
         != [_HOURLY_PROBE_STATE_BINDING]

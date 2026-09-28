@@ -31,11 +31,10 @@ _SYSTEMCTL = "/usr/bin/systemctl"
 _ENV = "/usr/bin/env"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _RUNTIME_DIRECTORY_ROOT = Path("/run/user")
-# This is the one manager-created RuntimeDirectory in the Hourly user unit.
-# ProtectHome=tmpfs keeps /run/user masked except for this managed destination,
-# where the unit binds only the user manager's public bus socket.
+# ProtectHome=tmpfs recreates the UID runtime root. The Hourly unit exposes only
+# the two manager sockets there; bounded child units mask both again.
 _PROTECTED_HOME_RUNTIME_DIRECTORY = (
-    _RUNTIME_DIRECTORY_ROOT / str(os.geteuid()) / "the-hive-hourly-runtime"
+    _RUNTIME_DIRECTORY_ROOT / str(os.geteuid())
 )
 BOUNDED_PROCESS_CLEANUP_SECONDS = 0.5
 _PREEXEC_STAGE_CODES = frozenset(

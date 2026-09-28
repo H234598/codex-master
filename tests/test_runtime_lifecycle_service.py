@@ -396,24 +396,23 @@ def test_canary_unit_preserves_sandbox_and_substitutes_only_private_sources(
     assert unit.run_arguments.count(f"--unit={unit.name}") == 1
 
 
-def test_canary_runtime_directory_reaches_the_fixed_runtime_process_contract(
+def test_canary_uses_absolute_manager_sockets_without_runtime_bridge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A unique host directory is mapped to the one accepted sandbox path."""
+    """Transient properties expose both manager sockets at the UID runtime root."""
 
     from the_hive import runtime_process
 
     runtime_root = tmp_path / "run" / "user"
     user_runtime = runtime_root / str(os.geteuid())
-    protected = user_runtime / "the-hive-hourly-runtime"
-    protected.mkdir(parents=True, mode=0o700)
-    protected.chmod(0o700)
+    user_runtime.mkdir(parents=True, mode=0o700)
+    user_runtime.chmod(0o700)
     monkeypatch.setattr(
         runtime_lifecycle, "_USER_RUNTIME_DIRECTORY_ROOT", runtime_root
     )
     monkeypatch.setattr(runtime_process, "_RUNTIME_DIRECTORY_ROOT", runtime_root)
     monkeypatch.setattr(
-        runtime_process, "_PROTECTED_HOME_RUNTIME_DIRECTORY", protected
+        runtime_process, "_PROTECTED_HOME_RUNTIME_DIRECTORY", user_runtime
     )
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
@@ -426,32 +425,35 @@ def test_canary_runtime_directory_reaches_the_fixed_runtime_process_contract(
     second = runtime_lifecycle._canary_unit_binding(
         image=image, home=home, nonce="e" * 32
     )
-    fixed_name = "the-hive-hourly-runtime"
     first_name = "the-hive-runtime-canary-" + "d" * 32
     second_name = "the-hive-runtime-canary-" + "e" * 32
-    first_bridge = (
-        f"BindReadOnlyPaths={user_runtime / first_name}:{protected}:norbind"
+    assert f"RuntimeDirectory={first_name}" in first.properties
+    assert f"RuntimeDirectory={second_name}" in second.properties
+    assert not any(
+        first_name in value
+        for value in first.properties
+        if value.startswith("Bind")
     )
-    second_bridge = (
-        f"BindReadOnlyPaths={user_runtime / second_name}:{protected}:norbind"
+    assert not any(
+        second_name in value
+        for value in second.properties
+        if value.startswith("Bind")
     )
-
-    assert first_bridge in first.properties
-    assert second_bridge in second.properties
-    assert first_bridge != second_bridge
     assert (
-        f"BindReadOnlyPaths={user_runtime / 'bus'}:{protected / 'bus'}:norbind"
+        f"BindReadOnlyPaths={user_runtime / 'bus'}:{user_runtime / 'bus'}:norbind"
+        in first.properties
+    )
+    assert (
+        "BindReadOnlyPaths="
+        f"{user_runtime / 'systemd' / 'private'}:"
+        f"{user_runtime / 'systemd' / 'private'}:norbind"
         in first.properties
     )
     assert all("%t" not in value for value in first.properties)
-    assert runtime_process._PROTECTED_HOME_RUNTIME_DIRECTORY.name == fixed_name
-    rendered_destination = Path(first_bridge.split(":", 2)[1])
-
-    assert rendered_destination == protected
     environment = runtime_process.minimal_environment(
-        home=home, bound_runtime_directory=rendered_destination
+        home=home, bound_runtime_directory=user_runtime
     )
-    assert environment["XDG_RUNTIME_DIR"] == str(protected)
+    assert environment["XDG_RUNTIME_DIR"] == str(user_runtime)
 
 
 @pytest.mark.parametrize(
@@ -459,8 +461,12 @@ def test_canary_runtime_directory_reaches_the_fixed_runtime_process_contract(
     (
         lambda value: value + b"ReadWritePaths=/foreign\n",
         lambda value: value.replace(
-            b"BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind",
+            b"BindReadOnlyPaths=%t/bus:%t/bus:norbind",
             b"BindReadOnlyPaths=%t:/tmp/foreign:norbind",
+        ),
+        lambda value: value.replace(
+            b"BindReadOnlyPaths=%t/systemd/private:%t/systemd/private:norbind",
+            b"BindReadOnlyPaths=%t/systemd/private:/tmp/foreign:norbind",
         ),
         lambda value: value.replace(b"ExecStart=", b"ExecStart=/foreign\nExecStart="),
     ),
@@ -1097,8 +1103,12 @@ def _identity(path: Path) -> tuple[int, int, int, int, int, bytes]:
     "replacement",
     (
         (
-            b"BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind",
+            b"BindReadOnlyPaths=%t/bus:%t/bus:norbind",
             b"BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind",
+        ),
+        (
+            b"BindReadOnlyPaths=%t/systemd/private:%t/systemd/private:norbind",
+            b"BindReadOnlyPaths=%t/systemd/private:/tmp/private:norbind",
         ),
         (b"RuntimeDirectory=the-hive-hourly-runtime\n", b""),
         (b"RuntimeDirectoryMode=0700\n", b"RuntimeDirectoryMode=0755\n"),
