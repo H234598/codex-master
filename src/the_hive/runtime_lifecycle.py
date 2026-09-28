@@ -72,6 +72,7 @@ _CANARY_MANAGER_START_SECONDS = 15.0
 _CANARY_RESULT_SECONDS = 112.0
 _CANARY_CLEANUP_SECONDS = 5.0
 _CANARY_HEALTH_BYTES = 64 * 1024
+_USER_RUNTIME_DIRECTORY_ROOT = Path("/run/user")
 _CANARY_STAGE_CODES = frozenset(
     {
         "command_runtime_directory_unavailable",
@@ -2113,6 +2114,12 @@ def _home_paths(home: Path) -> tuple[Path, Path, Path, Path]:
     )
 
 
+def _user_runtime_directory() -> Path:
+    """Return the same absolute user-runtime path used for manager routing."""
+
+    return _USER_RUNTIME_DIRECTORY_ROOT / str(os.geteuid())
+
+
 def _private_directory(path: Path) -> None:
     try:
         item = path.lstat()
@@ -2534,6 +2541,8 @@ def _canary_unit_binding(
     canonical_state = Path(home_text) / ".local" / "state" / "codex-master-mcp"
     canonical_release_text = _canary_path_text(canonical_release)
     canonical_state_text = _canary_path_text(canonical_state)
+    user_runtime_text = _canary_path_text(_user_runtime_directory())
+    protected_runtime_text = f"{user_runtime_text}/the-hive-hourly-runtime"
     replacements = {
         _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY: f"RuntimeDirectory={unit_stem}",
         _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY_MODE: (
@@ -2543,7 +2552,8 @@ def _canary_unit_binding(
             f"BindReadOnlyPaths={release}:{canonical_release_text}:norbind"
         ),
         _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING: (
-            _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING
+            "BindReadOnlyPaths="
+            f"{user_runtime_text}/bus:{protected_runtime_text}/bus:norbind"
         ),
         _HOURLY_PROBE_STATE_BINDING: (
             f"BindPaths={state}:{canonical_state_text}:norbind"
@@ -2580,7 +2590,8 @@ def _canary_unit_binding(
             if directive == _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY:
                 properties.append(
                     "BindReadOnlyPaths="
-                    f"%t/{unit_stem}:%t/the-hive-hourly-runtime:norbind"
+                    f"{user_runtime_text}/{unit_stem}:"
+                    f"{protected_runtime_text}:norbind"
                 )
         else:
             properties.append(directive)
@@ -3218,7 +3229,7 @@ def _systemd_run_failure_code(
 def _systemd_run_default(arguments: tuple[str, ...]) -> Mapping[str, str]:
     """Create one transient user unit without inheriting the caller environment."""
 
-    runtime_directory = f"/run/user/{os.geteuid()}"
+    runtime_directory = os.fspath(_user_runtime_directory())
     completed = None
     try:
         completed = subprocess.run(
@@ -3259,7 +3270,7 @@ def _systemd_run_default(arguments: tuple[str, ...]) -> Mapping[str, str]:
 def _systemctl_default(arguments: tuple[str, ...]) -> Mapping[str, str]:
     """Use the same UID's user manager with a bounded, data-sparse protocol."""
 
-    runtime_directory = f"/run/user/{os.geteuid()}"
+    runtime_directory = os.fspath(_user_runtime_directory())
     try:
         completed = subprocess.run(
             ["/usr/bin/systemctl", "--user", "--no-pager", *arguments],
@@ -4126,7 +4137,7 @@ def _validate_canary_home(home: Path) -> None:
 
 
 def _canary_runtime_root() -> Path:
-    return Path(f"/run/user/{os.geteuid()}") / _CANARY_RUNTIME_ROOT_NAME
+    return _user_runtime_directory() / _CANARY_RUNTIME_ROOT_NAME
 
 
 @contextmanager

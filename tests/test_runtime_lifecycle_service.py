@@ -387,6 +387,18 @@ def test_canary_runtime_directory_reaches_the_fixed_runtime_process_contract(
 
     from the_hive import runtime_process
 
+    runtime_root = tmp_path / "run" / "user"
+    user_runtime = runtime_root / str(os.geteuid())
+    protected = user_runtime / "the-hive-hourly-runtime"
+    protected.mkdir(parents=True, mode=0o700)
+    protected.chmod(0o700)
+    monkeypatch.setattr(
+        runtime_lifecycle, "_USER_RUNTIME_DIRECTORY_ROOT", runtime_root
+    )
+    monkeypatch.setattr(runtime_process, "_RUNTIME_DIRECTORY_ROOT", runtime_root)
+    monkeypatch.setattr(
+        runtime_process, "_PROTECTED_HOME_RUNTIME_DIRECTORY", protected
+    )
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     invocation = tmp_path / "invocation"
@@ -402,40 +414,22 @@ def test_canary_runtime_directory_reaches_the_fixed_runtime_process_contract(
     first_name = "the-hive-runtime-canary-" + "d" * 32
     second_name = "the-hive-runtime-canary-" + "e" * 32
     first_bridge = (
-        f"BindReadOnlyPaths=%t/{first_name}:%t/{fixed_name}:norbind"
+        f"BindReadOnlyPaths={user_runtime / first_name}:{protected}:norbind"
     )
     second_bridge = (
-        f"BindReadOnlyPaths=%t/{second_name}:%t/{fixed_name}:norbind"
+        f"BindReadOnlyPaths={user_runtime / second_name}:{protected}:norbind"
     )
 
     assert first_bridge in first.properties
     assert second_bridge in second.properties
     assert first_bridge != second_bridge
     assert (
-        f"BindReadOnlyPaths=%t/bus:%t/{fixed_name}/bus:norbind"
+        f"BindReadOnlyPaths={user_runtime / 'bus'}:{protected / 'bus'}:norbind"
         in first.properties
     )
+    assert all("%t" not in value for value in first.properties)
     assert runtime_process._PROTECTED_HOME_RUNTIME_DIRECTORY.name == fixed_name
-    assert "/tmp/" not in first_bridge
-    assert "/tmp/" not in next(
-        value
-        for value in first.properties
-        if value.startswith("BindReadOnlyPaths=%t/bus:")
-    )
-
-    runtime_root = tmp_path / "run" / "user"
-    protected = runtime_root / str(os.geteuid()) / fixed_name
-    protected.mkdir(parents=True, mode=0o700)
-    protected.chmod(0o700)
-    monkeypatch.setattr(runtime_process, "_RUNTIME_DIRECTORY_ROOT", runtime_root)
-    monkeypatch.setattr(
-        runtime_process, "_PROTECTED_HOME_RUNTIME_DIRECTORY", protected
-    )
-    rendered_destination = Path(
-        first_bridge.split(":", 2)[1].replace(
-            "%t", str(runtime_root / str(os.geteuid()))
-        )
-    )
+    rendered_destination = Path(first_bridge.split(":", 2)[1])
 
     assert rendered_destination == protected
     environment = runtime_process.minimal_environment(
