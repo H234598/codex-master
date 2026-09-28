@@ -1140,6 +1140,8 @@ def test_pricing_units_use_the_canonical_the_hive_state_path() -> None:
     )
 
     assert "codex-master-mcp" not in service
+    assert "StateDirectory=the-hive/openai-pricing" in service
+    assert "StateDirectoryMode=0700" in service
     assert "ReadWritePaths=%h/.local/state/the-hive/openai-pricing" in service
     assert "Restart=" not in service
     assert "ExecStart=%h/.local/bin/the-hive-openai-pricing-inventory" in service
