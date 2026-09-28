@@ -399,9 +399,9 @@ def _fast_or_emergency_mode_active() -> bool:
         pass
     try:
         status = emergency_queen_status()
-        if isinstance(status, dict) and (
-            status.get("state") in ("requested", "running")
-            or status.get("emergency_active") is True
+        if isinstance(status, dict) and status.get("state") in (
+            "requested",
+            "running",
         ):
             return True
     except Exception:
@@ -508,6 +508,7 @@ DEFAULT_AGENT_LEASE_SECONDS = 1800
 MAX_AGENT_LEASE_SECONDS = 7200
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "the-hive-mcp"
+LEGACY_MCP_SERVER_NAME = "codex-master-mcp"
 MCP_DEFAULT_TOOLS_APPROVAL_MODE = "approve"
 CANONICAL_CODEX_CLI_PATH = Path("/usr/local/bin/codex")
 CODEX_MCP_EXECUTION_PATH = "/usr/bin:/bin"
@@ -2235,7 +2236,30 @@ def _runtime_layout() -> Any:
 
 
 def _runtime_mcp_entrypoint() -> Path:
-    return _runtime_layout().mcp_entrypoint
+    from the_hive.runtime_layout import LayoutError, RuntimeLayout
+
+    layout = _runtime_layout()
+    root = layout.root
+    if root.parent.name != "generations":
+        return layout.mcp_entrypoint
+    release_root = root.parent.parent
+    try:
+        current = RuntimeLayout.from_current_release(
+            release_root, root.name, layout.manifest_digest
+        )
+    except LayoutError as exc:
+        raise AgentError("runtime_mcp_entrypoint_unavailable") from exc
+    if (
+        current.root != root
+        or current.root_device != layout.root_device
+        or current.root_inode != layout.root_inode
+        or current.manifest_digest != layout.manifest_digest
+    ):
+        raise AgentError("runtime_mcp_entrypoint_unavailable")
+    stable = release_root / "the-hive-mcp"
+    if not is_regular_executable_no_symlink(stable):
+        raise AgentError("runtime_mcp_entrypoint_unavailable")
+    return stable
 
 
 class _CanonicalCodexCliUnavailable(AgentError):
@@ -23371,6 +23395,34 @@ def check_mcp_registration(
     return result
 
 
+def check_legacy_mcp_registration(
+    *, binding: _CodexMcpBinding
+) -> dict[str, Any]:
+    try:
+        cp = _run_bound_codex_mcp_command(binding, "get", LEGACY_MCP_SERVER_NAME)
+    except AgentError:
+        return {
+            "registered": False,
+            "lookup_status": "unavailable",
+            "_registered_command": None,
+        }
+    raw_output = cp.stdout + cp.stderr
+    registered = cp.returncode == 0
+    return {
+        "registered": registered,
+        "lookup_status": (
+            "registered"
+            if registered
+            else "not_registered"
+            if re.search(r"\bno\s+mcp\s+server\s+named\b", raw_output, re.IGNORECASE)
+            else "unavailable"
+        ),
+        "_registered_command": (
+            mcp_get_field(raw_output, "command") if registered else None
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class _BoundMcpHealth:
     """One authoritative read of the pinned CLI and client-config binding."""
@@ -24120,9 +24172,15 @@ def _install_enrolled_unlocked(
     ensure_applet_action_key()
 
     registration: dict[str, Any] = {"requested": register, "status": "skipped"}
+    legacy_registration: dict[str, Any] = {
+        "requested": register,
+        "status": "skipped",
+    }
     previous_command: str | None = None
+    legacy_previous_command: str | None = None
     registration_removed = False
     registration_added = False
+    legacy_registration_removed = False
     startup_timeout_snapshot: dict[str, Any] | None = None
     desktop_install: dict[str, Any] = {
         "requested": install_desktop,
@@ -24165,6 +24223,25 @@ def _install_enrolled_unlocked(
             )
             if current.get("lookup_status") == "unavailable":
                 raise AgentError("MCP server registration could not be inspected")
+            legacy = check_legacy_mcp_registration(binding=binding)
+            if legacy.get("lookup_status") == "unavailable":
+                raise AgentError("legacy MCP server registration could not be inspected")
+            if legacy.get("registered"):
+                if not force:
+                    raise AgentError(
+                        "legacy MCP server is registered; rerun install with --force"
+                    )
+                legacy_previous_command = legacy.get("_registered_command")
+                if (
+                    not isinstance(legacy_previous_command, str)
+                    or not legacy_previous_command.strip()
+                ):
+                    raise AgentError(
+                        "legacy MCP server registration command could not be inspected; refusing force replacement"
+                    )
+                legacy_registration = {"requested": True, "status": "pending"}
+            else:
+                legacy_registration = {"requested": True, "status": "missing"}
             startup_timeout_config = None
             if current.get("ok") or (
                 current.get("registered") and current.get("command_matches")
@@ -24228,11 +24305,19 @@ def _install_enrolled_unlocked(
                         "raw_output": "not_returned",
                     }
             registration["startup_timeout"] = startup_timeout_config
+            if legacy_previous_command is not None:
+                remove_legacy = _run_bound_codex_mcp_command(
+                    binding, "remove", LEGACY_MCP_SERVER_NAME
+                )
+                if remove_legacy.returncode != 0:
+                    raise AgentError("legacy codex mcp remove failed")
+                legacy_registration_removed = True
+                legacy_registration = {"requested": True, "status": "removed"}
     except BaseException:
         mcp_restore_error: Exception | None = None
         config_restore_error: Exception | None = None
         desktop_restore_error: Exception | None = None
-        if registration_added or registration_removed:
+        if registration_added or registration_removed or legacy_registration_removed:
             try:
                 if registration_added:
                     assert binding is not None
@@ -24247,6 +24332,16 @@ def _install_enrolled_unlocked(
                     )
                     if restore.returncode != 0:
                         raise AgentError("codex mcp add failed")
+                if legacy_registration_removed and legacy_previous_command is not None:
+                    restore_legacy = _run_bound_codex_mcp_command(
+                        binding,
+                        "add",
+                        LEGACY_MCP_SERVER_NAME,
+                        "--",
+                        legacy_previous_command,
+                    )
+                    if restore_legacy.returncode != 0:
+                        raise AgentError("legacy codex mcp add failed")
             except Exception as restore_exc:
                 mcp_restore_error = restore_exc
         if startup_timeout_snapshot is not None:
@@ -24276,6 +24371,7 @@ def _install_enrolled_unlocked(
         "runtime_entrypoint_state": "set",
         "startup_self_test": startup_self_test,
         "mcp": registration,
+        "legacy_mcp": legacy_registration,
         "desktop_entry": desktop_install,
         "raw_output": "not_returned",
     }

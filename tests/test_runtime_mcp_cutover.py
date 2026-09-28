@@ -35,8 +35,20 @@ def runtime_layout(tmp_path: Path) -> RuntimeLayout:
     _write(root, "bin/the-hive-plugin-hook-stable", "#!/bin/sh\nexit 0\n", 0o755)
     _write(root, "bin/the-hive-hive-hourly-probe", "#!/bin/sh\nexit 0\n", 0o755)
     _write(root, "bin/the-hive-resource-monitor", "#!/bin/sh\nexit 0\n", 0o755)
+    _write(
+        root, "bin/the-hive-openai-pricing-inventory", "#!/bin/sh\nexit 0\n", 0o755
+    )
+    _write(
+        root,
+        "bin/the-hive-openai-pricing-inventory-stable",
+        "#!/bin/sh\nexit 0\n",
+        0o755,
+    )
     _write(root, "systemd/user/the-hive-resource-monitor.service", "[Service]\n")
     _write(root, "systemd/user/the-hive.slice", "[Slice]\n")
+    _write(root, "systemd/user/the-hive-openai-pricing.service", "[Service]\n")
+    _write(root, "systemd/user/the-hive-openai-pricing.timer", "[Timer]\n")
+    _write(root, "src/the_hive/pricing_inventory.py", "# pricing inventory\n")
     _write(
         root,
         ".codex-plugin/plugin.json",
@@ -130,7 +142,9 @@ def test_interactive_registration_uses_the_validated_image_entrypoint(
     timeout = {"status": "updated", "_config_snapshot": None}
 
     with (
-        patch.object(server, "_runtime_layout", return_value=layout),
+        patch.object(
+            server, "_runtime_mcp_entrypoint", return_value=layout.mcp_entrypoint
+        ),
         patch.object(server, "assert_install_context_allows_master_registration"),
         patch.object(
             server, "enroll_current_teamleader", return_value={"changed": False}
@@ -138,6 +152,15 @@ def test_interactive_registration_uses_the_validated_image_entrypoint(
         patch.object(server, "ensure_applet_action_key"),
         patch.object(server, "mcp_command_startup_self_test", return_value=startup),
         patch.object(server, "check_mcp_registration", return_value=current),
+        patch.object(
+            server,
+            "check_legacy_mcp_registration",
+            return_value={
+                "registered": False,
+                "lookup_status": "not_registered",
+                "_registered_command": None,
+            },
+        ),
         patch.object(
             server, "_codex_mcp_binding", return_value=contextlib.nullcontext(binding)
         ),
@@ -165,6 +188,79 @@ def test_interactive_registration_uses_the_validated_image_entrypoint(
     assert result["runtime_entrypoint"] == "not_returned"
     assert "symlink" not in result
     assert result["mcp"]["status"] == "registered"
+
+
+def test_force_install_retires_legacy_registration_after_new_registration(
+    tmp_path: Path,
+) -> None:
+    entrypoint = tmp_path / "the-hive-mcp"
+    entrypoint.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    entrypoint.chmod(0o700)
+    layout = SimpleNamespace(mcp_entrypoint=entrypoint)
+    binding = _PinnedMcpBinding()
+    current = {
+        "registered": False,
+        "lookup_status": "not_registered",
+        "command_matches": False,
+        "startup_timeout_ok": False,
+        "ok": False,
+    }
+    legacy = {
+        "registered": True,
+        "lookup_status": "registered",
+        "_registered_command": "/previous/codex-master-mcp",
+    }
+
+    with (
+        patch.object(
+            server, "_runtime_mcp_entrypoint", return_value=layout.mcp_entrypoint
+        ),
+        patch.object(server, "assert_install_context_allows_master_registration"),
+        patch.object(
+            server, "enroll_current_teamleader", return_value={"changed": False}
+        ),
+        patch.object(server, "ensure_applet_action_key"),
+        patch.object(
+            server, "mcp_command_startup_self_test", return_value={"ok": True}
+        ),
+        patch.object(server, "check_mcp_registration", return_value=current),
+        patch.object(
+            server, "check_legacy_mcp_registration", return_value=legacy, create=True
+        ),
+        patch.object(
+            server, "_codex_mcp_binding", return_value=contextlib.nullcontext(binding)
+        ),
+        patch.object(server, "install_lock", return_value=contextlib.nullcontext()),
+        patch.object(
+            server,
+            "ensure_mcp_startup_timeout_configured",
+            return_value={"status": "updated", "_config_snapshot": None},
+        ),
+        patch.object(server, "run_command") as run,
+    ):
+        run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        result = server.install(register=True, force=True)
+
+    assert [call.args[0] for call in run.call_args_list] == [
+        [
+            str(binding.command_path),
+            "mcp",
+            "add",
+            server.MCP_SERVER_NAME,
+            "--",
+            str(layout.mcp_entrypoint),
+        ],
+        [
+            str(binding.command_path),
+            "mcp",
+            "remove",
+            "codex-master-mcp",
+        ],
+    ]
+    assert result["legacy_mcp"] == {
+        "requested": True,
+        "status": "removed",
+    }
 
 
 def test_interactive_unregistration_only_removes_matching_image_registration(
@@ -465,6 +561,15 @@ def test_force_rollback_reuses_one_pinned_cli_and_client_home_after_add_failure(
             server, "mcp_command_startup_self_test", return_value={"ok": True}
         ),
         patch.object(server, "check_mcp_registration", return_value=current) as check,
+        patch.object(
+            server,
+            "check_legacy_mcp_registration",
+            return_value={
+                "registered": False,
+                "lookup_status": "not_registered",
+                "_registered_command": None,
+            },
+        ),
         patch.object(
             server,
             "codex_client_mcp_config_status",
@@ -803,6 +908,15 @@ def test_force_rollback_keeps_the_pinned_dot_codex_after_a_swap(
             server, "mcp_command_startup_self_test", return_value={"ok": True}
         ),
         patch.object(server, "check_mcp_registration", return_value=current),
+        patch.object(
+            server,
+            "check_legacy_mcp_registration",
+            return_value={
+                "registered": False,
+                "lookup_status": "not_registered",
+                "_registered_command": None,
+            },
+        ),
         patch.object(
             server,
             "codex_client_mcp_config_status",

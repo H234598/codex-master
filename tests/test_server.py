@@ -6171,12 +6171,12 @@ class ServerHelpersTest(unittest.TestCase):
     def test_codex_client_mcp_config_status_detects_ready_config_without_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / ".codex" / "config.toml"
-            install_path = Path(tmpdir) / "bin" / "codex-master-mcp"
+            install_path = Path(tmpdir) / "bin" / "the-hive-mcp"
             config.parent.mkdir()
             config.write_text(
                 "\n".join(
                     [
-                        "[mcp_servers.codex-master-mcp]",
+                        "[mcp_servers.the-hive-mcp]",
                         f'command = "{install_path}"',
                         "startup_timeout_sec = 120",
                         'default_tools_approval_mode = "approve"',
@@ -6199,11 +6199,11 @@ class ServerHelpersTest(unittest.TestCase):
     def test_codex_client_mcp_config_status_requires_approve_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / ".codex" / "config.toml"
-            install_path = Path(tmpdir) / "bin" / "codex-master-mcp"
+            install_path = Path(tmpdir) / "bin" / "the-hive-mcp"
             config.parent.mkdir()
             base = "\n".join(
                 [
-                    "[mcp_servers.codex-master-mcp]",
+                    "[mcp_servers.the-hive-mcp]",
                     f'command = "{install_path}"',
                     "startup_timeout_sec = 120",
                 ]
@@ -6226,12 +6226,12 @@ class ServerHelpersTest(unittest.TestCase):
     def test_codex_client_mcp_config_status_rejects_non_finite_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / ".codex" / "config.toml"
-            install_path = Path(tmpdir) / "bin" / "codex-master-mcp"
+            install_path = Path(tmpdir) / "bin" / "the-hive-mcp"
             config.parent.mkdir()
             config.write_text(
                 "\n".join(
                     [
-                        "[mcp_servers.codex-master-mcp]",
+                        "[mcp_servers.the-hive-mcp]",
                         f'command = "{install_path}"',
                         "startup_timeout_sec = 1e999",
                     ]
@@ -6249,13 +6249,13 @@ class ServerHelpersTest(unittest.TestCase):
     def test_codex_client_mcp_config_status_detects_mismatch_without_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / ".codex" / "config.toml"
-            install_path = Path(tmpdir) / "bin" / "codex-master-mcp"
+            install_path = Path(tmpdir) / "bin" / "the-hive-mcp"
             wrong_path = Path(tmpdir) / "bin" / "wrong-mcp"
             config.parent.mkdir()
             config.write_text(
                 "\n".join(
                     [
-                        "[mcp_servers.codex-master-mcp]",
+                        "[mcp_servers.the-hive-mcp]",
                         f'command = "{wrong_path}"',
                         "startup_timeout_sec = 30",
                     ]
@@ -27591,6 +27591,14 @@ google_accounts:
             args_priority = server_module.agent_base_args("gpt-5.6-sol", "xhigh", service_tier="priority")
             self.assertIn('service_tier="priority"', args_priority)
 
+    def test_blocked_emergency_state_does_not_authorize_priority(self) -> None:
+        with patch("the_hive.fast_mode.snapshot", return_value={"modes": {}}), patch.object(
+            server_module,
+            "emergency_queen_status",
+            return_value={"state": "blocked", "emergency_active": True},
+        ):
+            self.assertFalse(server_module._fast_or_emergency_mode_active())
+
     def test_home_refresh_config_flex_tier_invariant(self) -> None:
         home = Path("/tmp/fake-home")
         refreshed = server_module._home_refresh_config(
@@ -34081,16 +34089,16 @@ class CliLifecycleTest(unittest.TestCase):
         response = (
             '{"jsonrpc":"2.0","id":1,'
             '"result":{"protocolVersion":"2024-11-05","capabilities":{},'
-            '"serverInfo":{"name":"codex-master-mcp"}}}'
+            '"serverInfo":{"name":"the-hive-mcp"}}}'
         )
         mock_run.return_value = subprocess.CompletedProcess(
-            ["codex-master-mcp"],
+            ["the-hive-mcp"],
             0,
             response,
             "",
         )
 
-        result = mcp_command_startup_self_test(Path("/tmp/codex-master-mcp"))
+        result = mcp_command_startup_self_test(Path("/tmp/the-hive-mcp"))
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["raw_output"], "not_returned")
@@ -34104,18 +34112,18 @@ class CliLifecycleTest(unittest.TestCase):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "serverInfo": {"name": "codex-master-mcp"},
+                "serverInfo": {"name": "the-hive-mcp"},
             },
         }
         encoded = json.dumps(response, separators=(",", ":"))
         mock_run.return_value = subprocess.CompletedProcess(
-            ["codex-master-mcp"],
+            ["the-hive-mcp"],
             0,
             f"Content-Length: {len(encoded)}\r\n\r\n{encoded}",
             "",
         )
 
-        result = mcp_command_startup_self_test(Path("/tmp/codex-master-mcp"))
+        result = mcp_command_startup_self_test(Path("/tmp/the-hive-mcp"))
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "ok")

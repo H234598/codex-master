@@ -178,7 +178,9 @@ def _published_launcher_release(
         generation=generation,
         commit=TEST_STRUCTURAL_COMMIT,
     )
-    release_root = tmp_path / "the-hive-runtime"
+    library = tmp_path / "home" / ".local" / "lib"
+    library.mkdir(mode=0o700, parents=True)
+    release_root = library / "the-hive-runtime"
     installer["_publish_runtime_generation"](stage=stage, release_root=release_root)  # type: ignore[operator]
     manifest_digest = "sha256:" + hashlib.sha256(
         (
@@ -369,6 +371,22 @@ def test_plugin_mcp_config_uses_only_the_authority_materialized_stable_launcher(
     assert rejected.returncode == 64
     assert rejected.stdout == ""
     assert rejected.stderr == ""
+
+
+def test_interactive_runtime_entrypoint_is_the_current_stable_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import the_hive.server as server
+
+    release_root, generation, manifest_digest, _installer = (
+        _published_launcher_release(tmp_path)
+    )
+    layout = RuntimeLayout.from_current_release(
+        release_root, generation, manifest_digest
+    )
+    monkeypatch.setattr(server, "_runtime_layout", lambda: layout)
+
+    assert server.runtime_mcp_entrypoint() == release_root / "the-hive-mcp"
 
 
 def test_complete_p2_runtime_image_binds_its_attested_root_without_a_checkout(
