@@ -13,6 +13,7 @@ from the_hive.runtime_layout import (
 from the_hive.runtime_process import (
     BoundedProcessError,
     DEFAULT_STDERR_LIMIT,
+    _PROTECTED_HOME_RUNTIME_DIRECTORY,
     run_bounded,
 )
 
@@ -75,7 +76,9 @@ def _current_release_binding(layout: RuntimeLayout) -> tuple[RuntimeLayout, Path
     return current_layout, release_root, generation
 
 
-def _run_direct_mcp(*, layout: RuntimeLayout, home: Path) -> tuple[int, str]:
+def _run_direct_mcp(
+    *, layout: RuntimeLayout, home: Path, bound_runtime_directory: Path | None = None
+) -> tuple[int, str]:
     current_layout, release_root, generation = _current_release_binding(layout)
     try:
         result = run_bounded(
@@ -93,6 +96,7 @@ def _run_direct_mcp(*, layout: RuntimeLayout, home: Path) -> tuple[int, str]:
             stderr_limit=DEFAULT_STDERR_LIMIT,
             input_data=_probe_payload(),
             runtime_layout=current_layout,
+            bound_runtime_directory=bound_runtime_directory,
         )
     except BoundedProcessError as exc:
         if exc.code == "command_timeout":
@@ -224,7 +228,10 @@ def _blocked_surface(reason_code: str) -> dict[str, object]:
 
 
 def runtime_status(
-    *, layout: RuntimeLayout | None = None, home: Path | None = None
+    *,
+    layout: RuntimeLayout | None = None,
+    home: Path | None = None,
+    protected_home_runtime: bool = False,
 ) -> dict[str, object]:
     """Check only the image metadata and its direct MCP initialize/tools surface."""
 
@@ -240,9 +247,22 @@ def runtime_status(
             "mcp_surface": _blocked_surface("metadata_invalid"),
             "raw_output": "not_returned",
         }
+    if type(protected_home_runtime) is not bool:
+        return {
+            "ok": False,
+            "metadata": {"ok": False, "reason_code": "metadata_invalid"},
+            "mcp_surface": _blocked_surface("metadata_invalid"),
+            "raw_output": "not_returned",
+        }
     try:
         returncode, output = _run_direct_mcp(
-            layout=active_layout, home=Path.home() if home is None else home
+            layout=active_layout,
+            home=Path.home() if home is None else home,
+            bound_runtime_directory=(
+                _PROTECTED_HOME_RUNTIME_DIRECTORY
+                if protected_home_runtime
+                else None
+            ),
         )
     except TimeoutError as exc:
         surface = _blocked_surface(str(exc) or "mcp_timeout")

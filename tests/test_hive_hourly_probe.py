@@ -566,17 +566,23 @@ def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics
     layout = RuntimeLayout.from_current_release(
         release_root, generation, stage.manifest_digest
     )
-    status_layouts: list[RuntimeLayout] = []
-    bounded_commands: list[tuple[tuple[str, ...], str]] = []
+    status_layouts: list[tuple[RuntimeLayout, bool]] = []
+    bounded_commands: list[tuple[tuple[str, ...], str, Path | None]] = []
 
-    def direct_status(*, layout: RuntimeLayout) -> dict[str, object]:
-        status_layouts.append(layout)
+    def direct_status(
+        *, layout: RuntimeLayout, protected_home_runtime: bool
+    ) -> dict[str, object]:
+        status_layouts.append((layout, protected_home_runtime))
         return green_runtime_status()
 
     def bounded(
-        _layout: RuntimeLayout, _command: Path, *arguments: str, phase: str
+        _layout: RuntimeLayout,
+        _command: Path,
+        *arguments: str,
+        phase: str,
+        bound_runtime_directory: Path | None,
     ) -> tuple[dict[str, object], bool]:
-        bounded_commands.append((arguments, phase))
+        bounded_commands.append((arguments, phase, bound_runtime_directory))
         binding = (str(release_root), generation, layout.manifest_digest)
         if arguments == (*binding, "hive", "status"):
             return green_hive_runtime(), True
@@ -600,17 +606,20 @@ def test_run_probe_calls_runtime_status_outside_the_two_bounded_hive_diagnostics
         layout=layout,
         state_directory=tmp_path / "state",
         now=lambda: NOW,
+        protected_home_runtime=True,
     )
 
-    assert status_layouts == [layout]
+    assert status_layouts == [(layout, True)]
     assert bounded_commands == [
         (
             (str(release_root), generation, layout.manifest_digest, "hive", "status"),
             "hive_status",
+            hourly_probe_module._PROTECTED_HOME_RUNTIME_DIRECTORY,
         ),
         (
             (str(release_root), generation, layout.manifest_digest, "hive", "doctor"),
             "hive_doctor",
+            hourly_probe_module._PROTECTED_HOME_RUNTIME_DIRECTORY,
         ),
     ]
     assert result["commands"]["runtime_status"] is True
@@ -778,7 +787,9 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
     assert [line for line in service_lines if line.startswith("ProtectHome=")] == [
         "ProtectHome=tmpfs"
     ]
-    assert [line for line in service_lines if "%t" in line] == []
+    assert [line for line in service_lines if "%t" in line] == [
+        "BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind"
+    ]
     assert "CODEX_MASTER_PROBE_REPOSITORY" not in service_text
     assert "%h/codex-master/src" not in service_text
     assert "%h/codex-master/bin/codex-master-mcp" not in service_text
@@ -798,7 +809,7 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
         in service_text
     )
     assert (
-        "ExecStart=%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@/bin/the-hive-hive-hourly-probe %h/.local/lib/the-hive-runtime @MASTERJET_GENERATION@ @MASTERJET_MANIFEST_DIGEST@ --json"
+        "ExecStart=%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@/bin/the-hive-hive-hourly-probe %h/.local/lib/the-hive-runtime @MASTERJET_GENERATION@ @MASTERJET_MANIFEST_DIGEST@ --protected-home-runtime --json"
         in service_text
     )
     assert "libexec" not in service_text
@@ -837,6 +848,10 @@ def test_attested_runtime_materializes_hourly_without_runtime_directory_self_bin
     ).read_text(encoding="utf-8")
     assert "BindReadOnlyPaths=%t:%t:norbind" not in installed_service
     assert (
+        "BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind"
+        in installed_service
+    )
+    assert (
         "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:"
         "%h/.local/lib/the-hive-runtime:norbind"
     ) in installed_service
@@ -860,6 +875,64 @@ def test_hourly_probe_service_renderer_rejects_a_generation_only_sandbox() -> No
             b"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind",
             b"BindReadOnlyPaths=%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@:norbind",
         )
+    )
+
+    with pytest.raises(install_error, match="install_release_template_invalid"):
+        installer["_render_hourly_probe_service"](
+            template,
+            generation="a" * 40,
+            manifest_digest="sha256:" + "b" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        (
+            b"BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind",
+            b"BindReadOnlyPaths=%t:%t:norbind",
+        ),
+        (
+            b"--protected-home-runtime --json",
+            b"--json",
+        ),
+    ),
+)
+def test_hourly_probe_renderer_rejects_missing_protected_home_contract(
+    replacement: tuple[bytes, bytes],
+) -> None:
+    """The installer cannot publish a probe that will lose its manager socket."""
+
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    install_error = installer["InstallError"]
+    old, new = replacement
+    template = (
+        (ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service")
+        .read_bytes()
+        .replace(old, new)
+    )
+
+    with pytest.raises(install_error, match="install_release_template_invalid"):
+        installer["_render_hourly_probe_service"](
+            template,
+            generation="a" * 40,
+            manifest_digest="sha256:" + "b" * 64,
+        )
+
+
+def test_hourly_probe_renderer_rejects_an_extra_home_bind() -> None:
+    """The fixed runtime bind must not authorize an additional home exposure."""
+
+    installer = runpy.run_path(
+        str(ROOT / "scripts" / "the-hive-hive-hourly-probe-install")
+    )
+    install_error = installer["InstallError"]
+    template = (
+        (ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service")
+        .read_bytes()
+        + b"BindReadOnlyPaths=%h:%h:norbind\n"
     )
 
     with pytest.raises(install_error, match="install_release_template_invalid"):
@@ -991,6 +1064,32 @@ def test_hourly_probe_direct_entrypoint_reports_invalid_arguments(capsys) -> Non
     assert captured.err == (
         "hive_hourly_probe_error code=arguments_invalid expected=--json\n"
     )
+
+
+def test_hourly_probe_direct_entrypoint_uses_a_fixed_protected_home_marker(
+    monkeypatch, capsys
+) -> None:
+    observed: list[bool] = []
+    monkeypatch.setattr(
+        hourly_probe_module,
+        "run_probe",
+        lambda *, protected_home_runtime: observed.append(protected_home_runtime)
+        or {
+            "checks": {
+                "runtime_layout": True,
+                "hive_runtime": True,
+                "hive_doctor": True,
+            }
+        },
+    )
+
+    assert hourly_probe_module.main(["--protected-home-runtime", "--json"]) == 0
+    assert observed == [True]
+    assert json.loads(capsys.readouterr().out)["checks"] == {
+        "runtime_layout": True,
+        "hive_runtime": True,
+        "hive_doctor": True,
+    }
 
 
 def test_hourly_probe_direct_entrypoint_explains_a_red_result(

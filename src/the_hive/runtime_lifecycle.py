@@ -39,6 +39,19 @@ _PRICING_UNITS = (
     "the-hive-openai-pricing.timer",
 )
 _EIGHT_UTC_TERMS = "OnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00 UTC"
+_HOURLY_PROBE_RUNTIME_ROOT_BINDING = (
+    "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:"
+    "%h/.local/lib/the-hive-runtime:norbind"
+)
+_HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING = (
+    "BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind"
+)
+_HOURLY_PROBE_PROTECTED_HOME_RUNTIME_ARGUMENT = "--protected-home-runtime"
+_HOURLY_PROBE_STATE_BINDING = (
+    "BindPaths=%h/.local/state/codex-master-mcp:"
+    "%h/.local/state/codex-master-mcp:norbind"
+)
+_HOURLY_PROBE_STATE_WRITE_PATH = "ReadWritePaths=%h/.local/state/codex-master-mcp"
 _MAX_UNIT_BYTES = 128 * 1024
 _MAX_HEALTH_BYTES = 256 * 1024
 _LOCK_NAME = ".runtime-lifecycle.lock"
@@ -2489,11 +2502,23 @@ def _attested_hourly_unit_bytes(
         template = service_template.decode("utf-8")
     except (RuntimeLifecycleError, UnicodeDecodeError, ValueError) as exc:
         raise _error("runtime_lifecycle_postinstall_invalid") from exc
+    template_lines = template.splitlines()
     if (
         template.count("@MASTERJET_GENERATION@") != 2
         or template.count("@MASTERJET_MANIFEST_DIGEST@") != 1
-        or "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind"
-        not in template
+        or [line for line in template_lines if line.startswith("PrivateTmp=")]
+        != ["PrivateTmp=yes"]
+        or [line for line in template_lines if line.startswith("ProtectHome=")]
+        != ["ProtectHome=tmpfs"]
+        or [line for line in template_lines if line.startswith("BindReadOnlyPaths=")]
+        != [
+            _HOURLY_PROBE_RUNTIME_ROOT_BINDING,
+            _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING,
+        ]
+        or [line for line in template_lines if line.startswith("BindPaths=")]
+        != [_HOURLY_PROBE_STATE_BINDING]
+        or [line for line in template_lines if line.startswith("ReadWritePaths=")]
+        != [_HOURLY_PROBE_STATE_WRITE_PATH]
     ):
         raise _error("runtime_lifecycle_postinstall_invalid")
     service = (
@@ -2505,7 +2530,8 @@ def _attested_hourly_unit_bytes(
         "ExecStart=%h/.local/lib/the-hive-runtime/generations/"
         f"{generation}/bin/the-hive-hive-hourly-probe "
         "%h/.local/lib/the-hive-runtime "
-        f"{generation} {manifest_digest} --json"
+        f"{generation} {manifest_digest} "
+        f"{_HOURLY_PROBE_PROTECTED_HOME_RUNTIME_ARGUMENT} --json"
     )
     terms = [
         line.strip()
@@ -2514,7 +2540,12 @@ def _attested_hourly_unit_bytes(
     ]
     if (
         "@MASTERJET_" in service.decode("utf-8")
-        or expected not in service.decode("utf-8")
+        or [
+            line
+            for line in service.decode("utf-8").splitlines()
+            if line.startswith("ExecStart=")
+        ]
+        != [expected]
         or terms != [_EIGHT_UTC_TERMS]
     ):
         raise _error("runtime_lifecycle_postinstall_invalid")

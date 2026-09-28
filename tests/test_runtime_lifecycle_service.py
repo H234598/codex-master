@@ -32,6 +32,55 @@ def _identity(path: Path) -> tuple[int, int, int, int, int, bytes]:
     )
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        (
+            b"BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind",
+            b"BindReadOnlyPaths=%t:%t:norbind",
+        ),
+        (b"--protected-home-runtime --json", b"--json"),
+    ),
+)
+def test_lifecycle_attestation_rejects_missing_protected_home_runtime_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, replacement: tuple[bytes, bytes]
+) -> None:
+    """A manifest-attested unit still needs the exact protected-home contract."""
+
+    from the_hive import runtime_layout as runtime_layout_module
+
+    old, new = replacement
+    service = (
+        (ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service")
+        .read_bytes()
+        .replace(old, new)
+    )
+    timer = (ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.timer").read_bytes()
+
+    class AttestedLayout:
+        def read_attested_file(self, relative: str) -> bytes:
+            return {
+                "systemd/user/the-hive-hive-hourly-probe.service": service,
+                "systemd/user/the-hive-hive-hourly-probe.timer": timer,
+            }[relative]
+
+    monkeypatch.setattr(
+        runtime_layout_module.RuntimeLayout,
+        "from_current_release",
+        classmethod(lambda _cls, *_args: AttestedLayout()),
+    )
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_postinstall_invalid",
+    ):
+        runtime_lifecycle._attested_hourly_unit_bytes(
+            release_root=tmp_path,
+            generation="a" * 40,
+            manifest_digest="sha256:" + "b" * 64,
+        )
+
+
 def _lifecycle_state(home: Path) -> None:
     leaf = home / ".local" / "state" / "codex-master-mcp" / "hive"
     leaf.mkdir(parents=True, mode=0o700)

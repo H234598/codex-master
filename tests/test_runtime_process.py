@@ -899,6 +899,92 @@ def test_runtime_directory_contrasts_interactive_and_hardened_contexts_without_l
     assert hardened_error.value.code == "command_group_unavailable"
 
 
+def test_protected_home_runtime_directory_is_fixed_validated_and_not_environment_controlled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the fixed Hourly bind target can replace the canonical runtime path."""
+
+    import the_hive.runtime_process as runtime_process
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    bound_runtime = tmp_path / "hourly-runtime"
+    bound_runtime.mkdir(mode=0o700)
+    foreign_runtime = tmp_path / "foreign-runtime"
+    foreign_runtime.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        runtime_process, "_PROTECTED_HOME_RUNTIME_DIRECTORY", bound_runtime
+    )
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(foreign_runtime))
+
+    environment = runtime_process.minimal_environment(
+        home=home, bound_runtime_directory=bound_runtime
+    )
+
+    assert environment["XDG_RUNTIME_DIR"] == str(bound_runtime)
+    with pytest.raises(runtime_process.BoundedProcessError) as arbitrary:
+        runtime_process.minimal_environment(
+            home=home, bound_runtime_directory=foreign_runtime
+        )
+    assert arbitrary.value.code == "command_group_unavailable"
+
+    bound_runtime.rmdir()
+    bound_runtime.symlink_to(foreign_runtime)
+    with pytest.raises(runtime_process.BoundedProcessError) as unsafe:
+        runtime_process.minimal_environment(
+            home=home, bound_runtime_directory=bound_runtime
+        )
+    assert unsafe.value.code == "command_group_unavailable"
+
+
+def test_bounded_runner_forwards_only_the_fixed_protected_home_runtime_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Hourly caller reaches the minimal environment through run_bounded."""
+
+    import the_hive.runtime_process as runtime_process
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    bound_runtime = tmp_path / "hourly-runtime"
+    bound_runtime.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        runtime_process, "_PROTECTED_HOME_RUNTIME_DIRECTORY", bound_runtime
+    )
+    captured: dict[str, object] = {}
+    real_minimal_environment = runtime_process.minimal_environment
+
+    def observe_minimal_environment(**kwargs: object) -> dict[str, str]:
+        captured.update(kwargs)
+        return real_minimal_environment(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        runtime_process, "minimal_environment", observe_minimal_environment
+    )
+    monkeypatch.setattr(
+        runtime_process,
+        "_load_runtime_spawn_helper",
+        lambda _layout: (_ for _ in ()).throw(
+            runtime_process.BoundedProcessError("command_group_unavailable")
+        ),
+    )
+
+    with pytest.raises(runtime_process.BoundedProcessError):
+        runtime_process.run_bounded(
+            ["/bin/true"],
+            cwd=tmp_path,
+            home=home,
+            timeout_seconds=1,
+            runtime_layout=object(),  # type: ignore[arg-type]
+            bound_runtime_directory=bound_runtime,
+        )
+
+    assert captured == {
+        "home": home,
+        "bound_runtime_directory": bound_runtime,
+    }
+
+
 @pytest.mark.parametrize("stream", ("stdout", "stderr"))
 def test_bounded_runner_rejects_each_output_overflow(
     tmp_path: Path, stream: str

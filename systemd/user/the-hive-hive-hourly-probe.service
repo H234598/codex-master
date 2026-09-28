@@ -31,6 +31,9 @@ UMask=0077
 ReadOnlyPaths=/usr/bin/python3
 # RuntimeLayout attests the release pointer and both retained generations.
 BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:%h/.local/lib/the-hive-runtime:norbind
+# ProtectHome=tmpfs also masks /run/user. Bind the host user runtime into the
+# unit's private /tmp at the one fixed path accepted by the probe.
+BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind
 BindPaths=%h/.local/state/codex-master-mcp:%h/.local/state/codex-master-mcp:norbind
 ReadWritePaths=%h/.local/state/codex-master-mcp
-ExecStart=%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@/bin/the-hive-hive-hourly-probe %h/.local/lib/the-hive-runtime @MASTERJET_GENERATION@ @MASTERJET_MANIFEST_DIGEST@ --json
+ExecStart=%h/.local/lib/the-hive-runtime/generations/@MASTERJET_GENERATION@/bin/the-hive-hive-hourly-probe %h/.local/lib/the-hive-runtime @MASTERJET_GENERATION@ @MASTERJET_MANIFEST_DIGEST@ --protected-home-runtime --json

@@ -20,6 +20,7 @@ from the_hive.runtime_process import (
     BoundedProcessError,
     DEFAULT_STDERR_LIMIT,
     DEFAULT_STDOUT_LIMIT,
+    _PROTECTED_HOME_RUNTIME_DIRECTORY,
     run_bounded,
 )
 from the_hive.runtime_status import (
@@ -126,6 +127,7 @@ RUNTIME_IMAGE_PROBE_TOTAL_TIMEOUT_SECONDS = sum(
     seconds for _phase, seconds in RUNTIME_IMAGE_PROBE_PHASE_TIMEOUTS
 )
 _RUNTIME_IMAGE_PROBE_PHASE_LIMITS = dict(RUNTIME_IMAGE_PROBE_PHASE_TIMEOUTS)
+_PROTECTED_HOME_RUNTIME_ARGUMENT = "--protected-home-runtime"
 
 
 def _ready_state(value: object) -> bool:
@@ -833,7 +835,11 @@ def _diagnostic(code: str, exit_code: int | None, stderr: object) -> dict[str, o
 
 
 def _run_json(
-    layout: RuntimeLayout, command: Path, *arguments: str, phase: str
+    layout: RuntimeLayout,
+    command: Path,
+    *arguments: str,
+    phase: str,
+    bound_runtime_directory: Path | None = None,
 ) -> tuple[dict[str, Any], bool, dict[str, object]]:
     """Run one bounded command and retain a safe, bounded failure cause."""
 
@@ -846,6 +852,7 @@ def _run_json(
             stdout_limit=DEFAULT_STDOUT_LIMIT,
             stderr_limit=DEFAULT_STDERR_LIMIT,
             runtime_layout=layout,
+            bound_runtime_directory=bound_runtime_directory,
         )
         if completed.returncode != 0:
             return (
@@ -905,11 +912,15 @@ def _run_json(
 
 
 def _runtime_status_json(
-    layout: RuntimeLayout,
+    layout: RuntimeLayout, *, protected_home_runtime: bool = False
 ) -> tuple[dict[str, Any], bool, dict[str, object]]:
     """Run the one bounded MCP status check outside a bus-isolated child."""
 
-    value = runtime_status(layout=layout)
+    value = (
+        runtime_status(layout=layout, protected_home_runtime=True)
+        if protected_home_runtime
+        else runtime_status(layout=layout)
+    )
     reason_code = value.get("mcp_surface", {}).get("reason_code")
     if reason_code == "mcp_timeout":
         _emit_phase_timeout("direct_mcp")
@@ -1019,6 +1030,7 @@ def run_probe(
     state_directory: Path | None = None,
     now: Callable[[], datetime] | None = None,
     runner: Callable[..., object] | None = None,
+    protected_home_runtime: bool = False,
 ) -> dict[str, Any]:
     """Run direct v3 checks and atomically publish exactly one v3 record."""
 
@@ -1030,9 +1042,15 @@ def run_probe(
         raise ValueError("probe_runtime_layout_unavailable") from exc
     if not isinstance(active_layout, RuntimeLayout):
         raise ValueError("probe_runtime_layout_unavailable")
+    if type(protected_home_runtime) is not bool:
+        raise ValueError("probe_runtime_layout_unavailable")
     state_directory = _state_directory(state_directory or _probe_state_root())
     if runner is not None:
-        runtime, runtime_command, runtime_diagnostic = _runtime_status_json(active_layout)
+        runtime, runtime_command, runtime_diagnostic = (
+            _runtime_status_json(active_layout, protected_home_runtime=True)
+            if protected_home_runtime
+            else _runtime_status_json(active_layout)
+        )
         hive, hive_command, hive_diagnostic = _injected_command_result(
             runner(active_layout.mcp_entrypoint, "hive", "status")
         )
@@ -1041,26 +1059,54 @@ def run_probe(
         )
     else:
         current_layout, release_root, generation = _current_release_binding(active_layout)
-        runtime, runtime_command, runtime_diagnostic = _runtime_status_json(current_layout)
+        runtime, runtime_command, runtime_diagnostic = (
+            _runtime_status_json(current_layout, protected_home_runtime=True)
+            if protected_home_runtime
+            else _runtime_status_json(current_layout)
+        )
         binding = (str(release_root), generation, current_layout.manifest_digest)
         hive, hive_command, hive_diagnostic = _injected_command_result(
-            _run_json(
-                current_layout,
-                current_layout.mcp_entrypoint,
-                *binding,
-                "hive",
-                "status",
-                phase="hive_status",
+            (
+                _run_json(
+                    current_layout,
+                    current_layout.mcp_entrypoint,
+                    *binding,
+                    "hive",
+                    "status",
+                    phase="hive_status",
+                    bound_runtime_directory=_PROTECTED_HOME_RUNTIME_DIRECTORY,
+                )
+                if protected_home_runtime
+                else _run_json(
+                    current_layout,
+                    current_layout.mcp_entrypoint,
+                    *binding,
+                    "hive",
+                    "status",
+                    phase="hive_status",
+                )
             )
         )
         doctor, doctor_command, doctor_diagnostic = _injected_command_result(
-            _run_json(
-                current_layout,
-                current_layout.mcp_entrypoint,
-                *binding,
-                "hive",
-                "doctor",
-                phase="hive_doctor",
+            (
+                _run_json(
+                    current_layout,
+                    current_layout.mcp_entrypoint,
+                    *binding,
+                    "hive",
+                    "doctor",
+                    phase="hive_doctor",
+                    bound_runtime_directory=_PROTECTED_HOME_RUNTIME_DIRECTORY,
+                )
+                if protected_home_runtime
+                else _run_json(
+                    current_layout,
+                    current_layout.mcp_entrypoint,
+                    *binding,
+                    "hive",
+                    "doctor",
+                    phase="hive_doctor",
+                )
             )
         )
     result = evaluate(runtime, hive, doctor)
@@ -1098,7 +1144,12 @@ def run_probe(
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    if tuple(arguments or ()) not in {(), ("--json",)}:
+    parsed_arguments = tuple(arguments or ())
+    if parsed_arguments not in {
+        (),
+        ("--json",),
+        (_PROTECTED_HOME_RUNTIME_ARGUMENT, "--json"),
+    }:
         print(
             "hive_hourly_probe_error code=arguments_invalid expected=--json",
             file=sys.stderr,
@@ -1106,7 +1157,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
         )
         return 2
     try:
-        result = run_probe()
+        result = (
+            run_probe(protected_home_runtime=True)
+            if parsed_arguments == (_PROTECTED_HOME_RUNTIME_ARGUMENT, "--json")
+            else run_probe()
+        )
     except ValueError as exc:
         print(f"hive_hourly_probe_error code={exc}", file=sys.stderr, flush=True)
         return 2

@@ -332,6 +332,28 @@ def test_runtime_status_passes_only_the_explicit_current_release_binding_to_mcp(
     assert received["kwargs"]["cwd"] == layout.root
 
 
+def test_runtime_status_uses_the_fixed_protected_home_runtime_only_when_requested(
+    runtime_image, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    modules = _runtime_modules()
+    assert modules is not None
+    _layout_module, status_module = modules
+    layout = _named_release_layout(tmp_path, runtime_image)
+    received: list[object] = []
+
+    def observe(_argv: list[str], **kwargs: object) -> SimpleNamespace:
+        received.append(kwargs.get("bound_runtime_directory"))
+        return _healthy_mcp_result()
+
+    monkeypatch.setattr(status_module, "run_bounded", observe)
+
+    assert status_module.runtime_status(layout=layout)["ok"] is True
+    assert status_module.runtime_status(
+        layout=layout, protected_home_runtime=True
+    )["ok"] is True
+    assert received == [None, status_module._PROTECTED_HOME_RUNTIME_DIRECTORY]
+
+
 def test_runtime_status_rejects_plain_stage_layout_before_starting_mcp(
     runtime_image, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

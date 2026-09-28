@@ -31,6 +31,10 @@ _SYSTEMCTL = "/usr/bin/systemctl"
 _ENV = "/usr/bin/env"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _RUNTIME_DIRECTORY_ROOT = Path("/run/user")
+# This exists only inside the Hourly unit's PrivateTmp mount namespace. The
+# unit binds the canonical host user runtime directory here before
+# ProtectHome=tmpfs masks /run/user.
+_PROTECTED_HOME_RUNTIME_DIRECTORY = Path("/tmp/the-hive-hourly-runtime")
 BOUNDED_PROCESS_CLEANUP_SECONDS = 0.5
 
 
@@ -76,8 +80,18 @@ class _SpawnedProcess:
     cgroup_released: bool = False
 
 
-def _runtime_directory() -> Path:
-    path = _RUNTIME_DIRECTORY_ROOT / str(os.geteuid())
+def _runtime_directory(*, bound_runtime_directory: Path | None = None) -> Path:
+    """Return the canonical runtime directory or the one fixed Hourly bind."""
+
+    if bound_runtime_directory is None:
+        path = _RUNTIME_DIRECTORY_ROOT / str(os.geteuid())
+    elif (
+        not isinstance(bound_runtime_directory, Path)
+        or bound_runtime_directory != _PROTECTED_HOME_RUNTIME_DIRECTORY
+    ):
+        raise BoundedProcessError("command_group_unavailable")
+    else:
+        path = bound_runtime_directory
     try:
         info = path.lstat()
     except OSError as exc:
@@ -92,7 +106,9 @@ def _runtime_directory() -> Path:
     return path
 
 
-def minimal_environment(*, home: Path) -> dict[str, str]:
+def minimal_environment(
+    *, home: Path, bound_runtime_directory: Path | None = None
+) -> dict[str, str]:
     """Return the complete direct-child environment; no caller values leak in."""
 
     if (
@@ -107,7 +123,9 @@ def minimal_environment(*, home: Path) -> dict[str, str]:
         "PATH": "/usr/bin:/bin",
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
-        "XDG_RUNTIME_DIR": os.fspath(_runtime_directory()),
+        "XDG_RUNTIME_DIR": os.fspath(
+            _runtime_directory(bound_runtime_directory=bound_runtime_directory)
+        ),
     }
 
 
@@ -635,6 +653,7 @@ def run_bounded(
     stderr_limit: int = DEFAULT_STDERR_LIMIT,
     input_data: bytes = b"",
     runtime_layout: RuntimeLayout | None = None,
+    bound_runtime_directory: Path | None = None,
 ) -> BoundedProcessResult:
     """Run one command inside a bounded non-delegated cgroup-v2 service."""
 
@@ -667,7 +686,9 @@ def run_bounded(
         )
     except LayoutError as exc:
         raise BoundedProcessError("command_group_unavailable") from exc
-    environment = minimal_environment(home=home)
+    environment = minimal_environment(
+        home=home, bound_runtime_directory=bound_runtime_directory
+    )
     helper = _load_runtime_spawn_helper(layout)
     _verify_runner_capability(environment=environment, deadline=deadline)
     unit = _unit_name()
