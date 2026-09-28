@@ -17,7 +17,7 @@ from the_hive.runtime_migration_policy import (
 )
 
 
-_COMMON_POLICY_PATH = Path("src/the_hive/markdown/common.md")
+_COMMON_POLICY_PATH = hive_policy.COMMON_POLICY_PATH
 
 
 def _canonical_source(payload: object) -> bytes:
