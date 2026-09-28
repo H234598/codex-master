@@ -293,6 +293,15 @@ def test_canary_image_is_source_and_manifest_bound(
     assert manifest["generation"] == commit
     assert manifest["commit"] == commit
     assert image.manifest_digest == layout.manifest_digest
+    launcher = (
+        image.release_root
+        / "generations"
+        / image.generation
+        / "bin"
+        / "the-hive-hive-hourly-probe"
+    )
+    assert launcher.is_file()
+    assert os.access(launcher, os.X_OK)
     assert image.service == layout.read_attested_file(
         "systemd/user/the-hive-hive-hourly-probe.service"
     ).replace(b"@MASTERJET_GENERATION@", commit.encode()).replace(
@@ -368,7 +377,13 @@ def test_canary_unit_preserves_sandbox_and_substitutes_only_private_sources(
     assert "TimeoutStartSec=107s" in properties
     assert all("codex-master-openai-pricing" not in value for value in properties)
     assert unit.command == (
-        str(canonical_release / "generations" / _CANARY_GENERATION / "bin" / "the-hive-hive-hourly-probe"),
+        str(
+            image.release_root
+            / "generations"
+            / _CANARY_GENERATION
+            / "bin"
+            / "the-hive-hive-hourly-probe"
+        ),
         str(canonical_release),
         _CANARY_GENERATION,
         _CANARY_DIGEST,
