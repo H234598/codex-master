@@ -2604,8 +2604,9 @@ def _canary_unit_binding(
         home=home,
         properties=tuple(properties),
         command=(
+            "/usr/bin/bash",
             os.fspath(
-                image.release_root
+                canonical_release
                 / "generations"
                 / image.generation
                 / "bin"

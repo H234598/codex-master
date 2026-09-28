@@ -377,8 +377,9 @@ def test_canary_unit_preserves_sandbox_and_substitutes_only_private_sources(
     assert "TimeoutStartSec=107s" in properties
     assert all("codex-master-openai-pricing" not in value for value in properties)
     assert unit.command == (
+        "/usr/bin/bash",
         str(
-            image.release_root
+            canonical_release
             / "generations"
             / _CANARY_GENERATION
             / "bin"
