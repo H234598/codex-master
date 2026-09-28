@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 from types import MappingProxyType
@@ -395,6 +396,44 @@ def _canonical_json_bytes(value: object) -> bytes:
         raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid") from exc
 
 
+def _deep_freeze_json(value: object) -> object:
+    """Freeze one validated JSON value without changing its JSON representation."""
+
+    if type(value) is dict:
+        frozen: dict[str, object] = {}
+        for key, nested_value in value.items():
+            if type(key) is not str:
+                raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid")
+            frozen[key] = _deep_freeze_json(nested_value)
+        return MappingProxyType(frozen)
+    if type(value) is list:
+        return tuple(_deep_freeze_json(item) for item in value)
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid")
+
+
+def _thaw_frozen_json(value: object) -> object:
+    """Return a standard JSON container from the module's frozen representation."""
+
+    if isinstance(value, Mapping):
+        thawed: dict[str, object] = {}
+        for key, nested_value in value.items():
+            if type(key) is not str:
+                raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid")
+            thawed[key] = _thaw_frozen_json(nested_value)
+        return thawed
+    if type(value) in {list, tuple}:
+        return [_thaw_frozen_json(item) for item in value]
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid")
+
+
 def _strict_text(value: object, code: str, maximum: int) -> str:
     if (
         type(value) is not str
@@ -522,7 +561,10 @@ def _parse_machine_contract(identifier: str, value: object) -> Mapping[str, obje
     _validate_machine_contract_bounds(identifier, value)
     if not _strict_contract_value(value, expected):
         raise RuntimeMigrationPolicyError("runtime_migration_policy_machine_contract_invalid")
-    return MappingProxyType(dict(value))
+    frozen = _deep_freeze_json(value)
+    if not isinstance(frozen, Mapping):
+        raise RuntimeMigrationPolicyError("runtime_migration_policy_json_invalid")
+    return frozen
 
 
 def _parse_rule_group(value: object) -> RuntimeMigrationRuleGroup:
@@ -654,10 +696,11 @@ def render_runtime_migration_policy_block(
     ]
     for group in contract.rule_groups:
         machine_contract = json.dumps(
-            dict(group.machine_contract),
+            _thaw_frozen_json(group.machine_contract),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         )
         lines.extend(
             (

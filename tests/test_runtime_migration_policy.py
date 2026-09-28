@@ -137,12 +137,12 @@ def test_loads_the_complete_canonical_runtime_migration_policy() -> None:
         "canary": {
             "canonical_artifact_mutation": "deny",
             "first_failed_layer": "stop",
-            "layers": [
+            "layers": (
                 "manager_syntax_transport",
                 "namespace_sandbox",
                 "helper",
                 "product_logic",
-            ],
+            ),
         },
         "classifier": {
             "contract": "versioned_closed",
@@ -170,12 +170,12 @@ def test_loads_the_complete_canonical_runtime_migration_policy() -> None:
             "policy_and_diagnostic_integration": "not_required",
         },
         "harness_scope": {
-            "bound_declarations": [
+            "bound_declarations": (
                 "files",
                 "production_loc",
                 "error_families",
                 "live_attempts",
-            ],
+            ),
             "exceedance": {
                 "design_review": "required",
                 "native_alternative": "required",
@@ -191,11 +191,11 @@ def test_loads_the_complete_canonical_runtime_migration_policy() -> None:
             "full_rebuild": "requires_minimal_fix_comparison_and_justification",
             "minimal_fix": "preferred_when_root_cause_closed",
         },
-        "phases": {"gated": ["install", "activate", "observe", "commit"]},
+        "phases": {"gated": ("install", "activate", "observe", "commit")},
         "post_blind_diagnostic_revision": {"limit": 2, "next": "hold"},
         "pre_generation_compatibility": {
-            "before": ["generate", "mutation"],
-            "dimensions": ["manager", "runtime", "client", "features"],
+            "before": ("generate", "mutation"),
+            "dimensions": ("manager", "runtime", "client", "features"),
             "matrix": "required",
         },
         "telemetry": {
@@ -204,6 +204,46 @@ def test_loads_the_complete_canonical_runtime_migration_policy() -> None:
             "second_authority": "deny",
         },
     }
+
+
+def test_machine_contracts_are_deeply_immutable_and_render_original_json() -> None:
+    source_bytes = RUNTIME_MIGRATION_POLICY_PATH.read_bytes()
+    contract = load_runtime_migration_policy()
+    contracts = {group.identifier: group.machine_contract for group in contract.rule_groups}
+    compatibility = contracts["versioning-and-deterministic-execution"][
+        "compatibility"
+    ]
+    canary = contracts["diagnostic-evidence-and-remediation-gates"]["canary"]
+    assert isinstance(compatibility, dict) is False
+    assert isinstance(canary, dict) is False
+    assert isinstance(canary["layers"], list) is False
+    rendered_before = render_runtime_migration_policy_block(contract)
+
+    with pytest.raises(TypeError):
+        compatibility["unbounded_legacy"] = "allow"
+    with pytest.raises(AttributeError):
+        canary["layers"].append("extra_layer")
+
+    rendered_after = render_runtime_migration_policy_block(contract)
+    machine_contracts = [
+        json.loads(
+            line.removeprefix("Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `")
+            .removesuffix("`")
+        )
+        for line in rendered_after.decode("utf-8").splitlines()
+        if line.startswith("Maschinenvertrag (nur Source-/Compiler-Durchsetzung): `")
+    ]
+    assert contract.source_digest == "sha256:" + hashlib.sha256(source_bytes).hexdigest()
+    assert f'source_digest":"{contract.source_digest}"'.encode() in rendered_after
+    assert rendered_after == rendered_before
+    assert len(machine_contracts) == len(contract.rule_groups)
+    assert machine_contracts[1]["compatibility"]["unbounded_legacy"] == "deny"
+    assert machine_contracts[-1]["canary"]["layers"] == [
+        "manager_syntax_transport",
+        "namespace_sandbox",
+        "helper",
+        "product_logic",
+    ]
 
 
 def test_rendered_block_is_exactly_materialized_in_common_policy() -> None:
