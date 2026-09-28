@@ -104,8 +104,9 @@ def test_loads_the_complete_canonical_runtime_migration_policy() -> None:
         "transaction-publication-and-recovery",
         "failure-observation-and-retention",
         "evidence-contracts-and-telemetry",
+        "diagnostic-evidence-and-remediation-gates",
     ]
-    assert sum(len(group.rules) for group in contract.rule_groups) == 35
+    assert sum(len(group.rules) for group in contract.rule_groups) == 50
     assert {
         rule.enforcement for group in contract.rule_groups for rule in group.rules
     } == {"machine", "governance"}
@@ -116,6 +117,7 @@ def test_loads_the_complete_canonical_runtime_migration_policy() -> None:
     ]
     journal = contracts["transaction-publication-and-recovery"]["journal"]
     telemetry = contracts["evidence-contracts-and-telemetry"]["telemetry"]
+    diagnostic = contracts["diagnostic-evidence-and-remediation-gates"]
     assert compatibility == {
         "attested_predecessor_count": 1,
         "current_version_required": True,
@@ -125,6 +127,83 @@ def test_loads_the_complete_canonical_runtime_migration_policy() -> None:
     assert journal["rollback_guard"] == "cas_fencing"
     assert journal["max_bytes"] == 8 * 1024 * 1024
     assert telemetry["retention_seconds"] == 30 * 24 * 60 * 60
+    assert diagnostic == {
+        "baselines": {
+            "claim_without_prebaseline": "deny",
+            "post_baseline": "required",
+            "pre_baseline": "immutable_redacted_required",
+            "quiescence": "required",
+        },
+        "canary": {
+            "canonical_artifact_mutation": "deny",
+            "first_failed_layer": "stop",
+            "layers": [
+                "manager_syntax_transport",
+                "namespace_sandbox",
+                "helper",
+                "product_logic",
+            ],
+        },
+        "classifier": {
+            "contract": "versioned_closed",
+            "generic_after_improved_classification_limit": 2,
+            "negative_matrix": "complete_pre_live_supported_families",
+            "unknown": "fail_closed",
+        },
+        "cleanup": {
+            "foreign_object_mutation": "deny",
+            "fresh_owner_check": "required",
+            "result_precedence": "cleanup",
+        },
+        "diagnostic_gates": {
+            "activation": "separate_remediation_gate",
+            "diagnostic": "separate",
+            "root_cause_for_product_activation": "required",
+        },
+        "evidence_freshness": {
+            "cutover": "fresh_ttl_only",
+            "stale": "block",
+            "ttl_declaration": "required",
+        },
+        "fixture_gate": {
+            "activation_and_cutover": "required",
+            "policy_and_diagnostic_integration": "not_required",
+        },
+        "harness_scope": {
+            "bound_declarations": [
+                "files",
+                "production_loc",
+                "error_families",
+                "live_attempts",
+            ],
+            "exceedance": {
+                "design_review": "required",
+                "native_alternative": "required",
+                "silent_growth": "deny",
+            },
+        },
+        "live_attempts": {
+            "blind_identical_retry": "deny",
+            "maximum": 1,
+            "per": "evidence_changing_reviewed_commit",
+        },
+        "migration_decision": {
+            "full_rebuild": "requires_minimal_fix_comparison_and_justification",
+            "minimal_fix": "preferred_when_root_cause_closed",
+        },
+        "phases": {"gated": ["install", "activate", "observe", "commit"]},
+        "post_blind_diagnostic_revision": {"limit": 2, "next": "hold"},
+        "pre_generation_compatibility": {
+            "before": ["generate", "mutation"],
+            "dimensions": ["manager", "runtime", "client", "features"],
+            "matrix": "required",
+        },
+        "telemetry": {
+            "activation_authority": "deny",
+            "before_root_cause": "reviewed_bounded_secret_free_observability_only",
+            "second_authority": "deny",
+        },
+    }
 
 
 def test_rendered_block_is_exactly_materialized_in_common_policy() -> None:
@@ -136,7 +215,8 @@ def test_rendered_block_is_exactly_materialized_in_common_policy() -> None:
     assert common_bytes.count(rendered) == 1
     assert f'source_digest":"{contract.source_digest}"'.encode() in rendered
     assert b"normierten Maschinenvertr\xc3\xa4ge" in rendered
-    assert b"Runtime-Executor f\xc3\xbcr die operative Ausf\xc3\xbchrung ist unbekannt" in rendered
+    assert b"Policy-Executor f\xc3\xbcr die operative Durchsetzung dieser Vertr\xc3\xa4ge ist unbekannt" in rendered
+    assert b"keine Aussage \xc3\xbcber vorhandene Runtime-Mechanismen" in rendered
     assert b'"rollback_guard":"cas_fencing"' in rendered
 
 
@@ -192,6 +272,178 @@ def test_rendered_block_is_exactly_materialized_in_common_policy() -> None:
     ),
 )
 def test_rejects_incomplete_or_unsafe_runtime_migration_policy_source(
+    tmp_path: Path,
+    mutate: object,
+    error: str,
+) -> None:
+    path = _write_policy_variant(tmp_path, mutate)
+
+    with pytest.raises(RuntimeMigrationPolicyError, match=error):
+        load_runtime_migration_policy(path)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error"),
+    [
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["diagnostic_gates"].pop("root_cause_for_product_activation"),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["telemetry"].__setitem__(
+                "second_authority", "allow"
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["live_attempts"].__setitem__("maximum", 2),
+            "runtime_migration_policy_machine_contract_value_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["classifier"].__setitem__("unknown", "allow"),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["classifier"].__setitem__(
+                "generic_after_improved_classification_limit", 3
+            ),
+            "runtime_migration_policy_machine_contract_value_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["canary"].__setitem__(
+                "layers", [
+                    "namespace_sandbox",
+                    "manager_syntax_transport",
+                    "helper",
+                    "product_logic",
+                ]
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["canary"].__setitem__(
+                "canonical_artifact_mutation", "allow"
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["baselines"].__setitem__(
+                "claim_without_prebaseline", "allow"
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["cleanup"].__setitem__(
+                "foreign_object_mutation", "allow"
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["fixture_gate"].__setitem__(
+                "policy_and_diagnostic_integration", "required"
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["evidence_freshness"].__setitem__(
+                "stale", "allow"
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["harness_scope"].__setitem__(
+                "bound_declarations", [
+                    "files",
+                    "production_loc",
+                    "error_families",
+                ]
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["phases"].__setitem__(
+                "gated", ["install", "observe", "activate", "commit"]
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["migration_decision"].__setitem__(
+                "minimal_fix", "optional"
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["post_blind_diagnostic_revision"].__setitem__(
+                "limit", 3
+            ),
+            "runtime_migration_policy_machine_contract_value_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["machine_contract"]["pre_generation_compatibility"].__setitem__(
+                "before", ["mutation"]
+            ),
+            "runtime_migration_policy_machine_contract_invalid",
+        ),
+        (
+            lambda payload: _group(
+                payload, "diagnostic-evidence-and-remediation-gates"
+            )["rules"].pop(),
+            "runtime_migration_policy_rule_catalog_invalid",
+        ),
+    ],
+    ids=(
+        "missing-root-cause-activation-gate",
+        "telemetry-cannot-be-second-authority",
+        "one-live-attempt-bound",
+        "unknown-classification-fails-closed",
+        "generic-results-stop-after-two",
+        "canary-layer-order",
+        "canary-cannot-mutate-canonical-artifacts",
+        "prebaseline-required-for-unchanged-claim",
+        "cleanup-cannot-mutate-foreign-objects",
+        "fixture-cycle-is-forbidden",
+        "stale-evidence-cannot-open-cutover",
+        "harness-bounds-must-be-declared",
+        "phase-order-is-gated",
+        "minimal-fix-comparison-is-required",
+        "blind-diagnostic-revision-limit",
+        "compatibility-matrix-before-generation-and-mutation",
+        "complete-atomic-rule-catalog",
+    ),
+)
+def test_rejects_unsafe_diagnostic_evidence_and_remediation_contract(
     tmp_path: Path,
     mutate: object,
     error: str,

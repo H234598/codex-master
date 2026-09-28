@@ -21,6 +21,16 @@ außerhalb dieses Skills attestierten Entscheidungspfad berichten. Fehlt diese
 Evidenz oder Autorität, bleibt der Vorgang gesperrt; keine Live-Autorität wird
 aus diesem Dokument abgeleitet.
 
+Queen hält Diagnosegate, reviewed Remediationgate und Aktivierungsgate
+getrennt. Sie kann reviewte, bounded Telemetrie nur als nicht autoritative
+Evidenz entgegennehmen; sie wird nie zur zweiten Autorität und öffnet keine
+Produktaktivierung. Die Real-Live-Fixture ist vor Aktivierung oder Cutover
+Pflicht, nicht vor Policy- oder Diagnoseintegration. Fehlende, veraltete oder
+widersprüchliche Liveevidenz bleibt ein fail-closed Blocker. Zwei trotz
+verbesserter Klassifikation generische oder blind gebliebene Ergebnisse
+meldet Queen als `HOLD` zur nativen Plattformdiagnostik oder expliziten
+Userentscheidung, nicht als Auftrag für weitere Runtimearchitektur.
+
 Queen fordert für kohärente Slices getrennte Review- und Integrationsrollen an.
 Sie übernimmt deren Produktionsarbeit nicht und eskaliert führungsrelevante
 Entscheidungen, Blocker, Handoffs und Risiken über den typisierten Bus.

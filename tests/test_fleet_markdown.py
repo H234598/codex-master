@@ -75,6 +75,37 @@ _TEAMLEAD_RUNTIME_MIGRATION_MARKERS = (
     b"no Install, Activate, Reload, or Cutover authority.",
     b"explicitly named, attested predecessor input",
 )
+_TEAMLEAD_DIAGNOSTIC_EVIDENCE_MARKERS = (
+    b"Keep diagnostic, reviewed remediation, and activation gates separate.",
+    b"reviewed, bounded, secret-free telemetry before a proven root cause",
+    b"not a second authority and cannot open product activation.",
+    b"real-live fixture is required before activation or cutover, not before "
+    b"policy or diagnostic integration.",
+    b"Install, Activate, Observe, and Final Commit as separate gated phases.",
+    b"attested compatibility matrix of manager, runtime, and client versions",
+    b"stale evidence cannot open a gate.",
+    b"one live or canary attempt for each evidence-changing, reviewed commit",
+    b"do not repeat blindly.",
+    b"two generic or blind outcomes despite improved classification, HOLD",
+    b"native platform diagnostics or an explicit user decision",
+    b"versioned, closed failure classifier needs a negative matrix",
+    b"unknown remains fail-closed.",
+    b"manager syntax/transport, namespace/sandbox, helper, then product logic.",
+    b"Stop at the first red layer.",
+    b"A canary must not mutate canonical artifacts.",
+    b"After two blind diagnostic revisions, HOLD; do not commission a third "
+    b"classifier architecture.",
+    b"immutable, redacted pre-baseline",
+    b"post-baseline and quiescence as results.",
+    b"Recheck ownership immediately before cleanup mutation; never touch "
+    b"foreign objects.",
+    b"Prioritize cleanup outcome over primary diagnosis.",
+    b"diagnostic harness by files, production LOC, failure families, and live "
+    b"attempts.",
+    b"design review and a simpler native alternative.",
+    b"full runtime redesign against a local tested minimal fix",
+    b"prefer that minimal fix when it closes the root cause.",
+)
 _QUEEN_RUNTIME_MIGRATION_MARKERS = (
     b"runtime-migration-policy-v1.json",
     b"no live lifecycle authority: do not Install, Activate, Reload, or "
@@ -82,12 +113,44 @@ _QUEEN_RUNTIME_MIGRATION_MARKERS = (
     b"only read-only, attested evidence",
     b"do not infer a live authority or a compatibility fallback.",
 )
+_QUEEN_DIAGNOSTIC_EVIDENCE_MARKERS = (
+    b"Keep diagnostic, reviewed remediation, and activation gates separate.",
+    b"bounded telemetry may be received only as non-authoritative evidence",
+    b"never a second authority and cannot open product activation.",
+    b"real-live fixture is required before activation or cutover, not before "
+    b"policy or diagnostic integration.",
+    b"Missing, stale, or contradictory live evidence is fail-closed.",
+    b"two generic or blind outcomes despite improved classification, report HOLD",
+    b"native platform diagnostics or an explicit user decision",
+    b"After two blind diagnostic revisions, report mandatory HOLD; do not "
+    b"request a third classifier architecture.",
+)
 _WORKER_RUNTIME_MIGRATION_MARKERS = (
     b"Do not activate an unbound runtime migration or an unbound cutover.",
     b"no Install, Activate, Reload, or Cutover authority.",
     b"only its explicitly named, attested predecessor input",
     b"never a legacy or fallback runtime path.",
     b"redacted, secret-free, and bounded.",
+)
+_WORKER_DIAGNOSTIC_EVIDENCE_MARKERS = (
+    b"Keep diagnostic, reviewed remediation, and activation gates separate.",
+    b"reviewed, bounded, secret-free telemetry before a proven root cause",
+    b"cannot open product activation.",
+    b"real-live fixture is required before activation or cutover, not before "
+    b"policy or diagnostic integration.",
+    b"Do not perform product activation, repeat a live or canary attempt, or "
+    b"commission runtime architecture.",
+    b"missing compatibility matrix, missing negative matrix for the versioned "
+    b"closed failure classifier, or an unknown failure as fail-closed",
+    b"immutable redacted pre-baseline",
+    b"post-baseline and quiescence",
+    b"A canary must not mutate canonical artifacts.",
+    b"Never clean up a foreign object",
+    b"cleanup result that takes priority over primary diagnosis",
+    b"scope-/complexity-budget exceedance",
+    b"two blind diagnostic revisions as HOLD; do not propose a third classifier "
+    b"architecture.",
+    b"local tested minimal fix when it closes the root cause.",
 )
 
 
@@ -289,9 +352,18 @@ def test_runtime_migration_policy_materializes_to_role_homes() -> None:
     """Managed role homes retain the named migration gate without live authority."""
     contract = load_common_policy()
     class_markers = {
-        "koenigin": _QUEEN_RUNTIME_MIGRATION_MARKERS,
-        "teamleiterin": _TEAMLEAD_RUNTIME_MIGRATION_MARKERS,
-        "worker": _WORKER_RUNTIME_MIGRATION_MARKERS,
+        "koenigin": (
+            _QUEEN_RUNTIME_MIGRATION_MARKERS
+            + _QUEEN_DIAGNOSTIC_EVIDENCE_MARKERS
+        ),
+        "teamleiterin": (
+            _TEAMLEAD_RUNTIME_MIGRATION_MARKERS
+            + _TEAMLEAD_DIAGNOSTIC_EVIDENCE_MARKERS
+        ),
+        "worker": (
+            _WORKER_RUNTIME_MIGRATION_MARKERS
+            + _WORKER_DIAGNOSTIC_EVIDENCE_MARKERS
+        ),
     }
 
     source_path = _MARKDOWN_ROOT / "runtime-migration-policy-v1.json"
@@ -324,7 +396,10 @@ def test_both_teamlead_role_profiles_share_runtime_migration_contract() -> None:
         body = (_MARKDOWN_ROOT / "classes" / f"{profile}.md").read_bytes()
         normalized_body = b" ".join(body.split())
 
-        for marker in _TEAMLEAD_RUNTIME_MIGRATION_MARKERS:
+        for marker in (
+            _TEAMLEAD_RUNTIME_MIGRATION_MARKERS
+            + _TEAMLEAD_DIAGNOSTIC_EVIDENCE_MARKERS
+        ):
             assert marker in normalized_body
 
 

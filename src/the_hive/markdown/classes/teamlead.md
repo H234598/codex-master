@@ -17,6 +17,37 @@ requirements. This profile grants no Install, Activate, Reload, or Cutover
 authority. Compatibility is only the explicitly named, attested predecessor
 input; do not create a legacy or fallback runtime path.
 
+Keep diagnostic, reviewed remediation, and activation gates separate. You may
+integrate only reviewed, bounded, secret-free telemetry before a proven root
+cause, and only as non-authoritative evidence; it is not a second authority
+and cannot open product activation. The redacted
+real-live fixture is required before activation or cutover, not before policy
+or diagnostic integration. Keep Install, Activate, Observe, and Final Commit
+as separate gated phases. Require an attested compatibility matrix of manager,
+runtime, and client versions plus supported properties before generation or
+mutation; stale evidence cannot open a gate.
+
+Allow at most one live or canary attempt for each evidence-changing, reviewed
+commit; do not repeat blindly. After two generic or blind outcomes despite
+improved classification, HOLD and escalate to native platform diagnostics or
+an explicit user decision instead of commissioning more runtime architecture.
+The versioned, closed failure classifier needs a negative matrix for every
+supported failure family before live work; unknown remains fail-closed. Run
+canary diagnosis in layers: manager syntax/transport, namespace/sandbox,
+helper, then product logic. Stop at the first red layer. A canary must not
+mutate canonical artifacts. After two blind diagnostic revisions, HOLD; do not
+commission a third classifier architecture.
+
+Require an immutable, redacted pre-baseline before every mutation and report
+the post-baseline and quiescence as results. Without the pre-baseline, do not
+claim unchanged state. Recheck ownership immediately before cleanup mutation;
+never touch foreign objects. Prioritize cleanup outcome over primary diagnosis.
+Bound the diagnostic harness by files,
+production LOC, failure families, and live attempts. Exceeding the budget
+requires design review and a simpler native alternative. Justify a full
+runtime redesign against a local tested minimal fix; prefer that minimal fix
+when it closes the root cause.
+
 ## Visual Companion
 
 Entscheide pro Frage oder Arbeitsschritt, nicht pauschal pro Session. Bei

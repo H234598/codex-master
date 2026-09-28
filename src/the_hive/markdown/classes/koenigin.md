@@ -11,3 +11,13 @@ no live lifecycle authority: do not Install, Activate, Reload, or Cutover.
 Collect and report only read-only, attested evidence through the authorized
 coordination path. If that path or its evidence is absent, report the blocker;
 do not infer a live authority or a compatibility fallback.
+
+Keep diagnostic, reviewed remediation, and activation gates separate.
+Reviewed, bounded telemetry may be received only as non-authoritative
+evidence; it is never a second authority and cannot open product activation.
+The redacted real-live fixture is required before activation or cutover, not
+before policy or diagnostic integration. Missing, stale, or contradictory live
+evidence is fail-closed. After two generic or blind outcomes despite improved
+classification, report HOLD for native platform diagnostics or an explicit user
+decision, not more runtime architecture. After two blind diagnostic revisions,
+report mandatory HOLD; do not request a third classifier architecture.

@@ -23,6 +23,42 @@ Rollback- oder HOLD-Zustand und finale Identität, ohne Secrets oder
 unbegrenzte Felder aufzunehmen. Zwei identische Live-Fehlschläge sperren den
 dritten Versuch bis neue Ursachenevidenz und ein Regressionstest vorliegen.
 
+Diagnostik-, Remediation- und Aktivierungsautorität bleiben getrennt.
+Vor bekannter Root Cause darf nur reviewte, begrenzte und secretfreie
+Telemetrie als nicht autoritative Evidenz integriert werden, ist aber nie eine
+zweite Autorität und darf keine Produktaktivierung öffnen. Vor jedem Live-
+oder Canary-Versuch bindet der Bericht neue, reviewte Evidenz an genau einen
+Commit; blinde Wiederholung ist verboten.
+Nach zwei trotz verbesserter Klassifikation generischen oder blind gebliebenen
+Ergebnissen ist `HOLD` zu berichten und native Plattformdiagnostik oder eine
+explizite Userentscheidung zu verlangen statt das Runtimeharness weiter
+auszubauen.
+
+Der Fehlerklassifikator ist versioniert und geschlossen. Vor Live weist eine
+Negativmatrix jede unterstützte Fehlerfamilie nach; unbekannt bleibt
+fail-closed. Die Canary-Reihenfolge ist Manager-Syntax/Transport,
+Namespace/Sandbox, Helper und Produktlogik; die früheste rote Schicht beendet
+den Lauf und darf kanonische Artefakte nicht mutieren. Nach zwei blind
+gebliebenen Diagnoserevisionen ist `HOLD` zu berichten; eine dritte
+Klassifikationsarchitektur ist verboten. Vor jeder Mutation wird eine
+immutable, redigierte Pre-Baseline erhoben. Der Bericht enthält auch
+Post-Baseline und Quieszenz; ohne Pre-Baseline behauptet er keine
+Unverändertheit. Das Cleanup-Ergebnis hat Vorrang vor Primärdiagnose. Cleanup
+berichtet die frisch geprüfte Ownership; Foreign Objects bleiben unberührt.
+Evidenz-Freshness/TTL ist auszuweisen, damit veraltete Evidenz kein Gate
+öffnet.
+
+Die Real-Live-Fixture ist vor Aktivierung oder Cutover Pflicht, nicht vor
+Policy- oder Diagnoseintegration. Installieren, Aktivieren, Beobachten und
+endgültiges Committen bleiben getrennte Phasen. Vor Generierung oder Mutation
+gehört eine attestierte Kompatibilitätsmatrix von Manager-, Runtime- und
+Client-Versionen sowie unterstützten Eigenschaften zur Evidenz. Das
+Diagnoseharness berichtet sein Scope-/Komplexitätsbudget für Dateien,
+Produktions-LOC, Fehlerklassen und Liveversuche; eine Überschreitung verlangt
+Designreview und eine einfachere native Alternative. Ein vollständiger
+Runtimeumbau ist gegenüber einem lokalen getesteten Minimalfix zu begründen;
+schließt dieser die Root Cause, ist er vorzuziehen.
+
 ## Enge Berichtsausnahme und Resume
 
 `agent_assignment_report` ist nur nach `agent_wait` oder

@@ -15,6 +15,7 @@ RUNTIME_MIGRATION_POLICY_LINK = (
     "[Runtime-Migrationspolicy v1]"
     "(../../../src/the_hive/markdown/runtime-migration-policy-v1.json)"
 )
+ROADMAP = Path("ROADMAP.md")
 EXPECTED_REFERENCES = {
     "references/common-invariants.md",
     "references/queen-operations.md",
@@ -34,6 +35,18 @@ REQUIRED_MARKERS = {
         "weder Install noch Activate noch Reload noch Cutover",
         "genau benannte und attestierte Vorgängerversion",
         "Read-only-Live-Preflight",
+        "Diagnosegate, reviewed Remediationgate und Aktivierungsgate sind getrennt.",
+        "nicht autoritative Evidenz",
+        "keine zweite Autorität",
+        "Vor belegter Root Cause darf nur reviewte, begrenzte und secretfreie Telemetrie",
+        "Real-Live-Fixture dagegen Pflicht",
+        "höchstens einmal je evidenzveränderndem, reviewtem Commit",
+        "versionierte, geschlossene Fehlerklassifikator",
+        "immutable und redigiert",
+        "darf kanonische Artefakte nicht mutieren",
+        "dritte Klassifikationsarchitektur ist verboten",
+        "Cleanup-Ergebnis hat Vorrang vor Primärdiagnose",
+        "schließt der Minimalfix die Root Cause, ist er vorzuziehen",
     ),
     "references/common-invariants.md": (
         "Keine numerische globale, Serien- oder Provider-Flottenobergrenze.",
@@ -49,6 +62,23 @@ REQUIRED_MARKERS = {
         "secret-freie, begrenzte Telemetrie",
         "echten Consumer-E2E-Vertrag",
         "genau benannte, attestierte Vorgängerversion-Input",
+        "Diagnose, reviewed Remediation und Aktivierung bleiben getrennte Gates",
+        "nie zur zweiten Autorität",
+        "Vor bekannter Root Cause darf nur reviewte, begrenzte und secretfreie Telemetrie",
+        "Real-Live-Fixture ist Pflicht vor Aktivierung oder Cutover",
+        "Evidenz hat eine definierte Freshness/TTL",
+        "versionierter geschlossener Vertrag",
+        "Negativmatrix jede unterstützte Fehlerfamilie",
+        "früheste rote Schicht beendet den Lauf",
+        "Höchstens ein Live- oder Canary-Versuch",
+        "immutable, redigierte Pre-Baseline",
+        "Ownership unmittelbar vor jeder Mutation",
+        "Scope-/Komplexitätsbudget",
+        "lokalen getesteten Minimalfix",
+        "Canary darf kanonische Artefakte nicht mutieren",
+        "dritte Klassifikationsarchitektur ist verboten",
+        "Cleanup-Ergebnis hat Vorrang vor Primärdiagnose",
+        "Minimalfix die Root Cause, ist er vorzuziehen",
     ),
     "references/queen-operations.md": (
         "Queen plant, delegiert und pflegt Entscheidungen und Pläne.",
@@ -58,6 +88,10 @@ REQUIRED_MARKERS = {
         "Weder Queen noch ihr Fleet-Skill oder MCP-Koordinationspfad darf "
         "Install, Activate, Reload oder Cutover ausführen oder erlauben.",
         "keine Live-Autorität wird aus diesem Dokument abgeleitet.",
+        "Diagnosegate, reviewed Remediationgate und Aktivierungsgate",
+        "nie zur zweiten Autorität",
+        "Real-Live-Fixture ist vor Aktivierung oder Cutover Pflicht",
+        "nativen Plattformdiagnostik oder expliziten Userentscheidung",
     ),
     "references/tl-worker-operations.md": (
         "TL startet Workerinnen.",
@@ -78,6 +112,19 @@ REQUIRED_MARKERS = {
         "gebundenen Dry-run, CAS/Fencing, Journal, Rollback/HOLD",
         "Workerinnen aktivieren keine ungebundene Migration oder keinen "
         "ungebundenen Cutover.",
+        "Diagnosegate, reviewed Remediationgate und Aktivierungsgate",
+        "nicht autoritative Evidenz",
+        "vor belegter Root Cause nur reviewte, begrenzte und secretfreie Telemetrie",
+        "höchstens einen Live- oder Canary-Versuch",
+        "nativer Plattformdiagnostik",
+        "Negativmatrix für jede unterstützte Fehlerfamilie",
+        "immutable, redigierte Pre-Baseline",
+        "Foreign Objects bleiben unberührt",
+        "Scope-/Komplexitätsbudget",
+        "darf kanonische Artefakte nicht mutieren",
+        "dritte Klassifikationsarchitektur beauftragt sie nicht",
+        "Cleanup-Ergebnis hat Vorrang vor Primärdiagnose",
+        "wenn er die Root Cause schließt",
     ),
     "references/diagnostics-retry-reporting.md": (
         "spätestens stündlich",
@@ -93,6 +140,20 @@ REQUIRED_MARKERS = {
         "HOLD-Zustand und finale Identität",
         "ohne Secrets oder unbegrenzte Felder",
         "Zwei identische Live-Fehlschläge sperren den dritten Versuch",
+        "Diagnostik-, Remediation- und Aktivierungsautorität bleiben getrennt.",
+        "nie eine zweite Autorität",
+        "Vor bekannter Root Cause darf nur reviewte, begrenzte und secretfreie Telemetrie",
+        "genau einen Commit; blinde Wiederholung ist verboten.",
+        "Negativmatrix jede unterstützte Fehlerfamilie",
+        "früheste rote Schicht beendet den Lauf",
+        "Pre-Baseline behauptet er keine Unverändertheit",
+        "Evidenz-Freshness/TTL",
+        "Real-Live-Fixture ist vor Aktivierung oder Cutover Pflicht",
+        "Kompatibilitätsmatrix von Manager-, Runtime- und Client-Versionen",
+        "darf kanonische Artefakte nicht mutieren",
+        "dritte Klassifikationsarchitektur ist verboten",
+        "Cleanup-Ergebnis hat Vorrang vor Primärdiagnose",
+        "schließt dieser die Root Cause, ist er vorzuziehen",
     ),
 }
 FORBIDDEN_LEGACY = (
@@ -246,3 +307,78 @@ def test_runtime_migration_policy_is_closed_linked_read_only_contract() -> None:
     assert "Zwei identische Live-Fehlschläge" in text[
         "references/diagnostics-retry-reporting.md"
     ]
+
+
+def test_runtime_diagnostic_evidence_contract_stays_non_authoritative() -> None:
+    """Keep every fleet projection linked and unable to open lifecycle gates."""
+    root = _skill_root()
+    contract_files = {
+        "SKILL.md": root / "SKILL.md",
+        **{relative: root / relative for relative in EXPECTED_REFERENCES},
+    }
+    text = {
+        relative: re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+        for relative, path in contract_files.items()
+    }
+
+    assert "Runtime-Migrationspolicy v1" in text["SKILL.md"]
+    for relative in EXPECTED_REFERENCES:
+        assert RUNTIME_MIGRATION_POLICY_LINK in text[relative]
+
+    combined = " ".join(text.values())
+    assert "nicht autoritative Evidenz" in combined
+    assert "nie zur zweiten Autorität" in combined
+    assert "secretfreie Telemetrie" in combined
+    assert "kein Produktaktivierungsgate" in combined
+    assert "Installieren, Aktivieren, Beobachten und endgültiges Committen" in combined
+    assert "Höchstens ein Live- oder Canary-Versuch" in combined
+    assert "blinde Wiederholung ist verboten" in combined
+    assert "native Plattformdiagnostik" in combined
+    assert "unbekannt bleibt fail-closed" in combined
+    assert "früheste rote Schicht beendet den Lauf" in combined
+    assert "kanonische Artefakte nicht mutieren" in combined
+    assert "dritte Klassifikationsarchitektur ist verboten" in combined
+    assert "Cleanup-Ergebnis hat Vorrang vor Primärdiagnose" in combined
+    assert "Foreign Objects" in combined
+    assert "Kompatibilitätsmatrix" in combined
+    assert "Real-Live-Fixture ist vor Aktivierung oder Cutover Pflicht" in combined
+
+    authority_denials = {
+        "SKILL.md": "weder Install noch Activate noch Reload noch Cutover",
+        "references/common-invariants.md": "erteilen keine Live-Autorität",
+        "references/queen-operations.md": "keine Lifecycle-Ausführungsautorität",
+        "references/tl-worker-operations.md": "weder Install noch Activate noch Reload noch Cutover",
+        "references/diagnostics-retry-reporting.md": "führen weder Install noch Activate noch Reload noch Cutover",
+    }
+    for relative, marker in authority_denials.items():
+        assert marker in text[relative], f"{relative} grants lifecycle authority"
+
+
+def test_runtime_migration_roadmap_keeps_fixture_and_masterplan_holds_visible() -> (
+    None
+):
+    """Keep the repo plan complete without turning deferred live evidence into a loop."""
+    roadmap = Path(__file__).resolve().parents[1] / ROADMAP
+    text = re.sub(r"\s+", " ", roadmap.read_text(encoding="utf-8"))
+
+    for marker in (
+        "POLICY_MATERIALIZATION_OPEN",
+        "DEFERRED_LIVE_FIXTURE",
+        "[kanonische maschinenlesbare Policy]"
+        "(src/the_hive/markdown/runtime-migration-policy-v1.json)",
+        "[Common-Policy-Projektion](src/the_hive/markdown/common.md)",
+        "[Policytests](tests/test_runtime_migration_policy.py)",
+        "[Fleet-Router-Vertragstests](tests/test_the_hive_fleet_router_contract.py)",
+        "read-only Diagnose mit frischer Evidenz",
+        "reviewter, bounded Telemetrie ausschließlich als nicht autoritative Evidenz",
+        "reviewed Remediation",
+        "separates Aktivierungsgate",
+        "begrenzte Beobachtung",
+        "endgültiges Committen",
+        "kein Gate für Policy- oder Diagnoseintegration",
+        "Sidecar-Konflikts `HOLD`",
+        "Canarys mutieren keine kanonischen Artefakte.",
+        "Cleanup-Ergebnis hat Vorrang vor Primärdiagnose.",
+        "dritte Klassifikationsarchitektur ist verboten.",
+    ):
+        assert marker in text

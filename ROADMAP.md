@@ -88,8 +88,42 @@ Jeder solche Schritt bleibt von seinem eigenen read-only Preflight,
 getrennten Migrationspaket, fokussierten Tests und unabhängiger Review
 abhängig.
 
-Die Gate-Reihenfolge ist verbindlich: (1) getrenntes Voraussetzungspaket,
-(2) read-only Preflight, (3) deterministischer Dry-run mit Cutover-CAS/Fencing
-und Journal, (4) mindestens ein echter Consumer-E2E-Vertrag, (5) fokussierte
-Tests und unabhängige Review, (6) deterministisches `HOLD` bei Gate- oder
+Die Gate-Reihenfolge ist verbindlich: (1) getrenntes Voraussetzungspaket und
+read-only Diagnose mit frischer Evidenz, (2) Integration reviewter, bounded
+Telemetrie ausschließlich als nicht autoritative Evidenz, (3) reviewed
+Remediation mit deterministischem Dry-run, Cutover-CAS/Fencing und Journal,
+(4) separates Aktivierungsgate mit mindestens einem echten Consumer-E2E-
+Vertrag und der redaktierten Real-Live-Fixture, (5) begrenzte Beobachtung,
+(6) endgültiges Committen erst nach bestandenem Beobachtungsgate. Fokussierte
+Tests und unabhängige Review liegen vor Remediation und vor jeder beantragten
+Aktivierung. Deterministisches `HOLD` gilt bei Gate-, Evidenz- oder
 Beobachtungsfehler.
+
+Die Real-Live-Fixture ist somit ein zwingendes Aktivierungs-/Cutovergate,
+aber kein Gate für Policy- oder Diagnoseintegration: Ihr gegenwärtiges Fehlen
+ist als `DEFERRED_LIVE_FIXTURE` dokumentiert und darf keinen Zirkelschluss
+erzeugen. `POLICY_MATERIALIZATION_OPEN` bleibt bis zur vollständigen,
+digestgebundenen Materialisierung der Quelle, der
+[Common-Policy-Projektion](src/the_hive/markdown/common.md), der
+[Policytests](tests/test_runtime_migration_policy.py) und der
+[Fleet-Router-Vertragstests](tests/test_the_hive_fleet_router_contract.py)
+offen. Der Obsidian-Masterplan bleibt wegen eines Annotation-Marker-
+Sidecar-Konflikts `HOLD`; diese Repo-Roadmap ersetzt oder verkürzt keinen
+Masterplaninhalt und behauptet keine aufgelöste Vault-Integration.
+
+Für konkrete Remediation gilt: nur ein Live-/Canary-Versuch pro
+evidenzveränderndem, reviewtem Commit, keine blinde Wiederholung; zwei trotz
+verbesserter Klassifikation generische oder blind gebliebene Ergebnisse führen
+zu `HOLD` und nativer Plattformdiagnostik oder expliziter Userentscheidung.
+Vor Generierung oder Mutation sind attestierte Kompatibilitätsmatrix,
+immutable redigierte Pre-Baseline und der versionierte geschlossene
+Fehlerklassifikator mit Negativmatrix erforderlich. Post-Baseline und
+Quieszenz gehören zum Ergebnis; Cleanup prüft Ownership frisch und fasst
+Foreign Objects nicht an. Das Diagnoseharness bleibt durch Dateien,
+Produktions-LOC, Fehlerklassen und Liveversuche begrenzt; eine Überschreitung
+erzwingt Designreview und eine einfachere native Alternative. Ein
+Runtimeumbau ist gegenüber einem lokalen getesteten Minimalfix zu begründen
+und bei geschlossener Root Cause dem Minimalfix nachzustellen. Canarys mutieren
+keine kanonischen Artefakte. Das Cleanup-Ergebnis hat Vorrang vor
+Primärdiagnose. Nach zwei blind gebliebenen Diagnoserevisionen bleibt `HOLD`
+verbindlich; eine dritte Klassifikationsarchitektur ist verboten.

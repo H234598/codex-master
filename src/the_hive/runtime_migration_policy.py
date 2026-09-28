@@ -156,6 +156,83 @@ _EXPECTED_MACHINE_CONTRACTS: dict[str, dict[str, object]] = {
             "secret_free": True,
         },
     },
+    "diagnostic-evidence-and-remediation-gates": {
+        "baselines": {
+            "claim_without_prebaseline": "deny",
+            "post_baseline": "required",
+            "pre_baseline": "immutable_redacted_required",
+            "quiescence": "required",
+        },
+        "canary": {
+            "canonical_artifact_mutation": "deny",
+            "first_failed_layer": "stop",
+            "layers": [
+                "manager_syntax_transport",
+                "namespace_sandbox",
+                "helper",
+                "product_logic",
+            ],
+        },
+        "classifier": {
+            "contract": "versioned_closed",
+            "generic_after_improved_classification_limit": 2,
+            "negative_matrix": "complete_pre_live_supported_families",
+            "unknown": "fail_closed",
+        },
+        "cleanup": {
+            "foreign_object_mutation": "deny",
+            "fresh_owner_check": "required",
+            "result_precedence": "cleanup",
+        },
+        "diagnostic_gates": {
+            "activation": "separate_remediation_gate",
+            "diagnostic": "separate",
+            "root_cause_for_product_activation": "required",
+        },
+        "evidence_freshness": {
+            "cutover": "fresh_ttl_only",
+            "stale": "block",
+            "ttl_declaration": "required",
+        },
+        "fixture_gate": {
+            "activation_and_cutover": "required",
+            "policy_and_diagnostic_integration": "not_required",
+        },
+        "harness_scope": {
+            "bound_declarations": [
+                "files",
+                "production_loc",
+                "error_families",
+                "live_attempts",
+            ],
+            "exceedance": {
+                "design_review": "required",
+                "native_alternative": "required",
+                "silent_growth": "deny",
+            },
+        },
+        "live_attempts": {
+            "blind_identical_retry": "deny",
+            "maximum": 1,
+            "per": "evidence_changing_reviewed_commit",
+        },
+        "migration_decision": {
+            "full_rebuild": "requires_minimal_fix_comparison_and_justification",
+            "minimal_fix": "preferred_when_root_cause_closed",
+        },
+        "phases": {"gated": ["install", "activate", "observe", "commit"]},
+        "post_blind_diagnostic_revision": {"limit": 2, "next": "hold"},
+        "pre_generation_compatibility": {
+            "before": ["generate", "mutation"],
+            "dimensions": ["manager", "runtime", "client", "features"],
+            "matrix": "required",
+        },
+        "telemetry": {
+            "activation_authority": "deny",
+            "before_root_cause": "reviewed_bounded_secret_free_observability_only",
+            "second_authority": "deny",
+        },
+    },
 }
 
 _EXPECTED_RULE_GROUPS = (
@@ -217,6 +294,29 @@ _EXPECTED_RULE_GROUPS = (
             ("bounded-secret-free-migration-telemetry", "machine"),
             ("failure-classification-retry-policy-schema", "machine"),
             ("canonical-policy-source-artifact-digest-staleness", "machine"),
+        ),
+    ),
+    (
+        "diagnostic-evidence-and-remediation-gates",
+        (
+            ("separate-diagnostic-and-remediation-activation-gates", "machine"),
+            ("reviewed-observability-only-telemetry-before-root-cause", "machine"),
+            ("one-canary-attempt-per-evidence-changing-reviewed-commit", "machine"),
+            ("generic-results-stop-harness-expansion", "machine"),
+            ("declared-diagnostic-harness-scope-budget", "machine"),
+            (
+                "versioned-closed-classifier-negative-matrix-and-fail-closed-unknown",
+                "machine",
+            ),
+            ("layered-canary-first-failure-stops", "machine"),
+            ("immutable-prebaseline-postbaseline-and-quiescence", "machine"),
+            ("cleanup-precedence-and-foreign-object-protection", "machine"),
+            ("fixture-required-for-activation-not-policy-integration", "machine"),
+            ("fresh-evidence-ttl-cutover-gate", "machine"),
+            ("gated-install-activate-observe-commit-phases", "machine"),
+            ("minimal-fix-comparison-before-runtime-rebuild", "machine"),
+            ("two-blind-diagnostic-revisions-then-hold", "machine"),
+            ("compatibility-matrix-before-generate-or-mutate", "machine"),
         ),
     ),
 )
@@ -387,6 +487,19 @@ def _validate_machine_contract_bounds(
                 telemetry["retention_seconds"],
             )
             bounds = ((1, 64), (1024, 64 * 1024 * 1024), (1, 366 * 24 * 60 * 60))
+        elif identifier == "diagnostic-evidence-and-remediation-gates":
+            classifier = machine_contract["classifier"]
+            live_attempts = machine_contract["live_attempts"]
+            blind_revisions = machine_contract["post_blind_diagnostic_revision"]
+            assert type(classifier) is dict
+            assert type(live_attempts) is dict
+            assert type(blind_revisions) is dict
+            values = (
+                classifier["generic_after_improved_classification_limit"],
+                live_attempts["maximum"],
+                blind_revisions["limit"],
+            )
+            bounds = ((1, 2), (1, 1), (1, 2))
         else:
             return
     except (AssertionError, KeyError) as exc:
@@ -530,9 +643,11 @@ def render_runtime_migration_policy_block(
         "kennzeichnet einen verbindlichen, maschinenprüfbaren Laufzeit- oder "
         "Releasevertrag. Dieser Policy-Compiler erzwingt derzeit ausschließlich "
         "die kanonische Quelle, die normierten Maschinenverträge und ihre "
-        "vollständige Projektion; ein Runtime-Executor für die operative "
-        "Ausführung ist unbekannt und nicht implementiert. `enforcement: "
-        "governance` kennzeichnet einen verbindlichen menschlichen Prozess-Gate.",
+        "vollständige Projektion; ein Policy-Executor für die operative "
+        "Durchsetzung dieser Verträge ist unbekannt und nicht implementiert. "
+        "Daraus folgt keine Aussage über vorhandene Runtime-Mechanismen. "
+        "`enforcement: governance` kennzeichnet einen verbindlichen "
+        "menschlichen Prozess-Gate.",
         "",
         "Kanonische Quelle: `src/the_hive/markdown/runtime-migration-policy-v1.json`.",
         "",
