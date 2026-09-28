@@ -3544,6 +3544,48 @@ def _canary_evidence_result(
         and manager_state.get("ExecMainStatus") == "0"
     ):
         return "runtime_canary_green", None
+    readiness = payload.get("global_pilot_readiness")
+    alarm = payload.get("alarm")
+    owner = alarm.get("owner") if isinstance(alarm, Mapping) else None
+    if (
+        checks
+        == {
+            "runtime_layout": True,
+            "hive_runtime": False,
+            "hive_doctor": False,
+        }
+        and all(commands.values())
+        and codes == {"ok"}
+        and readiness
+        == {
+            "schema_version": 1,
+            "pilot": "blocked",
+            "generation_id": None,
+            "freshness": "unknown",
+            "candidate_count": 0,
+            "reason_codes": ["usage_generation_missing"],
+            "raw_output": "not_returned",
+        }
+        and isinstance(alarm, Mapping)
+        and set(alarm) == {"scope", "status", "reason_codes", "owner"}
+        and alarm.get("scope") == "hive"
+        and alarm.get("status") == "active"
+        and alarm.get("reason_codes") == ["hive_doctor", "hive_runtime"]
+        and isinstance(owner, Mapping)
+        and set(owner) == {"principal_id", "class_id", "repo_id"}
+        and owner.get("class_id") == "koenigin"
+        and all(
+            isinstance(owner.get(key), str) and 1 <= len(owner[key]) <= 128
+            for key in ("principal_id", "repo_id")
+        )
+        and manager_state.get("ActiveState") == "failed"
+        and manager_state.get("Result") == "exit-code"
+        and manager_state.get("ExecMainStatus") == "1"
+    ):
+        # Empty private Canary state has no real usage generation by design.
+        # Exact fail-closed authority is therefore successful product behavior;
+        # real-live readiness remains a separate activation/cutover gate.
+        return "runtime_canary_green", None
     stage_codes = codes & _CANARY_STAGE_CODES
     if (
         len(stage_codes) == 1

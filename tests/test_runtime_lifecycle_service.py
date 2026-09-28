@@ -136,6 +136,35 @@ def _canary_green_health() -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
 
+def _canary_isolated_health() -> bytes:
+    payload = json.loads(_canary_green_health())
+    payload["checks"] = {
+        "runtime_layout": True,
+        "hive_runtime": False,
+        "hive_doctor": False,
+    }
+    payload["alarm"] = {
+        "scope": "hive",
+        "status": "active",
+        "reason_codes": ["hive_doctor", "hive_runtime"],
+        "owner": {
+            "principal_id": "canary",
+            "class_id": "koenigin",
+            "repo_id": "the-hive",
+        },
+    }
+    payload["global_pilot_readiness"] = {
+        "schema_version": 1,
+        "pilot": "blocked",
+        "generation_id": None,
+        "freshness": "unknown",
+        "candidate_count": 0,
+        "reason_codes": ["usage_generation_missing"],
+        "raw_output": "not_returned",
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
 def _fake_canary_image(root: Path, code: str) -> object:
     release = root / "release"
     state = root / "state"
@@ -641,6 +670,64 @@ def test_canary_green_result_is_bounded_and_quiescent(
     assert len(manager.run_calls) == 1
     assert manager.stopped is True
     assert manager.reset is True
+
+
+def test_canary_accepts_exact_fail_closed_empty_private_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+
+    def prepare(*, repository: Path, invocation_root: Path, source_commit: str):
+        image = _fake_canary_image(invocation_root, _CANARY_STAGE_CODES[0])
+        health = image.state_root / "hive-hourly-health.json"
+        health.write_bytes(_canary_isolated_health())
+        health.chmod(0o600)
+        return image
+
+    monkeypatch.setattr(runtime_lifecycle, "_prepare_canary_image", prepare)
+    manager = _CanaryManager()
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result == {
+        "status": "runtime_canary_green",
+        "error_code": None,
+        "generation": _CANARY_GENERATION,
+        "manifest_digest": _CANARY_DIGEST,
+        "raw_output": "not_returned",
+    }
+    assert manager.stopped is True
+    assert manager.reset is True
+
+
+def test_canary_rejects_noncanonical_empty_private_state_reason(tmp_path: Path) -> None:
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    image = _fake_canary_image(invocation, _CANARY_STAGE_CODES[0])
+    payload = json.loads(_canary_isolated_health())
+    payload["global_pilot_readiness"]["reason_codes"] = ["usage_missing"]
+    health = image.state_root / "hive-hourly-health.json"
+    health.write_bytes(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+    health.chmod(0o600)
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_canary_evidence_invalid",
+    ):
+        runtime_lifecycle._canary_evidence_result(
+            image=image,
+            manager_state={
+                "ActiveState": "failed",
+                "Result": "exit-code",
+                "ExecMainStatus": "1",
+            },
+        )
 
 
 def test_canary_source_rebind_stops_before_manager_entry_and_cleans_image(
