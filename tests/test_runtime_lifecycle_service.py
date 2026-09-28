@@ -380,6 +380,70 @@ def test_canary_unit_preserves_sandbox_and_substitutes_only_private_sources(
     assert unit.run_arguments.count(f"--unit={unit.name}") == 1
 
 
+def test_canary_runtime_directory_reaches_the_fixed_runtime_process_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A unique host directory is mapped to the one accepted sandbox path."""
+
+    from the_hive import runtime_process
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    image = _fake_canary_image(invocation, _CANARY_STAGE_CODES[0])
+    first = runtime_lifecycle._canary_unit_binding(
+        image=image, home=home, nonce="d" * 32
+    )
+    second = runtime_lifecycle._canary_unit_binding(
+        image=image, home=home, nonce="e" * 32
+    )
+    fixed_name = "the-hive-hourly-runtime"
+    first_name = "the-hive-runtime-canary-" + "d" * 32
+    second_name = "the-hive-runtime-canary-" + "e" * 32
+    first_bridge = (
+        f"BindReadOnlyPaths=%t/{first_name}:%t/{fixed_name}:norbind"
+    )
+    second_bridge = (
+        f"BindReadOnlyPaths=%t/{second_name}:%t/{fixed_name}:norbind"
+    )
+
+    assert first_bridge in first.properties
+    assert second_bridge in second.properties
+    assert first_bridge != second_bridge
+    assert (
+        f"BindReadOnlyPaths=%t/bus:%t/{fixed_name}/bus:norbind"
+        in first.properties
+    )
+    assert runtime_process._PROTECTED_HOME_RUNTIME_DIRECTORY.name == fixed_name
+    assert "/tmp/" not in first_bridge
+    assert "/tmp/" not in next(
+        value
+        for value in first.properties
+        if value.startswith("BindReadOnlyPaths=%t/bus:")
+    )
+
+    runtime_root = tmp_path / "run" / "user"
+    protected = runtime_root / str(os.geteuid()) / fixed_name
+    protected.mkdir(parents=True, mode=0o700)
+    protected.chmod(0o700)
+    monkeypatch.setattr(runtime_process, "_RUNTIME_DIRECTORY_ROOT", runtime_root)
+    monkeypatch.setattr(
+        runtime_process, "_PROTECTED_HOME_RUNTIME_DIRECTORY", protected
+    )
+    rendered_destination = Path(
+        first_bridge.split(":", 2)[1].replace(
+            "%t", str(runtime_root / str(os.geteuid()))
+        )
+    )
+
+    assert rendered_destination == protected
+    environment = runtime_process.minimal_environment(
+        home=home, bound_runtime_directory=rendered_destination
+    )
+    assert environment["XDG_RUNTIME_DIR"] == str(protected)
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -683,6 +747,71 @@ def test_canary_cleanup_failure_invalidates_the_diagnosis(
         "raw_output": "not_returned",
     }
     assert _CANARY_STAGE_CODES[0] not in json.dumps(result)
+
+
+def test_canary_cleanup_never_uses_historical_ownership_after_show_failure(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    binding = runtime_lifecycle._canary_unit_binding(
+        image=_fake_canary_image(invocation, _CANARY_STAGE_CODES[0]),
+        home=home,
+        nonce="d" * 32,
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def unavailable(arguments: tuple[str, ...]) -> dict[str, str]:
+        calls.append(arguments)
+        if arguments[0] == "show":
+            raise runtime_lifecycle.RuntimeLifecycleError("bounded-show-failure")
+        return {}
+
+    cleaned = runtime_lifecycle._cleanup_canary_unit(
+        unavailable, binding, ownership_attested=True
+    )
+
+    assert cleaned is False
+    assert calls == [("show", binding.name, runtime_lifecycle._CANARY_SHOW_PROPERTIES)]
+
+
+def test_canary_cleanup_rejects_foreign_replacement_between_stop_and_reset(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    binding = runtime_lifecycle._canary_unit_binding(
+        image=_fake_canary_image(invocation, _CANARY_STAGE_CODES[0]),
+        home=home,
+        nonce="d" * 32,
+    )
+    owned = {
+        "LoadState": "loaded",
+        "ActiveState": "failed",
+        "Description": binding.description,
+        "Transient": "yes",
+        "Result": "exit-code",
+        "ExecMainStatus": "1",
+    }
+    foreign = {**owned, "Description": "foreign replacement"}
+    shows = iter((owned, foreign))
+    calls: list[tuple[str, ...]] = []
+
+    def replaced(arguments: tuple[str, ...]) -> dict[str, str]:
+        calls.append(arguments)
+        return next(shows) if arguments[0] == "show" else {}
+
+    cleaned = runtime_lifecycle._cleanup_canary_unit(
+        replaced, binding, ownership_attested=True
+    )
+
+    assert cleaned is False
+    assert ("stop", binding.name) in calls
+    assert ("reset-failed", binding.name) not in calls
 
 
 def test_canary_rejects_a_foreign_unit_without_touching_it(

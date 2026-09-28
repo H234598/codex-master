@@ -2526,7 +2526,7 @@ def _canary_unit_binding(
             f"BindReadOnlyPaths={release}:{canonical_release_text}:norbind"
         ),
         _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING: (
-            f"BindReadOnlyPaths=%t/bus:%t/{unit_stem}/bus:norbind"
+            _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING
         ),
         _HOURLY_PROBE_STATE_BINDING: (
             f"BindPaths={state}:{canonical_state_text}:norbind"
@@ -2560,6 +2560,11 @@ def _canary_unit_binding(
                 raise _error("runtime_canary_sandbox_invalid")
             seen.add(directive)
             properties.append(replacement)
+            if directive == _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY:
+                properties.append(
+                    "BindReadOnlyPaths="
+                    f"%t/{unit_stem}:%t/the-hive-hourly-runtime:norbind"
+                )
         else:
             properties.append(directive)
     if not type_seen or not exec_seen or seen != set(replacements):
@@ -3355,19 +3360,16 @@ def _cleanup_canary_unit(
     *,
     ownership_attested: bool,
 ) -> bool:
-    """Quiesce only the exact transient unit; continue after each failure."""
+    """Quiesce only after current exact ownership; history never authorizes."""
 
     clean = True
     try:
         state = _canary_show(systemctl, binding.name)
     except RuntimeLifecycleError:
-        state = {}
-        clean = False
+        return False
     if state.get("LoadState") == "not-found":
         return clean
-    if not ownership_attested and not _canary_unit_owned(state, binding):
-        return False
-    if state and not _canary_unit_owned(state, binding):
+    if not _canary_unit_owned(state, binding):
         return False
     try:
         _systemctl_mutate(systemctl, ("stop", binding.name))
@@ -3376,11 +3378,10 @@ def _cleanup_canary_unit(
     try:
         after_stop = _canary_show(systemctl, binding.name)
     except RuntimeLifecycleError:
-        after_stop = {}
-        clean = False
+        return False
     if after_stop.get("LoadState") == "not-found":
         return clean
-    if after_stop and not _canary_unit_owned(after_stop, binding):
+    if not _canary_unit_owned(after_stop, binding):
         return False
     try:
         _systemctl_mutate(systemctl, ("reset-failed", binding.name))

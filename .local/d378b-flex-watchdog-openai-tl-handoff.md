@@ -4,6 +4,7 @@ Status: `WORKER_COMPLETE_AWAITING_TL_REVIEW`
 Date: 2026-09-28 (Europe/Berlin)
 Branch: `d378b-flex-watchdog`
 Reviewed parent / starting HEAD: `ea83d5903cab77c118de005f23e29ac8fa2804c4`
+Canary follow-up parent: `76ab518f33494d2850d30dd0aa25b8af7fb2b9bd`
 
 ## Scope
 
@@ -53,8 +54,11 @@ authority:
    creates no canonical live pointer, unit, launcher, or pin-store authority.
 4. It reads the manifest-attested Hourly service, preserves every static
    service directive, and transforms only the typed RuntimeDirectory,
-   release/state bind sources, nested bus destination, and ExecStart binding.
-   Unknown or duplicate path/ExecStart directives fail closed.
+   release/state bind sources, and ExecStart binding. The unique manager-owned
+   Canary RuntimeDirectory is bridged read-only to the fixed
+   `%t/the-hive-hourly-runtime` path accepted by `runtime_process`; the public
+   manager bus remains bound only below that fixed path. Unknown or duplicate
+   path/ExecStart directives fail closed.
 5. It starts exactly one random 128-bit-named transient user service via
    `systemd-run --no-block`. The unit uses the canonical `107s` service bound;
    lifecycle polling is bounded to `112s`, and manager entry is bounded to
@@ -65,15 +69,19 @@ authority:
    canonical release, state, health, pricing, launcher, units, or timers.
 7. Caller environment is excluded from both manager adapters. The transient
    unit receives explicit `HOME`, `LANG`, and `PATH` overrides; the existing
-   attested launcher retains its own CODEX/Python sanitization. Service
-   stdout/stderr are `null`; no raw child output is returned.
+   attested launcher retains its own CODEX/Python sanitization. Its explicit
+   working directory remains the supplied Home, matching the user-unit default
+   and introducing no new CWD contract. Service stdout/stderr are `null`; no
+   raw child output is returned.
 8. Before start, the random unit name must be `not-found`. After start,
    `Transient=yes` and the exact random Description attest ownership. A foreign
    unit is never stopped or reset.
-9. `finally` performs bounded `stop`, conditional `reset-failed`, proves final
-   `LoadState=not-found`, and removes the complete invocation root. Any manager
-   or filesystem cleanup uncertainty replaces the diagnosis with
-   `runtime_canary_cleanup_unverified`.
+9. `finally` re-attests exact current transient ownership immediately before
+   both `stop` and conditional `reset-failed`; historical ownership never
+   authorizes a mutation. A failed, empty, or foreign current show stops
+   cleanup fail-closed. It then proves final `LoadState=not-found` and removes
+   the complete invocation root. Any manager or filesystem cleanup uncertainty
+   replaces the diagnosis with `runtime_canary_cleanup_unverified`.
 
 The coordination root and its private lock may persist under the UID runtime
 directory. No generation, state record, process, or transient unit is retained.
@@ -112,16 +120,24 @@ filesystem image below pytest's temporary directory.
 Passed before final commit:
 
 ```text
+# Red regression before the follow-up production fix:
+PYTHONPATH=src pytest -q \
+  tests/test_runtime_lifecycle_service.py::test_canary_runtime_directory_reaches_the_fixed_runtime_process_contract \
+  tests/test_runtime_lifecycle_service.py::test_canary_cleanup_never_uses_historical_ownership_after_show_failure \
+  tests/test_runtime_lifecycle_service.py::test_canary_cleanup_rejects_foreign_replacement_between_stop_and_reset
+# 2 failed, 1 passed
+
 python3 -m py_compile \
   src/the_hive/runtime_lifecycle.py \
+  src/the_hive/runtime_process.py \
   tests/test_runtime_lifecycle_service.py
 
 PYTHONPATH=src pytest -q tests/test_runtime_lifecycle_service.py \
   -k 'canary or public_runtime_lifecycle_surface'
-# 25 passed, 281 deselected
+# 28 passed, 281 deselected
 
 PYTHONPATH=src pytest -q tests/test_runtime_lifecycle_service.py
-# 306 passed in 9.59s
+# 309 passed in 9.60s
 
 git diff --check
 ```
@@ -135,11 +151,15 @@ The focused evidence covers:
 - isolated release/state sources and unchanged canonical pointer, health,
   pricing, and unit sentinels;
 - safe unique unit and RuntimeDirectory names;
+- two distinct unique RuntimeDirectory sources reaching the fixed
+  cross-module `runtime_process` destination without a `/tmp` bridge;
 - explicit manager/service/poll bounds and exactly one start attempt;
 - all six `ea83d590` pre-exec stage codes;
 - green evidence and unknown evidence fail-closed;
 - cleanup after a start adapter error;
 - individual `stop`, `reset-failed`, and filesystem cleanup failures;
+- refusal to mutate after a current-show failure and refusal to reset a unit
+  replaced between `stop` and `reset-failed`;
 - concurrent invocation rejection;
 - foreign-unit rejection without mutation; and
 - caller-environment exclusion and raw-output redaction.
