@@ -2540,9 +2540,7 @@ def _canary_unit_binding(
     ):
         raise _error("runtime_canary_sandbox_invalid")
     unit_stem = _CANARY_UNIT_PREFIX + nonce
-    canonical_release = Path(home_text) / ".local" / "lib" / "the-hive-runtime"
     canonical_state = Path(home_text) / ".local" / "state" / "codex-master-mcp"
-    canonical_release_text = _canary_path_text(canonical_release)
     canonical_state_text = _canary_path_text(canonical_state)
     user_runtime_text = _canary_path_text(_user_runtime_directory())
     replacements = {
@@ -2551,7 +2549,7 @@ def _canary_unit_binding(
             _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY_MODE
         ),
         _HOURLY_PROBE_RUNTIME_ROOT_BINDING: (
-            f"BindReadOnlyPaths={release}:{canonical_release_text}:norbind"
+            f"BindReadOnlyPaths={release}:{release}:norbind"
         ),
         _HOURLY_PROBE_PROTECTED_HOME_BUS_BINDING: (
             "BindReadOnlyPaths="
@@ -2607,13 +2605,13 @@ def _canary_unit_binding(
         command=(
             "/usr/bin/bash",
             os.fspath(
-                canonical_release
+                image.release_root
                 / "generations"
                 / image.generation
                 / "bin"
                 / "the-hive-hive-hourly-probe"
             ),
-            canonical_release_text,
+            release,
             image.generation,
             image.manifest_digest,
             _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_ARGUMENT,

@@ -358,15 +358,11 @@ def test_canary_unit_preserves_sandbox_and_substitutes_only_private_sources(
         image=image, home=home, nonce="d" * 32
     )
     properties = tuple(unit.properties)
-    canonical_release = home / ".local" / "lib" / "the-hive-runtime"
     canonical_state = home / ".local" / "state" / "codex-master-mcp"
 
     assert unit.name == "the-hive-runtime-canary-" + "d" * 32 + ".service"
     assert f"RuntimeDirectory=the-hive-runtime-canary-{'d' * 32}" in properties
-    assert (
-        f"BindReadOnlyPaths={image.release_root}:{canonical_release}:norbind"
-        in properties
-    )
+    assert f"BindReadOnlyPaths={image.release_root}:{image.release_root}:norbind" in properties
     assert f"BindPaths={image.state_root}:{canonical_state}:norbind" in properties
     assert f"ReadWritePaths={canonical_state}" in properties
     assert "ProtectHome=tmpfs" in properties
@@ -379,13 +375,13 @@ def test_canary_unit_preserves_sandbox_and_substitutes_only_private_sources(
     assert unit.command == (
         "/usr/bin/bash",
         str(
-            canonical_release
+            image.release_root
             / "generations"
             / _CANARY_GENERATION
             / "bin"
             / "the-hive-hive-hourly-probe"
         ),
-        str(canonical_release),
+        str(image.release_root),
         _CANARY_GENERATION,
         _CANARY_DIGEST,
         "--protected-home-runtime",
