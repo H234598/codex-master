@@ -862,6 +862,215 @@ def test_systemd_run_default_excludes_caller_environment_and_raw_output(
     assert "must-not-cross" not in json.dumps(observed)
 
 
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    (
+        (
+            "Failed to start transient service unit: Invalid argument\n",
+            "runtime_canary_manager_contract_invalid",
+        ),
+        (
+            "Failed to connect to user scope bus via local transport: "
+            "Connection refused\n",
+            "runtime_canary_manager_unavailable",
+        ),
+        (
+            "Failed to connect to user scope bus via local transport: "
+            "No such file or directory\n",
+            "runtime_canary_manager_unavailable",
+        ),
+        (
+            "Failed to start transient service unit: Access denied\n",
+            "runtime_canary_manager_rejected",
+        ),
+        (
+            "Failed to start transient service unit: Access denied as the "
+            "requested operation requires interactive authentication. However, "
+            "interactive authentication has not been enabled by the calling "
+            "program.\n",
+            "runtime_canary_manager_rejected",
+        ),
+    ),
+)
+def test_systemd_run_default_classifies_only_fixed_installed_error_forms(
+    monkeypatch: pytest.MonkeyPatch, stderr: str, expected: str
+) -> None:
+    calls = 0
+
+    def run(_command, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(runtime_lifecycle.subprocess, "run", run)
+
+    with pytest.raises(runtime_lifecycle.RuntimeLifecycleError) as caught:
+        runtime_lifecycle._systemd_run_default(
+            ("--unit=sensitive-unit.service", "/sensitive/command")
+        )
+
+    assert str(caught.value) == expected
+    assert calls == 1
+    assert stderr not in repr(caught.value)
+    assert "sensitive-unit" not in repr(caught.value)
+    assert "/sensitive" not in repr(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    (
+        (
+            1,
+            "secret-stdout",
+            "Failed to start transient service unit: Invalid argument\n",
+        ),
+        (
+            1,
+            "",
+            "Failed to start transient service unit: Invalid argument\n"
+            "secret-token\n",
+        ),
+        (
+            1,
+            "",
+            "Failed to start transient service unit: Invalid argument\n"
+            "Failed to connect to user scope bus via local transport: "
+            "Connection refused\n",
+        ),
+        (
+            1,
+            "",
+            "Failed to start transient service unit /secret/path: rejected\n",
+        ),
+        (
+            2,
+            "",
+            "Failed to start transient service unit: Invalid argument\n",
+        ),
+        (1, "", "secret" * 128),
+    ),
+)
+def test_systemd_run_default_collapses_unknown_or_contradictory_output(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: str, stderr: str
+) -> None:
+    calls = 0
+
+    def run(_command, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(runtime_lifecycle.subprocess, "run", run)
+
+    with pytest.raises(runtime_lifecycle.RuntimeLifecycleError) as caught:
+        runtime_lifecycle._systemd_run_default(
+            ("--unit=sensitive-unit.service", "/sensitive/command")
+        )
+
+    assert str(caught.value) == "runtime_canary_manager_failed"
+    assert calls == 1
+    rendered = repr(caught.value)
+    assert stdout not in rendered or not stdout
+    assert stderr not in rendered
+    assert "secret" not in rendered
+    assert "sensitive-unit" not in rendered
+    assert "/sensitive" not in rendered
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        OSError("secret-os-path"),
+        subprocess.TimeoutExpired("secret-command", 15, stderr="secret-timeout"),
+    ),
+)
+def test_systemd_run_default_os_and_timeout_failures_remain_unavailable(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    calls = 0
+
+    def run(_command, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise failure
+
+    monkeypatch.setattr(runtime_lifecycle.subprocess, "run", run)
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="^runtime_canary_manager_unavailable$",
+    ) as caught:
+        runtime_lifecycle._systemd_run_default(("--unit=safe.service", "/bin/false"))
+
+    assert calls == 1
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "secret" not in repr(caught.value)
+
+
+@pytest.mark.parametrize(
+    "code",
+    (
+        "runtime_canary_manager_contract_invalid",
+        "runtime_canary_manager_rejected",
+    ),
+)
+def test_canary_returns_fixed_manager_start_code_and_still_quiesces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+    manager = _CanaryManager()
+
+    def fail_start(arguments: tuple[str, ...]) -> dict[str, str]:
+        manager.run(arguments)
+        raise runtime_lifecycle.RuntimeLifecycleError(code)
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=fail_start
+    )
+
+    assert result == {
+        "status": "runtime_canary_failed",
+        "error_code": code,
+        "generation": _CANARY_GENERATION,
+        "manifest_digest": _CANARY_DIGEST,
+        "raw_output": "not_returned",
+    }
+    assert len(manager.run_calls) == 1
+    assert manager.stopped is True
+    assert manager.reset is True
+
+
+def test_canary_cleanup_failure_overrides_fixed_manager_start_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+    manager = _CanaryManager(fail="stop")
+
+    def fail_start(arguments: tuple[str, ...]) -> dict[str, str]:
+        manager.run(arguments)
+        raise runtime_lifecycle.RuntimeLifecycleError(
+            "runtime_canary_manager_contract_invalid"
+        )
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=fail_start
+    )
+
+    assert result == {
+        "status": "runtime_canary_cleanup_failed",
+        "error_code": "runtime_canary_cleanup_unverified",
+        "generation": _CANARY_GENERATION,
+        "manifest_digest": _CANARY_DIGEST,
+        "raw_output": "not_returned",
+    }
+    assert len(manager.run_calls) == 1
+
+
 def _identity(path: Path) -> tuple[int, int, int, int, int, bytes]:
     info = path.stat()
     return (

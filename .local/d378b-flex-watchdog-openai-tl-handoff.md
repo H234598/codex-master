@@ -5,6 +5,7 @@ Date: 2026-09-28 (Europe/Berlin)
 Branch: `d378b-flex-watchdog`
 Reviewed parent / starting HEAD: `ea83d5903cab77c118de005f23e29ac8fa2804c4`
 Canary follow-up parent: `76ab518f33494d2850d30dd0aa25b8af7fb2b9bd`
+Manager-adapter follow-up parent: `e7520ef7850f28d6356d83e9ecc87dbd9e14303e`
 
 ## Scope
 
@@ -18,6 +19,23 @@ It does not change the canonical cutover, installed runtime, pointers, user
 units, timers, pricing inventory, health, or migration policy. It does not
 claim a root cause or a remediation for the live `command_group_unavailable`
 failure.
+
+## Historical live evidence binding this follow-up
+
+The one separately authorized live Canary from generation
+`e7520ef7850f28d6356d83e9ecc87dbd9e14303e` exited 1 and returned only:
+
+- `status=runtime_canary_failed`;
+- `error_code=runtime_canary_manager_failed`;
+- manifest digest reported as the bounded prefix `sha256:f152…` (the full
+  digest was not supplied to this follow-up and remains unknown); and
+- `raw_output=not_returned`.
+
+Post-run evidence found zero Canary run roots, zero Canary units, zero jobs,
+and only the coordination `.canary.lock`. No Canary/systemd-run journal
+metadata survived. The previous adapter collapsed every synchronous nonzero
+`systemd-run` result and discarded stderr, so the exact manager subpath cannot
+be reconstructed. The product root cause therefore remains unknown.
 
 Tracked files in this handoff:
 
@@ -82,6 +100,14 @@ authority:
    cleanup fail-closed. It then proves final `LoadState=not-found` and removes
    the complete invocation root. Any manager or filesystem cleanup uncertainty
    replaces the diagnosis with `runtime_canary_cleanup_unverified`.
+10. A synchronous `systemd-run` exit is classified only when exit status is
+    exactly 1, stdout is empty, and stderr is one exact installed systemd-259.9
+    `LANG=C` full line. The fixed classes distinguish transient-service
+    `Invalid argument`, user-bus absence/refusal, and manager `Access denied`.
+    Extra, multiple, oversized, dynamic, or unknown output remains
+    `runtime_canary_manager_failed`; OSError and timeout remain
+    `runtime_canary_manager_unavailable`. No raw text enters an exception or
+    public result, and the adapter still performs exactly one start attempt.
 
 The coordination root and its private lock may persist under the UID runtime
 directory. No generation, state record, process, or transient unit is retained.
@@ -111,6 +137,17 @@ Missing, malformed, contradictory, unknown, or freely worded diagnostic data
 becomes `runtime_canary_evidence_invalid`. Exception text, paths, environment,
 stderr, stdout, and tokens are never returned.
 
+Before command execution, an exact synchronous manager failure may instead
+return `runtime_canary_failed` with one of these bounded codes:
+
+- `runtime_canary_manager_contract_invalid`;
+- `runtime_canary_manager_unavailable`;
+- `runtime_canary_manager_rejected`; or
+- the generic `runtime_canary_manager_failed` for every unrecognized form.
+
+Cleanup uncertainty still replaces any of these with
+`runtime_canary_cleanup_unverified`.
+
 ## Manager-free evidence
 
 No test in this task contacted the user manager. `systemctl` and `systemd-run`
@@ -127,17 +164,30 @@ PYTHONPATH=src pytest -q \
   tests/test_runtime_lifecycle_service.py::test_canary_cleanup_rejects_foreign_replacement_between_stop_and_reset
 # 2 failed, 1 passed
 
+# Red manager-adapter regression before its production fix:
+PYTHONPATH=src pytest -q tests/test_runtime_lifecycle_service.py \
+  -k 'systemd_run_default or fixed_manager_start_code or cleanup_failure_overrides_fixed_manager_start_code'
+# 6 failed, 8 passed, 308 deselected
+
+# Red exception-chain redaction before its adapter fix:
+PYTHONPATH=src pytest -q tests/test_runtime_lifecycle_service.py \
+  -k 'systemd_run_default_os_and_timeout_failures_remain_unavailable'
+# 2 failed, 323 deselected
+
 python3 -m py_compile \
   src/the_hive/runtime_lifecycle.py \
-  src/the_hive/runtime_process.py \
   tests/test_runtime_lifecycle_service.py
 
 PYTHONPATH=src pytest -q tests/test_runtime_lifecycle_service.py \
   -k 'canary or public_runtime_lifecycle_surface'
-# 28 passed, 281 deselected
+# 36 passed, 289 deselected
+
+PYTHONPATH=src pytest -q tests/test_runtime_lifecycle_service.py \
+  -k 'systemd_run_default or fixed_manager_start_code or cleanup_failure_overrides_fixed_manager_start_code'
+# 17 passed, 308 deselected
 
 PYTHONPATH=src pytest -q tests/test_runtime_lifecycle_service.py
-# 309 passed in 9.60s
+# 325 passed in 9.60s
 
 git diff --check
 ```
@@ -162,7 +212,13 @@ The focused evidence covers:
   replaced between `stop` and `reset-failed`;
 - concurrent invocation rejection;
 - foreign-unit rejection without mutation; and
-- caller-environment exclusion and raw-output redaction.
+- caller-environment exclusion and raw-output redaction;
+- exact installed manager-error classification with one start attempt;
+- collapse of secret-bearing, multi-line, contradictory, oversized, or
+  unexpected-exit output to the generic fixed code;
+- unchanged OSError/timeout unavailability without a foreign exception cause
+  or context; and
+- public propagation of fixed manager codes with cleanup precedence.
 
 ## Mutations deliberately not performed
 
@@ -171,17 +227,21 @@ The focused evidence covers:
 - no real `systemctl`, `systemd-run`, daemon reload, unit start, or transient
   unit;
 - no pointer, pin-store, launcher, unit, timer, pricing, or health mutation;
-- no live Canary execution; and
+- no live Canary execution;
+- no retry or diagnostic systemd-run invocation for the historical live
+  failure; and
 - no deletion or staging of the two excluded prompt files.
 
 ## Gate separation and residual work
 
 The diagnostic gate and remediation gate are separate.
 
-This source makes a future, explicitly authorized live Canary possible from a
-clean detached source. It does not prove which stage will fail live. The live
-root cause therefore remains unknown until that one bounded Canary is reviewed,
-integrated, and separately authorized to run.
+This source makes a future, explicitly authorized live Canary able to preserve
+one bounded manager sub-class without returning raw output. It does not prove
+which manager form occurred historically and does not prove which stage will
+fail in a future run. The live root cause remains unknown until this follow-up
+is independently reviewed, integrated, and a new bounded Canary is separately
+authorized.
 
 Even after a live stage code exists, no cutover retry is authorized by this
 handoff. A red regression, minimal remediation, focused tests, and independent

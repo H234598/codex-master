@@ -86,6 +86,23 @@ _CANARY_SHOW_PROPERTIES = (
     "--property=LoadState,ActiveState,Description,Transient,Result,"
     "ExecMainStatus"
 )
+_CANARY_SYSTEMD_RUN_FAILURES = {
+    "Failed to start transient service unit: Invalid argument\n": (
+        "runtime_canary_manager_contract_invalid"
+    ),
+    "Failed to connect to user scope bus via local transport: "
+    "Connection refused\n": "runtime_canary_manager_unavailable",
+    "Failed to connect to user scope bus via local transport: "
+    "No such file or directory\n": "runtime_canary_manager_unavailable",
+    "Failed to start transient service unit: Access denied\n": (
+        "runtime_canary_manager_rejected"
+    ),
+    "Failed to start transient service unit: Access denied as the requested "
+    "operation requires interactive authentication. However, interactive "
+    "authentication has not been enabled by the calling program.\n": (
+        "runtime_canary_manager_rejected"
+    ),
+}
 _ROLLBACK_PHASE_FILE_RESTORE = "file_restore"
 _ROLLBACK_PHASE_GENERATION_DISCARD = "generation_discard"
 _ROLLBACK_PHASE_DAEMON_RELOAD = "restore_daemon_reload"
@@ -3181,10 +3198,28 @@ def _unit_bytes(units: Path, name: str) -> bytes | None:
     return _regular_bytes(units / name, maximum=_MAX_UNIT_BYTES, mode=0o644)
 
 
+def _systemd_run_failure_code(
+    *, returncode: object, stdout: object, stderr: object
+) -> str:
+    """Classify only exact, installed LANG=C systemd-run failure lines."""
+
+    if (
+        returncode != 1
+        or stdout != ""
+        or not isinstance(stderr, str)
+        or len(stderr) > 512
+    ):
+        return "runtime_canary_manager_failed"
+    return _CANARY_SYSTEMD_RUN_FAILURES.get(
+        stderr, "runtime_canary_manager_failed"
+    )
+
+
 def _systemd_run_default(arguments: tuple[str, ...]) -> Mapping[str, str]:
     """Create one transient user unit without inheriting the caller environment."""
 
     runtime_directory = f"/run/user/{os.geteuid()}"
+    completed = None
     try:
         completed = subprocess.run(
             [
@@ -3206,10 +3241,18 @@ def _systemd_run_default(arguments: tuple[str, ...]) -> Mapping[str, str]:
                 "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_directory}/bus",
             },
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise _error("runtime_canary_manager_unavailable") from exc
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if completed is None:
+        raise _error("runtime_canary_manager_unavailable")
     if completed.returncode != 0:
-        raise _error("runtime_canary_manager_failed")
+        raise _error(
+            _systemd_run_failure_code(
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+        )
     return {}
 
 
@@ -4193,8 +4236,10 @@ def _canary_public_failure(code: str) -> str:
         "runtime_canary_evidence_invalid",
         "runtime_canary_home_invalid",
         "runtime_canary_image_invalid",
+        "runtime_canary_manager_contract_invalid",
         "runtime_canary_manager_failed",
         "runtime_canary_manager_invalid",
+        "runtime_canary_manager_rejected",
         "runtime_canary_manager_unavailable",
         "runtime_canary_root_invalid",
         "runtime_canary_sandbox_invalid",
