@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import json
+import os
 import runpy
 import subprocess
 import sys
@@ -18,6 +20,717 @@ SCRIPT = ROOT / "scripts" / "the-hive-runtime-service"
 sys.path.insert(0, str(ROOT / "src"))
 
 from the_hive import runtime_lifecycle  # noqa: E402
+
+
+_CANARY_GENERATION = "a" * 40
+_CANARY_DIGEST = "sha256:" + "b" * 64
+_CANARY_STAGE_CODES = (
+    "command_runtime_directory_unavailable",
+    "command_spawn_helper_unavailable",
+    "command_cgroup_preflight_unavailable",
+    "command_manager_preflight_unavailable",
+    "command_native_spawn_unavailable",
+    "command_cgroup_bind_unavailable",
+)
+
+
+def _canary_service() -> bytes:
+    return (
+        (ROOT / "systemd" / "user" / "the-hive-hive-hourly-probe.service")
+        .read_bytes()
+        .replace(b"@MASTERJET_GENERATION@", _CANARY_GENERATION.encode("ascii"))
+        .replace(b"@MASTERJET_MANIFEST_DIGEST@", _CANARY_DIGEST.encode("ascii"))
+    )
+
+
+def _canary_health(code: str) -> bytes:
+    ok = {
+        "code": "ok",
+        "exit_code": 0,
+        "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False},
+    }
+    failed = {
+        "code": code,
+        "exit_code": None,
+        "stderr": {
+            "state": "not_returned",
+            "excerpt": "",
+            "redaction_applied": False,
+        },
+    }
+    return (
+        json.dumps(
+            {
+                "schema_version": 3,
+                "checked_at": "2026-09-28T00:00:00+00:00",
+                "checks": {
+                    "runtime_layout": True,
+                    "hive_runtime": False,
+                    "hive_doctor": False,
+                },
+                "commands": {
+                    "runtime_status": True,
+                    "hive_status": False,
+                    "hive_doctor": False,
+                },
+                "diagnostics": {
+                    "runtime_status": ok,
+                    "hive_status": failed,
+                    "hive_doctor": failed,
+                },
+                "alarm": {
+                    "scope": "hive",
+                    "status": "active",
+                    "reason_codes": ["hive_doctor", "hive_runtime"],
+                    "owner": None,
+                },
+                "global_pilot_readiness": {
+                    "schema_version": 1,
+                    "pilot": "blocked",
+                    "generation_id": None,
+                    "freshness": "unknown",
+                    "candidate_count": 0,
+                    "reason_codes": ["usage_missing"],
+                    "raw_output": "not_returned",
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _canary_green_health() -> bytes:
+    payload = json.loads(_canary_health(_CANARY_STAGE_CODES[0]))
+    ok = {
+        "code": "ok",
+        "exit_code": 0,
+        "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False},
+    }
+    payload["checks"] = {
+        "runtime_layout": True,
+        "hive_runtime": True,
+        "hive_doctor": True,
+    }
+    payload["commands"] = {
+        "runtime_status": True,
+        "hive_status": True,
+        "hive_doctor": True,
+    }
+    payload["diagnostics"] = {
+        "runtime_status": ok,
+        "hive_status": ok,
+        "hive_doctor": ok,
+    }
+    payload["alarm"] = {
+        "scope": "hive",
+        "status": "cleared",
+        "reason_codes": [],
+        "owner": {
+            "principal_id": "canary",
+            "class_id": "koenigin",
+            "repo_id": "the-hive",
+        },
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def _fake_canary_image(root: Path, code: str) -> object:
+    release = root / "release"
+    state = root / "state"
+    release.mkdir(mode=0o700)
+    state.mkdir(mode=0o700)
+    health = state / "hive-hourly-health.json"
+    health.write_bytes(_canary_health(code))
+    health.chmod(0o600)
+    return runtime_lifecycle._CanaryImage(
+        invocation_root=root,
+        release_root=release,
+        state_root=state,
+        generation=_CANARY_GENERATION,
+        manifest_digest=_CANARY_DIGEST,
+        service=_canary_service(),
+    )
+
+
+class _CanaryManager:
+    def __init__(
+        self,
+        *,
+        foreign: bool = False,
+        fail: str | None = None,
+        success: bool = False,
+    ) -> None:
+        self.foreign = foreign
+        self.fail = fail
+        self.success = success
+        self.started = False
+        self.stopped = False
+        self.reset = False
+        self.description = ""
+        self.run_calls: list[tuple[str, ...]] = []
+        self.systemctl_calls: list[tuple[str, ...]] = []
+
+    def run(self, arguments: tuple[str, ...]) -> dict[str, str]:
+        self.run_calls.append(arguments)
+        self.description = next(
+            value.removeprefix("--description=")
+            for value in arguments
+            if value.startswith("--description=")
+        )
+        self.started = True
+        if self.fail == "run":
+            raise runtime_lifecycle.RuntimeLifecycleError("sensitive-run-detail")
+        return {}
+
+    def systemctl(self, arguments: tuple[str, ...]) -> dict[str, str]:
+        self.systemctl_calls.append(arguments)
+        if arguments[0] == "show":
+            if self.foreign:
+                return {
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "Description": "foreign-unit",
+                    "Transient": "yes",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                }
+            if not self.started or self.reset:
+                return {
+                    "LoadState": "not-found",
+                    "ActiveState": "inactive",
+                    "Description": "",
+                    "Transient": "no",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                }
+            if self.success:
+                return {
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "Description": self.description,
+                    "Transient": "yes",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                }
+            return {
+                "LoadState": "loaded",
+                "ActiveState": "failed",
+                "Description": self.description,
+                "Transient": "yes",
+                "Result": "exit-code",
+                "ExecMainStatus": "1",
+            }
+        if arguments[0] == "stop":
+            if self.fail == "stop":
+                raise runtime_lifecycle.RuntimeLifecycleError("sensitive-stop-detail")
+            self.stopped = True
+            return {}
+        if arguments[0] == "reset-failed":
+            if self.fail == "reset-failed":
+                raise runtime_lifecycle.RuntimeLifecycleError("sensitive-reset-detail")
+            self.reset = True
+            return {}
+        raise AssertionError(arguments)
+
+
+def _patch_canary_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: str
+) -> Path:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    monkeypatch.setattr(runtime_lifecycle, "_canary_runtime_root", lambda: runtime_root)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: (_CANARY_GENERATION, "c" * 64),
+    )
+
+    def prepare(*, repository: Path, invocation_root: Path, source_commit: str):
+        assert repository == ROOT
+        assert source_commit == _CANARY_GENERATION
+        return _fake_canary_image(invocation_root, code)
+
+    monkeypatch.setattr(runtime_lifecycle, "_prepare_canary_image", prepare)
+    monkeypatch.setattr(runtime_lifecycle.secrets, "token_hex", lambda _size: "d" * 32)
+    return runtime_root
+
+
+def test_canary_image_is_source_and_manifest_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The disposable image is complete, sealed, and named by clean HEAD."""
+
+    commit = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_source_tree_binding",
+        lambda _repository: (commit, "e" * 64),
+    )
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    image = runtime_lifecycle._prepare_canary_image(
+        repository=ROOT,
+        invocation_root=invocation,
+        source_commit=commit,
+    )
+
+    from the_hive.runtime_layout import RuntimeLayout
+
+    layout = RuntimeLayout.from_current_release(
+        image.release_root, image.generation, image.manifest_digest
+    )
+    manifest = json.loads(
+        (layout.root / ".the-hive-runtime-manifest.json").read_text(encoding="utf-8")
+    )
+    assert image.generation == commit
+    assert manifest["generation"] == commit
+    assert manifest["commit"] == commit
+    assert image.manifest_digest == layout.manifest_digest
+    assert image.service == layout.read_attested_file(
+        "systemd/user/the-hive-hive-hourly-probe.service"
+    ).replace(b"@MASTERJET_GENERATION@", commit.encode()).replace(
+        b"@MASTERJET_MANIFEST_DIGEST@", image.manifest_digest.encode()
+    )
+
+
+def test_canary_source_binding_rejects_untracked_input(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir(mode=0o700)
+    subprocess.run(["git", "init", "-q", repository], check=True)
+    tracked = repository / "tracked.txt"
+    tracked.write_text("attested\n", encoding="utf-8")
+    subprocess.run(["git", "-C", repository, "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            repository,
+            "-c",
+            "user.name=Canary Test",
+            "-c",
+            "user.email=canary@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "attested",
+        ],
+        check=True,
+    )
+
+    commit, tree_digest = runtime_lifecycle._source_tree_binding(repository)
+    assert len(commit) == 40
+    assert len(tree_digest) == 64
+    (repository / "untracked.txt").write_text("excluded\n", encoding="utf-8")
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_lifecycle_source_dirty",
+    ):
+        runtime_lifecycle._source_tree_binding(repository)
+
+
+def test_canary_unit_preserves_sandbox_and_substitutes_only_private_sources(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    image = _fake_canary_image(invocation, _CANARY_STAGE_CODES[0])
+
+    unit = runtime_lifecycle._canary_unit_binding(
+        image=image, home=home, nonce="d" * 32
+    )
+    properties = tuple(unit.properties)
+    canonical_release = home / ".local" / "lib" / "the-hive-runtime"
+    canonical_state = home / ".local" / "state" / "codex-master-mcp"
+
+    assert unit.name == "the-hive-runtime-canary-" + "d" * 32 + ".service"
+    assert f"RuntimeDirectory=the-hive-runtime-canary-{'d' * 32}" in properties
+    assert (
+        f"BindReadOnlyPaths={image.release_root}:{canonical_release}:norbind"
+        in properties
+    )
+    assert f"BindPaths={image.state_root}:{canonical_state}:norbind" in properties
+    assert f"ReadWritePaths={canonical_state}" in properties
+    assert "ProtectHome=tmpfs" in properties
+    assert "PrivateTmp=yes" in properties
+    assert "RemainAfterExit=yes" in properties
+    assert "StandardOutput=null" in properties
+    assert "StandardError=null" in properties
+    assert "TimeoutStartSec=107s" in properties
+    assert all("codex-master-openai-pricing" not in value for value in properties)
+    assert unit.command == (
+        str(canonical_release / "generations" / _CANARY_GENERATION / "bin" / "the-hive-hive-hourly-probe"),
+        str(canonical_release),
+        _CANARY_GENERATION,
+        _CANARY_DIGEST,
+        "--protected-home-runtime",
+        "--json",
+    )
+    assert "--no-block" in unit.run_arguments
+    assert "--wait" not in unit.run_arguments
+    assert unit.run_arguments.count(f"--unit={unit.name}") == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda value: value + b"ReadWritePaths=/foreign\n",
+        lambda value: value.replace(
+            b"BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind",
+            b"BindReadOnlyPaths=%t:/tmp/foreign:norbind",
+        ),
+        lambda value: value.replace(b"ExecStart=", b"ExecStart=/foreign\nExecStart="),
+    ),
+)
+def test_canary_unit_rejects_sandbox_drift(
+    tmp_path: Path, mutation
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    image = _fake_canary_image(invocation, _CANARY_STAGE_CODES[0])
+    image = runtime_lifecycle._CanaryImage(
+        invocation_root=image.invocation_root,
+        release_root=image.release_root,
+        state_root=image.state_root,
+        generation=image.generation,
+        manifest_digest=image.manifest_digest,
+        service=mutation(image.service),
+    )
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_canary_sandbox_invalid",
+    ):
+        runtime_lifecycle._canary_unit_binding(
+            image=image, home=home, nonce="d" * 32
+        )
+
+
+def test_canary_unit_rejects_a_path_that_systemd_could_reparse(tmp_path: Path) -> None:
+    home = tmp_path / "unsafe:home"
+    home.mkdir(mode=0o700)
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    image = _fake_canary_image(invocation, _CANARY_STAGE_CODES[0])
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_canary_sandbox_invalid",
+    ):
+        runtime_lifecycle._canary_unit_binding(
+            image=image, home=home, nonce="d" * 32
+        )
+
+
+@pytest.mark.parametrize("code", _CANARY_STAGE_CODES)
+def test_canary_returns_each_bounded_preexec_stage_and_quiesces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    runtime_root = _patch_canary_source(monkeypatch, tmp_path, code)
+    manager = _CanaryManager()
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result == {
+        "status": "runtime_canary_red",
+        "error_code": code,
+        "generation": _CANARY_GENERATION,
+        "manifest_digest": _CANARY_DIGEST,
+        "raw_output": "not_returned",
+    }
+    assert len(manager.run_calls) == 1
+    assert manager.stopped is True
+    assert manager.reset is True
+    assert not tuple(runtime_root.glob("run-*"))
+    touched = " ".join(" ".join(call) for call in manager.systemctl_calls)
+    assert "the-hive-hive-hourly-probe" not in touched
+    assert "codex-master" not in touched
+    assert "pricing" not in touched
+
+
+def test_canary_unknown_diagnostic_fails_closed_without_returning_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _patch_canary_source(monkeypatch, tmp_path, "secret-unknown-stage")
+    manager = _CanaryManager()
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result["status"] == "runtime_canary_failed"
+    assert result["error_code"] == "runtime_canary_evidence_invalid"
+    assert "secret" not in json.dumps(result)
+    assert manager.stopped is True
+    assert manager.reset is True
+
+
+def test_canary_start_error_still_quiesces_its_attested_transient_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+    manager = _CanaryManager(fail="run")
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result["status"] == "runtime_canary_failed"
+    assert result["error_code"] == "runtime_canary_failed"
+    assert "sensitive" not in json.dumps(result)
+    assert manager.stopped is True
+    assert manager.reset is True
+
+
+def test_canary_manager_wait_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    invocation = tmp_path / "invocation"
+    invocation.mkdir(mode=0o700)
+    binding = runtime_lifecycle._canary_unit_binding(
+        image=_fake_canary_image(invocation, _CANARY_STAGE_CODES[0]),
+        home=home,
+        nonce="d" * 32,
+    )
+    moments = iter((0.0, runtime_lifecycle._CANARY_RESULT_SECONDS + 1.0))
+    monkeypatch.setattr(runtime_lifecycle.time, "monotonic", lambda: next(moments))
+    monkeypatch.setattr(runtime_lifecycle.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_canary_timeout",
+    ):
+        runtime_lifecycle._wait_for_canary_result(
+            lambda _arguments: {
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "Description": binding.description,
+                "Transient": "yes",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+            binding,
+        )
+
+
+def test_canary_green_result_is_bounded_and_quiescent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+
+    def prepare(*, repository: Path, invocation_root: Path, source_commit: str):
+        image = _fake_canary_image(invocation_root, _CANARY_STAGE_CODES[0])
+        health = image.state_root / "hive-hourly-health.json"
+        health.write_bytes(_canary_green_health())
+        health.chmod(0o600)
+        return image
+
+    monkeypatch.setattr(runtime_lifecycle, "_prepare_canary_image", prepare)
+    manager = _CanaryManager(success=True)
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result == {
+        "status": "runtime_canary_green",
+        "error_code": None,
+        "generation": _CANARY_GENERATION,
+        "manifest_digest": _CANARY_DIGEST,
+        "raw_output": "not_returned",
+    }
+    assert len(manager.run_calls) == 1
+    assert manager.stopped is True
+    assert manager.reset is True
+
+
+def test_canary_source_rebind_stops_before_manager_entry_and_cleans_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    monkeypatch.setattr(runtime_lifecycle, "_canary_runtime_root", lambda: runtime_root)
+    calls = 0
+
+    def source(_repository: Path) -> tuple[str, str]:
+        nonlocal calls
+        calls += 1
+        return _CANARY_GENERATION, ("c" if calls < 3 else "e") * 64
+
+    monkeypatch.setattr(runtime_lifecycle, "_source_tree_binding", source)
+    monkeypatch.setattr(
+        runtime_lifecycle,
+        "_prepare_canary_image",
+        lambda **kwargs: _fake_canary_image(
+            kwargs["invocation_root"], _CANARY_STAGE_CODES[0]
+        ),
+    )
+    manager = _CanaryManager()
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result["error_code"] == "runtime_canary_source_changed"
+    assert manager.run_calls == []
+    assert manager.systemctl_calls == []
+    assert not tuple(runtime_root.glob("run-*"))
+
+
+def test_canary_concurrency_is_rejected_before_image_or_manager_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    runtime_root = _patch_canary_source(
+        monkeypatch, tmp_path, _CANARY_STAGE_CODES[0]
+    )
+    manager = _CanaryManager()
+
+    with runtime_lifecycle._canary_lock(runtime_root):
+        result = runtime_lifecycle.canary(
+            home=home, systemctl=manager.systemctl, systemd_run=manager.run
+        )
+
+    assert result["status"] == "runtime_canary_failed"
+    assert result["error_code"] == "runtime_canary_busy"
+    assert manager.run_calls == []
+    assert manager.systemctl_calls == []
+    assert not tuple(runtime_root.glob("run-*"))
+
+
+def test_canary_never_changes_canonical_runtime_state_or_pricing_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    canonical = {
+        home / ".local/lib/the-hive-runtime/.the-hive-release-pointers.json": b"pointer\n",
+        home / ".local/state/codex-master-mcp/hive-hourly-health.json": b"health\n",
+        home / ".local/state/the-hive/openai-pricing/current.json": b"pricing\n",
+        home / ".config/systemd/user/the-hive-hive-hourly-probe.service": b"unit\n",
+    }
+    for path, content in canonical.items():
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_bytes(content)
+    before = {path: _identity(path) for path in canonical}
+    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+    manager = _CanaryManager()
+
+    runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert {path: _identity(path) for path in canonical} == before
+
+
+@pytest.mark.parametrize("failed_operation", ("stop", "reset-failed", "filesystem"))
+def test_canary_cleanup_failure_invalidates_the_diagnosis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_operation: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+    manager = _CanaryManager(
+        fail=failed_operation if failed_operation != "filesystem" else None
+    )
+    if failed_operation == "filesystem":
+        real_rmtree = runtime_lifecycle.shutil.rmtree
+
+        def fail_rmtree(path: Path) -> None:
+            if Path(path).name.startswith("run-"):
+                raise OSError("sensitive-cleanup-path")
+            real_rmtree(path)
+
+        monkeypatch.setattr(runtime_lifecycle.shutil, "rmtree", fail_rmtree)
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result == {
+        "status": "runtime_canary_cleanup_failed",
+        "error_code": "runtime_canary_cleanup_unverified",
+        "generation": _CANARY_GENERATION,
+        "manifest_digest": _CANARY_DIGEST,
+        "raw_output": "not_returned",
+    }
+    assert _CANARY_STAGE_CODES[0] not in json.dumps(result)
+
+
+def test_canary_rejects_a_foreign_unit_without_touching_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _patch_canary_source(monkeypatch, tmp_path, _CANARY_STAGE_CODES[0])
+    manager = _CanaryManager(foreign=True)
+
+    result = runtime_lifecycle.canary(
+        home=home, systemctl=manager.systemctl, systemd_run=manager.run
+    )
+
+    assert result["status"] == "runtime_canary_failed"
+    assert result["error_code"] == "runtime_canary_unit_collision"
+    assert manager.run_calls == []
+    assert all(call[0] == "show" for call in manager.systemctl_calls)
+
+
+def test_systemd_run_default_excludes_caller_environment_and_raw_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    monkeypatch.setenv("CANARY_CALLER_SECRET", "must-not-cross")
+
+    def run(command, **kwargs):
+        observed["command"] = command
+        observed["env"] = kwargs["env"]
+        observed["timeout"] = kwargs["timeout"]
+        return SimpleNamespace(returncode=1, stdout="raw-secret", stderr="raw-secret")
+
+    monkeypatch.setattr(runtime_lifecycle.subprocess, "run", run)
+    with pytest.raises(
+        runtime_lifecycle.RuntimeLifecycleError,
+        match="runtime_canary_manager_failed",
+    ):
+        runtime_lifecycle._systemd_run_default(("--unit=safe.service", "/bin/false"))
+
+    assert observed["env"] == {
+        "LANG": "C",
+        "PATH": "/usr/bin:/bin",
+        "XDG_RUNTIME_DIR": f"/run/user/{os.geteuid()}",
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.geteuid()}/bus",
+    }
+    assert observed["command"][0] == "/usr/bin/systemd-run"
+    assert observed["timeout"] == runtime_lifecycle._CANARY_MANAGER_START_SECONDS
+    assert "must-not-cross" not in json.dumps(observed)
 
 
 def _identity(path: Path) -> tuple[int, int, int, int, int, bytes]:
@@ -304,7 +1017,7 @@ def test_bind_cutover_inputs_rejects_unsafe_pricing_targets(
         runtime_lifecycle._bind_cutover_inputs(home)
 
 
-def test_public_runtime_lifecycle_surface_exposes_only_cutover_status_and_verify() -> (
+def test_public_runtime_lifecycle_surface_exposes_canary_cutover_status_and_verify() -> (
     None
 ):
     completed = subprocess.run(
@@ -312,6 +1025,7 @@ def test_public_runtime_lifecycle_surface_exposes_only_cutover_status_and_verify
     )
 
     assert completed.returncode == 0
+    assert "canary" in completed.stdout
     assert "cutover" in completed.stdout
     assert "status" in completed.stdout
     assert "verify" in completed.stdout

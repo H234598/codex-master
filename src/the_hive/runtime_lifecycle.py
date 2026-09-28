@@ -1,7 +1,8 @@
-"""D298's fail-closed lifecycle transaction for the hourly-probe runtime.
+"""Fail-closed lifecycle transactions for the hourly-probe runtime.
 
-The module deliberately has one mutator (``cutover``).  ``status`` and
-``verify`` only inspect bounded local data and systemd's user-manager state.
+``cutover`` owns the canonical runtime.  ``canary`` owns only one isolated,
+disposable transient unit and private image.  ``status`` and ``verify`` only
+inspect bounded local data and systemd's user-manager state.
 """
 
 from __future__ import annotations
@@ -16,11 +17,13 @@ import json
 import os
 from pathlib import Path
 import posixpath
+import secrets
 import stat
 import subprocess
 import runpy
 import shutil
 import tempfile
+import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
@@ -61,6 +64,28 @@ _OBSERVATION_NAME = "runtime-lifecycle-probe-observation.json"
 _MAX_OBSERVATION_BYTES = 4096
 _PROBE_OBSERVATION_SECONDS = 120.0
 _PROBE_OUTPUT_BYTES = 16 * 1024
+_CANARY_UNIT_PREFIX = "the-hive-runtime-canary-"
+_CANARY_RUNTIME_ROOT_NAME = "the-hive-runtime-canary"
+_CANARY_LOCK_NAME = ".canary.lock"
+_CANARY_RUN_PREFIX = "run-"
+_CANARY_MANAGER_START_SECONDS = 15.0
+_CANARY_RESULT_SECONDS = 112.0
+_CANARY_CLEANUP_SECONDS = 5.0
+_CANARY_HEALTH_BYTES = 64 * 1024
+_CANARY_STAGE_CODES = frozenset(
+    {
+        "command_runtime_directory_unavailable",
+        "command_spawn_helper_unavailable",
+        "command_cgroup_preflight_unavailable",
+        "command_manager_preflight_unavailable",
+        "command_native_spawn_unavailable",
+        "command_cgroup_bind_unavailable",
+    }
+)
+_CANARY_SHOW_PROPERTIES = (
+    "--property=LoadState,ActiveState,Description,Transient,Result,"
+    "ExecMainStatus"
+)
 _ROLLBACK_PHASE_FILE_RESTORE = "file_restore"
 _ROLLBACK_PHASE_GENERATION_DISCARD = "generation_discard"
 _ROLLBACK_PHASE_DAEMON_RELOAD = "restore_daemon_reload"
@@ -121,6 +146,7 @@ _PRODUCER_CONSUMER_CONTRACT = {
 }
 
 Systemctl = Callable[[tuple[str, ...]], Mapping[str, str]]
+SystemdRun = Callable[[tuple[str, ...]], Mapping[str, str]]
 
 
 class RuntimeLifecycleError(ValueError):
@@ -2018,6 +2044,47 @@ class _InstallerEntry:
     digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class _CanaryImage:
+    """One unpublished-authority image and its private diagnostic state."""
+
+    invocation_root: Path
+    release_root: Path
+    state_root: Path
+    generation: str
+    manifest_digest: str
+    service: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _CanaryUnitBinding:
+    """The exact transient unit identity and transformed hourly contract."""
+
+    name: str
+    description: str
+    home: Path
+    properties: tuple[str, ...]
+    command: tuple[str, ...]
+
+    @property
+    def run_arguments(self) -> tuple[str, ...]:
+        return (
+            f"--unit={self.name}",
+            f"--description={self.description}",
+            "--no-block",
+            "--no-ask-password",
+            "--expand-environment=no",
+            "--service-type=oneshot",
+            f"--working-directory={self.home}",
+            f"--setenv=HOME={self.home}",
+            "--setenv=LANG=C",
+            "--setenv=PATH=/usr/bin:/bin",
+            *(f"--property={value}" for value in self.properties),
+            "--",
+            *self.command,
+        )
+
+
 def _home_paths(home: Path) -> tuple[Path, Path, Path, Path]:
     if not isinstance(home, Path) or not home.is_absolute():
         raise _error("runtime_lifecycle_home_invalid")
@@ -2268,6 +2335,256 @@ def _bound_installer_entry(repository: Path):
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _prepare_canary_image(
+    *, repository: Path, invocation_root: Path, source_commit: str
+) -> _CanaryImage:
+    """Build and publish one complete image only below the disposable root."""
+
+    if (
+        not isinstance(repository, Path)
+        or not repository.is_absolute()
+        or not isinstance(invocation_root, Path)
+        or not invocation_root.is_absolute()
+        or len(source_commit) != 40
+        or any(character not in "0123456789abcdef" for character in source_commit)
+    ):
+        raise _error("runtime_canary_image_invalid")
+    _private_directory(invocation_root)
+    try:
+        with _bound_installer_entry(repository) as entry:
+            installer = runpy.run_path(f"/proc/self/fd/{entry.descriptor}")
+            build = installer.get("_build_runtime_image")
+            publish = installer.get("_publish_runtime_generation")
+            if not callable(build) or not callable(publish):
+                raise _error("runtime_canary_image_invalid")
+            stage = Path(
+                tempfile.mkdtemp(prefix=".stage-", dir=os.fspath(invocation_root))
+            )
+            local_root = invocation_root / ".local"
+            library_root = local_root / "lib"
+            state_parent = local_root / "state"
+            state_root = state_parent / "codex-master-mcp"
+            for directory in (local_root, library_root, state_parent, state_root):
+                directory.mkdir(mode=0o700)
+            release_root = library_root / "the-hive-runtime"
+            _private_directory(stage)
+            for directory in (local_root, library_root, state_parent):
+                _private_directory(directory)
+            _private_directory(state_root)
+            build(
+                repository=repository,
+                stage=stage,
+                generation=source_commit,
+                commit=source_commit,
+            )
+            layout = publish(stage=stage, release_root=release_root)
+            manifest_digest = getattr(layout, "manifest_digest", None)
+            layout_root = getattr(layout, "root", None)
+            if (
+                not isinstance(manifest_digest, str)
+                or len(manifest_digest) != 71
+                or not manifest_digest.startswith("sha256:")
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in manifest_digest.removeprefix("sha256:")
+                )
+                or layout_root
+                != release_root / "generations" / source_commit
+            ):
+                raise _error("runtime_canary_image_invalid")
+            service, _timer = _attested_hourly_unit_bytes(
+                release_root=release_root,
+                generation=source_commit,
+                manifest_digest=manifest_digest,
+            )
+    except RuntimeLifecycleError:
+        raise
+    except Exception as exc:
+        raise _error("runtime_canary_image_invalid") from exc
+    return _CanaryImage(
+        invocation_root=invocation_root,
+        release_root=release_root,
+        state_root=state_root,
+        generation=source_commit,
+        manifest_digest=manifest_digest,
+        service=service,
+    )
+
+
+def _unit_directives(raw: bytes) -> Mapping[str, tuple[str, ...]]:
+    """Parse only the tiny, exact unit grammar needed for Canary derivation."""
+
+    if not raw or len(raw) > _MAX_UNIT_BYTES or b"\x00" in raw:
+        raise _error("runtime_canary_sandbox_invalid")
+    try:
+        lines = raw.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise _error("runtime_canary_sandbox_invalid") from exc
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            if current not in {"Unit", "Service"} or current in sections:
+                raise _error("runtime_canary_sandbox_invalid")
+            sections[current] = []
+            continue
+        key, separator, _value = line.partition("=")
+        if (
+            current is None
+            or not separator
+            or not key
+            or line != line.strip()
+            or len(line) > 4096
+        ):
+            raise _error("runtime_canary_sandbox_invalid")
+        sections[current].append(line)
+    if set(sections) != {"Unit", "Service"}:
+        raise _error("runtime_canary_sandbox_invalid")
+    return {name: tuple(values) for name, values in sections.items()}
+
+
+def _canary_path_text(path: Path) -> str:
+    value = os.fspath(path) if isinstance(path, Path) else ""
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or not value
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-"
+            for character in value
+        )
+    ):
+        raise _error("runtime_canary_sandbox_invalid")
+    return value
+
+
+def _canary_unit_binding(
+    *, image: _CanaryImage, home: Path, nonce: str
+) -> _CanaryUnitBinding:
+    """Transform only the typed paths in the exact attested hourly sandbox."""
+
+    if (
+        not isinstance(image, _CanaryImage)
+        or not isinstance(nonce, str)
+        or len(nonce) != 32
+        or any(character not in "0123456789abcdef" for character in nonce)
+    ):
+        raise _error("runtime_canary_sandbox_invalid")
+    invocation = _canary_path_text(image.invocation_root)
+    release = _canary_path_text(image.release_root)
+    state = _canary_path_text(image.state_root)
+    home_text = _canary_path_text(home)
+    try:
+        image.release_root.relative_to(image.invocation_root)
+        image.state_root.relative_to(image.invocation_root)
+    except ValueError as exc:
+        raise _error("runtime_canary_sandbox_invalid") from exc
+    if (
+        image.release_root == image.state_root
+        or release == invocation
+        or state == invocation
+        or len(image.generation) != 40
+        or any(character not in "0123456789abcdef" for character in image.generation)
+        or len(image.manifest_digest) != 71
+        or not image.manifest_digest.startswith("sha256:")
+        or any(
+            character not in "0123456789abcdef"
+            for character in image.manifest_digest.removeprefix("sha256:")
+        )
+    ):
+        raise _error("runtime_canary_sandbox_invalid")
+    directives = _unit_directives(image.service)
+    expected_exec = (
+        "ExecStart=%h/.local/lib/the-hive-runtime/generations/"
+        f"{image.generation}/bin/the-hive-hive-hourly-probe "
+        "%h/.local/lib/the-hive-runtime "
+        f"{image.generation} {image.manifest_digest} "
+        f"{_HOURLY_PROBE_PROTECTED_HOME_RUNTIME_ARGUMENT} --json"
+    )
+    if directives.get("Unit") != (
+        "Description=The Hive Hive hourly self-test",
+        "Documentation=man:systemd.service(5)",
+    ):
+        raise _error("runtime_canary_sandbox_invalid")
+    unit_stem = _CANARY_UNIT_PREFIX + nonce
+    canonical_release = Path(home_text) / ".local" / "lib" / "the-hive-runtime"
+    canonical_state = Path(home_text) / ".local" / "state" / "codex-master-mcp"
+    canonical_release_text = _canary_path_text(canonical_release)
+    canonical_state_text = _canary_path_text(canonical_state)
+    replacements = {
+        _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY: f"RuntimeDirectory={unit_stem}",
+        _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY_MODE: (
+            _HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY_MODE
+        ),
+        _HOURLY_PROBE_RUNTIME_ROOT_BINDING: (
+            f"BindReadOnlyPaths={release}:{canonical_release_text}:norbind"
+        ),
+        _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING: (
+            f"BindReadOnlyPaths=%t/bus:%t/{unit_stem}/bus:norbind"
+        ),
+        _HOURLY_PROBE_STATE_BINDING: (
+            f"BindPaths={state}:{canonical_state_text}:norbind"
+        ),
+        _HOURLY_PROBE_STATE_WRITE_PATH: f"ReadWritePaths={canonical_state_text}",
+    }
+    special_keys = {
+        "RuntimeDirectory",
+        "RuntimeDirectoryMode",
+        "BindReadOnlyPaths",
+        "BindPaths",
+        "ReadWritePaths",
+    }
+    properties: list[str] = ["Documentation=man:systemd.service(5)"]
+    seen: set[str] = set()
+    type_seen = False
+    exec_seen = False
+    for directive in directives["Service"]:
+        key = directive.partition("=")[0]
+        if key == "Type":
+            if type_seen or directive != "Type=oneshot":
+                raise _error("runtime_canary_sandbox_invalid")
+            type_seen = True
+        elif key == "ExecStart":
+            if exec_seen or directive != expected_exec:
+                raise _error("runtime_canary_sandbox_invalid")
+            exec_seen = True
+        elif key in special_keys:
+            replacement = replacements.get(directive)
+            if replacement is None or directive in seen:
+                raise _error("runtime_canary_sandbox_invalid")
+            seen.add(directive)
+            properties.append(replacement)
+        else:
+            properties.append(directive)
+    if not type_seen or not exec_seen or seen != set(replacements):
+        raise _error("runtime_canary_sandbox_invalid")
+    properties.extend(("RemainAfterExit=yes", "StandardOutput=null", "StandardError=null"))
+    return _CanaryUnitBinding(
+        name=f"{unit_stem}.service",
+        description=f"The Hive runtime canary {nonce}",
+        home=home,
+        properties=tuple(properties),
+        command=(
+            os.fspath(
+                canonical_release
+                / "generations"
+                / image.generation
+                / "bin"
+                / "the-hive-hive-hourly-probe"
+            ),
+            canonical_release_text,
+            image.generation,
+            image.manifest_digest,
+            _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_ARGUMENT,
+            "--json",
+        ),
+    )
 
 
 def _bind_cutover_inputs(home: Path) -> _BoundCutover:
@@ -2859,6 +3176,38 @@ def _unit_bytes(units: Path, name: str) -> bytes | None:
     return _regular_bytes(units / name, maximum=_MAX_UNIT_BYTES, mode=0o644)
 
 
+def _systemd_run_default(arguments: tuple[str, ...]) -> Mapping[str, str]:
+    """Create one transient user unit without inheriting the caller environment."""
+
+    runtime_directory = f"/run/user/{os.geteuid()}"
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/systemd-run",
+                "--user",
+                "--no-pager",
+                "--quiet",
+                *arguments,
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_CANARY_MANAGER_START_SECONDS,
+            env={
+                "LANG": "C",
+                "PATH": "/usr/bin:/bin",
+                "XDG_RUNTIME_DIR": runtime_directory,
+                "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_directory}/bus",
+            },
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _error("runtime_canary_manager_unavailable") from exc
+    if completed.returncode != 0:
+        raise _error("runtime_canary_manager_failed")
+    return {}
+
+
 def _systemctl_default(arguments: tuple[str, ...]) -> Mapping[str, str]:
     """Use the same UID's user manager with a bounded, data-sparse protocol."""
 
@@ -2925,6 +3274,229 @@ def _state_is_enabled(state: Mapping[str, str]) -> bool:
 
 def _state_is_active(state: Mapping[str, str]) -> bool:
     return state.get("ActiveState") == "active"
+
+
+def _canary_show(systemctl: Systemctl, unit: str) -> Mapping[str, str]:
+    try:
+        result = systemctl(("show", unit, _CANARY_SHOW_PROPERTIES))
+    except RuntimeLifecycleError:
+        raise
+    except Exception as exc:
+        raise _error("runtime_canary_manager_unavailable") from exc
+    required = {
+        "LoadState",
+        "ActiveState",
+        "Description",
+        "Transient",
+        "Result",
+        "ExecMainStatus",
+    }
+    if (
+        not isinstance(result, Mapping)
+        or set(result) != required
+        or any(
+            not isinstance(key, str)
+            or not isinstance(value, str)
+            or len(value) > 256
+            for key, value in result.items()
+        )
+    ):
+        raise _error("runtime_canary_manager_invalid")
+    return dict(result)
+
+
+def _canary_unit_owned(
+    state: Mapping[str, str], binding: _CanaryUnitBinding
+) -> bool:
+    return (
+        state.get("LoadState") == "loaded"
+        and state.get("Transient") == "yes"
+        and state.get("Description") == binding.description
+    )
+
+
+def _start_canary_unit(
+    systemd_run: SystemdRun, binding: _CanaryUnitBinding
+) -> None:
+    try:
+        result = systemd_run(binding.run_arguments)
+    except RuntimeLifecycleError:
+        raise
+    except Exception as exc:
+        raise _error("runtime_canary_manager_unavailable") from exc
+    if not isinstance(result, Mapping) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in result.items()
+    ):
+        raise _error("runtime_canary_manager_invalid")
+
+
+def _wait_for_canary_result(
+    systemctl: Systemctl, binding: _CanaryUnitBinding
+) -> Mapping[str, str]:
+    deadline = time.monotonic() + _CANARY_RESULT_SECONDS
+    while True:
+        state = _canary_show(systemctl, binding.name)
+        if not _canary_unit_owned(state, binding):
+            raise _error("runtime_canary_unit_identity_invalid")
+        active = state.get("ActiveState")
+        if active in {"active", "failed"}:
+            return state
+        if active not in {"inactive", "activating", "deactivating", "reloading"}:
+            raise _error("runtime_canary_manager_invalid")
+        if time.monotonic() >= deadline:
+            raise _error("runtime_canary_timeout")
+        time.sleep(0.1)
+
+
+def _cleanup_canary_unit(
+    systemctl: Systemctl,
+    binding: _CanaryUnitBinding,
+    *,
+    ownership_attested: bool,
+) -> bool:
+    """Quiesce only the exact transient unit; continue after each failure."""
+
+    clean = True
+    try:
+        state = _canary_show(systemctl, binding.name)
+    except RuntimeLifecycleError:
+        state = {}
+        clean = False
+    if state.get("LoadState") == "not-found":
+        return clean
+    if not ownership_attested and not _canary_unit_owned(state, binding):
+        return False
+    if state and not _canary_unit_owned(state, binding):
+        return False
+    try:
+        _systemctl_mutate(systemctl, ("stop", binding.name))
+    except RuntimeLifecycleError:
+        clean = False
+    try:
+        after_stop = _canary_show(systemctl, binding.name)
+    except RuntimeLifecycleError:
+        after_stop = {}
+        clean = False
+    if after_stop.get("LoadState") == "not-found":
+        return clean
+    if after_stop and not _canary_unit_owned(after_stop, binding):
+        return False
+    try:
+        _systemctl_mutate(systemctl, ("reset-failed", binding.name))
+    except RuntimeLifecycleError:
+        clean = False
+    if not clean:
+        try:
+            _canary_show(systemctl, binding.name)
+        except RuntimeLifecycleError:
+            pass
+        return False
+    deadline = time.monotonic() + _CANARY_CLEANUP_SECONDS
+    while True:
+        try:
+            final = _canary_show(systemctl, binding.name)
+        except RuntimeLifecycleError:
+            return False
+        if final.get("LoadState") == "not-found":
+            return clean
+        if not _canary_unit_owned(final, binding):
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _canary_diagnostic_value(value: object, *, command_ready: bool) -> str:
+    if not isinstance(value, Mapping):
+        raise _error("runtime_canary_evidence_invalid")
+    code = value.get("code")
+    expected = {
+        "code": "ok" if command_ready else code,
+        "exit_code": 0 if command_ready else None,
+        "stderr": {
+            "state": "empty" if command_ready else "not_returned",
+            "excerpt": "",
+            "redaction_applied": False,
+        },
+    }
+    if value != expected or (
+        command_ready and code != "ok"
+    ) or (not command_ready and code not in _CANARY_STAGE_CODES):
+        raise _error("runtime_canary_evidence_invalid")
+    return code
+
+
+def _canary_evidence_result(
+    *, image: _CanaryImage, manager_state: Mapping[str, str]
+) -> tuple[str, str | None]:
+    """Return only one fixed diagnosis from the private Canary state."""
+
+    try:
+        raw = _regular_bytes(
+            image.state_root / "hive-hourly-health.json",
+            maximum=_CANARY_HEALTH_BYTES,
+            mode=0o600,
+        )
+    except RuntimeLifecycleError as exc:
+        raise _error("runtime_canary_evidence_invalid") from exc
+    if raw is None:
+        raise _error("runtime_canary_evidence_invalid")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise _error("runtime_canary_evidence_invalid") from exc
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "schema_version",
+        "checked_at",
+        "checks",
+        "commands",
+        "diagnostics",
+        "alarm",
+        "global_pilot_readiness",
+    }:
+        raise _error("runtime_canary_evidence_invalid")
+    checks = payload.get("checks")
+    commands = payload.get("commands")
+    diagnostics = payload.get("diagnostics")
+    keys = {"runtime_status", "hive_status", "hive_doctor"}
+    if (
+        payload.get("schema_version") != 3
+        or not isinstance(payload.get("checked_at"), str)
+        or not isinstance(checks, Mapping)
+        or set(checks) != {"runtime_layout", "hive_runtime", "hive_doctor"}
+        or any(type(value) is not bool for value in checks.values())
+        or not isinstance(commands, Mapping)
+        or set(commands) != keys
+        or any(type(value) is not bool for value in commands.values())
+        or not isinstance(diagnostics, Mapping)
+        or set(diagnostics) != keys
+    ):
+        raise _error("runtime_canary_evidence_invalid")
+    codes = {
+        _canary_diagnostic_value(
+            diagnostics[name], command_ready=commands[name] is True
+        )
+        for name in keys
+    }
+    if (
+        all(checks.values())
+        and all(commands.values())
+        and codes == {"ok"}
+        and manager_state.get("ActiveState") == "active"
+        and manager_state.get("Result") == "success"
+        and manager_state.get("ExecMainStatus") == "0"
+    ):
+        return "runtime_canary_green", None
+    stage_codes = codes & _CANARY_STAGE_CODES
+    if (
+        len(stage_codes) == 1
+        and manager_state.get("ActiveState") == "failed"
+        and manager_state.get("Result") == "exit-code"
+        and manager_state.get("ExecMainStatus") == "1"
+    ):
+        return "runtime_canary_red", next(iter(stage_codes))
+    raise _error("runtime_canary_evidence_invalid")
 
 
 def _valid_bound_unit_state(state: Mapping[str, str]) -> bool:
@@ -3492,6 +4064,264 @@ def status(
     return verify(home=home, systemctl=systemctl)
 
 
+def _validate_canary_home(home: Path) -> None:
+    if not isinstance(home, Path) or not home.is_absolute():
+        raise _error("runtime_canary_home_invalid")
+    try:
+        item = home.lstat()
+    except OSError as exc:
+        raise _error("runtime_canary_home_invalid") from exc
+    if (
+        stat.S_ISLNK(item.st_mode)
+        or not stat.S_ISDIR(item.st_mode)
+        or item.st_uid != os.geteuid()
+        or stat.S_IMODE(item.st_mode) & 0o022
+    ):
+        raise _error("runtime_canary_home_invalid")
+    _canary_path_text(home)
+
+
+def _canary_runtime_root() -> Path:
+    return Path(f"/run/user/{os.geteuid()}") / _CANARY_RUNTIME_ROOT_NAME
+
+
+@contextmanager
+def _canary_lock(root: Path):
+    descriptor = -1
+    try:
+        if not isinstance(root, Path) or not root.is_absolute():
+            raise _error("runtime_canary_root_invalid")
+        _private_directory(root.parent)
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except FileNotFoundError:
+            raise _error("runtime_canary_root_invalid")
+        _private_directory(root)
+        descriptor = os.open(
+            root / _CANARY_LOCK_NAME,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        item = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(item.st_mode)
+            or item.st_nlink != 1
+            or item.st_uid != os.geteuid()
+            or stat.S_IMODE(item.st_mode) != 0o600
+        ):
+            raise _error("runtime_canary_root_invalid")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise _error("runtime_canary_busy") from exc
+        yield
+    except RuntimeLifecycleError:
+        raise
+    except OSError as exc:
+        raise _error("runtime_canary_root_invalid") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def _remove_canary_invocation(*, root: Path, invocation: Path) -> bool:
+    if (
+        not isinstance(root, Path)
+        or not isinstance(invocation, Path)
+        or invocation.parent != root
+        or not invocation.name.startswith(_CANARY_RUN_PREFIX)
+    ):
+        return False
+    try:
+        item = invocation.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if (
+        stat.S_ISLNK(item.st_mode)
+        or not stat.S_ISDIR(item.st_mode)
+        or item.st_uid != os.geteuid()
+        or stat.S_IMODE(item.st_mode) != 0o700
+    ):
+        return False
+    try:
+        shutil.rmtree(invocation)
+        invocation.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _canary_result(
+    *,
+    status_code: str,
+    error_code: str | None,
+    generation: str | None,
+    manifest_digest: str | None,
+) -> dict[str, object]:
+    return {
+        "status": status_code,
+        "error_code": error_code,
+        "generation": generation,
+        "manifest_digest": manifest_digest,
+        "raw_output": "not_returned",
+    }
+
+
+def _canary_public_failure(code: str) -> str:
+    mapping = {
+        "runtime_lifecycle_source_dirty": "runtime_canary_source_dirty",
+        "runtime_lifecycle_source_invalid": "runtime_canary_source_invalid",
+        "runtime_lifecycle_source_entry_invalid": "runtime_canary_source_invalid",
+        "runtime_lifecycle_source_entry_changed": "runtime_canary_source_changed",
+    }
+    mapped = mapping.get(code, code)
+    allowed = {
+        "runtime_canary_busy",
+        "runtime_canary_evidence_invalid",
+        "runtime_canary_home_invalid",
+        "runtime_canary_image_invalid",
+        "runtime_canary_manager_failed",
+        "runtime_canary_manager_invalid",
+        "runtime_canary_manager_unavailable",
+        "runtime_canary_root_invalid",
+        "runtime_canary_sandbox_invalid",
+        "runtime_canary_source_changed",
+        "runtime_canary_source_dirty",
+        "runtime_canary_source_invalid",
+        "runtime_canary_timeout",
+        "runtime_canary_unit_collision",
+        "runtime_canary_unit_identity_invalid",
+    }
+    return mapped if mapped in allowed else "runtime_canary_failed"
+
+
+def canary(
+    *,
+    home: Path,
+    systemctl: Systemctl = _systemctl_default,
+    systemd_run: SystemdRun = _systemd_run_default,
+) -> dict[str, object]:
+    """Run one isolated transient diagnostic and prove complete quiescence."""
+
+    generation: str | None = None
+    manifest_digest: str | None = None
+    result = _canary_result(
+        status_code="runtime_canary_failed",
+        error_code="runtime_canary_failed",
+        generation=None,
+        manifest_digest=None,
+    )
+    invocation = Path()
+    binding: _CanaryUnitBinding | None = None
+    launch_attempted = False
+    ownership_attested = False
+    root = _canary_runtime_root()
+    try:
+        _validate_canary_home(home)
+        repository = Path(__file__).resolve().parents[2]
+        source_commit, source_tree_digest = _source_tree_binding(repository)
+        with _canary_lock(root):
+            try:
+                if _source_tree_binding(repository) != (
+                    source_commit,
+                    source_tree_digest,
+                ):
+                    raise _error("runtime_canary_source_changed")
+                invocation = Path(
+                    tempfile.mkdtemp(prefix=_CANARY_RUN_PREFIX, dir=os.fspath(root))
+                )
+                _private_directory(invocation)
+                image = _prepare_canary_image(
+                    repository=repository,
+                    invocation_root=invocation,
+                    source_commit=source_commit,
+                )
+                generation = image.generation
+                manifest_digest = image.manifest_digest
+                if _source_tree_binding(repository) != (
+                    source_commit,
+                    source_tree_digest,
+                ):
+                    raise _error("runtime_canary_source_changed")
+                binding = _canary_unit_binding(
+                    image=image,
+                    home=home,
+                    nonce=secrets.token_hex(16),
+                )
+                before = _canary_show(systemctl, binding.name)
+                if before.get("LoadState") != "not-found":
+                    raise _error("runtime_canary_unit_collision")
+                launch_attempted = True
+                _start_canary_unit(systemd_run, binding)
+                manager_state = _wait_for_canary_result(systemctl, binding)
+                ownership_attested = True
+                if _source_tree_binding(repository) != (
+                    source_commit,
+                    source_tree_digest,
+                ):
+                    raise _error("runtime_canary_source_changed")
+                status_code, error_code = _canary_evidence_result(
+                    image=image, manager_state=manager_state
+                )
+                result = _canary_result(
+                    status_code=status_code,
+                    error_code=error_code,
+                    generation=generation,
+                    manifest_digest=manifest_digest,
+                )
+            finally:
+                cleanup_ok = True
+                if launch_attempted and binding is not None:
+                    cleanup_ok = _cleanup_canary_unit(
+                        systemctl,
+                        binding,
+                        ownership_attested=ownership_attested,
+                    )
+                if invocation != Path():
+                    cleanup_ok = (
+                        _remove_canary_invocation(root=root, invocation=invocation)
+                        and cleanup_ok
+                    )
+                if not cleanup_ok:
+                    raise _error("runtime_canary_cleanup_unverified")
+    except RuntimeLifecycleError as exc:
+        code = str(exc)
+        result = _canary_result(
+            status_code=(
+                "runtime_canary_cleanup_failed"
+                if code == "runtime_canary_cleanup_unverified"
+                else "runtime_canary_failed"
+            ),
+            error_code=(
+                code
+                if code == "runtime_canary_cleanup_unverified"
+                else _canary_public_failure(code)
+            ),
+            generation=generation,
+            manifest_digest=manifest_digest,
+        )
+    except Exception:
+        result = _canary_result(
+            status_code="runtime_canary_failed",
+            error_code="runtime_canary_failed",
+            generation=generation,
+            manifest_digest=manifest_digest,
+        )
+    return result
+
+
 @contextmanager
 def _lifecycle_lock(home: Path):
     lock = home / ".local" / "state" / "codex-master-mcp" / "hive" / _LOCK_NAME
@@ -3639,16 +4469,24 @@ def cutover(
 def main() -> int:
     parser = argparse.ArgumentParser(prog="the-hive-runtime-service")
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("cutover", "status", "verify"):
+    for command in ("canary", "cutover", "status", "verify"):
         child = commands.add_parser(command)
         child.add_argument("--home", type=Path, required=True)
     arguments = parser.parse_args()
-    operation = {"cutover": cutover, "status": status, "verify": verify}[
-        arguments.command
-    ]
+    operation = {
+        "canary": canary,
+        "cutover": cutover,
+        "status": status,
+        "verify": verify,
+    }[arguments.command]
     result = operation(home=arguments.home)
     print(json.dumps(result, sort_keys=True))
-    return 0 if result.get("status") == "runtime_lifecycle_green" else 1
+    return (
+        0
+        if result.get("status")
+        in {"runtime_canary_green", "runtime_lifecycle_green"}
+        else 1
+    )
 
 
-__all__ = ["cutover", "main", "status", "verify"]
+__all__ = ["canary", "cutover", "main", "status", "verify"]

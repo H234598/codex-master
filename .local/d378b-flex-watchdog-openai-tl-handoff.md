@@ -1,186 +1,170 @@
-# D378-B – canonical pricing runtime materialization handoff
+# D378-B – isolated runtime Canary handoff
 
-Status: `REVIEW_READY`
+Status: `WORKER_COMPLETE_AWAITING_TL_REVIEW`
 Date: 2026-09-28 (Europe/Berlin)
 Branch: `d378b-flex-watchdog`
+Reviewed parent / starting HEAD: `ea83d5903cab77c118de005f23e29ac8fa2804c4`
 
-## Review scope
+## Scope
 
-This handoff covers the unreviewed source range beginning at the reviewed Flex
-watchdog parent `8c620cd96a76d20d9d8d9b23fc62feae02853d11`, including the
-follow-up that closes the two independent runtime-authority review findings.
+This change adds the missing public, bounded diagnostic route:
 
-The range contains the earlier unreviewed package-entrypoint commit
-`4c64686298b43ed94e2f4f609b77bbf490a99c64`. Its console-script declaration
-and isolated-wheel test are deliberately removed by this follow-up change: the
-console script would own the canonical name but cannot materialize the required
-user units or attest a generation. The commit remains in ancestry; no history
-was rewritten and no foreign work was discarded.
-
-## Product result awaiting review
-
-The existing single-owner attested runtime lifecycle now includes these
-manifested artifacts in every generation:
-
-- `bin/the-hive-openai-pricing-inventory` (generation entrypoint, `0755`)
-- `bin/the-hive-openai-pricing-inventory-stable` (stable launcher source, `0755`)
-- `systemd/user/the-hive-openai-pricing.service` and
-  `systemd/user/the-hive-openai-pricing.timer` (`0644`)
-- `src/the_hive/pricing_inventory.py`
-
-The installer writes only manifest-attested bytes to the canonical
-`~/.local/bin/the-hive-openai-pricing-inventory` launcher and the two
-`~/.config/systemd/user/the-hive-openai-pricing.*` units.
-
-The public launcher uses existing release-pointer/manifest ownership checks,
-validates its own digest and bytes plus the generation entrypoint through
-no-follow descriptors, then executes the pinned descriptor. It acquires the
-existing `.the-hive-release-publish.lock` with `LOCK_SH`; the publisher uses
-the compatible `LOCK_EX`. The descriptor remains inherited across the pinned
-`execve` until the generation entrypoint has completed
-`RuntimeLayout.from_current_release(...)`, which attests both `current` and
-`previous` plus the complete required image. The entrypoint verifies that the
-inherited descriptor is the canonical owned lock and only then releases it
-before invoking the inventory with `python3 -I`, not checkout-relative
-`PYTHONPATH`.
-
-The existing publish transaction snapshots the launcher and both units,
-publishes them before moving the release pointer, and restores all three on a
-failure. Existing owner, regular-file, link-count, mode, and no-follow
-conventions reject symlink, non-owned, and unsafe targets. Existing
-`current`/`previous` semantics remain intact.
-
-Staging accepts the pricing stable launcher, service, and timer only when each
-is byte-for-byte equal to its owned canonical source artifact. This is
-structurally fail-closed: repeated or overriding `ExecStart`,
-`ReadWritePaths`, `Unit`, or any other directives cannot be smuggled through
-a substring allowlist. The canonical service invokes only
-`%h/.local/bin/the-hive-openai-pricing-inventory`; its canonical state root
-and the timer target remain part of that exact contract.
-
-## Changed source files
-
-- `bin/the-hive-openai-pricing-inventory`
-- `bin/the-hive-openai-pricing-inventory-stable` (new)
-- `scripts/the-hive-hive-hourly-probe-install`
-- `src/the_hive/runtime_layout.py`
-- `src/the_hive/runtime_lifecycle.py` (canonical user-manager environment
-  follow-up)
-- `tests/test_hive_hourly_probe.py`
-- `tests/test_runtime_lifecycle_service.py`
-- `tests/test_runtime_layout.py`
-- `pyproject.toml` and `tests/test_pricing_inventory.py` (remove the
-  conflicting package console-script change)
-
-The pre-existing untracked prompt files
-`.local/d378b-flex-watchdog-openai-fix5.prompt.md` and
-`.local/d378b-flex-watchdog-openai-review-fix4.prompt.md` are not part of
-this change and must remain unstaged.
-
-## Focused evidence
-
-Passed:
-
+```text
+./scripts/the-hive-runtime-service canary --home <absolute-home>
 ```
-PYTHONPATH=src pytest -q tests/test_runtime_layout.py tests/test_pricing_inventory.py
-# 131 passed in 7.36s
 
-PYTHONPATH=src pytest -q -x \
-  tests/test_hive_hourly_probe.py::test_pricing_inventory_runtime_materialization_is_attested_and_upgrade_safe
-# 1 passed in 16.81s
+It does not change the canonical cutover, installed runtime, pointers, user
+units, timers, pricing inventory, health, or migration policy. It does not
+claim a root cause or a remediation for the live `command_group_unavailable`
+failure.
 
-PYTHONPATH=src pytest -q -x \
-  tests/test_hive_hourly_probe.py::test_pricing_runtime_rejects_noncanonical_launcher_and_unit_directives \
-  tests/test_hive_hourly_probe.py::test_pricing_stable_launcher_waits_for_the_runtime_publish_lock
-# 2 passed in 8.58s
+Tracked files in this handoff:
 
-PYTHONPATH=src pytest -q \
-  tests/test_hive_hourly_probe.py::test_pricing_stable_launcher_waits_for_the_runtime_publish_lock
-# 1 passed in 8.74s (after replacing the `/proc` observation with the
-# deterministic absent-pointer lock proof)
+- `src/the_hive/runtime_lifecycle.py`
+- `tests/test_runtime_lifecycle_service.py`
+- `.local/d378b-flex-watchdog-openai-tl-handoff.md`
 
-PYTHONPATH=src pytest -q \
-  tests/test_hive_hourly_probe.py::test_pricing_runtime_rolls_back_the_complete_pair_on_timer_failure
-# 1 passed in 15.57s
+The pre-existing untracked prompt files remain excluded and untouched:
 
-python3 -m py_compile scripts/the-hive-hive-hourly-probe-install
-# passed
+- `.local/d378b-flex-watchdog-openai-fix5.prompt.md`
+- `.local/d378b-flex-watchdog-openai-review-fix4.prompt.md`
 
-bash -n bin/the-hive-openai-pricing-inventory \
-  bin/the-hive-openai-pricing-inventory-stable
-# passed
+## Closed source gap
+
+Before this change, the public lifecycle exposed only `cutover`, `status`, and
+`verify`. The installer stage validator was not a Canary: it did not run the
+exact Hourly systemd sandbox and entered the canonical publisher transaction.
+Manual pointer, unit, launcher, or manager composition was forbidden.
+
+The new command is a separate diagnostic authority with no canonical runtime
+authority:
+
+1. It attests a completely clean tracked repository through the existing
+   commit/tree-closure binding. Any tracked change or untracked file fails
+   before the Canary root or manager is entered.
+2. It holds the existing installer entry by descriptor, reuses only the
+   existing complete Runtime Image builder and manifest publisher, and creates
+   a private disposable release at
+   `/run/user/<euid>/the-hive-runtime-canary/run-*/.local/lib/the-hive-runtime`.
+   The generation is the clean source commit; the digest is the generated
+   manifest digest.
+3. It does not call the installer's stage validator. Its required release
+   pointer and stable launcher remain below the disposable invocation root; it
+   creates no canonical live pointer, unit, launcher, or pin-store authority.
+4. It reads the manifest-attested Hourly service, preserves every static
+   service directive, and transforms only the typed RuntimeDirectory,
+   release/state bind sources, nested bus destination, and ExecStart binding.
+   Unknown or duplicate path/ExecStart directives fail closed.
+5. It starts exactly one random 128-bit-named transient user service via
+   `systemd-run --no-block`. The unit uses the canonical `107s` service bound;
+   lifecycle polling is bounded to `112s`, and manager entry is bounded to
+   `15s`.
+6. The disposable release and empty private state are bind sources. Their
+   sandbox destinations remain the canonical Hourly paths, so the executed
+   program sees the production layout without reading or changing the host's
+   canonical release, state, health, pricing, launcher, units, or timers.
+7. Caller environment is excluded from both manager adapters. The transient
+   unit receives explicit `HOME`, `LANG`, and `PATH` overrides; the existing
+   attested launcher retains its own CODEX/Python sanitization. Service
+   stdout/stderr are `null`; no raw child output is returned.
+8. Before start, the random unit name must be `not-found`. After start,
+   `Transient=yes` and the exact random Description attest ownership. A foreign
+   unit is never stopped or reset.
+9. `finally` performs bounded `stop`, conditional `reset-failed`, proves final
+   `LoadState=not-found`, and removes the complete invocation root. Any manager
+   or filesystem cleanup uncertainty replaces the diagnosis with
+   `runtime_canary_cleanup_unverified`.
+
+The coordination root and its private lock may persist under the UID runtime
+directory. No generation, state record, process, or transient unit is retained.
+
+## Public evidence contract
+
+Every result contains only:
+
+- `status`
+- `error_code`
+- `generation`
+- `manifest_digest`
+- `raw_output=not_returned`
+
+Accepted diagnostic outcomes are deliberately narrow:
+
+- `runtime_canary_green` with `error_code=null`; or
+- `runtime_canary_red` with exactly one of the six reviewed `ea83d590` codes:
+  - `command_runtime_directory_unavailable`
+  - `command_spawn_helper_unavailable`
+  - `command_cgroup_preflight_unavailable`
+  - `command_manager_preflight_unavailable`
+  - `command_native_spawn_unavailable`
+  - `command_cgroup_bind_unavailable`
+
+Missing, malformed, contradictory, unknown, or freely worded diagnostic data
+becomes `runtime_canary_evidence_invalid`. Exception text, paths, environment,
+stderr, stdout, and tokens are never returned.
+
+## Manager-free evidence
+
+No test in this task contacted the user manager. `systemctl` and `systemd-run`
+were fully mocked; the one real image test only built and attested a disposable
+filesystem image below pytest's temporary directory.
+
+Passed before final commit:
+
+```text
+python3 -m py_compile \
+  src/the_hive/runtime_lifecycle.py \
+  tests/test_runtime_lifecycle_service.py
+
+PYTHONPATH=src pytest -q tests/test_runtime_lifecycle_service.py \
+  -k 'canary or public_runtime_lifecycle_surface'
+# 25 passed, 281 deselected
+
+PYTHONPATH=src pytest -q tests/test_runtime_lifecycle_service.py
+# 306 passed in 9.59s
 
 git diff --check
-# passed
 ```
 
-## User-manager preflight follow-up
+The focused evidence covers:
 
-`runtime_lifecycle._systemctl_default` now invokes the bounded user-manager
-protocol with only `LANG=C`, `PATH=/usr/bin:/bin`, and canonical,
-effective-UID-derived `XDG_RUNTIME_DIR=/run/user/<euid>` plus
-`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<euid>/bus`. It does not inherit
-caller-supplied bus, runtime directory, or path values. This repairs the
-otherwise fail-closed preflight path under a sanitized environment without
-changing the existing nonzero-systemctl failure code.
+- clean commit/tree closure and rejection of an untracked source;
+- complete manifest generation, commit identity, and digest binding;
+- byte-structural Hourly sandbox parity and rejection of extra/changed bind or
+  ExecStart directives;
+- isolated release/state sources and unchanged canonical pointer, health,
+  pricing, and unit sentinels;
+- safe unique unit and RuntimeDirectory names;
+- explicit manager/service/poll bounds and exactly one start attempt;
+- all six `ea83d590` pre-exec stage codes;
+- green evidence and unknown evidence fail-closed;
+- cleanup after a start adapter error;
+- individual `stop`, `reset-failed`, and filesystem cleanup failures;
+- concurrent invocation rejection;
+- foreign-unit rejection without mutation; and
+- caller-environment exclusion and raw-output redaction.
 
-```
-PYTHONPATH=src pytest -q \
-  tests/test_runtime_lifecycle_service.py::test_systemctl_default_uses_only_the_canonical_uid_user_manager_environment \
-  tests/test_runtime_lifecycle_service.py::test_systemctl_default_keeps_a_nonzero_systemctl_result_fail_closed
-# 2 passed in 0.42s
+## Mutations deliberately not performed
 
-python3 -m py_compile src/the_hive/runtime_lifecycle.py \
-  tests/test_runtime_lifecycle_service.py
-# passed
-```
+- no fetch, push, merge, rebase, or integration;
+- no canonical cutover or installer invocation;
+- no real `systemctl`, `systemd-run`, daemon reload, unit start, or transient
+  unit;
+- no pointer, pin-store, launcher, unit, timer, pricing, or health mutation;
+- no live Canary execution; and
+- no deletion or staging of the two excluded prompt files.
 
-The tests mock `subprocess.run`; no live `systemctl` retry, user-runtime
-installation, daemon reload, unit action, or inventory execution occurred.
+## Gate separation and residual work
 
-The materialization node proves manifest inclusion, modes/content,
-neutral-working-directory launch despite hostile `PYTHONPATH` and Codex
-environment, pointer-digest rejection, upgrade materialization, and
-`current`/`previous` preservation. It now additionally proves that an invalid
-`previous` binding fails the public launcher. The new negative-contract node
-rejects a manipulated stable launcher and appended/overriding service
-`ExecStart`, service `ReadWritePaths`, service `[Unit]`, and timer `Unit`
-directives. The lock node holds the real publish lock with `LOCK_EX`, removes
-the release pointer, and proves that the launcher cannot complete while the
-exclusive lock remains held. Only after unlock does it reach the deliberately
-absent pointer and fail closed with exit status `64`; this does not depend on
-`/proc` observation. The existing unsafe replacement cases and rollback node
-were exercised during this follow-up; only the rollback command's complete
-result is reproduced above. The parameterized unsafe-replacement command
-returned incremental progress before the tool yielded; after it exited, its
-exit status was not independently recoverable, so its final aggregate result
-is unknown despite no corresponding pytest `lastfailed` entry.
+The diagnostic gate and remediation gate are separate.
 
-The existing installer stage validator did create temporary
-`systemd-run --user` child processes against test-only `/tmp/pytest-.../home`
-images. No `systemctl` command ran, no canonical real-home user unit was
-installed or activated, and no live inventory ran. Lasting transient-manager
-state was not independently queried, so it remains unknown.
+This source makes a future, explicitly authorized live Canary possible from a
+clean detached source. It does not prove which stage will fail live. The live
+root cause therefore remains unknown until that one bounded Canary is reviewed,
+integrated, and separately authorized to run.
 
-## Residual unknowns / blockers
-
-- This source range is ready for independent review. It is not self-reviewed;
-  no integration, push, installation, or activation is authorized by this
-  status.
-- The pre-existing
-  `test_internal_attested_runtime_api_materializes_one_complete_regular_runtime_image`
-  was observed failing during inspection with
-  `hive_hourly_probe_error code=legacy_probe_attestation_failed`. Its
-  baseline status and causality are unverified.
-- No fetch was performed during this materialization-only task. The supplied
-  earlier `origin/main` was
-  `5de430caa4a8b95d272d3dfb1223cd3b26a9954a`; current remote state is unknown.
-- No canonical real-home runtime was installed and no daemon reload, unit
-  enable/start, old-unit removal, or inventory run occurred. Live health,
-  catalog, unit state, redaction, and ordinary-restart Flex capability are
-  unverified.
-- The repaired user-manager environment has not been exercised against the
-  live user bus in this task; the live cutover preflight remains unverified.
-- The subscription-path 400 versus direct `openai-flex` 200 boundary was not
-  re-executed. No secret was persisted or placed in source, command arguments,
-  output, or this handoff.
+Even after a live stage code exists, no cutover retry is authorized by this
+handoff. A red regression, minimal remediation, focused tests, and independent
+TL review remain required before integration. The runtime migration-policy
+package is still outstanding and is not implied or modified by this diagnostic
+route.
