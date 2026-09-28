@@ -3588,7 +3588,7 @@ def _valid_bound_unit_state(state: Mapping[str, str]) -> bool:
     unit_file = state.get("UnitFileState")
     active = state.get("ActiveState")
     if load == "not-found":
-        return unit_file == "disabled" and active == "inactive"
+        return unit_file in {"", "disabled"} and active == "inactive"
     return (
         load == "loaded"
         and unit_file

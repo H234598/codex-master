@@ -1902,6 +1902,18 @@ def test_verify_rejects_units_not_exactly_derived_from_attested_runtime(
     assert calls == []
 
 
+def test_not_found_systemd_unit_accepts_empty_unit_file_state() -> None:
+    assert runtime_lifecycle._valid_bound_unit_state(
+        {
+            "LoadState": "not-found",
+            "UnitFileState": "",
+            "ActiveState": "inactive",
+            "Result": "success",
+            "ExecMainStatus": "0",
+        }
+    )
+
+
 def test_cutover_rejects_parallel_lifecycle_lock_before_systemd(tmp_path: Path) -> None:
     home = tmp_path / "home"
     (home / ".local" / "state" / "codex-master-mcp" / "hive").mkdir(
