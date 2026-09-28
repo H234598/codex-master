@@ -36,9 +36,10 @@ def _identity(path: Path) -> tuple[int, int, int, int, int, bytes]:
     "replacement",
     (
         (
+            b"BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind",
             b"BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind",
-            b"BindReadOnlyPaths=%t:%t:norbind",
         ),
+        (b"RuntimeDirectory=the-hive-hourly-runtime\n", b""),
         (b"--protected-home-runtime --json", b"--json"),
     ),
 )

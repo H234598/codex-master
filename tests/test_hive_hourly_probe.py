@@ -787,9 +787,16 @@ def test_hourly_probe_unit_remains_an_explicit_th_r3_boundary() -> None:
     assert [line for line in service_lines if line.startswith("ProtectHome=")] == [
         "ProtectHome=tmpfs"
     ]
-    assert [line for line in service_lines if "%t" in line] == [
-        "BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind"
+    assert [line for line in service_lines if line.startswith("RuntimeDirectory=")] == [
+        "RuntimeDirectory=the-hive-hourly-runtime"
     ]
+    assert [
+        line for line in service_lines if line.startswith("RuntimeDirectoryMode=")
+    ] == ["RuntimeDirectoryMode=0700"]
+    assert [line for line in service_lines if "%t" in line] == [
+        "BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind"
+    ]
+    assert "/tmp/the-hive-hourly-runtime" not in service_text
     assert "CODEX_MASTER_PROBE_REPOSITORY" not in service_text
     assert "%h/codex-master/src" not in service_text
     assert "%h/codex-master/bin/codex-master-mcp" not in service_text
@@ -848,7 +855,7 @@ def test_attested_runtime_materializes_hourly_without_runtime_directory_self_bin
     ).read_text(encoding="utf-8")
     assert "BindReadOnlyPaths=%t:%t:norbind" not in installed_service
     assert (
-        "BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind"
+        "BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind"
         in installed_service
     )
     assert (
@@ -889,9 +896,10 @@ def test_hourly_probe_service_renderer_rejects_a_generation_only_sandbox() -> No
     "replacement",
     (
         (
+            b"BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind",
             b"BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind",
-            b"BindReadOnlyPaths=%t:%t:norbind",
         ),
+        (b"RuntimeDirectory=the-hive-hourly-runtime\n", b""),
         (
             b"--protected-home-runtime --json",
             b"--json",

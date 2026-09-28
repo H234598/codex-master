@@ -937,6 +937,21 @@ def test_protected_home_runtime_directory_is_fixed_validated_and_not_environment
     assert unsafe.value.code == "command_group_unavailable"
 
 
+def test_protected_home_runtime_directory_is_the_managed_user_runtime_destination() -> None:
+    """The Hourly marker never selects a private-tmp or caller-chosen path."""
+
+    import the_hive.runtime_process as runtime_process
+
+    assert runtime_process._PROTECTED_HOME_RUNTIME_DIRECTORY == (
+        runtime_process._RUNTIME_DIRECTORY_ROOT
+        / str(os.geteuid())
+        / "the-hive-hourly-runtime"
+    )
+    assert str(runtime_process._PROTECTED_HOME_RUNTIME_DIRECTORY).startswith(
+        "/run/user/"
+    )
+
+
 def test_bounded_runner_forwards_only_the_fixed_protected_home_runtime_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

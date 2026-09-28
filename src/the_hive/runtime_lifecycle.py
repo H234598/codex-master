@@ -43,8 +43,10 @@ _HOURLY_PROBE_RUNTIME_ROOT_BINDING = (
     "BindReadOnlyPaths=%h/.local/lib/the-hive-runtime:"
     "%h/.local/lib/the-hive-runtime:norbind"
 )
+_HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY = "RuntimeDirectory=the-hive-hourly-runtime"
+_HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY_MODE = "RuntimeDirectoryMode=0700"
 _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_BINDING = (
-    "BindReadOnlyPaths=%t:/tmp/the-hive-hourly-runtime:norbind"
+    "BindReadOnlyPaths=%t/bus:%t/the-hive-hourly-runtime/bus:norbind"
 )
 _HOURLY_PROBE_PROTECTED_HOME_RUNTIME_ARGUMENT = "--protected-home-runtime"
 _HOURLY_PROBE_STATE_BINDING = (
@@ -2510,6 +2512,10 @@ def _attested_hourly_unit_bytes(
         != ["PrivateTmp=yes"]
         or [line for line in template_lines if line.startswith("ProtectHome=")]
         != ["ProtectHome=tmpfs"]
+        or [line for line in template_lines if line.startswith("RuntimeDirectory=")]
+        != [_HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY]
+        or [line for line in template_lines if line.startswith("RuntimeDirectoryMode=")]
+        != [_HOURLY_PROBE_MANAGED_RUNTIME_DIRECTORY_MODE]
         or [line for line in template_lines if line.startswith("BindReadOnlyPaths=")]
         != [
             _HOURLY_PROBE_RUNTIME_ROOT_BINDING,

@@ -31,10 +31,12 @@ _SYSTEMCTL = "/usr/bin/systemctl"
 _ENV = "/usr/bin/env"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _RUNTIME_DIRECTORY_ROOT = Path("/run/user")
-# This exists only inside the Hourly unit's PrivateTmp mount namespace. The
-# unit binds the canonical host user runtime directory here before
-# ProtectHome=tmpfs masks /run/user.
-_PROTECTED_HOME_RUNTIME_DIRECTORY = Path("/tmp/the-hive-hourly-runtime")
+# This is the one manager-created RuntimeDirectory in the Hourly user unit.
+# ProtectHome=tmpfs keeps /run/user masked except for this managed destination,
+# where the unit binds only the user manager's public bus socket.
+_PROTECTED_HOME_RUNTIME_DIRECTORY = (
+    _RUNTIME_DIRECTORY_ROOT / str(os.geteuid()) / "the-hive-hourly-runtime"
+)
 BOUNDED_PROCESS_CLEANUP_SECONDS = 0.5
 
 
