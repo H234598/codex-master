@@ -27881,6 +27881,52 @@ google_accounts:
         )
         run_tmux_mock.assert_not_called()
 
+    def test_chatgpt_auth_rejects_flex_before_capacity_or_process_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            (root / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {"access_token": "opaque-access-token"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = root / "state"
+            with patch.dict(
+                "the_hive.server.AGENTS",
+                {
+                    "a": {
+                        "label": "A",
+                        "runner": runner,
+                        "home": root,
+                        "session": "test-session",
+                    }
+                },
+                clear=False,
+            ), patch("the_hive.server.STATE_ROOT", state), patch(
+                "the_hive.server.RAW_DIR", state / "raw"
+            ), patch("the_hive.server.META_DIR", state / "meta"), patch(
+                "the_hive.server.LOCK_DIR", state / "locks"
+            ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
+                "the_hive.server.tmux_alive", return_value=False
+            ), patch(
+                "the_hive.server.require_spawn_capacity"
+            ) as require_capacity, patch("the_hive.server.run_tmux") as run_tmux_mock:
+                with self.assertRaisesRegex(
+                    AgentError,
+                    "^flex_transport_unavailable_for_chatgpt_auth$",
+                ):
+                    start_agent("a", cwd=tmpdir)
+
+        require_capacity.assert_not_called()
+        run_tmux_mock.assert_not_called()
+
     def test_parallel_new_starts_serialize_admission_without_global_capacity_cap(self) -> None:
         lifecycle_barrier = threading.Barrier(2)
         admission_mutex = threading.Lock()

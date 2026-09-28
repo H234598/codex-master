@@ -483,6 +483,13 @@ def _service_tier_for_agent(agent: str) -> str:
     return "flex"
 
 
+def require_agent_service_tier_transport(agent: str, service_tier: str) -> None:
+    if service_tier != "flex":
+        return
+    if agent_auth_status(agent)["auth_mode"] in {"chatgpt", "oauth"}:
+        raise AgentError("flex_transport_unavailable_for_chatgpt_auth")
+
+
 MAX_TAIL_LINES = 80
 MAX_TAIL_CHARS = 8192
 MAX_RAW_LOG_BYTES = 5 * 1024 * 1024
@@ -12983,6 +12990,10 @@ def _start_agent_unlocked(
             replacement_reservation_id=replacement_reservation_id,
         )
 
+    service_tier = _service_tier_for_agent(agent)
+    if ollama_descriptor is None:
+        require_agent_service_tier_transport(agent, service_tier)
+
     with spawn_admission_lock():
         if replacement_reservation_id is not None:
             validation = require_managed_replacement_reservation(
@@ -13085,7 +13096,7 @@ def _start_agent_unlocked(
                 model,
                 reasoning_effort,
                 agent_class=agent_class,
-                service_tier=_service_tier_for_agent(agent),
+                service_tier=service_tier,
             )
         )
 
