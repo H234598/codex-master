@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 from urllib.request import Request, urlopen
 
-PRICING_URL = "https://platform.openai.com/pricing?latest-pricing"
+PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 MODELS_URL = "https://developers.openai.com/api/docs/models/all"
 DEFAULT_ROOT = Path.home() / ".local/state/the-hive/openai-pricing"
 DEFAULT_TOKEN_FILE = Path.home() / ".config/the-hive/api-token.env"

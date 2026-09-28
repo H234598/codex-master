@@ -1132,6 +1132,7 @@ def test_health_history_accepts_only_canonical_non_sensitive_values(tmp_path: Pa
 
 def test_pricing_units_use_the_canonical_the_hive_state_path() -> None:
     repository = Path(__file__).resolve().parents[1]
+    assert pricing_inventory.PRICING_URL == "https://developers.openai.com/api/docs/pricing"
     service = (repository / "systemd/user/the-hive-openai-pricing.service").read_text(
         encoding="utf-8"
     )
