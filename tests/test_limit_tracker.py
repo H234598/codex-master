@@ -1482,12 +1482,9 @@ def test_refresh_is_consumer_reread_not_legacy_or_provider_call() -> None:
 
 
 def test_spark_priority_and_display_state_are_bounded() -> None:
-    assert limit_tracker.set_spark_priority("acct", enabled=True, reason="need") == {
-        "account": "acct",
-        "active": True,
-        "reason": "need",
-    }
-    assert limit_tracker.spark_priority_active("acct")
+    with pytest.raises(ValueError, match="spark_model_retired"):
+        limit_tracker.set_spark_priority("acct", enabled=True, reason="need")
+    assert not limit_tracker.spark_priority_active("acct")
     assert not limit_tracker.set_spark_priority("acct", enabled=False)["active"]
     display = limit_tracker.set_emergency_display_override(
         "acct", enabled=True, limit_window="5h", reason="need"

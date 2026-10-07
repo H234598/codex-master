@@ -8,6 +8,8 @@ import json
 from collections.abc import Mapping
 from typing import Any, Iterable
 
+from the_hive.selection.model_policy import RETIRED_MODEL_SELECTORS
+
 
 REASONING_RANK = {"low": 10, "medium": 20, "high": 30, "xhigh": 40, "max": 50}
 LIFECYCLE_ALIASES = {"invocation": "ephemeral"}
@@ -314,16 +316,10 @@ def _select_class(request: ResolutionRequest, classes: tuple[AgentClassPolicy, .
 
 
 def _default_model_family(request: ResolutionRequest, lifecycle: str) -> str:
-    if lifecycle == "persistent" or lifecycle == "binding":
-        return "luna"
-    if request.scope_kind == "write" and request.complexity == "simple" and request.spark_eligible:
-        return "spark"
     return "luna"
 
 
 def _default_reasoning(model: ModelPolicy, lifecycle: str) -> str:
-    if model.family == "spark":
-        return "low"
     if lifecycle == "persistent":
         return "xhigh"
     if lifecycle == "binding":
@@ -339,16 +335,7 @@ def _model_allowed_for_class(model: ModelPolicy, class_policy: AgentClassPolicy)
 
 
 def _model_supports_task(model: ModelPolicy, request: ResolutionRequest) -> bool:
-    if not set(request.required_capabilities).issubset(model.capabilities):
-        return False
-    return (
-        model.family != "spark"
-        or (
-            request.spark_eligible
-            and request.scope_kind == "write"
-            and {"write", "simple_task_eligible"}.issubset(model.capabilities)
-        )
-    )
+    return set(request.required_capabilities).issubset(model.capabilities)
 
 
 def _clamp_reasoning(
@@ -412,7 +399,16 @@ def resolve_agent_selection(
     """Resolve one valid selection. Callers must not reapply defaults."""
 
     class_values = tuple(classes)
-    model_values = tuple(models)
+    source_models = tuple(models)
+    if request.requested_model in RETIRED_MODEL_SELECTORS or any(
+        item.model_id == request.requested_model and item.family == "spark"
+        for item in source_models
+    ):
+        raise ValueError("retired_model_unavailable")
+    model_values = tuple(
+        item for item in source_models
+        if item.model_id not in RETIRED_MODEL_SELECTORS and item.family != "spark"
+    )
     reasons: list[str] = []
     class_policy = _select_class(request, class_values, reasons)
 
@@ -490,18 +486,6 @@ def resolve_agent_selection(
         ),
         key=lambda item: item.rank,
     )
-    if (
-        request.requested_model is None
-        and minimum_family == "spark"
-        and any(
-            item.family == "spark"
-            and item.model_id in available_models
-            and _model_allowed_for_class(item, class_policy)
-            and not _model_supports_task(item, request)
-            for item in model_values
-        )
-    ):
-        reasons.append("spark_model_capability_mismatch")
     if requested_model is not None and requested_model.rank >= minimum_rank:
         model = requested_model
     else:
@@ -558,7 +542,6 @@ def resolve_agent_selection(
         "requested_reasoning_unsupported",
         "requested_reasoning_outside_limits",
         "default_model_unavailable",
-        "spark_model_capability_mismatch",
     }
     return ResolutionDecision(
         class_id=class_policy.class_id,
@@ -587,7 +570,10 @@ def build_selection_offer(
         compatible_models = [
             model
             for model in sorted(models, key=lambda item: item.rank)
-            if model.model_id in available_models and _model_allowed_for_class(model, class_policy)
+            if model.model_id in available_models
+            and model.model_id not in RETIRED_MODEL_SELECTORS
+            and model.family != "spark"
+            and _model_allowed_for_class(model, class_policy)
         ]
         if class_policy.allowed_model_ids and not compatible_models:
             raise ValueError("required_model_unavailable:" + ",".join(class_policy.allowed_model_ids))
@@ -647,6 +633,8 @@ def policies_from_catalogs(
         )
         for item in model_registry.public()
         if item["enabled"] and item["spawn_behavior"] == "manual"
+        and item["model_id"] not in RETIRED_MODEL_SELECTORS
+        and item["family"] != "spark"
     )
     return classes, models
 

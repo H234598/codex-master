@@ -308,7 +308,11 @@ from the_hive.runtime_status import (
     AUTONOMOUS_RUNTIME_STATUS_MCP_ARGUMENT,
     runtime_status,
 )
-from the_hive.selection.model_policy import load_model_policy
+from the_hive.selection.model_policy import (
+    ModelPolicyError,
+    RETIRED_MODEL_SELECTORS,
+    load_model_policy,
+)
 from the_hive.limit_tracker import (
     derive_limit_decisions,
     emergency_queen_status,
@@ -416,6 +420,8 @@ def agent_base_args(
     agent_class: str | None = None,
     service_tier: str = "default",
 ) -> list[str]:
+    if model in RETIRED_MODEL_SELECTORS:
+        raise AgentError("retired_model_unavailable")
     if service_tier == "auto" or not service_tier:
         service_tier = "default"
     elif service_tier == "priority":
@@ -426,6 +432,8 @@ def agent_base_args(
 
     model_registry = load_model_policy(repo_root() / "codex-model-policy.json")
     definition = model_registry.get_exact(model)
+    if definition is not None and definition.family == "spark":
+        raise AgentError("retired_model_unavailable")
     if (
         definition is None
         or not definition.enabled
@@ -830,7 +838,7 @@ ROUTING_CONTEXT_ID_RE = re.compile(r"^[A-Za-z0-9_.:@+-]{1,128}$")
 CODEX_USAGE_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 CODEX_USAGE_DECISION_TIMEOUT_SECONDS = 8
 CODEX_USAGE_SPARK_HEALTH_STATES = {"healthy", "failed"}
-CODEX_USAGE_DECISIONS = {"spark", "main", "credits", "blocked", "unchanged"}
+CODEX_USAGE_DECISIONS = {"main", "credits", "blocked", "unchanged"}
 LEASE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 MAX_POOL_AGENTS = 1000
 MAX_POOL_SERIES = 26
@@ -3924,6 +3932,8 @@ def fleet_selection_preview(
         descriptor = inventory.agents[agent_id]
         if descriptor.series_prefix not in selected_series:
             continue
+        if descriptor.model in RETIRED_MODEL_SELECTORS:
+            continue
         if published:
             gate = fleet_service.account_gate(
                 agent_id,
@@ -3971,11 +3981,7 @@ def fleet_selection_preview(
         lease = agent_lease_status(agent_id, initialize_state=False)
         lease_available = lease.get("state") in {"unclaimed", "expired"}
         model_id = descriptor.model or DEFAULT_AGENT_MODEL
-        model_role = (
-            ModelRole.SECONDARY_SIMPLE
-            if model_id == WRITE_AGENT_MODEL
-            else ModelRole.PRIMARY
-        )
+        model_role = ModelRole.PRIMARY
         candidates.append(
             SelectionCandidate(
                 agent_id=agent_id,
@@ -3992,7 +3998,7 @@ def fleet_selection_preview(
                 usage=usage_observation,
                 sp1a_eligible=usage_sp1a,
                 sp1b_eligible=False,
-                sp2_eligible=model_role is ModelRole.SECONDARY_SIMPLE,
+                sp2_eligible=False,
             )
         )
 
@@ -6252,6 +6258,24 @@ def activate_native_agent_resume(
                 "reason_codes": ["session_metrics_unavailable"],
             }
         record = matches[0]
+        managed_session = next(
+            (
+                session.get("managed_session")
+                for session in registry["sessions"]
+                if session["session_id"] == session_id
+            ),
+            None,
+        )
+        if isinstance(managed_session, str) and any(
+            descriptor.session == managed_session
+            and descriptor.model in RETIRED_MODEL_SELECTORS
+            for descriptor in current_agent_inventory().agents.values()
+        ):
+            return {
+                "allowed": False,
+                "error_code": "retired_model_unavailable",
+                "reason_codes": ["retired_model_unavailable"],
+            }
         if record["activity_state"] == "completed":
             # Resuming completed subagent turn does not spawn another process.
             # Keep global slot accounting, but do not block on transient host
@@ -10568,7 +10592,6 @@ def validate_codex_usage_routing_decision(
         required=decision != "blocked",
     )
     expected_models = {
-        "spark": {WRITE_AGENT_MODEL},
         "main": {DEFAULT_AGENT_MODEL, CODEX_USAGE_LEGACY_MAIN_MODEL},
         "credits": {DEFAULT_AGENT_MODEL, CODEX_USAGE_LEGACY_MAIN_MODEL},
         "blocked": {None},
@@ -10782,6 +10805,32 @@ def _model_runner_admission(
             "complete",
             "ollama_resource_admission",
         )
+    if getattr(selected, "runner", None) is RunnerKind.CODEX_CLI:
+        try:
+            definition = load_model_policy(
+                repo_root() / "codex-model-policy.json"
+            ).get_exact(model)
+        except ModelPolicyError:
+            return _ModelRunnerAdmission(
+                False,
+                _MODEL_INVOCABILITY_UNATTESTED,
+                "model_policy",
+                "unavailable",
+                "model_policy_unavailable",
+            )
+        if (
+            definition is None
+            or not definition.enabled
+            or definition.spawn_behavior != "manual"
+            or definition.family == "spark"
+        ):
+            return _ModelRunnerAdmission(
+                False,
+                _MODEL_RUNNER_UNSUPPORTED,
+                "model_policy",
+                "complete",
+                "model_removed_or_disabled",
+            )
     attested = evidence
     if attested is None:
         attested = read_usage_evidence_v2(
@@ -10921,6 +10970,9 @@ def resolve_runtime_agent_selection(
     callers always bind a verified or fail-safe principal class before reaching
     this shared resolver path.
     """
+
+    if requested_model in RETIRED_MODEL_SELECTORS:
+        raise AgentError("retired_model_unavailable")
 
     scope_kind = (
         "read"
@@ -12843,6 +12895,8 @@ def start_agent(
     replacement_reservation_id: str | None = None,
     confirm_home_refresh: bool = False,
 ) -> dict[str, Any]:
+    if model in RETIRED_MODEL_SELECTORS:
+        raise AgentError("retired_model_unavailable")
     require_resource_capacity_preflight(operation="agent_start")
     require_fleet_recovery_ready("agent_start")
     if type(confirm_home_refresh) is not bool:
@@ -12928,6 +12982,8 @@ def _start_agent_unlocked(
     replacement_reservation_id: str | None = None,
     confirm_home_refresh: bool = False,
 ) -> dict[str, Any]:
+    if model in RETIRED_MODEL_SELECTORS:
+        raise AgentError("retired_model_unavailable")
     require_fleet_recovery_ready("agent_start")
     if type(confirm_home_refresh) is not bool:
         raise AgentError("confirm_home_refresh must be a boolean")
@@ -13038,10 +13094,8 @@ def _start_agent_unlocked(
             )
 
         if managed_fleet_home and agent_class is not None:
-            refresh_reasoning_effort = model_reasoning_effort or (
-                WRITE_AGENT_MODEL_EFFORT
-                if model == WRITE_AGENT_MODEL
-                else DEFAULT_AGENT_MODEL_EFFORT
+            refresh_reasoning_effort = (
+                model_reasoning_effort or DEFAULT_AGENT_MODEL_EFFORT
             )
             refreshed = _materialize_managed_codex_runtime_class(
                 descriptor,
@@ -13094,12 +13148,7 @@ def _start_agent_unlocked(
         reasoning_effort = (
             None
             if ollama_descriptor is not None
-            else model_reasoning_effort
-            or (
-                WRITE_AGENT_MODEL_EFFORT
-                if model == WRITE_AGENT_MODEL
-                else DEFAULT_AGENT_MODEL_EFFORT
-            )
+            else model_reasoning_effort or DEFAULT_AGENT_MODEL_EFFORT
         )
         routed_args = (
             ["--yolo", "-s", "danger-full-access"]
@@ -17887,9 +17936,9 @@ def capabilities_agent(agent: str) -> dict[str, Any]:
         "models": {
             "default": DEFAULT_AGENT_MODEL,
             "read_only": DEFAULT_AGENT_MODEL,
-            "write": WRITE_AGENT_MODEL,
+            "write": DEFAULT_AGENT_MODEL,
             "default_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
-            "write_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
+            "write_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
         },
         "skill_count": inventory["total"],
         "system_skills": inventory["system_skills"],
@@ -18096,6 +18145,8 @@ def ensure_assignment_session_model(
     name: str | None = None,
     lease_acquisition: list[bool] | None = None,
 ) -> dict[str, Any]:
+    if model in RETIRED_MODEL_SELECTORS:
+        raise AgentError("retired_model_unavailable")
     agent = canonical_agent_id(agent)
     cfg = agent_config(agent)
     if not tmux_alive(cfg["session"]):
@@ -40033,6 +40084,23 @@ def _server_runtime_model_gate(admission: Any) -> RuntimeGateDecision:
         return _runtime_decision(False, "model_agent_disabled")
     if descriptor.model != admission.resource.model_id:
         return _runtime_decision(False, "model_binding_mismatch")
+    if (
+        getattr(descriptor, "runner", None) is RunnerKind.CODEX_CLI
+        and getattr(descriptor, "provider", None) is not Provider.OLLAMA_LOCAL
+    ):
+        try:
+            definition = load_model_policy(
+                repo_root() / "codex-model-policy.json"
+            ).get_exact(descriptor.model)
+        except ModelPolicyError:
+            return _runtime_decision(False, "model_policy_unavailable")
+        if (
+            definition is None
+            or not definition.enabled
+            or definition.spawn_behavior != "manual"
+            or definition.family == "spark"
+        ):
+            return _runtime_decision(False, "model_removed_or_disabled")
     return _runtime_decision(True, "model_verified")
 
 

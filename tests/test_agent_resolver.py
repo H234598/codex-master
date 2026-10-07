@@ -206,26 +206,21 @@ def test_invocation_is_accepted_but_ephemeral_is_returned() -> None:
     assert "lifecycle_alias_normalized" in decision.reason_codes
 
 
-def test_simple_write_without_model_defaults_to_spark_low() -> None:
+def test_simple_write_without_model_defaults_to_luna_medium() -> None:
     decision = resolve(scope_kind="write", complexity="simple")
 
-    assert (decision.model, decision.reasoning) == ("gpt-5.3-codex-spark", "low")
+    assert (decision.model, decision.reasoning) == ("gpt-5.6-luna", "medium")
 
 
-def test_explicit_spark_for_medium_write_falls_back_to_luna_with_capability_reason() -> None:
-    decision = resolve(
-        scope_kind="write",
-        complexity="medium",
-        requested_model="gpt-5.3-codex-spark",
-        required_capabilities=("write", "complex_task_eligible"),
-        spark_eligible=False,
-    )
-
-    assert (decision.model, decision.reasoning, decision.fallback) == (
-        "gpt-5.6-luna", "medium", True
-    )
-    assert decision.requested_model == "gpt-5.3-codex-spark"
-    assert "requested_model_capability_mismatch" in decision.reason_codes
+def test_explicit_spark_for_medium_write_is_refused_without_fallback() -> None:
+    with pytest.raises(ValueError, match="retired_model_unavailable"):
+        resolve(
+            scope_kind="write",
+            complexity="medium",
+            requested_model="gpt-5.3-codex-spark",
+            required_capabilities=("write", "complex_task_eligible"),
+            spark_eligible=False,
+        )
 
 
 def test_explicit_luna_for_simple_write_remains_a_compatible_upgrade() -> None:
@@ -240,7 +235,7 @@ def test_explicit_luna_for_simple_write_remains_a_compatible_upgrade() -> None:
     assert (decision.model, decision.fallback) == ("gpt-5.6-luna", False)
 
 
-def test_spark_without_simple_task_capability_defaults_to_luna() -> None:
+def test_retired_spark_in_model_catalog_defaults_to_luna() -> None:
     models = (
         ModelPolicy("gpt-5.3-codex-spark", "spark", 10, ("low",), ("write",)),
         MODELS[1],
@@ -259,9 +254,9 @@ def test_spark_without_simple_task_capability_defaults_to_luna() -> None:
     )
 
     assert decision.model == "gpt-5.6-luna"
-    assert decision.fallback is True
-    assert "spark_model_capability_mismatch" in decision.reason_codes
-    assert "default_model_unavailable" in decision.reason_codes
+    assert decision.fallback is False
+    assert "spark_model_capability_mismatch" not in decision.reason_codes
+    assert "default_model_unavailable" not in decision.reason_codes
 
 
 def test_unknown_explicit_model_for_simple_write_falls_back_to_luna() -> None:
@@ -424,7 +419,8 @@ def test_teamleiterin_defaults_to_the_exact_terra_xhigh_tuple() -> None:
 
 @pytest.mark.parametrize("model", ["gpt-5.3-codex-spark", "gpt-5.6-luna", "gpt-5.6-sol"])
 def test_teamleiterin_rejects_other_model_families_from_explicit_tuple(model: str) -> None:
-    with pytest.raises(ValueError, match=r"^leadership_explicit_tuple_required$"):
+    error = "retired_model_unavailable" if model == "gpt-5.3-codex-spark" else "leadership_explicit_tuple_required"
+    with pytest.raises(ValueError, match=rf"^{error}$"):
         resolve(requested_class="teamleiterin", requested_model=model, requested_reasoning="xhigh")
 
 
@@ -800,7 +796,7 @@ def test_offer_and_resolver_reject_persistent_class_without_xhigh_capacity() -> 
         )
 
 
-def test_offer_generation_changes_with_availability() -> None:
+def test_offer_generation_ignores_retired_spark_availability() -> None:
     complete = build_selection_offer(classes=CLASSES, models=MODELS, available_models={model.model_id for model in MODELS})
     without_spark = build_selection_offer(
         classes=CLASSES,
@@ -808,8 +804,8 @@ def test_offer_generation_changes_with_availability() -> None:
         available_models={model.model_id for model in MODELS if model.family != "spark"},
     )
 
-    assert complete.generation != without_spark.generation
-    assert "gpt-5.3-codex-spark" in complete.models
+    assert complete.generation == without_spark.generation
+    assert "gpt-5.3-codex-spark" not in complete.models
     assert "gpt-5.3-codex-spark" not in without_spark.models
 
 
@@ -856,7 +852,8 @@ def test_agent_base_args_accepts_catalog_models_and_enforces_max_exception() -> 
 def test_agent_base_args_rejects_noncanonical_root_and_worker_tuples(
     model: str, reasoning: str, agent_class: str,
 ) -> None:
-    with pytest.raises(AgentError, match=r"^unsupported routed agent tuple$"):
+    error = "retired_model_unavailable" if model == "gpt-5.3-codex-spark" else "unsupported routed agent tuple"
+    with pytest.raises(AgentError, match=rf"^{error}$"):
         agent_base_args(model, reasoning, agent_class=agent_class)
 
 
@@ -970,10 +967,10 @@ def test_runtime_resolver_does_not_materialize_attested_spark_id_from_usage_rout
     assert (no_spark.class_id, no_spark.model, no_spark.reasoning) == (
         "arbeitsbiene", "gpt-6-luna", "medium",
     )
-    assert "default_model_unavailable" in simple.reason_codes
-    assert "default_model_unavailable" in no_spark.reason_codes
-    assert simple.fallback is True
-    assert no_spark.fallback is True
+    assert "default_model_unavailable" not in simple.reason_codes
+    assert "default_model_unavailable" not in no_spark.reason_codes
+    assert simple.fallback is False
+    assert no_spark.fallback is False
 
 
 def test_selection_options_keeps_q_target_bound_to_requester_authority() -> None:

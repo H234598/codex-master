@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from the_hive import limit_tracker_contract as limit_tracker
 
 
@@ -45,9 +47,10 @@ def test_emergency_display_and_spark_priority_are_reversible(monkeypatch, tmp_pa
     monkeypatch.setattr(limit_tracker, "CODEX_USAGE_EMERGENCY_OVERRIDES", overrides)
     monkeypatch.setattr(limit_tracker, "SPARK_PRIORITY_STATE", priority)
     limit_tracker.set_emergency_display_override("nufker", enabled=True, limit_window="spark")
-    limit_tracker.set_spark_priority("nufker", enabled=True)
+    with pytest.raises(ValueError, match="spark_model_retired"):
+        limit_tracker.set_spark_priority("nufker", enabled=True)
     assert json.loads(overrides.read_text())["nufker"]["delta_enabled"] is True
-    assert limit_tracker.spark_priority_active("nufker") is True
+    assert limit_tracker.spark_priority_active("nufker") is False
     limit_tracker.set_emergency_display_override("nufker", enabled=False)
     limit_tracker.set_spark_priority("nufker", enabled=False)
     assert json.loads(overrides.read_text()) == {}

@@ -1,4 +1,4 @@
-"""In-memory ResumeCapsuleV1 state machine for Spark capacity retries.
+"""Legacy ResumeCapsuleV1 reader; retired Spark capacity retries are disabled.
 
 Public API:
 - ResumeCapsuleV1: immutable capsule state container.
@@ -19,9 +19,6 @@ _CAPACITY_RETRY_LIMIT: Final = 50
 _ACTIVE_WINDOW_MS: Final = 300_000
 _ACCOUNT_BINDING_RE: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SPARK_REQUIREMENT_TOKEN: Final = "explicit_spark"
-_CAPACITY_RETRY_CODES: Final[frozenset[str]] = frozenset(
-    {"at_capacity", "server_overloaded"}
-)
 _ACTIVE_EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {"provider", "tool", "progress"}
 )
@@ -60,9 +57,9 @@ _BINDING_KEYS: Final[frozenset[str]] = frozenset(
 
 
 def is_capacity_retry_code(code: str) -> bool:
-    """Return True only for canonical capacity retry trigger codes."""
+    """Retired Spark requests never qualify for a capacity retry."""
 
-    return code in _CAPACITY_RETRY_CODES
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,14 +320,6 @@ def apply_resume_event(
     if event_state.event_type in _ACTIVE_EVENT_TYPES:
         active_window_ms += event_state.active_duration_ms
         active_window_ms, retry_count = _apply_active_window(active_window_ms, retry_count)
-
-    if (
-        event_state.event_type == "capacity"
-        and is_capacity_retry_code(event_state.error_code or "")
-    ):
-        if retry_count < _CAPACITY_RETRY_LIMIT:
-            retry_count += 1
-        active_window_ms = 0
 
     return ResumeCapsuleV1(
         bee_id=capsule.bee_id,

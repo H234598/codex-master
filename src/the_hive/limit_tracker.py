@@ -1446,14 +1446,13 @@ def set_spark_priority(
     if not isinstance(enabled, bool):
         raise ValueError("limit_tracker_input_invalid")
     if enabled:
-        _spark_priority[account] = {"active": True, "reason": reason}
-    else:
-        _spark_priority.pop(account, None)
-    return {"account": account, "active": enabled, "reason": reason if enabled else ""}
+        raise ValueError("spark_model_retired")
+    _spark_priority.pop(account, None)
+    return {"account": account, "active": False, "reason": ""}
 
 
 def spark_priority_active(account: str) -> bool:
-    return _spark_priority.get(account, {}).get("active") is True
+    return False
 
 
 def set_emergency_display_override(

@@ -46,14 +46,14 @@ def test_hard_boundary_and_simple_downgrade_remain_conservative() -> None:
     assert "simple_override_rejected" in profile.reason_codes
 
 
-def test_confirmed_atomic_low_risk_write_is_simple_and_spark_eligible() -> None:
+def test_confirmed_atomic_low_risk_write_stays_simple_without_spark_eligibility() -> None:
     profile = TaskClassifier().classify(atomic_fix_request())
 
     assert profile.complexity is TaskComplexity.SIMPLE
-    assert profile.spark_eligible is True
-    assert profile.required_capabilities == ("write",)
+    assert profile.spark_eligible is False
+    assert profile.required_capabilities == ("write", "complex_task_eligible")
     assert profile.reason_codes == ("positive_atomic_low_risk_write_evidence",)
-    assert profile.expected_usage_micro == 1000
+    assert profile.expected_usage_micro is None
 
 
 def test_explicit_medium_remains_luna_only() -> None:

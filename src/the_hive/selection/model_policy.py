@@ -12,6 +12,9 @@ class ModelPolicyError(ValueError):
     """Raised for invalid model policy configuration."""
 
 
+RETIRED_MODEL_SELECTORS = frozenset({"gpt-5.3-codex-spark", "spark"})
+
+
 @dataclass(frozen=True, slots=True)
 class ModelDefinition:
     model_id: str
@@ -83,10 +86,16 @@ class ModelPolicyRegistry:
         self._aliases = {alias: item for item in values for alias in item.aliases}
 
     def get_exact(self, model_id: str) -> ModelDefinition | None:
-        return self._definitions.get(model_id)
+        if model_id in RETIRED_MODEL_SELECTORS:
+            return None
+        definition = self._definitions.get(model_id)
+        return definition if definition is not None and definition.family != "spark" else None
 
     def resolve_alias(self, alias: str) -> ModelDefinition | None:
-        return self._aliases.get(alias)
+        if alias in RETIRED_MODEL_SELECTORS:
+            return None
+        definition = self._aliases.get(alias)
+        return definition if definition is not None and definition.family != "spark" else None
 
     def public(self) -> tuple[dict[str, object], ...]:
         return tuple(
@@ -106,6 +115,7 @@ class ModelPolicyRegistry:
                 "spawn_behavior": item.spawn_behavior,
             }
             for item in self._definitions.values()
+            if item.model_id not in RETIRED_MODEL_SELECTORS and item.family != "spark"
         )
 
 

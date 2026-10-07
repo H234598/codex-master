@@ -17631,7 +17631,7 @@ google_accounts:
                 (
                     ModelInvocabilityV1(
                         "legacy-a",
-                        "gpt-5.6-luna",
+                        "gpt-6-luna",
                         "codex_cli",
                         True,
                         True,
@@ -17668,12 +17668,12 @@ google_accounts:
                 complexity="simple",
             )
 
-        self.assertEqual(start.call_args.kwargs["model"], "gpt-5.6-luna")
-        self.assertEqual(result["selection"]["model"], "gpt-5.6-luna")
+        self.assertEqual(start.call_args.kwargs["model"], "gpt-6-luna")
+        self.assertEqual(result["selection"]["model"], "gpt-6-luna")
         self.assertEqual(read_evidence.call_count, 2)
         tracker.assert_not_called()
 
-    def test_confirmed_assign_write_can_select_spark_and_audit_profile(self) -> None:
+    def test_confirmed_assign_write_selects_gpt6_and_audits_profile(self) -> None:
         auth_gate = {
             "authenticated": True,
             "provider": "openai",
@@ -17785,8 +17785,8 @@ google_accounts:
             )
 
         self.assertEqual(result["model"], "gpt-6-luna")
-        self.assertTrue(result["task_profile"]["spark_eligible"])
-        self.assertIn("default_model_unavailable", result["selection"]["reason_codes"])
+        self.assertFalse(result["task_profile"]["spark_eligible"])
+        self.assertNotIn("default_model_unavailable", result["selection"]["reason_codes"])
         self.assertEqual(
             record.call_args.args[0]["task_profile"], result["task_profile"]
         )
@@ -25550,8 +25550,8 @@ google_accounts:
             "hi",
             lease={"state": "held"},
             release_lease_on_failure=True,
-            model=WRITE_AGENT_MODEL,
-            model_reasoning_effort="low",
+            model="gpt-6-sol",
+            model_reasoning_effort="medium",
         )
 
         self.assertEqual(result["status"], "started")
@@ -25562,8 +25562,8 @@ google_accounts:
             "hi",
             {"state": "held"},
             True,
-            WRITE_AGENT_MODEL,
-            "low",
+            "gpt-6-sol",
+            "medium",
             None,
         )
 
@@ -29792,7 +29792,7 @@ google_accounts:
         self.assertFalse(capabilities["result"]["isError"])
         capability_payload = json.loads(capabilities["result"]["content"][0]["text"])["results"][0]
         self.assertEqual(capability_payload["models"]["default"], DEFAULT_AGENT_MODEL)
-        self.assertEqual(capability_payload["models"]["write"], "gpt-5.3-codex-spark")
+        self.assertEqual(capability_payload["models"]["write"], DEFAULT_AGENT_MODEL)
         self.assertEqual(capability_payload["master_mcp_tools"], "not_configured_for_agent")
         self.assertEqual(capability_payload["plugin_count"], 26)
         self.assertEqual(capability_payload["plugin_page_count"], 20)
@@ -30305,13 +30305,13 @@ google_accounts:
                 with patch("the_hive.server.reserve_managed_replacement", return_value={"allowed": True, "reservation_id": "res-model"}), patch("the_hive.server.complete_managed_replacement"):
                     result = ensure_assignment_session_model(
                     "a",
-                    model=WRITE_AGENT_MODEL,
-                    reasoning_effort="low",
+                    model="gpt-6-sol",
+                    reasoning_effort="medium",
                     lease=lease,
                     )
 
         self.assertEqual(result["status"], "restarted")
-        self.assertEqual(start.call_args.kwargs["model"], WRITE_AGENT_MODEL)
+        self.assertEqual(start.call_args.kwargs["model"], "gpt-6-sol")
         self.assertEqual(start.call_args.kwargs["lease"], lease)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -30343,8 +30343,8 @@ google_accounts:
                 with self.assertRaisesRegex(AgentError, "controlled restart requires an inactive Agentin"):
                     ensure_assignment_session_model(
                         "a",
-                        model=WRITE_AGENT_MODEL,
-                        reasoning_effort="low",
+                        model="gpt-6-sol",
+                        reasoning_effort="medium",
                         lease=lease,
                     )
                 tmux.assert_not_called()
@@ -30459,7 +30459,7 @@ google_accounts:
             ), patch("the_hive.server.start_agent", side_effect=lambda *args, **kwargs: events.append("start") or {"status": "started"}), patch(
                 "the_hive.server.complete_managed_replacement", side_effect=lambda *args, **kwargs: events.append("complete")
             ) as complete:
-                result = ensure_assignment_session_model("q3", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease)
+                result = ensure_assignment_session_model("q3", model="gpt-6-sol", reasoning_effort="medium", lease=lease)
         self.assertEqual(result["status"], "restarted")
         self.assertLess(events.index("lock_enter"), events.index("reserve"))
         self.assertLess(events.index("reserve"), events.index("kill"))
@@ -30514,7 +30514,7 @@ google_accounts:
                 "the_hive.server.complete_managed_replacement"
             ) as complete:
                 with self.assertRaisesRegex(AgentError, "simulated replacement start failure"):
-                    ensure_assignment_session_model("q3", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease)
+                    ensure_assignment_session_model("q3", model="gpt-6-sol", reasoning_effort="medium", lease=lease)
 
         self.assertLess(events.index("lock_enter"), events.index("reserve"))
         self.assertLess(events.index("reserve"), events.index("kill"))
@@ -30543,7 +30543,7 @@ google_accounts:
             try:
                 a_result.append(
                     ensure_assignment_session_model(
-                        "q3", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease
+                        "q3", model="gpt-6-sol", reasoning_effort="medium", lease=lease
                     )
                 )
             except BaseException as exc:  # pragma: no cover - surfaced below
@@ -30654,7 +30654,7 @@ google_accounts:
                 "the_hive.server.reserve_managed_replacement", return_value=denial
             ), patch("the_hive.server.run_tmux") as run_tmux, patch("the_hive.server.start_agent") as start_agent:
                 with self.assertRaises(AgentCapacityError) as raised:
-                    ensure_assignment_session_model("b1", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease)
+                    ensure_assignment_session_model("b1", model="gpt-6-sol", reasoning_effort="medium", lease=lease)
         public = public_error_payload(raised.exception)
         self.assertEqual(public["error_code"], "spawn_capacity_unavailable")
         self.assertTrue(public["retryable"])
@@ -41905,7 +41905,7 @@ def _d204_codex_descriptor() -> SimpleNamespace:
         account_id="account-d204",
         runner=server_module.RunnerKind.CODEX_CLI,
         provider=server_module.Provider.OPENAI_CHATGPT,
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
     )
 
 
@@ -41923,7 +41923,7 @@ def test_d204_supported_in_api_false_is_attested_for_persistent_tui() -> None:
         ),
         ModelInvocabilityV1(
             "account-d204",
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             "codex_cli",
             True,
             True,
@@ -41943,35 +41943,35 @@ def test_d204_supported_in_api_false_is_attested_for_persistent_tui() -> None:
         available = server_module.available_model_ids_for_routing(
             (
                 SimpleNamespace(model_id="gpt-5.3-codex-spark"),
-                SimpleNamespace(model_id="gpt-5.6-luna"),
+                SimpleNamespace(model_id="gpt-6-luna"),
             ),
             None,
             agent="a1",
         )
 
-    assert "gpt-5.3-codex-spark" in available
-    assert "gpt-5.6-luna" in available
+    assert "gpt-5.3-codex-spark" not in available
+    assert "gpt-6-luna" in available
     admission = server_module._model_runner_admission(
         "a1",
         "gpt-5.3-codex-spark",
         descriptor=descriptor,
         evidence=evidence,
     )
-    assert admission.allowed is True
-    assert admission.reason_code == "allowed"
+    assert admission.allowed is False
+    assert admission.missing_factor == "model_removed_or_disabled"
 
 
 def test_d204_admission_diagnostics_preserve_projection_and_missing_factor() -> None:
     descriptor = _d204_codex_descriptor()
     negative_capabilities = {
         "meter_visible": ModelInvocabilityV1(
-            "account-d204", "gpt-5.6-luna", "codex_cli", False, True, False, True
+            "account-d204", "gpt-6-luna", "codex_cli", False, True, False, True
         ),
         "catalog_visible": ModelInvocabilityV1(
-            "account-d204", "gpt-5.6-luna", "codex_cli", True, False, False, False
+            "account-d204", "gpt-6-luna", "codex_cli", True, False, False, False
         ),
         "runner_invocable": ModelInvocabilityV1(
-            "account-d204", "gpt-5.6-luna", "codex_cli", True, True, False, False
+            "account-d204", "gpt-6-luna", "codex_cli", True, True, False, False
         ),
     }
     cases = (
@@ -42016,7 +42016,7 @@ def test_d204_admission_diagnostics_preserve_projection_and_missing_factor() -> 
         with pytest.raises(AgentError) as raised:
             server_module._require_model_runner_admission(
                 "a1",
-                "gpt-5.6-luna",
+                "gpt-6-luna",
                 descriptor=descriptor,
                 evidence=evidence,
             )
@@ -42032,7 +42032,7 @@ def test_d204_admission_diagnostics_preserve_projection_and_missing_factor() -> 
 def test_d204_root_usage_status_blocks_capability_lookup_with_bound_diagnostics() -> None:
     descriptor = _d204_codex_descriptor()
     positive_capability = ModelInvocabilityV1(
-        "account-d204", "gpt-5.6-luna", "codex_cli", True, True, False, True
+        "account-d204", "gpt-6-luna", "codex_cli", True, True, False, True
     )
     for evidence_status in ("stale", "invalid", "unavailable"):
         evidence = _d204_model_invocability_evidence(
@@ -42046,7 +42046,7 @@ def test_d204_root_usage_status_blocks_capability_lookup_with_bound_diagnostics(
         ) as lookup, pytest.raises(AgentError) as raised:
             server_module._require_model_runner_admission(
                 "a1",
-                "gpt-5.6-luna",
+                "gpt-6-luna",
                 descriptor=descriptor,
                 evidence=evidence,
             )
@@ -42065,7 +42065,7 @@ def test_d204_positive_capability_allows_only_its_attested_runner() -> None:
     evidence = _d204_model_invocability_evidence(
         ModelInvocabilityV1(
             "account-d204",
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             "gemini_cli",
             True,
             True,
@@ -42074,7 +42074,7 @@ def test_d204_positive_capability_allows_only_its_attested_runner() -> None:
         ),
         ModelInvocabilityV1(
             "account-d204",
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             "codex_cli",
             True,
             True,
@@ -42085,7 +42085,7 @@ def test_d204_positive_capability_allows_only_its_attested_runner() -> None:
 
     codex_admission = server_module._model_runner_admission(
         "a1",
-        "gpt-5.6-luna",
+        "gpt-6-luna",
         descriptor=descriptor,
         evidence=evidence,
     )
@@ -42094,11 +42094,11 @@ def test_d204_positive_capability_allows_only_its_attested_runner() -> None:
         account_id="account-d204",
         runner=server_module.RunnerKind.GEMINI_CLI,
         provider=server_module.Provider.GEMINI_API,
-        model="gpt-5.6-luna",
+        model="gpt-6-luna",
     )
     gemini_admission = server_module._model_runner_admission(
         "a1",
-        "gpt-5.6-luna",
+        "gpt-6-luna",
         descriptor=gemini_descriptor,
         evidence=evidence,
     )
@@ -42106,7 +42106,7 @@ def test_d204_positive_capability_allows_only_its_attested_runner() -> None:
     only_codex = _d204_model_invocability_evidence(
         ModelInvocabilityV1(
             "account-d204",
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             "codex_cli",
             True,
             True,
@@ -42116,7 +42116,7 @@ def test_d204_positive_capability_allows_only_its_attested_runner() -> None:
     )
     unmatched_admission = server_module._model_runner_admission(
         "a1",
-        "gpt-5.6-luna",
+        "gpt-6-luna",
         descriptor=gemini_descriptor,
         evidence=only_codex,
     )

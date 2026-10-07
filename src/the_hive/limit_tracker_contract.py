@@ -387,7 +387,9 @@ def set_emergency_display_override(
 
 
 def set_spark_priority(account: str, *, enabled: bool, reason: str = "") -> dict[str, Any]:
-    """Publish Spark worker-selection priority without changing leadership routing."""
+    """Reject retired activation; permit clearing old priority state."""
+    if enabled:
+        raise ValueError("spark_model_retired")
     try:
         current = json.loads(SPARK_PRIORITY_STATE.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
@@ -403,11 +405,7 @@ def set_spark_priority(account: str, *, enabled: bool, reason: str = "") -> dict
 
 
 def spark_priority_active(account: str) -> bool:
-    try:
-        payload = json.loads(SPARK_PRIORITY_STATE.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return False
-    return isinstance(payload, dict) and isinstance(payload.get(account), dict) and payload[account].get("active") is True
+    return False
 
 
 def preferred_delta_window(payload: dict[str, Any], *, pool: str = "main") -> str:

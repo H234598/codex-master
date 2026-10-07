@@ -18,12 +18,13 @@ def _catalogs():
     )
 
 
-def test_checked_in_catalog_has_no_gpt5_fallback_and_keeps_spark_explicit():
+def test_checked_in_catalog_has_no_spark_offer_or_gpt5_fallback():
     classes, models = _catalogs()
     ids = {model.model_id for model in models}
     assert {"gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"} <= ids
     assert all(not model_id.startswith("gpt-5") for model_id in ids)
     assert all(model.family != "spark" for model in models)
+    assert all("spark" not in policy.allowed_families for policy in classes)
     assert {policy.class_id for policy in classes} >= {"teamleiterin", "arbeitsbiene"}
 
 

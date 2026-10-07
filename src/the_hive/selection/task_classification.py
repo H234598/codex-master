@@ -135,17 +135,15 @@ class TaskClassifier:
         if request.complexity_override is TaskComplexity.SIMPLE and complexity is not TaskComplexity.SIMPLE:
             reasons.append("simple_override_rejected")
 
-        spark_eligible = complexity is TaskComplexity.SIMPLE and self._is_positive_atomic_write(request)
+        spark_eligible = False
         if request.scope_kind == "read":
             capabilities = ("read",)
-        elif spark_eligible:
-            capabilities = ("write",)
         else:
             capabilities = ("write", "complex_task_eligible")
         return TaskProfile(
             complexity,
             tuple(dict.fromkeys(reasons)),
-            1000 if spark_eligible else None,
+            None,
             capabilities,
             spark_eligible,
         )

@@ -173,7 +173,7 @@ def test_event_sequence_dedup_and_out_of_order_events_are_ignored() -> None:
     assert out_of_order == first
 
 
-def test_capacity_event_codes_and_non_codes_are_distinct() -> None:
+def test_retired_spark_capacity_codes_never_increment_retry_count() -> None:
     capsule = normalize_resume_capsule(base_capsule_payload())
     cap_event = base_event_payload() | {
         "event_sequence": 1,
@@ -195,13 +195,13 @@ def test_capacity_event_codes_and_non_codes_are_distinct() -> None:
     after_non_cap = apply_resume_event(after_cap, non_cap_event)
     after_cap2 = apply_resume_event(after_non_cap, cap_event2)
 
-    assert is_capacity_retry_code("at_capacity")
-    assert is_capacity_retry_code("server_overloaded")
+    assert not is_capacity_retry_code("at_capacity")
+    assert not is_capacity_retry_code("server_overloaded")
     assert not is_capacity_retry_code("at capacity")
     assert not is_capacity_retry_code("token_lost")
-    assert after_cap.retry_count == 8
-    assert after_non_cap.retry_count == 8
-    assert after_cap2.retry_count == 9
+    assert after_cap.retry_count == 7
+    assert after_non_cap.retry_count == 7
+    assert after_cap2.retry_count == 7
     assert after_cap2.event_sequence == 3
 
 
@@ -223,9 +223,9 @@ def test_retry_counter_caps_at_fifty_retries() -> None:
         | {"event_sequence": 3, "event_type": "capacity", "error_code": "at_capacity"},
     )
 
-    assert near_cap.retry_count == 50
-    assert at_cap.retry_count == 50
-    assert blocked.retry_count == 50
+    assert near_cap.retry_count == 49
+    assert at_cap.retry_count == 49
+    assert blocked.retry_count == 49
     assert blocked.event_sequence == 3
 
 
@@ -276,10 +276,10 @@ def test_capacity_event_starts_new_activity_epoch_before_retry_reset() -> None:
         | {"event_sequence": 2, "event_type": "provider", "active_duration_ms": 100},
     )
 
-    assert after_capacity.retry_count == 13
-    assert after_capacity.active_window_ms == 0
-    assert after_small_provider.retry_count == 13
-    assert after_small_provider.active_window_ms == 100
+    assert after_capacity.retry_count == 12
+    assert after_capacity.active_window_ms == 299_900
+    assert after_small_provider.retry_count == 0
+    assert after_small_provider.active_window_ms == 0
 
     after_reset = apply_resume_event(
         after_small_provider,
@@ -287,7 +287,7 @@ def test_capacity_event_starts_new_activity_epoch_before_retry_reset() -> None:
         | {"event_sequence": 3, "event_type": "provider", "active_duration_ms": 299_900},
     )
     assert after_reset.retry_count == 0
-    assert after_reset.active_window_ms == 0
+    assert after_reset.active_window_ms == 299_900
 
 
 def test_noncanonical_capacity_and_inactive_events_do_not_open_new_epoch() -> None:
@@ -361,10 +361,10 @@ def test_active_window_reset_and_capacity_before_and_after_boundary() -> None:
         base_event_payload() | {"event_sequence": 2, "event_type": "capacity", "error_code": "at_capacity"},
     )
 
-    assert before_reset.retry_count == 13
+    assert before_reset.retry_count == 12
     assert after_reset_boundary.retry_count == 0
     assert after_reset_boundary.active_window_ms == 0
-    assert after_capacity.retry_count == 1
+    assert after_capacity.retry_count == 0
 
 
 def test_invalid_payload_and_event_types_are_fail_closed() -> None:
