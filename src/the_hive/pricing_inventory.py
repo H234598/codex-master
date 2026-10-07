@@ -746,6 +746,10 @@ def _home_service_tier(
     config: Path, catalogs: list[dict[str, object]], eligible_flex: set[str]
 ) -> tuple[str, str]:
     """Return a tier and an audit reason for one concrete Codex home."""
+    for line in config.read_text(encoding="utf-8").splitlines():
+        match = SERVICE_TIER_LINE_RE.fullmatch(line)
+        if match is not None and match["value"] == "default":
+            return "default", "explicit_default_service_tier"
     catalog = _cache_for_config(config, catalogs)
     model_id = _configured_model(config)
     if not catalog or not catalog.get("fresh"):

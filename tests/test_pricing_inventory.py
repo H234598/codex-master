@@ -156,7 +156,11 @@ def test_update_removes_its_previous_model_catalog_override(
 
     text = config.read_text(encoding="utf-8")
     assert "model_catalog_json" not in text
-    assert 'service_tier = "flex"' in text
+    assert 'service_tier = "default"' in text
+    plans = pricing_inventory._plan_codex_config_updates(managed_catalog, [], {MODEL})
+    assert len(plans) == 1
+    assert plans[0]["changed"] is False
+    assert plans[0]["decision"]["reason"] == "explicit_default_service_tier"
 
 
 def test_update_preserves_unrelated_custom_model_catalog(
