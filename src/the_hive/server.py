@@ -351,7 +351,7 @@ ADMISSION_STATE_FILE = STATE_ROOT / "admission-state.json"
 ADMISSION_LOCK_FILE = STATE_ROOT / "admission-state.lock"
 TEAMLEADER_REGISTRY_FILE = STATE_ROOT / "teamleaders.json"
 LEGACY_META_DIR = LEGACY_STATE_ROOT / "meta"
-DEFAULT_AGENT_MODEL = "gpt-5.6-luna"
+DEFAULT_AGENT_MODEL = "gpt-6-luna"
 DEFAULT_AGENT_MODEL_EFFORT = "medium"
 WRITE_AGENT_MODEL = "gpt-5.3-codex-spark"
 WRITE_AGENT_MODEL_EFFORT = "low"
@@ -414,14 +414,14 @@ def agent_base_args(
     reasoning_effort: str,
     *,
     agent_class: str | None = None,
-    service_tier: str = "flex",
+    service_tier: str = "default",
 ) -> list[str]:
     if service_tier == "auto" or not service_tier:
-        service_tier = "flex"
+        service_tier = "default"
     elif service_tier == "priority":
         if not _fast_or_emergency_mode_active():
             raise AgentError("priority_tier_unauthorized")
-    elif service_tier != "flex":
+    elif service_tier not in {"default", "flex"}:
         raise AgentError("unsupported_service_tier")
 
     model_registry = load_model_policy(repo_root() / "codex-model-policy.json")
@@ -480,14 +480,26 @@ def agent_base_args(
 
 
 def _service_tier_for_agent(agent: str) -> str:
-    return "flex"
+    # Preserve direct API Flex only when both the transport and the home
+    # configuration explicitly select it. Unknown auth modes use Standard.
+    if agent_auth_status(agent)["auth_mode"] != "api":
+        return "default"
+    config = agent_config(agent)["home"] / "config.toml"
+    try:
+        text = read_private_regular_text(
+            config, MAX_CODEX_CONFIG_BYTES, "could not read codex config"
+        )
+        tier = tomllib.loads(text).get("service_tier")
+    except (AgentError, tomllib.TOMLDecodeError):
+        return "default"
+    return "flex" if tier == "flex" else "default"
 
 
 def require_agent_service_tier_transport(agent: str, service_tier: str) -> None:
     if service_tier != "flex":
         return
-    if agent_auth_status(agent)["auth_mode"] in {"chatgpt", "oauth"}:
-        raise AgentError("flex_transport_unavailable_for_chatgpt_auth")
+    if agent_auth_status(agent)["auth_mode"] != "api":
+        raise AgentError("flex_transport_unavailable_for_auth_transport")
 
 
 MAX_TAIL_LINES = 80
@@ -9489,13 +9501,13 @@ def _home_refresh_config(
             raise AgentError("agent_class_materialization_invalid")
     tier = document.get("service_tier")
     if tier is None or tier == "auto":
-        tier = "flex"
+        tier = "default"
     elif not isinstance(tier, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", tier) is None:
         raise AgentError("agent_class_materialization_invalid")
     elif tier == "priority":
         if not _fast_or_emergency_mode_active():
             raise AgentError("agent_class_materialization_invalid")
-    elif tier != "flex":
+    elif tier not in {"default", "flex"}:
         raise AgentError("agent_class_materialization_invalid")
     for field, maximum in (
         ("model", 128),
@@ -11151,9 +11163,9 @@ def agent_selection_options(
         and "teamleiterin" in allowed_class_ids
         and not offer.options
     ):
-        if "gpt-5.6-terra" not in available_models:
-            raise AgentError("required_model_unavailable:gpt-5.6-terra")
-        raise AgentError("required_model_effort_unavailable:gpt-5.6-terra:xhigh")
+        if "gpt-6-sol" not in available_models:
+            raise AgentError("required_model_unavailable:gpt-6-sol")
+        raise AgentError("required_model_effort_unavailable:gpt-6-sol:xhigh")
     return {
         "schema_version": 1,
         "generation": offer.generation,
@@ -15346,7 +15358,10 @@ def limit_model_pool(model: Any) -> str:
     text = str(model or "").lower()
     if "spark" in text or WRITE_AGENT_MODEL in text:
         return "spark_write_model"
-    if DEFAULT_AGENT_MODEL in text or "5.4" in text:
+    if any(
+        model_id in text
+        for model_id in ("gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra")
+    ) or "5.4" in text:
         return "default_agent_model"
     return "unknown"
 
@@ -15377,7 +15392,13 @@ def model_from_status_text(text: str) -> str | None:
         r"\b(?:gpt[- ]?5\.3[- ]?codex[- ]?spark|codex[- ]?spark|spark)\b", lowered
     ):
         return WRITE_AGENT_MODEL
-    if re.search(r"\b(?:gpt[- ]?5\.4[- ]?mini|gpt[- ]?5\.4|5\.4[- ]?mini)\b", lowered):
+    for model_id in ("gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"):
+        if re.search(r"\b" + re.escape(model_id) + r"\b", lowered):
+            return model_id
+    if re.search(
+        r"\b(?:gpt[- ]?5\.4[- ]?mini|gpt[- ]?5\.4|5\.4[- ]?mini)\b",
+        lowered,
+    ):
         return DEFAULT_AGENT_MODEL
     return None
 
@@ -18438,10 +18459,10 @@ def _assign_agent_unlocked(
             active_meta = read_meta(agent)
             if (
                 getattr(descriptor, "skill_profile", None) == "teamleiterin"
-                and active_meta.get("model") == "gpt-5.6-terra"
+                and active_meta.get("model") == "gpt-6-sol"
                 and active_meta.get("model_reasoning_effort") == "xhigh"
             ):
-                model = "gpt-5.6-terra"
+                model = "gpt-6-sol"
                 reasoning_effort = "xhigh"
     subagent_admission = (
         admission

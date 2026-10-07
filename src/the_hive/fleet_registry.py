@@ -1017,7 +1017,7 @@ def _runtime_principal(
         runner=_exact_enum(
             RunnerKind, raw["runner"], expected=RunnerKind.CODEX_CLI, code=code
         ),
-        model=_exact_text(raw["model"], expected="gpt-5.6-terra", code=code),
+        model=_runtime_principal_model(raw["model"], code=code),
         reasoning=_exact_text(raw["reasoning"], expected="xhigh", code=code),
         enabled=_boolean(raw["enabled"], code),
     )
@@ -1028,6 +1028,15 @@ def _exact_text(value: object, *, expected: str, code: str) -> str:
     if text != expected:
         _fail(code)
     return text
+
+
+def _runtime_principal_model(value: object, *, code: str) -> str:
+    # Persisted V2 principals predate the GPT-6 pin. They must remain readable
+    # until an explicit registry migration updates their binding.
+    model = _text(value, minimum=1, maximum=len("gpt-5.6-terra"), code=code)
+    if model not in {"gpt-5.6-terra", "gpt-6-sol"}:
+        _fail(code)
+    return model
 
 
 def _exact_enum(enum: type[Enum], value: object, *, expected: Enum, code: str) -> Any:

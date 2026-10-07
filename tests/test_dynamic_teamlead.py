@@ -73,7 +73,7 @@ def principal(**changes: object) -> FleetRuntimePrincipalV2:
         lifecycle="persistent",
         provider=Provider.OPENAI_CHATGPT,
         runner=RunnerKind.CODEX_CLI,
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         reasoning="xhigh",
         enabled=True,
     )
@@ -85,7 +85,7 @@ def request(**changes: object) -> DynamicTeamleadRequest:
         agent_id=AGENT_ID,
         account_id=ACCOUNT_ID,
         registry_generation=7,
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         reasoning="xhigh",
     )
     return replace(value, **changes)
@@ -283,7 +283,7 @@ def test_prepare_rejects_runtime_principal_runner_mismatch() -> None:
 def test_prepare_rejects_runtime_principal_model_mismatch() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
-            snapshot(runtime_principals=(principal(model="gpt-5.6-luna"),)), request(), binding()
+            snapshot(runtime_principals=(principal(model="gpt-6-luna"),)), request(), binding()
         )
 
     assert caught.value.code is DynamicTeamleadCode.INVALID_CLASS_SELECTION
@@ -331,7 +331,7 @@ def test_prepare_prioritizes_identity_over_request_model_capability() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
             snapshot(runtime_principals=(principal(profile_id="other-profile"),)),
-            request(model="gpt-5.6-luna"),
+            request(model="gpt-6-luna"),
             binding(),
         )
 
@@ -387,7 +387,7 @@ def test_prepare_prioritizes_request_capability_over_account_eligibility() -> No
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
             snapshot(accounts=(account(enabled=False),)),
-            request(model="gpt-5.6-luna"),
+            request(model="gpt-6-luna"),
             binding(),
         )
 
@@ -436,7 +436,7 @@ def test_prepare_prioritizes_principal_selection_over_later_capability_error(
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(
             snapshot(runtime_principals=runtime_principals),
-            request(model="gpt-5.6-luna"),
+            request(model="gpt-6-luna"),
             binding(),
         )
 
@@ -495,7 +495,7 @@ def test_prepare_rejects_ineligible_or_unbound_account(
     [
         ({"agent_id": "a1"}, DynamicTeamleadCode.LEGACY_TARGET_FORBIDDEN),
         ({"registry_generation": 8}, DynamicTeamleadCode.STALE_REGISTRY),
-        ({"model": "gpt-5.6-luna"}, DynamicTeamleadCode.INVALID_CLASS_SELECTION),
+        ({"model": "gpt-6-luna"}, DynamicTeamleadCode.INVALID_CLASS_SELECTION),
         ({"reasoning": "high"}, DynamicTeamleadCode.INVALID_CLASS_SELECTION),
     ],
 )

@@ -185,13 +185,13 @@ def prepare_dynamic_teamlead(
     ):
         _fail(DynamicTeamleadCode.PROFILE_IDENTITY_MISMATCH)
     if (
-        selected.model != "gpt-5.6-terra"
+        selected.model != "gpt-6-sol"
         or selected.reasoning != "xhigh"
         or principal.class_id != "teamleiterin"
         or principal.lifecycle != "persistent"
         or principal.provider is not Provider.OPENAI_CHATGPT
         or principal.runner is not RunnerKind.CODEX_CLI
-        or principal.model != "gpt-5.6-terra"
+        or principal.model != "gpt-6-sol"
         or principal.reasoning != "xhigh"
     ):
         _fail(DynamicTeamleadCode.INVALID_CLASS_SELECTION)

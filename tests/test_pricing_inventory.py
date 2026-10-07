@@ -115,7 +115,7 @@ def test_update_promotes_documented_api_flex_sol_when_home_cache_only_has_priori
     service_tiers = _catalog_model(effective)["service_tiers"]
     assert [tier["id"] for tier in service_tiers] == ["priority", "flex"]
     assert config.read_text(encoding="utf-8").splitlines()[:2] == [
-        'service_tier = "flex"',
+        'service_tier = "default"',
         'model = "gpt-5.6-sol"',
     ]
     assert generation.is_dir()
@@ -133,7 +133,7 @@ def test_update_does_not_replace_codex_server_model_catalog(
 
     text = config.read_text(encoding="utf-8")
     assert "model_catalog_json" not in text
-    assert 'service_tier = "flex"' in text
+    assert 'service_tier = "default"' in text
 
 
 def test_update_removes_its_previous_model_catalog_override(
@@ -198,17 +198,26 @@ def test_update_does_not_promote_model_without_documented_flex_evidence(
 
     effective_model = _catalog_model(root / "effective-codex-model-catalog.json")
     assert [tier["id"] for tier in effective_model["service_tiers"]] == ["priority"]
-    assert 'service_tier = "flex"' in config.read_text(encoding="utf-8")
+    assert 'service_tier = "default"' in config.read_text(encoding="utf-8")
 
 
-def test_home_service_tier_fallback_returns_flex_when_cache_missing_or_stale(
+def test_home_service_tier_uses_standard_when_transport_is_unknown(
     tmp_path: Path,
 ) -> None:
     config = tmp_path / "config.toml"
     config.write_text('model = "gpt-5.6-sol"\nservice_tier = "flex"\n', encoding="utf-8")
     tier, reason = pricing_inventory._home_service_tier(config, [], {"gpt-5.6-sol"})
-    assert tier == "flex"
-    assert reason == "model_cache_missing_or_stale"
+    assert tier == "default"
+    assert reason == "standard_service_tier"
+
+
+def test_home_service_tier_preserves_explicit_flex_for_api_auth(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('service_tier = "flex"\n', encoding="utf-8")
+    (tmp_path / "auth.json").write_text('{"auth_mode":"api"}\n', encoding="utf-8")
+    assert pricing_inventory._home_service_tier(config, [], set()) == (
+        "flex", "explicit_api_flex_service_tier"
+    )
 
 
 def test_effective_catalog_preserves_existing_tiers_and_never_duplicates_flex(
@@ -259,7 +268,7 @@ def test_all_discovered_home_configs_keep_server_catalog_and_receive_resolved_ti
             if " = " in line
         }
         assert "model_catalog_json" not in values
-        assert values["service_tier"] == "flex"
+        assert values["service_tier"] == "default"
     assert (root / "effective-codex-model-catalog.json").is_file()
 
 
@@ -748,7 +757,7 @@ def test_committed_transaction_keeps_backup_journal_for_retry_then_second_update
 
     assert json.loads(journal.read_text(encoding="utf-8"))["phase"] == "committed"
     assert backup.is_file()
-    assert 'service_tier = "flex"' in config.read_text(encoding="utf-8")
+    assert 'service_tier = "default"' in config.read_text(encoding="utf-8")
     first_published = pricing_inventory._read_current_generation(root)
     assert first_published is not None and (root / first_published).is_dir()
 

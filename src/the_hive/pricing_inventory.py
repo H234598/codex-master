@@ -746,29 +746,42 @@ def _home_service_tier(
     config: Path, catalogs: list[dict[str, object]], eligible_flex: set[str]
 ) -> tuple[str, str]:
     """Return a tier and an audit reason for one concrete Codex home."""
+    del catalogs, eligible_flex
+    configured_tier = None
     for line in config.read_text(encoding="utf-8").splitlines():
         match = SERVICE_TIER_LINE_RE.fullmatch(line)
-        if match is not None and match["value"] == "default":
-            return "default", "explicit_default_service_tier"
-    catalog = _cache_for_config(config, catalogs)
-    model_id = _configured_model(config)
-    if not catalog or not catalog.get("fresh"):
-        return "flex", "model_cache_missing_or_stale"
-    entries = catalog.get("models", [])
-    model = next(
-        (entry for entry in entries if isinstance(entry, dict) and entry.get("id") == model_id),
-        None,
-    )
-    if not model:
-        return "flex", "model_missing_from_home_cache"
-    tiers = model.get("service_tiers", [])
-    if model_id in eligible_flex:
-        return "flex", "documented_flex_evidence"
-    if isinstance(tiers, list) and "flex" in tiers:
-        return "flex", "home_cache_flex_without_documented_evidence"
-    if isinstance(tiers, list) and tiers:
-        return "flex", "home_cache_denies_flex"
-    return "flex", "home_cache_has_no_service_tier"
+        if match is not None:
+            configured_tier = match["value"]
+            break
+    if configured_tier == "default":
+        return "default", "explicit_default_service_tier"
+    if configured_tier == "flex" and _home_auth_mode(config.parent) == "api":
+        return "flex", "explicit_api_flex_service_tier"
+    return "default", "standard_service_tier"
+
+
+def _home_auth_mode(home: Path) -> str:
+    """Inspect only the transport discriminator; never return credential data."""
+    path = home / "auth.json"
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 1024 * 1024:
+            return "unknown"
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino, opened.st_size) != (
+                metadata.st_dev, metadata.st_ino, metadata.st_size
+            ):
+                return "unknown"
+            data = os.read(fd, 1024 * 1024 + 1)
+        finally:
+            os.close(fd)
+        document = json.loads(data)
+        return "api" if isinstance(document, dict) and document.get("auth_mode") == "api" else "unknown"
+    except (OSError, ValueError, UnicodeDecodeError):
+        return "unknown"
 
 
 def _plan_codex_config_updates(

@@ -41,14 +41,14 @@ def test_model_policy_loader_rejects_unknown_fields_and_loads_strict_document(tm
 def test_model_policy_loads_resolver_metadata() -> None:
     registry = load_model_policy(Path(__file__).resolve().parents[1] / "codex-model-policy.json")
 
-    sol = registry.get_exact("gpt-5.6-sol")
+    sol = registry.get_exact("gpt-6-sol")
     assert sol is not None
     assert sol.family == "sol"
     assert sol.rank == 40
-    assert sol.reasoning_levels == ("xhigh", "max")
-    assert sol.default_reasoning == "xhigh"
+    assert sol.reasoning_levels == ("low", "medium", "high", "xhigh", "max")
+    assert sol.default_reasoning == "medium"
     assert sol.spawn_behavior == "manual"
-    assert {item["family"] for item in registry.public()} == {"luna", "terra", "sol"}
+    assert {item["family"] for item in registry.public()} == {"luna", "sol", "astra"}
 
 
 def test_model_policy_bytes_loader_matches_the_strict_path_loader() -> None:

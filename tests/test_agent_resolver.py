@@ -175,9 +175,10 @@ def runtime_model_invocability_evidence() -> UsageEvidenceV2:
                 )
                 for model_id in (
                     "gpt-5.3-codex-spark",
-                    "gpt-5.6-luna",
-                    "gpt-5.6-terra",
-                    "gpt-5.6-sol",
+                    "gpt-6-luna",
+                    "gpt-6-sol",
+                    "gpt-6.1-sol",
+                    "gpt-6-astra",
                 )
             ),
         ),
@@ -485,7 +486,7 @@ def test_root_catalog_goettin_defaults_to_persistent_sol_max_red_then_green() ->
     )
 
     assert (decision.class_id, decision.lifecycle, decision.model, decision.reasoning) == (
-        "goettin", "persistent", "gpt-5.6-sol", "max"
+        "goettin", "persistent", "gpt-6.1-sol", "max"
     )
     assert decision.fallback is False
 
@@ -825,17 +826,17 @@ def test_checked_in_catalogs_drive_resolver_without_hardcoded_model_ids() -> Non
         available_models={item.model_id for item in models},
     )
 
-    assert (decision.lifecycle, decision.model, decision.reasoning) == ("binding", "gpt-5.6-luna", "high")
+    assert (decision.lifecycle, decision.model, decision.reasoning) == ("binding", "gpt-6-luna", "high")
 
 
 def test_agent_base_args_accepts_catalog_models_and_enforces_max_exception() -> None:
-    terra = agent_base_args("gpt-5.6-terra", "high")
-    assert terra[:2] == ["--model", "gpt-5.6-terra"]
-    assert 'model_reasoning_effort="high"' in terra
+    sol = agent_base_args("gpt-6-sol", "high")
+    assert sol[:2] == ["--model", "gpt-6-sol"]
+    assert 'model_reasoning_effort="high"' in sol
     for class_id, reasoning in (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "max")):
-        assert agent_base_args("gpt-5.6-sol", reasoning, agent_class=class_id)[:2] == ["--model", "gpt-5.6-sol"]
+        assert agent_base_args("gpt-6-sol", reasoning, agent_class=class_id)[:2] == ["--model", "gpt-6-sol"]
     with pytest.raises(AgentError, match=r"^unsupported routed agent tuple$"):
-        agent_base_args("gpt-5.6-sol", "max")
+        agent_base_args("gpt-6-sol", "max")
 
 
 @pytest.mark.parametrize(
@@ -848,7 +849,7 @@ def test_agent_base_args_accepts_catalog_models_and_enforces_max_exception() -> 
         ("gpt-5.6-terra", "max", "gottbiene"),
         ("gpt-5.3-codex-spark", "xhigh", "koenigin"),
         ("gpt-5.6-terra", "high", "teamleiterin"),
-        ("gpt-5.6-sol", "max", "arbeitsbiene"),
+        ("gpt-6-sol", "max", "arbeitsbiene"),
         ("gpt-5.6-sol", "ultra", "gottbiene"),
     ),
 )
@@ -923,10 +924,10 @@ def test_legacy_codex_usage_main_model_is_normalized_to_luna_with_reason() -> No
         role="arbeitsbiene",
     )
 
-    assert decision["model"] == "gpt-5.6-luna"
+    assert decision["model"] == "gpt-6-luna"
     assert decision["model_fallback"] == {
         "requested": "gpt-5.4-mini",
-        "selected": "gpt-5.6-luna",
+        "selected": "gpt-6-luna",
         "reason": "legacy_main_model_replaced",
     }
 
@@ -952,22 +953,22 @@ def test_runtime_resolver_does_not_materialize_attested_spark_id_from_usage_rout
         no_spark = resolve_runtime_agent_selection(
             agent="a1",
             role="arbeitsbiene",
-            routing={"decision": "main", "model": "gpt-5.6-luna"},
+            routing={"decision": "main", "model": "gpt-6-luna"},
             task_profile=runtime_profile(),
         )
 
     assert (simple.class_id, simple.model, simple.reasoning) == (
         "arbeitsbiene",
-        "gpt-5.6-luna",
+        "gpt-6-luna",
         "medium",
     )
     assert (complex_job.class_id, complex_job.model, complex_job.reasoning) == (
         "spezialistin",
-        "gpt-5.6-luna",
+        "gpt-6-luna",
         "high",
     )
     assert (no_spark.class_id, no_spark.model, no_spark.reasoning) == (
-        "arbeitsbiene", "gpt-5.6-luna", "medium",
+        "arbeitsbiene", "gpt-6-luna", "medium",
     )
     assert "default_model_unavailable" in simple.reason_codes
     assert "default_model_unavailable" in no_spark.reason_codes
@@ -1073,7 +1074,7 @@ def test_unbound_leadership_request_remains_filtered_by_principal_authority() ->
         decision = resolve_runtime_agent_selection(
             agent="a1",
             role="exploriererin",
-            routing={"decision": "main", "model": "gpt-5.6-sol"},
+            routing={"decision": "main", "model": "gpt-6-sol"},
             task_profile=runtime_profile(
                 complexity_override=TaskComplexity.COMPLEX,
                 scope_kind="read",
@@ -1082,7 +1083,7 @@ def test_unbound_leadership_request_remains_filtered_by_principal_authority() ->
             authority_class="teamleiterin",
         )
     assert decision.class_id != "teamleiterin"
-    assert decision.model != "gpt-5.6-sol"
+    assert decision.model != "gpt-6-sol"
     assert decision.fallback is True
     assert "requested_class_unavailable" in decision.reason_codes
 
@@ -1098,7 +1099,7 @@ def test_runtime_missing_class_auto_selects_specialist_for_complex_teamlead_work
         decision = resolve_runtime_agent_selection(
             agent="a1",
             role="arbeitsbiene",
-            routing={"decision": "main", "model": "gpt-5.6-luna"},
+            routing={"decision": "main", "model": "gpt-6-luna"},
             task_profile=runtime_profile(complexity_override=TaskComplexity.COMPLEX),
             requested_class=None,
             authority_class="teamleiterin",
@@ -1119,7 +1120,7 @@ def test_bound_teamlead_selection_keeps_persistent_terra_xhigh_defaults() -> Non
         decision = resolve_runtime_agent_selection(
             agent="a1",
             role="arbeitsbiene",
-            routing={"decision": "main", "model": "gpt-5.6-sol"},
+            routing={"decision": "main", "model": "gpt-6-sol"},
             task_profile=runtime_profile(),
             requested_class="teamleiterin",
             authority_class=None,
@@ -1127,6 +1128,6 @@ def test_bound_teamlead_selection_keeps_persistent_terra_xhigh_defaults() -> Non
     assert (decision.class_id, decision.lifecycle, decision.model, decision.reasoning) == (
         "teamleiterin",
         "persistent",
-        "gpt-5.6-terra",
+        "gpt-6-sol",
         "xhigh",
     )

@@ -1,0 +1,287 @@
+#!/usr/bin/python3
+import argparse
+import ctypes
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import stat
+import tempfile
+
+
+ABI = "/usr/local/libexec/the-hive/hook-abi/v1/launcher"
+TRIO = {
+    "launcher": ("bin/the-hive-plugin-hook-stable", 0o755),
+    "companion": ("src/the_hive/hook_session_pin_store.py", 0o644),
+    "core": ("src/the_hive/hook_abi_v1_core.py", 0o644),
+}
+HOOKS = {
+    "native_bee_event": "TheHivePluginBundleV1/hooks/native_bee_event.py",
+    "native_spawn_admission": "TheHivePluginBundleV1/hooks/native_spawn_admission.py",
+}
+
+
+class GateError(ValueError):
+    pass
+
+
+def _need(condition, reason="hook_abi_gate_invalid"):
+    if not condition:
+        raise GateError(reason)
+
+
+def _sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _json(raw):
+    def unique(pairs):
+        value = dict(pairs)
+        _need(len(value) == len(pairs))
+        return value
+
+    try:
+        return json.loads(raw.decode("ascii"), object_pairs_hook=unique)
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise GateError("hook_abi_gate_invalid") from exc
+
+
+def _canonical(value):
+    return (json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def _directory(fd, name, uid, gid=None, mode=None):
+    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+    item = os.fstat(child)
+    if not (item.st_uid == uid and
+            (gid is None or item.st_gid == gid) and
+            (mode is None or stat.S_IMODE(item.st_mode) == mode) and
+            not stat.S_IMODE(item.st_mode) & 0o022):
+        os.close(child)
+        raise GateError("hook_abi_gate_untrusted_directory")
+    return child
+
+
+def _absolute(path, uid, gid=None, mode=None):
+    _need(path.is_absolute() and ".." not in path.parts)
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            ancestor = os.fstat(fd)
+            _need(ancestor.st_uid in (0, uid) and
+                  (ancestor.st_uid != 0 or ancestor.st_gid == 0) and
+                  not stat.S_IMODE(ancestor.st_mode) & 0o022)
+        item = os.fstat(fd)
+        _need(item.st_uid == uid and
+              (gid is None or item.st_gid == gid) and
+              (mode is None or stat.S_IMODE(item.st_mode) == mode) and
+              not stat.S_IMODE(item.st_mode) & 0o022)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read(fd, relative, uid, mode, gid=None, dir_mode=0o700):
+    parts = relative.split("/")
+    _need(all(part and part not in (".", "..") for part in parts))
+    directory = os.dup(fd)
+    try:
+        for part in parts[:-1]:
+            child = _directory(directory, part, uid, gid, dir_mode)
+            os.close(directory)
+            directory = child
+        source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+        try:
+            before = os.fstat(source)
+            _need(stat.S_ISREG(before.st_mode) and before.st_uid == uid and
+                  (gid is None or before.st_gid == gid) and before.st_nlink == 1 and
+                  stat.S_IMODE(before.st_mode) == mode and 0 < before.st_size <= 2 * 1024 * 1024)
+            with os.fdopen(os.dup(source), "rb") as stream:
+                raw = stream.read(before.st_size + 1)
+            after = os.fstat(source)
+            # stat_result[:7] is mode, inode, device, links, uid, gid, size.
+            _need(len(raw) == before.st_size and before[:7] == after[:7] and
+                  before.st_mtime_ns == after.st_mtime_ns and
+                  before.st_ctime_ns == after.st_ctime_ns)
+            return raw
+        finally:
+            os.close(source)
+    finally:
+        os.close(directory)
+
+
+def _payload(home, uid, generation, pin):
+    release_fd = _absolute(home / ".local/lib/the-hive-runtime", uid, mode=0o700)
+    try:
+        generations = _directory(release_fd, "generations", uid, mode=0o700)
+        try:
+            generation_fd = _directory(generations, generation, uid, mode=0o700)
+        finally:
+            os.close(generations)
+        try:
+            return _generation_payload(release_fd, generation_fd, uid, generation, pin)
+        finally:
+            os.close(generation_fd)
+    finally:
+        os.close(release_fd)
+
+
+def _generation_payload(release_fd, generation_fd, uid, generation, pin):
+    pointers = _json(_read(release_fd, ".the-hive-release-pointers.json", uid, 0o644))
+    _need(isinstance(pointers, dict) and set(pointers) == {"schema_version", "current", "previous"} and
+          pointers["schema_version"] == 1 and pointers["current"] ==
+          {"generation": generation, "manifest_digest": pin})
+    manifest_raw = _read(generation_fd, ".the-hive-runtime-manifest.json", uid, 0o644)
+    _need("sha256:" + _sha(manifest_raw) == pin, "hook_abi_gate_pin_mismatch")
+    manifest = _json(manifest_raw)
+    _need(isinstance(manifest, dict) and manifest.get("schema_version") == 2 and
+          manifest.get("generation") == generation and isinstance(manifest.get("files"), dict))
+    files = manifest["files"]
+
+    def member(path, mode):
+        entry = files.get(path)
+        _need(isinstance(entry, dict) and entry.get("mode") == mode and entry.get("nlink") == 1)
+        raw = _read(generation_fd, path, uid, mode)
+        _need(len(raw) == entry.get("size") and _sha(raw) == entry.get("sha256"))
+        return raw, "sha256:" + entry["sha256"]
+
+    sources = {key: member(path, mode) for key, (path, mode) in TRIO.items()}
+    hooks = {key: member(path, 0o644)[1] for key, path in HOOKS.items()}
+    plan = {"schema": "RootInstallPlanV1", "plugin_id": "the-hive",
+            "generation": generation, "runtime_manifest_digest": pin}
+    targets = {"launcher": ABI, "companion": ABI.replace("/launcher", "/hook_session_pin_store.py"),
+               "core": ABI.replace("/launcher", "/hook_abi_v1_core.py")}
+    for key, (path, _mode) in TRIO.items():
+        plan[key] = {"source": path, "target": targets[key], "sha256": sources[key][1]}
+    plan_raw = _canonical(plan)
+    _need(_read(generation_fd, "root-install-plan.json", uid, 0o644) == plan_raw)
+    descriptor = {"schema": "TheHivePluginBundleV1", "plugin_id": "the-hive",
+                  "generation": generation, "runtime_manifest_digest": pin,
+                  "launcher_abi": ABI, "hooks": hooks}
+    descriptor_raw = _canonical(descriptor)
+    _need(_read(generation_fd, "TheHivePluginBundleV1/release-binding.json", uid, 0o644) == descriptor_raw)
+    allowlist = {"schema": "D320DispatchAllowlistV1", "plugin_id": "the-hive",
+                 "generation": generation, "runtime_manifest_digest": pin,
+                 "launcher_abi": ABI, "descriptor_sha256": "sha256:" + _sha(descriptor_raw),
+                 "root_install_plan_sha256": "sha256:" + _sha(plan_raw), "hooks": hooks}
+    return {"launcher": sources["launcher"][0],
+            "hook_session_pin_store.py": sources["companion"][0],
+            "hook_abi_v1_core.py": sources["core"][0],
+            "allowlists/" + _sha(descriptor_raw) + ".json": _canonical(allowlist)}
+
+
+def _existing(parent, payload, uid, gid, name="v1"):
+    root = _directory(parent, name, uid, gid, 0o755)
+    try:
+        _need(set(os.listdir(root)) == {"launcher", "hook_session_pin_store.py",
+                                          "hook_abi_v1_core.py", "allowlists"})
+        allow = _directory(root, "allowlists", uid, gid, 0o755)
+        try:
+            _need(set(os.listdir(allow)) ==
+                  {next(k.split("/")[1] for k in payload if k.startswith("allowlists/"))})
+        finally:
+            os.close(allow)
+        for path, raw in payload.items():
+            _need(_read(root, path, uid, 0o755 if path == "launcher" else 0o644,
+                        gid, 0o755) == raw)
+    finally:
+        os.close(root)
+
+
+def _publish(parent, payload, uid, gid, verify):
+    _need(not any(name.startswith(".v1.stage-") for name in os.listdir(parent)),
+          "hook_abi_gate_stale_stage_hold")
+    stage = tempfile.mkdtemp(prefix=".v1.stage-", dir=f"/proc/self/fd/{parent}")
+    name = Path(stage).name
+    visible = False
+    try:
+        root = _directory(parent, name, uid, gid, 0o700)
+        try:
+            os.mkdir("allowlists", 0o755, dir_fd=root)
+            allow = _directory(root, "allowlists", uid, gid)
+            try:
+                os.fchmod(allow, 0o755)
+                for path, raw in payload.items():
+                    directory = allow if path.startswith("allowlists/") else root
+                    target = path.split("/")[-1]
+                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                 0o755 if path == "launcher" else 0o644, dir_fd=directory)
+                    try:
+                        os.fchown(fd, uid, gid)
+                        os.fchmod(fd, 0o755 if path == "launcher" else 0o644)
+                        view = memoryview(raw)
+                        while view:
+                            view = view[os.write(fd, view):]
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                os.fsync(allow)
+            finally:
+                os.close(allow)
+            os.fchmod(root, 0o755)
+            os.fsync(root)
+        finally:
+            os.close(root)
+        _existing(parent, payload, uid, gid, name)
+        _need(verify() == payload, "hook_abi_gate_source_changed")
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.renameat2(parent, name.encode(), parent, b"v1", 1):
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        visible = True
+        try:
+            os.fsync(parent)
+        except OSError as exc:
+            raise GateError("hook_abi_gate_publish_durability_unknown") from exc
+    finally:
+        if not visible:
+            candidate = Path(f"/proc/self/fd/{parent}") / name
+            if candidate.is_dir() and not candidate.is_symlink():
+                shutil.rmtree(candidate)
+
+
+def install(home, uid, generation, pin, *, parent_path=Path("/usr/local/libexec/the-hive/hook-abi"), root_uid=0, root_gid=0):
+    _need(isinstance(uid, int) and uid > 0 and re.fullmatch("[0-9a-f]{40}", generation) is not None and
+          re.fullmatch("sha256:[0-9a-f]{64}", pin) is not None)
+    payload = _payload(home, uid, generation, pin)
+    parent = _absolute(parent_path, root_uid, root_gid, mode=0o755)
+    try:
+        try:
+            os.stat("v1", dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            _publish(parent, payload, root_uid, root_gid,
+                     lambda: _payload(home, uid, generation, pin))
+            return "installed"
+        else:
+            _existing(parent, payload, root_uid, root_gid)
+            return "already_installed"
+    finally:
+        os.close(parent)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--uid", type=int, required=True)
+    parser.add_argument("--generation", required=True)
+    parser.add_argument("--manifest-sha256", required=True)
+    args = parser.parse_args()
+    try:
+        _need(os.geteuid() == 0 and os.getegid() == 0, "hook_abi_gate_root_required")
+        home = Path(pwd.getpwuid(args.uid).pw_dir)
+        status = install(home, args.uid, args.generation, args.manifest_sha256)
+    except (GateError, OSError, KeyError) as exc:
+        print(json.dumps({"status": str(exc)}))
+        return 1
+    print(json.dumps({"status": status}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

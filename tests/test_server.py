@@ -1122,6 +1122,10 @@ def attested_codex_model_reader_for_test(
         "gpt-5.6-luna",
         "gpt-5.6-terra",
         "gpt-5.6-sol",
+        "gpt-6-luna",
+        "gpt-6-sol",
+        "gpt-6.1-sol",
+        "gpt-6-astra",
     ),
 ) -> Iterator[UsageEvidenceV2]:
     """Supply explicit account/model/codex-cli capability evidence to one fixture."""
@@ -17275,7 +17279,7 @@ google_accounts:
     ) -> None:
         descriptor = server_module.AgentDescriptor(
             "a", "a", 1, "A", server_module.RunnerKind.CODEX_CLI,
-            server_module.Provider.OPENAI_CHATGPT, "gpt-5.6-luna", "d254-offer-a",
+            server_module.Provider.OPENAI_CHATGPT, "gpt-6-luna", "d254-offer-a",
             Path("/tmp/d254-offer-a"), "d254-offer-a", True, Path("/tmp/d254-codex"),
         )
         inventory = server_module.InventorySnapshot(
@@ -17313,7 +17317,7 @@ google_accounts:
     ) -> None:
         descriptor = server_module.AgentDescriptor(
             "a1", "a", 1, "A1", server_module.RunnerKind.CODEX_CLI,
-            server_module.Provider.OPENAI_CHATGPT, "gpt-5.6-luna", "d254-offer-a1",
+            server_module.Provider.OPENAI_CHATGPT, "gpt-6-luna", "d254-offer-a1",
             Path("/tmp/d254-offer-a1"), "d254-offer-a1", True, Path("/tmp/d254-codex"),
         )
         inventory = server_module.InventorySnapshot(
@@ -17332,7 +17336,7 @@ google_accounts:
         teamleader_options = [option for option in result["options"] if option["class"] == "teamleiterin"]
         self.assertEqual(
             teamleader_options,
-            [{"class": "teamleiterin", "lifecycle": "persistent", "model": "gpt-5.6-terra", "reasoning": "xhigh"}],
+            [{"class": "teamleiterin", "lifecycle": "persistent", "model": "gpt-6-sol", "reasoning": "xhigh"}],
         )
         self.assertTrue({"koenigin", "gottbiene", "goettin"}.isdisjoint(result["classes"]))
 
@@ -17350,9 +17354,9 @@ google_accounts:
     def test_runtime_selection_filters_leadership_spoofing_by_bound_authority(self) -> None:
         available_models = {
             "gpt-5.3-codex-spark",
-            "gpt-5.6-luna",
-            "gpt-5.6-terra",
-            "gpt-5.6-sol",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
         }
         with patch.object(
             server_module,
@@ -17412,9 +17416,9 @@ google_accounts:
             "available_model_ids_for_routing",
             return_value={
                 "gpt-5.3-codex-spark",
-                "gpt-5.6-luna",
-                "gpt-5.6-terra",
-                "gpt-5.6-sol",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol",
             },
         ):
             decision = server_module.resolve_runtime_agent_selection(
@@ -17433,9 +17437,9 @@ google_accounts:
             "available_model_ids_for_routing",
             return_value={
                 "gpt-5.3-codex-spark",
-                "gpt-5.6-luna",
-                "gpt-5.6-terra",
-                "gpt-5.6-sol",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol",
             },
         ):
             decision = server_module.resolve_runtime_agent_selection(
@@ -17448,7 +17452,7 @@ google_accounts:
 
         self.assertEqual(
             (decision.class_id, decision.lifecycle, decision.model, decision.reasoning),
-            ("gottbiene", "persistent", "gpt-5.6-sol", "max"),
+            ("gottbiene", "persistent", "gpt-6.1-sol", "max"),
         )
 
     def test_verified_rpc_binds_teamleader_principal_to_tool_call(self) -> None:
@@ -17720,7 +17724,7 @@ google_accounts:
                         False,
                         True,
                     )
-                    for model_id in ("gpt-5.3-codex-spark", "gpt-5.6-luna")
+                    for model_id in ("gpt-5.3-codex-spark", "gpt-6-luna")
                 ),
             ),
         )
@@ -17748,7 +17752,7 @@ google_accounts:
                             account_id="account-a1",
                             runner=server_module.RunnerKind.CODEX_CLI,
                             provider=server_module.Provider.OPENAI_CHATGPT,
-                            model="gpt-5.6-luna",
+                            model="gpt-6-luna",
                             series_prefix="a",
                             skill_profile="arbeitsbiene",
                         )
@@ -17780,7 +17784,7 @@ google_accounts:
                 root_cause_known=True,
             )
 
-        self.assertEqual(result["model"], "gpt-5.6-luna")
+        self.assertEqual(result["model"], "gpt-6-luna")
         self.assertTrue(result["task_profile"]["spark_eligible"])
         self.assertIn("default_model_unavailable", result["selection"]["reason_codes"])
         self.assertEqual(
@@ -17903,7 +17907,7 @@ google_accounts:
             descriptor.account_id = f"d254-{descriptor.agent_id}"
             descriptor.runner = server_module.RunnerKind.CODEX_CLI
             descriptor.provider = server_module.Provider.OPENAI_CHATGPT
-            descriptor.model = "gpt-5.6-luna"
+            descriptor.model = "gpt-6-luna"
             inventory = SimpleNamespace(
                 agents={descriptor.agent_id: descriptor},
                 agent_ids=(descriptor.agent_id,),
@@ -17986,7 +17990,7 @@ google_accounts:
                     result["selection"]["class"],
                     {"teamleiterin", "koenigin", "gottbiene"},
                 )
-                self.assertNotEqual(result["model"], "gpt-5.6-sol")
+                self.assertNotEqual(result["model"], "gpt-6-sol")
 
         teamleader_q = assign_with(
             SimpleNamespace(
@@ -18003,7 +18007,7 @@ google_accounts:
                 teamleader_q["model"],
                 teamleader_q["model_reasoning_effort"],
             ),
-            ("spezialistin", "binding", "gpt-5.6-luna", "high"),
+            ("spezialistin", "binding", "gpt-6-luna", "high"),
         )
 
         queen_to_a1 = assign_with(
@@ -18016,7 +18020,7 @@ google_accounts:
             agent_class="teamleiterin",
             role="exploriererin",
             lifecycle="persistent",
-            requested_model="gpt-5.6-terra",
+            requested_model="gpt-6-sol",
             requested_reasoning="xhigh",
         )
         self.assertEqual(
@@ -18026,7 +18030,7 @@ google_accounts:
                 queen_to_a1["model"],
                 queen_to_a1["model_reasoning_effort"],
             ),
-            ("teamleiterin", "persistent", "gpt-5.6-terra", "xhigh"),
+            ("teamleiterin", "persistent", "gpt-6-sol", "xhigh"),
         )
 
     def test_mcp_tool_call_enforces_schema_value_types_and_bounds(self) -> None:
@@ -25405,7 +25409,7 @@ google_accounts:
             "hi",
             lease={"state": "held", "held_by_this_server": True},
             release_lease_on_failure=True,
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             model_reasoning_effort="medium",
             agent_class="arbeitsbiene",
         )
@@ -25706,7 +25710,7 @@ google_accounts:
                     "a",
                     cwd=str(root),
                     lease={"state": "held"},
-                    model="gpt-5.6-terra",
+                    model="gpt-6-sol",
                     model_reasoning_effort="xhigh",
                     agent_class="arbeitsbiene",
                 )
@@ -26011,7 +26015,7 @@ google_accounts:
             )
             descriptor = dataclass_replace(
                 legacy_descriptor,
-                model="gpt-5.6-luna",
+                model="gpt-6-luna",
                 skill_profile="generic",
                 account_id="d254-a3",
             )
@@ -26167,7 +26171,7 @@ google_accounts:
                     "a3",
                     cwd=str(root),
                     lease={"state": "held"},
-                    model="gpt-5.6-luna",
+                    model="gpt-6-luna",
                     model_reasoning_effort="xhigh",
                     agent_class="arbeitsbiene",
                     confirm_home_refresh=True,
@@ -26176,14 +26180,14 @@ google_accounts:
             refreshed = json.loads(marker_path.read_text(encoding="utf-8"))
             refreshed_config = server_module.tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
             self.assertEqual(result["status"], "started")
-            self.assertEqual(refreshed["model"], "gpt-5.6-luna")
+            self.assertEqual(refreshed["model"], "gpt-6-luna")
             self.assertEqual(refreshed["runtime_skill_profile"], "worker")
             self.assertEqual(
                 refreshed_config["model_catalog_json"],
                 str(root / "effective-codex-model-catalog.json"),
             )
-            self.assertEqual(refreshed_config["service_tier"], "flex")
-            self.assertEqual(refreshed_config["model"], "gpt-5.6-luna")
+            self.assertEqual(refreshed_config["service_tier"], "default")
+            self.assertEqual(refreshed_config["model"], "gpt-6-luna")
             self.assertEqual(refreshed_config["model_reasoning_effort"], "xhigh")
             self.assertFalse(refreshed_config["tui"]["animations"])
             self.assertEqual(refreshed_config["projects"][str(root)], {"trust_level": "trusted"})
@@ -27579,17 +27583,40 @@ google_accounts:
             allow_unauthenticated=True,
         )
 
-    def test_agent_base_args_flex_tier_invariant(self) -> None:
-        args_auto = server_module.agent_base_args("gpt-5.6-sol", "xhigh", service_tier="auto")
-        self.assertIn('service_tier="flex"', args_auto)
+    def test_agent_base_args_standard_tier_and_explicit_flex(self) -> None:
+        args_auto = server_module.agent_base_args("gpt-6-sol", "xhigh", service_tier="auto")
+        self.assertIn('service_tier="default"', args_auto)
+        args_default = server_module.agent_base_args("gpt-6-sol", "xhigh", service_tier="default")
+        self.assertIn('service_tier="default"', args_default)
+        args_flex = server_module.agent_base_args("gpt-6-sol", "xhigh", service_tier="flex")
+        self.assertIn('service_tier="flex"', args_flex)
 
         with patch.object(server_module, "_fast_or_emergency_mode_active", return_value=False):
             with self.assertRaises(server_module.AgentError):
-                server_module.agent_base_args("gpt-5.6-sol", "xhigh", service_tier="priority")
+                server_module.agent_base_args("gpt-6-sol", "xhigh", service_tier="priority")
 
         with patch.object(server_module, "_fast_or_emergency_mode_active", return_value=True):
-            args_priority = server_module.agent_base_args("gpt-5.6-sol", "xhigh", service_tier="priority")
+            args_priority = server_module.agent_base_args("gpt-6-sol", "xhigh", service_tier="priority")
             self.assertIn('service_tier="priority"', args_priority)
+
+    def test_agent_service_tier_requires_explicit_api_flex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            config = home / "config.toml"
+            config.write_text('service_tier = "flex"\n', encoding="utf-8")
+            with patch.object(server_module, "agent_config", return_value={"home": home}), patch.object(
+                server_module, "agent_auth_status", return_value={"auth_mode": "api"}
+            ):
+                self.assertEqual(server_module._service_tier_for_agent("a"), "flex")
+                server_module.require_agent_service_tier_transport("a", "flex")
+                config.write_text('service_tier = "default"\n', encoding="utf-8")
+                self.assertEqual(server_module._service_tier_for_agent("a"), "default")
+            with patch.object(server_module, "agent_auth_status", return_value={"auth_mode": "unknown"}):
+                self.assertEqual(server_module._service_tier_for_agent("a"), "default")
+                with self.assertRaisesRegex(
+                    server_module.AgentError, "^flex_transport_unavailable_for_auth_transport$"
+                ):
+                    server_module.require_agent_service_tier_transport("a", "flex")
 
     def test_blocked_emergency_state_does_not_authorize_priority(self) -> None:
         with patch("the_hive.fast_mode.snapshot", return_value={"modes": {}}), patch.object(
@@ -27599,7 +27626,7 @@ google_accounts:
         ):
             self.assertFalse(server_module._fast_or_emergency_mode_active())
 
-    def test_home_refresh_config_flex_tier_invariant(self) -> None:
+    def test_home_refresh_config_standard_tier_and_explicit_default(self) -> None:
         home = Path("/tmp/fake-home")
         refreshed = server_module._home_refresh_config(
             home,
@@ -27607,7 +27634,14 @@ google_accounts:
             model="gpt-5.6-sol",
             reasoning_effort="high",
         )
-        self.assertIn(b'service_tier = "flex"', refreshed)
+        self.assertIn(b'service_tier = "default"', refreshed)
+        explicit = server_module._home_refresh_config(
+            home,
+            b'service_tier = "default"\n',
+            model="gpt-5.6-sol",
+            reasoning_effort="high",
+        )
+        self.assertIn(b'service_tier = "default"', explicit)
 
         with patch.object(server_module, "_fast_or_emergency_mode_active", return_value=False):
             with self.assertRaises(server_module.AgentError):
@@ -27881,7 +27915,7 @@ google_accounts:
         )
         run_tmux_mock.assert_not_called()
 
-    def test_chatgpt_auth_rejects_flex_before_capacity_or_process_spawn(self) -> None:
+    def test_chatgpt_auth_uses_standard_before_capacity_or_process_spawn(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             runner = root / "codex"
@@ -27916,15 +27950,12 @@ google_accounts:
             ), patch("the_hive.server.LEASE_DIR", state / "leases"), patch(
                 "the_hive.server.tmux_alive", return_value=False
             ), patch(
-                "the_hive.server.require_spawn_capacity"
+                "the_hive.server.require_spawn_capacity", side_effect=AgentError("capacity_probe_reached")
             ) as require_capacity, patch("the_hive.server.run_tmux") as run_tmux_mock:
-                with self.assertRaisesRegex(
-                    AgentError,
-                    "^flex_transport_unavailable_for_chatgpt_auth$",
-                ):
+                with self.assertRaisesRegex(AgentError, "^capacity_probe_reached$"):
                     start_agent("a", cwd=tmpdir)
 
-        require_capacity.assert_not_called()
+        require_capacity.assert_called_once()
         run_tmux_mock.assert_not_called()
 
     def test_parallel_new_starts_serialize_admission_without_global_capacity_cap(self) -> None:
@@ -29872,7 +29903,7 @@ google_accounts:
             "schema_version": 1,
             "class": "arbeitsbiene",
             "lifecycle": "ephemeral",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "reasoning": "medium",
             "requested": {
                 "class": "arbeitsbiene",
@@ -29890,7 +29921,7 @@ google_accounts:
             "schema_version": 1,
             "class": "arbeitsbiene",
             "lifecycle": "ephemeral",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "reasoning": "medium",
             "requested": {
                 "class": "arbeitsbiene",
@@ -29990,7 +30021,7 @@ google_accounts:
             "schema_version": 1,
             "class": "arbeitsbiene",
             "lifecycle": "ephemeral",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "reasoning": "medium",
             "requested": {
                 "class": "arbeitsbiene",
@@ -30014,18 +30045,18 @@ google_accounts:
         self.assertNotIn("gpt-5.4-mini", json.dumps(listed, sort_keys=True))
 
     @patch("the_hive.server.ensure_state")
-    def test_assignment_selection_drops_reasoning_without_requested_model(self, _mock_ensure_state) -> None:
+    def test_assignment_selection_drops_unsupported_reasoning_without_requested_model(self, _mock_ensure_state) -> None:
         selection = {
             "schema_version": 1,
             "class": "arbeitsbiene",
             "lifecycle": "ephemeral",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "reasoning": "medium",
             "requested": {
                 "class": "arbeitsbiene",
                 "lifecycle": "invocation",
                 "model": None,
-                "reasoning": "max",
+                "reasoning": "ultra",
             },
             "fallback": True,
             "reason_codes": ["model_defaulted"],
@@ -30042,18 +30073,18 @@ google_accounts:
         self.assertEqual(safe_selection["reason_codes"], ["model_defaulted"])
 
     @patch("the_hive.server.ensure_state")
-    def test_assignment_selection_drops_reasoning_for_unknown_requested_model(self, _mock_ensure_state) -> None:
+    def test_assignment_selection_drops_unsupported_reasoning_for_unknown_requested_model(self, _mock_ensure_state) -> None:
         selection = {
             "schema_version": 1,
             "class": "arbeitsbiene",
             "lifecycle": "ephemeral",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "reasoning": "medium",
             "requested": {
                 "class": "arbeitsbiene",
                 "lifecycle": "invocation",
                 "model": "gpt-5.4-mini",
-                "reasoning": "max",
+                "reasoning": "ultra",
             },
             "fallback": True,
             "reason_codes": ["requested_model_unknown"],
@@ -30189,7 +30220,7 @@ google_accounts:
         assignment_id = payload["assignment_id"]
         self.assertEqual(payload["status"], "assigned")
         self.assertEqual(payload["role"], "exploriererin")
-        self.assertEqual(payload["model"], "gpt-5.6-luna")
+        self.assertEqual(payload["model"], "gpt-6-luna")
         self.assertEqual(payload["write_policy"], "read_only")
         self.assertFalse(payload["subagents_allowed"])
         self.assertEqual(payload["skill"]["requested"], "codex-security:security-scan")
@@ -30205,7 +30236,7 @@ google_accounts:
         self.assertEqual(sent_agent, "a")
         self.assertTrue(sent_enter)
         self.assertIn("[EXPLORER_BEE_TASK]", sent_prompt)
-        self.assertIn("Modell: gpt-5.6-luna", sent_prompt)
+        self.assertIn("Modell: gpt-6-luna", sent_prompt)
         self.assertIn("Skill: codex-security:security-scan", sent_prompt)
         self.assertIn("Darf schreiben: nein", sent_prompt)
         self.assertIn("Darf eigene Subagentinnen starten: nein", sent_prompt)
@@ -30219,7 +30250,7 @@ google_accounts:
         self.assertEqual(record["assignment_id"], assignment_id)
         self.assertEqual(record["agent"], "a")
         self.assertEqual(record["role"], "exploriererin")
-        self.assertEqual(record["model"], "gpt-5.6-luna")
+        self.assertEqual(record["model"], "gpt-6-luna")
         self.assertEqual(record["scope"], ["src/codex_master/server.py"])
         self.assertEqual(record["write_policy"], "read_only")
         self.assertFalse(record["allow_subagents"])
@@ -30810,7 +30841,7 @@ google_accounts:
                 runner_path=home / "codex",
                 runner=server_module.RunnerKind.CODEX_CLI,
                 provider=server_module.Provider.OPENAI_CHATGPT,
-                model="gpt-5.6-luna",
+                model="gpt-6-luna",
                 account_id="d254-q1",
                 enabled=True,
                 skill_profile="teamleiterin",
@@ -30850,7 +30881,7 @@ google_accounts:
                     "the_hive.server.read_meta",
                     return_value={
                         "agent_class": "arbeitsbiene",
-                        "model": "gpt-5.6-luna",
+                        "model": "gpt-6-luna",
                         "model_reasoning_effort": "medium",
                     },
                 ),
@@ -30882,7 +30913,7 @@ google_accounts:
                 result["model_reasoning_effort"],
                 result["model_switch"]["status"],
             ),
-            ("gpt-5.6-luna", "medium", "unchanged"),
+            ("gpt-6-luna", "medium", "unchanged"),
         )
         ensure_model.assert_called_once()
         self.assertIsNone(ensure_model.call_args.kwargs["agent_class"])
@@ -31253,11 +31284,11 @@ google_accounts:
         self.assertFalse(response["result"]["isError"])
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertTrue(payload["subagents_allowed"])
-        self.assertEqual(payload["model"], "gpt-5.6-luna")
+        self.assertEqual(payload["model"], "gpt-6-luna")
         self.assertEqual(payload["write_policy"], "explicit_paths_only")
         sent_prompt = mock_send_agent.call_args.args[1]
         self.assertIn("[WORK_BEE_TASK]", sent_prompt)
-        self.assertIn("Modell: gpt-5.6-luna", sent_prompt)
+        self.assertIn("Modell: gpt-6-luna", sent_prompt)
         self.assertIn("Darf eigene Subagentinnen starten: ja, nur innerhalb Scope und Schreibpfaden", sent_prompt)
 
     def test_agent_assign_enforces_role_write_and_skill_boundaries(self) -> None:
@@ -33727,7 +33758,7 @@ class CliLifecycleTest(unittest.TestCase):
                     account_id="d254-cli-a1",
                     runner=server_module.RunnerKind.CODEX_CLI,
                     provider=server_module.Provider.OPENAI_CHATGPT,
-                    model="gpt-5.6-luna",
+                    model="gpt-6-luna",
                 )
             },
             agent_ids=("a1",),
@@ -33747,7 +33778,7 @@ class CliLifecycleTest(unittest.TestCase):
             "--lifecycle",
             "persistent",
             "--model",
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             "--reasoning-effort",
             "xhigh",
             "--allow-unauthenticated",
@@ -33791,7 +33822,7 @@ class CliLifecycleTest(unittest.TestCase):
                 "the_hive.server.read_meta",
                 return_value={
                     "agent_class": "arbeitsbiene",
-                    "model": "gpt-5.6-luna",
+                    "model": "gpt-6-luna",
                     "model_reasoning_effort": "xhigh",
                     "cwd": "/tmp",
                 },
@@ -33814,7 +33845,7 @@ class CliLifecycleTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         assignment = mock_print_json.call_args.args[0]
-        self.assertEqual(assignment["model"], "gpt-5.6-luna")
+        self.assertEqual(assignment["model"], "gpt-6-luna")
         self.assertEqual(assignment["model_reasoning_effort"], "xhigh")
         self.assertEqual(
             (
@@ -33823,7 +33854,7 @@ class CliLifecycleTest(unittest.TestCase):
                 assignment["selection"]["model"],
                 assignment["selection"]["reasoning"],
             ),
-            ("arbeitsbiene", "persistent", "gpt-5.6-luna", "xhigh"),
+            ("arbeitsbiene", "persistent", "gpt-6-luna", "xhigh"),
         )
         self.assertEqual(assignment["model_switch"]["status"], "unchanged")
         reserve.assert_not_called()
