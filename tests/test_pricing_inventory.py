@@ -115,10 +115,68 @@ def test_update_promotes_documented_api_flex_sol_when_home_cache_only_has_priori
     service_tiers = _catalog_model(effective)["service_tiers"]
     assert [tier["id"] for tier in service_tiers] == ["priority", "flex"]
     assert config.read_text(encoding="utf-8").splitlines()[:2] == [
-        f'model_catalog_json = "{effective}"',
         'service_tier = "flex"',
+        'model = "gpt-5.6-sol"',
     ]
     assert generation.is_dir()
+
+
+def test_update_does_not_replace_codex_server_model_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    config = _write_home(home, tiers=["priority"])
+    monkeypatch.setenv("HOME", str(home))
+    _stub_external_sources(monkeypatch, pricing="gpt-5.6-sol: Flex Processing")
+
+    pricing_inventory.update(tmp_path / "inventory")
+
+    text = config.read_text(encoding="utf-8")
+    assert "model_catalog_json" not in text
+    assert 'service_tier = "flex"' in text
+
+
+def test_update_removes_its_previous_model_catalog_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    config = _write_home(home, tiers=["priority"])
+    root = tmp_path / "inventory"
+    managed_catalog = root / "effective-codex-model-catalog.json"
+    config.write_text(
+        f'model_catalog_json = "{managed_catalog}"\nmodel = "gpt-5.6-sol"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    _stub_external_sources(monkeypatch, pricing="gpt-5.6-sol: Flex Processing")
+
+    pricing_inventory.update(root)
+
+    text = config.read_text(encoding="utf-8")
+    assert "model_catalog_json" not in text
+    assert 'service_tier = "flex"' in text
+
+
+def test_update_preserves_unrelated_custom_model_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    config = _write_home(home, tiers=["priority"])
+    custom_catalog = tmp_path / "custom-models.json"
+    custom_catalog.write_text("{}\n", encoding="utf-8")
+    config.write_text(
+        f'model_catalog_json = "{custom_catalog}"\nmodel = "gpt-5.6-sol"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    _stub_external_sources(monkeypatch, pricing="gpt-5.6-sol: Flex Processing")
+
+    pricing_inventory.update(tmp_path / "inventory")
+
+    assert (
+        f'model_catalog_json = "{custom_catalog}"'
+        in config.read_text(encoding="utf-8")
+    )
 
 
 def test_update_does_not_promote_model_without_documented_flex_evidence(
@@ -167,7 +225,7 @@ def test_effective_catalog_preserves_existing_tiers_and_never_duplicates_flex(
     assert [tier["id"] for tier in model["service_tiers"]].count("flex") == 1
 
 
-def test_all_discovered_home_configs_receive_same_stable_catalog_and_resolved_tier(
+def test_all_discovered_home_configs_keep_server_catalog_and_receive_resolved_tier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
@@ -188,17 +246,15 @@ def test_all_discovered_home_configs_receive_same_stable_catalog_and_resolved_ti
     root = tmp_path / "inventory"
     pricing_inventory.update(root)
 
-    catalog_paths = set()
     for config in configs:
         values = {
             line.split(" = ", 1)[0]: line.split(" = ", 1)[1].strip('"')
             for line in config.read_text(encoding="utf-8").splitlines()
             if " = " in line
         }
-        catalog_paths.add(values["model_catalog_json"])
+        assert "model_catalog_json" not in values
         assert values["service_tier"] == "flex"
-    assert catalog_paths == {str(root / "effective-codex-model-catalog.json")}
-    assert Path(next(iter(catalog_paths))).is_file()
+    assert (root / "effective-codex-model-catalog.json").is_file()
 
 
 def test_fetch_builds_fixed_request_and_decodes_response(

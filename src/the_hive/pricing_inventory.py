@@ -781,13 +781,14 @@ def _plan_codex_config_updates(
             lines = text.splitlines()
             updated: list[str] = []
             for line in lines:
-                if re.match(r"^\s*(?:model_catalog_json|service_tier)\s*=", line):
+                catalog_match = MODEL_CATALOG_JSON_LINE_RE.fullmatch(line)
+                if SERVICE_TIER_LINE_RE.fullmatch(line) or (
+                    catalog_match is not None
+                    and catalog_match["value"] == str(catalog)
+                ):
                     continue
                 updated.append(line)
-            updated[0:0] = [
-                f"model_catalog_json = {json.dumps(str(catalog), ensure_ascii=False)}",
-                f'service_tier = "{tier}"',
-            ]
+            updated.insert(0, f'service_tier = "{tier}"')
             new_text = "\n".join(updated) + "\n"
             plans.append({
                 "path": path,
