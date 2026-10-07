@@ -472,6 +472,7 @@ def agent_base_args(
     ):
         raise AgentError("unsupported routed agent tuple")
     return [
+        "--no-daemon",
         "--model",
         model,
         "-c",
@@ -8601,6 +8602,177 @@ def _managed_codex_home(home: Path) -> Path:
     return home
 
 
+# Codex CLI 0.161's home-local shared-server artifacts. Presence alone is a
+# stop condition: a stale PID or socket is not ours to resolve or clean up.
+_MANAGED_CODEX_DAEMON_ARTIFACTS = (
+    ("app-server-daemon", "daemon.pid"),
+    ("app-server-daemon", "daemon-updater.pid"),
+    ("app-server-daemon", "daemon-updater.sock"),
+    ("ipc", "ipc.sock"),
+)
+
+
+def _managed_codex_daemon_artifact_snapshot(
+    home_fd: int,
+    flags: int,
+    previous: Mapping[str, os.stat_result | None] | None = None,
+) -> dict[str, os.stat_result | None]:
+    """Inspect only pinned home children and reject changed parent identity."""
+
+    error = "managed_codex_daemon_home_unknown"
+    snapshot: dict[str, os.stat_result | None] = {}
+    for directory in ("app-server-daemon", "ipc"):
+        directory_fd = -1
+        try:
+            try:
+                directory_fd = os.open(directory, flags, dir_fd=home_fd)
+            except FileNotFoundError:
+                # A dangling symlink is present, not an absent directory.
+                try:
+                    os.stat(directory, dir_fd=home_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    snapshot[directory] = None
+                    continue
+                raise AgentError(error) from None
+            opened = os.fstat(directory_fd)
+            _fleet_private_directory_stat(opened, error)
+            for parent, artifact in _MANAGED_CODEX_DAEMON_ARTIFACTS:
+                if parent != directory:
+                    continue
+                try:
+                    os.stat(artifact, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise AgentError("managed_codex_daemon_artifact_present")
+            for observed in (
+                os.fstat(directory_fd),
+                os.stat(directory, dir_fd=home_fd, follow_symlinks=False),
+            ):
+                _fleet_private_directory_stat(observed, error)
+                if not source_identity_with_snapshot_matches(observed, opened):
+                    raise AgentError(error)
+            snapshot[directory] = opened
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError(error) from exc
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+    if previous is not None:
+        for directory, before in previous.items():
+            after = snapshot[directory]
+            if (before is None) != (after is None) or (
+                before is not None
+                and after is not None
+                and not source_identity_with_snapshot_matches(after, before)
+            ):
+                raise AgentError(error)
+    return snapshot
+
+
+def _require_managed_codex_daemon_free(home: Path) -> None:
+    """Fail closed on daemon artifacts in exactly the bound Codex home."""
+
+    if (
+        not isinstance(home, Path)
+        or not home.is_absolute()
+        or not hasattr(os, "O_NOFOLLOW")
+        or not directory_chain_is_real_no_symlink(home.parent)
+        or not executable_directory_chain_is_trusted(home.parent)
+    ):
+        raise AgentError("managed_codex_daemon_home_unknown")
+    home_fd = -1
+    try:
+        home_stat = home.lstat()
+        _fleet_private_directory_stat(home_stat, "managed_codex_daemon_home_unknown")
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        home_fd = os.open(home, flags)
+        opened_home_stat = os.fstat(home_fd)
+        _fleet_private_directory_stat(
+            opened_home_stat, "managed_codex_daemon_home_unknown"
+        )
+        if not source_identity_with_snapshot_matches(opened_home_stat, home_stat):
+            raise AgentError("managed_codex_daemon_home_unknown")
+        daemon_parents = _managed_codex_daemon_artifact_snapshot(home_fd, flags)
+        config_error = "managed_codex_daemon_config_invalid"
+        config_data, config_stat = _fleet_read_private_file_at(
+            home_fd, "config.toml", 0o600, config_error
+        )
+        if len(config_data) > MAX_CODEX_CONFIG_BYTES:
+            raise AgentError(config_error)
+        try:
+            config = tomllib.loads(config_data.decode("utf-8"))
+            current_config = os.stat(
+                "config.toml", dir_fd=home_fd, follow_symlinks=False
+            )
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise AgentError(config_error) from exc
+        for observed_config in (config_stat, current_config):
+            if (
+                not stat_module.S_ISREG(observed_config.st_mode)
+                or getattr(observed_config, "st_nlink", 1) != 1
+                or observed_config.st_uid != os.geteuid()
+                or stat_module.S_IMODE(observed_config.st_mode) != 0o600
+            ):
+                raise AgentError(config_error)
+        if (
+            not source_identity_with_snapshot_matches(current_config, config_stat)
+            or not isinstance(config, dict)
+            or not isinstance(config.get("features"), dict)
+            or config["features"].get("daemon_auto_start") is not False
+        ):
+            raise AgentError(config_error)
+        _managed_codex_daemon_artifact_snapshot(home_fd, flags, daemon_parents)
+        for observed_home in (os.fstat(home_fd), home.lstat()):
+            _fleet_private_directory_stat(
+                observed_home, "managed_codex_daemon_home_unknown"
+            )
+            if not source_identity_with_snapshot_matches(observed_home, home_stat):
+                raise AgentError("managed_codex_daemon_home_unknown")
+        if (
+            not directory_chain_is_real_no_symlink(home.parent)
+            or not executable_directory_chain_is_trusted(home.parent)
+        ):
+            raise AgentError("managed_codex_daemon_home_unknown")
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("managed_codex_daemon_home_unknown") from exc
+    finally:
+        if home_fd >= 0:
+            os.close(home_fd)
+
+
+def _managed_codex_daemon_guard_command(home: Path) -> str:
+    """Use the same fail-closed FD guard in generated direct CLI wrappers."""
+
+    source_root = Path(__file__).resolve().parents[1]
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "try:\n"
+        "    sys.path.insert(0, sys.argv[1])\n"
+        "    from the_hive.server import _require_managed_codex_daemon_free\n"
+        "    _require_managed_codex_daemon_free(Path(sys.argv[2]))\n"
+        "except Exception as exc:\n"
+        "    code = str(exc)\n"
+        "    if code not in {'managed_codex_daemon_home_unknown', "
+        "'managed_codex_daemon_artifact_present', "
+        "'managed_codex_daemon_config_invalid'}:\n"
+        "        code = 'managed_codex_daemon_guard_unavailable'\n"
+        "    print(code, file=sys.stderr)\n"
+        "    raise SystemExit(76)\n"
+    )
+    return (
+        "/usr/bin/python3 -I -B -c "
+        f"{shlex.quote(script)} {shlex.quote(str(source_root))} "
+        f"{shlex.quote(str(home))} || exit 76"
+    )
+
+
 def _managed_codex_wrapper_snapshot(wrapper: Path) -> os.stat_result:
     if not isinstance(wrapper, Path) or not wrapper.is_absolute():
         raise AgentError("managed_codex_runner_metadata_invalid")
@@ -8877,12 +9049,12 @@ def _managed_codex_native_snapshot(native: Path) -> os.stat_result:
     return expected
 
 
-def _managed_codex_native_path(
+def _managed_codex_configured_binary(
     agent: str,
     home: Path,
     wrapper: Path,
     wrapper_snapshot: os.stat_result,
-) -> tuple[Path, os.stat_result]:
+) -> Path:
     home = _managed_codex_home(home)
     wrapper_text = _read_managed_codex_wrapper(wrapper, wrapper_snapshot)
     candidates = _MANAGED_CODEX_BIN_LINE.findall(wrapper_text)
@@ -8901,6 +9073,18 @@ def _managed_codex_native_path(
         agent, home, str(configured)
     ):
         raise AgentError("managed_codex_runner_metadata_invalid")
+    return configured
+
+
+def _managed_codex_native_path(
+    agent: str,
+    home: Path,
+    wrapper: Path,
+    wrapper_snapshot: os.stat_result,
+) -> tuple[Path, os.stat_result]:
+    configured = _managed_codex_configured_binary(
+        agent, home, wrapper, wrapper_snapshot
+    )
     try:
         configured_stat = configured.lstat()
     except OSError as exc:
@@ -9511,10 +9695,18 @@ def _home_refresh_config(
         "model_reasoning_effort",
         "approval_policy",
         "sandbox_mode",
+        "features",
         "tui",
         "projects",
         "hooks",
     }:
+        raise AgentError("agent_class_materialization_invalid")
+    features = document.get("features", {})
+    if (
+        not isinstance(features, dict)
+        or set(features) - {"daemon_auto_start"}
+        or features.get("daemon_auto_start", False) is not False
+    ):
         raise AgentError("agent_class_materialization_invalid")
     catalog = document.get("model_catalog_json")
     if catalog is not None:
@@ -9626,6 +9818,9 @@ def _home_refresh_config(
             f"model_reasoning_effort = {json.dumps(reasoning_effort)}",
             'approval_policy = "never"',
             'sandbox_mode = "danger-full-access"',
+            "",
+            "[features]",
+            "daemon_auto_start = false",
             "",
             "[tui]",
             "animations = false",
@@ -12995,12 +13190,6 @@ def _start_agent_unlocked(
     ensure_state()
     cfg = agent_config(agent)
     descriptor = current_agent_inventory().agents.get(agent)
-    if (
-        agent_class == "teamleiterin"
-        and descriptor is not None
-        and descriptor.series_prefix == "q"
-    ):
-        enroll_managed_principal(agent, "teamleiterin")
     runner = cfg["runner"]
     session = cfg["session"]
     managed_fleet_home = (
@@ -13015,7 +13204,11 @@ def _start_agent_unlocked(
     )
     if managed_codex:
         managed_home = _managed_codex_home(cfg["home"])
+        _require_managed_codex_daemon_free(managed_home)
         managed_wrapper_snapshot = _managed_codex_wrapper_snapshot(runner)
+        _managed_codex_configured_binary(
+            agent, managed_home, runner, managed_wrapper_snapshot
+        )
         if agent_class is not None and managed_fleet_home:
             try:
                 managed_pool_parent_stat = AGENT_POOL_ROOT.parent.lstat()
@@ -13036,7 +13229,13 @@ def _start_agent_unlocked(
                 managed_home_stat,
                 "agent_class_materialization_invalid",
             )
-    else:
+    if (
+        agent_class == "teamleiterin"
+        and descriptor is not None
+        and descriptor.series_prefix == "q"
+    ):
+        enroll_managed_principal(agent, "teamleiterin")
+    if not managed_codex:
         try:
             runner_stat = runner.lstat()
         except OSError as exc:
@@ -13151,7 +13350,7 @@ def _start_agent_unlocked(
             else model_reasoning_effort or DEFAULT_AGENT_MODEL_EFFORT
         )
         routed_args = (
-            ["--yolo", "-s", "danger-full-access"]
+            ["--no-daemon", "--yolo", "-s", "danger-full-access"]
             if ollama_descriptor is not None
             else agent_base_args(
                 model,
@@ -13162,6 +13361,7 @@ def _start_agent_unlocked(
         )
 
         if managed_codex:
+            _require_managed_codex_daemon_free(managed_home)
             execution_path, execution_stat = _managed_codex_native_path(
                 agent,
                 managed_home,
@@ -26574,6 +26774,12 @@ def fleet_wrapper_text(
     }
     unset_variables = " ".join(sorted(secret_variables - retained))
     executable_word = shlex.quote(str(executable))
+    daemon_flag = "--no-daemon " if agent.runner is RunnerKind.CODEX_CLI else ""
+    daemon_guard = (
+        (_managed_codex_daemon_guard_command(agent.home),)
+        if agent.runner is RunnerKind.CODEX_CLI
+        else ()
+    )
     taskset_word = shlex.quote(str(taskset_executable))
     true_word = shlex.quote(str(true_executable))
     return "\n".join(
@@ -26583,10 +26789,11 @@ def fleet_wrapper_text(
             "",
             *home_lines,
             f"unset {unset_variables}",
+            *daemon_guard,
             f"if {taskset_word} --cpu-list 4-10 {true_word} >/dev/null 2>&1; then",
-            f'  exec {taskset_word} --cpu-list 4-10 {executable_word} "$@"',
+            f'  exec {taskset_word} --cpu-list 4-10 {executable_word} {daemon_flag}"$@"',
             "fi",
-            f'exec {executable_word} "$@"',
+            f'exec {executable_word} {daemon_flag}"$@"',
             "",
         ]
     )
@@ -26647,6 +26854,9 @@ def fleet_minimal_config(agent: AgentDescriptor) -> tuple[str, str]:
         )
     lines.extend(
         [
+            "",
+            "[features]",
+            "daemon_auto_start = false",
             "",
             "[tui]",
             "animations = false",
@@ -32870,10 +33080,11 @@ def pool_wrapper_text(agent: str, home: Path, codex_bin: str) -> str:
             "fi",
             "export CODEX_AGENT_BIN",
             "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
+            _managed_codex_daemon_guard_command(home),
             "if taskset --cpu-list 4-10 /usr/bin/true >/dev/null 2>&1; then",
-            '  exec taskset --cpu-list 4-10 /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
+            '  exec taskset --cpu-list 4-10 /usr/bin/env -- "${CODEX_AGENT_BIN}" --no-daemon "$@"',
             "fi",
-            'exec /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
+            'exec /usr/bin/env -- "${CODEX_AGENT_BIN}" --no-daemon "$@"',
             "",
         ]
     )
@@ -32887,6 +33098,9 @@ def pool_minimal_config(home: Path) -> str:
             f'model_reasoning_effort = "{DEFAULT_AGENT_MODEL_EFFORT}"',
             'approval_policy = "never"',
             'sandbox_mode = "danger-full-access"',
+            "",
+            "[features]",
+            "daemon_auto_start = false",
             "",
             "[tui]",
             "animations = false",

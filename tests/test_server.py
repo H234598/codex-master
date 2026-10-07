@@ -369,9 +369,17 @@ def fake_g5_start_scope_for_test(session: str) -> tuple[Any, PreparedAgentScope]
     )
 
 
-def write_managed_codex_launcher_for_test(runner: Path, home: Path, *, agent: str = "a") -> Path:
-    """Create pool-format launcher metadata pointing at one real native ELF."""
+def write_codex_no_daemon_config_for_test(home: Path) -> None:
+    config = home / "config.toml"
+    if not config.exists():
+        config.write_text("[features]\ndaemon_auto_start = false\n", encoding="utf-8")
+        config.chmod(0o600)
 
+
+def write_managed_codex_launcher_for_test(runner: Path, home: Path, *, agent: str = "a") -> Path:
+    """Create a materialized pool launcher and config for one native ELF."""
+
+    write_codex_no_daemon_config_for_test(home)
     native = runner.with_name(f"{runner.name}-native")
     shutil.copyfile(sys.executable, native)
     native.chmod(0o700)
@@ -7606,13 +7614,20 @@ class ServerHelpersTest(unittest.TestCase):
                 "printf '%s\\n' \"${OPENAI_API_KEY-unset}\" \"${GEMINI_API_KEY-unset}\" "
                 "\"${HF_TOKEN-unset}\" \"${CODEX_ACCESS_TOKEN-unset}\" \"${GOOGLE_API_KEY-unset}\" "
                 "\"${GOOGLE_APPLICATION_CREDENTIALS-unset}\" \"${GOOGLE_CLOUD_PROJECT-unset}\" "
-                "\"${GOOGLE_CLOUD_LOCATION-unset}\" \"${GOOGLE_GENAI_USE_VERTEXAI-unset}\" \"$1\"\n",
+                "\"${GOOGLE_CLOUD_LOCATION-unset}\" \"${GOOGLE_GENAI_USE_VERTEXAI-unset}\" \"$1\" \"$2\"\n",
                 encoding="utf-8",
             )
             executable.chmod(0o700)
             for provider, runner, home_key, retained in cases:
                 with self.subTest(provider=provider.value):
                     home = root / provider.value
+                    if runner is RunnerKind.CODEX_CLI:
+                        home.mkdir(mode=0o700)
+                        (home / "config.toml").write_text(
+                            "[features]\ndaemon_auto_start = false\n",
+                            encoding="utf-8",
+                        )
+                        (home / "config.toml").chmod(0o600)
                     agent = AgentDescriptor(
                         "d1",
                         "d",
@@ -7652,7 +7667,13 @@ class ServerHelpersTest(unittest.TestCase):
                         {key for key, value in values.items() if value != "unset"},
                         set(retained),
                     )
-                    self.assertEqual(lines[3 + len(secret_keys)], "argument with spaces")
+                    received = lines[3 + len(secret_keys):]
+                    self.assertEqual(
+                        received[:2],
+                        ["--no-daemon", "argument with spaces"]
+                        if runner is RunnerKind.CODEX_CLI
+                        else ["argument with spaces", ""],
+                    )
                     self.assertNotIn("account", wrapper.read_text(encoding="utf-8"))
 
     def test_fleet_minimal_config_matches_runner_and_provider_contract(self) -> None:
@@ -18378,6 +18399,10 @@ google_accounts:
             runner = root / "codex"
             native = root / "codex-native"
             raw_dir = root / "raw"
+            (root / "config.toml").write_text(
+                "[features]\ndaemon_auto_start = false\n", encoding="utf-8"
+            )
+            (root / "config.toml").chmod(0o600)
             shutil.copyfile(sys.executable, native)
             native.chmod(0o700)
             runner.write_text(server_module.pool_wrapper_text("a", root, str(native)), encoding="utf-8")
@@ -18607,6 +18632,7 @@ google_accounts:
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            write_codex_no_daemon_config_for_test(root)
             native = root / "codex-native"
             runner = root / "codex"
             raw_dir = root / "raw"
@@ -18661,6 +18687,7 @@ google_accounts:
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            write_codex_no_daemon_config_for_test(root)
             runner = root / "codex"
             native = root / "codex-native"
             replacement = root / "codex-replacement"
@@ -25995,7 +26022,7 @@ google_accounts:
                 with self.assertRaisesRegex(AgentError, "^fleet_home_content_invalid$"):
                     server_module._fleet_managed_home_state(pool, descriptor, strict_contents=True)
 
-    def test_start_agent_migrates_stopped_legacy_generic_registry_home_to_worker(self) -> None:
+    def test_start_agent_rejects_legacy_wrapper_before_home_refresh(self) -> None:
         process_summary = {
             "process_count": 0,
             "managed_process_count": 0,
@@ -26081,6 +26108,9 @@ google_accounts:
                         'approval_policy = "never"',
                         'sandbox_mode = "danger-full-access"',
                         "",
+                        "[features]",
+                        "daemon_auto_start = false",
+                        "",
                         "[tui]",
                         "animations = false",
                         "",
@@ -26120,6 +26150,9 @@ google_accounts:
             sqlite_runtime.chmod(0o644)
             raw_dir = root / "state" / "raw"
             raw_dir.mkdir(parents=True)
+            before_marker = marker_path.read_bytes()
+            before_config = (home / "config.toml").read_bytes()
+            before_wrapper = (home / "codex").read_bytes()
 
             def stopped_then_started_tmux(
                 args: list[str],
@@ -26128,6 +26161,18 @@ google_accounts:
                 if args == ["has-session", "-t", descriptor.session]:
                     return subprocess.CompletedProcess(args, 1, "", "")
                 return subprocess.CompletedProcess(args, 0, "", "")
+
+            def expect_legacy_rejection() -> None:
+                with self.assertRaisesRegex(AgentError, "^managed_codex_runner_metadata_invalid$"):
+                    start_agent(
+                        "a3",
+                        cwd=str(root),
+                        lease={"state": "held"},
+                        model="gpt-6-luna",
+                        model_reasoning_effort="xhigh",
+                        agent_class="arbeitsbiene",
+                        confirm_home_refresh=True,
+                    )
 
             with attested_codex_model_reader_for_test("d254-a3"), patch.object(server_module, "AGENT_POOL_ROOT", pool), patch.object(
                 server_module, "STATE_ROOT", root / "state"
@@ -26167,41 +26212,13 @@ google_accounts:
             ), patch.object(server_module, "write_meta"), patch.object(
                 server_module, "run_tmux", side_effect=stopped_then_started_tmux
             ), patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
-                result = start_agent(
-                    "a3",
-                    cwd=str(root),
-                    lease={"state": "held"},
-                    model="gpt-6-luna",
-                    model_reasoning_effort="xhigh",
-                    agent_class="arbeitsbiene",
-                    confirm_home_refresh=True,
-                )
+                expect_legacy_rejection()
 
-            refreshed = json.loads(marker_path.read_text(encoding="utf-8"))
-            refreshed_config = server_module.tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
-            self.assertEqual(result["status"], "started")
-            self.assertEqual(refreshed["model"], "gpt-6-luna")
-            self.assertEqual(refreshed["runtime_skill_profile"], "worker")
-            self.assertEqual(
-                refreshed_config["model_catalog_json"],
-                str(root / "effective-codex-model-catalog.json"),
-            )
-            self.assertEqual(refreshed_config["service_tier"], "default")
-            self.assertEqual(refreshed_config["model"], "gpt-6-luna")
-            self.assertEqual(refreshed_config["model_reasoning_effort"], "xhigh")
-            self.assertFalse(refreshed_config["tui"]["animations"])
-            self.assertEqual(refreshed_config["projects"][str(root)], {"trust_level": "trusted"})
-            self.assertEqual(refreshed_config["hooks"]["state"][hook_ids[0]]["trusted_hash"], hook_hashes[0])
-            self.assertEqual(refreshed_config["hooks"]["state"][hook_ids[1]]["trusted_hash"], hook_hashes[1])
+            self.assertEqual(marker_path.read_bytes(), before_marker)
+            self.assertEqual((home / "config.toml").read_bytes(), before_config)
+            self.assertEqual((home / "codex").read_bytes(), before_wrapper)
             self.assertEqual(history.read_bytes(), b'{"session_id":"019c0000-0000-7000-8000-000000000003"}\n')
             self.assertEqual(os.readlink(home / "models_cache.json"), "../a1/models_cache.json")
-            unknown_runtime = home / "operator-note.txt"
-            unknown_runtime.write_bytes(b"not Codex runtime\n")
-            unknown_runtime.chmod(0o600)
-            with self.assertRaisesRegex(AgentError, "^fleet_home_content_invalid$"):
-                server_module._fleet_managed_home_state(pool, descriptor, strict_contents=True)
-            unknown_runtime.unlink()
-            server_module._fleet_managed_home_state(pool, descriptor, strict_contents=True)
 
     def test_legacy_home_refresh_accepts_current_pool_wrapper_and_codex_plugin_hook_state(self) -> None:
         process_summary = {
@@ -28186,6 +28203,7 @@ google_accounts:
     @patch("the_hive.server.run_tmux")
     def test_start_agent_refuses_symlink_runner(self, mock_run_tmux, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            write_codex_no_daemon_config_for_test(Path(tmpdir))
             target = Path(tmpdir) / "target-codex"
             runner = Path(tmpdir) / "codex"
             target.write_text("#!/bin/sh\n", encoding="utf-8")
