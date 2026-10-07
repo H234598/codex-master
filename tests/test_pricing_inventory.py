@@ -144,7 +144,9 @@ def test_update_removes_its_previous_model_catalog_override(
     root = tmp_path / "inventory"
     managed_catalog = root / "effective-codex-model-catalog.json"
     config.write_text(
-        f'model_catalog_json = "{managed_catalog}"\nmodel = "gpt-5.6-sol"\n',
+        f'model_catalog_json = "{managed_catalog}"\n'
+        'service_tier = "default"\n'
+        'model = "gpt-5.6-sol"\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(home))

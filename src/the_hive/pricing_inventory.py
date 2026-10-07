@@ -50,7 +50,7 @@ MODEL_CATALOG_JSON_LINE_RE = re.compile(
 SERVICE_TIER_LINE_RE = re.compile(
     r'^\s*service_tier\s*=\s*"(?P<value>[a-z0-9_-]+)"\s*$'
 )
-SERVICE_TIER_VALUES = frozenset({"auto", "flex", "priority"})
+SERVICE_TIER_VALUES = frozenset({"auto", "default", "flex", "priority"})
 CREDENTIAL_VALUE_PATH_RE = re.compile(
     r"(?:^|[^a-z0-9])(?:api[_-]?key|access[_-]?token|token|secret|credential|password|passwd|authorization|bearer|auth)(?:=|:)[^/?#&;\s]+",
     re.IGNORECASE,
