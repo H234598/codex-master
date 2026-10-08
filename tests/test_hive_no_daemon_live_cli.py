@@ -22,6 +22,15 @@ from the_hive import server
 
 
 CODEX = Path("/home/teladi/.codex/packages/app-server-daemon/releases/0.161.0-x86_64-unknown-linux-musl/bin/codex")
+HIVE_BUNDLE_FILES = (
+    "release-binding.json", ".codex-plugin/plugin.json", ".mcp.json", ".app.json",
+    "hooks/hooks.json", "hooks/native_bee_event.py", "hooks/native_spawn_admission.py",
+    "skills/the-hive-fleet/SKILL.md",
+    "skills/the-hive-fleet/references/common-invariants.md",
+    "skills/the-hive-fleet/references/diagnostics-retry-reporting.md",
+    "skills/the-hive-fleet/references/queen-operations.md",
+    "skills/the-hive-fleet/references/tl-worker-operations.md",
+)
 
 
 def _run(argv: list[str], *, env: dict[str, str], cwd: Path,
@@ -100,11 +109,18 @@ def _fixture_plugin(root: Path, home: Path) -> None:
     (home / "config.toml").chmod(0o600)
 
 
-def _trust_installed_hive(home: Path, plugin: Path, personal_home: Path) -> None:
+def _attest_hive_bundle(source: Path, release: Path, cache: Path) -> None:
+    for name in HIVE_BUNDLE_FILES:
+        expected = (release / name).read_bytes()
+        assert (source / name).read_bytes() == expected
+        assert (cache / name).read_bytes() == expected
+
+
+def _trust_installed_hive(home: Path, plugin: Path, release: Path,
+                          personal_home: Path) -> None:
     """Reuse only the nine previously approved hashes for identical hook bytes."""
     personal_cache = personal_home / "plugins/cache/personal/the-hive/0.10.5+codex.20260808003125"
-    for name in ("release-binding.json", "hooks/hooks.json"):
-        assert (personal_cache / name).read_bytes() == (plugin / name).read_bytes()
+    _attest_hive_bundle(plugin, release, personal_cache)
     groups = json.loads((plugin / "hooks/hooks.json").read_text())["hooks"]
     expected = set()
     for event, rules in groups.items():
@@ -384,7 +400,8 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
                 cwd=tmp_path).stdout.strip() == "codex-cli 0.161.0"
     (codex_home / "config.toml").write_text("[features]\ndaemon_auto_start=false\n")
     _fixture_plugin(tmp_path, codex_home)
-    _trust_installed_hive(codex_home, source_plugin, personal_codex_home)
+    _trust_installed_hive(codex_home, source_plugin,
+                          release / "TheHivePluginBundleV1", personal_codex_home)
     trusted_before = tomllib.loads((codex_home / "config.toml").read_text())["hooks"]["state"]
     for command in (
         [str(CODEX), "--no-daemon", "plugin", "marketplace", "add", str(home)],
@@ -395,8 +412,7 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
         result = _run(command, env=env, cwd=tmp_path)
         assert result.returncode == 0, f"native plugin materialization rc={result.returncode}"
     server._require_managed_codex_daemon_free(codex_home)
-    assert digest(plugin / "release-binding.json") == digest(source_plugin / "release-binding.json")
-    assert digest(plugin / "hooks/hooks.json") == digest(source_plugin / "hooks/hooks.json")
+    _attest_hive_bundle(source_plugin, release / "TheHivePluginBundleV1", plugin)
     hook_state = tomllib.loads((codex_home / "config.toml").read_text())["hooks"]["state"]
     hive_hooks = [value for key, value in hook_state.items()
                   if key.startswith("the-hive@personal:hooks/hooks.json:")]
