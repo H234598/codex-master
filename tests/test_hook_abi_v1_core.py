@@ -258,6 +258,8 @@ def test_core_reactivates_only_pinned_sessionstart_resume(tmp_path: Path) -> Non
     )[0].open_at(state_root)
     assert store.bindings() == {}
     send("SessionStart", 10, "startup")
+    send("SessionStart", 11, "clear")
+    send("SessionStart", 12, "compact")
     send("SessionEnd", 20)
     ended = store.bindings()["session-one"]
 
@@ -270,7 +272,7 @@ def test_core_reactivates_only_pinned_sessionstart_resume(tmp_path: Path) -> Non
     )
     _write_allowlist(release_root, plugin_root, abi_root)
 
-    for source in ("startup", "invalid", 1, ["resume"]):
+    for source in ("startup", "clear", "compact", "invalid", 1, ["resume"]):
         with pytest.raises(HookAbiV1Error, match="hook_abi_v1_invalid"):
             send("SessionStart", 30, source)
         assert store.bindings()["session-one"] == ended
@@ -299,6 +301,28 @@ def test_core_reactivates_only_pinned_sessionstart_resume(tmp_path: Path) -> Non
     assert store.bindings()["session-one"] == resumed
     send("SessionEnd", 60)
     assert store.bindings()["session-one"]["state"] == "ended"
+
+
+@pytest.mark.parametrize("source", ("clear", "compact"))
+def test_core_accepts_documented_first_sessionstart_sources(
+    tmp_path: Path, source: str
+) -> None:
+    _installer_value, release_root, plugin_root, abi_root, state_root = _fixture(tmp_path)
+    result = _dispatch(
+        release_root=release_root,
+        plugin_root=plugin_root,
+        abi_root=abi_root,
+        state_root=state_root,
+        payload=json.dumps(
+            {"session_id": "session-one", "hook_event_name": "SessionStart", "source": source}
+        ).encode(),
+        now=10,
+    )
+    result.close()
+    store = hook_core._pin_store_api(
+        (abi_root / "hook_session_pin_store.py").read_bytes()
+    )[0].open_at(state_root)
+    assert store.bindings()["session-one"]["state"] == "active"
 
 
 def test_core_rejects_an_absent_allowlist_before_pin_or_hook_handoff(

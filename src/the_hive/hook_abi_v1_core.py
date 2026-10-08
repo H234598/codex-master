@@ -739,7 +739,10 @@ def _event(stdin_bytes: bytes, *, hook_name: str) -> tuple[str, str, str | None]
     if (
         event_name == "SessionStart"
         and "source" in value
-        and (type(source) is not str or source not in {"startup", "resume"})
+        and (
+            type(source) is not str
+            or source not in {"startup", "resume", "clear", "compact"}
+        )
     ):
         raise _invalid()
     return session_id, event_name, source
