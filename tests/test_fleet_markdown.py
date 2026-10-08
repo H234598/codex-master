@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -409,7 +412,7 @@ def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
     primary = projection.artifacts[metadata.provider_artifact_name]
 
     assert metadata.schema_version == 1
-    assert metadata.generation == 10
+    assert metadata.generation == 11
     assert metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
     assert metadata.common_size == len(_COMMON_BYTES) <= MAX_COMMON_POLICY_BYTES
     assert metadata.provider_artifact_name == "AGENTS.md"
@@ -435,7 +438,7 @@ def test_provider_projection_digests_are_deterministic_and_distinct() -> None:
 
 def test_canonical_header_remains_first_in_both_provider_artifacts() -> None:
     expected_header = (
-        b'<!-- codex-master-common-policy:{"generation":10,"schema_version":1} -->'
+        b'<!-- codex-master-common-policy:{"generation":11,"schema_version":1} -->'
     )
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
@@ -463,7 +466,7 @@ def test_both_provider_projections_carry_same_annotation_response_policy() -> No
         assert required_inline_link in primary
         assert obsolete_line not in primary
         assert projection.metadata.common_digest == contract.common_digest
-        assert projection.metadata.generation == contract.generation == 10
+        assert projection.metadata.generation == contract.generation == 11
 
 
 def test_both_provider_projections_keep_annotation_marker_sidecars_read_only() -> None:
@@ -484,7 +487,7 @@ def test_both_provider_projections_keep_annotation_marker_sidecars_read_only() -
         assert primary.startswith(contract.common_bytes)
         for fragment in required_fragments:
             assert fragment in normalized_primary
-        assert projection.metadata.generation == contract.generation == 10
+        assert projection.metadata.generation == contract.generation == 11
 
 
 def test_both_provider_projections_carry_corrected_annotation_heading_and_guards() -> (
@@ -567,14 +570,14 @@ def test_both_provider_projections_carry_identical_inline_and_multi_source_guard
         assert projection.metadata.common_digest == contract.common_digest
 
 
-def test_both_provider_projections_carry_same_generation_ten_policy_bytes() -> None:
+def test_both_provider_projections_carry_same_generation_eleven_policy_bytes() -> None:
     contract = load_common_policy()
 
     for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
         projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
         primary = projection.artifacts[projection.metadata.provider_artifact_name]
         assert primary[: len(contract.common_bytes)] == contract.common_bytes
-        assert projection.metadata.generation == contract.generation == 10
+        assert projection.metadata.generation == contract.generation == 11
 
 
 def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> None:
@@ -609,7 +612,7 @@ def test_both_provider_projections_carry_openai_stickiness_and_reset_gate() -> N
         assert primary.startswith(contract.common_bytes)
         for fragment in required_fragments:
             assert fragment in primary
-        assert projection.metadata.generation == contract.generation == 10
+        assert projection.metadata.generation == contract.generation == 11
 
 
 def test_both_provider_projections_carry_side_effect_free_external_plan_handoff():
@@ -637,7 +640,7 @@ def test_both_provider_projections_carry_side_effect_free_external_plan_handoff(
             assert fragment in normalized_primary
         for backend in (b"wl-copy", b"xclip", b"xsel"):
             assert backend not in primary
-        assert projection.metadata.generation == contract.generation == 10
+        assert projection.metadata.generation == contract.generation == 11
 
 
 def test_both_provider_projections_carry_unencoded_local_file_link_contract() -> None:
@@ -718,3 +721,71 @@ def test_malformed_common_header_error_propagates_without_policy_fallback(
 
     with pytest.raises(CommonPolicyError, match="common_policy_header_invalid"):
         fleet_markdown.fleet_markdown_artifacts(_agent())
+
+
+@pytest.mark.parametrize("runner", [RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI])
+def test_priority_policy_materializes_all_profiles_without_changing_question_history(
+    tmp_path: Path,
+    runner: RunnerKind,
+) -> None:
+    contract = load_common_policy()
+    profiles = server_module._known_runtime_skill_profiles("test_invalid_profile")
+    for profile in sorted(profiles):
+        home = tmp_path / profile
+        agent = replace(
+            _agent(runner, profile),
+            home=home,
+            runner_path=home
+            / ("gemini" if runner is RunnerKind.GEMINI_CLI else "codex"),
+        )
+        target = server_module._build_fleet_home_target(
+            agent, Path(sys.executable), include_portable_skills=False
+        )
+        artifacts = {name: content for name, content, _mode in target.files}
+        artifacts[server_module.FLEET_AGENT_MARKER_FILE] = target.marker_bytes
+        assert server_module._fleet_write_home(home, artifacts)
+        projection = fleet_markdown.fleet_markdown_projection(agent)
+        primary = home / projection.metadata.provider_artifact_name
+        primary_bytes = primary.read_bytes()
+        normalized = " ".join(primary_bytes.decode("utf-8").split())
+        assert "im YAML-Frontmatter genau ein top-level-Feld `priority`" in normalized
+        assert (
+            "Fragen in Plänen, Analysen, Reports und Entscheidungsdokumenten"
+            in normalized
+        )
+        assert primary_bytes.startswith(contract.common_bytes)
+        assert (
+            primary_bytes
+            == projection.artifacts[projection.metadata.provider_artifact_name]
+        )
+        marker = json.loads((home / server_module.FLEET_AGENT_MARKER_FILE).read_bytes())
+        assert marker["common_policy"] == {
+            "schema_version": 1,
+            "generation": 11,
+            "digest": hashlib.sha256(contract.common_bytes).hexdigest(),
+        }
+        assert (
+            marker["files"][projection.metadata.provider_artifact_name]
+            == hashlib.sha256(primary_bytes).hexdigest()
+        )
+
+        preserved = {}
+        for filename, priority in (("report.md", "high"), ("plan.md", "null")):
+            question = home / filename
+            question.write_text(
+                f'---\npriority: {priority}\nstatus: answered\n---\n# Plan\n<mark data-annotation-id="question-1">Proceed?</mark>\n\n## Answer\nApproved.\n',
+                encoding="utf-8",
+            )
+            preserved[question] = (question.read_bytes(), question.stat().st_ino)
+        history = home / "sessions" / "history.jsonl"
+        history.parent.mkdir(mode=0o700)
+        history.write_bytes(
+            b'{"type":"session_meta","payload":{"id":"prior-session"}}\n'
+        )
+        preserved[history] = (history.read_bytes(), history.stat().st_ino)
+        preserved[primary] = (primary_bytes, primary.stat().st_ino)
+
+        # The existing safe writer is idempotent and owns only policy artifacts.
+        assert not server_module._fleet_write_home(home, artifacts)
+        for path, snapshot in preserved.items():
+            assert (path.read_bytes(), path.stat().st_ino) == snapshot

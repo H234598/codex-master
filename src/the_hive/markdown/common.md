@@ -1,4 +1,4 @@
-<!-- codex-master-common-policy:{"generation":10,"schema_version":1} -->
+<!-- codex-master-common-policy:{"generation":11,"schema_version":1} -->
 # Common Hive context
 
 This file is materialized and maintained by The Hive (masterjet). It is the
@@ -37,6 +37,25 @@ Ein vorhandenes grünes Testergebnis darf nur bei unveränderten relevanten Inpu
 und noch gültigem Evidence-Reuse-Fenster wiederverwendet werden. Andernfalls den
 Test neu ausführen. Vorgeschriebene Voll- und Release-Gates bleiben verbindlich
 und werden einmal am passenden Gate ausgeführt.
+
+## Userfragen und Prioritätsfeld
+
+Jedes Dokument mit an den User gerichteten Fragen enthält im YAML-Frontmatter
+genau ein top-level-Feld `priority`. Das umfasst `Offene-Frage`- und
+`codex-question`-Notizen sowie Fragen in Plänen, Analysen, Reports und
+Entscheidungsdokumenten. Die Regel gilt hiveweit für alle Rollen, Provider,
+Klassen, Repositories und Lifecycles, unabhängig vom Fragestatus.
+
+Bestehende Prioritätswerte bleiben erhalten. Wenn noch keine Priorität
+festgelegt ist, `priority: null` verwenden; keine Rangfolge erfinden. Beim
+Erstellen oder Bearbeiten eines betroffenen Dokuments das fehlende Feld
+ergänzen. Fehlende oder doppelte top-level-Felder sind unzulässig; keine
+vorhandene Priorität stillschweigend überschreiben.
+
+Vor der Übergabe genau einmal prüfen, dass jedes betroffene Dokument genau
+ein top-level-Feld `priority` enthält. Antworten, Fragestatus und
+Annotation-Marker bleiben erhalten. Diese Regel gilt auch beim Fortsetzen
+oder Resumen.
 
 ## Public documentation OPSEC
 

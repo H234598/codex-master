@@ -8,7 +8,7 @@ import pytest
 
 
 CANONICAL_HEADER = (
-    b'<!-- codex-master-common-policy:{"generation":10,"schema_version":1} -->\n'
+    b'<!-- codex-master-common-policy:{"generation":11,"schema_version":1} -->\n'
 )
 
 
@@ -33,7 +33,7 @@ def test_loads_canonical_policy_with_complete_file_digest() -> None:
     contract = policy_api.load_common_policy(path)
 
     assert contract.schema_version == 1
-    assert contract.generation == 10
+    assert contract.generation == 11
     assert contract.common_bytes == expected_bytes
     assert contract.common_digest == hashlib.sha256(expected_bytes).hexdigest()
 
@@ -711,3 +711,38 @@ def test_annotation_response_fixture_rejects_fenced_code_before_mutation() -> No
     assert fixture is original_fixture
     assert fixture == original_fixture
     assert fixture.count("(A)") == 0
+
+
+@pytest.mark.parametrize("provider", ["codex", "gemini"])
+def test_user_question_priority_policy_materializes_for_both_providers(
+    provider: str,
+) -> None:
+    """Assert the shared prompt contract, without pretending to scan user YAML."""
+    contract = load_policy_api().load_common_policy()
+    projection = getattr(contract.project("worker"), provider)
+    policy = " ".join(projection.artifact_bytes.decode("utf-8").split())
+
+    required_meanings = (
+        "Jedes Dokument mit an den User gerichteten Fragen",
+        "im YAML-Frontmatter genau ein top-level-Feld `priority`",
+        "`Offene-Frage`- und `codex-question`-Notizen",
+        "Fragen in Plänen, Analysen, Reports und Entscheidungsdokumenten",
+        "hiveweit für alle Rollen, Provider, Klassen, Repositories und Lifecycles",
+        "unabhängig vom Fragestatus",
+        "Bestehende Prioritätswerte bleiben erhalten",
+        "noch keine Priorität festgelegt ist, `priority: null`",
+        "keine Rangfolge erfinden",
+        "Beim Erstellen oder Bearbeiten eines betroffenen Dokuments das fehlende Feld ergänzen",
+        "Fehlende oder doppelte top-level-Felder sind unzulässig",
+        "Vor der Übergabe genau einmal prüfen",
+        "Antworten, Fragestatus und Annotation-Marker bleiben erhalten",
+        "auch beim Fortsetzen oder Resumen",
+    )
+    for meaning in required_meanings:
+        assert meaning in policy
+    assert projection.artifact_bytes.startswith(contract.common_bytes)
+    assert projection.common_digest == hashlib.sha256(contract.common_bytes).hexdigest()
+    assert (
+        projection.artifact_digest
+        == hashlib.sha256(projection.artifact_bytes).hexdigest()
+    )
