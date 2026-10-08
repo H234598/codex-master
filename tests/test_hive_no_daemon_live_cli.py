@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -20,7 +21,7 @@ import pytest
 from the_hive import server
 
 
-CODEX = Path("/usr/local/bin/codex")  # Avoid the desktop launcher, which moves into its own scope.
+CODEX = Path("/home/teladi/.codex/packages/app-server-daemon/releases/0.161.0-x86_64-unknown-linux-musl/bin/codex")
 
 
 def _run(argv: list[str], *, env: dict[str, str], cwd: Path,
@@ -96,6 +97,36 @@ def _fixture_plugin(root: Path, home: Path) -> None:
                 event, groups[key][0], groups[key][0]["hooks"][0]
             )
             config.write(f'[hooks.state."{hook_id}"]\ntrusted_hash="{trusted_hash}"\n')
+    (home / "config.toml").chmod(0o600)
+
+
+def _trust_installed_hive(home: Path, plugin: Path, personal_home: Path) -> None:
+    """Reuse only the nine previously approved hashes for identical hook bytes."""
+    personal_cache = personal_home / "plugins/cache/personal/the-hive/0.10.5+codex.20260808003125"
+    for name in ("release-binding.json", "hooks/hooks.json"):
+        assert (personal_cache / name).read_bytes() == (plugin / name).read_bytes()
+    groups = json.loads((plugin / "hooks/hooks.json").read_text())["hooks"]
+    expected = set()
+    for event, rules in groups.items():
+        key = re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
+        for rule_index, rule in enumerate(rules):
+            for hook_index, _hook in enumerate(rule["hooks"]):
+                expected.add(f"the-hive@personal:hooks/hooks.json:{key}:{rule_index}:{hook_index}")
+    approved = tomllib.loads((personal_home / "config.toml").read_text())["hooks"]["state"]
+    approved = {key: value for key, value in approved.items()
+                if key.startswith("the-hive@personal:hooks/hooks.json:")}
+    assert len(expected) == 9 and set(approved) == expected
+    approved_hashes = {}
+    for hook_id in expected:
+        value = approved[hook_id]
+        trusted_hash = value.get("trusted_hash")
+        assert set(value) == {"enabled", "trusted_hash"} and value["enabled"] is True
+        assert isinstance(trusted_hash, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", trusted_hash)
+        approved_hashes[hook_id] = trusted_hash
+    with (home / "config.toml").open("a") as config:
+        for hook_id in sorted(expected):
+            config.write(f'[hooks.state."{hook_id}"]\n'
+                         f'trusted_hash="{approved_hashes[hook_id]}"\nenabled=true\n')
     (home / "config.toml").chmod(0o600)
 
 
@@ -305,38 +336,74 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
     if os.environ.get("HIVE_INSTALLED_HOOK_LIVE_TEST") != "1":
         pytest.skip("set HIVE_INSTALLED_HOOK_LIVE_TEST=1 for the installed hook probe")
     home = Path("/home/teladi")
-    codex_home = home / ".codex"
+    personal_codex_home = home / ".codex"
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(mode=0o700)
+    source_plugin = home / "plugins/the-hive"
+    source_descriptor = json.loads((source_plugin / "release-binding.json").read_text())
+    generation = source_descriptor["generation"]
+    assert generation == "ab5973849639df261d82c1cec84c4619af89f889"
+    release = home / ".local/lib/the-hive-runtime/generations" / generation
     plugin = codex_home / "plugins/cache/personal/the-hive/0.10.5+codex.20260808003125"
-    release = home / ".local/lib/the-hive-runtime/generations/e9d2df5ec2493680104165371697df93cf4ac8fc"
     pins = home / ".local/state/the-hive/hook-session-pins-v1"
     registry_path = home / ".local/state/codex-master-mcp/native-agents.json"
     launcher = "/usr/local/libexec/the-hive/hook-abi/v1/launcher"
     def digest(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     if (not CODEX.is_file() or not shutil.which("systemd-run")
-            or digest(plugin / "release-binding.json")
+            or digest(source_plugin / "release-binding.json")
             != digest(release / "TheHivePluginBundleV1/release-binding.json")):
-        pytest.skip("installed e9 hook source/cache unavailable")
-    config_digest = digest(codex_home / "config.toml")
+        pytest.skip("installed Hive source and runtime descriptor unavailable")
+    assert digest(CODEX) == "9a820c17865fa825d04db416818679a9d63bd72e50835c396f496e5684626c9c"
+    verify = _run([str(Path(__file__).resolve().parents[1] / "scripts/the-hive-runtime-service"),
+                   "verify", "--home", str(home)], env=os.environ.copy(), cwd=tmp_path)
+    assert verify.returncode == 0
+    identity = json.loads(verify.stdout)["runtime_identity"]
+    assert identity["generation"] == generation
+    assert identity["manifest_digest"] == source_descriptor["runtime_manifest_digest"]
+    config_digest = digest(personal_codex_home / "config.toml")
+    updater_pid = 886704
+    assert b"pid-update-loop" in Path(f"/proc/{updater_pid}/cmdline").read_bytes()
+    children = Path(f"/proc/{updater_pid}/task/{updater_pid}/children").read_text().split()
+    daemons = [int(pid) for pid in children if b"app-server\x00--listen\x00" in
+               Path(f"/proc/{pid}/cmdline").read_bytes()]
+    assert len(daemons) == 1
+    process_ticks = {
+        pid: Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        for pid in (updater_pid, daemons[0])
+    }
+    before = json.loads(registry_path.read_text())
+    probe_before = server.read_probe_gate()
+    assert len(before["sessions"]) < 1024 and len(before["agents"]) < 1024
+    env = {key: os.environ[key] for key in (
+        "PATH", "LANG", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "USER", "LOGNAME",
+    ) if key in os.environ}
+    env.update(HOME=str(tmp_path), CODEX_HOME=str(codex_home),
+               LOCAL_RESPONSES_DUMMY_TOKEN="dummy-local-only")
+    assert _run([str(CODEX), "--no-daemon", "--version"], env=env,
+                cwd=tmp_path).stdout.strip() == "codex-cli 0.161.0"
+    (codex_home / "config.toml").write_text("[features]\ndaemon_auto_start=false\n")
+    _fixture_plugin(tmp_path, codex_home)
+    _trust_installed_hive(codex_home, source_plugin, personal_codex_home)
+    trusted_before = tomllib.loads((codex_home / "config.toml").read_text())["hooks"]["state"]
+    for command in (
+        [str(CODEX), "--no-daemon", "plugin", "marketplace", "add", str(home)],
+        [str(CODEX), "--no-daemon", "plugin", "marketplace", "add", str(tmp_path)],
+        [str(CODEX), "--no-daemon", "plugin", "add", "the-hive@personal"],
+        [str(CODEX), "--no-daemon", "plugin", "add", "fixture-plugin@local-fixture"],
+    ):
+        result = _run(command, env=env, cwd=tmp_path)
+        assert result.returncode == 0, f"native plugin materialization rc={result.returncode}"
+    server._require_managed_codex_daemon_free(codex_home)
+    assert digest(plugin / "release-binding.json") == digest(source_plugin / "release-binding.json")
+    assert digest(plugin / "hooks/hooks.json") == digest(source_plugin / "hooks/hooks.json")
     hook_state = tomllib.loads((codex_home / "config.toml").read_text())["hooks"]["state"]
     hive_hooks = [value for key, value in hook_state.items()
                   if key.startswith("the-hive@personal:hooks/hooks.json:")]
     assert len(hive_hooks) == 9 and all(value.get("enabled") is True
                                         and value.get("trusted_hash", "").startswith("sha256:")
                                         for value in hive_hooks)
-    process_ticks = {
-        pid: Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-        for pid in (1131276, 886704)
-    }
-    before = json.loads(registry_path.read_text())
-    assert len(before["sessions"]) < 1024 and len(before["agents"]) < 1024
-    env = {key: os.environ[key] for key in (
-        "PATH", "LANG", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "USER", "LOGNAME",
-    ) if key in os.environ}
-    env.update(HOME=str(home), CODEX_HOME=str(codex_home),
-               LOCAL_RESPONSES_DUMMY_TOKEN="dummy-local-only")
-    assert _run([str(CODEX), "--no-daemon", "--version"], env=env,
-                cwd=tmp_path).stdout.strip() == "codex-cli 0.161.0"
+    assert all(hook_state[key] == value for key, value in trusted_before.items())
     requests: list[dict[str, bool]] = []
     probes: list[dict[str, object]] = []
     units: list[str] = []
@@ -357,7 +424,7 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
         return False
 
     def direct_hook(name: str, event: dict[str, object]) -> subprocess.CompletedProcess[str]:
-        unit = f"hive-e9-{name}-{uuid.uuid4().hex[:10]}.scope"
+        unit = f"hive-resume-{name}-{uuid.uuid4().hex[:10]}.scope"
         units.append(unit)
         result = _run(["systemd-run", "--user", "--scope", "--quiet", "--unit", unit,
                        launcher, "native_spawn_admission" if name == "admission"
@@ -374,30 +441,58 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
                              "Bearer dummy-local-only",
                              "prior": "fixture answer" in str(payload.get("input", []))})
             observation: dict[str, object] = {"phase": current_phase[0]}
-            observation["active_cgroup"] = _run(
+            observation["cgroup"] = _run(
                 ["systemctl", "--user", "show", current_unit[0],
                  "-p", "ControlGroup", "--value"], env=env,
-                cwd=tmp_path).stdout.strip().endswith("/" + current_unit[0])
+                cwd=tmp_path).stdout.strip()
+            observation["active_cgroup"] = observation["cgroup"].endswith("/" + current_unit[0])
             if started.wait(5):
                 sid = started_id[0]
                 observation["pin_active"] = _installed_pin_active(pins, sid)
+                pin_path = pins / (hashlib.sha256(sid.encode()).hexdigest() + ".json")
+                try:
+                    observation["pin_transitions"] = [
+                        item["state"] for item in json.loads(pin_path.read_text())["state_transitions"]
+                    ]
+                except (OSError, ValueError, KeyError):
+                    observation["pin_transitions"] = []
                 if current_phase[0] == "start" and observation["pin_active"]:
                     reservations_before = json.loads(registry_path.read_text())["reservations"]
-                    admission = direct_hook("admission", {
-                        "session_id": sid, "hook_event_name": "PreToolUse",
-                        "tool_name": "spawn_agent", "tool_input": [], "cwd": str(tmp_path),
-                    })
                     try:
-                        decision = json.loads(admission.stdout)["hookSpecificOutput"]
+                        admission = direct_hook("admission", {
+                            "session_id": sid, "hook_event_name": "PreToolUse",
+                            "tool_name": "spawn_agent",
+                            "tool_input": {"task_name": "fixture-admission", "message": "local no-op"},
+                            "cwd": str(tmp_path),
+                        })
+                    finally:
+                        reservations_after = json.loads(registry_path.read_text())["reservations"]
+                        own_before = {row["reservation_id"] for row in reservations_before
+                                      if row.get("parent_session_id") == sid}
+                        own_new = [row for row in reservations_after
+                                   if row.get("parent_session_id") == sid
+                                   and row["reservation_id"] not in own_before]
+                        observation["reservation_delta"] = len(own_new)
+                        if own_new:
+                            agent_id = f"fixture-{uuid.uuid4().hex[:12]}"
+                            agent = {"session_id": sid, "agent_id": agent_id,
+                                     "agent_type": "fixture"}
+                            started_agent = direct_hook("agent-start", {
+                                **agent, "hook_event_name": "SubagentStart"})
+                            stopped_agent = direct_hook("agent-stop", {
+                                **agent, "hook_event_name": "SubagentStop"})
+                            observation["reservation_cleanup"] = (
+                                started_agent.returncode == stopped_agent.returncode == 0
+                                and not any(row.get("reservation_id") == own_new[0]["reservation_id"]
+                                            for row in json.loads(registry_path.read_text())["reservations"])
+                            )
+                    try:
+                        decision = json.loads(admission.stdout)["hookSpecificOutput"] if admission.stdout else {}
                     except (KeyError, TypeError, ValueError):
                         decision = {}
                     observation["admission_rc"] = admission.returncode
-                    observation["admission_decision"] = decision.get("permissionDecision")
+                    observation["admission_decision"] = decision.get("permissionDecision", "allow" if not admission.stdout else None)
                     observation["admission_reason"] = decision.get("permissionDecisionReason")
-                    observation["reservations_unchanged"] = (
-                        json.loads(registry_path.read_text())["reservations"]
-                        == reservations_before
-                    )
                     stop = direct_hook("stop", {"session_id": sid,
                                                 "hook_event_name": "Stop"})
                     observation["direct_stop_rc"] = stop.returncode
@@ -427,8 +522,9 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
     turns: list[dict[str, object]] = []
     try:
         for phase in ("start", "resume"):
+            server._require_managed_codex_daemon_free(codex_home)
             current_phase[0] = phase
-            current_unit[0] = f"hive-e9-cli-{uuid.uuid4().hex[:12]}.scope"
+            current_unit[0] = f"hive-resume-cli-{uuid.uuid4().hex[:12]}.scope"
             units.append(current_unit[0])
             started.clear()
             tail = (["resume", "--skip-git-repo-check", "--json", sid, "say again"]
@@ -463,7 +559,8 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
                     process.wait(timeout=5)
                     raise
                 reader.join(timeout=5)
-            assert scope_empty(current_unit[0]), f"own CLI scope not empty: {current_unit[0]}"
+            _wait_own_scope_empty(current_unit[0], codex_home, env, tmp_path)
+            server._require_managed_codex_daemon_free(codex_home)
             ids = [event["thread_id"] for event in events
                    if event.get("type") == "thread.started"]
             sid = sid or (str(ids[0]) if ids else "")
@@ -475,29 +572,57 @@ def test_installed_hive_admission_during_active_cli_session(tmp_path: Path) -> N
                                           for item in requests)
         assert requests[1]["prior"]
         assert probes[0]["pin_active"] and probes[0]["active_cgroup"]
-        assert probes[0]["admission_rc"] == 0
-        assert probes[0]["admission_decision"] == "deny"
-        assert probes[0]["admission_reason"] == (
-            "error_code=invalid_pretooluse_input reason_codes=invalid_input"
-        )
-        assert probes[0]["reservations_unchanged"]
+        assert probes[1]["pin_active"] and probes[1]["active_cgroup"]
+        assert probes[1]["pin_transitions"][-3:] == ["active", "ended", "active"]
         assert probes[0]["direct_stop_rc"] == 0 and probes[0]["direct_stop_json"]
-        assert probes[1]["active_cgroup"]
+        recorded = [json.loads(line) for line in (tmp_path / "hook-events.jsonl").read_text().splitlines()]
+        assert [(event["hook_event_name"], event.get("source")) for event in recorded] == [
+            ("SessionStart", "startup"), ("Stop", None),
+            ("SessionStart", "resume"), ("Stop", None),
+        ]
+        assert all(event["session_id"] == sid for event in recorded)
+        assert [event["cgroup"].removeprefix("0::") for event in recorded] == [
+            probes[0]["cgroup"], probes[0]["cgroup"],
+            probes[1]["cgroup"], probes[1]["cgroup"],
+        ]
+        for item in probes:
+            scope = Path("/sys/fs/cgroup" + item["cgroup"])
+            assert not scope.exists() or not (scope / "cgroup.procs").read_text().strip()
         after = json.loads(registry_path.read_text())
-        assert all(item in after["sessions"] for item in before["sessions"])
-        assert all(item in after["agents"] for item in before["agents"])
-        assert after["reservations"] == before["reservations"]
+        assert [item for item in after["sessions"] if item.get("session_id") != sid] == before["sessions"]
+        assert [item for item in after["agents"] if item.get("session_id") != sid] == before["agents"]
+        assert [item for item in after["reservations"] if item.get("parent_session_id") != sid] == before["reservations"]
+        assert not any(item.get("parent_session_id") == sid for item in after["reservations"])
+        assert not any(item.get("session_id") == sid and item.get("activity_state") == "active"
+                       for item in after["agents"])
         assert any(item.get("session_id") == sid and item.get("activity_state") == "ended"
                    for item in after["sessions"])
         assert not _installed_pin_active(pins, sid)
-        assert digest(codex_home / "config.toml") == config_digest
+        server._require_managed_codex_daemon_free(codex_home)
+        assert digest(personal_codex_home / "config.toml") == config_digest
         assert all(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
                    == tick for pid, tick in process_ticks.items())
-        print(json.dumps({"cli_turns": turns, "fixture_direct_admission":
-                          probes[0]["admission_reason"], "fixture_direct_stop": True,
-                          "resume_pin_active": probes[1].get("pin_active"),
+        gate_after = server.read_probe_gate()
+        print(json.dumps({"cli_turns": turns, "admission":
+                          {"decision": probes[0]["admission_decision"],
+                           "reason": probes[0]["admission_reason"],
+                           "reservation_delta": probes[0]["reservation_delta"]},
+                          "probe_before": probe_before.get("reason_code"),
+                          "probe_after": gate_after.get("reason_code"),
+                          "fixture_direct_stop": True, "codex_auto_stop": True,
+                          "resume_pin_active": probes[1]["pin_active"],
                           "foreign_registry_preserved": True,
                           "own_scopes_empty": True}, sort_keys=True))
+        assert probes[0]["admission_rc"] == 0
+        assert probes[0]["admission_decision"] in {"allow", "deny"}
+        assert probes[0]["admission_reason"] is None or "invalid_pretooluse_input" not in probes[0]["admission_reason"]
+        if probes[0]["admission_decision"] == "allow":
+            assert probes[0]["reservation_delta"] == 1
+            assert probes[0]["reservation_cleanup"]
+        else:
+            assert probes[0]["reservation_delta"] == 0
+            assert isinstance(probes[0]["admission_reason"], str)
+            assert "hook_error" not in probes[0]["admission_reason"], "valid admission blocked; inspect probe gate"
     finally:
         cleanup_errors = []
         try:
