@@ -37554,7 +37554,7 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 self.assertEqual(status["counts"]["active"], 7)
                 self.assertEqual(status["counts"]["overflow"], 1)
 
-    def test_registry_limits_to_sixty_four_records_before_storage(self) -> None:
+    def test_registry_retains_sixty_five_records_before_storage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state"
             lock_dir = state / "locks"
@@ -37576,8 +37576,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
 
                 stored = json.loads(record_path.read_text(encoding="utf-8"))
                 self.assertEqual(stored["schema_version"], 2)
-                self.assertEqual(len(stored["agents"]), 64)
-                self.assertEqual(len(stored["sessions"]), 64)
+                self.assertEqual(len(stored["agents"]), 65)
+                self.assertEqual(len(stored["sessions"]), 65)
+                self.assertEqual(stored["agents"][0]["agent_id"], "agent-0-x")
+                self.assertEqual(stored["sessions"][0]["session_id"], "session-0")
 
     def test_invalid_inputs_do_not_mutate_registry(self) -> None:
         invalid_payloads = [

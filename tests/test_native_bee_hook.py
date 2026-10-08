@@ -260,6 +260,79 @@ class NativeBeeHookTest(unittest.TestCase):
                 {"session_id": "thr_parent", "activity_state": "active"},
             )
 
+    def test_registry_retains_65_and_1024_then_trims_1025_on_hook_server_roundtrip(self) -> None:
+        from the_hive import server as server_module
+
+        self.assertEqual(server_module.MAX_NATIVE_AGENT_RECORDS, 1024)
+        self.assertEqual(server_module.MAX_NATIVE_SESSION_RECORDS, 1024)
+        for original_count in (64, 1023, 1024):
+            with self.subTest(original_count=original_count), tempfile.TemporaryDirectory() as tmpdir:
+                state_root = Path(tmpdir) / "state"
+                state_root.mkdir(mode=0o700)
+                registry_path = state_root / "native-agents.json"
+                rows = range(original_count)
+                seed = {
+                    "schema_version": 2,
+                    "agents": [
+                        {"session_id": f"parent_{i}", "agent_id": f"agent_{i}",
+                         "agent_type": "worker", "activity_state": "completed", "updated_at": 1.0}
+                        for i in rows
+                    ],
+                    "sessions": [
+                        {"session_id": f"parent_{i}", "managed_session": f"managed_{i}",
+                         "activity_state": "ended", "updated_at": 1.0}
+                        for i in rows
+                    ],
+                    "reservations": [],
+                }
+                with patch.object(server_module, "NATIVE_AGENT_REGISTRY_FILE", registry_path):
+                    server_module._write_native_agent_registry(seed)
+                    completed = self.run_hook(json.dumps({
+                        "hook_event_name": "SubagentStart", "session_id": "new_parent",
+                        "agent_id": "new_agent", "agent_type": "worker",
+                    }), state_root=state_root)
+                    self.assertEqual(completed.returncode, 0)
+                    self.assertEqual(completed.stderr, "")
+                    stored = json.loads(registry_path.read_text(encoding="utf-8"))
+                    normalized, read_state = server_module._read_native_agent_registry_read_only()
+                    if original_count == 1024:
+                        overfull = {
+                            **seed,
+                            "agents": [*seed["agents"], stored["agents"][-1]],
+                            "sessions": [*seed["sessions"], stored["sessions"][-1]],
+                        }
+                        server_module._write_native_agent_registry(overfull)
+                        server_trimmed = json.loads(registry_path.read_text(encoding="utf-8"))
+                        self.assertEqual(server_trimmed["agents"][0]["agent_id"], "agent_1")
+                        self.assertEqual(server_trimmed["sessions"][0]["managed_session"], "managed_1")
+                self.assertEqual(read_state, "ready")
+                self.assertEqual(normalized, stored)
+                self.assertEqual(len(stored["agents"]), min(original_count + 1, 1024))
+                self.assertEqual(len(stored["sessions"]), min(original_count + 1, 1024))
+                first_retained = max(0, original_count + 1 - 1024)
+                self.assertEqual(stored["agents"][0]["agent_id"], f"agent_{first_retained}")
+                self.assertEqual(stored["sessions"][0]["managed_session"], f"managed_{first_retained}")
+                self.assertEqual(stored["agents"][-1]["agent_id"], "new_agent")
+                self.assertEqual(stored["sessions"][-1]["session_id"], "new_parent")
+
+        maximal = {
+            "schema_version": 2,
+            "agents": [{"session_id": f"{index:04x}" + "s" * 124,
+                        "agent_id": f"{index:04x}" + "a" * 124,
+                        "agent_type": "t" * 64, "activity_state": "unconfirmed",
+                        "updated_at": -1.7976931348623157e308} for index in range(1024)],
+            "sessions": [{"session_id": f"{index:04x}" + "s" * 124,
+                          "managed_session": "m" * 128,
+                          "activity_state": "active", "updated_at": -1.7976931348623157e308}
+                         for index in range(1024)],
+            "reservations": [{"reservation_id": f"{index:04x}" + "r" * 124,
+                              "kind": "headless_inflight",
+                              "created_at": -1.7976931348623157e308, "agent": "a" * 128,
+                              "assignment_id": "i" * 128} for index in range(64)],
+        }
+        self.assertEqual(len(server_module._native_agent_normalize_registry(maximal)["sessions"]), 1024)
+        self.assertLessEqual(len((json.dumps(maximal, sort_keys=True) + "\n").encode()), 1024 * 1024)
+
     def test_session_start_preserves_parallel_parent_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_root = Path(tmpdir) / "state"

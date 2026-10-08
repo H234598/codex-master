@@ -13,11 +13,11 @@ from pathlib import Path
 
 
 MAX_STDIN_BYTES = 65537
-MAX_NATIVE_AGENT_REGISTRY_BYTES = 64 * 1024
+MAX_NATIVE_AGENT_REGISTRY_BYTES = 1024 * 1024
 _NATIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _NATIVE_TYPE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-_MAX_NATIVE_RECORDS = 64
-_MAX_NATIVE_SESSIONS = 64
+_MAX_NATIVE_RECORDS = 1024
+_MAX_NATIVE_SESSIONS = 1024
 PLUGIN_ROOT = Path(os.environ.get("PLUGIN_ROOT") or Path(__file__).resolve().parents[1])
 SRC_ROOT = PLUGIN_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -101,6 +101,7 @@ def _normalized_registry(value: object) -> dict[str, object] | None:
         session_id = item.get("session_id")
         activity_state = item.get("activity_state")
         updated_at = item.get("updated_at")
+        managed_session = item.get("managed_session")
         if (
             not _native_id(session_id)
             or activity_state not in {"active", "ended"}
@@ -108,13 +109,10 @@ def _normalized_registry(value: object) -> dict[str, object] | None:
             or not isinstance(updated_at, (int, float))
         ):
             continue
-        sessions.append(
-            {
-                "session_id": session_id,
-                "activity_state": activity_state,
-                "updated_at": float(updated_at),
-            }
-        )
+        row = {"session_id": session_id, "activity_state": activity_state, "updated_at": float(updated_at)}
+        if _native_id(managed_session):
+            row["managed_session"] = managed_session
+        sessions.append(row)
     reservations = value.get("reservations", [])
     return {
         "schema_version": 2,

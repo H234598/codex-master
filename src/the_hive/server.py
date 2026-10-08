@@ -858,9 +858,10 @@ MAX_APPLET_ACTION_TOKEN_CHARS = 512
 APPLET_ACTION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 NATIVE_AGENT_REGISTRY_FILE = STATE_ROOT / "native-agents.json"
 NATIVE_AGENT_REGISTRY_LOCK_FILE = LOCK_DIR / "native-agents.lock"
-MAX_NATIVE_AGENT_RECORDS = 64
-MAX_NATIVE_SESSION_RECORDS = 64
-MAX_NATIVE_AGENT_REGISTRY_BYTES = 64 * 1024
+MAX_NATIVE_AGENT_RECORDS = 1024
+MAX_NATIVE_SESSION_RECORDS = 1024
+MAX_NATIVE_AGENT_REGISTRY_BYTES = 1024 * 1024
+MAX_NATIVE_TOOL_RESPONSE_BYTES = 64 * 1024
 MAX_NATIVE_TRANSCRIPT_HEADER_BYTES = 64 * 1024
 MAX_NATIVE_APPLET_AGENTS = 6
 NATIVE_AGENT_ACTIVE_SECONDS = 2 * 60 * 60
@@ -6325,7 +6326,7 @@ def _native_completed_agent_ids_from_tool_event(
         return frozenset()
     response = payload.get("tool_response")
     if isinstance(response, str):
-        if len(response) > MAX_NATIVE_AGENT_REGISTRY_BYTES:
+        if len(response) > MAX_NATIVE_TOOL_RESPONSE_BYTES:
             return frozenset()
         try:
             response = json.loads(response)
