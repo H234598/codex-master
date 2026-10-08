@@ -73,6 +73,70 @@ def test_session_end_retains_exactly_24_hours_and_stop_style_touches_do_not_rele
     assert store.retained_generations(now_unix_ns=30 + DAY_NS) == set()
 
 
+@pytest.mark.parametrize("mismatch", ("generation", "digest", "hooks", "time"))
+def test_resume_reopens_only_matching_ended_pin_and_can_end_again(
+    tmp_path: Path, mismatch: str
+) -> None:
+    store = _store(tmp_path)
+    original = _bind(store, now=10)
+    ended = store.end_session(session_id="session-a", now_unix_ns=20)
+
+    invalid = {
+        "session_id": "session-a",
+        "generation": "generation-a",
+        "runtime_manifest_digest": "sha256:" + "c" * 64,
+        "hooks": HOOKS,
+        "now_unix_ns": 30,
+    }
+    if mismatch == "generation":
+        invalid["generation"] = "generation-other"
+    elif mismatch == "digest":
+        invalid["runtime_manifest_digest"] = "sha256:" + "d" * 64
+    elif mismatch == "hooks":
+        invalid["hooks"] = {**HOOKS, "native_bee_event": "sha256:" + "d" * 64}
+    else:
+        invalid["now_unix_ns"] = 19
+    with pytest.raises(HookSessionPinStoreError):
+        store.resume_session(**invalid)
+    assert store.bindings()["session-a"] == ended
+
+    resumed = store.resume_session(
+        session_id="session-a",
+        generation="generation-a",
+        runtime_manifest_digest="sha256:" + "c" * 64,
+        hooks=HOOKS,
+        now_unix_ns=30,
+    )
+    assert resumed["state"] == "active"
+    assert resumed["ended_at_unix_ns"] is None
+    assert resumed["state_transitions"] == [
+        {"state": "active", "at_unix_ns": 10},
+        {"state": "ended", "at_unix_ns": 20},
+        {"state": "active", "at_unix_ns": 30},
+    ]
+    for key in (
+        "session_id",
+        "generation",
+        "runtime_manifest_digest",
+        "launcher_abi",
+        "hooks",
+        "created_at_unix_ns",
+    ):
+        assert resumed[key] == original[key]
+    assert resumed["store_generation"] == ended["store_generation"] + 1
+
+    with pytest.raises(HookSessionPinStoreError):
+        store.resume_session(
+            session_id="session-a",
+            generation="generation-a",
+            runtime_manifest_digest="sha256:" + "c" * 64,
+            hooks=HOOKS,
+            now_unix_ns=31,
+        )
+    assert store.bindings()["session-a"] == resumed
+    assert store.end_session(session_id="session-a", now_unix_ns=40)["state"] == "ended"
+
+
 def test_unended_orphan_requires_30_days_seven_day_quarantine_two_day_spaced_reads(
     tmp_path: Path,
 ) -> None:

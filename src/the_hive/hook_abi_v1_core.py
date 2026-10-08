@@ -718,7 +718,7 @@ def _attest_first_session_start_pointer(
         raise _invalid()
 
 
-def _event(stdin_bytes: bytes, *, hook_name: str) -> tuple[str, str]:
+def _event(stdin_bytes: bytes, *, hook_name: str) -> tuple[str, str, str | None]:
     if hook_name not in _ALLOWED_HOOKS or not isinstance(stdin_bytes, bytes):
         raise _invalid()
     if not 0 < len(stdin_bytes) <= _MAX_EVENT_BYTES:
@@ -735,7 +735,14 @@ def _event(stdin_bytes: bytes, *, hook_name: str) -> tuple[str, str]:
     event_name = value.get("hook_event_name")
     if not _safe_session_id(session_id) or event_name not in _HOOK_EVENTS[hook_name]:
         raise _invalid()
-    return session_id, event_name
+    source = value.get("source") if event_name == "SessionStart" else None
+    if (
+        event_name == "SessionStart"
+        and "source" in value
+        and (type(source) is not str or source not in {"startup", "resume"})
+    ):
+        raise _invalid()
+    return session_id, event_name, source
 
 
 def _checked_directory_info(item: os.stat_result, expected: dict[str, int]) -> None:
@@ -1010,7 +1017,7 @@ def dispatch_hook_v1(
         or abi_owner_uid < 0
     ):
         raise _invalid()
-    session_id, event_name = _event(stdin_bytes, hook_name=hook_name)
+    session_id, event_name, source = _event(stdin_bytes, hook_name=hook_name)
     descriptor, cache_descriptor_raw = _plugin_descriptor(plugin_root)
     (
         current_bundle,
@@ -1046,7 +1053,7 @@ def dispatch_hook_v1(
     except (AttributeError, TypeError, ValueError) as exc:
         raise _invalid() from exc
     if existing is None:
-        if event_name != "SessionStart":
+        if event_name != "SessionStart" or source == "resume":
             raise _invalid()
         _attest_first_session_start_pointer(
             release_root=release_root, descriptor=descriptor
@@ -1090,6 +1097,14 @@ def dispatch_hook_v1(
         try:
             if event_name == "SessionEnd":
                 store.end_session(session_id=session_id, now_unix_ns=now_unix_ns)
+            elif event_name == "SessionStart" and source == "resume":
+                store.resume_session(
+                    session_id=session_id,
+                    generation=selected["generation"],
+                    runtime_manifest_digest=selected["runtime_manifest_digest"],
+                    hooks=selected["hooks"],
+                    now_unix_ns=now_unix_ns,
+                )
             else:
                 store.bind_session(
                     session_id=session_id,

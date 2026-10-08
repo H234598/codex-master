@@ -559,6 +559,53 @@ class HookSessionPinStoreV1:
             self._write_locked(directory, name, binding)
             return binding
 
+    def resume_session(
+        self,
+        *,
+        session_id: str,
+        generation: str,
+        runtime_manifest_digest: str,
+        hooks: Mapping[str, str],
+        now_unix_ns: int,
+    ) -> dict[str, object]:
+        """Reopen only the exact ended binding for a SessionStart resume event."""
+
+        if not (
+            _safe_session_id(session_id)
+            and _safe_generation(generation)
+            and _safe_digest(runtime_manifest_digest)
+            and _safe_time(now_unix_ns)
+        ):
+            raise _invalid()
+        normalized_hooks = _validated_hooks(dict(hooks))
+        with self._locked_directory(create_lock=True) as directory:
+            bindings = self._read_all_locked(directory)
+            existing = bindings.get(session_id)
+            if (
+                existing is None
+                or existing["state"] != "ended"
+                or existing["generation"] != generation
+                or existing["runtime_manifest_digest"] != runtime_manifest_digest
+                or existing["launcher_abi"] != _ABI_V1
+                or existing["hooks"] != normalized_hooks
+                or now_unix_ns < existing["last_seen_at_unix_ns"]
+            ):
+                raise _invalid()
+            binding = dict(existing)
+            binding["state"] = "active"
+            binding["state_transitions"] = [
+                *binding["state_transitions"],
+                {"state": "active", "at_unix_ns": now_unix_ns},
+            ]
+            binding["last_seen_at_unix_ns"] = now_unix_ns
+            binding["ended_at_unix_ns"] = None
+            binding["store_generation"] = existing["store_generation"] + 1
+            binding = self._with_digest(binding)
+            name = _binding_name(session_id)
+            _validated_binding(binding, expected_name=name)
+            self._write_locked(directory, name, binding)
+            return binding
+
     def bindings(self) -> dict[str, dict[str, object]]:
         """Read all complete bindings under exactly the canonical store lock."""
 

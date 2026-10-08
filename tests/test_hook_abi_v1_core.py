@@ -234,6 +234,73 @@ def test_core_returns_held_attested_capabilities_and_original_event_bytes(
         result.close()
 
 
+def test_core_reactivates_only_pinned_sessionstart_resume(tmp_path: Path) -> None:
+    installer, release_root, plugin_root, abi_root, state_root = _fixture(tmp_path)
+
+    def send(event: str, now: int, source: object = None) -> None:
+        payload = {"session_id": "session-one", "hook_event_name": event}
+        if source is not None:
+            payload["source"] = source
+        result = _dispatch(
+            release_root=release_root,
+            plugin_root=plugin_root,
+            abi_root=abi_root,
+            state_root=state_root,
+            payload=json.dumps(payload).encode(),
+            now=now,
+        )
+        result.close()
+
+    with pytest.raises(HookAbiV1Error, match="hook_abi_v1_invalid"):
+        send("SessionStart", 9, "resume")
+    store = hook_core._pin_store_api(
+        (abi_root / "hook_session_pin_store.py").read_bytes()
+    )[0].open_at(state_root)
+    assert store.bindings() == {}
+    send("SessionStart", 10, "startup")
+    send("SessionEnd", 20)
+    ended = store.bindings()["session-one"]
+
+    second = _stage(installer, tmp_path, "two")
+    second.rename(release_root / "generations" / "two")
+    _write_pointers(release_root, current="two", previous="one")
+    shutil.rmtree(plugin_root)
+    shutil.copytree(
+        release_root / "generations" / "two" / "TheHivePluginBundleV1", plugin_root
+    )
+    _write_allowlist(release_root, plugin_root, abi_root)
+
+    for source in ("startup", "invalid", 1, ["resume"]):
+        with pytest.raises(HookAbiV1Error, match="hook_abi_v1_invalid"):
+            send("SessionStart", 30, source)
+        assert store.bindings()["session-one"] == ended
+    with pytest.raises(HookAbiV1Error, match="hook_abi_v1_invalid"):
+        send("UserPromptSubmit", 30)
+    with pytest.raises(HookAbiV1Error, match="hook_abi_v1_invalid"):
+        _dispatch(
+            release_root=release_root,
+            plugin_root=plugin_root,
+            abi_root=abi_root,
+            state_root=state_root,
+            payload=b'{"session_id":"session-one","hook_event_name":"SessionStart","source":"resume","source":"resume"}',
+            now=30,
+        )
+
+    send("SessionStart", 40, "resume")
+    resumed = store.bindings()["session-one"]
+    assert resumed["state"] == "active"
+    assert resumed["generation"] == ended["generation"]
+    assert resumed["generation"] == "one"
+    assert resumed["runtime_manifest_digest"] == ended["runtime_manifest_digest"]
+    assert resumed["hooks"] == ended["hooks"]
+    assert resumed["state_transitions"][-1] == {"state": "active", "at_unix_ns": 40}
+    with pytest.raises(HookAbiV1Error, match="hook_abi_v1_invalid"):
+        send("SessionStart", 50, "resume")
+    assert store.bindings()["session-one"] == resumed
+    send("SessionEnd", 60)
+    assert store.bindings()["session-one"]["state"] == "ended"
+
+
 def test_core_rejects_an_absent_allowlist_before_pin_or_hook_handoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
