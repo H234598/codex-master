@@ -77,3 +77,31 @@ digest without including secrets or raw private-state output.
 See [configuration](configuration.md) for source-controlled inputs,
 [troubleshooting](operations/troubleshooting.md) for safe evidence gathering,
 and [releases](releases.md) for the release boundary.
+
+## Bound local Hive plugin descriptor
+
+After the root Hook ABI and its allowlist have been independently verified for
+the active Runtime Image, the owner can publish that image's canonical hook
+descriptor into the configured local `the-hive@personal` source:
+
+```sh
+./scripts/the-hive-plugin-release-publish \
+  --home <absolute-home> --generation <active-generation> \
+  --manifest-sha256 sha256:<active-manifest-digest> \
+  --descriptor-sha256 sha256:<verified-descriptor-digest>
+```
+
+This source-only operator attests the current release pointer and image,
+checks the local marketplace mapping, registration files, hooks and Fleet skill
+against the attested bundle, and publishes only an absent descriptor. An
+already matching descriptor is a no-op; any different target or input holds.
+It does not install a Runtime Image, write the root ABI, edit hook trust or
+settings, or update a Codex plugin cache.
+
+Codex 0.161 refreshes an installed local plugin of the same version with
+`codex --no-daemon plugin add the-hive@personal`. Run that native command once
+for each separately bound `CODEX_HOME` that actually consumes the plugin,
+then independently compare its cached `release-binding.json` with the active
+Runtime descriptor. `plugin marketplace upgrade` applies to Git marketplace
+snapshots and does not refresh this local source. Keep personal config and
+trust values under their own backup and compare-and-swap gate.

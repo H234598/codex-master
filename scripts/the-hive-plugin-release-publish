@@ -1,0 +1,242 @@
+#!/usr/bin/python3
+"""Publish the active, attested Hive hook descriptor to its local plugin source."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import uuid
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.fspath(Path(__file__).resolve().parents[1] / "src"))
+
+from the_hive.runtime_layout import (  # noqa: E402
+    RuntimeLayout,
+    _read_regular_bytes,
+)
+from the_hive.runtime_lifecycle import (  # noqa: E402
+    _bound_path_from_home,
+    _lifecycle_lock,
+    _regular_bytes,
+)
+
+
+_BUNDLE = "TheHivePluginBundleV1"
+_DESCRIPTOR = "release-binding.json"
+_PLUGIN_FILES = (
+    ".codex-plugin/plugin.json",
+    ".mcp.json",
+    ".app.json",
+    "hooks/hooks.json",
+    "hooks/native_bee_event.py",
+    "hooks/native_spawn_admission.py",
+    "skills/the-hive-fleet/SKILL.md",
+    "skills/the-hive-fleet/references/common-invariants.md",
+    "skills/the-hive-fleet/references/diagnostics-retry-reporting.md",
+    "skills/the-hive-fleet/references/queen-operations.md",
+    "skills/the-hive-fleet/references/tl-worker-operations.md",
+)
+
+
+class PublishError(Exception):
+    pass
+
+
+def _fail(code: str) -> None:
+    raise PublishError(code)
+
+
+def _directory(path: Path) -> tuple[int, int]:
+    item = path.lstat()
+    if (
+        not stat.S_ISDIR(item.st_mode)
+        or item.st_uid != os.geteuid()
+        or stat.S_IMODE(item.st_mode) & 0o022
+    ):
+        _fail("plugin_source_untrusted")
+    return item.st_dev, item.st_ino
+
+
+def _source_file(home: Path, path: Path, maximum: int = 2 * 1024 * 1024) -> bytes:
+    _bound_path_from_home(home, path)
+    value = _regular_bytes(path, maximum=maximum, mode=0o644)
+    if value is None:
+        _fail("plugin_source_incomplete")
+    return value
+
+
+def publish(
+    home: Path, generation: str, manifest_digest: str, descriptor_digest: str
+) -> dict[str, str]:
+    if (
+        not home.is_absolute()
+        or not generation
+        or "/" in generation
+        or generation in {".", ".."}
+        or len(manifest_digest) != 71
+        or not manifest_digest.startswith("sha256:")
+        or len(descriptor_digest) != 71
+        or not descriptor_digest.startswith("sha256:")
+        or any(
+            c not in "0123456789abcdef"
+            for c in manifest_digest[7:] + descriptor_digest[7:]
+        )
+    ):
+        _fail("plugin_publish_arguments_invalid")
+    plugin = home / "plugins" / "the-hive"
+    target = plugin / _DESCRIPTOR
+    release_root = home / ".local" / "lib" / "the-hive-runtime"
+    with _lifecycle_lock(home):
+        _bound_path_from_home(home, target)
+        plugin_identity = _directory(plugin)
+        marketplace_path = home / ".agents" / "plugins" / "marketplace.json"
+        marketplace = _source_file(home, marketplace_path, 65536)
+        try:
+            listing = json.loads(marketplace)
+            entries = listing["plugins"]
+            matches = [entry for entry in entries if entry.get("name") == "the-hive"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PublishError("plugin_marketplace_invalid") from exc
+        if (
+            listing.get("name") != "personal"
+            or len(matches) != 1
+            or matches[0].get("source")
+            != {"source": "local", "path": "./plugins/the-hive"}
+        ):
+            _fail("plugin_marketplace_invalid")
+        layout = RuntimeLayout.from_current_release(
+            release_root, generation, manifest_digest
+        )
+        descriptor = _read_regular_bytes(
+            layout.root, f"{_BUNDLE}/{_DESCRIPTOR}", max_bytes=65536
+        )
+        if "sha256:" + hashlib.sha256(descriptor).hexdigest() != descriptor_digest:
+            _fail("plugin_descriptor_drift")
+        expected_files = {
+            name: layout.read_attested_file(f"{_BUNDLE}/{name}")
+            for name in _PLUGIN_FILES
+        }
+
+        def validate_source() -> None:
+            _bound_path_from_home(home, target)
+            if _directory(plugin) != plugin_identity:
+                _fail("plugin_source_raced")
+            if _source_file(home, marketplace_path, 65536) != marketplace:
+                _fail("plugin_marketplace_drift")
+            for name, expected in expected_files.items():
+                if _source_file(home, plugin / name) != expected:
+                    _fail("plugin_source_drift")
+
+        validate_source()
+        present = _regular_bytes(target, maximum=65536, mode=0o644)
+        if present is not None:
+            if present != descriptor:
+                _fail("plugin_descriptor_conflict")
+            return {
+                "status": "already_published",
+                "descriptor_sha256": descriptor_digest,
+            }
+
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        parent_fd = os.open(plugin, flags)
+        stage_name = f".{_DESCRIPTOR}.{uuid.uuid4().hex}"
+        stage_fd = -1
+        linked = False
+        stage_identity = plugin_identity
+        stage_present = False
+        try:
+            parent = os.fstat(parent_fd)
+            if (parent.st_dev, parent.st_ino) != plugin_identity:
+                _fail("plugin_source_raced")
+            stage_fd = os.open(
+                stage_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o644,
+                dir_fd=parent_fd,
+            )
+            stage_present = True
+            os.fchmod(stage_fd, 0o644)
+            with os.fdopen(stage_fd, "wb", closefd=False) as stage:
+                stage.write(descriptor)
+                stage.flush()
+            os.fsync(stage_fd)
+            stage_info = os.fstat(stage_fd)
+            stage_identity = (stage_info.st_dev, stage_info.st_ino)
+            os.close(stage_fd)
+            stage_fd = -1
+            validate_source()
+            # Hard-link publication is atomic and refuses a concurrent target.
+            os.link(
+                stage_name,
+                _DESCRIPTOR,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            linked = True
+            linked_info = os.stat(_DESCRIPTOR, dir_fd=parent_fd, follow_symlinks=False)
+            if stage_identity != (linked_info.st_dev, linked_info.st_ino):
+                _fail("plugin_stage_raced")
+            os.unlink(stage_name, dir_fd=parent_fd)
+            stage_present = False
+            os.fsync(parent_fd)
+            published = _regular_bytes(target, maximum=65536, mode=0o644)
+            if published != descriptor:
+                _fail("plugin_publish_postcheck_failed")
+            validate_source()
+            return {"status": "published", "descriptor_sha256": descriptor_digest}
+        except FileExistsError as exc:
+            raise PublishError("plugin_descriptor_raced") from exc
+        except Exception:
+            if linked:
+                try:
+                    target_info = os.stat(
+                        _DESCRIPTOR, dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    target_info = None
+                if target_info is not None and stage_identity == (
+                    target_info.st_dev,
+                    target_info.st_ino,
+                ):
+                    os.unlink(_DESCRIPTOR, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+            raise
+        finally:
+            if stage_fd >= 0:
+                os.close(stage_fd)
+            if stage_present:
+                try:
+                    os.unlink(stage_name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                except FileNotFoundError:
+                    pass
+            os.close(parent_fd)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="the-hive-plugin-release-publish")
+    parser.add_argument("--home", type=Path, required=True)
+    parser.add_argument("--generation", required=True)
+    parser.add_argument("--manifest-sha256", required=True)
+    parser.add_argument("--descriptor-sha256", required=True)
+    args = parser.parse_args()
+    try:
+        result = publish(
+            args.home, args.generation, args.manifest_sha256, args.descriptor_sha256
+        )
+    except Exception as exc:
+        code = str(exc) if isinstance(exc, PublishError) else "plugin_publish_failed"
+        print(json.dumps({"status": "hold", "error_code": code}, sort_keys=True))
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
