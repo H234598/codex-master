@@ -348,7 +348,7 @@ def _manifest_directory(manifest: dict[str, Any], relative: str) -> dict[str, in
         or type(entry.get("mode")) is not int
         or entry["mode"] != 0o700
         or type(entry.get("nlink")) is not int
-        or entry["nlink"] < 2
+        or entry["nlink"] < 1
     ):
         raise _invalid()
     return {"mode": entry["mode"], "nlink": entry["nlink"]}

@@ -172,6 +172,41 @@ def _dispatch(
     )
 
 
+@pytest.mark.parametrize("nlink", (1, 2))
+def test_manifest_directory_accepts_positive_nlink(nlink: int) -> None:
+    manifest = {"directories": {"held-directory": {"mode": 0o700, "nlink": nlink}}}
+    assert hook_core._manifest_directory(manifest, "held-directory") == {
+        "mode": 0o700,
+        "nlink": nlink,
+    }
+
+
+def test_manifest_directory_keeps_real_fd_identity_binding(tmp_path: Path) -> None:
+    directory = tmp_path / "held-directory"
+    directory.mkdir(mode=0o700)
+    actual_nlink = directory.stat().st_nlink
+    manifest = {
+        "directories": {"held-directory": {"mode": 0o700, "nlink": actual_nlink}}
+    }
+    expected = hook_core._manifest_directory(manifest, "held-directory")
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        hook_core._checked_directory_info(os.fstat(descriptor), expected)
+        with pytest.raises(HookAbiV1Error, match="hook_abi_v1_invalid"):
+            hook_core._checked_directory_info(
+                os.fstat(descriptor), {"mode": 0o700, "nlink": actual_nlink + 1}
+            )
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("nlink", (0, -1, True, 1.0, "1"))
+def test_manifest_directory_rejects_invalid_nlink(nlink: object) -> None:
+    manifest = {"directories": {"held-directory": {"mode": 0o700, "nlink": nlink}}}
+    with pytest.raises(HookAbiV1Error, match="hook_abi_v1_invalid"):
+        hook_core._manifest_directory(manifest, "held-directory")
+
+
 def test_core_returns_held_attested_capabilities_and_original_event_bytes(
     tmp_path: Path,
 ) -> None:
