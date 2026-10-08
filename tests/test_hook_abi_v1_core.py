@@ -1288,3 +1288,71 @@ def reserve_native_agent_spawn(payload):
             payload=b'{"session_id":"session-one","hook_event_name":"SessionStart"}',
             now=10,
         )
+
+
+def test_fd_backed_native_event_imports_shared_registry_and_retains_over_1024_active_rows(
+    tmp_path: Path,
+) -> None:
+    _installer_value, release_root, plugin_root, abi_root, state_root = _fixture(
+        tmp_path
+    )
+    payload = b'{"session_id":"session-one","hook_event_name":"SessionStart"}'
+    result = _dispatch(
+        release_root=release_root,
+        plugin_root=plugin_root,
+        abi_root=abi_root,
+        state_root=state_root,
+        payload=payload,
+        now=10,
+    )
+    agent_state = tmp_path / "agent-state"
+    agent_state.mkdir(mode=0o700)
+    path = agent_state / "native-agents.json"
+    document = {
+        "schema_version": 2,
+        "agents": [
+            {
+                "session_id": "other-parent",
+                "agent_id": f"child-{i}",
+                "agent_type": "worker",
+                "activity_state": "active",
+                "updated_at": 10.0,
+            }
+            for i in range(1100)
+        ],
+        "sessions": [
+            {
+                "session_id": f"parent-{i}",
+                "activity_state": "active",
+                "updated_at": 10.0,
+            }
+            for i in range(1100)
+        ],
+        "reservations": [],
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-B", f"/proc/self/fd/{result.hook_fd}"],
+            check=False,
+            input=result.stdin_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "PLUGIN_ROOT": f"/proc/self/fd/{result.bundle_fd}",
+                "CODEX_MASTER_MCP_STATE": str(agent_state),
+            },
+            pass_fds=(result.hook_fd, result.bundle_fd),
+            timeout=10,
+        )
+    finally:
+        result.close()
+    assert completed.returncode == 0, completed.stderr.decode("utf-8")
+    assert completed.stderr == b""
+    assert completed.stdout == b""
+    stored = json.loads(path.read_bytes())
+    assert len(stored["agents"]) == 1100
+    assert len(stored["sessions"]) == 1101
+    assert (agent_state / "locks" / "native-agents.lock").is_file()

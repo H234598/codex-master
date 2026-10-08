@@ -37683,10 +37683,10 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 }
                 server_module._write_native_agent_registry(payload)
                 stored = json.loads(record_path.read_text(encoding="utf-8"))
-                self.assertEqual(len(stored["reservations"]), server_module.MAX_NATIVE_AGENT_RESERVATIONS)
+                self.assertEqual(len(stored["reservations"]), server_module.MAX_NATIVE_AGENT_RESERVATIONS + 5)
                 self.assertEqual(
                     server_module._fresh_native_reservation_count(now=1_000.0),
-                    server_module.MAX_NATIVE_AGENT_RESERVATIONS,
+                    server_module.MAX_NATIVE_AGENT_RESERVATIONS + 5,
                 )
 
     def test_native_spawn_reservation_unknown_registry_fails_closed(self) -> None:
@@ -37741,6 +37741,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 "the_hive.server.time.time", return_value=1_000.0
             ):
                 with server_module.native_agent_registry_lock():
+                    registry, state = server_module._read_native_agent_registry()
+                    self.assertEqual(len(registry["reservations"]), 1)
+                    server_module._write_native_agent_registry(registry)
                     registry, state = server_module._read_native_agent_registry()
             self.assertEqual(state, "ready")
             self.assertEqual(registry["reservations"], [])
@@ -38130,6 +38133,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
             ), patch("the_hive.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
                 "the_hive.server.time.time", return_value=1_031.0
             ), server_module.native_agent_registry_lock():
+                registry, state = server_module._read_native_agent_registry()
+                self.assertEqual(len(registry["reservations"]), 1)
+                server_module._write_native_agent_registry(registry)
                 registry, state = server_module._read_native_agent_registry()
             self.assertEqual(state, "ready")
             self.assertEqual(registry["reservations"], [])

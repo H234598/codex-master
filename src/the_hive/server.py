@@ -64,6 +64,9 @@ from the_hive.admin_contracts import (
     ADMIN_OPERATION_CATALOG_DIGEST,
     ADMIN_OPERATION_METADATA,
 )
+from the_hive.native_registry import (
+    RegistryByteBudgetError, encode_registry_for_write, normalize_registry, reservation_is_live,
+)
 from the_hive.fleet_registry import (
     AgentDescriptor,
     AuthKind,
@@ -5907,141 +5910,7 @@ def _native_agent_registry_is_stale(last_update: float, now: float) -> bool:
 
 
 def _native_agent_normalize_registry(payload: dict[str, Any]) -> dict[str, Any]:
-    schema_version = payload.get("schema_version")
-    if schema_version not in (1, 2) or not isinstance(payload.get("agents"), list):
-        return _native_agent_registry_payload()
-    normalized: list[dict[str, Any]] = []
-    for candidate in payload["agents"]:
-        if not isinstance(candidate, dict):
-            continue
-        session_id = candidate.get("session_id")
-        agent_id = candidate.get("agent_id")
-        agent_type = candidate.get("agent_type")
-        activity_state = candidate.get("activity_state")
-        updated_at = candidate.get("updated_at")
-        if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE):
-            continue
-        if not _validate_native_agent_identifier(agent_id, NATIVE_AGENT_ID_RE):
-            continue
-        if not _validate_native_agent_identifier(agent_type, NATIVE_AGENT_TYPE_RE):
-            continue
-        if activity_state not in ("active", "unconfirmed", "completed"):
-            continue
-        updated_at_ts = _normalize_native_agent_timestamp(updated_at)
-        if updated_at_ts is None:
-            continue
-        normalized.append(
-            {
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "agent_type": agent_type,
-                "activity_state": activity_state,
-                "updated_at": updated_at_ts,
-            }
-        )
-    normalized = normalized[-MAX_NATIVE_AGENT_RECORDS:]
-
-    session_candidates: list[dict[str, Any]]
-    if schema_version == 2:
-        if not isinstance(payload.get("sessions"), list):
-            return _native_agent_registry_payload()
-        session_candidates = payload["sessions"]
-    else:
-        session_candidates = [
-            {
-                "session_id": record["session_id"],
-                "activity_state": "active",
-                "updated_at": record["updated_at"],
-            }
-            for record in normalized
-        ]
-
-    sessions_by_id: dict[str, dict[str, Any]] = {}
-    for candidate in session_candidates:
-        if not isinstance(candidate, dict):
-            continue
-        session_id = candidate.get("session_id")
-        activity_state = candidate.get("activity_state")
-        managed_session = candidate.get("managed_session")
-        updated_at_ts = _normalize_native_agent_timestamp(candidate.get("updated_at"))
-        if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE):
-            continue
-        if activity_state not in ("active", "ended") or updated_at_ts is None:
-            continue
-        current = sessions_by_id.get(session_id)
-        if current is None or updated_at_ts >= current["updated_at"]:
-            normalized_session = {
-                "session_id": session_id,
-                "activity_state": activity_state,
-                "updated_at": updated_at_ts,
-            }
-            if isinstance(managed_session, str) and _validate_native_agent_identifier(
-                managed_session, NATIVE_AGENT_ID_RE
-            ):
-                normalized_session["managed_session"] = managed_session
-            sessions_by_id[session_id] = normalized_session
-    sessions = list(sessions_by_id.values())[-MAX_NATIVE_SESSION_RECORDS:]
-    reservations: list[dict[str, Any]] = []
-    now = time.time()
-    candidates = payload.get("reservations", []) if schema_version == 2 else []
-    if isinstance(candidates, list):
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            reservation_id = candidate.get("reservation_id")
-            kind = candidate.get("kind")
-            created_at = _normalize_native_agent_timestamp(candidate.get("created_at"))
-            parent_session_id = candidate.get("parent_session_id")
-            managed_session = candidate.get("managed_session")
-            agent = candidate.get("agent")
-            assignment_id = candidate.get("assignment_id")
-            if (
-                not _validate_native_agent_identifier(
-                    reservation_id, NATIVE_AGENT_ID_RE
-                )
-                or kind
-                not in {"native_spawn", "managed_replacement", "headless_inflight"}
-                or created_at is None
-            ):
-                continue
-            if (
-                kind in {"native_spawn", "managed_replacement"}
-                and now - created_at > NATIVE_AGENT_RESERVATION_TTL_SECONDS
-            ):
-                continue
-            row = {
-                "reservation_id": reservation_id,
-                "kind": kind,
-                "created_at": created_at,
-            }
-            if kind == "native_spawn":
-                if not _validate_native_agent_identifier(
-                    parent_session_id, NATIVE_AGENT_ID_RE
-                ):
-                    continue
-                row["parent_session_id"] = parent_session_id
-            elif kind == "managed_replacement":
-                if not _validate_native_agent_identifier(
-                    managed_session, NATIVE_AGENT_ID_RE
-                ):
-                    continue
-                row["managed_session"] = managed_session
-            elif kind == "headless_inflight":
-                if not _validate_native_agent_identifier(
-                    agent, NATIVE_AGENT_ID_RE
-                ) or not _validate_native_agent_identifier(
-                    assignment_id, NATIVE_AGENT_ID_RE
-                ):
-                    continue
-                row["agent"] = agent
-                row["assignment_id"] = assignment_id
-            reservations.append(row)
-    return {
-        "schema_version": 2,
-        "agents": normalized,
-        "sessions": sessions,
-        "reservations": reservations[-MAX_NATIVE_AGENT_RESERVATIONS:],
-    }
+    return normalize_registry(payload) or _native_agent_registry_payload()
 
 
 def _read_native_agent_registry() -> tuple[dict[str, Any], str]:
@@ -6064,39 +5933,50 @@ def _read_native_agent_registry() -> tuple[dict[str, Any], str]:
     normalized = _native_agent_normalize_registry(loaded)
     if normalized != loaded:
         empty_legacy = loaded == {"schema_version": 1, "agents": []}
-        stale_only = (
-            loaded.get("schema_version") == 2
-            and loaded.get("agents") == normalized.get("agents")
-            and loaded.get("sessions") == normalized.get("sessions")
-            and isinstance(loaded.get("reservations"), list)
-            and all(
-                isinstance(row, dict)
-                and row.get("kind")
-                in {"native_spawn", "managed_replacement", "headless_inflight"}
-                and isinstance(row.get("created_at"), (int, float))
-                and (
-                    row.get("kind") == "headless_inflight"
-                    or time.time() - row["created_at"]
-                    > NATIVE_AGENT_RESERVATION_TTL_SECONDS
-                )
-                for row in loaded["reservations"]
-            )
-        )
-        if stale_only or empty_legacy:
+        if empty_legacy:
             _write_native_agent_registry(normalized)
         else:
             degraded = True
     return normalized, "degraded" if degraded else "ready"
 
 
-def _write_native_agent_registry(payload: dict[str, Any]) -> None:
-    safe_payload = _native_agent_normalize_registry(payload)
-    safe_payload["agents"] = safe_payload["agents"][:MAX_NATIVE_AGENT_RECORDS]
-    safe_payload["sessions"] = safe_payload["sessions"][:MAX_NATIVE_SESSION_RECORDS]
-    replace_private_text(
-        NATIVE_AGENT_REGISTRY_FILE,
-        json.dumps(safe_payload, sort_keys=True) + "\n",
-    )
+def _write_native_agent_registry(
+    payload: dict[str, Any],
+    *,
+    now: float | None = None,
+    stopped_managed_sessions: frozenset[str] = frozenset(),
+) -> None:
+    try:
+        encoded = encode_registry_for_write(
+            payload,
+            now=time.time() if now is None else now,
+            stopped_managed_sessions=stopped_managed_sessions,
+            max_bytes=MAX_NATIVE_AGENT_REGISTRY_BYTES,
+        )
+    except (RegistryByteBudgetError, ValueError) as exc:
+        raise AgentError(str(exc)) from exc
+    replace_private_text(NATIVE_AGENT_REGISTRY_FILE, encoded.decode("utf-8"))
+
+
+def _native_registry_after_confirmed_managed_stop(managed_session: str) -> None:
+    """Release only ended parent history after a lifecycle-locked stop.
+
+    The caller has confirmed the whole home has zero processes and released its
+    lease while holding agent_lifecycle_lock. Native child thread IDs lack a
+    process/home binding: this proof deliberately cannot retire uncertain child
+    rows. Pins, active/reopened parents, and all remaining child references win.
+    """
+    with native_agent_registry_lock():
+        registry, state = _read_native_agent_registry()
+        if state != "ready" or not any(
+            row.get("managed_session") == managed_session
+            and row["activity_state"] == "ended"
+            for row in registry["sessions"]
+        ):
+            return
+        _write_native_agent_registry(
+            registry, stopped_managed_sessions=frozenset({managed_session})
+        )
 
 
 def _trusted_managed_tmux_session_for_home() -> str | None:
@@ -6294,7 +6174,7 @@ def activate_native_agent_resume(
                 }
         record["activity_state"] = "active"
         record["updated_at"] = timestamp
-        _write_native_agent_registry(registry)
+        _write_native_agent_registry(registry, now=timestamp)
     return {"allowed": True, "reason_codes": []}
 
 
@@ -6391,7 +6271,9 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
         if event_name in {"UserPromptSubmit", "SubagentStart"}:
             lock_stack.enter_context(spawn_admission_lock())
         lock_stack.enter_context(native_agent_registry_lock())
-        registry, _state = _read_native_agent_registry()
+        registry, registry_state = _read_native_agent_registry()
+        if registry_state != "ready" and path_present_no_follow(NATIVE_AGENT_REGISTRY_FILE):
+            raise AgentError("native agent registry unavailable; event update rejected")
         current = registry["agents"]
         if event_name == "PostToolUse":
             completed_ids = _native_completed_agent_ids_from_tool_event(payload)
@@ -6402,7 +6284,7 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
                 ):
                     record["activity_state"] = "completed"
                     record["updated_at"] = timestamp
-            _write_native_agent_registry(registry)
+            _write_native_agent_registry(registry, now=timestamp)
             return
         if event_name in {"UserPromptSubmit", "Stop"}:
             activity_state = (
@@ -6428,13 +6310,16 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
                             "updated_at": timestamp,
                         }
                     )
-                    if len(current) > MAX_NATIVE_AGENT_RECORDS:
-                        current[:] = current[-MAX_NATIVE_AGENT_RECORDS:]
-            _write_native_agent_registry(registry)
+            _write_native_agent_registry(registry, now=timestamp)
             return
         sessions = registry["sessions"]
         session_state = "ended" if event_name == "SessionEnd" else "active"
         managed_session = _trusted_managed_tmux_session_for_home()
+        if managed_session is None:
+            managed_session = next(
+                (row.get("managed_session") for row in sessions if row["session_id"] == session_id),
+                None,
+            )
         sessions[:] = [
             record for record in sessions if record["session_id"] != session_id
         ]
@@ -6446,8 +6331,6 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
         if managed_session is not None:
             session_record["managed_session"] = managed_session
         sessions.append(session_record)
-        if len(sessions) > MAX_NATIVE_SESSION_RECORDS:
-            sessions[:] = sessions[-MAX_NATIVE_SESSION_RECORDS:]
         if event_name == "SessionStart":
             for record in current:
                 if (
@@ -6456,7 +6339,7 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
                 ):
                     record["activity_state"] = "unconfirmed"
                     record["updated_at"] = timestamp
-            _write_native_agent_registry(registry)
+            _write_native_agent_registry(registry, now=timestamp)
             return
         if event_name == "SubagentStart":
             reservations = registry.get("reservations", [])
@@ -6466,6 +6349,7 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
                 if isinstance(record, dict)
                 and record.get("kind") == "native_spawn"
                 and record.get("parent_session_id") == session_id
+                and reservation_is_live(record, timestamp)
             ]
             if matching:
                 reservations.pop(matching[0])
@@ -6488,9 +6372,7 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
                         "updated_at": timestamp,
                     }
                 )
-            if len(current) > MAX_NATIVE_AGENT_RECORDS:
-                current[:] = current[-MAX_NATIVE_AGENT_RECORDS:]
-            _write_native_agent_registry(registry)
+            _write_native_agent_registry(registry, now=timestamp)
             return
         if event_name == "SubagentStop":
             for record in current:
@@ -6500,7 +6382,7 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
                 ):
                     record["activity_state"] = "completed"
                     record["updated_at"] = timestamp
-            _write_native_agent_registry(registry)
+            _write_native_agent_registry(registry, now=timestamp)
             return
         if event_name == "SessionEnd":
             for record in current:
@@ -6510,7 +6392,7 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
                 ):
                     record["activity_state"] = "unconfirmed"
                     record["updated_at"] = timestamp
-            _write_native_agent_registry(registry)
+            _write_native_agent_registry(registry, now=timestamp)
             return
 
 
@@ -7021,6 +6903,7 @@ def reserve_managed_replacement(managed_session: Any) -> dict[str, Any]:
             reservations = registry.setdefault("reservations", [])
             if any(
                 row.get("kind") == "managed_replacement"
+                and reservation_is_live(row, time.time())
                 and row.get("managed_session") == managed_session
                 for row in reservations
                 if isinstance(row, dict)
@@ -15474,6 +15357,7 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
     cfg = agent_config(agent)
     session = cfg["session"]
     was_running = tmux_alive(session)
+    home_confirmed_empty = False
     if was_running:
         require_managed_tmux_session(agent)
         ensure_agent_lease_available(agent, force=force)
@@ -15495,6 +15379,7 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
             or process_count != 0
         ):
             raise AgentError(f"tmux stop failed for agent {agent}")
+        home_confirmed_empty = True
         release = release_agent(agent, force=True)
     else:
         current_lease = agent_lease_status(agent)
@@ -15510,6 +15395,7 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
                 or process_count != 0
             ):
                 raise AgentError(f"tmux stop failed for agent {agent}")
+            home_confirmed_empty = True
             release = release_agent(agent, force=True)
         else:
             release = {
@@ -15517,6 +15403,8 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
                 "lease": current_lease,
                 "raw_output": "not_returned",
             }
+    if home_confirmed_empty and release.get("lease", {}).get("state") in {"unclaimed", "expired"}:
+        _native_registry_after_confirmed_managed_stop(session)
     close_runner_execution_fd(agent)
     return {
         "agent": agent,

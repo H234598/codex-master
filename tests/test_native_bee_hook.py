@@ -260,7 +260,7 @@ class NativeBeeHookTest(unittest.TestCase):
                 {"session_id": "thr_parent", "activity_state": "active"},
             )
 
-    def test_registry_retains_65_and_1024_then_trims_1025_on_hook_server_roundtrip(self) -> None:
+    def test_registry_retains_all_managed_referenced_history_on_hook_server_roundtrip(self) -> None:
         from the_hive import server as server_module
 
         self.assertEqual(server_module.MAX_NATIVE_AGENT_RECORDS, 1024)
@@ -303,13 +303,13 @@ class NativeBeeHookTest(unittest.TestCase):
                         }
                         server_module._write_native_agent_registry(overfull)
                         server_trimmed = json.loads(registry_path.read_text(encoding="utf-8"))
-                        self.assertEqual(server_trimmed["agents"][0]["agent_id"], "agent_1")
-                        self.assertEqual(server_trimmed["sessions"][0]["managed_session"], "managed_1")
+                        self.assertEqual(server_trimmed["agents"][0]["agent_id"], "agent_0")
+                        self.assertEqual(server_trimmed["sessions"][0]["managed_session"], "managed_0")
                 self.assertEqual(read_state, "ready")
                 self.assertEqual(normalized, stored)
-                self.assertEqual(len(stored["agents"]), min(original_count + 1, 1024))
-                self.assertEqual(len(stored["sessions"]), min(original_count + 1, 1024))
-                first_retained = max(0, original_count + 1 - 1024)
+                self.assertEqual(len(stored["agents"]), original_count + 1)
+                self.assertEqual(len(stored["sessions"]), original_count + 1)
+                first_retained = 0
                 self.assertEqual(stored["agents"][0]["agent_id"], f"agent_{first_retained}")
                 self.assertEqual(stored["sessions"][0]["managed_session"], f"managed_{first_retained}")
                 self.assertEqual(stored["agents"][-1]["agent_id"], "new_agent")
@@ -795,3 +795,657 @@ class NativeBeeHookTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(completed.stdout, "")
             self.assertEqual(completed.stderr, "")
+
+
+class NativeRegistryCleanupTest(unittest.TestCase):
+    def setUp(self):
+        from the_hive import server
+
+        self.server = server
+        spec = importlib.util.spec_from_file_location("cleanup_hook", HOOK)
+        self.hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.hook)
+
+    @staticmethod
+    def registry(agents=(), sessions=(), reservations=()):
+        return {
+            "schema_version": 2,
+            "agents": list(agents),
+            "sessions": list(sessions),
+            "reservations": list(reservations),
+        }
+
+    @staticmethod
+    def agent(index, state="completed", parent="ended"):
+        return {
+            "session_id": parent,
+            "agent_id": f"child-{index}",
+            "agent_type": "worker",
+            "activity_state": state,
+            "updated_at": float(index),
+        }
+
+    @staticmethod
+    def session(index, state="ended", **extra):
+        return {
+            "session_id": f"session-{index}",
+            "activity_state": state,
+            "updated_at": float(index),
+            **extra,
+        }
+
+    def cleanup(self, document, **kwargs):
+        from the_hive.native_registry import cleanup_registry
+
+        return cleanup_registry(
+            document, now=2000, retained_session_ids=frozenset(), **kwargs
+        )
+
+    def test_normalizers_never_slice_protected_population(self):
+        document = self.registry(
+            [self.agent(i, "active") for i in range(1100)],
+            [self.session(i, "active") for i in range(1100)],
+        )
+        for normalizer in (
+            self.hook._normalized_registry,
+            self.server._native_agent_normalize_registry,
+        ):
+            normalized = normalizer(document)
+            self.assertEqual(len(normalized["agents"]), 1100)
+            self.assertEqual(len(normalized["sessions"]), 1100)
+
+    def test_mixed_overflow_preserves_active_and_uncertain_and_trims_oldest_history(
+        self,
+    ):
+        protected = [self.agent(-2, "active"), self.agent(-1, "unconfirmed")]
+        result = self.cleanup(
+            self.registry(protected + [self.agent(i) for i in range(1100)])
+        )
+        self.assertEqual(result["agents"][:2], protected)
+        self.assertEqual(len(result["agents"]), 1026)
+        self.assertEqual(result["agents"][2]["agent_id"], "child-76")
+
+    def test_terminal_parent_child_pin_and_reservation_references_are_protected(self):
+        from the_hive.native_registry import cleanup_registry
+
+        rows = [self.agent(i, parent="session-1") for i in range(1050)]
+        for sessions, reservations, pins in (
+            ([self.session(1, "active")], [], frozenset()),
+            ([self.session(1, managed_session="managed")], [], frozenset()),
+            (
+                [],
+                [
+                    {
+                        "reservation_id": "r",
+                        "kind": "native_spawn",
+                        "created_at": 2000,
+                        "parent_session_id": "session-1",
+                    }
+                ],
+                frozenset(),
+            ),
+            ([], [], frozenset({"session-1"})),
+        ):
+            result = cleanup_registry(
+                self.registry(rows, sessions, reservations),
+                now=2000,
+                retained_session_ids=pins,
+            )
+            self.assertEqual(result["agents"], rows)
+        child_rows = [self.agent(i) for i in range(1050)]
+        sessions = [
+            {
+                "session_id": row["agent_id"],
+                "activity_state": "active",
+                "updated_at": 2000,
+            }
+            for row in child_rows
+        ]
+        self.assertEqual(
+            self.cleanup(self.registry(child_rows, sessions))["agents"], child_rows
+        )
+
+    def test_unknown_orphan_survives_managed_shutdown_without_individual_proof(self):
+        rows = [self.agent(i, "unconfirmed", parent="session-1") for i in range(1050)]
+        document = self.registry(rows, [self.session(1, managed_session="managed")])
+        result = self.cleanup(document, stopped_managed_sessions=frozenset({"managed"}))
+        self.assertEqual(result["agents"], rows)
+        self.assertEqual(len(result["sessions"]), 1)
+
+    def test_fresh_terminal_child_event_releases_history_but_reopen_protects(self):
+        rows = [self.agent(i, "unconfirmed") for i in range(1050)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "native-agents.json"
+            path.write_text(json.dumps(self.registry(rows)))
+            path.chmod(0o600)
+            with (
+                patch.object(self.server, "STATE_ROOT", root),
+                patch.object(self.server, "LOCK_DIR", root / "locks"),
+                patch.object(self.server, "NATIVE_AGENT_REGISTRY_FILE", path),
+                patch.object(
+                    self.server,
+                    "NATIVE_AGENT_REGISTRY_LOCK_FILE",
+                    root / "locks" / "native-agents.lock",
+                ),
+                patch(
+                    "the_hive.native_registry.retained_pin_session_ids",
+                    return_value=frozenset(),
+                ),
+            ):
+                ids = [row["agent_id"] for row in rows]
+                self.server.record_native_agent_event(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": "ended",
+                        "tool_name": "wait_agent",
+                        "tool_input": {"ids": ids},
+                        "tool_response": {
+                            "status": {child: {"completed": "done"} for child in ids}
+                        },
+                    },
+                    now=2000,
+                )
+                stored = json.loads(path.read_text())
+                self.assertEqual(len(stored["agents"]), 1024)
+                self.server.record_native_agent_event(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": stored["agents"][0]["agent_id"],
+                    },
+                    now=2001,
+                )
+                self.assertEqual(
+                    json.loads(path.read_text())["agents"][0]["activity_state"],
+                    "active",
+                )
+
+    def test_ttl_is_only_for_native_and_replacement_reservations(self):
+        reservations = [
+            {
+                "reservation_id": "native",
+                "kind": "native_spawn",
+                "created_at": 1969,
+                "parent_session_id": "parent",
+            },
+            {
+                "reservation_id": "replacement",
+                "kind": "managed_replacement",
+                "created_at": 1969,
+                "managed_session": "managed",
+            },
+            {
+                "reservation_id": "headless",
+                "kind": "headless_inflight",
+                "created_at": 1,
+                "agent": "agent",
+                "assignment_id": "assignment",
+            },
+        ]
+        self.assertEqual(
+            self.cleanup(self.registry(reservations=reservations))["reservations"],
+            reservations[2:],
+        )
+        self.assertEqual(
+            self.hook._normalized_registry(self.registry(reservations=reservations)),
+            self.server._native_agent_normalize_registry(
+                self.registry(reservations=reservations)
+            ),
+        )
+
+    def test_atomic_byte_rejection_preserves_file_and_protected_reservations(self):
+        rows = [
+            self.agent(i, "active", parent="p" * 128)
+            | {"agent_id": f"{i:06d}" + "a" * 122, "agent_type": "t" * 64}
+            for i in range(3000)
+        ]
+        document = self.registry(rows)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "native-agents.json"
+            path.write_text(json.dumps(self.registry()))
+            path.chmod(0o600)
+            before = path.read_bytes()
+            with patch.object(self.server, "NATIVE_AGENT_REGISTRY_FILE", path):
+                with self.assertRaisesRegex(self.server.AgentError, "byte budget"):
+                    self.server._write_native_agent_registry(document)
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                self.assertFalse(self.hook._write_registry(fd, document))
+            finally:
+                os.close(fd)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(root.iterdir()), [path])
+
+    def test_uncertain_pin_store_protects_terminal_history(self):
+        from the_hive.native_registry import cleanup_registry
+
+        document = self.registry([self.agent(i) for i in range(1100)])
+        self.assertEqual(
+            cleanup_registry(document, now=2000, retained_session_ids=None), document
+        )
+
+    def test_event_rejects_existing_invalid_or_oversized_registry_atomically(self):
+        for raw in (b'{"broken":true}', b"x" * (1024 * 1024 + 1)):
+            with self.subTest(size=len(raw)), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "native-agents.json"
+                path.write_bytes(raw)
+                path.chmod(0o600)
+                inode = path.stat().st_ino
+                with (
+                    patch.object(self.server, "STATE_ROOT", root),
+                    patch.object(self.server, "LOCK_DIR", root / "locks"),
+                    patch.object(self.server, "NATIVE_AGENT_REGISTRY_FILE", path),
+                    patch.object(
+                        self.server,
+                        "NATIVE_AGENT_REGISTRY_LOCK_FILE",
+                        root / "locks" / "native-agents.lock",
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        self.server.AgentError, "event update rejected"
+                    ):
+                        self.server.record_native_agent_event(
+                            {"hook_event_name": "SessionStart", "session_id": "new"},
+                            now=2000,
+                        )
+                self.assertEqual(path.read_bytes(), raw)
+                self.assertEqual(path.stat().st_ino, inode)
+
+    def test_managed_association_survives_hook_and_server_end_and_reopen(self):
+        document = self.registry(
+            [self.agent(1, "unconfirmed", parent="session-1")],
+            [self.session(1, "active", managed_session="managed")],
+        )
+        for module in (self.hook, self.server):
+            with (
+                self.subTest(module=module.__name__),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                path = root / "native-agents.json"
+                path.write_text(json.dumps(document))
+                path.chmod(0o600)
+                with (
+                    patch.dict(os.environ, {"CODEX_MASTER_MCP_STATE": str(root)}),
+                    patch.object(self.server, "STATE_ROOT", root),
+                    patch.object(self.server, "LOCK_DIR", root / "locks"),
+                    patch.object(self.server, "NATIVE_AGENT_REGISTRY_FILE", path),
+                    patch.object(
+                        self.server,
+                        "NATIVE_AGENT_REGISTRY_LOCK_FILE",
+                        root / "locks" / "native-agents.lock",
+                    ),
+                    patch.object(
+                        self.server,
+                        "_trusted_managed_tmux_session_for_home",
+                        return_value=None,
+                    ),
+                ):
+                    for event in ("SessionEnd", "SessionStart"):
+                        payload = {"hook_event_name": event, "session_id": "session-1"}
+                        if module is self.hook:
+                            module._record_native_event(payload)
+                        else:
+                            module.record_native_agent_event(payload, now=2000)
+                        self.assertEqual(
+                            json.loads(path.read_text())["sessions"][0][
+                                "managed_session"
+                            ],
+                            "managed",
+                        )
+
+    def test_hook_and_server_writers_produce_identical_cleanup_and_one_reservation_consumption(
+        self,
+    ):
+        document = self.registry(
+            [self.agent(i) for i in range(1100)],
+            reservations=[
+                {
+                    "reservation_id": f"r-{i}",
+                    "kind": "native_spawn",
+                    "created_at": 1999,
+                    "parent_session_id": "new-parent",
+                }
+                for i in range(2)
+            ],
+        )
+        stored = []
+        for module in (self.hook, self.server):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "native-agents.json"
+                path.write_text(json.dumps(document))
+                path.chmod(0o600)
+                with (
+                    patch.dict(os.environ, {"CODEX_MASTER_MCP_STATE": str(root)}),
+                    patch.object(self.server, "STATE_ROOT", root),
+                    patch.object(self.server, "LOCK_DIR", root / "locks"),
+                    patch.object(self.server, "NATIVE_AGENT_REGISTRY_FILE", path),
+                    patch.object(
+                        self.server,
+                        "NATIVE_AGENT_REGISTRY_LOCK_FILE",
+                        root / "locks" / "native-agents.lock",
+                    ),
+                    patch.object(
+                        self.server,
+                        "_trusted_managed_tmux_session_for_home",
+                        return_value=None,
+                    ),
+                    patch(
+                        "the_hive.native_registry.retained_pin_session_ids",
+                        return_value=frozenset(),
+                    ),
+                    patch.object(self.hook.time, "time", return_value=2000),
+                ):
+                    payload = {
+                        "hook_event_name": "SubagentStart",
+                        "session_id": "new-parent",
+                        "agent_id": "new-child",
+                        "agent_type": "worker",
+                    }
+                    if module is self.hook:
+                        module._record_native_event(payload)
+                    else:
+                        module.record_native_agent_event(payload, now=2000)
+                    stored.append(path.read_bytes())
+        self.assertEqual(stored[0], stored[1])
+        self.assertEqual(len(json.loads(stored[0])["reservations"]), 1)
+
+    def test_hook_event_overflow_reports_bounded_reason_without_overwriting(self):
+        document = self.registry([self.agent(i, "active") for i in range(4)])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "native-agents.json"
+            path.write_text(json.dumps(document))
+            path.chmod(0o600)
+            before = path.read_bytes()
+            errors = io.StringIO()
+            with (
+                patch.dict(os.environ, {"CODEX_MASTER_MCP_STATE": str(root)}),
+                patch.object(
+                    self.hook, "MAX_NATIVE_AGENT_REGISTRY_BYTES", len(before) + 1
+                ),
+                patch.object(self.hook.sys, "stderr", errors),
+            ):
+                self.hook._record_native_event(
+                    {
+                        "hook_event_name": "SubagentStart",
+                        "session_id": "new-parent",
+                        "agent_id": "new-child",
+                        "agent_type": "worker",
+                    }
+                )
+            self.assertEqual(
+                errors.getvalue(), "error_code=native_registry_byte_budget_exceeded\n"
+            )
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_server_and_hook_share_lock_and_do_not_lose_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "native-agents.json"
+            path.write_text(json.dumps(self.registry()))
+            path.chmod(0o600)
+            env = os.environ.copy() | {
+                "PLUGIN_ROOT": str(REPO_ROOT),
+                "CODEX_MASTER_MCP_STATE": str(root),
+            }
+            with (
+                patch.object(self.server, "STATE_ROOT", root),
+                patch.object(self.server, "LOCK_DIR", root / "locks"),
+                patch.object(self.server, "NATIVE_AGENT_REGISTRY_FILE", path),
+                patch.object(
+                    self.server,
+                    "NATIVE_AGENT_REGISTRY_LOCK_FILE",
+                    root / "locks" / "native-agents.lock",
+                ),
+            ):
+                with self.server.native_agent_registry_lock():
+                    child = subprocess.Popen(
+                        [sys.executable, str(HOOK)],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=env,
+                    )
+                    try:
+                        child.communicate(
+                            json.dumps(
+                                {
+                                    "hook_event_name": "SessionStart",
+                                    "session_id": "hook-parent",
+                                }
+                            ),
+                            timeout=0.5,
+                        )
+                    except subprocess.TimeoutExpired:
+                        pass
+                    else:
+                        self.fail("hook did not wait for the server registry lock")
+                    self.server.record_native_agent_event(
+                        {
+                            "hook_event_name": "SessionStart",
+                            "session_id": "server-parent",
+                        },
+                        now=2000,
+                    )
+                output, error = child.communicate(timeout=10)
+                self.assertEqual(child.returncode, 0, error)
+                self.assertEqual(output, "")
+                self.assertEqual(
+                    {
+                        row["session_id"]
+                        for row in json.loads(path.read_text())["sessions"]
+                    },
+                    {"hook-parent", "server-parent"},
+                )
+
+    def test_canonical_pin_collection_retains_ended_grace_and_resume_and_fails_closed(
+        self,
+    ):
+        from the_hive.hook_session_pin_store import HookSessionPinStoreV1
+        from the_hive.native_registry import retained_pin_session_ids
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+            store = HookSessionPinStoreV1.create_at(root)
+            digest = "sha256:" + "a" * 64
+            store.bind_session(
+                session_id="pin-parent",
+                generation="one",
+                runtime_manifest_digest=digest,
+                hooks={"native_bee_event": digest, "native_spawn_admission": digest},
+                now_unix_ns=1_000_000_000,
+            )
+            store.end_session(session_id="pin-parent", now_unix_ns=2_000_000_000)
+            with patch(
+                "the_hive.native_registry.pwd.getpwuid",
+                return_value=SimpleNamespace(pw_dir=str(home)),
+            ):
+                self.assertEqual(retained_pin_session_ids(3), frozenset({"pin-parent"}))
+                self.assertEqual(
+                    retained_pin_session_ids(86402), frozenset({"pin-parent"})
+                )
+                store.resume_session(
+                    session_id="pin-parent",
+                    generation="one",
+                    runtime_manifest_digest=digest,
+                    hooks={
+                        "native_bee_event": digest,
+                        "native_spawn_admission": digest,
+                    },
+                    now_unix_ns=86403_000_000_000,
+                )
+                self.assertEqual(
+                    retained_pin_session_ids(86404), frozenset({"pin-parent"})
+                )
+                (root / "untrusted").write_text("bad")
+                self.assertIsNone(retained_pin_session_ids(86405))
+            with patch(
+                "the_hive.native_registry.pwd.getpwuid",
+                return_value=SimpleNamespace(pw_dir=str(home / "missing")),
+            ):
+                self.assertIsNone(retained_pin_session_ids(86405))
+
+    def test_actual_managed_stop_releases_only_unreferenced_ended_parent_history(self):
+        import contextlib
+
+        sessions = [self.session(i, managed_session="managed") for i in range(1100)]
+        sessions[1]["activity_state"] = "active"
+        document = self.registry(
+            [self.agent(0, "unconfirmed", parent="session-0")], sessions
+        )
+        for process_count, lease_state, expected in (
+            (None, "unclaimed", None),
+            (0, "held", 1100),
+            (0, "unclaimed", 1027),
+        ):
+            with (
+                self.subTest(process_count=process_count, lease_state=lease_state),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                path = root / "native-agents.json"
+                path.write_text(json.dumps(document))
+                path.chmod(0o600)
+                with contextlib.ExitStack() as stack:
+                    for name, value in (
+                        ("STATE_ROOT", root),
+                        ("LOCK_DIR", root / "locks"),
+                        ("NATIVE_AGENT_REGISTRY_FILE", path),
+                        (
+                            "NATIVE_AGENT_REGISTRY_LOCK_FILE",
+                            root / "locks" / "native-agents.lock",
+                        ),
+                    ):
+                        stack.enter_context(patch.object(self.server, name, value))
+                    for name, value in (
+                        ("canonical_agent_id", "agent"),
+                        ("_headless_descriptor", None),
+                        ("agent_config", {"session": "managed"}),
+                        ("tmux_alive", True),
+                        ("require_managed_tmux_session", None),
+                        ("ensure_agent_lease_available", None),
+                        ("_tmux_args_for_session", []),
+                        ("run_tmux", SimpleNamespace(returncode=0)),
+                        (
+                            "agent_home_process_summary",
+                            {"process_count": process_count},
+                        ),
+                        ("release_agent", {"lease": {"state": lease_state}}),
+                        ("close_runner_execution_fd", None),
+                    ):
+                        stack.enter_context(
+                            patch.object(self.server, name, return_value=value)
+                        )
+                    lifecycle = stack.enter_context(
+                        patch.object(
+                            self.server,
+                            "agent_lifecycle_lock",
+                            return_value=contextlib.nullcontext(),
+                        )
+                    )
+                    stack.enter_context(
+                        patch(
+                            "the_hive.native_registry.retained_pin_session_ids",
+                            return_value=frozenset({"session-2"}),
+                        )
+                    )
+                    if expected is None:
+                        with self.assertRaises(self.server.AgentError):
+                            self.server.stop_agent("agent")
+                        self.assertEqual(json.loads(path.read_text()), document)
+                    else:
+                        self.server.stop_agent("agent")
+                        stored = json.loads(path.read_text())
+                        self.assertEqual(len(stored["sessions"]), expected)
+                        self.assertEqual(stored["agents"], document["agents"])
+                        self.assertTrue(
+                            {"session-0", "session-1", "session-2"}
+                            <= {row["session_id"] for row in stored["sessions"]}
+                        )
+                    lifecycle.assert_called_once()
+
+    def test_terminal_session_history_and_persistent_reservations_have_separate_limits(
+        self,
+    ):
+        from the_hive.native_registry import cleanup_registry
+
+        reservations = [
+            {
+                "reservation_id": f"r-{i}",
+                "kind": "headless_inflight",
+                "created_at": 1.0,
+                "agent": f"child-{i}",
+                "assignment_id": f"session-{i}",
+            }
+            for i in range(1100)
+        ]
+        rows = [self.agent(i) for i in range(1100)]
+        sessions = [self.session(i) for i in range(1100)]
+        result = self.cleanup(self.registry(rows, sessions, reservations))
+        self.assertEqual(result["reservations"], reservations)
+        self.assertEqual(result["agents"], rows)
+        self.assertEqual(result["sessions"], sessions)
+        history = self.cleanup(self.registry(sessions=sessions))
+        self.assertEqual(len(history["sessions"]), 1024)
+        self.assertEqual(history["sessions"][0]["session_id"], "session-76")
+        replacement = {
+            "reservation_id": "replacement",
+            "kind": "managed_replacement",
+            "created_at": 2000.0,
+            "managed_session": "managed",
+        }
+        managed = [self.session(i, managed_session="managed") for i in range(1100)]
+        kept = cleanup_registry(
+            self.registry(sessions=managed, reservations=[replacement]),
+            now=2000,
+            retained_session_ids=frozenset(),
+            stopped_managed_sessions=frozenset({"managed"}),
+        )
+        self.assertEqual(kept["sessions"], managed)
+
+    def test_mixed_byte_pressure_trims_eligible_history_before_rejecting(self):
+        protected = [
+            self.agent(i, "active", parent="p" * 128)
+            | {"agent_id": f"{i:06d}" + "a" * 122, "agent_type": "t" * 64}
+            for i in range(2200)
+        ]
+        protected_document = self.registry(protected)
+        protected_size = len(
+            (json.dumps(protected_document, sort_keys=True) + "\n").encode()
+        )
+        budget = protected_size + 2048
+        self.assertLess(budget, 1024 * 1024)
+        history = [self.agent(i + 10000) for i in range(100)]
+        ended = [self.session(i) for i in range(100)]
+        document = self.registry(protected + history, ended)
+        self.assertGreater(
+            len((json.dumps(document, sort_keys=True) + "\n").encode()), budget
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "native-agents.json"
+            path.write_text(json.dumps(self.registry()))
+            path.chmod(0o600)
+            with (
+                patch(
+                    "the_hive.native_registry.retained_pin_session_ids",
+                    return_value=frozenset(),
+                ),
+                patch.object(self.server, "NATIVE_AGENT_REGISTRY_FILE", path),
+                patch.object(self.server, "MAX_NATIVE_AGENT_REGISTRY_BYTES", budget),
+            ):
+                self.server._write_native_agent_registry(document, now=2000)
+            stored = json.loads(path.read_bytes())
+            self.assertLessEqual(path.stat().st_size, budget)
+            self.assertEqual(stored["agents"][: len(protected)], protected)
+            remaining = stored["agents"][len(protected) :]
+            self.assertGreater(len(remaining), 0)
+            self.assertLess(len(remaining), len(history))
+            self.assertEqual(remaining, history[-len(remaining) :])
+            self.assertEqual(stored["sessions"], [])

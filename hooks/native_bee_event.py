@@ -23,6 +23,10 @@ SRC_ROOT = PLUGIN_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from the_hive.native_registry import (
+    RegistryByteBudgetError, encode_registry_for_write, normalize_registry, reservation_is_live,
+)
+
 
 def _read_payload() -> dict[str, object] | None:
     try:
@@ -59,67 +63,7 @@ def _empty_registry() -> dict[str, object]:
 
 
 def _normalized_registry(value: object) -> dict[str, object] | None:
-    if not isinstance(value, dict) or value.get("schema_version") not in {1, 2}:
-        return None
-    raw_agents = value.get("agents")
-    if not isinstance(raw_agents, list):
-        return None
-    agents: list[dict[str, object]] = []
-    for item in raw_agents[-_MAX_NATIVE_RECORDS:]:
-        if not isinstance(item, dict):
-            continue
-        session_id = item.get("session_id")
-        agent_id = item.get("agent_id")
-        agent_type = item.get("agent_type")
-        activity_state = item.get("activity_state")
-        updated_at = item.get("updated_at")
-        if (
-            not _native_id(session_id)
-            or not _native_id(agent_id)
-            or not _native_type(agent_type)
-            or activity_state not in {"active", "unconfirmed", "completed"}
-            or isinstance(updated_at, bool)
-            or not isinstance(updated_at, (int, float))
-        ):
-            continue
-        agents.append(
-            {
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "agent_type": agent_type,
-                "activity_state": activity_state,
-                "updated_at": float(updated_at),
-            }
-        )
-    raw_sessions = value.get("sessions", [])
-    if not isinstance(raw_sessions, list):
-        return None
-    sessions: list[dict[str, object]] = []
-    for item in raw_sessions[-_MAX_NATIVE_SESSIONS:]:
-        if not isinstance(item, dict):
-            continue
-        session_id = item.get("session_id")
-        activity_state = item.get("activity_state")
-        updated_at = item.get("updated_at")
-        managed_session = item.get("managed_session")
-        if (
-            not _native_id(session_id)
-            or activity_state not in {"active", "ended"}
-            or isinstance(updated_at, bool)
-            or not isinstance(updated_at, (int, float))
-        ):
-            continue
-        row = {"session_id": session_id, "activity_state": activity_state, "updated_at": float(updated_at)}
-        if _native_id(managed_session):
-            row["managed_session"] = managed_session
-        sessions.append(row)
-    reservations = value.get("reservations", [])
-    return {
-        "schema_version": 2,
-        "agents": agents,
-        "sessions": sessions,
-        "reservations": reservations if isinstance(reservations, list) else [],
-    }
+    return normalize_registry(value)
 
 
 def _read_registry(root_fd: int) -> dict[str, object] | None:
@@ -157,9 +101,13 @@ def _read_registry(root_fd: int) -> dict[str, object] | None:
             os.close(fd)
 
 
-def _write_registry(root_fd: int, registry: dict[str, object]) -> bool:
-    encoded = (json.dumps(registry, sort_keys=True) + "\n").encode("utf-8")
-    if len(encoded) > MAX_NATIVE_AGENT_REGISTRY_BYTES:
+def _write_registry(root_fd: int, registry: dict[str, object], *, now: float | None = None) -> bool:
+    try:
+        encoded = encode_registry_for_write(registry, now=time.time() if now is None else now, max_bytes=MAX_NATIVE_AGENT_REGISTRY_BYTES)
+    except RegistryByteBudgetError:
+        sys.stderr.write("error_code=native_registry_byte_budget_exceeded\n")
+        return False
+    except ValueError:
         return False
     temporary = f".native-agents.{os.getpid()}.{os.urandom(8).hex()}"
     flags = (
@@ -200,7 +148,7 @@ def _write_registry(root_fd: int, registry: dict[str, object]) -> bool:
             pass
 
 
-def _update_registry(mutator) -> bool:
+def _update_registry(mutator, *, now: float | None = None) -> bool:
     root = _hook_state_root()
     try:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -217,25 +165,36 @@ def _update_registry(mutator) -> bool:
         )
     except OSError:
         return False
-    lock_fd = -1
+    lock_fd = locks_fd = -1
     try:
+        try:
+            os.mkdir("locks", 0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        locks_fd = os.open("locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        locks_info = os.fstat(locks_fd)
+        if locks_info.st_uid != os.geteuid() or stat.S_IMODE(locks_info.st_mode) != 0o700:
+            return False
         lock_fd = os.open(
-            ".native-agents.lock",
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-            dir_fd=root_fd,
+            "native-agents.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600, dir_fd=locks_fd,
         )
+        lock_info = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_nlink != 1 or lock_info.st_uid != os.geteuid() or stat.S_IMODE(lock_info.st_mode) != 0o600:
+            return False
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         registry = _read_registry(root_fd)
         if registry is None:
             return False
         mutator(registry)
-        return _write_registry(root_fd, registry)
+        return _write_registry(root_fd, registry, now=now)
     except OSError:
         return False
     finally:
         if lock_fd >= 0:
             os.close(lock_fd)
+        if locks_fd >= 0:
+            os.close(locks_fd)
         os.close(root_fd)
 
 
@@ -329,25 +288,30 @@ def _record_native_event(payload: dict[str, object]) -> None:
                 parent = _legacy_parent_from_transcript(payload, session_id)
                 if parent is not None:
                     agents.append({"session_id": parent, "agent_id": session_id, "agent_type": "subagent", "activity_state": "active", "updated_at": timestamp})
-            registry["agents"] = agents[-_MAX_NATIVE_RECORDS:]
             return
+        managed_session = next((row.get("managed_session") for row in sessions if row.get("session_id") == session_id), None)
         sessions[:] = [row for row in sessions if not isinstance(row, dict) or row.get("session_id") != session_id]
-        sessions.append({"session_id": session_id, "activity_state": "ended" if event == "SessionEnd" else "active", "updated_at": timestamp})
-        registry["sessions"] = sessions[-_MAX_NATIVE_SESSIONS:]
+        session_row = {"session_id": session_id, "activity_state": "ended" if event == "SessionEnd" else "active", "updated_at": timestamp}
+        if _native_id(managed_session):
+            session_row["managed_session"] = managed_session
+        sessions.append(session_row)
         if event == "SessionStart":
             for row in agents:
                 if isinstance(row, dict) and row.get("session_id") == session_id and row.get("activity_state") != "completed":
                     row.update(activity_state="unconfirmed", updated_at=timestamp)
             return
         if event == "SubagentStart":
-            registry["reservations"] = [row for row in registry["reservations"] if not isinstance(row, dict) or not (row.get("kind") == "native_spawn" and row.get("parent_session_id") == session_id)]
+            reservations = registry["reservations"]
+            for index, row in enumerate(reservations):
+                if row.get("kind") == "native_spawn" and row.get("parent_session_id") == session_id and reservation_is_live(row, timestamp):
+                    reservations.pop(index)
+                    break
             for row in agents:
                 if isinstance(row, dict) and row.get("session_id") == session_id and row.get("agent_id") == agent_id:
                     row.update(agent_type=agent_type, activity_state="active", updated_at=timestamp)
                     break
             else:
                 agents.append({"session_id": session_id, "agent_id": agent_id, "agent_type": agent_type, "activity_state": "active", "updated_at": timestamp})
-            registry["agents"] = agents[-_MAX_NATIVE_RECORDS:]
             return
         if event == "SubagentStop":
             for row in agents:
@@ -359,7 +323,7 @@ def _record_native_event(payload: dict[str, object]) -> None:
                 if isinstance(row, dict) and row.get("session_id") == session_id and row.get("activity_state") != "completed":
                     row.update(activity_state="unconfirmed", updated_at=timestamp)
 
-    _update_registry(mutate)
+    _update_registry(mutate, now=timestamp)
 
 
 def _resume_association_is_known(payload: dict[str, object]) -> bool:
