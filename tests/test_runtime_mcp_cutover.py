@@ -1674,6 +1674,10 @@ def test_unauthorized_runtime_surface_stays_sterile_until_a_principal_is_verifie
     assert str(tmp_path) not in json.dumps(blocked_tool)
 
 
+@pytest.mark.skipif(
+    os.environ.get("THE_HIVE_SYSTEMD_USER_IT") != "1",
+    reason="systemd_user_it_disabled",
+)
 def test_unauthorized_stdio_runtime_status_creates_no_private_state(
     tmp_path: Path,
 ) -> None:
