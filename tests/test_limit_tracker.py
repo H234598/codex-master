@@ -1423,6 +1423,38 @@ def test_file_and_parent_security_fail_closed(
     assert read(evidence).status == "invalid"
 
 
+@pytest.mark.parametrize(
+    "validator",
+    [limit_tracker._validate_private_directory, limit_tracker._validate_release_directory],
+)
+def test_private_directory_accepts_single_link_filesystems(validator) -> None:
+    item = SimpleNamespace(
+        st_mode=stat.S_IFDIR | 0o700, st_uid=os.geteuid(), st_nlink=1
+    )
+    validator(item)
+
+
+@pytest.mark.parametrize(
+    "validator",
+    [limit_tracker._validate_private_directory, limit_tracker._validate_release_directory],
+)
+@pytest.mark.parametrize("defect", ["unlinked", "type", "mode", "owner"])
+def test_private_directory_still_rejects_unsafe_metadata(validator, defect) -> None:
+    item = SimpleNamespace(
+        st_mode=stat.S_IFDIR | 0o700, st_uid=os.geteuid(), st_nlink=1
+    )
+    if defect == "unlinked":
+        item.st_nlink = 0
+    elif defect == "type":
+        item.st_mode = stat.S_IFLNK | 0o700
+    elif defect == "mode":
+        item.st_mode = stat.S_IFDIR | 0o750
+    else:
+        item.st_uid += 1
+    with pytest.raises(limit_tracker._InvalidEvidence):
+        validator(item)
+
+
 def test_owner_validation_is_exact() -> None:
     item = SimpleNamespace(
         st_mode=stat.S_IFREG | 0o600,

@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 import pickle
+import tempfile
 
 import pytest
 import yaml
 
 from the_hive import google_inventory_store as store_module
 from the_hive.google_account_inventory import GoogleAccountInventoryLoader
+
+
+@pytest.fixture
+def tmp_path():
+    # The synthetic migration issuer intentionally accepts only paths under /tmp.
+    with tempfile.TemporaryDirectory(prefix="hive-schema3-", dir="/tmp") as directory:
+        yield Path(directory)
 
 
 def _legacy(tmp_path):
@@ -111,6 +120,12 @@ def test_migration_effect_has_only_synthetic_test_factory(tmp_path):
         store_module.GoogleInventoryStoreError, match="migration_unavailable"
     ):
         store_module._schema3_migration_for_test(tmp_path / "api-token.yaml")
+    with pytest.raises(
+        store_module.GoogleInventoryStoreError, match="migration_unavailable"
+    ):
+        store_module._schema3_migration_for_test(
+            Path("/home/synthetic/synthetic-inventory.yaml")
+        )
 
 
 def test_migration_failed_replace_keeps_schema2_unchanged(tmp_path, monkeypatch):

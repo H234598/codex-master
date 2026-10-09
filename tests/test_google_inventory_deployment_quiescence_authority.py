@@ -161,6 +161,20 @@ def test_issue_resolve_claim_consume_is_bound_to_each_canonical_action(
     assert instance.resolve(receipt.receipt_reference) == consumed
 
 
+def test_store_enumeration_observes_publication_on_the_same_bound_directory(
+    tmp_path: Path,
+) -> None:
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        assert authority._entry_names(descriptor) == []
+        staged = tmp_path / "staged"
+        staged.write_bytes(b"synthetic-record")
+        staged.rename(tmp_path / "published")
+        assert authority._entry_names(descriptor) == ["published"]
+    finally:
+        os.close(descriptor)
+
+
 def test_parameterless_ports_and_private_authority_have_no_product_factory() -> None:
     signature = inspect.signature(
         authority.GoogleInventoryDeploymentQuiescenceAuthorityV1.__init__

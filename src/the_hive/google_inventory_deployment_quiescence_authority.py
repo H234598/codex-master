@@ -817,10 +817,20 @@ def _read_record_file(dirfd: int, name: str) -> QuiescenceReceipt:
 
 
 def _entry_names(dirfd: int) -> list[str]:
+    nofollow, cloexec = _require_safe_fd_flags()
+    scanfd = -1
     try:
-        names = os.listdir(dirfd)
+        # A fresh description sees mutations on filesystems that retain directory
+        # enumeration state. Resolve only "." relative to the held authority.
+        scanfd = os.open(
+            ".", os.O_RDONLY | os.O_DIRECTORY | nofollow | cloexec, dir_fd=dirfd
+        )
+        names = os.listdir(scanfd)
     except OSError as exc:
         raise AuthorityUnavailable("store_list_failed") from exc
+    finally:
+        if scanfd >= 0:
+            os.close(scanfd)
     if not isinstance(names, list) or len(names) > _MAX_RECORDS + 1:
         raise AuthorityUnavailable("store_entry_bound")
     return names

@@ -283,7 +283,7 @@ def _validate_private_directory(item: os.stat_result) -> None:
         not stat.S_ISDIR(item.st_mode)
         or stat.S_IMODE(item.st_mode) != 0o700
         or item.st_uid != os.geteuid()
-        or item.st_nlink < 2
+        or item.st_nlink < 1
     ):
         raise _InvalidEvidence("unsafe evidence directory")
 
@@ -488,7 +488,7 @@ def _validate_release_directory(item: os.stat_result) -> None:
         not stat.S_ISDIR(item.st_mode)
         or stat.S_IMODE(item.st_mode) != 0o700
         or item.st_uid != os.geteuid()
-        or item.st_nlink < 2
+        or item.st_nlink < 1
     ):
         raise _InvalidEvidence("unsafe release directory")
 
