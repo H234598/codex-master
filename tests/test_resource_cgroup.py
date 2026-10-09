@@ -1032,6 +1032,9 @@ def test_scope_gate_rejects_wrong_or_replayed_challenge_without_exec(tmp_path: P
         os.close(runner_fd)
 
 
+@pytest.mark.skipif(
+    os.environ.get("THE_HIVE_TMUX_IT") != "1", reason="tmux_it_disabled"
+)
 def test_scope_gate_retains_verified_runner_fd_for_tmux_pane_after_source_replacement(
     tmp_path: Path,
 ) -> None:
@@ -1151,6 +1154,9 @@ def test_scope_gate_retains_verified_runner_fd_for_tmux_pane_after_source_replac
                 assert result == 0
 
 
+@pytest.mark.skipif(
+    os.environ.get("THE_HIVE_TMUX_IT") != "1", reason="tmux_it_disabled"
+)
 @pytest.mark.parametrize("mode", ("timeout", "identity_mismatch"))
 def test_scope_gate_cleans_new_session_when_pane_exec_evidence_fails(mode: str, tmp_path: Path) -> None:
     runner = tmp_path / "runner"

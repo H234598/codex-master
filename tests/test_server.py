@@ -4720,6 +4720,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertIn("session_metrics_unavailable", snapshot["reason_codes"])
             self.assertNotIn(secret, json.dumps(snapshot))
 
+    @unittest.skipUnless(os.environ.get("THE_HIVE_TMUX_IT") == "1", "tmux_it_disabled")
     @unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
     def test_managed_tmux_session_count_accepts_real_isolated_socket_without_server(self) -> None:
         socket_name = f"codex-master-zero-session-{os.getpid()}"
