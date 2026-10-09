@@ -20,7 +20,7 @@ from the_hive.agent_resolver import (
 )
 
 MODULE_PATH = (
-    Path(__file__).resolve().parents[1] / "src/codex_master/worker_spawn_ledger.py"
+    Path(__file__).resolve().parents[1] / "src/the_hive/worker_spawn_ledger.py"
 )
 
 

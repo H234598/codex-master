@@ -19,7 +19,7 @@ from the_hive.agent_resolver import (
 from the_hive.spark_retry import ResumeCapsuleV1
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "src/codex_master/worker_resume.py"
+MODULE_PATH = Path(__file__).resolve().parents[1] / "src/the_hive/worker_resume.py"
 
 
 def _resume_module():

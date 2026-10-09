@@ -8,6 +8,7 @@ import signal
 import subprocess
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -28,6 +29,11 @@ from the_hive.fleet_registry import (
     build_inventory,
 )
 from the_hive.fleet_service import AccountGateDecision, FleetSecretError, GeminiGateDecision
+from the_hive.usage_snapshot import (
+    ModelInvocabilityProjectionV1,
+    ModelInvocabilityV1,
+    UsageEvidenceV2,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -328,6 +334,18 @@ def test_headless_start_only_reserves_a_ready_slot(monkeypatch) -> None:
         "codex_agent_d1_mcp", True, Path("/tmp/gemini"),
     )
     inventory = type("Inventory", (), {"agents": {"d1": descriptor}})()
+    observed_at = datetime(2026, 10, 10, tzinfo=timezone.utc)
+    evidence = UsageEvidenceV2(
+        (), "complete", observed_at, observed_at,
+        model_invocability=ModelInvocabilityProjectionV1(
+            "complete", "pool_authority-v3.model_capabilities",
+            (ModelInvocabilityV1(
+                "gemini-project", "gemini-3-flash-preview", "gemini_cli",
+                True, True, True, True,
+            ),),
+        ),
+    )
+    monkeypatch.setattr(server, "read_usage_evidence_v2", lambda **_kwargs: evidence)
     service = Mock()
     service.account_gate.return_value = AccountGateDecision(True, "ready", "gemini-project", 9)
     service.gemini_headless_gate.return_value = GeminiGateDecision(
@@ -364,6 +382,26 @@ def test_headless_start_routes_gemini_rotation_to_selected_slot(monkeypatch) -> 
         ),
     }
     markers: list[tuple[str, dict[str, object]]] = []
+    observed_at = datetime(2026, 10, 10, tzinfo=timezone.utc)
+    evidence = UsageEvidenceV2(
+        (), "complete", observed_at, observed_at,
+        model_invocability=ModelInvocabilityProjectionV1(
+            "complete", "pool_authority-v3.model_capabilities",
+            (
+                ModelInvocabilityV1(
+                    "gemini-project-1", "gemini-3-flash", "gemini_cli",
+                    True, True, True, True,
+                ),
+                ModelInvocabilityV1(
+                    "gemini-project-2", "gemini-3.1-flash-lite", "gemini_cli",
+                    True, True, True, True,
+                ),
+            ),
+        ),
+    )
+    inventory = type("Inventory", (), {"agents": descriptors})()
+    monkeypatch.setattr(server, "current_agent_inventory", lambda: inventory)
+    monkeypatch.setattr(server, "read_usage_evidence_v2", lambda **_kwargs: evidence)
 
     monkeypatch.setattr(server, "canonical_agent_id", lambda agent: agent)
     monkeypatch.setattr(server, "_headless_descriptor", descriptors.get)

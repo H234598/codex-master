@@ -809,7 +809,7 @@ def test_red_probe_allows_pure_send_and_report_to_a_running_agent(
         label="Agentin A1",
         runner=server.RunnerKind.CODEX_CLI,
         provider=server.Provider.OPENAI_CHATGPT,
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         account_id="account-d205",
         home=Path("/tmp/d205-a1-home"),
         session="a1",
@@ -829,7 +829,7 @@ def test_red_probe_allows_pure_send_and_report_to_a_running_agent(
             (
                 ModelInvocabilityV1(
                     "account-d205",
-                    "gpt-5.6-terra",
+                    "gpt-6-sol",
                     "codex_cli",
                     True,
                     True,
@@ -860,7 +860,7 @@ def test_red_probe_allows_pure_send_and_report_to_a_running_agent(
     monkeypatch.setattr(server, "tmux_alive", lambda _session: True)
     monkeypatch.setattr(server, "require_managed_tmux_session", lambda _agent: None)
     monkeypatch.setattr(server, "current_agent_inventory", lambda: inventory)
-    monkeypatch.setattr(server, "read_meta", lambda _agent: {"model": "gpt-5.6-terra"})
+    monkeypatch.setattr(server, "read_meta", lambda _agent: {"model": "gpt-6-sol"})
     monkeypatch.setattr(server, "read_usage_evidence_v2", lambda **_kwargs: evidence)
     monkeypatch.setattr(
         server,
@@ -1150,7 +1150,7 @@ def test_d244_tool_send_blocks_stale_evidence_before_tmux_effect(
         label="Agentin A1",
         runner=server.RunnerKind.CODEX_CLI,
         provider=server.Provider.OPENAI_CHATGPT,
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         account_id="account-d244",
         home=Path("/tmp/d244-a1-home"),
         session="a1-session",
@@ -1193,7 +1193,7 @@ def test_d244_tool_send_blocks_stale_evidence_before_tmux_effect(
     monkeypatch.setattr(
         server, "wait_agent_input_ready", lambda *_args, **_kwargs: {"ready": True}
     )
-    monkeypatch.setattr(server, "read_meta", lambda _agent: {"model": "gpt-5.6-terra"})
+    monkeypatch.setattr(server, "read_meta", lambda _agent: {"model": "gpt-6-sol"})
     monkeypatch.setattr(server, "read_usage_evidence_v2", lambda **_kwargs: stale_evidence)
     monkeypatch.setattr(
         server,
