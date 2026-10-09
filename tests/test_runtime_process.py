@@ -17,6 +17,10 @@ import pytest
 
 
 pytestmark = pytest.mark.usefixtures("runtime_spawn_helper")
+requires_user_systemd = pytest.mark.skipif(
+    os.environ.get("THE_HIVE_SYSTEMD_USER_IT") != "1",
+    reason="systemd_user_it_disabled",
+)
 
 
 def _script(path: Path, body: str) -> Path:
@@ -178,6 +182,7 @@ def _close_test_process(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=1)
 
 
+@requires_user_systemd
 def test_bounded_runner_never_kills_a_reused_cgroup_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -293,6 +298,7 @@ def test_bounded_runner_never_kills_a_reused_cgroup_generation(
     assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
 
 
+@requires_user_systemd
 def test_bounded_runner_never_stops_a_reused_unit_after_a_valid_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -429,6 +435,7 @@ def test_bounded_runner_never_stops_a_reused_unit_after_a_valid_snapshot(
     assert len(list(Path("/proc/self/fd").iterdir())) == descriptors_before
 
 
+@requires_user_systemd
 def test_bounded_runner_manager_lifetime_ends_a_unit_after_runner_sigkill(
     tmp_path: Path, runtime_image
 ) -> None:
@@ -540,6 +547,7 @@ def test_bounded_runner_manager_lifetime_ends_a_unit_after_runner_sigkill(
         )
 
 
+@requires_user_systemd
 def test_bounded_runner_reports_a_bounded_manager_lifetime_when_cleanup_loses_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -635,6 +643,7 @@ def test_bounded_runner_reports_a_bounded_manager_lifetime_when_cleanup_loses_au
         )
 
 
+@requires_user_systemd
 def test_bounded_runner_denies_a_user_manager_escape_from_the_runtime_unit(
     tmp_path: Path,
 ) -> None:
@@ -719,6 +728,7 @@ def test_bounded_runner_denies_a_user_manager_escape_from_the_runtime_unit(
         )
 
 
+@requires_user_systemd
 def test_bounded_runner_terminates_its_bound_cgroup_without_a_manager_stop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -837,6 +847,7 @@ def test_default_runtime_image_loads_its_manifest_bound_native_helper(
     assert len(runtime_image.spawn_helper_digest) == 64
 
 
+@requires_user_systemd
 def test_bounded_runner_uses_an_explicit_minimal_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1028,6 +1039,7 @@ def test_bounded_runner_names_the_fixed_runtime_directory_stage(
 
 
 @pytest.mark.parametrize("stream", ("stdout", "stderr"))
+@requires_user_systemd
 def test_bounded_runner_rejects_each_output_overflow(
     tmp_path: Path, stream: str
 ) -> None:
@@ -1049,6 +1061,7 @@ def test_bounded_runner_rejects_each_output_overflow(
         )
 
 
+@requires_user_systemd
 def test_bounded_runner_times_out_and_terminates_the_whole_cgroup(
     tmp_path: Path,
 ) -> None:
@@ -1083,6 +1096,7 @@ def test_bounded_runner_times_out_and_terminates_the_whole_cgroup(
         pytest.fail("descendant process survived bounded-runner termination")
 
 
+@requires_user_systemd
 def test_bounded_runner_terminates_a_setsid_descendant_after_leader_exit(
     tmp_path: Path,
 ) -> None:
@@ -1135,6 +1149,7 @@ def test_bounded_runner_terminates_a_setsid_descendant_after_leader_exit(
         ("stderr", "command_stderr_limit"),
     ),
 )
+@requires_user_systemd
 def test_bounded_runner_removes_the_actual_cgroup_after_every_outcome(
     tmp_path: Path, mode: str, failure_code: str | None
 ) -> None:
@@ -1185,6 +1200,7 @@ def test_bounded_runner_removes_the_actual_cgroup_after_every_outcome(
     )
 
 
+@requires_user_systemd
 def test_bounded_runner_times_out_while_a_child_does_not_read_64k_stdin(
     tmp_path: Path,
 ) -> None:
@@ -1313,6 +1329,7 @@ def test_bounded_runner_names_native_spawn_and_cgroup_bind_stages(
     assert preserved_failure.value.code == "command_arguments_invalid"
 
 
+@requires_user_systemd
 def test_bounded_runner_handles_partial_stdin_and_epipe(
     tmp_path: Path,
 ) -> None:
@@ -1335,6 +1352,7 @@ def test_bounded_runner_handles_partial_stdin_and_epipe(
     assert result.stdout == "read-one-byte\n"
 
 
+@requires_user_systemd
 def test_bounded_runner_delivers_all_64k_stdin_within_the_shared_deadline(
     tmp_path: Path,
 ) -> None:
@@ -1382,6 +1400,7 @@ def _wait_until_process_is_not_live(process_id: int) -> None:
 
 
 @pytest.mark.parametrize("attempt", range(3))
+@requires_user_systemd
 def test_bounded_runner_repeatedly_reaps_descendants_after_leader_exit(
     tmp_path: Path, attempt: int
 ) -> None:

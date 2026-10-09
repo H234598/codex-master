@@ -14,6 +14,10 @@ from the_hive.runtime_process import BoundedProcessError
 
 
 pytestmark = pytest.mark.usefixtures("runtime_spawn_helper")
+requires_user_systemd = pytest.mark.skipif(
+    os.environ.get("THE_HIVE_SYSTEMD_USER_IT") != "1",
+    reason="systemd_user_it_disabled",
+)
 
 
 def _runtime_modules():
@@ -116,6 +120,7 @@ def _write_authorized_queen_registry(home: Path) -> None:
     registry.chmod(0o600)
 
 
+@requires_user_systemd
 def test_runtime_status_uses_its_sterile_surface_with_an_authorized_queen_home(
     runtime_image, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -164,6 +169,7 @@ def test_runtime_status_checks_validated_metadata_and_direct_mcp_surface(
     assert result["raw_output"] == "not_returned"
 
 
+@requires_user_systemd
 def test_runtime_status_sanitizes_client_layout_environment(
     runtime_image, tmp_path: Path, monkeypatch
 ) -> None:
