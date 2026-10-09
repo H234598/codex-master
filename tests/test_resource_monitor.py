@@ -2020,11 +2020,12 @@ def test_resource_monitor_entrypoint_rejects_all_legacy_noarg_paths(
 
 
 def test_documentation_marks_unit_delivered_but_not_installed_or_active() -> None:
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-    assert "the-hive-resource-monitor.service is delivered but not installed or active" in readme
-    assert "No installer, MCP tool, or standard test enables or starts this unit" in readme
-    assert "ProtectHome=tmpfs and PrivatePIDs=yes hide unrelated Home and process data" in readme
-    assert "BindReadOnlyPaths exposes only the installed monitor layout" in readme
+    documentation = (Path(__file__).resolve().parents[1] / "docs/operations/resource-monitor.md").read_text(encoding="utf-8")
+    documentation = " ".join(documentation.split())
+    assert "Allein die Auslieferung aktiviert den Dienst nicht." in documentation
+    assert "Die normale Runtime-Image-Installation materialisiert die H4-Unit-Paarung nicht in das User-Systemd-Verzeichnis und startet den Monitor nicht implizit." in documentation
+    assert "`ProtectHome=tmpfs` und `PrivatePIDs=yes` verbergen fremde Home- bzw. Prozessdaten" in documentation
+    assert "`BindReadOnlyPaths` bindet nur Monitor-Layout, Quellbaum, feste Kataloge und zentralen Hive-State lesbar ein." in documentation
 
 
 def test_snapshot_stale_persistence_is_unavailable_without_cross_document_atomicity_claim(tmp_path: Path) -> None:

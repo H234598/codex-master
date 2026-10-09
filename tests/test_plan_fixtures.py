@@ -43,7 +43,10 @@ def test_selection_usage_and_model_policy_fixtures_normalize() -> None:
         windows = normalize_usage_v2(read_json(fixtures / name))
         assert windows
     assert normalize_usage_v2(read_json(fixtures / "usage-v1-main.json")) is None
-    assert len(load_model_policy(fixtures / "model-policy-valid.json").public()) == 2
+    registry = load_model_policy(fixtures / "model-policy-valid.json")
+    assert tuple(model["model_id"] for model in registry.public()) == ("gpt-primary",)
+    assert registry.get_exact("gpt-spark") is None
+    assert registry.resolve_alias("spark") is None
 
 
 def test_private_selection_policy_example_loads_without_opening_execution() -> None:

@@ -27,7 +27,7 @@ from the_hive.agent_resolver import (
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[1]
-    / "src/codex_master/runtime_account_allocator.py"
+    / "src/the_hive/runtime_account_allocator.py"
 )
 
 
