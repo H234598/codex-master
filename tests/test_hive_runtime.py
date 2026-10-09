@@ -524,7 +524,7 @@ def _pilot_readiness_evidence(
             (
                 ModelInvocabilityV1(
                     "attested-pool",
-                    "gpt-5.6-sol",
+                    "gpt-6.1-sol",
                     "codex_cli",
                     True,
                     True,
@@ -574,7 +574,7 @@ def test_global_pilot_readiness_is_a_redacted_policy_validated_diagnostic(
     }
     public_text = str(readiness.public())
     assert "attested-pool" not in public_text
-    assert "gpt-5.6-sol" not in public_text
+    assert "gpt-6.1-sol" not in public_text
     assert "codex_cli" not in public_text
 
     assert enforced_pilot_gate(config, classes, readiness, now=lambda: NOW)["allowed"] is False

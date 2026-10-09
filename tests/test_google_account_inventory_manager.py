@@ -1753,53 +1753,53 @@ def test_review_parallel_issue_consume_close_and_gc_stay_bounded(
 
 _D321_FINGERPRINT = "sha256:" + "f" * 64
 _D321_CONSUMER_PREIMAGE = (
-    b'{"account_ref":"account-A","inventory_authority_generation":7,'
+    b'{"account_ref":"synthetic-account-A","inventory_authority_generation":7,'
     b'"inventory_content_fingerprint":"sha256:ffffffffffffffffffffffffffffffff'
-    b'ffffffffffffffffffffffffffffffff","key_id":"key-A",'
-    b'"kind":"gemini_consumer_binding.v1","project_id":"project-A",'
-    b'"project_ref":"hive-project-A","schema_version":1}'
+    b'ffffffffffffffffffffffffffffffff","key_id":"synthetic-key-A",'
+    b'"kind":"gemini_consumer_binding.v1","project_id":"synthetic-project-A",'
+    b'"project_ref":"hive-synthetic-project-A","schema_version":1}'
 )
 _D321_CONSUMER_DIGEST = (
-    "sha256:2e81c71b212b67fde50070560ebb925af87de40289eb0ed1cbc81e079c2afe24"
+    "sha256:f4a8a7dab13a0932deed3c211fc58c6f3f1a239d6fac8ad290afa47e7e7e8316"
 )
 _D321_GROUP_PREIMAGE = (
-    b'{"billing_account_id":"billing-A","kind":"gemini_billing_group.v1",'
+    b'{"billing_account_id":"synthetic-billing-A","kind":"gemini_billing_group.v1",'
     b'"schema_version":1}'
 )
 _D321_GROUP_DIGEST = (
-    "sha256:5f3891da67bcf03c9d3acd9bdf5b3eb30238f9dc7f231fd79e952a1980bc3c59"
+    "sha256:21525b4de76d3e6d1a45210c44d42835c7eddcd0bae75b0908541ca2ffd0792b"
 )
 _D321_INVENTORY_PREIMAGE = (
-    b'{"billing_group_digest":"sha256:5f3891da67bcf03c9d3acd9bdf5b3eb30238f9dc7f231fd79e952a1980bc3c59",'
-    b'"consumer_binding_digest":"sha256:2e81c71b212b67fde50070560ebb925af87de40289eb0ed1cbc81e079c2afe24",'
+    b'{"billing_group_digest":"sha256:21525b4de76d3e6d1a45210c44d42835c7eddcd0bae75b0908541ca2ffd0792b",'
+    b'"consumer_binding_digest":"sha256:f4a8a7dab13a0932deed3c211fc58c6f3f1a239d6fac8ad290afa47e7e7e8316",'
     b'"inventory_authority_generation":7,"inventory_content_fingerprint":'
     b'"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",'
     b'"kind":"gemini_inventory_billing_binding.v1","schema_version":1}'
 )
 _D321_INVENTORY_DIGEST = (
-    "sha256:9e072a3c09512f0dc75f6b84e2ee355990551fb677157163268d258790028f1e"
+    "sha256:a8102b33111b30dfd068e5d81eb46ec60c15316ae0f1e8af398d19bb464a0a6d"
 )
 _D321_EVIDENCE_PREIMAGE = (
-    b'{"billing_group_digest":"sha256:5f3891da67bcf03c9d3acd9bdf5b3eb30238f9dc7f231fd79e952a1980bc3c59",'
-    b'"consumer_binding_digest":"sha256:2e81c71b212b67fde50070560ebb925af87de40289eb0ed1cbc81e079c2afe24",'
+    b'{"billing_group_digest":"sha256:21525b4de76d3e6d1a45210c44d42835c7eddcd0bae75b0908541ca2ffd0792b",'
+    b'"consumer_binding_digest":"sha256:f4a8a7dab13a0932deed3c211fc58c6f3f1a239d6fac8ad290afa47e7e7e8316",'
     b'"expires_at_utc":"2026-09-23T12:15:00Z",'
     b'"inventory_authority_generation":7,'
-    b'"inventory_binding_digest":"sha256:9e072a3c09512f0dc75f6b84e2ee355990551fb677157163268d258790028f1e",'
+    b'"inventory_binding_digest":"sha256:a8102b33111b30dfd068e5d81eb46ec60c15316ae0f1e8af398d19bb464a0a6d",'
     b'"inventory_content_fingerprint":"sha256:ffffffffffffffffffffffffffffffff'
     b'ffffffffffffffffffffffffffffffff","issued_at_utc":"2026-09-23T12:00:00Z",'
     b'"kind":"billing_group_quota_evidence.v1","reason":"billing_group_quota",'
     b'"schema_version":1,"status":"blocked","supersedes_evidence_digest":null}'
 )
 _D321_EVIDENCE_DIGEST = (
-    "sha256:8b68af06ae9a708dae4832d6a4ba0129a43a81a00df1f48be93305dcea38739e"
+    "sha256:c5818cd486bd26f5e53db243b222a8c53e8c620fdeb3871920c7e841e43cf7c4"
 )
 _D321_EVIDENCE_BYTES = (
-    b'{"billing_group_digest":"sha256:5f3891da67bcf03c9d3acd9bdf5b3eb30238f9dc7f231fd79e952a1980bc3c59",'
-    b'"consumer_binding_digest":"sha256:2e81c71b212b67fde50070560ebb925af87de40289eb0ed1cbc81e079c2afe24",'
-    b'"evidence_digest":"sha256:8b68af06ae9a708dae4832d6a4ba0129a43a81a00df1f48be93305dcea38739e",'
+    b'{"billing_group_digest":"sha256:21525b4de76d3e6d1a45210c44d42835c7eddcd0bae75b0908541ca2ffd0792b",'
+    b'"consumer_binding_digest":"sha256:f4a8a7dab13a0932deed3c211fc58c6f3f1a239d6fac8ad290afa47e7e7e8316",'
+    b'"evidence_digest":"sha256:c5818cd486bd26f5e53db243b222a8c53e8c620fdeb3871920c7e841e43cf7c4",'
     b'"expires_at_utc":"2026-09-23T12:15:00Z",'
     b'"inventory_authority_generation":7,'
-    b'"inventory_binding_digest":"sha256:9e072a3c09512f0dc75f6b84e2ee355990551fb677157163268d258790028f1e",'
+    b'"inventory_binding_digest":"sha256:a8102b33111b30dfd068e5d81eb46ec60c15316ae0f1e8af398d19bb464a0a6d",'
     b'"inventory_content_fingerprint":"sha256:ffffffffffffffffffffffffffffffff'
     b'ffffffffffffffffffffffffffffffff","issued_at_utc":"2026-09-23T12:00:00Z",'
     b'"kind":"billing_group_quota_evidence.v1","reason":"billing_group_quota",'
@@ -1899,13 +1899,13 @@ def test_d321_digest_preimages_have_exact_gold_bytes_and_sha256() -> None:
     consumer_preimage = manager_module._d321_consumer_binding_preimage(
         inventory_authority_generation=7,
         inventory_content_fingerprint=_D321_FINGERPRINT,
-        account_ref="account-A",
-        project_ref="hive-project-A",
-        project_id="project-A",
-        key_id="key-A",
+        account_ref="synthetic-account-A",
+        project_ref="hive-synthetic-project-A",
+        project_id="synthetic-project-A",
+        key_id="synthetic-key-A",
     )
     group_preimage = manager_module._d321_billing_group_preimage(
-        billing_account_id="billing-A"
+        billing_account_id="synthetic-billing-A"
     )
     inventory_preimage = manager_module._d321_inventory_binding_preimage(
         inventory_authority_generation=7,
@@ -1919,14 +1919,14 @@ def test_d321_digest_preimages_have_exact_gold_bytes_and_sha256() -> None:
     assert manager_module._d321_consumer_binding_digest(
         inventory_authority_generation=7,
         inventory_content_fingerprint=_D321_FINGERPRINT,
-        account_ref="account-A",
-        project_ref="hive-project-A",
-        project_id="project-A",
-        key_id="key-A",
+        account_ref="synthetic-account-A",
+        project_ref="hive-synthetic-project-A",
+        project_id="synthetic-project-A",
+        key_id="synthetic-key-A",
     ) == _D321_CONSUMER_DIGEST
     assert group_preimage == _D321_GROUP_PREIMAGE
     assert manager_module._d321_billing_group_digest(
-        billing_account_id="billing-A"
+        billing_account_id="synthetic-billing-A"
     ) == _D321_GROUP_DIGEST
     assert inventory_preimage == _D321_INVENTORY_PREIMAGE
     assert manager_module._d321_inventory_binding_digest(
@@ -2181,10 +2181,10 @@ def test_d321_each_binding_raw_component_changes_its_digest() -> None:
     consumer_arguments = {
         "inventory_authority_generation": 7,
         "inventory_content_fingerprint": _D321_FINGERPRINT,
-        "account_ref": "account-A",
-        "project_ref": "hive-project-A",
-        "project_id": "project-A",
-        "key_id": "key-A",
+        "account_ref": "synthetic-account-A",
+        "project_ref": "hive-synthetic-project-A",
+        "project_id": "synthetic-project-A",
+        "key_id": "synthetic-key-A",
     }
     baseline_consumer = manager_module._d321_consumer_binding_digest(
         **consumer_arguments
@@ -2192,10 +2192,10 @@ def test_d321_each_binding_raw_component_changes_its_digest() -> None:
     for field, replacement in (
         ("inventory_authority_generation", 8),
         ("inventory_content_fingerprint", "sha256:" + "0" * 64),
-        ("account_ref", "account-B"),
-        ("project_ref", "hive-project-B"),
-        ("project_id", "project-B"),
-        ("key_id", "key-B"),
+        ("account_ref", "synthetic-account-B"),
+        ("project_ref", "hive-synthetic-project-B"),
+        ("project_id", "synthetic-project-B"),
+        ("key_id", "synthetic-key-B"),
     ):
         changed_arguments = {**consumer_arguments, field: replacement}
         assert (
@@ -2204,8 +2204,8 @@ def test_d321_each_binding_raw_component_changes_its_digest() -> None:
         )
 
     assert manager_module._d321_billing_group_digest(
-        billing_account_id="billing-B"
-    ) != manager_module._d321_billing_group_digest(billing_account_id="billing-A")
+        billing_account_id="synthetic-billing-B"
+    ) != manager_module._d321_billing_group_digest(billing_account_id="synthetic-billing-A")
 
 
 def test_d321_codec_rejects_tampered_value_without_recomputed_evidence_digest() -> None:
@@ -2421,7 +2421,7 @@ def _d327_json_bytes(payload: object) -> bytes:
 
 def test_d327_configured_quota_codec_is_canonical_private_and_non_authorizing(
 ) -> None:
-    raw_project_id = "synthetic-private-project-marker"
+    raw_project_id = "synthetic-private-synthetic-project-marker"
     evidence = _d327_evidence_for_test(
         project_id=raw_project_id,
         dimensions={"region": "global", "model": "gemini-test"},
@@ -2876,7 +2876,7 @@ def test_d328_source_preimage_rejects_removed_kind_and_nonexact_service(
         ("dimensions", {"key": "value\x1f"}),
         ("dimensions", {"key": "value\x7f"}),
         ("dimensions", {"key": "v" * 257}),
-        ("dimensions", {f"key-{index}": "value" for index in range(33)}),
+        ("dimensions", {f"synthetic-key-{index}": "value" for index in range(33)}),
     ),
 )
 def test_d328_source_preimage_enforces_every_string_and_map_bound(
@@ -3087,7 +3087,7 @@ def test_d328_decoder_accepts_only_structural_digest_until_manager_reattests(
         ("service", "other.googleapis.com"),
         ("quota_id", "q" * 257),
         ("metric", "m" * 513),
-        ("dimensions", {f"key-{index}": "value" for index in range(33)}),
+        ("dimensions", {f"synthetic-key-{index}": "value" for index in range(33)}),
         ("effective_limit", "01"),
         ("refresh_interval", "0s"),
         ("refresh_interval", "01s"),
@@ -3126,7 +3126,7 @@ def test_d328_manager_rejects_source_preimage_project_drift_without_leak(
         inventory_content_fingerprint=evidence.inventory_content_fingerprint,
         inventory_binding_digest=evidence.inventory_binding_digest,
         project_id="000789",
-        source_project_id="private-project-drift",
+        source_project_id="synthetic-private-synthetic-project-drift",
         observed_at_utc="2026-08-23T11:55:00Z",
         expires_at_utc="2026-08-23T12:05:00Z",
         refresh_interval="600s",
@@ -3139,7 +3139,7 @@ def test_d328_manager_rejects_source_preimage_project_drift_without_leak(
             project_ref="the-hive-1",
             key_id="000654",
         )
-    assert "private-project-drift" not in repr(caught.value)
+    assert "synthetic-private-synthetic-project-drift" not in repr(caught.value)
 
 
 def test_d329_d327_invalid_raises_configured_quota_evidence_error() -> None:

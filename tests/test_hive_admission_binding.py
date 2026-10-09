@@ -520,15 +520,34 @@ def test_source_only_dispatcher_composition_uses_the_real_admission_and_lease_pa
         runner.write_text("#!/bin/sh\\nexit 0\\n", encoding="utf-8")
         runner.chmod(0o700)
 
-        # The real capacity guard reads this fresh v2 record and its shared
+        # The real capacity guard reads this complete v3 record and its shared
         # lock.  The runner above is not called by this test.
         probe_root = Path.home() / ".local" / "state" / "codex-master-mcp"
         probe_root.mkdir(parents=True, mode=0o700)
         probe_record = {
-            "schema_version": 2,
+            "schema_version": 3,
             "checked_at": moment.isoformat(),
             "checks": {"runtime_layout": True, "hive_runtime": True, "hive_doctor": True},
             "commands": {"runtime_status": True, "hive_status": True, "hive_doctor": True},
+            "diagnostics": {
+                name: {
+                    "code": "ok", "exit_code": 0,
+                    "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False},
+                }
+                for name in ("runtime_status", "hive_status", "hive_doctor")
+            },
+            "alarm": {
+                "scope": "hive", "status": "cleared", "reason_codes": [],
+                "owner": {
+                    "principal_id": "queen-codex-master", "class_id": "koenigin",
+                    "repo_id": "codex-master",
+                },
+            },
+            "global_pilot_readiness": {
+                "schema_version": 1, "pilot": "blocked", "generation_id": None,
+                "freshness": "unknown", "candidate_count": 0,
+                "reason_codes": ["usage_missing"], "raw_output": "not_returned",
+            },
         }
         probe_file = probe_root / "hive-hourly-health.json"
         probe_file.write_text(json.dumps(probe_record), encoding="utf-8")

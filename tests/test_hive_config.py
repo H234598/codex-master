@@ -56,9 +56,9 @@ def test_public_classes_expose_resolver_profiles() -> None:
     assert classes["goettin"].resolver_profile == ("persistent", ("persistent",), ("sol",), "max", "max")
     assert classes["gottbiene"].resolver_profile == ("persistent", ("persistent",), ("sol",), "max", "max")
     assert classes["koenigin"].resolver_profile == ("persistent", ("persistent",), ("sol",), "max", "max")
-    assert classes["teamleiterin"].resolver_profile == ("persistent", ("persistent",), ("terra",), "xhigh", "xhigh")
-    assert classes["teamleiterin"].allowed_model_ids == ("gpt-5.6-terra",)
-    assert classes["spezialistin"].resolver_profile == ("binding", ("binding",), ("spark", "luna", "terra", "sol"), "high", "xhigh")
+    assert classes["teamleiterin"].resolver_profile == ("persistent", ("persistent",), ("sol",), "xhigh", "xhigh")
+    assert classes["teamleiterin"].allowed_model_ids == ("gpt-6-sol",)
+    assert classes["spezialistin"].resolver_profile == ("binding", ("binding",), ("luna", "sol", "astra"), "high", "xhigh")
     assert classes["arbeitsbiene"].resolver_profile[0] == "ephemeral"
 
 

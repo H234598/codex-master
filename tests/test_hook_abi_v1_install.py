@@ -20,14 +20,21 @@ GENERATION = "a" * 40
 
 @pytest.fixture
 def safe_tmp_path(monkeypatch):
-    # The managed test sandbox presents / and /home as nobody-owned mounts.
+    # Model trusted deployment ancestors without changing host permissions.
+    # Only these exact directory inodes are substituted; fixture descendants
+    # still pass through the real ownership and mode checks.
     real_fstat = os.fstat
     sandbox_ancestors = {(p.stat().st_dev, p.stat().st_ino) for p in (Path('/'), Path('/home'))}
+    temporary_ancestor = Path(tempfile.gettempdir()).stat()
+    temporary_identity = (temporary_ancestor.st_dev, temporary_ancestor.st_ino)
     def sandbox_fstat(fd):
         result = real_fstat(fd)
-        if (result.st_dev, result.st_ino) in sandbox_ancestors:
+        identity = (result.st_dev, result.st_ino)
+        if identity in sandbox_ancestors or identity == temporary_identity:
             values = list(result)
             values[4:6] = [0, 0]
+            if identity == temporary_identity:
+                values[0] = stat.S_IFDIR | 0o755
             return os.stat_result(values)
         return result
     monkeypatch.setattr(os, 'fstat', sandbox_fstat)
@@ -113,6 +120,15 @@ def test_install_is_atomic_and_idempotent(safe_tmp_path):
     assert stat.S_IMODE(installed.stat().st_mode) == 0o755
     assert stat.S_IMODE((installed / "launcher").stat().st_mode) == 0o755
     assert all(stat.S_IMODE(p.stat().st_mode) == 0o644 for p in before if p.name != "launcher")
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o777])
+def test_writable_fixture_ancestor_never_publishes(safe_tmp_path, mode):
+    home, parent, _generation, pin = _fixture(safe_tmp_path)
+    (home / ".local").chmod(mode)
+    with pytest.raises(GATE["GateError"]):
+        _install(home, parent, pin)
+    assert list(parent.iterdir()) == []
 
 
 @pytest.mark.parametrize("defect", ["digest", "plan_target", "source_symlink", "source_hardlink", "source_mode", "source_owner"])
