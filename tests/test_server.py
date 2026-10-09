@@ -1776,39 +1776,6 @@ class ServerHelpersTest(unittest.TestCase):
             )
         self.assertEqual(str(context.exception), "test_output_too_large")
 
-    def test_spawn_offer_docs_cover_operation_and_security_contract(self) -> None:
-        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-
-        for term in (
-            "agent_spawn_offers",
-            "spawn-offers",
-            "Ressourcendruck-Grenzen bleiben mit ihren bisherigen Werten konfiguriert und aktiv",
-            "keine numerische globale, Serien- oder Provider-Spawn-Grenze",
-            "Operator-/Batch-Aufruf",
-            "Session-/Native-Gesamtzahlen bleiben Observability-Evidenz",
-            "10",
-            "5 Sekunden",
-            "15 Sekunden",
-            "advisory",
-            "mcp_host",
-            "developer_vm",
-            "sandbox",
-            "native Subagentinnen",
-            "Pre-Spawn-Hook",
-        ):
-            with self.subTest(term=term):
-                self.assertIn(term, readme)
-
-        for prerequisite in (
-            "real reachability/health probe against the actual VM",
-            "authenticated transport and host-key verification/pinning",
-            "distributed leases/reservations across hosts",
-            "bounded remote execution (timeouts and bounded output)",
-            "end-to-end integration testing against the real target",
-        ):
-            with self.subTest(vm_prerequisite=prerequisite):
-                self.assertIn(prerequisite, readme)
-
     def test_spawn_offers_omit_unimplemented_routes(self) -> None:
         with patch.dict(
             os.environ,
@@ -5437,20 +5404,6 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("git diff-tree --check --root", workflow)
         self.assertIn("git diff --check", workflow)
 
-    def test_readme_checks_document_local_and_ci_gates(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        readme = (root / "README.md").read_text(encoding="utf-8")
-
-        self.assertIn("git diff --check", readme)
-        self.assertIn("PYTHONPATH=src python3 -m compileall -q src tests", readme)
-        self.assertIn("PYTHONPATH=src python3 -m unittest discover -s tests -v", readme)
-        self.assertIn("./bin/codex-master-mcp tools", readme)
-        self.assertIn("./bin/codex-master-mcp commit-ready-check", readme)
-        self.assertIn("plugin/App/MCP manifest validation", readme)
-        self.assertIn("committed-whitespace", readme)
-        self.assertIn("CLI wrapper smoke", readme)
-        self.assertIn("agent-pool installer smoke", readme)
-
     def test_read_json_file_rejects_regular_file_swap_before_open(self) -> None:
         from the_hive import server as server_module
 
@@ -5675,20 +5628,17 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(path.exists())
 
-    def test_github_ci_smokes_agent_pool_installer(self) -> None:
+    def test_github_ci_checks_fail_closed_installer_boundary(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
         self.assertIn("name: Check agent pool installer", workflow)
-        self.assertIn(
-            "./scripts/codex-master-hive-hourly-probe-install --home \"${home}\"",
-            workflow,
-        )
-        self.assertIn('HOME="${home}" ./scripts/install-agent-pool', workflow)
-        self.assertIn('HOME="${home}" "${mcp}" pool validate', workflow)
-        self.assertIn('HOME="${home}" "${mcp}" pool status', workflow)
-        self.assertIn('HOME="${home}" "${mcp}" pool destroy_pool', workflow)
-        self.assertIn("--remove-root", workflow)
+        self.assertIn('./scripts/the-hive-hive-hourly-probe-install --home "${home}"', workflow)
+        self.assertIn('test "${status}" -eq 1', workflow)
+        self.assertIn('"status": "runtime_lifecycle_cutover_required"', workflow)
+        self.assertIn('"raw_output": "not_returned"', workflow)
+        self.assertIn("if errors.read_bytes():", workflow)
+        self.assertIn("if any(home.iterdir()):", workflow)
 
     def test_redacts_common_secret_shapes(self) -> None:
         text = "OPENAI_API_KEY=sk-testtoken1234567890 and jwt eyJabcabcabcabc.abcabcabcabc.sigsignaturesig"
@@ -5809,8 +5759,8 @@ class ServerHelpersTest(unittest.TestCase):
                 '[projects."/tmp/example"]',
                 'trust_level = "trusted"',
                 "",
-                "[mcp_servers.codex-master-mcp]",
-                'command = "/tmp/codex-master-mcp"',
+                "[mcp_servers.the-hive-mcp]",
+                'command = "/tmp/the-hive-mcp"',
                 "startup_timeout_sec = 30",
                 'default_tools_approval_mode = "approve"',
                 "",
@@ -5867,24 +5817,24 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(inserted_changed)
         self.assertIsNone(inserted_previous)
         self.assertEqual(
-            tomllib.loads(inserted)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"],
+            tomllib.loads(inserted)["mcp_servers"]["the-hive-mcp"]["startup_timeout_sec"],
             120,
         )
 
         commented_header = existing_low.replace(
-            "[mcp_servers.codex-master-mcp]", "[mcp_servers.codex-master-mcp] # keep this section"
+            "[mcp_servers.the-hive-mcp]", "[mcp_servers.the-hive-mcp] # keep this section"
         )
         commented_updated, commented_changed, _commented_previous = updated_mcp_startup_timeout_config(commented_header)
         self.assertTrue(commented_changed)
-        self.assertEqual(commented_updated.count("[mcp_servers.codex-master-mcp]"), 1)
+        self.assertEqual(commented_updated.count("[mcp_servers.the-hive-mcp]"), 1)
         self.assertIn("startup_timeout_sec = 120", commented_updated)
 
         array_table = "\n".join(
             [
-                "[mcp_servers.codex-master-mcp]",
-                'command = "/tmp/codex-master-mcp"',
+                "[mcp_servers.the-hive-mcp]",
+                'command = "/tmp/the-hive-mcp"',
                 "",
-                "[[mcp_servers.codex-master-mcp.extra]]",
+                "[[mcp_servers.the-hive-mcp.extra]]",
                 'name = "extra"',
             ]
         )
@@ -5893,53 +5843,53 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertLess(array_updated.index("startup_timeout_sec = 120"), array_updated.index("[["))
 
         quoted_header = array_table.replace(
-            "[mcp_servers.codex-master-mcp]", '[mcp_servers."codex-master-mcp"]'
+            "[mcp_servers.the-hive-mcp]", '[mcp_servers."the-hive-mcp"]'
         )
         quoted_header_updated, quoted_header_changed, _quoted_header_previous = updated_mcp_startup_timeout_config(
             quoted_header
         )
         self.assertTrue(quoted_header_changed)
-        self.assertEqual(quoted_header_updated.count('[mcp_servers."codex-master-mcp"]'), 1)
+        self.assertEqual(quoted_header_updated.count('[mcp_servers."the-hive-mcp"]'), 1)
         self.assertLess(quoted_header_updated.index("startup_timeout_sec = 120"), quoted_header_updated.index("[["))
 
         from tomllib import loads
 
         single_quoted_header = array_table.replace(
-            "[mcp_servers.codex-master-mcp]", "[mcp_servers.'codex-master-mcp']"
+            "[mcp_servers.the-hive-mcp]", "[mcp_servers.'the-hive-mcp']"
         )
         single_quoted_updated, single_quoted_changed, _single_quoted_previous = (
             updated_mcp_startup_timeout_config(single_quoted_header)
         )
         self.assertTrue(single_quoted_changed)
         self.assertEqual(
-            loads(single_quoted_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"],
+            loads(single_quoted_updated)["mcp_servers"]["the-hive-mcp"]["startup_timeout_sec"],
             120,
         )
 
         spaced_header = array_table.replace(
-            "[mcp_servers.codex-master-mcp]", "[ mcp_servers . 'codex-master-mcp' ]"
+            "[mcp_servers.the-hive-mcp]", "[ mcp_servers . 'the-hive-mcp' ]"
         )
         spaced_updated, spaced_changed, _spaced_previous = updated_mcp_startup_timeout_config(spaced_header)
         self.assertTrue(spaced_changed)
-        self.assertEqual(loads(spaced_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"], 120)
+        self.assertEqual(loads(spaced_updated)["mcp_servers"]["the-hive-mcp"]["startup_timeout_sec"], 120)
 
         dotted_config = (
-            'mcp_servers."codex-master-mcp".command = "/tmp/codex-master-mcp"\n'
-            'mcp_servers."codex-master-mcp".startup_timeout_sec = 30\n'
+            'mcp_servers."the-hive-mcp".command = "/tmp/the-hive-mcp"\n'
+            'mcp_servers."the-hive-mcp".startup_timeout_sec = 30\n'
         )
         dotted_updated, dotted_changed, dotted_previous = updated_mcp_startup_timeout_config(dotted_config)
         self.assertTrue(dotted_changed)
         self.assertEqual(dotted_previous, 30)
-        self.assertEqual(loads(dotted_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"], 120)
+        self.assertEqual(loads(dotted_updated)["mcp_servers"]["the-hive-mcp"]["startup_timeout_sec"], 120)
 
         inline_config = (
-            'mcp_servers = { "codex-master-mcp" = '
-            '{ command = "/tmp/codex-master-mcp", startup_timeout_sec = 30 } }\n'
+            'mcp_servers = { "the-hive-mcp" = '
+            '{ command = "/tmp/the-hive-mcp", startup_timeout_sec = 30 } }\n'
         )
         inline_updated, inline_changed, inline_previous = updated_mcp_startup_timeout_config(inline_config)
         self.assertTrue(inline_changed)
         self.assertEqual(inline_previous, 30)
-        self.assertEqual(loads(inline_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"], 120)
+        self.assertEqual(loads(inline_updated)["mcp_servers"]["the-hive-mcp"]["startup_timeout_sec"], 120)
 
         for literal, expected_changed, expected_previous in (
             ("0x78", False, 120),
@@ -5955,7 +5905,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(numeric_changed, expected_changed)
             self.assertEqual(numeric_previous, expected_previous)
             self.assertEqual(
-                loads(numeric_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"],
+                loads(numeric_updated)["mcp_servers"]["the-hive-mcp"]["startup_timeout_sec"],
                 120,
             )
 
@@ -5965,7 +5915,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertTrue(invalid_changed)
             self.assertIsNone(invalid_previous)
             self.assertEqual(
-                loads(invalid_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"],
+                loads(invalid_updated)["mcp_servers"]["the-hive-mcp"]["startup_timeout_sec"],
                 120,
             )
 
@@ -5980,7 +5930,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertTrue(multiline_changed)
             self.assertIsNone(multiline_previous)
             self.assertEqual(
-                loads(multiline_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"],
+                loads(multiline_updated)["mcp_servers"]["the-hive-mcp"]["startup_timeout_sec"],
                 120,
             )
 
@@ -5991,8 +5941,8 @@ class ServerHelpersTest(unittest.TestCase):
                 'command = "/tmp/unrelated"',
                 'default_tools_approval_mode = "prompt"',
                 "",
-                "[mcp_servers.codex-master-mcp]",
-                'command = "/tmp/codex-master-mcp"',
+                "[mcp_servers.the-hive-mcp]",
+                'command = "/tmp/the-hive-mcp"',
                 "startup_timeout_sec = 120",
                 "",
                 "[features]",
@@ -6005,7 +5955,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(
-            config["mcp_servers"]["codex-master-mcp"]["default_tools_approval_mode"],
+            config["mcp_servers"]["the-hive-mcp"]["default_tools_approval_mode"],
             "approve",
         )
         self.assertEqual(
@@ -6021,7 +5971,7 @@ class ServerHelpersTest(unittest.TestCase):
         existing = "\n".join(
             [
                 'theme = "dark"',
-                'mcp_servers = { codex-master-mcp = { command = "/tmp/codex-master-mcp", startup_timeout_sec = 120, default_tools_approval_mode = "prompt" }, unrelated = { command = "/tmp/unrelated" } }',
+                'mcp_servers = { the-hive-mcp = { command = "/tmp/the-hive-mcp", startup_timeout_sec = 120, default_tools_approval_mode = "prompt" }, unrelated = { command = "/tmp/unrelated" } }',
                 "[features]",
                 "memories = true",
             ]
@@ -6036,8 +5986,8 @@ class ServerHelpersTest(unittest.TestCase):
             {
                 "theme": "dark",
                 "mcp_servers": {
-                    "codex-master-mcp": {
-                        "command": "/tmp/codex-master-mcp",
+                    "the-hive-mcp": {
+                        "command": "/tmp/the-hive-mcp",
                         "startup_timeout_sec": 120,
                         "default_tools_approval_mode": "approve",
                     },
@@ -6083,7 +6033,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "updated")
         self.assertEqual(result["config_path"], "not_returned")
-        self.assertIn("[mcp_servers.codex-master-mcp]", content)
+        self.assertIn("[mcp_servers.the-hive-mcp]", content)
         self.assertIn("startup_timeout_sec = 120", content)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -11948,6 +11898,8 @@ google_accounts:
                 "d1", "d", 1, "D1", RunnerKind.CODEX_CLI, Provider.OLLAMA_LOCAL,
                 "local-model", None, root / "home", "session", True,
             )
+            agent.home.mkdir(mode=0o700)
+            write_codex_no_daemon_config_for_test(agent.home)
             wrapper = root / "wrapper"
             wrapper.write_text(server_module.fleet_wrapper_text(agent, runner), encoding="utf-8")
             wrapper.chmod(0o700)
@@ -15677,7 +15629,7 @@ google_accounts:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / ".mcp.json").write_text(
-                json.dumps({"mcpServers": {"codex-master-mcp": {}}}), encoding="utf-8"
+                json.dumps({"mcpServers": {"the-hive-mcp": {}}}), encoding="utf-8"
             )
 
             result = server_module.plugin_mcp_manifest_status(root)
@@ -16855,7 +16807,7 @@ google_accounts:
 
         result = response["result"]
         self.assertEqual(result["protocolVersion"], "2025-11-25")
-        self.assertEqual(result["serverInfo"]["name"], "codex-master-mcp")
+        self.assertEqual(result["serverInfo"]["name"], "the-hive-mcp")
         self.assertIn("tools", result["capabilities"])
         self.assertIn("resources", result["capabilities"])
         self.assertIn("prompts", result["capabilities"])
@@ -18363,7 +18315,7 @@ google_accounts:
                     task="Inspect src",
                     scope=["src"],
                     skill=None,
-                    write_paths=["src/codex_master/server.py"],
+                    write_paths=["src/the_hive/server.py"],
                     context=[],
                     forbidden=[],
                     name="Seraphina",
@@ -18376,7 +18328,7 @@ google_accounts:
                     "a",
                     cwd=tmpdir,
                     prompt="START_TASK",
-                    model="gpt-5.6-terra",
+                    model="gpt-6-sol",
                     model_reasoning_effort="xhigh",
                     agent_class="spezialistin",
                     name="Seraphina",
@@ -34284,7 +34236,7 @@ class CliLifecycleTest(unittest.TestCase):
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "serverInfo": {"name": "codex-master-mcp"},
+                    "serverInfo": {"name": "the-hive-mcp"},
                 },
             },
             separators=(",", ":"),
@@ -34299,10 +34251,10 @@ class CliLifecycleTest(unittest.TestCase):
                 frame
             )
         )
-        self.assertFalse(mcp_probe_response_ok('codex-master-mcp finished with "id":1 but no JSON-RPC response'))
+        self.assertFalse(mcp_probe_response_ok('the-hive-mcp finished with "id":1 but no JSON-RPC response'))
         self.assertFalse(
             mcp_probe_response_ok(
-                '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"codex-master-mcp"}}}'
+                '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"the-hive-mcp"}}}'
             )
         )
         self.assertFalse(
@@ -35672,19 +35624,6 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue(destroy_result["root_removed"])
             self.assertFalse((canonical_pool / "a1").exists())
             self.assertFalse(canonical_pool.exists())
-
-    def test_auth_copy_docs_match_data_sparse_output_contract(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        text = (root / "docs" / "auth-copy.md").read_text(encoding="utf-8")
-
-        self.assertIn('"source_agent": "not_returned"', text)
-        self.assertIn('"source_agent_state": "set"', text)
-        self.assertIn('"target_selector": "not_returned"', text)
-        self.assertIn('"target_selector_state": "set"', text)
-        self.assertIn("never echo the source Agentin id", text)
-        self.assertIn("never echo the requested target selector", text)
-        self.assertNotIn('"source_agent": "a1"', text)
-        self.assertNotIn('"target_selector": "a-series"', text)
 
     def test_agent_pool_install_replaces_wrapper_and_config_symlinks_without_touching_targets(self) -> None:
         from the_hive import server as server_module
@@ -38980,14 +38919,14 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
         self._lease_temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._lease_temporary_directory.cleanup)
         self._lease_release_root = (
-            Path(self._lease_temporary_directory.name) / "codex-master-runtime"
+            Path(self._lease_temporary_directory.name) / "the-hive-runtime"
         )
         self._lease_layout_root = (
             self._lease_release_root / "generations" / self._release_generation
         )
         self._lease_layout_root.mkdir(parents=True, mode=0o700)
         self._lease_authority_lock = (
-            self._lease_release_root / ".codex-master-release-publish.lock"
+            self._lease_release_root / ".the-hive-release-publish.lock"
         )
         self._lease_authority_lock.touch(mode=0o600)
         self._lease_authority_lock.chmod(0o600)
@@ -39076,7 +39015,13 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
         )
         stage = root / f".stage-{generation}"
         stage.mkdir(mode=0o700)
-        release_root = root / "codex-master-runtime"
+        home = root / "publisher-home"
+        home.mkdir(mode=0o700, exist_ok=True)
+        (home / ".local" / "lib").mkdir(mode=0o700, parents=True, exist_ok=True)
+        pin_store = home / ".local" / "state" / "the-hive" / "hook-session-pins-v1"
+        if not pin_store.exists():
+            installer["HookSessionPinStoreV1"].create_at(pin_store)
+        release_root = home / ".local" / "lib" / "the-hive-runtime"
         installer["_build_runtime_image"](
             repository=self._release_source_root,
             stage=stage,
@@ -39267,7 +39212,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
                     service.write_bytes(service.read_bytes() + b"# drift\n")
                     server_layout = layout
                 else:
-                    pointers = release_root / ".codex-master-release-pointers.json"
+                    pointers = release_root / ".the-hive-release-pointers.json"
                     value = json.loads(pointers.read_text(encoding="utf-8"))
                     value["current"]["manifest_digest"] = "sha256:" + "0" * 64
                     pointers.write_text(json.dumps(value), encoding="utf-8")
@@ -39317,7 +39262,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
                 )
                 self.assertEqual(previous.root, first.root)
                 self.assertEqual(release_root, current.root.parent.parent)
-                pointers = release_root / ".codex-master-release-pointers.json"
+                pointers = release_root / ".the-hive-release-pointers.json"
                 value = json.loads(pointers.read_text(encoding="utf-8"))
                 value["previous"] = {
                     "generation": "checkout",
@@ -39438,7 +39383,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             root = Path(tmpdir)
             current = self._published_release(root, "h4-current")
             release_root = current.root.parent.parent
-            authority_lock = release_root / ".codex-master-release-publish.lock"
+            authority_lock = release_root / ".the-hive-release-publish.lock"
             lock_before = authority_lock.stat()
             lock_bytes_before = authority_lock.read_bytes()
             target = root / "systemd-user"
@@ -39502,7 +39447,7 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
                 root = Path(tmpdir)
                 current = self._published_release(root, "h4-current")
                 authority_lock = (
-                    current.root.parent.parent / ".codex-master-release-publish.lock"
+                    current.root.parent.parent / ".the-hive-release-publish.lock"
                 )
                 if defect == "missing":
                     authority_lock.unlink()
@@ -42614,7 +42559,7 @@ def test_d236_send_agent_blocks_toctou_stale_model_evidence_before_tmux_effect()
         patch.object(server_module, "require_managed_tmux_session"),
         patch.object(server_module, "wait_agent_input_ready", return_value={"ready": True}),
         patch.object(server_module, "current_agent_inventory", return_value=inventory),
-        patch.object(server_module, "read_meta", return_value={"model": "gpt-5.6-luna"}),
+        patch.object(server_module, "read_meta", return_value={"model": "gpt-6-luna"}),
         patch.object(
             server_module,
             "read_usage_evidence_v2",

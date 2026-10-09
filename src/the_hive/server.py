@@ -21471,10 +21471,10 @@ def _resource_monitor_read_sources(root: Path) -> dict[str, dict[str, Any]]:
     return sources
 
 
-_RESOURCE_MONITOR_RELEASE_ROOT_NAME = "codex-master-runtime"
+_RESOURCE_MONITOR_RELEASE_ROOT_NAME = "the-hive-runtime"
 _RESOURCE_MONITOR_RELEASE_GENERATIONS_NAME = "generations"
-_RESOURCE_MONITOR_RELEASE_POINTERS_NAME = ".codex-master-release-pointers.json"
-_RESOURCE_MONITOR_RELEASE_PUBLISH_LOCK_NAME = ".codex-master-release-publish.lock"
+_RESOURCE_MONITOR_RELEASE_POINTERS_NAME = ".the-hive-release-pointers.json"
+_RESOURCE_MONITOR_RELEASE_PUBLISH_LOCK_NAME = ".the-hive-release-publish.lock"
 _RESOURCE_MONITOR_SERVICE_TEMPLATE = "systemd/user/the-hive-resource-monitor.service"
 _RESOURCE_MONITOR_SLICE_TEMPLATE = "systemd/user/the-hive.slice"
 _RESOURCE_MONITOR_RELEASE_ATTESTED_PATHS = (
