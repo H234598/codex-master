@@ -23,7 +23,7 @@ SRC_ROOT = PLUGIN_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from the_hive.native_registry import (
+from the_hive.native_registry import (  # noqa: E402
     RegistryByteBudgetError, encode_registry_for_write, normalize_registry, reservation_is_live,
 )
 
