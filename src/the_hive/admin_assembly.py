@@ -415,7 +415,7 @@ def _empty_inventory(path: Path) -> None:
             raise
         store.replace_private_bytes(
             _INVENTORY_DOCUMENT,
-            b"schema_version: 2\ngoogle_accounts: []\n",
+            b"schema_version: 3\nauthority_generation: 1\ngoogle_accounts: []\n",
         )
 
 

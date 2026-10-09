@@ -976,9 +976,19 @@ class ControlCenterWindowContractTest(unittest.TestCase):
 
         controller = Mock()
         controller.close.return_value = True
-        window = control_center.ControlCenterWindow(
-            Gtk, GLib, object(), controller=controller
-        )
+        # The GUI consumes an authorized catalog; obtaining authorization belongs
+        # to the provider's tests, not this display-free construction fixture.
+        catalog = [{
+            "name": "fleet_hosts",
+            "description": "List fleet hosts",
+            "inputSchema": {
+                "type": "object", "properties": {}, "additionalProperties": False,
+            },
+        }]
+        with patch.object(control_center, "teamleader_tool_catalog", return_value=catalog):
+            window = control_center.ControlCenterWindow(
+                Gtk, GLib, object(), controller=controller
+            )
         try:
             self.assertEqual(
                 window.page_names(),
@@ -992,6 +1002,9 @@ class ControlCenterWindowContractTest(unittest.TestCase):
             )
             self.assertIs(window.Gtk, Gtk)
             self.assertGreater(len(window.tool_catalog), 0)
+            self.assertIsNone(window.catalog_error)
+            self.assertEqual(window.tool_catalog[0].name, "fleet_hosts")
+            self.assertTrue(window.tool_catalog[0].enabled)
             self.assertEqual(Gtk.Notebook.return_value.append_page.call_count, 6)
         finally:
             self.assertTrue(window.controller.close())

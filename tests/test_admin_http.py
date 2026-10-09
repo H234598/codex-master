@@ -1378,12 +1378,12 @@ def test_google_client_http_restart_reconciles_durable_owner_receipt(
     service = compose()
     google = composed["google"]
     plan = google.plan_oauth_client_import(
-        "google-account-01", expected_generation=1, idempotency_key="google-plan"
+        "google-synthetic-account-01", expected_generation=1, idempotency_key="google-plan"
     )
     create_body = _document(
         "secret.ingress.create",
         {
-            "account_ref": "google-account-01",
+            "account_ref": "google-synthetic-account-01",
             "credential_kind": "google.oauth-client",
         },
         expected_generation=1,
@@ -1392,7 +1392,7 @@ def test_google_client_http_restart_reconciles_durable_owner_receipt(
     )
     apply_body = _document(
         "google.oauth-client-import.apply",
-        {"account_ref": "google-account-01"},
+        {"account_ref": "google-synthetic-account-01"},
         expected_generation=1,
         idempotency_key="google-plan",
         plan_digest=plan.plan_digest,
@@ -1462,7 +1462,7 @@ def test_google_client_http_restart_reconciles_durable_owner_receipt(
     )
     assert ambiguous_problem["retryable"] is True
     assert journal_faults == ([session_id] if unknown_journal_fault else [])
-    assert json.loads(payload)["account_ref"] == "google-account-01"
+    assert json.loads(payload)["account_ref"] == "google-synthetic-account-01"
     google_state = json.loads(
         (tmp_path / "google" / "oauth-state" / "google-oauth-control.json").read_text()
     )
@@ -1507,7 +1507,7 @@ def test_google_accounts_http_projects_real_bound_opaque_oauth_client_ref(
 
     document = json.loads(payload)
     account = next(
-        item for item in document["accounts"] if item["ref"] == "google-account-01"
+        item for item in document["accounts"] if item["ref"] == "google-synthetic-account-01"
     )
     assert status == 200
     assert document["schema_version"] == 1
@@ -1560,7 +1560,7 @@ def test_google_accounts_http_degrades_oauth_journal_lock_fault(
 
     document = json.loads(payload)
     account = next(
-        item for item in document["accounts"] if item["ref"] == "google-account-01"
+        item for item in document["accounts"] if item["ref"] == "google-synthetic-account-01"
     )
     assert status == 200
     assert document["schema_version"] == 1

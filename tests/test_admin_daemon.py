@@ -1746,7 +1746,7 @@ def installed_admin_entrypoint(tmp_path_factory: pytest.TempPathFactory) -> Path
         check=False,
     )
     assert installed.returncode == 0
-    entrypoint = install_root / "bin" / "codex-master-admin"
+    entrypoint = install_root / "bin" / "the-hive-admin"
     assert entrypoint.is_file()
     assert os.access(entrypoint, os.X_OK)
     return entrypoint
@@ -1767,6 +1767,49 @@ def service(
         yield owner_runtime.service
     finally:
         owner_runtime.close()
+
+
+def test_empty_inventory_is_readable_by_canonical_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh product inventory must publish a valid authority generation."""
+    from the_hive.google_account_inventory_manager import GoogleAccountInventoryManager
+
+    state = tmp_path / "initial-inventory"
+    state.mkdir(mode=0o700)
+    monkeypatch.setenv("STATE_DIRECTORY", os.fspath(state))
+    inventory = state / "api-token.yaml"
+    admin_assembly._empty_inventory(inventory)
+    manager = GoogleAccountInventoryManager.from_systemd_state_directory()
+    try:
+        manager.reload()
+        snapshot = manager._snapshot_for_internal_use()
+        assert snapshot.generation == 1
+        assert not snapshot.by_account_ref
+        original = inventory.read_bytes()
+        admin_assembly._empty_inventory(inventory)
+        assert inventory.read_bytes() == original
+    finally:
+        manager.close()
+
+
+def test_empty_inventory_preserves_existing_invalid_document(tmp_path: Path) -> None:
+    """Initialization must not silently replace or migrate an existing authority."""
+    from the_hive.google_account_inventory import (
+        GoogleAccountInventoryError,
+        GoogleAccountInventoryLoader,
+    )
+
+    state = tmp_path / "existing-inventory"
+    state.mkdir(mode=0o700)
+    inventory = state / "api-token.yaml"
+    original = b"schema_version: 2\ngoogle_accounts: []\n"
+    inventory.write_bytes(original)
+    inventory.chmod(0o600)
+    admin_assembly._empty_inventory(inventory)
+    assert inventory.read_bytes() == original
+    with pytest.raises(GoogleAccountInventoryError, match="credential.inventory_schema_invalid"):
+        GoogleAccountInventoryLoader._for_test_path(inventory).load()
 
 
 def test_product_assembly_owns_empty_ollama_registry(
