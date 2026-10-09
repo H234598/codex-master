@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,6 +27,9 @@ from the_hive.hive.config import (
 from the_hive.runtime_layout import RuntimeLayout
 from the_hive.usage_snapshot import (
     AccountUsageEvidenceV2,
+    ModelInvocabilityProjectionV1,
+    ModelInvocabilityV1,
+    PoolAuthorityV2,
     TrackerEvidenceV2,
     UsageEvidenceV2,
     UsageLimitV2,
@@ -86,20 +90,21 @@ def _p2_checkout(tmp_path: Path) -> Path:
 
 
 def _attested_pool_evidence(now: datetime) -> UsageEvidenceV2:
+    generation = "a" * 32
     return UsageEvidenceV2(
         accounts=(
             AccountUsageEvidenceV2(
                 "runtime-image-test",
                 (
                     UsageLimitV2(
-                        "main", 18_000, "runtime-image-generation", 0.0, 100.0, now + timedelta(hours=1)
+                        "main", 18_000, generation, 0.0, 100.0, now + timedelta(hours=1)
                     ),
                 ),
                 (
                     UsageTrendV2(
                         "main",
                         18_000,
-                        "runtime-image-generation",
+                        generation,
                         "complete",
                         now,
                         now + timedelta(hours=1),
@@ -107,7 +112,7 @@ def _attested_pool_evidence(now: datetime) -> UsageEvidenceV2:
                 ),
                 (
                     TrackerEvidenceV2(
-                        "main", 18_000, "runtime-image-generation", "complete", now
+                        "main", 18_000, generation, "complete", now
                     ),
                 ),
             ),
@@ -115,6 +120,31 @@ def _attested_pool_evidence(now: datetime) -> UsageEvidenceV2:
         status="complete",
         captured_at=now,
         generated_at=now,
+        generation_id=generation,
+        pool_authorities=(
+            PoolAuthorityV2(
+                account_id="runtime-image-test",
+                pool_id="dynamic-pool",
+                provider="openai",
+                allowed_lifecycles=("persistent",),
+                allowed_model_families=("sol",),
+                hive_available=True,
+                persistent_leadership_eligible=True,
+                long_running_leadership_eligible=True,
+                reasoning_minimum="max",
+                reasoning_maximum="max",
+            ),
+        ),
+        model_invocability=ModelInvocabilityProjectionV1(
+            "complete",
+            "pool_authority-v3.model_capabilities",
+            (
+                ModelInvocabilityV1(
+                    "runtime-image-test", "gpt-6.1-sol", "codex_cli",
+                    True, True, True, True,
+                ),
+            ),
+        ),
     )
 
 
@@ -389,16 +419,24 @@ def test_interactive_runtime_entrypoint_is_the_current_stable_launcher(
     assert server.runtime_mcp_entrypoint() == release_root / "the-hive-mcp"
 
 
+@pytest.mark.skipif(
+    os.environ.get("THE_HIVE_SYSTEMD_USER_IT") != "1",
+    reason="systemd_user_it_disabled",
+)
+def test_complete_p2_runtime_image_stage_diagnostics_live(tmp_path: Path) -> None:
+    stage, _state_root, installer = _p2_runtime_image(tmp_path)
+    installer["_validate_runtime_image_stage"](stage=stage, home=tmp_path / "home")
+
+
 def test_complete_p2_runtime_image_binds_its_attested_root_without_a_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The image is a valid P2 consumer even though it deliberately has no .git."""
 
-    stage, state_root, installer = _p2_runtime_image(tmp_path)
+    stage, state_root, _installer = _p2_runtime_image(tmp_path)
     external_checkout = _p2_checkout(tmp_path / "external")
     (external_checkout / "codex-hive.json").write_text("{", encoding="utf-8")
     assert not (stage / ".git").exists()
-    installer["_validate_runtime_image_stage"](stage=stage, home=tmp_path / "home")
 
     legacy_launcher = subprocess.run(
         [stage / "bin" / "the-hive-mcp", "hive", "status"],
@@ -439,11 +477,15 @@ def test_complete_p2_runtime_image_binds_its_attested_root_without_a_checkout(
     assert evidence.repository == "ready"
     assert evidence.principal == "ready"
     assert evidence.state == "ready"
-    assert evidence.authority == "ready", evidence.public()
+    assert evidence.authority == "fail_closed", evidence.public()
     assert evidence.pilot == "ready", evidence.public()
     assert evidence.reason_codes == ()
+    assert evidence.mutation_performed is False
+    assert evidence.global_pilot_readiness is not None
+    assert evidence.global_pilot_readiness.candidate_count == 1
+    assert evidence.global_pilot_readiness.reason_codes == ()
     assert hive_status(runtime_evidence=evidence)["repository"] == "ready"
-    assert hive_doctor(runtime_evidence=evidence)["healthy"] is True
+    assert hive_doctor(runtime_evidence=evidence)["healthy"] is False
     status = hive_status(runtime_evidence=evidence)
     doctor = hive_doctor(runtime_evidence=evidence)
 
@@ -456,11 +498,14 @@ def test_complete_p2_runtime_image_binds_its_attested_root_without_a_checkout(
         now=lambda: NOW,
         runner=runner,
     )
+    # A valid unpublished stage cannot authorize the current-release MCP surface.
     assert probe["checks"] == {
-        "runtime_layout": True,
-        "hive_runtime": True,
-        "hive_doctor": True,
+        "runtime_layout": False,
+        "hive_runtime": False,
+        "hive_doctor": False,
     }
+    assert probe["commands"]["runtime_status"] is False
+    assert probe["diagnostics"]["runtime_status"]["code"] == "runtime_status_red"
     public = evidence.public()
     rendered = json.dumps(public, sort_keys=True)
     assert str(stage) not in rendered
