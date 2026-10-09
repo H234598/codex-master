@@ -112,6 +112,7 @@ def test_d89_successor_witness_binds_only_the_final_the_hive_anchor_and_git_line
         "bin/the-hive-mcp-stable",
         "bin/the-hive-mcp",
         "bin/the-hive-resource-monitor",
+        "bin/the-hive-openai-pricing-inventory-stable",
     } == set(manifest["release"]["stable_launchers"])
     assert manifest["release"]["h4_units"] == [
         "systemd/user/the-hive-resource-monitor.service",
