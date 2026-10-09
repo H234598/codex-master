@@ -96,7 +96,7 @@ def runtime_principal() -> FleetRuntimePrincipalV2:
         lifecycle="persistent",
         provider=Provider.OPENAI_CHATGPT,
         runner=RunnerKind.CODEX_CLI,
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         reasoning="xhigh",
         enabled=True,
     )
@@ -117,7 +117,7 @@ def selection() -> DynamicTeamleadRequest:
         agent_id=AGENT_ID,
         account_id=ACCOUNT_ID,
         registry_generation=REGISTRY_GENERATION,
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         reasoning="xhigh",
     )
 

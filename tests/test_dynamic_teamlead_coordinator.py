@@ -95,7 +95,7 @@ def principal(**changes: object) -> FleetRuntimePrincipalV2:
         lifecycle="persistent",
         provider=Provider.OPENAI_CHATGPT,
         runner=RunnerKind.CODEX_CLI,
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         reasoning="xhigh",
         enabled=True,
     )
@@ -112,7 +112,7 @@ def teamlead_request(**changes: object) -> DynamicTeamleadRequest:
         agent_id=AGENT_ID,
         account_id=ACCOUNT_ID,
         registry_generation=7,
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         reasoning="xhigh",
     )
     return replace(value, **changes)

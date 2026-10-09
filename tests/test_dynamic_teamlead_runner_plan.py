@@ -81,7 +81,7 @@ def principal(**changes: object) -> FleetRuntimePrincipalV2:
         lifecycle="persistent",
         provider=Provider.OPENAI_CHATGPT,
         runner=RunnerKind.CODEX_CLI,
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         reasoning="xhigh",
         enabled=True,
     )
@@ -97,7 +97,7 @@ def request(**changes: object) -> DynamicTeamleadRequest:
         agent_id=AGENT_ID,
         account_id=ACCOUNT_ID,
         registry_generation=7,
-        model="gpt-5.6-terra",
+        model="gpt-6-sol",
         reasoning="xhigh",
     )
     return replace(value, **changes)
@@ -224,7 +224,7 @@ def test_valid_launch_returns_identity_preserving_runner_plan() -> None:
     assert result.runtime_principal.lifecycle == "persistent"
     assert result.runtime_principal.provider is Provider.OPENAI_CHATGPT
     assert result.runtime_principal.runner is RunnerKind.CODEX_CLI
-    assert result.runtime_principal.model == "gpt-5.6-terra"
+    assert result.runtime_principal.model == "gpt-6-sol"
     assert result.runtime_principal.reasoning == "xhigh"
 
 
