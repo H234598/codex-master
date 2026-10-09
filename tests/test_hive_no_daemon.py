@@ -337,10 +337,42 @@ def test_direct_wrapper_blocks_unhardened_config_before_child(
     assert (home / "config.toml").exists() is (config is not None)
 
 
+def test_codex_0161_parser_rejects_path_launcher_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launcher_directory = tmp_path / "bin"
+    launcher_directory.mkdir(mode=0o700)
+    marker = tmp_path / "launcher-executed"
+    launcher = launcher_directory / "codex"
+    launcher.write_text(
+        '#!/bin/sh\nprintf executed > "$CODEX_TEST_WRAPPER_MARKER"\n'
+        'case "$1" in\n'
+        "  features) printf 'daemon_auto_start stable false\\n' ;;\n"
+        "  *) printf 'codex-cli 0.161.0\\n' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{launcher_directory}:/usr/bin:/bin")
+    monkeypatch.setenv("CODEX_TEST_WRAPPER_MARKER", str(marker))
+
+    with pytest.raises(pytest.skip.Exception, match="PATH launcher rejected"):
+        test_codex_0161_parser_accepts_start_and_resume_flag(tmp_path)
+
+    assert not marker.exists()
+
+
 def test_codex_0161_parser_accepts_start_and_resume_flag(tmp_path: Path) -> None:
     codex = shutil.which("codex")
     if codex is None:
         pytest.skip("Codex CLI unavailable")
+    try:
+        with Path(codex).open("rb") as candidate:
+            native_header = candidate.read(4)
+    except OSError:
+        pytest.skip("native Codex CLI unavailable")
+    if native_header != b"\x7fELF":
+        pytest.skip("native Codex CLI unavailable (PATH launcher rejected)")
     home = tmp_path / "codex-home"
     home.mkdir(mode=0o700)
     env = dict(os.environ, CODEX_HOME=str(home))

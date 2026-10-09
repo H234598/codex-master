@@ -807,7 +807,9 @@ def _seed_capacity_rows(
 
 @pytest.fixture
 def secure_tmp_path() -> Path:
-    with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix="hive-bus-store-test-", dir=Path.home().resolve()
+    ) as temporary:
         yield Path(temporary)
 
 

@@ -207,9 +207,12 @@ def _inventory(
                     "billing_account_ref": None,
                     "status": "active",
                     "project_id": project_id,
+                    "project_name": "Project One",
+                    "purpose": "hive",
                     "project_number": "100001",
                     "key_id": None,
                     "key_uid": None,
+                    "key_name": None,
                     "secret": "synthetic-secret-not-for-output",
                 }
             ],
@@ -238,7 +241,7 @@ def _inventory(
     path = root / "api-token.yaml"
     path.write_text(
         yaml.safe_dump(
-            {"schema_version": 1, "google_accounts": accounts},
+            {"schema_version": 3, "authority_generation": 1, "google_accounts": accounts},
             sort_keys=False,
         ),
         encoding="utf-8",
