@@ -827,10 +827,12 @@ def test_checked_in_catalogs_drive_resolver_without_hardcoded_model_ids() -> Non
 
 def test_agent_base_args_accepts_catalog_models_and_enforces_max_exception() -> None:
     sol = agent_base_args("gpt-6-sol", "high")
-    assert sol[:2] == ["--model", "gpt-6-sol"]
+    assert sol[:3] == ["--no-daemon", "--model", "gpt-6-sol"]
     assert 'model_reasoning_effort="high"' in sol
     for class_id, reasoning in (("goettin", "max"), ("gottbiene", "max"), ("koenigin", "max")):
-        assert agent_base_args("gpt-6-sol", reasoning, agent_class=class_id)[:2] == ["--model", "gpt-6-sol"]
+        args = agent_base_args("gpt-6-sol", reasoning, agent_class=class_id)
+        assert args[:3] == ["--no-daemon", "--model", "gpt-6-sol"]
+        assert f'model_reasoning_effort="{reasoning}"' in args
     with pytest.raises(AgentError, match=r"^unsupported routed agent tuple$"):
         agent_base_args("gpt-6-sol", "max")
 
@@ -885,9 +887,11 @@ def test_agent_base_args_accepts_second_sol_family_member_red_then_green(
     )
     monkeypatch.setattr("the_hive.server.load_model_policy", lambda _path: registry)
 
-    assert agent_base_args(alternate_definition.model_id, reasoning, agent_class=class_id)[:2] == [
-        "--model", alternate_definition.model_id,
+    args = agent_base_args(alternate_definition.model_id, reasoning, agent_class=class_id)
+    assert args[:3] == [
+        "--no-daemon", "--model", alternate_definition.model_id,
     ]
+    assert f'model_reasoning_effort="{reasoning}"' in args
 
 
 def test_assign_write_cli_rejects_ultra_before_dispatch(capsys: pytest.CaptureFixture[str]) -> None:
