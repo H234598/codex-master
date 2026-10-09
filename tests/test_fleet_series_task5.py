@@ -44,10 +44,13 @@ def runtime_probe_record(
         "reason_codes": [],
         "mutation_performed": False,
         "raw_output": "not_returned",
+        "global_pilot_readiness": {
+            "schema_version": 1, "pilot": "ready", "generation_id": "c" * 32,
+            "freshness": "fresh", "candidate_count": 1,
+            "reason_codes": [], "raw_output": "not_returned",
+        },
     }
     healthy = {
-        "namespace-status": ({"ok": True, "namespace_ready": True}, True),
-        "plugin-status": ({"ok": True}, True),
         "hive status": (runtime, True),
         "hive doctor": (
             {"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}},
@@ -56,10 +59,14 @@ def runtime_probe_record(
     }
     layout = Mock(spec=RuntimeLayout)
     layout.mcp_entrypoint = command
+    layout.read_attested_file.return_value = (
+        b'{"principals":[{"principal_id":"queen-one","class_id":"koenigin",'
+        b'"repo_id":"codex-master"}]}'
+    )
     monkeypatch.setattr(
         hourly_probe_module,
         "_runtime_status_json",
-        lambda _layout: (
+        lambda _layout, *, protected_home_runtime=False: (
             {
                 "ok": True,
                 "metadata": {"ok": True, "reason_code": "ok"},
@@ -73,6 +80,10 @@ def runtime_probe_record(
                 "raw_output": "not_returned",
             },
             True,
+            {
+                "code": "ok", "exit_code": 0,
+                "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False},
+            },
         ),
     )
     run_probe(
@@ -466,15 +477,22 @@ runtime = {
     "config_digest": "sha256:" + "a" * 64, "catalog_digest": "sha256:" + "b" * 64,
     "repository": "ready", "principal": "ready", "authority": "ready", "state": "ready", "pilot": "ready",
     "reason_codes": [], "mutation_performed": False, "raw_output": "not_returned",
+    "global_pilot_readiness": {
+        "schema_version": 1, "pilot": "ready", "generation_id": "c" * 32,
+        "freshness": "fresh", "candidate_count": 1,
+        "reason_codes": [], "raw_output": "not_returned",
+    },
 }
 healthy = {
-    "namespace-status": ({"ok": True, "namespace_ready": True}, True),
-    "plugin-status": ({"ok": True}, True),
     "hive status": (runtime, True),
     "hive doctor": ({"healthy": True, "checks": {"authority": "ready", "repository": "ready", "state": "ready"}}, True),
 }
 layout = Mock(spec=RuntimeLayout)
 layout.mcp_entrypoint = executable
+layout.read_attested_file.return_value = (
+    b'{"principals":[{"principal_id":"queen-one","class_id":"koenigin",'
+    b'"repo_id":"codex-master"}]}'
+)
 direct_runtime = {
     "ok": True,
     "metadata": {"ok": True, "reason_code": "ok"},
@@ -484,7 +502,11 @@ direct_runtime = {
     },
     "raw_output": "not_returned",
 }
-with patch.object(hourly_probe_module, "_runtime_status_json", return_value=(direct_runtime, True)):
+direct_diagnostic = {
+    "code": "ok", "exit_code": 0,
+    "stderr": {"state": "empty", "excerpt": "", "redaction_applied": False},
+}
+with patch.object(hourly_probe_module, "_runtime_status_json", return_value=(direct_runtime, True, direct_diagnostic)):
     run_probe(
         layout=layout, state_directory=probe_state,
         now=lambda: datetime.now(UTC), runner=lambda _command, *arguments: healthy[" ".join(arguments)],
