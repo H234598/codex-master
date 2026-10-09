@@ -38,7 +38,7 @@ def safe_tmp_path(monkeypatch):
             return os.stat_result(values)
         return result
     monkeypatch.setattr(os, 'fstat', sandbox_fstat)
-    with tempfile.TemporaryDirectory(prefix="hook-abi-gate-test-", dir=ROOT) as path:
+    with tempfile.TemporaryDirectory(prefix="hook-abi-gate-test-", dir=tempfile.gettempdir()) as path:
         yield Path(path)
 
 

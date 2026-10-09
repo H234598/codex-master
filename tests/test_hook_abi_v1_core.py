@@ -1122,13 +1122,24 @@ def test_core_rejects_a_root_plan_core_digest_mismatch_before_dispatch(
 
 def test_core_rejects_held_bundle_fd_when_manifest_nlink_drifts(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _installer_value, release_root, plugin_root, abi_root, state_root = _fixture(
         tmp_path
     )
-    (
-        release_root / "generations" / "one" / "TheHivePluginBundleV1" / "unexpected"
-    ).mkdir(mode=0o700)
+    bundle = release_root / "generations" / "one" / "TheHivePluginBundleV1"
+    identity = (bundle.stat().st_dev, bundle.stat().st_ino)
+    real_fstat = os.fstat
+
+    def drifted_bundle_stat(descriptor: int) -> os.stat_result:
+        result = real_fstat(descriptor)
+        if (result.st_dev, result.st_ino) == identity:
+            values = list(result)
+            values[3] += 1
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(os, "fstat", drifted_bundle_stat)
 
     with pytest.raises(HookAbiV1Error, match="hook_abi_v1_invalid"):
         _dispatch(

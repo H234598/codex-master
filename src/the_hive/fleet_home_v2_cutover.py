@@ -336,10 +336,22 @@ class LocalFleetHomeV2Filesystem:
 
     def fsync_tree_at(self, directory_fd: int) -> None:
         """Flush files then every directory bottom-up without symlink traversal."""
+        enumeration_fd = -1
         try:
-            names = os.listdir(directory_fd)
+            enumeration_fd = os.open(
+                ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=directory_fd,
+            )
+            bound = os.fstat(directory_fd)
+            enumeration = os.fstat(enumeration_fd)
+            if (bound.st_dev, bound.st_ino) != (enumeration.st_dev, enumeration.st_ino):
+                raise FleetHomeV2CutoverError("fleet_home_v2_stage_invalid")
+            names = os.listdir(enumeration_fd)
         except OSError as exc:
             raise FleetHomeV2CutoverError("fleet_home_v2_stage_invalid") from exc
+        finally:
+            if enumeration_fd >= 0:
+                os.close(enumeration_fd)
         for name in sorted(names):
             current = self.identity_at(directory_fd, name)
             if stat.S_ISDIR(current.mode):

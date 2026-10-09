@@ -498,6 +498,31 @@ def test_apply_rejects_caller_constructed_handle(tmp_path: Path) -> None:
         service.apply(forged)
 
 
+def test_fsync_tree_flushes_entries_added_after_bound_directory_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        assert os.listdir(directory_fd) == []
+        nested = tmp_path / "nested"
+        nested.mkdir(mode=0o700)
+        artifact = nested / "artifact"
+        artifact.write_bytes(b"private stage data")
+        flushed: list[int] = []
+        real_fsync = os.fsync
+
+        def record_fsync(descriptor: int) -> None:
+            real_fsync(descriptor)
+            flushed.append(os.fstat(descriptor).st_ino)
+
+        monkeypatch.setattr(os, "fsync", record_fsync)
+        LocalFleetHomeV2Filesystem().fsync_tree_at(directory_fd)
+
+        assert flushed == [artifact.stat().st_ino, nested.stat().st_ino, tmp_path.stat().st_ino]
+    finally:
+        os.close(directory_fd)
+
+
 def test_stage_root_owner_mode_nested_fsync_and_temp_collision_are_attested(tmp_path: Path) -> None:
     filesystem = NestedFsyncCrashFilesystem()
     authority, service, _port, plan = _single_plan(tmp_path, filesystem=filesystem)
